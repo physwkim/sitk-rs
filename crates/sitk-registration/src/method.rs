@@ -886,6 +886,57 @@ mod tests {
     }
 
     #[test]
+    fn displacement_field_recovers_a_translation() {
+        // A dense displacement field has one free vector per pixel — the most
+        // flexible deformable transform. Registering a translated blob drives the
+        // field to align the images (each pixel nulls its own intensity
+        // residual), dropping the metric far below the identity baseline; on the
+        // blob's steep flank, where the gradient carries signal, the recovered
+        // displacement approaches the true translation.
+        use sitk_transform::{DisplacementFieldTransform, Transform};
+
+        let (w, h, sigma, amp) = (20usize, 20usize, 4.0, 1.0);
+        let (cx, cy) = (10.0f64, 10.0f64);
+        let (tx, ty) = (2.0f64, -1.0f64);
+        let fixed = gaussian(w, h, cx, cy, sigma, amp);
+        let moving = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
+
+        let identity = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let baseline = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(&identity, &CpuBackend)
+            .value;
+
+        let field = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-4,
+                200,
+                1e-7,
+                EstimateLearningRate::Once,
+            );
+        let result = reg.execute(&fixed, &moving, field).unwrap();
+
+        // The field aligned the images: metric far below the identity baseline.
+        assert!(
+            result.metric_value < 0.15 * baseline,
+            "metric {} not below 0.15×baseline {baseline}",
+            result.metric_value
+        );
+        // On the blob's flank (one sigma right of centre, where the x-gradient
+        // carries signal) the recovered x-displacement approaches the true shift.
+        let flank = [cx + sigma, cy];
+        let mapped = result.transform.transform_point(&flank);
+        assert!(
+            (mapped[0] - (flank[0] + tx)).abs() < 0.7,
+            "flank mapped to {mapped:?}, expected x≈{}; metric {} (baseline {baseline})",
+            flank[0] + tx,
+            result.metric_value
+        );
+    }
+
+    #[test]
     fn each_iteration_estimation_converges_coarsely_and_stops_on_plateau() {
         // Estimate-at-each-iteration holds every step at ~one voxel, so it
         // recovers the shift only to roughly voxel precision and is stopped by

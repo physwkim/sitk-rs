@@ -18,6 +18,12 @@ pub enum TransformError {
     #[error("invalid B-spline transform domain (mesh size must be ≥ 1 in every dimension)")]
     InvalidBSplineDomain,
 
+    /// A displacement-field transform was constructed with per-dimension
+    /// arguments (size, origin, spacing, direction) of inconsistent length, or
+    /// an empty field grid.
+    #[error("invalid displacement-field domain (inconsistent per-dimension geometry)")]
+    InvalidDisplacementFieldDomain,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
