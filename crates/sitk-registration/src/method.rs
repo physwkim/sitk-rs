@@ -788,6 +788,89 @@ mod tests {
         }
     }
 
+    /// Sum of two Gaussian blobs at `c1`, `c2` — a rotationally asymmetric
+    /// pattern, so a rigid rotation (not just a translation) is needed to align
+    /// two such images.
+    fn two_blobs(w: usize, h: usize, c1: (f64, f64), c2: (f64, f64), sigma: f64) -> Image {
+        let s2 = 2.0 * sigma * sigma;
+        let mut v = vec![0.0f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let g = |c: (f64, f64)| {
+                    let (dx, dy) = (x as f64 - c.0, y as f64 - c.1);
+                    (-(dx * dx + dy * dy) / s2).exp()
+                };
+                v[y * w + x] = g(c1) + g(c2);
+            }
+        }
+        Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    #[test]
+    fn recovers_a_rigid_euler2d_rotation_and_translation() {
+        // Ground truth: rotate the fixed features by +theta about the image
+        // centre, then translate. The optimal Euler2D that aligns moving back
+        // onto fixed is exactly that (theta, tx, ty), since moving has a feature
+        // at p' = R(theta)(p − c) + c + t wherever fixed has one at p.
+        use sitk_transform::Euler2DTransform;
+        let (w, h) = (48usize, 48usize);
+        let (cx, cy) = (24.0f64, 24.0f64);
+        let sigma = 4.0;
+        let (a, b) = ((34.0, 24.0), (24.0, 31.0)); // 10 px right, 7 px above centre
+
+        let theta = 0.08f64; // ~4.6°
+        let (tx, ty) = (1.0f64, -0.5f64);
+        let rot = |p: (f64, f64)| {
+            let (dx, dy) = (p.0 - cx, p.1 - cy);
+            let (ct, st) = (theta.cos(), theta.sin());
+            (cx + ct * dx - st * dy + tx, cy + st * dx + ct * dy + ty)
+        };
+
+        let fixed = two_blobs(w, h, a, b, sigma);
+        let moving = two_blobs(w, h, rot(a), rot(b), sigma);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                300,
+                1e-8,
+                EstimateLearningRate::Once,
+            );
+        let init = Euler2DTransform::new(0.0, [0.0, 0.0], [cx, cy]);
+        let result = reg.execute(&fixed, &moving, init).unwrap();
+
+        let p = result.transform.parameters(); // [angle, tx, ty]
+        assert!(
+            (p[0] - theta).abs() < 1e-2,
+            "angle: got {}, want {theta} (full {p:?}, metric {})",
+            p[0],
+            result.metric_value
+        );
+        assert!(
+            (p[1] - tx).abs() < 5e-2 && (p[2] - ty).abs() < 5e-2,
+            "translation: got ({}, {}), want ({tx}, {ty}) (metric {})",
+            p[1],
+            p[2],
+            result.metric_value
+        );
+
+        // The metric at the recovered transform is far below the initial mismatch.
+        let initial = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(
+                &Euler2DTransform::new(0.0, [0.0, 0.0], [cx, cy]),
+                &CpuBackend,
+            )
+            .value;
+        assert!(
+            result.metric_value < 0.05 * initial,
+            "final {} not << initial {}",
+            result.metric_value,
+            initial
+        );
+    }
+
     #[test]
     fn transform_dimension_mismatch_is_rejected() {
         let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);

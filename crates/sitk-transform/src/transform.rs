@@ -222,6 +222,122 @@ impl ParametricTransform for AffineTransform {
     }
 }
 
+/// A rigid 2-D transform `y = R(θ)·(x − center) + center + translation`,
+/// mirroring `itk::Euler2DTransform` / `itk::Rigid2DTransform`.
+///
+/// Parameters are `[angle, tx, ty]` (`angle` in radians); the `center` of
+/// rotation is fixed (not a parameter). The rotation matrix
+/// `R(θ) = [[cos θ, −sin θ], [sin θ, cos θ]]` and the equivalent
+/// `offset = translation + center − R·center` (in `y = R·x + offset`) are cached
+/// and refreshed whenever the parameters change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Euler2DTransform {
+    angle: f64,
+    /// Length 2.
+    translation: Vec<f64>,
+    /// Length 2, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 2×2 `R(θ)`.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − R·center`.
+    offset: Vec<f64>,
+}
+
+impl Euler2DTransform {
+    /// A rigid transform of `angle` radians about `center`, then `translation`.
+    pub fn new(angle: f64, translation: [f64; 2], center: [f64; 2]) -> Self {
+        let mut t = Self {
+            angle,
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 4],
+            offset: vec![0.0; 2],
+        };
+        t.recompute();
+        t
+    }
+
+    /// The identity rigid transform (zero angle/translation, center at origin).
+    pub fn identity() -> Self {
+        Self::new(0.0, [0.0, 0.0], [0.0, 0.0])
+    }
+
+    /// Rotation angle in radians.
+    pub fn angle(&self) -> f64 {
+        self.angle
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 2×2 rotation matrix `R(θ)`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = R·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Rebuild the cached matrix and offset from `angle`, `translation`, `center`.
+    fn recompute(&mut self) {
+        let (c, s) = (self.angle.cos(), self.angle.sin());
+        self.matrix = vec![c, -s, s, c];
+        let m_center = matrix::mat_vec(&self.matrix, &self.center, 2);
+        self.offset = (0..2)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+    }
+}
+
+impl Transform for Euler2DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 2);
+        let mx = matrix::mat_vec(&self.matrix, point, 2);
+        (0..2).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        2
+    }
+}
+
+impl ParametricTransform for Euler2DTransform {
+    fn number_of_parameters(&self) -> usize {
+        3
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![self.angle, self.translation[0], self.translation[1]]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 3, "parameter length");
+        self.angle = params[0];
+        self.translation[0] = params[1];
+        self.translation[1] = params[2];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // y = R(θ)·(x − c) + c + t, parameters [θ, tx, ty]:
+        //   ∂y/∂θ = R'(θ)·(x − c),  R'(θ) = [[−sin, −cos], [cos, −sin]]
+        //   ∂y/∂t = I.
+        let (ca, sa) = (self.angle.cos(), self.angle.sin());
+        let (dx, dy) = (point[0] - self.center[0], point[1] - self.center[1]);
+        // Row-major 2×3: [ ∂y0/∂θ, ∂y0/∂tx, ∂y0/∂ty ; ∂y1/∂θ, ... ].
+        vec![-sa * dx - ca * dy, 1.0, 0.0, ca * dx - sa * dy, 0.0, 1.0]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +435,87 @@ mod tests {
             pm[k] -= h;
             a.set_parameters(&pm);
             let ym = a.transform_point(&point);
+            for i in 0..2 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * nparams + k]).abs() < 1e-6,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * nparams + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn euler2d_identity_is_noop() {
+        let e = Euler2DTransform::identity();
+        assert_eq!(e.number_of_parameters(), 3);
+        assert_eq!(e.transform_point(&[3.0, 4.0]), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn euler2d_rotation_about_center_fixes_center() {
+        use std::f64::consts::FRAC_PI_2;
+        // 90° CCW about center (5,5): the center maps to itself,
+        let e = Euler2DTransform::new(FRAC_PI_2, [0.0, 0.0], [5.0, 5.0]);
+        let c = e.transform_point(&[5.0, 5.0]);
+        assert!(
+            (c[0] - 5.0).abs() < 1e-12 && (c[1] - 5.0).abs() < 1e-12,
+            "{c:?}"
+        );
+        // and (6,5) rotates to (5,6): R=[[0,-1],[1,0]], (x−c)=(1,0) ⇒ (0,1) ⇒ +c.
+        let p = e.transform_point(&[6.0, 5.0]);
+        assert!(
+            (p[0] - 5.0).abs() < 1e-12 && (p[1] - 6.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn euler2d_pure_translation_when_angle_is_zero() {
+        let e = Euler2DTransform::new(0.0, [5.0, -2.0], [3.0, 7.0]);
+        // Zero angle ⇒ R = I ⇒ y = x + t regardless of center.
+        assert_eq!(e.transform_point(&[1.0, 1.0]), vec![6.0, -1.0]);
+    }
+
+    #[test]
+    fn euler2d_parameters_are_angle_then_translation() {
+        let mut e = Euler2DTransform::new(0.1, [0.0, 0.0], [2.0, -1.0]);
+        e.set_parameters(&[0.5, 3.0, -4.0]);
+        assert_eq!(e.parameters(), vec![0.5, 3.0, -4.0]);
+        assert_eq!(e.angle(), 0.5);
+        assert_eq!(e.translation(), &[3.0, -4.0]);
+    }
+
+    #[test]
+    fn euler2d_jacobian_matches_itk_analytic_form() {
+        // At angle 0, center (5,5), point (7,3): (x−c) = (2,−2).
+        //   ∂y/∂θ = R'(0)·(x−c) = [[0,−1],[1,0]]·(2,−2) = (2, 2)
+        //   ∂y/∂t = I
+        let e = Euler2DTransform::new(0.0, [0.0, 0.0], [5.0, 5.0]);
+        let j = e.jacobian_wrt_parameters(&[7.0, 3.0]);
+        // Row 0: [∂y0/∂θ, 1, 0]; Row 1: [∂y1/∂θ, 0, 1].
+        assert_eq!(j, vec![2.0, 1.0, 0.0, 2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn euler2d_jacobian_is_finite_difference_consistent() {
+        let base = [0.3, 0.5, -0.7];
+        let center = [2.0, -1.0];
+        let point = [4.0, 5.0];
+        let mut e = Euler2DTransform::new(base[0], [base[1], base[2]], center);
+        let jac = e.jacobian_wrt_parameters(&point);
+        let nparams = e.number_of_parameters();
+        let h = 1e-6;
+        for k in 0..nparams {
+            let mut pp = base;
+            pp[k] += h;
+            e.set_parameters(&pp);
+            let yp = e.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            e.set_parameters(&pm);
+            let ym = e.transform_point(&point);
             for i in 0..2 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
                 assert!(
