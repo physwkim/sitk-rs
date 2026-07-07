@@ -75,13 +75,15 @@
 //! tolerance — reaching far higher finest-level precision at the same iteration
 //! budget.
 //!
-//! The Gaussian is a result-faithful separable FIR
-//! ([`filters::smooth_gaussian`]); the bit-exact recursive Gaussian
+//! The pyramid smooths with the bit-exact recursive Gaussian
 //! ([`filters::recursive_gaussian`], a Deriche/Farnebäck IIR porting
-//! `itk::RecursiveGaussianImageFilter`) shares its signature and can replace it
-//! at this seam without touching callers, though the pyramid has not yet been
-//! switched to it. The shrink is a bit-exact [`filters::shrink`]
-//! (`itk::ShrinkImageFilter`).
+//! `itk::RecursiveGaussianImageFilter`), matching ITK's
+//! `SmoothingRecursiveGaussianImageFilter`; the result-faithful separable FIR
+//! ([`filters::smooth_gaussian`]) remains available behind the same seam. Both
+//! images are smoothed at full resolution, so the recursive filter's
+//! ≥4-pixels-per-smoothed-axis requirement bites only on a pathologically small
+//! input (a `sigma == 0` level is a no-op). The shrink is a bit-exact
+//! [`filters::shrink`] (`itk::ShrinkImageFilter`).
 //!
 //! [`set_shrink_factors_per_level`]:
 //! ImageRegistrationMethod::set_shrink_factors_per_level

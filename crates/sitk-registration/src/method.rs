@@ -19,7 +19,7 @@
 //! strategies come later.
 
 use sitk_core::Image;
-use sitk_filters::{shrink, smooth_gaussian};
+use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
 
 use crate::error::{RegistrationError, Result};
@@ -404,6 +404,14 @@ impl ImageRegistrationMethod {
     /// Build one resolution level's `(fixed, moving)` pair from the physical
     /// smoothing `sigma` and per-dimension shrink `factors`.
     ///
+    /// Smoothing uses the bit-exact recursive Gaussian
+    /// ([`recursive_gaussian`](sitk_filters::recursive_gaussian()), the
+    /// Deriche/Farnebäck IIR), matching ITK's
+    /// `SmoothingRecursiveGaussianImageFilter`. Both images are smoothed at full
+    /// resolution, so the recursive filter's ≥4-pixels-per-smoothed-axis
+    /// requirement bites only on a pathologically small input (a level with
+    /// `sigma == 0` is a no-op and imposes nothing).
+    ///
     /// The moving image is only smoothed (it is resampled through the transform,
     /// so it is not shrunk). The fixed image is smoothed and then placed on the
     /// coarse **virtual-domain** grid: ITK shrinks the virtual domain with
@@ -423,14 +431,14 @@ impl ImageRegistrationMethod {
         factors: &[usize],
         dim: usize,
     ) -> Result<(Image, Image)> {
-        let smoothed_fixed = smooth_gaussian(fixed, sigma)?;
+        let smoothed_fixed = recursive_gaussian(fixed, sigma)?;
         let coarse_grid = shrink(&smoothed_fixed, factors)?;
         let mut resampler = ResampleImageFilter::new();
         resampler
             .set_reference_image(&coarse_grid)
             .set_interpolator(Interpolator::Linear);
         let fixed_level = resampler.execute(&smoothed_fixed, &AffineTransform::identity(dim))?;
-        let moving_level = smooth_gaussian(moving, sigma)?;
+        let moving_level = recursive_gaussian(moving, sigma)?;
         Ok((fixed_level, moving_level))
     }
 

@@ -123,10 +123,11 @@ estimated initial step is ~one voxel regardless of how small the restart gradien
 is, so it halves toward the minimum, bounded below only by its gradient-magnitude
 tolerance (lower the tolerance to refine further).
 
-A bit-exact recursive Gaussian (`recursive_gaussian`, the Deriche/Farnebäck IIR
-that ports `itk::RecursiveGaussianImageFilter`'s zero-order smoothing) is now
-available in `sitk-filters`; the registration pyramid still uses the FIR smoother
-by default (swapping it in is the next step behind the `smooth_gaussian` seam).
+The registration pyramid smooths with the bit-exact recursive Gaussian
+(`recursive_gaussian`, the Deriche/Farnebäck IIR that ports
+`itk::RecursiveGaussianImageFilter`'s zero-order smoothing), matching ITK's
+`SmoothingRecursiveGaussianImageFilter`; the separable FIR (`smooth_gaussian`)
+stays available behind the same seam.
 
 Not yet: the recursive filter's first/second-derivative orders; the other metrics
 (Mattes MI, ANTS CC, correlation, Demons) and optimizers (LBFGS, Amoeba, Powell,
@@ -173,16 +174,17 @@ Remaining, deliberately-scoped deviations (documented in code):
   constant) and narrows with a **saturating** cast; the final out-of-range
   float→int cast is undefined in C++, so saturation is a defined choice, not a
   bug. `cast`/`rescale`/`threshold` likewise narrow via saturating `f64→int`.
-- **Registration-pyramid smoothing** still calls the separable **truncated-FIR**
-  Gaussian (`smooth_gaussian`: `kernel[k]=exp(-(k·spacing)²/2σ²)`, normalized, 4σ
-  radius, physical-unit σ, edge-replicating boundary) — result-faithful to the
-  same continuous Gaussian but **not** byte-identical to
-  `itk::RecursiveGaussianImageFilter`'s IIR recursion. The bit-exact IIR port
-  (`recursive_gaussian`) now exists and shares `smooth_gaussian`'s signature, so
-  it drops in at that seam; the pyramid has not yet been switched to it. Note the
-  recursive filter needs ≥4 pixels along each smoothed axis (an ITK requirement)
-  and its effective width is a fixed ~0.938·σ² — both genuine properties of the
-  Farnebäck coefficients, matched exactly here.
+- **Gaussian smoothing.** The registration pyramid uses the bit-exact recursive
+  Gaussian (`recursive_gaussian`, the Deriche/Farnebäck IIR porting
+  `itk::RecursiveGaussianImageFilter`), matching ITK's
+  `SmoothingRecursiveGaussianImageFilter`. It needs ≥4 pixels along each smoothed
+  axis (an ITK requirement; a `sigma == 0` level is a no-op) and its effective
+  width is a fixed ~0.938·σ² — both genuine properties of the Farnebäck
+  coefficients, matched exactly here. The separable **truncated-FIR** Gaussian
+  (`smooth_gaussian`: `kernel[k]=exp(-(k·spacing)²/2σ²)`, normalized, 4σ radius,
+  physical-unit σ, edge-replicating boundary) remains available behind the same
+  seam: result-faithful to the same continuous Gaussian, without the ≥4-pixel
+  floor, but not byte-identical to the IIR recursion.
 - **estimate-`Once` learning rate** is capped per step at the estimator's
   one-voxel maximum shift; this is inactive for any converging run (so
   single-resolution results are unchanged) and exists to stop a pyramid level
@@ -202,12 +204,10 @@ The near-term focus is **registration**, deepened incrementally, rather than
 broad filter coverage:
 
 1. **Registration depth (current focus):** multi-resolution pyramids
-   (shrink/smooth per level), regular-step gradient descent, and a bit-exact
-   zero-order `RecursiveGaussianImageFilter` (`recursive_gaussian`) — **done**;
-   next, switch the pyramid onto the recursive smoother behind the
-   `smooth_gaussian` seam; more metrics (Mattes MI, correlation, ANTS CC) and
-   optimizers (LBFGS, Amoeba); rigid/similarity/BSpline transforms; a
-   CUDA/`wgpu` `MetricBackend`.
+   (shrink/smooth per level, smoothing via the bit-exact zero-order
+   `RecursiveGaussianImageFilter`) and regular-step gradient descent — **done**;
+   next, more metrics (Mattes MI, correlation, ANTS CC) and optimizers (LBFGS,
+   Amoeba); rigid/similarity/BSpline transforms; a CUDA/`wgpu` `MetricBackend`.
 2. **Core infra:** neighborhood iterators, regions, the functor framework
    (unblocks the `BinaryFunctor`/`UnaryFunctor` filter families).
 3. **Filter breadth:** yaml→Rust codegen; port the ~247 `ImageFilter`-shaped
