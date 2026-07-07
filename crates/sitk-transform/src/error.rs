@@ -11,6 +11,13 @@ pub enum TransformError {
     #[error("input direction matrix is singular")]
     SingularDirection,
 
+    /// A B-spline transform was constructed with a zero mesh size in some
+    /// dimension, or with per-dimension arguments of inconsistent length. The
+    /// control-point grid spacing (`physicalDimensions / meshSize`) is then
+    /// undefined.
+    #[error("invalid B-spline transform domain (mesh size must be ≥ 1 in every dimension)")]
+    InvalidBSplineDomain,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

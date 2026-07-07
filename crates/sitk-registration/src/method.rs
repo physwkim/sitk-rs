@@ -737,6 +737,57 @@ mod tests {
     }
 
     #[test]
+    fn bspline_recovers_a_translation_as_a_deformation_field() {
+        // A cubic B-spline free-form transform is over-parameterised for a
+        // global translation, but a constant coefficient field represents one
+        // exactly (the weights sum to 1), so the deformable registration must
+        // recover it end-to-end: the transform maps the fixed blob centre onto
+        // the moving one, and the metric drops far below its identity baseline.
+        // This exercises the whole deformable path — B-spline weights, the
+        // per-control-point Jacobian, physical-shift scales over ~100
+        // parameters, and the optimiser over the full coefficient vector.
+        use sitk_transform::{BSplineTransform, Transform};
+
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (cx, cy) = (20.0f64, 20.0f64);
+        let (tx, ty) = (2.0f64, -1.5f64);
+        let fixed = gaussian(w, h, cx, cy, sigma, amp);
+        // fixed(x) ≈ moving(T(x)) is minimised when T(c) = c + (tx, ty).
+        let moving = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
+
+        let bspline = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        // Identity-baseline mean-squares, for comparison with the final metric.
+        let baseline = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(&bspline, &CpuBackend)
+            .value;
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-4,
+                200,
+                1e-6,
+                EstimateLearningRate::Once,
+            );
+        let result = reg.execute(&fixed, &moving, bspline).unwrap();
+
+        let mapped = result.transform.transform_point(&[cx, cy]);
+        assert!(
+            (mapped[0] - (cx + tx)).abs() < 0.5 && (mapped[1] - (cy + ty)).abs() < 0.5,
+            "blob centre mapped to {mapped:?}, expected {:?}; metric {} (baseline {baseline}), iters {}",
+            [cx + tx, cy + ty],
+            result.metric_value,
+            result.iterations
+        );
+        assert!(
+            result.metric_value < 0.1 * baseline,
+            "metric {} not below 0.1×baseline {baseline}",
+            result.metric_value
+        );
+    }
+
+    #[test]
     fn mattes_mi_recovers_a_translation_under_contrast_inversion() {
         // The multi-modality case: the moving image is the fixed blob shifted
         // AND contrast-inverted (a dark blob on a bright field where the fixed

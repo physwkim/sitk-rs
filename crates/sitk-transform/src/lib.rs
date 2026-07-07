@@ -5,11 +5,13 @@
 //! enough to close the read → transform → resample → write vertical slice. The
 //! remaining transform classes and interpolators follow in later phases.
 
+pub mod bspline;
 pub mod error;
 pub mod interpolator;
 pub mod resample;
 pub mod transform;
 
+pub use bspline::BSplineTransform;
 pub use error::{Result, TransformError};
 pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform::{
