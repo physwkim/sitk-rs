@@ -12,6 +12,13 @@
 //! shrink/smoothing schedule is configured (see
 //! [Multi-resolution](#multi-resolution) below).
 //!
+//! The metric is selectable: mean squares ([`MeanSquaresMetric`]) by default, or
+//! **Mattes mutual information** ([`MattesMutualInformationMetric`],
+//! `itk::MattesMutualInformationImageToImageMetricv4`) for **multi-modality**
+//! registration — images related by an arbitrary invertible intensity map, where
+//! mean squares fails — via
+//! [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information).
+//!
 //! Optimizer scales and the learning rate are **estimated automatically** from
 //! physical shift ([`PhysicalShiftScales`], ITK's
 //! `RegistrationParameterScalesFromPhysicalShift` +
@@ -111,6 +118,7 @@
 pub mod convergence;
 pub mod error;
 pub mod initializer;
+pub mod mattes;
 pub mod method;
 pub mod metric;
 pub mod optimizer;
@@ -119,6 +127,7 @@ pub mod scales;
 pub use convergence::WindowConvergenceMonitor;
 pub use error::{RegistrationError, Result};
 pub use initializer::{CenteredTransformInitializer, OperationMode};
+pub use mattes::MattesMutualInformationMetric;
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 pub use optimizer::{

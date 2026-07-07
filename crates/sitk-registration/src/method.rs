@@ -10,21 +10,28 @@
 //! and shrunk, the moving image is Gaussian-smoothed (not shrunk, since it is
 //! resampled through the transform), and the transform optimized at the coarse
 //! level initializes the next finer one. With no schedule set it runs a single
-//! full-resolution level. The metric is mean squares and interpolation is
-//! linear; the optimizer is either fixed-step gradient descent
+//! full-resolution level. The metric is mean squares
+//! (`itk::MeanSquaresImageToImageMetricv4`, the default) or Mattes mutual
+//! information (`itk::MattesMutualInformationImageToImageMetricv4`, for
+//! multi-modality), selected with
+//! [`set_metric_as_mean_squares`](ImageRegistrationMethod::set_metric_as_mean_squares)
+//! / [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information);
+//! interpolation is linear. The optimizer is either fixed-step gradient descent
 //! (`itk::GradientDescentOptimizerv4`) or regular-step gradient descent
 //! (`itk::RegularStepGradientDescentOptimizerv4`), the latter halving its step
 //! on each overshoot so it converges cleanly at an already-registered pyramid
-//! level and refines the finest one to high precision. More metrics and sampling
-//! strategies come later.
+//! level and refines the finest one to high precision. More sampling strategies
+//! come later.
 
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend};
+use crate::mattes::MattesMutualInformationMetric;
+use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 use crate::optimizer::{GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason};
+use crate::scales::PhysicalShiftScales;
 
 /// When the gradient-descent learning rate is estimated from physical shift,
 /// mirroring SimpleITK's `estimateLearningRate` option
@@ -60,6 +67,54 @@ enum LearningRateMode {
     Manual,
     /// Estimated from physical shift, once or at each iteration.
     Estimate(EstimateLearningRate),
+}
+
+/// Which similarity metric the method optimizes. Selected via
+/// [`ImageRegistrationMethod::set_metric_as_mean_squares`] /
+/// [`ImageRegistrationMethod::set_metric_as_mattes_mutual_information`].
+enum MetricKind {
+    /// Mean squares (`itk::MeanSquaresImageToImageMetricv4`) — the default,
+    /// suited to same-modality images with a linear intensity relationship.
+    MeanSquares,
+    /// Mattes mutual information
+    /// (`itk::MattesMutualInformationImageToImageMetricv4`) with the given
+    /// number of joint-histogram bins — suited to multi-modality registration.
+    MattesMutualInformation { number_of_histogram_bins: usize },
+}
+
+/// A constructed metric for one resolution level, dispatching
+/// [`evaluate`](Self::evaluate) and [`physical_shift_scales`] to the concrete
+/// metric selected by [`MetricKind`]. Both expose the same `MetricValue`
+/// interface, so the optimizer loop is metric-agnostic.
+///
+/// [`physical_shift_scales`]: Self::physical_shift_scales
+enum ActiveMetric {
+    MeanSquares(MeanSquaresMetric),
+    Mattes(MattesMutualInformationMetric),
+}
+
+impl ActiveMetric {
+    /// Value + parameter-derivative at `transform`. The mean-squares reduction
+    /// runs through the (GPU-swappable) `backend`; Mattes MI is CPU-only and
+    /// ignores it.
+    fn evaluate(
+        &self,
+        transform: &dyn ParametricTransform,
+        backend: &dyn MetricBackend,
+    ) -> MetricValue {
+        match self {
+            ActiveMetric::MeanSquares(m) => m.evaluate(transform, backend),
+            ActiveMetric::Mattes(m) => m.evaluate(transform),
+        }
+    }
+
+    /// Physical-shift scale/learning-rate estimator over the fixed samples.
+    fn physical_shift_scales(&self, transform: &dyn ParametricTransform) -> PhysicalShiftScales {
+        match self {
+            ActiveMetric::MeanSquares(m) => m.physical_shift_scales(transform),
+            ActiveMetric::Mattes(m) => m.physical_shift_scales(transform),
+        }
+    }
 }
 
 /// Which optimizer the method drives. The learning-rate estimation
@@ -101,6 +156,7 @@ pub struct RegistrationResult<T> {
 /// transform.
 pub struct ImageRegistrationMethod {
     optimizer: OptimizerKind,
+    metric_kind: MetricKind,
     scales_mode: ScalesMode,
     learning_rate_mode: LearningRateMode,
     backend: Box<dyn MetricBackend>,
@@ -119,6 +175,7 @@ impl Default for ImageRegistrationMethod {
     fn default() -> Self {
         Self {
             optimizer: OptimizerKind::GradientDescent(GradientDescentOptimizer::new(1.0, 100)),
+            metric_kind: MetricKind::MeanSquares,
             scales_mode: ScalesMode::Unit,
             learning_rate_mode: LearningRateMode::Manual,
             backend: Box::new(CpuBackend),
@@ -132,7 +189,8 @@ impl Default for ImageRegistrationMethod {
 impl ImageRegistrationMethod {
     /// A registration method with default settings (mean-squares metric, linear
     /// interpolation, CPU backend, gradient descent at learning rate 1 for 100
-    /// iterations). The metric is mean squares — the only Phase-0 metric.
+    /// iterations). Switch to Mattes mutual information for multi-modality with
+    /// [`set_metric_as_mattes_mutual_information`](Self::set_metric_as_mattes_mutual_information).
     pub fn new() -> Self {
         Self::default()
     }
@@ -268,12 +326,54 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Use the **mean-squares** metric (`itk::MeanSquaresImageToImageMetricv4`),
+    /// the default. Suited to same-modality images related by a roughly linear
+    /// intensity map. SimpleITK `SetMetricAsMeanSquares`.
+    pub fn set_metric_as_mean_squares(&mut self) -> &mut Self {
+        self.metric_kind = MetricKind::MeanSquares;
+        self
+    }
+
+    /// Use the **Mattes mutual-information** metric
+    /// (`itk::MattesMutualInformationImageToImageMetricv4`) with
+    /// `number_of_histogram_bins` joint-histogram bins (SimpleITK's default is
+    /// 50). Suited to **multi-modality** registration — images related by an
+    /// arbitrary invertible intensity map, where mean squares fails. Errors at
+    /// [`execute`](Self::execute) time if fewer than five bins are requested or
+    /// an image is constant. SimpleITK `SetMetricAsMattesMutualInformation`.
+    pub fn set_metric_as_mattes_mutual_information(
+        &mut self,
+        number_of_histogram_bins: usize,
+    ) -> &mut Self {
+        self.metric_kind = MetricKind::MattesMutualInformation {
+            number_of_histogram_bins,
+        };
+        self
+    }
+
     /// Replace the metric compute backend (the GPU seam). Defaults to
     /// [`CpuBackend`]; a CUDA/`wgpu` backend implements the same
     /// [`MetricBackend`] trait.
     pub fn set_metric_backend(&mut self, backend: Box<dyn MetricBackend>) -> &mut Self {
         self.backend = backend;
         self
+    }
+
+    /// Construct the metric selected by [`MetricKind`] for one resolution
+    /// level's fixed/moving pair.
+    fn build_metric(&self, fixed: &Image, moving: &Image) -> Result<ActiveMetric> {
+        match &self.metric_kind {
+            MetricKind::MeanSquares => Ok(ActiveMetric::MeanSquares(MeanSquaresMetric::new(
+                fixed, moving,
+            )?)),
+            MetricKind::MattesMutualInformation {
+                number_of_histogram_bins,
+            } => Ok(ActiveMetric::Mattes(MattesMutualInformationMetric::new(
+                fixed,
+                moving,
+                *number_of_histogram_bins,
+            )?)),
+        }
     }
 
     /// Set the per-level shrink factors of the multi-resolution pyramid
@@ -450,7 +550,7 @@ impl ImageRegistrationMethod {
         moving: &Image,
         initial: T,
     ) -> Result<RegistrationResult<T>> {
-        let metric = MeanSquaresMetric::new(fixed, moving)?;
+        let metric = self.build_metric(fixed, moving)?;
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
@@ -630,6 +730,47 @@ mod tests {
         let p = result.transform.parameters();
         assert!(
             (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+    }
+
+    #[test]
+    fn mattes_mi_recovers_a_translation_under_contrast_inversion() {
+        // The multi-modality case: the moving image is the fixed blob shifted
+        // AND contrast-inverted (a dark blob on a bright field where the fixed
+        // is a bright blob on a dark field). Mean squares wants M ≈ F and is
+        // maximally confused here; Mattes mutual information sees the intensity
+        // dependence regardless of the (inverting) intensity map and recovers
+        // the shift.
+        let (w, h, sigma, amp) = (48usize, 48usize, 6.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 24.0, 24.0, sigma, amp);
+        // moving(p) = amp − blob(p; centre shifted by (tx, ty)): inverted contrast.
+        let bright = gaussian(w, h, 24.0 + tx, 24.0 + ty, sigma, amp);
+        let moving = Image::from_vec(
+            &[w, h],
+            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+        )
+        .unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mattes_mutual_information(32)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                0.01,
+                200,
+                1e-6,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 0.5 && (p[1] - ty).abs() < 0.5,
             "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
             result.metric_value,
             result.iterations

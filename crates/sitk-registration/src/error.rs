@@ -54,6 +54,20 @@ pub enum RegistrationError {
     /// `ImageMomentsCalculator`, which aborts to avoid dividing by zero).
     #[error("center of gravity is undefined: {which} image has zero total intensity mass")]
     ZeroTotalMass { which: &'static str },
+
+    /// The Mattes MI metric was asked for too few histogram bins. The cubic
+    /// B-spline Parzen window pads the histogram by two bins on each axis end, so
+    /// at least `2·padding + 1 = 5` bins are required for a non-empty central
+    /// range (matches `itk::MattesMutualInformationImageToImageMetricv4`'s
+    /// `numberOfHistogramBins − 2·padding` bin-size divisor).
+    #[error("Mattes MI needs at least 5 histogram bins, got {bins}")]
+    TooFewHistogramBins { bins: usize },
+
+    /// The Mattes MI metric cannot be built because an image is constant: its
+    /// intensity range is zero, so the marginal entropy is zero and mutual
+    /// information is undefined (matches ITK, which throws in this case).
+    #[error("Mattes mutual information is undefined: {which} image has a constant intensity value")]
+    ConstantIntensity { which: &'static str },
 }
 
 /// Registration result alias.

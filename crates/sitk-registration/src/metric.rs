@@ -1,7 +1,12 @@
-//! Image-to-image similarity metrics and their compute backend.
+//! The **mean-squares** similarity metric and its compute backend.
 //!
-//! Phase-0 registration ships one metric, **mean squares**
-//! (`itk::MeanSquaresImageToImageMetricv4`):
+//! This module implements **mean squares**
+//! (`itk::MeanSquaresImageToImageMetricv4`); the Mattes mutual-information metric
+//! for multi-modality registration lives in the sibling
+//! [`mattes`](crate::mattes) module and reuses this module's [`FixedSamples`] /
+//! [`MovingImage`] primitives.
+//!
+//! Mean squares is
 //!
 //! ```text
 //! value = (1/N) Σ ( M(T(xᵢ)) − F(xᵢ) )²
@@ -50,11 +55,11 @@ use crate::scales::PhysicalShiftScales;
 /// The fixed image reduced to its sample set (the registration *virtual
 /// domain*): every pixel's value and its physical point, precomputed once.
 pub struct FixedSamples {
-    dim: usize,
+    pub(crate) dim: usize,
     /// One value per sample, length `N`.
-    values: Vec<f64>,
+    pub(crate) values: Vec<f64>,
     /// Physical points, row-major `N × dim`.
-    points: Vec<f64>,
+    pub(crate) points: Vec<f64>,
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
 }
@@ -107,6 +112,34 @@ impl FixedSamples {
     /// Whether there are no samples.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    /// The `(min, max)` of the sampled fixed-image values. `(0, 0)` when empty.
+    /// This is the fixed-image intensity range over the analysis region (full
+    /// sampling ⇒ the whole image), which the Mattes MI metric uses to size the
+    /// joint-histogram fixed axis.
+    pub(crate) fn value_range(&self) -> (f64, f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &v in &self.values {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if self.values.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (lo, hi)
+        }
+    }
+
+    /// Build a physical-shift scale/learning-rate estimator for `transform` over
+    /// these fixed sample points (shared by every metric). See
+    /// [`PhysicalShiftScales`].
+    pub(crate) fn physical_shift_scales(
+        &self,
+        transform: &dyn ParametricTransform,
+    ) -> PhysicalShiftScales {
+        PhysicalShiftScales::new(&self.points, self.dim, transform, self.min_spacing)
     }
 }
 
@@ -161,6 +194,45 @@ impl MovingImage {
     fn value_and_gradient(&self, c: &[f64]) -> Option<(f64, Vec<f64>)> {
         linear_value_and_gradient(&self.buf, &self.size, &self.strides, c)
     }
+
+    /// Linear sample of physical point `p` and its gradient expressed in
+    /// **physical space**, or `None` if `p` maps outside the buffer.
+    ///
+    /// With `cindex = M·(p − origin)`, the physical-space gradient is
+    /// `∂M(value)/∂p_d = Σ_j (∂value/∂cindex_j) · M[j][d]`, i.e. the index-space
+    /// gradient left-multiplied by the moving image's physical-to-index matrix.
+    /// Both the mean-squares and Mattes MI metrics need exactly this, so it lives
+    /// here rather than being duplicated in each metric's reduction.
+    pub(crate) fn value_and_physical_gradient(&self, p: &[f64]) -> Option<(f64, Vec<f64>)> {
+        let dim = self.dim;
+        let cidx = self.continuous_index(p);
+        let (value, grad_index) = self.value_and_gradient(&cidx)?;
+        let mut grad_phys = vec![0.0; dim];
+        for (d, gp) in grad_phys.iter_mut().enumerate() {
+            *gp = grad_index
+                .iter()
+                .enumerate()
+                .map(|(j, &gj)| gj * self.phys_to_index[j * dim + d])
+                .sum();
+        }
+        Some((value, grad_phys))
+    }
+
+    /// The `(min, max)` of the moving-image buffer. `(0, 0)` when empty. The
+    /// Mattes MI metric uses this to size the joint-histogram moving axis.
+    pub(crate) fn value_range(&self) -> (f64, f64) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &v in &self.buf {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if self.buf.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (lo, hi)
+        }
+    }
 }
 
 /// The value and parameter-derivative of a metric at one transform.
@@ -211,26 +283,13 @@ impl MetricBackend for CpuBackend {
             let fv = fixed.values[s];
 
             let mp = transform.transform_point(fp);
-            let cidx = moving.continuous_index(&mp);
-            let (mv, grad_index) = match moving.value_and_gradient(&cidx) {
+            let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
                 Some(vg) => vg,
                 None => continue,
             };
 
             let diff = mv - fv;
             value_sum += diff * diff;
-
-            // Convert the index-space gradient to a physical-space gradient. With
-            // cindex = M·(p − origin),
-            // ∂M(value)/∂p_d = Σ_j (∂value/∂cindex_j) · M[j][d].
-            let mut grad_phys = vec![0.0; dim];
-            for (d, gp) in grad_phys.iter_mut().enumerate() {
-                *gp = grad_index
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &gj)| gj * moving.phys_to_index[j * dim + d])
-                    .sum();
-            }
 
             // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k].
             let jac = transform.jacobian_wrt_parameters(fp);
@@ -297,12 +356,7 @@ impl MeanSquaresMetric {
         &self,
         transform: &dyn ParametricTransform,
     ) -> PhysicalShiftScales {
-        PhysicalShiftScales::new(
-            &self.fixed.points,
-            self.fixed.dim,
-            transform,
-            self.fixed.min_spacing,
-        )
+        self.fixed.physical_shift_scales(transform)
     }
 
     /// Evaluate value + derivative for `transform` using `backend`.
