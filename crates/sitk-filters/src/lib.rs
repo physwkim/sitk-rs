@@ -21,10 +21,12 @@
 //! yaml codegen in a later phase.
 
 pub mod error;
+pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
 pub use error::{FilterError, Result};
+pub use recursive_gaussian::recursive_gaussian;
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;

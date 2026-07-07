@@ -76,9 +76,12 @@
 //! budget.
 //!
 //! The Gaussian is a result-faithful separable FIR
-//! ([`filters::smooth_gaussian`]), isolated so a bit-exact recursive Gaussian
-//! can replace it without touching callers; the shrink is a bit-exact
-//! [`filters::shrink`] (`itk::ShrinkImageFilter`).
+//! ([`filters::smooth_gaussian`]); the bit-exact recursive Gaussian
+//! ([`filters::recursive_gaussian`], a Deriche/Farnebäck IIR porting
+//! `itk::RecursiveGaussianImageFilter`) shares its signature and can replace it
+//! at this seam without touching callers, though the pyramid has not yet been
+//! switched to it. The shrink is a bit-exact [`filters::shrink`]
+//! (`itk::ShrinkImageFilter`).
 //!
 //! [`set_shrink_factors_per_level`]:
 //! ImageRegistrationMethod::set_shrink_factors_per_level
@@ -87,6 +90,7 @@
 //! [`set_optimizer_as_regular_step_gradient_descent_estimated`]:
 //! ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
 //! [`filters::smooth_gaussian`]: sitk_filters::smooth_gaussian
+//! [`filters::recursive_gaussian`]: sitk_filters::recursive_gaussian()
 //! [`filters::shrink`]: sitk_filters::shrink
 //!
 //! ## GPU seam

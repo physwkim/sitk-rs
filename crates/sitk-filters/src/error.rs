@@ -31,6 +31,12 @@ pub enum FilterError {
     #[error("smoothing sigmas must be >= 0, got {0:?}")]
     InvalidSigma(Vec<f64>),
 
+    /// The recursive Gaussian was asked to filter an axis shorter than the
+    /// four pixels its fourth-order recursion needs (matching ITK's
+    /// `RecursiveSeparableImageFilter` requirement).
+    #[error("axis {axis} has {len} pixels; the recursive Gaussian needs at least 4")]
+    AxisTooShortForRecursion { axis: usize, len: usize },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

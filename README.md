@@ -28,7 +28,7 @@ registration only, ~6 exposed symbols) and is **not** the basis for this port.
 |---|---|
 | `sitk-core` | Runtime-typed `Image`, pixel dispatch (`dispatch_scalar!`), physical-space geometry (spacing/origin/direction) |
 | `sitk-io` | Image file IO — MetaImage (`.mha`/`.mhd`) reader/writer |
-| `sitk-filters` | Pixel-wise / statistical filters, separable FIR Gaussian smoothing, `ShrinkImageFilter` (procedural API) |
+| `sitk-filters` | Pixel-wise / statistical filters, Gaussian smoothing (separable FIR and bit-exact recursive/Deriche IIR), `ShrinkImageFilter` (procedural API) |
 | `sitk-transform` | `TranslationTransform`, `AffineTransform`, interpolation, `ResampleImageFilter` |
 | `sitk-registration` | `ImageRegistrationMethod`: mean-squares metric, gradient-descent and regular-step-gradient-descent optimizers, automatic physical-shift scales/learning-rate, GPU-backend seam |
 | `sitk` | Umbrella crate re-exporting the above under one namespace |
@@ -123,10 +123,14 @@ estimated initial step is ~one voxel regardless of how small the restart gradien
 is, so it halves toward the minimum, bounded below only by its gradient-magnitude
 tolerance (lower the tolerance to refine further).
 
-Not yet: bit-exact recursive Gaussian (the FIR smoother is result-faithful, not
-byte-identical to `itk::RecursiveGaussianImageFilter`); the other metrics (Mattes
-MI, ANTS CC, correlation, Demons) and optimizers (LBFGS, Amoeba, Powell, …);
-sampling strategies.
+A bit-exact recursive Gaussian (`recursive_gaussian`, the Deriche/Farnebäck IIR
+that ports `itk::RecursiveGaussianImageFilter`'s zero-order smoothing) is now
+available in `sitk-filters`; the registration pyramid still uses the FIR smoother
+by default (swapping it in is the next step behind the `smooth_gaussian` seam).
+
+Not yet: the recursive filter's first/second-derivative orders; the other metrics
+(Mattes MI, ANTS CC, correlation, Demons) and optimizers (LBFGS, Amoeba, Powell,
+…); sampling strategies.
 
 ### GPU acceleration (CPU now, CUDA-ready seam)
 
@@ -157,6 +161,7 @@ The Phase-0 numerics were cross-checked against the ITK source
 | shrink geometry (`outSpacing=inSpacing·f`, `outSize=⌊inSize/f⌋`, center-preserving origin, integer sampling offset) | `sitk-filters/shrink.rs` | `itkShrinkImageFilter.hxx` |
 | multi-resolution per-level scheme (shrink virtual domain; interpolate smoothed fixed at virtual points; smooth moving; carry transform) | `sitk-registration/method.rs` | `itkImageRegistrationMethodv4.hxx` |
 | regular-step descent (fixed step length; halve on gradient reversal; stop on gradient-magnitude/step tolerance) | `sitk-registration/optimizer.rs` | `itkRegularStepGradientDescentOptimizerv4.hxx` |
+| recursive Gaussian smoothing (Farnebäck 4th-order Deriche IIR; zero-order N/D/M/boundary coefficients; causal+anti-causal recursion) | `sitk-filters/recursive_gaussian.rs` | `itkRecursiveGaussianImageFilter.hxx`, `itkRecursiveSeparableImageFilter.hxx` |
 
 **Confirmed matching:** NN rounding, inside-buffer boundary, linear boundary
 clamp, variance divisor, and (as of this pass) image⊕image integer wraparound
@@ -168,12 +173,16 @@ Remaining, deliberately-scoped deviations (documented in code):
   constant) and narrows with a **saturating** cast; the final out-of-range
   float→int cast is undefined in C++, so saturation is a defined choice, not a
   bug. `cast`/`rescale`/`threshold` likewise narrow via saturating `f64→int`.
-- **Gaussian smoothing** is a separable **truncated-FIR** Gaussian
-  (`kernel[k]=exp(-(k·spacing)²/2σ²)`, normalized, 4σ radius, physical-unit σ,
-  edge-replicating boundary) — result-faithful to the same continuous Gaussian
-  but **not** byte-identical to `itk::RecursiveGaussianImageFilter`'s IIR
-  recursion. It sits behind the `smooth_gaussian` boundary so a bit-exact
-  recursive port can replace it without touching callers.
+- **Registration-pyramid smoothing** still calls the separable **truncated-FIR**
+  Gaussian (`smooth_gaussian`: `kernel[k]=exp(-(k·spacing)²/2σ²)`, normalized, 4σ
+  radius, physical-unit σ, edge-replicating boundary) — result-faithful to the
+  same continuous Gaussian but **not** byte-identical to
+  `itk::RecursiveGaussianImageFilter`'s IIR recursion. The bit-exact IIR port
+  (`recursive_gaussian`) now exists and shares `smooth_gaussian`'s signature, so
+  it drops in at that seam; the pyramid has not yet been switched to it. Note the
+  recursive filter needs ≥4 pixels along each smoothed axis (an ITK requirement)
+  and its effective width is a fixed ~0.938·σ² — both genuine properties of the
+  Farnebäck coefficients, matched exactly here.
 - **estimate-`Once` learning rate** is capped per step at the estimator's
   one-voxel maximum shift; this is inactive for any converging run (so
   single-resolution results are unchanged) and exists to stop a pyramid level
@@ -193,10 +202,12 @@ The near-term focus is **registration**, deepened incrementally, rather than
 broad filter coverage:
 
 1. **Registration depth (current focus):** multi-resolution pyramids
-   (shrink/smooth per level) and regular-step gradient descent — **done**, with a
-   bit-exact `RecursiveGaussianImageFilter` to follow behind the smoothing seam;
-   more metrics (Mattes MI, correlation, ANTS CC) and optimizers (LBFGS, Amoeba);
-   rigid/similarity/BSpline transforms; a CUDA/`wgpu` `MetricBackend`.
+   (shrink/smooth per level), regular-step gradient descent, and a bit-exact
+   zero-order `RecursiveGaussianImageFilter` (`recursive_gaussian`) — **done**;
+   next, switch the pyramid onto the recursive smoother behind the
+   `smooth_gaussian` seam; more metrics (Mattes MI, correlation, ANTS CC) and
+   optimizers (LBFGS, Amoeba); rigid/similarity/BSpline transforms; a
+   CUDA/`wgpu` `MetricBackend`.
 2. **Core infra:** neighborhood iterators, regions, the functor framework
    (unblocks the `BinaryFunctor`/`UnaryFunctor` filter families).
 3. **Filter breadth:** yaml→Rust codegen; port the ~247 `ImageFilter`-shaped

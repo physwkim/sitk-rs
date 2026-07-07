@@ -13,8 +13,10 @@
 //!
 //! This is a *result-faithful* Gaussian: it approximates the same continuous
 //! Gaussian ITK's recursive filter does, but is not bit-identical to
-//! `RecursiveGaussianImageFilter` (a Deriche/Farnebäck IIR). It is isolated so
-//! that a bit-exact recursive port can replace it without touching callers.
+//! `RecursiveGaussianImageFilter` (a Deriche/Farnebäck IIR). It is isolated
+//! behind this seam so that the bit-exact recursive port
+//! ([`recursive_gaussian`](crate::recursive_gaussian())), which shares this
+//! signature, can replace it without touching callers.
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
