@@ -338,6 +338,149 @@ impl ParametricTransform for Euler2DTransform {
     }
 }
 
+/// A similarity 2-D transform `y = s·R(θ)·(x − center) + center + translation`,
+/// mirroring `itk::Similarity2DTransform` — a rigid rotation plus an isotropic
+/// `scale`.
+///
+/// Parameters are `[scale, angle, tx, ty]` (`angle` in radians); the `center` is
+/// fixed. The matrix `M = s·R(θ)` and the equivalent
+/// `offset = translation + center − M·center` (in `y = M·x + offset`) are cached
+/// and refreshed whenever the parameters change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Similarity2DTransform {
+    scale: f64,
+    angle: f64,
+    /// Length 2.
+    translation: Vec<f64>,
+    /// Length 2, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 2×2 `s·R(θ)`.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl Similarity2DTransform {
+    /// A similarity transform: rotate `angle` radians about `center`, scale by
+    /// `scale`, then `translation`.
+    pub fn new(scale: f64, angle: f64, translation: [f64; 2], center: [f64; 2]) -> Self {
+        let mut t = Self {
+            scale,
+            angle,
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 4],
+            offset: vec![0.0; 2],
+        };
+        t.recompute();
+        t
+    }
+
+    /// The identity similarity transform (scale 1, zero angle/translation, center
+    /// at origin).
+    pub fn identity() -> Self {
+        Self::new(1.0, 0.0, [0.0, 0.0], [0.0, 0.0])
+    }
+
+    /// Isotropic scale factor.
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    /// Rotation angle in radians.
+    pub fn angle(&self) -> f64 {
+        self.angle
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 2×2 matrix `s·R(θ)`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Rebuild the cached matrix and offset from `scale`, `angle`, `translation`,
+    /// `center`.
+    fn recompute(&mut self) {
+        let (c, s) = (self.angle.cos(), self.angle.sin());
+        let (mc, ms) = (c * self.scale, s * self.scale);
+        self.matrix = vec![mc, -ms, ms, mc];
+        let m_center = matrix::mat_vec(&self.matrix, &self.center, 2);
+        self.offset = (0..2)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+    }
+}
+
+impl Transform for Similarity2DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 2);
+        let mx = matrix::mat_vec(&self.matrix, point, 2);
+        (0..2).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        2
+    }
+}
+
+impl ParametricTransform for Similarity2DTransform {
+    fn number_of_parameters(&self) -> usize {
+        4
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.scale,
+            self.angle,
+            self.translation[0],
+            self.translation[1],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 4, "parameter length");
+        self.scale = params[0];
+        self.angle = params[1];
+        self.translation[0] = params[2];
+        self.translation[1] = params[3];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // y = s·R(θ)·(x − c) + c + t, parameters [s, θ, tx, ty]:
+        //   ∂y/∂s = R(θ)·(x − c)                  (unscaled rotation)
+        //   ∂y/∂θ = s·R'(θ)·(x − c)
+        //   ∂y/∂t = I.
+        let (ca, sa) = (self.angle.cos(), self.angle.sin());
+        let (dx, dy) = (point[0] - self.center[0], point[1] - self.center[1]);
+        // Row-major 2×4: columns [s, θ, tx, ty].
+        vec![
+            ca * dx - sa * dy,
+            (-sa * dx - ca * dy) * self.scale,
+            1.0,
+            0.0,
+            sa * dx + ca * dy,
+            (ca * dx - sa * dy) * self.scale,
+            0.0,
+            1.0,
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +659,93 @@ mod tests {
             pm[k] -= h;
             e.set_parameters(&pm);
             let ym = e.transform_point(&point);
+            for i in 0..2 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * nparams + k]).abs() < 1e-6,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * nparams + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn similarity2d_identity_is_noop() {
+        let s = Similarity2DTransform::identity();
+        assert_eq!(s.number_of_parameters(), 4);
+        assert_eq!(s.parameters(), vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(s.transform_point(&[3.0, 4.0]), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn similarity2d_scales_about_center() {
+        // Scale 2 about center (5,5), no rotation/translation: (6,5) ⇒ (7,5).
+        let s = Similarity2DTransform::new(2.0, 0.0, [0.0, 0.0], [5.0, 5.0]);
+        let c = s.transform_point(&[5.0, 5.0]);
+        assert!(
+            (c[0] - 5.0).abs() < 1e-12 && (c[1] - 5.0).abs() < 1e-12,
+            "{c:?}"
+        );
+        let p = s.transform_point(&[6.0, 5.0]);
+        assert!(
+            (p[0] - 7.0).abs() < 1e-12 && (p[1] - 5.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn similarity2d_scaled_rotation_about_center() {
+        use std::f64::consts::FRAC_PI_2;
+        // Scale 2 + 90° about (5,5): (x−c)=(1,0) ⇒ R gives (0,1) ⇒ ×2 ⇒ (0,2) ⇒ +c.
+        let s = Similarity2DTransform::new(2.0, FRAC_PI_2, [0.0, 0.0], [5.0, 5.0]);
+        let p = s.transform_point(&[6.0, 5.0]);
+        assert!(
+            (p[0] - 5.0).abs() < 1e-12 && (p[1] - 7.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn similarity2d_parameters_are_scale_angle_translation() {
+        let mut s = Similarity2DTransform::new(1.0, 0.0, [0.0, 0.0], [2.0, -1.0]);
+        s.set_parameters(&[1.5, 0.5, 3.0, -4.0]);
+        assert_eq!(s.parameters(), vec![1.5, 0.5, 3.0, -4.0]);
+        assert_eq!(s.scale(), 1.5);
+        assert_eq!(s.angle(), 0.5);
+        assert_eq!(s.translation(), &[3.0, -4.0]);
+    }
+
+    #[test]
+    fn similarity2d_jacobian_matches_itk_analytic_form() {
+        // Scale 2, angle 0, center (5,5), point (7,3): (x−c)=(2,−2).
+        //   ∂y/∂s = R(0)·(x−c) = (2, −2)
+        //   ∂y/∂θ = s·R'(0)·(x−c) = 2·(2, 2) = (4, 4)
+        //   ∂y/∂t = I
+        let s = Similarity2DTransform::new(2.0, 0.0, [0.0, 0.0], [5.0, 5.0]);
+        let j = s.jacobian_wrt_parameters(&[7.0, 3.0]);
+        // Row 0: [∂y0/∂s, ∂y0/∂θ, 1, 0]; Row 1: [∂y1/∂s, ∂y1/∂θ, 0, 1].
+        assert_eq!(j, vec![2.0, 4.0, 1.0, 0.0, -2.0, 4.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn similarity2d_jacobian_is_finite_difference_consistent() {
+        let base = [1.3, 0.4, 0.5, -0.7];
+        let center = [2.0, -1.0];
+        let point = [4.0, 5.0];
+        let mut s = Similarity2DTransform::new(base[0], base[1], [base[2], base[3]], center);
+        let jac = s.jacobian_wrt_parameters(&point);
+        let nparams = s.number_of_parameters();
+        let h = 1e-6;
+        for k in 0..nparams {
+            let mut pp = base;
+            pp[k] += h;
+            s.set_parameters(&pp);
+            let yp = s.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            s.set_parameters(&pm);
+            let ym = s.transform_point(&point);
             for i in 0..2 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
                 assert!(

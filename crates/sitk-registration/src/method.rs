@@ -872,6 +872,69 @@ mod tests {
     }
 
     #[test]
+    fn recovers_a_similarity2d_scale_rotation_and_translation() {
+        // Ground truth: scale + rotate the fixed features about the image centre,
+        // then translate: p' = s·R(theta)(p − c) + c + t. The optimal Similarity2D
+        // aligning moving back onto fixed is exactly (s, theta, tx, ty).
+        use sitk_transform::Similarity2DTransform;
+        let (w, h) = (48usize, 48usize);
+        let (cx, cy) = (24.0f64, 24.0f64);
+        let sigma = 4.0;
+        let (a, b) = ((34.0, 24.0), (24.0, 31.0)); // 10 px right, 7 px above centre
+
+        let scale = 1.1f64;
+        let theta = 0.06f64; // ~3.4°
+        let (tx, ty) = (0.8f64, -0.4f64);
+        let map = |p: (f64, f64)| {
+            let (dx, dy) = (p.0 - cx, p.1 - cy);
+            let (ct, st) = (theta.cos(), theta.sin());
+            (
+                cx + scale * (ct * dx - st * dy) + tx,
+                cy + scale * (st * dx + ct * dy) + ty,
+            )
+        };
+
+        let fixed = two_blobs(w, h, a, b, sigma);
+        // moving = fixed ∘ S⁻¹, so its blobs sit at the transformed centres AND
+        // are widened by the isotropic scale (an s-times-wider Gaussian). Placing
+        // same-width blobs would make the exact similarity a poor fit and the
+        // recovered scale biased.
+        let moving = two_blobs(w, h, map(a), map(b), sigma * scale);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                400,
+                1e-9,
+                EstimateLearningRate::Once,
+            );
+        let init = Similarity2DTransform::new(1.0, 0.0, [0.0, 0.0], [cx, cy]);
+        let result = reg.execute(&fixed, &moving, init).unwrap();
+
+        let p = result.transform.parameters(); // [scale, angle, tx, ty]
+        assert!(
+            (p[0] - scale).abs() < 2e-2,
+            "scale: got {}, want {scale} (full {p:?}, metric {})",
+            p[0],
+            result.metric_value
+        );
+        assert!(
+            (p[1] - theta).abs() < 1e-2,
+            "angle: got {}, want {theta} (full {p:?}, metric {})",
+            p[1],
+            result.metric_value
+        );
+        assert!(
+            (p[2] - tx).abs() < 5e-2 && (p[3] - ty).abs() < 5e-2,
+            "translation: got ({}, {}), want ({tx}, {ty}) (metric {})",
+            p[2],
+            p[3],
+            result.metric_value
+        );
+    }
+
+    #[test]
     fn transform_dimension_mismatch_is_rejected() {
         let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
         let moving = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);

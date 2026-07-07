@@ -13,5 +13,6 @@ pub mod transform;
 pub use error::{Result, TransformError};
 pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform::{
-    AffineTransform, Euler2DTransform, ParametricTransform, Transform, TranslationTransform,
+    AffineTransform, Euler2DTransform, ParametricTransform, Similarity2DTransform, Transform,
+    TranslationTransform,
 };
