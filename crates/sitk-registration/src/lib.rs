@@ -91,7 +91,7 @@
 //! ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
 //! [`filters::smooth_gaussian`]: sitk_filters::smooth_gaussian
 //! [`filters::recursive_gaussian`]: sitk_filters::recursive_gaussian()
-//! [`filters::shrink`]: sitk_filters::shrink
+//! [`filters::shrink`]: sitk_filters::shrink()
 //!
 //! ## GPU seam
 //!
