@@ -48,6 +48,12 @@ pub enum RegistrationError {
     /// A pixel type that this path does not handle.
     #[error("unsupported pixel type {0:?}")]
     UnsupportedPixelType(PixelId),
+
+    /// `CenteredTransformInitializer` in `Moments` mode cannot form a center of
+    /// gravity because an image's total intensity mass is zero (matches ITK's
+    /// `ImageMomentsCalculator`, which aborts to avoid dividing by zero).
+    #[error("center of gravity is undefined: {which} image has zero total intensity mass")]
+    ZeroTotalMass { which: &'static str },
 }
 
 /// Registration result alias.

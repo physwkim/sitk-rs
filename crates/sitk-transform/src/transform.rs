@@ -38,6 +38,25 @@ pub trait ParametricTransform: Transform {
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64>;
 }
 
+/// A transform with a fixed center of rotation and a translation that can be set
+/// independently of the parameter vector, mirroring
+/// `itk::MatrixOffsetTransformBase::SetCenter` / `SetTranslation`. This is the
+/// interface `CenteredTransformInitializer` configures; a pure
+/// [`TranslationTransform`] has no center and so does not implement it.
+pub trait CenteredTransform: Transform {
+    /// Set the fixed center of rotation (length = [`dimension`]). The matrix and
+    /// translation are unchanged; the applied offset is recomputed.
+    ///
+    /// [`dimension`]: Transform::dimension
+    fn set_center(&mut self, center: &[f64]);
+
+    /// Set the translation (length = [`dimension`]). The matrix and center are
+    /// unchanged; the applied offset is recomputed.
+    ///
+    /// [`dimension`]: Transform::dimension
+    fn set_translation(&mut self, translation: &[f64]);
+}
+
 /// A pure translation: `y = x + t`. Mirrors `itk::TranslationTransform`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TranslationTransform {
@@ -222,6 +241,20 @@ impl ParametricTransform for AffineTransform {
     }
 }
 
+impl CenteredTransform for AffineTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), self.dim, "center length");
+        self.center.copy_from_slice(center);
+        self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), self.dim, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+    }
+}
+
 /// A rigid 2-D transform `y = R(θ)·(x − center) + center + translation`,
 /// mirroring `itk::Euler2DTransform` / `itk::Rigid2DTransform`.
 ///
@@ -335,6 +368,20 @@ impl ParametricTransform for Euler2DTransform {
         let (dx, dy) = (point[0] - self.center[0], point[1] - self.center[1]);
         // Row-major 2×3: [ ∂y0/∂θ, ∂y0/∂tx, ∂y0/∂ty ; ∂y1/∂θ, ... ].
         vec![-sa * dx - ca * dy, 1.0, 0.0, ca * dx - sa * dy, 0.0, 1.0]
+    }
+}
+
+impl CenteredTransform for Euler2DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 2, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 2, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
     }
 }
 
@@ -478,6 +525,20 @@ impl ParametricTransform for Similarity2DTransform {
             0.0,
             1.0,
         ]
+    }
+}
+
+impl CenteredTransform for Similarity2DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 2, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 2, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
     }
 }
 
@@ -755,5 +816,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn centered_transform_set_center_recomputes_offset_keeping_matrix() {
+        // Euler2D: after set_center(c), the center maps to itself + translation,
+        // and the matrix (rotation) is untouched.
+        use std::f64::consts::FRAC_PI_2;
+        let mut e = Euler2DTransform::new(FRAC_PI_2, [1.0, 2.0], [0.0, 0.0]);
+        let matrix_before = e.matrix().to_vec();
+        e.set_center(&[5.0, 5.0]);
+        assert_eq!(e.center(), &[5.0, 5.0]);
+        assert_eq!(e.matrix(), &matrix_before[..]);
+        // y(center) = R·0 + center + translation = center + translation.
+        let y = e.transform_point(&[5.0, 5.0]);
+        assert!(
+            (y[0] - 6.0).abs() < 1e-12 && (y[1] - 7.0).abs() < 1e-12,
+            "{y:?}"
+        );
+    }
+
+    #[test]
+    fn centered_transform_set_translation_recomputes_offset() {
+        // Similarity2D: set_translation shifts the mapped center by exactly Δt.
+        let mut s = Similarity2DTransform::new(2.0, 0.0, [0.0, 0.0], [3.0, 4.0]);
+        let before = s.transform_point(&[3.0, 4.0]); // = center (no translation yet)
+        s.set_translation(&[10.0, -5.0]);
+        assert_eq!(s.translation(), &[10.0, -5.0]);
+        let after = s.transform_point(&[3.0, 4.0]);
+        assert!(
+            (after[0] - before[0] - 10.0).abs() < 1e-12
+                && (after[1] - before[1] + 5.0).abs() < 1e-12,
+            "before {before:?} after {after:?}"
+        );
+    }
+
+    #[test]
+    fn centered_transform_via_trait_object() {
+        // The three MatrixOffset transforms are usable behind &mut dyn.
+        let mut affine = AffineTransform::identity(2);
+        let t: &mut dyn CenteredTransform = &mut affine;
+        t.set_center(&[2.0, 2.0]);
+        t.set_translation(&[1.0, 1.0]);
+        // Identity matrix: y = x − c + c + t = x + t.
+        assert_eq!(affine.transform_point(&[4.0, 4.0]), vec![5.0, 5.0]);
     }
 }

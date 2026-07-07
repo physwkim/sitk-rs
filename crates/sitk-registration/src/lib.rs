@@ -110,6 +110,7 @@
 
 pub mod convergence;
 pub mod error;
+pub mod initializer;
 pub mod method;
 pub mod metric;
 pub mod optimizer;
@@ -117,6 +118,7 @@ pub mod scales;
 
 pub use convergence::WindowConvergenceMonitor;
 pub use error::{RegistrationError, Result};
+pub use initializer::{CenteredTransformInitializer, OperationMode};
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 pub use optimizer::{
