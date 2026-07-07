@@ -1,0 +1,332 @@
+//! Spatial transforms.
+//!
+//! A [`Transform`] maps a point in one physical space to another. In resampling
+//! it maps a point in the **output** image's physical space to the **input**
+//! image's physical space (ITK's backward mapping convention).
+
+use sitk_core::matrix;
+
+/// A spatial coordinate transform.
+pub trait Transform {
+    /// Map a physical point to its transformed physical point.
+    fn transform_point(&self, point: &[f64]) -> Vec<f64>;
+    /// Spatial dimension the transform operates on.
+    fn dimension(&self) -> usize;
+}
+
+/// A transform whose action is controlled by a flat parameter vector, and which
+/// exposes the Jacobian of the mapped point with respect to those parameters.
+/// This is the interface registration optimizes over, mirroring ITK's
+/// `Transform::GetJacobianWithRespectToParameters`.
+pub trait ParametricTransform: Transform {
+    /// Number of free parameters.
+    fn number_of_parameters(&self) -> usize;
+
+    /// Current parameter vector (length [`number_of_parameters`]).
+    ///
+    /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
+    fn parameters(&self) -> Vec<f64>;
+
+    /// Replace the parameter vector. `params.len()` must equal
+    /// [`number_of_parameters`].
+    ///
+    /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
+    fn set_parameters(&mut self, params: &[f64]);
+
+    /// Jacobian `∂(transform_point(point))ᵢ / ∂paramₖ`, row-major
+    /// `dimension × number_of_parameters`, evaluated at `point`.
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64>;
+}
+
+/// A pure translation: `y = x + t`. Mirrors `itk::TranslationTransform`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranslationTransform {
+    translation: Vec<f64>,
+}
+
+impl TranslationTransform {
+    /// A translation by `translation` (length = dimension).
+    pub fn new(translation: Vec<f64>) -> Self {
+        assert!(!translation.is_empty(), "dimension must be >= 1");
+        Self { translation }
+    }
+
+    /// The translation vector.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+}
+
+impl Transform for TranslationTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), self.translation.len());
+        point
+            .iter()
+            .zip(self.translation.iter())
+            .map(|(&p, &t)| p + t)
+            .collect()
+    }
+
+    fn dimension(&self) -> usize {
+        self.translation.len()
+    }
+}
+
+impl ParametricTransform for TranslationTransform {
+    fn number_of_parameters(&self) -> usize {
+        self.translation.len()
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        self.translation.clone()
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), self.translation.len(), "parameter length");
+        self.translation.copy_from_slice(params);
+    }
+
+    fn jacobian_wrt_parameters(&self, _point: &[f64]) -> Vec<f64> {
+        // ∂(x + t)ᵢ / ∂tₖ = δᵢₖ — the identity.
+        let dim = self.translation.len();
+        let mut j = vec![0.0; dim * dim];
+        for i in 0..dim {
+            j[i * dim + i] = 1.0;
+        }
+        j
+    }
+}
+
+/// An affine transform `y = A·(x − center) + translation + center`, mirroring
+/// `itk::MatrixOffsetTransformBase` / `itk::AffineTransform`.
+///
+/// The `center` of rotation is fixed; `matrix` and `translation` are the
+/// optimizable parameters (matrix row-major first, then translation, matching
+/// ITK's parameter ordering). The equivalent `offset` in `y = A·x + offset`,
+/// with `offset = center + translation − A·center`, is cached and refreshed
+/// whenever the parameters change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AffineTransform {
+    dim: usize,
+    /// Row-major `dim x dim`.
+    matrix: Vec<f64>,
+    /// Length `dim`.
+    translation: Vec<f64>,
+    /// Length `dim`, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached `center + translation − A·center`.
+    offset: Vec<f64>,
+}
+
+impl AffineTransform {
+    /// Build from a row-major `dim x dim` `matrix`, a `translation`, and a
+    /// `center` of rotation. Panics on inconsistent lengths.
+    pub fn new(dim: usize, matrix: Vec<f64>, translation: Vec<f64>, center: Vec<f64>) -> Self {
+        assert_eq!(matrix.len(), dim * dim, "matrix must be dim*dim");
+        assert_eq!(translation.len(), dim, "translation must be length dim");
+        assert_eq!(center.len(), dim, "center must be length dim");
+        let offset = Self::compute_offset(dim, &matrix, &translation, &center);
+        Self {
+            dim,
+            matrix,
+            translation,
+            center,
+            offset,
+        }
+    }
+
+    /// The identity affine transform of the given dimension.
+    pub fn identity(dim: usize) -> Self {
+        Self {
+            dim,
+            matrix: matrix::identity(dim),
+            translation: vec![0.0; dim],
+            center: vec![0.0; dim],
+            offset: vec![0.0; dim],
+        }
+    }
+
+    /// `offset = center + translation − A·center`.
+    fn compute_offset(dim: usize, matrix: &[f64], translation: &[f64], center: &[f64]) -> Vec<f64> {
+        let a_center = matrix::mat_vec(matrix, center, dim);
+        (0..dim)
+            .map(|d| center[d] + translation[d] - a_center[d])
+            .collect()
+    }
+
+    /// Row-major `dim x dim` matrix.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// The translation part (`itk::MatrixOffsetTransformBase::GetTranslation`).
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Translation offset actually applied (`y = A·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+}
+
+impl Transform for AffineTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), self.dim);
+        let ax = matrix::mat_vec(&self.matrix, point, self.dim);
+        (0..self.dim).map(|d| ax[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+impl ParametricTransform for AffineTransform {
+    fn number_of_parameters(&self) -> usize {
+        self.dim * self.dim + self.dim
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        let mut p = self.matrix.clone();
+        p.extend_from_slice(&self.translation);
+        p
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        let n = self.dim * self.dim;
+        assert_eq!(params.len(), n + self.dim, "parameter length");
+        self.matrix.copy_from_slice(&params[..n]);
+        self.translation.copy_from_slice(&params[n..]);
+        self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // For y = A·(x − c) + t + c (center c fixed):
+        //   ∂yᵢ / ∂A_rc = δᵢᵣ · (x_c − c_c),   ∂yᵢ / ∂t_k = δᵢₖ.
+        let dim = self.dim;
+        let nparams = self.number_of_parameters();
+        let mut j = vec![0.0; dim * nparams];
+        for i in 0..dim {
+            for c in 0..dim {
+                j[i * nparams + (i * dim + c)] = point[c] - self.center[c];
+            }
+            j[i * nparams + (dim * dim + i)] = 1.0;
+        }
+        j
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_transforms_point() {
+        let t = TranslationTransform::new(vec![2.0, -3.0]);
+        assert_eq!(t.transform_point(&[10.0, 10.0]), vec![12.0, 7.0]);
+    }
+
+    #[test]
+    fn affine_identity_is_noop() {
+        let a = AffineTransform::identity(2);
+        assert_eq!(a.transform_point(&[3.0, 4.0]), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn affine_pure_translation_matches_translation_transform() {
+        let a = AffineTransform::new(2, matrix::identity(2), vec![5.0, -2.0], vec![0.0, 0.0]);
+        assert_eq!(a.transform_point(&[1.0, 1.0]), vec![6.0, -1.0]);
+    }
+
+    #[test]
+    fn affine_rotation_about_center_fixes_center() {
+        // 90-degree rotation about center (5,5): the center maps to itself.
+        let a = AffineTransform::new(2, vec![0.0, -1.0, 1.0, 0.0], vec![0.0, 0.0], vec![5.0, 5.0]);
+        let c = a.transform_point(&[5.0, 5.0]);
+        assert!((c[0] - 5.0).abs() < 1e-12 && (c[1] - 5.0).abs() < 1e-12);
+        // (6,5) rotates to (5,6) about (5,5).
+        let p = a.transform_point(&[6.0, 5.0]);
+        assert!(
+            (p[0] - 5.0).abs() < 1e-12 && (p[1] - 6.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn translation_parameters_roundtrip_and_jacobian_is_identity() {
+        let mut t = TranslationTransform::new(vec![0.0, 0.0]);
+        assert_eq!(t.number_of_parameters(), 2);
+        t.set_parameters(&[3.0, -4.0]);
+        assert_eq!(t.parameters(), vec![3.0, -4.0]);
+        assert_eq!(t.transform_point(&[1.0, 1.0]), vec![4.0, -3.0]);
+        // Jacobian is the 2x2 identity regardless of the point.
+        assert_eq!(
+            t.jacobian_wrt_parameters(&[7.0, 9.0]),
+            vec![1.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn affine_parameters_are_matrix_then_translation() {
+        let a = AffineTransform::new(2, vec![1.0, 2.0, 3.0, 4.0], vec![5.0, 6.0], vec![0.0, 0.0]);
+        assert_eq!(a.number_of_parameters(), 6);
+        assert_eq!(a.parameters(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn affine_set_parameters_updates_offset() {
+        let mut a = AffineTransform::identity(2);
+        // Set matrix to identity, translation to (5,-2), center at origin.
+        a.set_parameters(&[1.0, 0.0, 0.0, 1.0, 5.0, -2.0]);
+        assert_eq!(a.transform_point(&[1.0, 1.0]), vec![6.0, -1.0]);
+    }
+
+    #[test]
+    fn affine_jacobian_matches_analytic_form() {
+        // Center (5,5); at point (7,3): matrix-col entries are (x−c), translation 1.
+        let a = AffineTransform::new(2, matrix::identity(2), vec![0.0, 0.0], vec![5.0, 5.0]);
+        let j = a.jacobian_wrt_parameters(&[7.0, 3.0]);
+        // Row 0: [x0−c0, x1−c1, 0, 0, 1, 0] = [2, -2, 0, 0, 1, 0]
+        // Row 1: [0, 0, x0−c0, x1−c1, 0, 1] = [0, 0, 2, -2, 0, 1]
+        assert_eq!(
+            j,
+            vec![2.0, -2.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0, -2.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn affine_jacobian_is_finite_difference_consistent() {
+        // Numerically verify ∂y/∂p against the analytic Jacobian.
+        let base = vec![0.9, 0.1, -0.2, 1.1, 0.3, -0.4];
+        let center = vec![2.0, -1.0];
+        let point = [4.0, 5.0];
+        let mut a = AffineTransform::new(2, base[..4].to_vec(), base[4..].to_vec(), center.clone());
+        let jac = a.jacobian_wrt_parameters(&point);
+        let nparams = a.number_of_parameters();
+        let h = 1e-6;
+        for k in 0..nparams {
+            let mut pp = base.clone();
+            pp[k] += h;
+            a.set_parameters(&pp);
+            let yp = a.transform_point(&point);
+            let mut pm = base.clone();
+            pm[k] -= h;
+            a.set_parameters(&pm);
+            let ym = a.transform_point(&point);
+            for i in 0..2 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * nparams + k]).abs() < 1e-6,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * nparams + k]
+                );
+            }
+        }
+    }
+}

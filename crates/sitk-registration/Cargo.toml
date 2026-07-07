@@ -1,0 +1,14 @@
+[package]
+name = "sitk-registration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Image registration (metrics, optimizers, ImageRegistrationMethod) for sitk-rs"
+
+[dependencies]
+sitk-core.workspace = true
+sitk-filters.workspace = true
+sitk-transform.workspace = true
+thiserror.workspace = true

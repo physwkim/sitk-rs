@@ -1,0 +1,12 @@
+[package]
+name = "sitk-filters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Image filters for sitk-rs"
+
+[dependencies]
+sitk-core.workspace = true
+thiserror.workspace = true

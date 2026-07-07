@@ -1,0 +1,12 @@
+[package]
+name = "sitk-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Image file IO for sitk-rs (MetaImage)"
+
+[dependencies]
+sitk-core.workspace = true
+thiserror.workspace = true

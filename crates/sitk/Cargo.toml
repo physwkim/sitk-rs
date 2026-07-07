@@ -1,0 +1,15 @@
+[package]
+name = "sitk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A pure-Rust port of SimpleITK (umbrella crate)"
+
+[dependencies]
+sitk-core.workspace = true
+sitk-io.workspace = true
+sitk-filters.workspace = true
+sitk-transform.workspace = true
+sitk-registration.workspace = true
