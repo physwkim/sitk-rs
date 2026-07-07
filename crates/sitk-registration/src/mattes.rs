@@ -40,10 +40,24 @@
 //!   deliberate deviation the mean-squares metric documents: ITK defaults to a
 //!   separately-computed (Gaussian-smoothed or central-difference) gradient
 //!   image that is not consistent with the interpolated value.
-//! * **Global transforms only.** The dense global-support derivative path is
-//!   ported; ITK's local-support (displacement-field / BSpline) branch is not,
-//!   since this crate's transforms are all global. When a deformable transform
-//!   is added, the `HasLocalSupport` accumulation joins here.
+//! * **Global-support derivative path (covers BSpline).** The dense
+//!   `jointPDFDerivatives` accumulation is ported. In ITK v4 this is the path
+//!   taken by every transform whose `HasLocalSupport()` is false — which, per
+//!   `itk::ObjectToObjectMetric::HasLocalSupport`, means every category *except*
+//!   `DisplacementField`. A [`BSplineTransform`] reports
+//!   `GetTransformCategory() == BSpline`, so it is **not** local-support and is
+//!   handled here exactly as ITK handles it: the (sparse) transform Jacobian is
+//!   folded densely over all parameters. This makes **deformable, multi-modality
+//!   registration** (BSpline + mutual information) work; it is finite-difference
+//!   verified against the value in the tests.
+//! * **Displacement-field local-support branch not ported.** ITK's genuine
+//!   local-support path (`m_LocalDerivativeByParzenBin`,
+//!   `ComputeParameterOffsetFromVirtualIndex`) fires only for a
+//!   `DisplacementFieldTransform` (`HasLocalSupport() == true`). This crate has
+//!   no displacement-field transform yet, so that branch is deferred; adding it
+//!   is what would bring the per-pixel accumulation here.
+//!
+//! [`BSplineTransform`]: sitk_transform::BSplineTransform
 
 use sitk_core::Image;
 use sitk_transform::ParametricTransform;
@@ -442,6 +456,68 @@ mod tests {
         assert!(
             aligned < shifted,
             "aligned {aligned} should be below shifted {shifted}"
+        );
+    }
+
+    #[test]
+    fn bspline_derivative_matches_finite_difference() {
+        // The existing dense/global-support path produces a correct Mattes
+        // derivative for a BSpline transform, which is !HasLocalSupport in ITK
+        // (GetTransformCategory() == BSpline, and HasLocalSupport() is true only
+        // for a displacement field) and so takes exactly this global path. The
+        // (sparse) BSpline Jacobian is folded densely over all parameters;
+        // compare the analytic MI derivative to a central finite difference.
+        use sitk_transform::{BSplineTransform, ParametricTransform};
+
+        let (w, h, sigma) = (32usize, 32usize, 6.0);
+        let fixed = gaussian(w, h, 16.0, 16.0, sigma, 1.0);
+        // contrast-inverted moving (multi-modality flavour): 1 − blob.
+        let s2 = 2.0 * sigma * sigma;
+        let mut mv = vec![0.0f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 - 16.0, y as f64 - 16.0);
+                mv[y * w + x] = 1.0 - (-(dx * dx + dy * dy) / s2).exp();
+            }
+        }
+        let moving = Image::from_vec(&[w, h], mv).unwrap();
+        let metric = MattesMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+
+        let mut base = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        let n = base.number_of_parameters();
+        // small non-zero coefficient field so we test off the identity.
+        let params: Vec<f64> = (0..n)
+            .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.05)
+            .collect();
+        base.set_parameters(&params);
+        let analytic = metric.evaluate(&base).derivative;
+
+        let step = 1e-3;
+        let mut checked = 0;
+        for k in 0..n {
+            // skip parameters with negligible analytic gradient (support gaps)
+            if analytic[k].abs() < 1e-4 {
+                continue;
+            }
+            let mut pp = params.clone();
+            pp[k] += step;
+            let mut pm = params.clone();
+            pm[k] -= step;
+            let mut tp = base.clone();
+            tp.set_parameters(&pp);
+            let mut tm = base.clone();
+            tm.set_parameters(&pm);
+            let fd = (metric.evaluate(&tp).value - metric.evaluate(&tm).value) / (2.0 * step);
+            assert!(
+                (fd - analytic[k]).abs() < 5e-3,
+                "param {k}: fd {fd} vs analytic {}",
+                analytic[k]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 5,
+            "expected several non-trivial params, got {checked}"
         );
     }
 

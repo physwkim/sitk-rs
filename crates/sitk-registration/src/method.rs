@@ -829,6 +829,63 @@ mod tests {
     }
 
     #[test]
+    fn bspline_mattes_recovers_a_deformable_shift_under_contrast_inversion() {
+        // Deformable AND multi-modality together: the moving image is the fixed
+        // blob shifted AND contrast-inverted, and the transform is a free-form
+        // cubic B-spline. Mean squares is defeated by the inversion; Mattes
+        // mutual information drives the deformation, and because a constant
+        // coefficient field represents the shift exactly, the recovered warp maps
+        // the fixed blob centre onto the moving one while mutual information
+        // improves over the identity. A BSpline is !HasLocalSupport in ITK, so
+        // this runs through the metric's ordinary global-support derivative path.
+        use sitk_transform::{BSplineTransform, Transform};
+
+        let (w, h, sigma, amp) = (40usize, 40usize, 6.0, 1.0);
+        let (cx, cy) = (20.0f64, 20.0f64);
+        let (tx, ty) = (2.0f64, -1.5f64);
+        let fixed = gaussian(w, h, cx, cy, sigma, amp);
+        let bright = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
+        let moving = Image::from_vec(
+            &[w, h],
+            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+        )
+        .unwrap();
+
+        // Baseline mutual information at the identity deformation.
+        let identity = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        let baseline = crate::mattes::MattesMutualInformationMetric::new(&fixed, &moving, 32)
+            .unwrap()
+            .evaluate(&identity)
+            .value;
+
+        let bspline = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mattes_mutual_information(32)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                0.01,
+                200,
+                1e-6,
+                EstimateLearningRate::Once,
+            );
+        let result = reg.execute(&fixed, &moving, bspline).unwrap();
+
+        let mapped = result.transform.transform_point(&[cx, cy]);
+        assert!(
+            (mapped[0] - (cx + tx)).abs() < 0.6 && (mapped[1] - (cy + ty)).abs() < 0.6,
+            "blob centre mapped to {mapped:?}, expected {:?}; metric {} (baseline {baseline}), iters {}",
+            [cx + tx, cy + ty],
+            result.metric_value,
+            result.iterations
+        );
+        assert!(
+            result.metric_value < baseline,
+            "mutual information did not improve: metric {} vs baseline {baseline}",
+            result.metric_value
+        );
+    }
+
+    #[test]
     fn each_iteration_estimation_converges_coarsely_and_stops_on_plateau() {
         // Estimate-at-each-iteration holds every step at ~one voxel, so it
         // recovers the shift only to roughly voxel precision and is stopped by
