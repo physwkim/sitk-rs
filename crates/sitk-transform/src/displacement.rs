@@ -39,9 +39,15 @@
 //! transform drops into the existing metric/optimizer unchanged.
 //!
 //! Because a displacement field has `dimension × numberOfPixels` parameters,
-//! that dense contract is only practical for small fields; ITK's genuine
-//! local-support path — which uses the `dimension × dimension` local Jacobian
-//! and accumulates per pixel — is a separate follow-up.
+//! that dense contract is only practical for small fields. For the genuine
+//! local-support path — one that never materializes the dense Jacobian — the
+//! transform also reports [`has_local_support`] and exposes, per point, the
+//! `dimension × dimension` identity [`local_support_jacobian`] together with the
+//! pixel's parameter-block offset; a metric with a local-support branch (Mattes
+//! mutual information) uses these to accumulate the derivative per pixel.
+//!
+//! [`has_local_support`]: ParametricTransform::has_local_support
+//! [`local_support_jacobian`]: ParametricTransform::local_support_jacobian
 
 use sitk_core::Image;
 
@@ -224,6 +230,37 @@ impl ParametricTransform for DisplacementFieldTransform {
         }
         jac
     }
+
+    fn has_local_support(&self) -> bool {
+        true
+    }
+
+    fn number_of_local_parameters(&self) -> usize {
+        self.dim
+    }
+
+    fn local_support_jacobian(&self, point: &[f64]) -> Option<(usize, Vec<f64>)> {
+        let dim = self.dim;
+        let cindex = self.continuous_index(point);
+        if !is_inside(&cindex, &self.size) {
+            return None; // outside the field ⇒ no local region governs this point
+        }
+        // The field shares the virtual/fixed domain, so a metric sample lands on
+        // a grid point: round to that pixel and return its parameter-block offset
+        // together with the identity local Jacobian ITK's
+        // `ComputeJacobianWithRespectToParameters` yields there (frac = 0 ⇒ unit
+        // weight at the pixel's own displacement).
+        let mut pixel = 0usize;
+        for (d, &ci) in cindex.iter().enumerate() {
+            let idx = (ci.round() as isize).clamp(0, self.size[d] as isize - 1) as usize;
+            pixel += idx * self.strides[d];
+        }
+        let mut local_jac = vec![0.0f64; dim * dim];
+        for c in 0..dim {
+            local_jac[c * dim + c] = 1.0;
+        }
+        Some((pixel * dim, local_jac))
+    }
 }
 
 #[cfg(test)]
@@ -347,6 +384,52 @@ mod tests {
         assert_eq!(t.size(), &[5, 7]);
         assert_eq!(t.number_of_pixels(), 35);
         assert_eq!(t.number_of_parameters(), 35 * 2);
+    }
+
+    #[test]
+    fn local_support_is_advertised_with_dimension_local_parameters() {
+        let t = field(4, 5);
+        assert!(t.has_local_support());
+        assert_eq!(t.number_of_local_parameters(), 2);
+    }
+
+    #[test]
+    fn local_support_jacobian_is_the_owning_pixel_and_identity() {
+        let t = field(4, 5);
+        // Grid point (2,3): raster pixel = 2 + 3*4 = 14, block offset = 14*2 = 28.
+        let (offset, jac) = t.local_support_jacobian(&[2.0, 3.0]).unwrap();
+        assert_eq!(offset, 14 * 2);
+        assert_eq!(jac, vec![1.0, 0.0, 0.0, 1.0]);
+        // An off-grid point rounds to its nearest pixel: (1.6, 2.4) → (2,2),
+        // raster 2 + 2*4 = 10, offset 20.
+        let (offset, _) = t.local_support_jacobian(&[1.6, 2.4]).unwrap();
+        assert_eq!(offset, 10 * 2);
+        // Outside the field ⇒ no owning region.
+        assert!(t.local_support_jacobian(&[-50.0, 100.0]).is_none());
+    }
+
+    #[test]
+    fn local_support_jacobian_offset_matches_the_dense_jacobian_block() {
+        // At a grid point the dense Jacobian is non-zero only in the owning
+        // pixel's block, and that block is the identity the local path returns.
+        let t = field(4, 4);
+        let n = t.number_of_parameters();
+        let point = [1.0, 2.0]; // raster pixel 1 + 2*4 = 9, offset 18
+        let dense = t.jacobian_wrt_parameters(&point);
+        let (offset, local) = t.local_support_jacobian(&point).unwrap();
+        assert_eq!(offset, 18);
+        for c in 0..2 {
+            for mu in 0..2 {
+                assert_eq!(dense[c * n + offset + mu], local[c * 2 + mu]);
+            }
+        }
+        // Every non-zero dense entry lies inside that block.
+        for (k, &v) in dense.iter().enumerate() {
+            if v != 0.0 {
+                let col = k % n;
+                assert!((offset..offset + 2).contains(&col), "stray non-zero at {k}");
+            }
+        }
     }
 
     #[test]

@@ -36,6 +36,49 @@ pub trait ParametricTransform: Transform {
     /// Jacobian `∂(transform_point(point))ᵢ / ∂paramₖ`, row-major
     /// `dimension × number_of_parameters`, evaluated at `point`.
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64>;
+
+    /// Whether the transform has *local support*: each point of space is
+    /// governed by its own small block of parameters rather than by all of them
+    /// (mirrors `itk::Transform::GetTransformCategory() == DisplacementField`,
+    /// which is exactly what `ObjectToObjectMetric::HasLocalSupport()` keys on).
+    /// A dense displacement field is the archetype; every global transform
+    /// (translation, affine, versor, B-spline) returns `false`.
+    ///
+    /// Metrics use this to select a per-region derivative accumulation that
+    /// avoids materializing the full (bins² × `number_of_parameters`) derivative
+    /// array. The default is `false`.
+    fn has_local_support(&self) -> bool {
+        false
+    }
+
+    /// Number of parameters governing each local region — ITK's
+    /// `GetNumberOfLocalParameters`. For a global transform this is just
+    /// [`number_of_parameters`]; for a displacement field it is the point
+    /// [`dimension`] (one displacement vector per pixel).
+    ///
+    /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
+    /// [`dimension`]: Transform::dimension
+    fn number_of_local_parameters(&self) -> usize {
+        self.number_of_parameters()
+    }
+
+    /// For a [local-support] transform, the `(offset, local_jacobian)` of the
+    /// region containing `point`: `offset` is the start index of that region's
+    /// parameter block in the flat parameter vector, and `local_jacobian` is the
+    /// row-major `dimension × number_of_local_parameters` Jacobian of the mapped
+    /// point with respect to *only* that block. Returns `None` when `point` lies
+    /// outside the region the transform can influence, or for a global transform
+    /// (the default).
+    ///
+    /// This is the crate's analogue of pairing ITK's
+    /// `ComputeParameterOffsetFromVirtualIndex` with the local
+    /// `ComputeJacobianWithRespectToParameters`; it lets a metric read one
+    /// region's contribution without ever building the dense Jacobian.
+    ///
+    /// [local-support]: ParametricTransform::has_local_support
+    fn local_support_jacobian(&self, _point: &[f64]) -> Option<(usize, Vec<f64>)> {
+        None
+    }
 }
 
 /// A transform with a fixed center of rotation and a translation that can be set

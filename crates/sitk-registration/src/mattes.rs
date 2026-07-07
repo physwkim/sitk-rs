@@ -50,14 +50,19 @@
 //!   folded densely over all parameters. This makes **deformable, multi-modality
 //!   registration** (BSpline + mutual information) work; it is finite-difference
 //!   verified against the value in the tests.
-//! * **Displacement-field local-support branch not ported.** ITK's genuine
-//!   local-support path (`m_LocalDerivativeByParzenBin`,
-//!   `ComputeParameterOffsetFromVirtualIndex`) fires only for a
-//!   `DisplacementFieldTransform` (`HasLocalSupport() == true`). This crate has
-//!   no displacement-field transform yet, so that branch is deferred; adding it
-//!   is what would bring the per-pixel accumulation here.
+//! * **Displacement-field local-support branch.** ITK's genuine local-support
+//!   path fires only for a [`DisplacementFieldTransform`]
+//!   (`HasLocalSupport() == true`), where each pixel's displacement is governed
+//!   by its own parameter block. It is ported: `evaluate` dispatches on
+//!   [`ParametricTransform::has_local_support`] to a per-pixel accumulation that
+//!   keeps only ITK's compact `m_LocalDerivativeByParzenBin` (`4 × params`),
+//!   `m_JointPdfIndex1DArray` (`params`), and `m_PRatioArray` (`bins²`) instead
+//!   of the dense `bins² × params` array — the same result, memory linear rather
+//!   than quadratic in the parameters. A test asserts it reproduces the global
+//!   path's derivative for the same field.
 //!
 //! [`BSplineTransform`]: sitk_transform::BSplineTransform
+//! [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
 
 use sitk_core::Image;
 use sitk_transform::ParametricTransform;
@@ -208,11 +213,29 @@ impl MattesMutualInformationMetric {
 
     /// Evaluate `value = −MI` and its parameter-derivative for `transform`.
     ///
+    /// The value is identical for every transform; only how the derivative is
+    /// accumulated differs by transform category, exactly as ITK keys on
+    /// `HasLocalSupport()`. A global transform (translation, affine, versor,
+    /// B-spline — everything except a displacement field) takes the dense
+    /// `evaluate_global_support` path; a
+    /// [local-support](ParametricTransform::has_local_support) displacement field
+    /// takes the per-pixel `evaluate_local_support` path, which never
+    /// materializes the `bins² × numberOfParameters` derivative array.
+    pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
+        if transform.has_local_support() {
+            self.evaluate_local_support(transform)
+        } else {
+            self.evaluate_global_support(transform)
+        }
+    }
+
+    /// Global-support derivative accumulation (ITK's `!HasLocalSupport` branch).
+    ///
     /// Two passes over the fixed samples' contributions, exactly as ITK: the
     /// first accumulates the joint histogram, the fixed marginal, and the
     /// per-bin joint-PDF parameter derivatives; the second walks the histogram
     /// to form `−MI` and folds each bin's `pRatio` into the derivative.
-    pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
+    fn evaluate_global_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
         let dim = self.fixed.dim;
         let bins = self.num_bins;
         let nparams = transform.number_of_parameters();
@@ -356,6 +379,175 @@ impl MattesMutualInformationMetric {
         // The optimizer minimizes, so the value is −MI (maximizing MI); the
         // derivative is +∇(−MI), the true gradient of that value (see the
         // `n_factor` sign note above).
+        MetricValue {
+            value: -sum,
+            derivative,
+            valid_points: valid,
+        }
+    }
+
+    /// Local-support derivative accumulation (ITK's `HasLocalSupport` branch,
+    /// fired only for a displacement field).
+    ///
+    /// A local-support transform governs each point by its own small parameter
+    /// block ([`local_support_jacobian`]), so a sample's four cubic-window taps
+    /// only ever touch *that* block. Instead of the dense `bins² ×
+    /// numberOfParameters` derivative array, this keeps ITK's compact trio:
+    /// `local_deriv_by_bin` (`4 × numberOfParameters`, the per-parzen-bin
+    /// projected gradient — `m_LocalDerivativeByParzenBin`), `jointpdf_index_1d`
+    /// (the 1-D joint-PDF index each parameter's sample lands in —
+    /// `m_JointPdfIndex1DArray`), and `pratio` (`bins²`, the per-bin `pRatio`
+    /// scaled by `n_factor` — `m_PRatioArray`). The result is *identical* to the
+    /// global path — each parameter's contribution is exactly its owning
+    /// sample's — but the memory is linear in the parameters, not quadratic in
+    /// the histogram times the parameters.
+    ///
+    /// [`local_support_jacobian`]: ParametricTransform::local_support_jacobian
+    fn evaluate_local_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
+        let dim = self.fixed.dim;
+        let bins = self.num_bins;
+        let nparams = transform.number_of_parameters();
+        let num_local = transform.number_of_local_parameters();
+        let n = self.fixed.len();
+
+        let mut joint_pdf = vec![0.0f64; bins * bins];
+        let mut fixed_marginal = vec![0.0f64; bins];
+        // ITK m_LocalDerivativeByParzenBin[bin][param] and m_JointPdfIndex1DArray.
+        let mut local_deriv_by_bin = vec![0.0f64; 4 * nparams];
+        let mut jointpdf_index_1d = vec![0usize; nparams];
+        let mut valid = 0usize;
+
+        for s in 0..n {
+            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fv = self.fixed.values[s];
+
+            let mp = transform.transform_point(fp);
+            let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
+                Some(vg) => vg,
+                None => continue, // maps outside the moving buffer
+            };
+            if mv < self.moving_true_min || mv > self.moving_true_max {
+                continue;
+            }
+            // The parameter block + local Jacobian of the region owning this
+            // sample; skip if the sample falls outside every region.
+            let (offset, local_jac) = match transform.local_support_jacobian(fp) {
+                Some(oj) => oj,
+                None => continue,
+            };
+
+            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
+            let moving_index =
+                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
+            let fixed_index =
+                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+
+            fixed_marginal[fixed_index] += 1.0;
+
+            // inner[mu] = ∇M · (column mu of the LOCAL Jacobian). It does not
+            // depend on the parzen bin, so compute it once per sample.
+            let mut inner = vec![0.0f64; num_local];
+            for (mu, im) in inner.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for (j, &g) in grad_phys.iter().enumerate() {
+                    acc += local_jac[j * num_local + mu] * g;
+                }
+                *im = acc;
+            }
+
+            // Every parameter of this block lands in the same joint-PDF row/first
+            // tap: index (fixed_index, moving_index − 1).
+            let moving_start = moving_index - 1;
+            let jpi1d = fixed_index * bins + moving_start;
+            for mu in 0..num_local {
+                jointpdf_index_1d[offset + mu] = jpi1d;
+            }
+
+            // Cubic window covers the four bins [moving_index − 1 .. + 2].
+            let mut pdf_moving_index = moving_start;
+            let mut arg = pdf_moving_index as f64 - moving_term;
+            for (b, chunk) in local_deriv_by_bin.chunks_exact_mut(nparams).enumerate() {
+                debug_assert!(b < 4);
+                joint_pdf[fixed_index * bins + pdf_moving_index] += cubic_bspline(arg);
+                let deriv_weight = cubic_bspline_derivative(arg);
+                for (mu, &im) in inner.iter().enumerate() {
+                    chunk[offset + mu] += im * deriv_weight;
+                }
+                arg += 1.0;
+                pdf_moving_index += 1;
+            }
+
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return MetricValue {
+                value: f64::MAX,
+                derivative: vec![0.0; nparams],
+                valid_points: 0,
+            };
+        }
+        let joint_sum: f64 = joint_pdf.iter().sum();
+        if joint_sum < f64::EPSILON {
+            return MetricValue {
+                value: f64::MAX,
+                derivative: vec![0.0; nparams],
+                valid_points: valid,
+            };
+        }
+
+        let n_factor = 1.0 / (self.moving_bin_size * valid as f64);
+        let inv_sum = 1.0 / joint_sum;
+        for p in joint_pdf.iter_mut() {
+            *p *= inv_sum;
+        }
+        for p in fixed_marginal.iter_mut() {
+            *p *= inv_sum;
+        }
+
+        let mut moving_marginal = vec![0.0f64; bins];
+        for f in 0..bins {
+            for (m, mm) in moving_marginal.iter_mut().enumerate() {
+                *mm += joint_pdf[f * bins + m];
+            }
+        }
+
+        // Value pass. Identical to the global path, but instead of folding the
+        // dense derivatives it records pRatio·n_factor per bin (m_PRatioArray),
+        // to be applied to the compact per-bin local derivatives below.
+        let close_to_zero = f64::EPSILON;
+        let mut sum = 0.0f64;
+        let mut pratio = vec![0.0f64; bins * bins];
+        for f in 0..bins {
+            let fm = fixed_marginal[f];
+            if fm <= close_to_zero {
+                continue;
+            }
+            let log_fm = fm.ln();
+            for m in 0..bins {
+                let mm = moving_marginal[m];
+                let jp = joint_pdf[f * bins + m];
+                if mm > close_to_zero && jp > close_to_zero {
+                    let p_ratio = (jp / mm).ln();
+                    sum += jp * (p_ratio - log_fm);
+                    pratio[f * bins + m] = p_ratio * n_factor;
+                }
+            }
+        }
+
+        // Apply the per-bin pRatio to each parameter's owning sample. The sign is
+        // + to match this crate's global path (see the `n_factor` sign note in
+        // `evaluate_global_support`); ITK subtracts under its opposite convention.
+        let mut derivative = vec![0.0f64; nparams];
+        for (i, di) in derivative.iter_mut().enumerate() {
+            let base = jointpdf_index_1d[i];
+            let mut acc = 0.0;
+            for b in 0..4 {
+                acc += local_deriv_by_bin[b * nparams + i] * pratio[base + b];
+            }
+            *di = acc;
+        }
+
         MetricValue {
             value: -sum,
             derivative,
@@ -548,5 +740,104 @@ mod tests {
                 analytic[k]
             );
         }
+    }
+
+    /// Fixed blob + contrast-inverted moving on a displacement field with a small
+    /// non-zero deformation, used by both local-support tests below.
+    fn displacement_field_case() -> (
+        MattesMutualInformationMetric,
+        sitk_transform::DisplacementFieldTransform,
+    ) {
+        use sitk_transform::{DisplacementFieldTransform, ParametricTransform};
+        let (w, h, sigma) = (16usize, 16usize, 4.0);
+        let fixed = gaussian(w, h, 8.0, 8.0, sigma, 1.0);
+        // contrast-inverted moving (multi-modality flavour): 1 − blob.
+        let s2 = 2.0 * sigma * sigma;
+        let mut mv = vec![0.0f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 - 8.0, y as f64 - 8.0);
+                mv[y * w + x] = 1.0 - (-(dx * dx + dy * dy) / s2).exp();
+            }
+        }
+        let moving = Image::from_vec(&[w, h], mv).unwrap();
+        let metric = MattesMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+
+        let mut field = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let np = field.number_of_parameters();
+        // small non-zero field so we test off the identity.
+        let params: Vec<f64> = (0..np)
+            .map(|i| ((i * 13 % 11) as f64 - 5.0) * 0.02)
+            .collect();
+        field.set_parameters(&params);
+        (metric, field)
+    }
+
+    #[test]
+    fn local_support_reproduces_the_global_support_derivative() {
+        // The per-pixel local-support accumulation is an exact reorganization of
+        // the dense global path: each displacement parameter's contribution is
+        // precisely its owning pixel's sample. So for a displacement field the
+        // two branches must agree in value AND derivative — the compact memory
+        // trio costs nothing in accuracy.
+        let (metric, field) = displacement_field_case();
+        let local = metric.evaluate_local_support(&field);
+        let global = metric.evaluate_global_support(&field);
+
+        assert_eq!(local.valid_points, global.valid_points);
+        assert!(
+            (local.value - global.value).abs() < 1e-12,
+            "value: local {} vs global {}",
+            local.value,
+            global.value
+        );
+        assert_eq!(local.derivative.len(), global.derivative.len());
+        let max_diff = local
+            .derivative
+            .iter()
+            .zip(&global.derivative)
+            .map(|(l, g)| (l - g).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn displacement_field_derivative_matches_finite_difference() {
+        // Independently confirm the local-support branch (selected by `evaluate`
+        // for a displacement field) is the true gradient of the value, via a
+        // central finite difference — not merely that it agrees with the global
+        // path.
+        use sitk_transform::ParametricTransform;
+        let (metric, field) = displacement_field_case();
+        let params = field.parameters();
+        let np = params.len();
+        let analytic = metric.evaluate(&field).derivative;
+
+        let step = 1e-3;
+        let mut checked = 0;
+        for k in 0..np {
+            if analytic[k].abs() < 1e-4 {
+                continue;
+            }
+            let mut pp = params.clone();
+            pp[k] += step;
+            let mut pm = params.clone();
+            pm[k] -= step;
+            let mut tp = field.clone();
+            tp.set_parameters(&pp);
+            let mut tm = field.clone();
+            tm.set_parameters(&pm);
+            let fd = (metric.evaluate(&tp).value - metric.evaluate(&tm).value) / (2.0 * step);
+            assert!(
+                (fd - analytic[k]).abs() < 5e-3,
+                "param {k}: fd {fd} vs analytic {}",
+                analytic[k]
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 5,
+            "expected several non-trivial params, got {checked}"
+        );
     }
 }
