@@ -14,5 +14,5 @@ pub use error::{Result, TransformError};
 pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform::{
     AffineTransform, CenteredTransform, Euler2DTransform, Euler3DTransform, ParametricTransform,
-    Similarity2DTransform, Transform, TranslationTransform,
+    Similarity2DTransform, Transform, TranslationTransform, VersorRigid3DTransform,
 };

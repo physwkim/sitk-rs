@@ -1015,6 +1015,62 @@ mod tests {
     }
 
     #[test]
+    fn recovers_a_rigid_versor3d_rotation_and_translation() {
+        // Same three-blob volume as the Euler3D test, but the ground-truth
+        // rotation is a versor; the optimal VersorRigid3D recovers its right part
+        // and translation. Rotation preserves the isotropic blob width.
+        use sitk_transform::{Transform, VersorRigid3DTransform};
+        let n = 20usize;
+        let c = [10.0f64, 10.0, 10.0];
+        let sigma = 2.0;
+        let feats = [[15.0, 10.0, 10.0], [10.0, 14.0, 10.0], [10.0, 10.0, 13.0]];
+
+        let gt = VersorRigid3DTransform::new(0.05, -0.04, 0.06, [0.7, -0.5, 0.4], c);
+        let moved: Vec<[f64; 3]> = feats
+            .iter()
+            .map(|f| {
+                let m = gt.transform_point(f);
+                [m[0], m[1], m[2]]
+            })
+            .collect();
+
+        let fixed = blobs_3d(n, &feats, sigma);
+        let moving = blobs_3d(n, &moved, sigma);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                150,
+                1e-8,
+                EstimateLearningRate::Once,
+            );
+        let init = VersorRigid3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], c);
+        let result = reg.execute(&fixed, &moving, init).unwrap();
+
+        let p = result.transform.parameters(); // [vx, vy, vz, tx, ty, tz]
+        let want = gt.parameters();
+        for k in 0..3 {
+            assert!(
+                (p[k] - want[k]).abs() < 2e-2,
+                "versor {k}: got {}, want {} (full {p:?}, metric {})",
+                p[k],
+                want[k],
+                result.metric_value
+            );
+        }
+        for k in 3..6 {
+            assert!(
+                (p[k] - want[k]).abs() < 5e-2,
+                "translation {k}: got {}, want {} (full {p:?}, metric {})",
+                p[k],
+                want[k],
+                result.metric_value
+            );
+        }
+    }
+
+    #[test]
     fn transform_dimension_mismatch_is_rejected() {
         let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
         let moving = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);

@@ -776,6 +776,227 @@ impl CenteredTransform for Euler3DTransform {
     }
 }
 
+/// A rigid 3-D transform parameterized by a versor (unit-quaternion) rotation:
+/// `y = R·(x − center) + center + translation`, mirroring
+/// `itk::VersorRigid3DTransform`.
+///
+/// Parameters are `[vx, vy, vz, tx, ty, tz]`, where `(vx, vy, vz)` is the
+/// versor's **right part** — the rotation axis scaled by `sin(θ/2)`. The scalar
+/// part is the dependent `w = √(1 − vx² − vy² − vz²)`, so the rotation is encoded
+/// by three numbers with no gimbal lock. As in ITK, a right part with norm `≥ 1`
+/// is scaled just under 1 before use (`Versor::Set` requires `‖v‖ ≤ 1`); the
+/// `center` is fixed and the matrix/offset are cached.
+///
+/// The rotation Jacobian is divided by `w` and so is singular at `θ = π`
+/// (`w = 0`) — a property of ITK's analytic form, not this port; registration
+/// stays well away from it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersorRigid3DTransform {
+    /// Normalized versor right part.
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    /// Normalized versor scalar part `√(1 − vx² − vy² − vz²)`.
+    vw: f64,
+    /// Length 3.
+    translation: Vec<f64>,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 rotation.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl VersorRigid3DTransform {
+    /// A rigid transform whose rotation has versor right part `(vx, vy, vz)`
+    /// (axis·sin(θ/2)), about `center`, then `translation`. A right part with
+    /// norm `≥ 1` is scaled to just under 1, matching ITK's `SetParameters`.
+    pub fn new(vx: f64, vy: f64, vz: f64, translation: [f64; 3], center: [f64; 3]) -> Self {
+        let mut t = Self {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            vw: 1.0,
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.set_versor(vx, vy, vz);
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (versor `(0,0,0; w=1)`, zero translation, center at
+    /// origin).
+    pub fn identity() -> Self {
+        Self::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    }
+
+    /// Versor right-part X (axis·sin(θ/2)).
+    pub fn versor_x(&self) -> f64 {
+        self.vx
+    }
+
+    /// Versor right-part Y.
+    pub fn versor_y(&self) -> f64 {
+        self.vy
+    }
+
+    /// Versor right-part Z.
+    pub fn versor_z(&self) -> f64 {
+        self.vz
+    }
+
+    /// Versor scalar part `w = √(1 − vx² − vy² − vz²)`.
+    pub fn versor_w(&self) -> f64 {
+        self.vw
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 rotation matrix.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Set the normalized versor from a right part, mirroring
+    /// `itk::VersorRigid3DTransform::SetParameters` + `Versor::Set(axis)`: scale a
+    /// right part of norm `≥ 1 − ε` to just under 1, then `w = √(1 − ‖v‖²)`.
+    fn set_versor(&mut self, vx: f64, vy: f64, vz: f64) {
+        const EPS: f64 = 1e-10;
+        let norm = (vx * vx + vy * vy + vz * vz).sqrt();
+        let (ax, ay, az) = if norm >= 1.0 - EPS {
+            let d = norm + EPS * norm;
+            (vx / d, vy / d, vz / d)
+        } else {
+            (vx, vy, vz)
+        };
+        self.vx = ax;
+        self.vy = ay;
+        self.vz = az;
+        self.vw = (1.0 - (ax * ax + ay * ay + az * az)).max(0.0).sqrt();
+    }
+
+    /// Rebuild the cached rotation matrix (`itk::Versor::GetMatrix`) and offset.
+    fn recompute(&mut self) {
+        let (x, y, z, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (xx, yy, zz) = (x * x, y * y, z * z);
+        let (xy, xz, xw) = (x * y, x * z, x * w);
+        let (yz, yw, zw) = (y * z, y * w, z * w);
+        #[rustfmt::skip]
+        let m = vec![
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw),       2.0 * (xz + yw),
+            2.0 * (xy + zw),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw),
+            2.0 * (xz - yw),       2.0 * (yz + xw),       1.0 - 2.0 * (xx + yy),
+        ];
+        let m_center = matrix::mat_vec(&m, &self.center, 3);
+        self.offset = (0..3)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+        self.matrix = m;
+    }
+}
+
+impl Transform for VersorRigid3DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for VersorRigid3DTransform {
+    fn number_of_parameters(&self) -> usize {
+        6
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.vx,
+            self.vy,
+            self.vz,
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 6, "parameter length");
+        self.set_versor(params[0], params[1], params[2]);
+        self.translation[0] = params[3];
+        self.translation[1] = params[4];
+        self.translation[2] = params[5];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // Analytic ∂y/∂versor from itk::VersorRigid3DTransform (divided by vw),
+        // plus the translation identity block. Row-major 3×6.
+        let (vx, vy, vz, vw) = (self.vx, self.vy, self.vz, self.vw);
+        let (px, py, pz) = (
+            point[0] - self.center[0],
+            point[1] - self.center[1],
+            point[2] - self.center[2],
+        );
+        let (vxx, vyy, vzz, vww) = (vx * vx, vy * vy, vz * vz, vw * vw);
+        let (vxy, vxz, vxw) = (vx * vy, vx * vz, vx * vw);
+        let (vyz, vyw, vzw) = (vy * vz, vy * vw, vz * vw);
+
+        let mut j = vec![0.0f64; 18];
+        j[0] = 2.0 * ((vyw + vxz) * py + (vzw - vxy) * pz) / vw;
+        j[6] = 2.0 * ((vyw - vxz) * px - 2.0 * vxw * py + (vxx - vww) * pz) / vw;
+        j[12] = 2.0 * ((vzw + vxy) * px + (vww - vxx) * py - 2.0 * vxw * pz) / vw;
+
+        j[1] = 2.0 * (-2.0 * vyw * px + (vxw + vyz) * py + (vww - vyy) * pz) / vw;
+        j[7] = 2.0 * ((vxw - vyz) * px + (vzw + vxy) * pz) / vw;
+        j[13] = 2.0 * ((vyy - vww) * px + (vzw - vxy) * py - 2.0 * vyw * pz) / vw;
+
+        j[2] = 2.0 * (-2.0 * vzw * px + (vzz - vww) * py + (vxw - vyz) * pz) / vw;
+        j[8] = 2.0 * ((vww - vzz) * px - 2.0 * vzw * py + (vyw + vxz) * pz) / vw;
+        j[14] = 2.0 * ((vxw + vyz) * px + (vyw - vxz) * py) / vw;
+
+        // Translation identity block: columns 3, 4, 5.
+        j[3] = 1.0;
+        j[10] = 1.0;
+        j[17] = 1.0;
+        j
+    }
+}
+
+impl CenteredTransform for VersorRigid3DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 3, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,5 +1444,117 @@ mod tests {
         assert_eq!(e.angle_y(), 0.2);
         assert_eq!(e.angle_z(), 0.3);
         assert_eq!(e.translation(), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn versor3d_identity_is_noop() {
+        let v = VersorRigid3DTransform::identity();
+        assert_eq!(v.number_of_parameters(), 6);
+        assert_eq!(v.versor_w(), 1.0);
+        assert_eq!(v.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn versor3d_ninety_degrees_about_z_matches_rz() {
+        use std::f64::consts::FRAC_PI_4;
+        // Right part (0,0,sin(θ/2)) with θ=90° ⇒ Rz(90°): (1,0,0) → (0,1,0).
+        let v = VersorRigid3DTransform::new(0.0, 0.0, FRAC_PI_4.sin(), [0.0; 3], [0.0; 3]);
+        let p = v.transform_point(&[1.0, 0.0, 7.0]);
+        assert!(
+            (p[0]).abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12 && (p[2] - 7.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn versor3d_matrix_is_orthonormal_and_fixes_center() {
+        let c = [5.0, -2.0, 3.0];
+        let v = VersorRigid3DTransform::new(0.1, -0.2, 0.15, [0.0; 3], c);
+        let m = v.matrix();
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| m[i * 3 + k] * m[j * 3 + k]).sum();
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - expect).abs() < 1e-12, "not orthonormal");
+            }
+        }
+        let y = v.transform_point(&c);
+        for d in 0..3 {
+            assert!((y[d] - c[d]).abs() < 1e-12, "center moved: {y:?}");
+        }
+    }
+
+    #[test]
+    fn versor3d_right_part_norm_above_one_is_scaled_below_one() {
+        // A right part with norm > 1 is scaled to just under 1 (so w stays real).
+        let v = VersorRigid3DTransform::new(0.8, 0.8, 0.8, [0.0; 3], [0.0; 3]);
+        let n2 = v.versor_x().powi(2) + v.versor_y().powi(2) + v.versor_z().powi(2);
+        assert!(n2 < 1.0, "norm² = {n2}");
+        assert!(v.versor_w() >= 0.0 && v.versor_w().is_finite());
+    }
+
+    #[test]
+    fn versor3d_jacobian_at_identity_is_twice_so3_generators() {
+        // At the identity versor, columns are 2× the so(3) generators applied to
+        // (p − centre): col0=(0,-2pz,2py), col1=(2pz,0,-2px), col2=(-2py,2px,0).
+        let v = VersorRigid3DTransform::identity();
+        let j = v.jacobian_wrt_parameters(&[2.0, 3.0, 5.0]);
+        assert_eq!(
+            j,
+            vec![
+                0.0, 10.0, -6.0, 1.0, 0.0, 0.0, //
+                -10.0, 0.0, 4.0, 0.0, 1.0, 0.0, //
+                6.0, -4.0, 0.0, 0.0, 0.0, 1.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn versor3d_jacobian_is_finite_difference_consistent() {
+        // Small right part keeps ‖v‖ well below 1 (no renormalization), so the
+        // finite difference exercises the analytic w = √(1−‖v‖²) dependence.
+        let base = [0.12, -0.08, 0.1, 1.0, -2.0, 0.5];
+        let center = [2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let mut v = VersorRigid3DTransform::new(
+            base[0],
+            base[1],
+            base[2],
+            [base[3], base[4], base[5]],
+            center,
+        );
+        let jac = v.jacobian_wrt_parameters(&point);
+        let n = v.number_of_parameters();
+        let h = 1e-7;
+        for k in 0..n {
+            let mut pp = base;
+            pp[k] += h;
+            v.set_parameters(&pp);
+            let yp = v.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            v.set_parameters(&pm);
+            let ym = v.transform_point(&point);
+            for i in 0..3 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-5,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn versor3d_parameters_roundtrip_for_small_right_part() {
+        let mut v = VersorRigid3DTransform::identity();
+        v.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0]);
+        let p = v.parameters();
+        // Small right part is stored unchanged (no renormalization).
+        assert!(
+            (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
+        );
+        assert_eq!(v.translation(), &[4.0, 5.0, 6.0]);
     }
 }
