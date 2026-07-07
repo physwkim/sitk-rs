@@ -4,8 +4,9 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 
 > **Status: early, registration-focused.** The core model, MetaImage IO, a
 > handful of filters, affine resampling, and a working **registration**
-> (mean-squares + gradient descent over a multi-resolution pyramid, recovering
-> known translations/affines) are implemented and tested end to end. This is a
+> (mean-squares + gradient descent / regular-step gradient descent over a
+> multi-resolution pyramid, recovering known translations/affines) are
+> implemented and tested end to end. This is a
 > foundation to build on, **not** a usable SimpleITK replacement yet — full
 > filter coverage is deliberately deferred in favour of deepening registration.
 
@@ -29,7 +30,7 @@ registration only, ~6 exposed symbols) and is **not** the basis for this port.
 | `sitk-io` | Image file IO — MetaImage (`.mha`/`.mhd`) reader/writer |
 | `sitk-filters` | Pixel-wise / statistical filters, separable FIR Gaussian smoothing, `ShrinkImageFilter` (procedural API) |
 | `sitk-transform` | `TranslationTransform`, `AffineTransform`, interpolation, `ResampleImageFilter` |
-| `sitk-registration` | `ImageRegistrationMethod`: mean-squares metric, gradient-descent optimizer, automatic physical-shift scales/learning-rate, GPU-backend seam |
+| `sitk-registration` | `ImageRegistrationMethod`: mean-squares metric, gradient-descent and regular-step-gradient-descent optimizers, automatic physical-shift scales/learning-rate, GPU-backend seam |
 | `sitk` | Umbrella crate re-exporting the above under one namespace |
 
 ## Architecture
@@ -67,7 +68,12 @@ chosen as the near-term focus over broad filter coverage:
   the full fixed grid, with value **and** analytic parameter-derivative.
 - **Optimizer:** gradient descent (`itk::GradientDescentOptimizerv4`) with
   per-parameter scales, early stop on a tiny step, and value-plateau convergence
-  monitoring (`itk::WindowConvergenceMonitoringFunction`).
+  monitoring (`itk::WindowConvergenceMonitoringFunction`); **or** regular-step
+  gradient descent (`itk::RegularStepGradientDescentOptimizerv4`), which moves a
+  fixed step length in the gradient direction, halves it on each direction
+  reversal (overshoot), and stops on a gradient-magnitude or step-length
+  tolerance — the robust choice for a pyramid's finest-level precision. Select it
+  with `set_optimizer_as_regular_step_gradient_descent[_estimated](…)`.
 - **Automatic scales + learning rate:** both are estimated from physical shift
   (`itk::RegistrationParameterScalesFromPhysicalShift` + the optimizer's
   learning-rate estimation), so no hand-tuning is required — call
@@ -99,16 +105,23 @@ translation to ≈ voxel precision (~0.5 voxel) and stops on the value plateau
 the translation to ~1e-8. A 3-level pyramid recovers a translation to sub-voxel
 accuracy and, crucially, **captures offsets a single level cannot** — e.g. two
 σ=5 blobs ~21 voxels apart (no overlap → zero single-level gradient → stuck) are
-aligned to ~0.04 voxel by the pyramid.
+aligned to ~0.04 voxel by the pyramid. **Regular-step** gradient descent recovers
+the same single-resolution translation to ~1e-6 and, on the 3-level pyramid,
+reaches ~6e-5-voxel accuracy — closing the finest-level gap the estimate-`Once`
+gradient descent leaves (below) — while stopping cleanly on its
+gradient-magnitude tolerance rather than the iteration cap.
 
-The estimate-`Once` learning rate is additionally **capped per step** at the
-estimator's one-voxel maximum shift. This is a no-op for a converging run (the
-fixed rate already bounds every step) but prevents a pyramid level that restarts
-from a near-converged transform — where the once-estimated rate is derived from a
-~0 gradient and is therefore enormous — from taking an exploding step. Because
-each level restarts near the previous optimum, the pyramid's finest level settles
-to sub-voxel rather than 1e-8 precision on these synthetic blobs; a following
-single-resolution `Once` pass refines further when needed.
+For the estimate-`Once` *gradient descent*, the learning rate is additionally
+**capped per step** at the estimator's one-voxel maximum shift. This is a no-op
+for a converging run (the fixed rate already bounds every step) but prevents a
+pyramid level that restarts from a near-converged transform — where the
+once-estimated rate is derived from a ~0 gradient and is therefore enormous —
+from taking an exploding step. Even capped, that optimizer's finest pyramid level
+settles only to sub-voxel on these synthetic blobs because each level restarts
+near the previous optimum. **Regular-step gradient descent closes that gap:** its
+estimated initial step is ~one voxel regardless of how small the restart gradient
+is, so it halves toward the minimum, bounded below only by its gradient-magnitude
+tolerance (lower the tolerance to refine further).
 
 Not yet: bit-exact recursive Gaussian (the FIR smoother is result-faithful, not
 byte-identical to `itk::RecursiveGaussianImageFilter`); the other metrics (Mattes
@@ -143,6 +156,7 @@ The Phase-0 numerics were cross-checked against the ITK source
 | value-plateau convergence (order-1/2-CP linear fit slope of the windowed energy) | `sitk-registration/convergence.rs` | `itkWindowConvergenceMonitoringFunction.hxx` |
 | shrink geometry (`outSpacing=inSpacing·f`, `outSize=⌊inSize/f⌋`, center-preserving origin, integer sampling offset) | `sitk-filters/shrink.rs` | `itkShrinkImageFilter.hxx` |
 | multi-resolution per-level scheme (shrink virtual domain; interpolate smoothed fixed at virtual points; smooth moving; carry transform) | `sitk-registration/method.rs` | `itkImageRegistrationMethodv4.hxx` |
+| regular-step descent (fixed step length; halve on gradient reversal; stop on gradient-magnitude/step tolerance) | `sitk-registration/optimizer.rs` | `itkRegularStepGradientDescentOptimizerv4.hxx` |
 
 **Confirmed matching:** NN rounding, inside-buffer boundary, linear boundary
 clamp, variance divisor, and (as of this pass) image⊕image integer wraparound
@@ -166,6 +180,12 @@ Remaining, deliberately-scoped deviations (documented in code):
   that restarts from a near-converged transform from diverging on the enormous
   rate implied by its ~0 initial gradient — a robustness bound ITK's plain
   `GradientDescentOptimizerv4` does not impose.
+- **regular-step direction test** uses the plain reversal of the scaled gradient
+  (`gᵏ · gᵏ⁻¹ < 0`). ITK instead dots against the previous gradient *after* it
+  has been re-weighted by the prior step's learning rate and an extra `1/scale`
+  factor; the two agree in sign for the uniform scales of a translation and
+  differ only for anisotropic scales, where it merely shifts which overshoot
+  triggers a step halving.
 
 ## Roadmap
 
@@ -173,11 +193,10 @@ The near-term focus is **registration**, deepened incrementally, rather than
 broad filter coverage:
 
 1. **Registration depth (current focus):** multi-resolution pyramids
-   (shrink/smooth per level) — **done**, with a bit-exact
-   `RecursiveGaussianImageFilter` to follow behind the smoothing seam; more
-   metrics (Mattes MI, correlation, ANTS CC) and optimizers
-   (RegularStepGradientDescent, LBFGS); rigid/similarity/BSpline transforms; a
-   CUDA/`wgpu` `MetricBackend`.
+   (shrink/smooth per level) and regular-step gradient descent — **done**, with a
+   bit-exact `RecursiveGaussianImageFilter` to follow behind the smoothing seam;
+   more metrics (Mattes MI, correlation, ANTS CC) and optimizers (LBFGS, Amoeba);
+   rigid/similarity/BSpline transforms; a CUDA/`wgpu` `MetricBackend`.
 2. **Core infra:** neighborhood iterators, regions, the functor framework
    (unblocks the `BinaryFunctor`/`UnaryFunctor` filter families).
 3. **Filter breadth:** yaml→Rust codegen; port the ~247 `ImageFilter`-shaped

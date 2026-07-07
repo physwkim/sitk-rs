@@ -3,12 +3,14 @@
 //!
 //! The core is the smallest end-to-end registration that actually aligns two
 //! images: the **mean-squares** metric ([`MeanSquaresMetric`]) sampled over the
-//! full fixed grid, **linear** interpolation of the moving image,
-//! **gradient-descent** optimization ([`GradientDescentOptimizer`]), and
-//! [`TranslationTransform`]/[`AffineTransform`] as the moving parameters,
-//! mirroring `itk::ImageRegistrationMethodv4`. It runs at a single resolution by
-//! default and over a **multi-resolution pyramid** when a shrink/smoothing
-//! schedule is configured (see [Multi-resolution](#multi-resolution) below).
+//! full fixed grid, **linear** interpolation of the moving image, a
+//! **gradient-descent** optimizer ([`GradientDescentOptimizer`] with a fixed or
+//! estimated rate, or [`RegularStepGradientDescentOptimizer`], which halves its
+//! step on each overshoot), and [`TranslationTransform`]/[`AffineTransform`] as
+//! the moving parameters, mirroring `itk::ImageRegistrationMethodv4`. It runs at
+//! a single resolution by default and over a **multi-resolution pyramid** when a
+//! shrink/smoothing schedule is configured (see
+//! [Multi-resolution](#multi-resolution) below).
 //!
 //! Optimizer scales and the learning rate are **estimated automatically** from
 //! physical shift ([`PhysicalShiftScales`], ITK's
@@ -65,6 +67,14 @@
 //!     .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
 //! ```
 //!
+//! For a pyramid, [`set_optimizer_as_regular_step_gradient_descent_estimated`]
+//! is usually the better optimizer: a level that restarts from an
+//! already-registered coarser transform has a near-zero gradient, which a fixed
+//! estimate-once rate cannot descend precisely, whereas the regular step halves
+//! its length on each overshoot and stops cleanly on its gradient-magnitude
+//! tolerance — reaching far higher finest-level precision at the same iteration
+//! budget.
+//!
 //! The Gaussian is a result-faithful separable FIR
 //! ([`filters::smooth_gaussian`]), isolated so a bit-exact recursive Gaussian
 //! can replace it without touching callers; the shrink is a bit-exact
@@ -74,6 +84,8 @@
 //! ImageRegistrationMethod::set_shrink_factors_per_level
 //! [`set_smoothing_sigmas_per_level`]:
 //! ImageRegistrationMethod::set_smoothing_sigmas_per_level
+//! [`set_optimizer_as_regular_step_gradient_descent_estimated`]:
+//! ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
 //! [`filters::smooth_gaussian`]: sitk_filters::smooth_gaussian
 //! [`filters::shrink`]: sitk_filters::shrink
 //!
@@ -101,5 +113,7 @@ pub use convergence::WindowConvergenceMonitor;
 pub use error::{RegistrationError, Result};
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
-pub use optimizer::{GradientDescentOptimizer, OptimizerResult, StopReason};
+pub use optimizer::{
+    GradientDescentOptimizer, OptimizerResult, RegularStepGradientDescentOptimizer, StopReason,
+};
 pub use scales::PhysicalShiftScales;

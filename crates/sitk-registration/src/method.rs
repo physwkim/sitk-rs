@@ -10,9 +10,13 @@
 //! and shrunk, the moving image is Gaussian-smoothed (not shrunk, since it is
 //! resampled through the transform), and the transform optimized at the coarse
 //! level initializes the next finer one. With no schedule set it runs a single
-//! full-resolution level. The metric is mean squares, interpolation is linear,
-//! and optimization is gradient descent — the smallest end-to-end registration.
-//! More metrics/optimizers and sampling strategies come later.
+//! full-resolution level. The metric is mean squares and interpolation is
+//! linear; the optimizer is either fixed-step gradient descent
+//! (`itk::GradientDescentOptimizerv4`) or regular-step gradient descent
+//! (`itk::RegularStepGradientDescentOptimizerv4`), the latter halving its step
+//! on each overshoot so it converges cleanly at an already-registered pyramid
+//! level and refines the finest one to high precision. More metrics and sampling
+//! strategies come later.
 
 use sitk_core::Image;
 use sitk_filters::{shrink, smooth_gaussian};
@@ -20,7 +24,7 @@ use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, Resampl
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend};
-use crate::optimizer::{GradientDescentOptimizer, StopReason};
+use crate::optimizer::{GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason};
 
 /// When the gradient-descent learning rate is estimated from physical shift,
 /// mirroring SimpleITK's `estimateLearningRate` option
@@ -58,6 +62,18 @@ enum LearningRateMode {
     Estimate(EstimateLearningRate),
 }
 
+/// Which optimizer the method drives. The learning-rate estimation
+/// ([`LearningRateMode`]) and parameter scales ([`ScalesMode`]) apply to
+/// whichever is selected.
+enum OptimizerKind {
+    /// Fixed-step gradient descent (`itk::GradientDescentOptimizerv4`).
+    GradientDescent(GradientDescentOptimizer),
+    /// Regular-step gradient descent (`itk::RegularStepGradientDescentOptimizerv4`):
+    /// a fixed step length halved on each direction reversal, converging to
+    /// `minimum_step_length` and stopping cleanly at an already-converged level.
+    RegularStep(RegularStepGradientDescentOptimizer),
+}
+
 /// SimpleITK `ImageRegistrationMethod` defaults for convergence monitoring in
 /// the estimate-at-each-iteration mode (window of the last 10 metric values,
 /// stop when the trend flattens to `1e-6`).
@@ -84,7 +100,7 @@ pub struct RegistrationResult<T> {
 /// [`execute`](Self::execute) against a fixed/moving image pair and an initial
 /// transform.
 pub struct ImageRegistrationMethod {
-    optimizer: GradientDescentOptimizer,
+    optimizer: OptimizerKind,
     scales_mode: ScalesMode,
     learning_rate_mode: LearningRateMode,
     backend: Box<dyn MetricBackend>,
@@ -102,7 +118,7 @@ pub struct ImageRegistrationMethod {
 impl Default for ImageRegistrationMethod {
     fn default() -> Self {
         Self {
-            optimizer: GradientDescentOptimizer::new(1.0, 100),
+            optimizer: OptimizerKind::GradientDescent(GradientDescentOptimizer::new(1.0, 100)),
             scales_mode: ScalesMode::Unit,
             learning_rate_mode: LearningRateMode::Manual,
             backend: Box::new(CpuBackend),
@@ -128,7 +144,10 @@ impl ImageRegistrationMethod {
         learning_rate: f64,
         iterations: usize,
     ) -> &mut Self {
-        self.optimizer = GradientDescentOptimizer::new(learning_rate, iterations);
+        self.optimizer = OptimizerKind::GradientDescent(GradientDescentOptimizer::new(
+            learning_rate,
+            iterations,
+        ));
         self.learning_rate_mode = LearningRateMode::Manual;
         self
     }
@@ -150,13 +169,72 @@ impl ImageRegistrationMethod {
         estimate: EstimateLearningRate,
     ) -> &mut Self {
         // The stored rate is a placeholder; it is overwritten by the estimate.
-        self.optimizer = GradientDescentOptimizer::new(1.0, iterations);
+        let mut optimizer = GradientDescentOptimizer::new(1.0, iterations);
         if estimate == EstimateLearningRate::EachIteration {
             // A non-shrinking step schedule needs value-plateau monitoring to
             // stop; the once schedule stops via the min-step tolerance.
-            self.optimizer
-                .set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
+            optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
         }
+        self.optimizer = OptimizerKind::GradientDescent(optimizer);
+        self.learning_rate_mode = LearningRateMode::Estimate(estimate);
+        self
+    }
+
+    /// Use regular-step gradient descent
+    /// (`itk::RegularStepGradientDescentOptimizerv4`) with a caller-supplied
+    /// initial step length, minimum step length, and iteration cap. Each step
+    /// moves a fixed length in the gradient's direction; the length is halved
+    /// whenever the gradient reverses (an overshoot) and iteration stops when it
+    /// falls below `minimum_step` (or the scaled gradient magnitude falls below
+    /// `gradient_magnitude_tolerance` — a stationary point). Unlike a fixed-rate
+    /// gradient descent it refines toward `minimum_step` precision without
+    /// hand-timing the rate; `gradient_magnitude_tolerance` (ITK's default is
+    /// `1e-4`) sets how flat the gradient must be to declare convergence, and is
+    /// often the binding stop on smooth objectives — lower it for finer results.
+    pub fn set_optimizer_as_regular_step_gradient_descent(
+        &mut self,
+        learning_rate: f64,
+        minimum_step: f64,
+        iterations: usize,
+        gradient_magnitude_tolerance: f64,
+    ) -> &mut Self {
+        let mut optimizer =
+            RegularStepGradientDescentOptimizer::new(learning_rate, minimum_step, iterations);
+        optimizer.set_gradient_magnitude_tolerance(gradient_magnitude_tolerance);
+        self.optimizer = OptimizerKind::RegularStep(optimizer);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Use regular-step gradient descent whose initial step length is
+    /// **estimated** from physical shift (bounded to ~one voxel, as ITK's
+    /// learning-rate estimation does), then halved on overshoot toward
+    /// `minimum_step`. This is the robust choice for a multi-resolution pyramid:
+    /// its `gradient_magnitude_tolerance` stops a level that restarts already
+    /// converged instead of taking a runaway fixed-rate step, and it still
+    /// refines the finest level toward `minimum_step` precision. Because the
+    /// estimated initial step is ~one voxel regardless of how small the restart
+    /// gradient is, `gradient_magnitude_tolerance` (ITK's default `1e-4`) — not
+    /// `minimum_step` — is usually what bounds the finest precision on smooth
+    /// images; lower it to refine further. `estimate` selects once
+    /// ([`EstimateLearningRate::Once`], the usual choice) or per-iteration
+    /// re-estimation. Pair with [`set_optimizer_scales_from_physical_shift`].
+    ///
+    /// [`set_optimizer_scales_from_physical_shift`]:
+    /// Self::set_optimizer_scales_from_physical_shift
+    pub fn set_optimizer_as_regular_step_gradient_descent_estimated(
+        &mut self,
+        minimum_step: f64,
+        iterations: usize,
+        gradient_magnitude_tolerance: f64,
+        estimate: EstimateLearningRate,
+    ) -> &mut Self {
+        // The stored step-length scale is a placeholder overwritten by the
+        // estimate; RegularStep stops via its own step/gradient tolerances, so
+        // no value-plateau monitoring is needed even for the each-iteration mode.
+        let mut optimizer = RegularStepGradientDescentOptimizer::new(1.0, minimum_step, iterations);
+        optimizer.set_gradient_magnitude_tolerance(gradient_magnitude_tolerance);
+        self.optimizer = OptimizerKind::RegularStep(optimizer);
         self.learning_rate_mode = LearningRateMode::Estimate(estimate);
         self
     }
@@ -177,8 +255,16 @@ impl ImageRegistrationMethod {
     }
 
     /// Set the minimum scaled-step length below which the optimizer stops early.
+    /// For regular-step gradient descent this is its `minimum_step_length`.
     pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
-        self.optimizer.set_min_step_tolerance(tol);
+        match &mut self.optimizer {
+            OptimizerKind::GradientDescent(gd) => {
+                gd.set_min_step_tolerance(tol);
+            }
+            OptimizerKind::RegularStep(rs) => {
+                rs.set_minimum_step_length(tol);
+            }
+        }
         self
     }
 
@@ -383,63 +469,101 @@ impl ImageRegistrationMethod {
             ScalesMode::PhysicalShift => estimator.as_ref().unwrap().estimate_scales(),
         };
 
-        let mut optimizer = self.optimizer.clone();
-        optimizer.set_scales(scales.clone());
-
         let scaled = |grad: &[f64]| -> Vec<f64> {
             grad.iter()
                 .zip(scales.iter())
                 .map(|(&g, &s)| g / s)
                 .collect()
         };
+        // The objective the optimizer minimizes: set the transform's parameters
+        // and evaluate the metric. Duplicated per branch because it borrows
+        // `transform` mutably and each branch drives its own optimizer call.
+        macro_rules! objective {
+            () => {
+                |p: &[f64]| {
+                    transform.set_parameters(p);
+                    let m = metric.evaluate(&transform, backend);
+                    (m.value, m.derivative)
+                }
+            };
+        }
 
-        let result = match self.learning_rate_mode {
-            // Caller-supplied fixed rate.
-            LearningRateMode::Manual => optimizer.optimize(start, |p| {
-                transform.set_parameters(p);
-                let m = metric.evaluate(&transform, backend);
-                (m.value, m.derivative)
-            }),
-            // Rate estimated once from the initial gradient, then held fixed so
-            // steps shrink with the gradient (ITK's default). Each step is also
-            // capped at the estimator's one-voxel maximum shift: a level that
-            // restarts from a near-converged transform has a ~0 initial gradient,
-            // which makes the once-estimated rate enormous and the *next* step
-            // (once the gradient grows again) explode. The cap makes "no step
-            // exceeds one voxel" hold by construction. It is inactive whenever
-            // the fixed rate already bounds the step — which is every step of a
-            // monotonically converging run, since the once-rate is exactly the
-            // per-step rate at the initial gradient and only grows as the
-            // gradient shrinks — so single-resolution runs are unchanged.
-            LearningRateMode::Estimate(EstimateLearningRate::Once) => {
-                let est = estimator.as_ref().unwrap();
-                transform.set_parameters(&start);
-                let m0 = metric.evaluate(&transform, backend);
-                let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
-                optimizer.optimize_with_lr(
-                    start,
-                    |p| {
-                        transform.set_parameters(p);
-                        let m = metric.evaluate(&transform, backend);
-                        (m.value, m.derivative)
-                    },
-                    |grad| lr_once.min(est.estimate_learning_rate(&scaled(grad))),
-                )
+        let result = match &self.optimizer {
+            OptimizerKind::GradientDescent(gd) => {
+                let mut optimizer = gd.clone();
+                optimizer.set_scales(scales.clone());
+                match self.learning_rate_mode {
+                    // Caller-supplied fixed rate.
+                    LearningRateMode::Manual => optimizer.optimize(start, objective!()),
+                    // Rate estimated once from the initial gradient, then held
+                    // fixed so steps shrink with the gradient (ITK's default).
+                    // Each step is also capped at the estimator's one-voxel
+                    // maximum shift: a level that restarts from a near-converged
+                    // transform has a ~0 initial gradient, which makes the
+                    // once-estimated rate enormous and the *next* step (once the
+                    // gradient grows again) explode. The cap makes "no step
+                    // exceeds one voxel" hold by construction. It is inactive
+                    // whenever the fixed rate already bounds the step — which is
+                    // every step of a monotonically converging run, since the
+                    // once-rate is exactly the per-step rate at the initial
+                    // gradient and only grows as the gradient shrinks — so
+                    // single-resolution runs are unchanged. (Regular-step descent
+                    // removes the need for this cap entirely.)
+                    LearningRateMode::Estimate(EstimateLearningRate::Once) => {
+                        let est = estimator.as_ref().unwrap();
+                        transform.set_parameters(&start);
+                        let m0 = metric.evaluate(&transform, backend);
+                        let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
+                        optimizer.optimize_with_lr(start, objective!(), |grad| {
+                            lr_once.min(est.estimate_learning_rate(&scaled(grad)))
+                        })
+                    }
+                    // Rate re-estimated each iteration from the current gradient;
+                    // the non-shrinking step schedule stops via convergence
+                    // monitoring (enabled on the optimizer by the estimated-mode
+                    // setter).
+                    LearningRateMode::Estimate(EstimateLearningRate::EachIteration) => {
+                        let est = estimator.as_ref().unwrap();
+                        optimizer.optimize_with_lr(start, objective!(), |grad| {
+                            est.estimate_learning_rate(&scaled(grad))
+                        })
+                    }
+                }
             }
-            // Rate re-estimated each iteration from the current gradient; the
-            // non-shrinking step schedule stops via convergence monitoring
-            // (enabled on the optimizer by the estimated-mode setter).
-            LearningRateMode::Estimate(EstimateLearningRate::EachIteration) => {
-                let est = estimator.as_ref().unwrap();
-                optimizer.optimize_with_lr(
-                    start,
-                    |p| {
-                        transform.set_parameters(p);
-                        let m = metric.evaluate(&transform, backend);
-                        (m.value, m.derivative)
-                    },
-                    |grad| est.estimate_learning_rate(&scaled(grad)),
-                )
+            OptimizerKind::RegularStep(rs) => {
+                let mut optimizer = rs.clone();
+                optimizer.set_scales(scales.clone());
+                match self.learning_rate_mode {
+                    // Caller-supplied fixed initial step length.
+                    LearningRateMode::Manual => optimizer.optimize(start, objective!()),
+                    // ITK's RegularStep sets `m_LearningRate =
+                    // (maxStep/stepScale)·‖g₀‖` once, giving a first step of about
+                    // one voxel; the fixed step length then halves on overshoot
+                    // toward `minimum_step_length`. No step cap is needed: the
+                    // gradient-magnitude tolerance stops a near-converged restart
+                    // before any runaway step.
+                    LearningRateMode::Estimate(EstimateLearningRate::Once) => {
+                        let est = estimator.as_ref().unwrap();
+                        transform.set_parameters(&start);
+                        let m0 = metric.evaluate(&transform, backend);
+                        let scaled0 = scaled(&m0.derivative);
+                        let grad_mag_0 = scaled0.iter().map(|g| g * g).sum::<f64>().sqrt();
+                        optimizer
+                            .set_learning_rate(est.estimate_learning_rate(&scaled0) * grad_mag_0);
+                        optimizer.optimize(start, objective!())
+                    }
+                    // Step-length scale re-estimated each iteration from the
+                    // current gradient (`(maxStep/stepScale)·‖g‖`); relaxation and
+                    // the step/gradient tolerances still govern stopping. The
+                    // closure receives the already-scaled gradient.
+                    LearningRateMode::Estimate(EstimateLearningRate::EachIteration) => {
+                        let est = estimator.as_ref().unwrap();
+                        optimizer.optimize_with_lr(start, objective!(), |scaled_grad| {
+                            let gm = scaled_grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+                            est.estimate_learning_rate(scaled_grad) * gm
+                        })
+                    }
+                }
             }
         };
 
@@ -796,6 +920,121 @@ mod tests {
         assert!(
             multi_err < 0.5,
             "multi resolution failed to capture the offset (err {multi_err})"
+        );
+    }
+
+    #[test]
+    fn regular_step_recovers_a_translation() {
+        // Regular-step gradient descent with an estimated initial step recovers
+        // the shift and stops at a stationary point (not the iteration cap),
+        // refining to high precision by halving the step on each overshoot.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                300,
+                1e-8,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-4 && (p[1] - ty).abs() < 1e-4,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+        assert_ne!(
+            result.stop_reason,
+            StopReason::MaxIterations,
+            "regular-step run hit the iteration cap instead of converging"
+        );
+    }
+
+    #[test]
+    fn regular_step_with_a_manual_learning_rate_recovers_a_translation() {
+        // The manual (un-estimated) regular-step path: a fixed initial step
+        // length of two voxels, halved on overshoot, still recovers the shift.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_regular_step_gradient_descent(2.0, 1e-6, 300, 1e-8);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+    }
+
+    #[test]
+    fn regular_step_multiresolution_reaches_higher_precision_than_gradient_descent() {
+        // The regular-step optimizer closes the finest-level precision gap of
+        // the estimate-once gradient descent on the pyramid. On a cleanly
+        // registerable pair both converge, but the fixed-step-with-relaxation
+        // schedule reaches far below the gradient-descent result at the same
+        // iteration budget, and stops at a stationary point rather than the cap.
+        let (w, h, sigma, amp) = (48usize, 48usize, 6.0, 1.0);
+        let (tx, ty) = (5.0f64, -3.0f64);
+        let fixed = gaussian(w, h, 24.0, 24.0, sigma, amp);
+        let moving = gaussian(w, h, 24.0 + tx, 24.0 + ty, sigma, amp);
+        let err = |p: &[f64]| ((p[0] - tx).powi(2) + (p[1] - ty).powi(2)).sqrt();
+
+        let mut gd = ImageRegistrationMethod::new();
+        gd.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_gradient_descent_estimated(200, EstimateLearningRate::Once)
+            .set_shrink_factors_per_level(vec![4, 2, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+        let gd_err = err(&gd
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap()
+            .transform
+            .parameters());
+
+        let mut rs = ImageRegistrationMethod::new();
+        rs.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                200,
+                1e-7,
+                EstimateLearningRate::Once,
+            )
+            .set_shrink_factors_per_level(vec![4, 2, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+        let result = rs
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        let rs_err = err(&result.transform.parameters());
+
+        assert!(
+            rs_err < 1e-3,
+            "regular-step multi-res err {rs_err} not below 1e-3 (metric {})",
+            result.metric_value
+        );
+        assert!(
+            rs_err < gd_err,
+            "regular-step err {rs_err} not below gradient-descent err {gd_err}"
+        );
+        assert_ne!(
+            result.stop_reason,
+            StopReason::MaxIterations,
+            "regular-step finest level hit the iteration cap instead of converging"
         );
     }
 
