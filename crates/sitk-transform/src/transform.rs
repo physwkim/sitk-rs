@@ -542,6 +542,240 @@ impl CenteredTransform for Similarity2DTransform {
     }
 }
 
+/// A rigid 3-D transform parameterized by Euler angles:
+/// `y = R·(x − center) + center + translation`, mirroring `itk::Euler3DTransform`.
+///
+/// Parameters are `[angleX, angleY, angleZ, tx, ty, tz]` (angles in radians); the
+/// `center` is fixed. The rotation composes the per-axis rotations `Rx`, `Ry`,
+/// `Rz`; the order is `Rz·Rx·Ry` by default (`compute_zyx = false`, ITK's default
+/// and VTK order) and `Rz·Ry·Rx` when [`set_compute_zyx(true)`]. The matrix and
+/// the equivalent `offset` in `y = M·x + offset`
+/// (`offset = translation + center − M·center`) are cached.
+///
+/// [`set_compute_zyx(true)`]: Euler3DTransform::set_compute_zyx
+#[derive(Clone, Debug, PartialEq)]
+pub struct Euler3DTransform {
+    angle_x: f64,
+    angle_y: f64,
+    angle_z: f64,
+    compute_zyx: bool,
+    /// Length 3.
+    translation: Vec<f64>,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 rotation.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl Euler3DTransform {
+    /// A rigid transform rotating by the Euler angles `(angle_x, angle_y,
+    /// angle_z)` (radians) about `center`, then `translation`. Uses ITK's default
+    /// composition order `Rz·Rx·Ry` (`compute_zyx = false`).
+    pub fn new(
+        angle_x: f64,
+        angle_y: f64,
+        angle_z: f64,
+        translation: [f64; 3],
+        center: [f64; 3],
+    ) -> Self {
+        let mut t = Self {
+            angle_x,
+            angle_y,
+            angle_z,
+            compute_zyx: false,
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (zero angles/translation, center at origin).
+    pub fn identity() -> Self {
+        Self::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    }
+
+    /// Rotation angle about the X axis (radians).
+    pub fn angle_x(&self) -> f64 {
+        self.angle_x
+    }
+
+    /// Rotation angle about the Y axis (radians).
+    pub fn angle_y(&self) -> f64 {
+        self.angle_y
+    }
+
+    /// Rotation angle about the Z axis (radians).
+    pub fn angle_z(&self) -> f64 {
+        self.angle_z
+    }
+
+    /// Whether the composition order is `Rz·Ry·Rx` (`true`) or `Rz·Rx·Ry`
+    /// (`false`, the default).
+    pub fn compute_zyx(&self) -> bool {
+        self.compute_zyx
+    }
+
+    /// Select the rotation composition order: `Rz·Ry·Rx` when `flag`, else
+    /// `Rz·Rx·Ry`. Recomputes the matrix and offset.
+    pub fn set_compute_zyx(&mut self, flag: bool) {
+        self.compute_zyx = flag;
+        self.recompute();
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 rotation matrix.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Rebuild the cached matrix (per-axis rotations composed in the configured
+    /// order) and offset.
+    fn recompute(&mut self) {
+        let (cx, sx) = (self.angle_x.cos(), self.angle_x.sin());
+        let (cy, sy) = (self.angle_y.cos(), self.angle_y.sin());
+        let (cz, sz) = (self.angle_z.cos(), self.angle_z.sin());
+
+        #[rustfmt::skip]
+        let rx = [1.0, 0.0, 0.0,  0.0, cx, -sx,  0.0, sx, cx];
+        #[rustfmt::skip]
+        let ry = [cy, 0.0, sy,  0.0, 1.0, 0.0,  -sy, 0.0, cy];
+        #[rustfmt::skip]
+        let rz = [cz, -sz, 0.0,  sz, cz, 0.0,  0.0, 0.0, 1.0];
+
+        // ITK ComputeMatrix: Rz·Rx·Ry by default, Rz·Ry·Rx when compute_zyx.
+        self.matrix = if self.compute_zyx {
+            matrix::matmul(&matrix::matmul(&rz, &ry, 3), &rx, 3)
+        } else {
+            matrix::matmul(&matrix::matmul(&rz, &rx, 3), &ry, 3)
+        };
+
+        let m_center = matrix::mat_vec(&self.matrix, &self.center, 3);
+        self.offset = (0..3)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+    }
+}
+
+impl Transform for Euler3DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for Euler3DTransform {
+    fn number_of_parameters(&self) -> usize {
+        6
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.angle_x,
+            self.angle_y,
+            self.angle_z,
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 6, "parameter length");
+        self.angle_x = params[0];
+        self.angle_y = params[1];
+        self.angle_z = params[2];
+        self.translation[0] = params[3];
+        self.translation[1] = params[4];
+        self.translation[2] = params[5];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // Analytic ∂y/∂angle from itk::Euler3DTransform, plus an identity block
+        // for the translation. Row-major 3×6.
+        let (cx, sx) = (self.angle_x.cos(), self.angle_x.sin());
+        let (cy, sy) = (self.angle_y.cos(), self.angle_y.sin());
+        let (cz, sz) = (self.angle_z.cos(), self.angle_z.sin());
+        let (px, py, pz) = (
+            point[0] - self.center[0],
+            point[1] - self.center[1],
+            point[2] - self.center[2],
+        );
+
+        let mut j = vec![0.0f64; 18];
+        if self.compute_zyx {
+            j[0] = (cz * sy * cx + sz * sx) * py + (-cz * sy * sx + sz * cx) * pz;
+            j[6] = (sz * sy * cx - cz * sx) * py + (-sz * sy * sx - cz * cx) * pz;
+            j[12] = (cy * cx) * py + (-cy * sx) * pz;
+
+            j[1] = (-cz * sy) * px + (cz * cy * sx) * py + (cz * cy * cx) * pz;
+            j[7] = (-sz * sy) * px + (sz * cy * sx) * py + (sz * cy * cx) * pz;
+            j[13] = (-cy) * px + (-sy * sx) * py + (-sy * cx) * pz;
+
+            j[2] =
+                (-sz * cy) * px + (-sz * sy * sx - cz * cx) * py + (-sz * sy * cx + cz * sx) * pz;
+            j[8] = (cz * cy) * px + (cz * sy * sx - sz * cx) * py + (cz * sy * cx + sz * sx) * pz;
+            j[14] = 0.0;
+        } else {
+            j[0] = (-sz * cx * sy) * px + (sz * sx) * py + (sz * cx * cy) * pz;
+            j[6] = (cz * cx * sy) * px + (-cz * sx) * py + (-cz * cx * cy) * pz;
+            j[12] = (sx * sy) * px + (cx) * py + (-sx * cy) * pz;
+
+            j[1] = (-cz * sy - sz * sx * cy) * px + (cz * cy - sz * sx * sy) * pz;
+            j[7] = (-sz * sy + cz * sx * cy) * px + (sz * cy + cz * sx * sy) * pz;
+            j[13] = (-cx * cy) * px + (-cx * sy) * pz;
+
+            j[2] =
+                (-sz * cy - cz * sx * sy) * px + (-cz * cx) * py + (-sz * sy + cz * sx * cy) * pz;
+            j[8] = (cz * cy - sz * sx * sy) * px + (-sz * cx) * py + (cz * sy + sz * sx * cy) * pz;
+            j[14] = 0.0;
+        }
+        // Translation identity block: ∂yᵢ/∂t_i = 1 at columns 3, 4, 5.
+        j[3] = 1.0;
+        j[10] = 1.0;
+        j[17] = 1.0;
+        j
+    }
+}
+
+impl CenteredTransform for Euler3DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 3, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,5 +1094,134 @@ mod tests {
         t.set_translation(&[1.0, 1.0]);
         // Identity matrix: y = x − c + c + t = x + t.
         assert_eq!(affine.transform_point(&[4.0, 4.0]), vec![5.0, 5.0]);
+    }
+
+    #[test]
+    fn euler3d_identity_is_noop() {
+        let e = Euler3DTransform::identity();
+        assert_eq!(e.number_of_parameters(), 6);
+        assert_eq!(e.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn euler3d_single_axis_rotations_match_basic_matrices() {
+        use std::f64::consts::FRAC_PI_2;
+        // 90° about Z: (1,0,0) → (0,1,0), z unchanged.
+        let ez = Euler3DTransform::new(0.0, 0.0, FRAC_PI_2, [0.0; 3], [0.0; 3]);
+        let p = ez.transform_point(&[1.0, 0.0, 7.0]);
+        assert!(
+            (p[0]).abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12 && (p[2] - 7.0).abs() < 1e-12,
+            "{p:?}"
+        );
+        // 90° about X: (0,1,0) → (0,0,1), x unchanged.
+        let ex = Euler3DTransform::new(FRAC_PI_2, 0.0, 0.0, [0.0; 3], [0.0; 3]);
+        let q = ex.transform_point(&[9.0, 1.0, 0.0]);
+        assert!(
+            (q[0] - 9.0).abs() < 1e-12 && (q[1]).abs() < 1e-12 && (q[2] - 1.0).abs() < 1e-12,
+            "{q:?}"
+        );
+        // 90° about Y: (0,0,1) → (1,0,0), y unchanged.
+        let ey = Euler3DTransform::new(0.0, FRAC_PI_2, 0.0, [0.0; 3], [0.0; 3]);
+        let r = ey.transform_point(&[0.0, 4.0, 1.0]);
+        assert!(
+            (r[0] - 1.0).abs() < 1e-12 && (r[1] - 4.0).abs() < 1e-12 && (r[2]).abs() < 1e-12,
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn euler3d_rotation_about_center_fixes_center() {
+        let c = [5.0, -2.0, 3.0];
+        let e = Euler3DTransform::new(0.3, -0.5, 0.7, [0.0; 3], c);
+        let y = e.transform_point(&c);
+        for d in 0..3 {
+            assert!((y[d] - c[d]).abs() < 1e-12, "center moved: {y:?}");
+        }
+    }
+
+    #[test]
+    fn euler3d_default_and_zyx_orders_differ_and_are_orthonormal() {
+        // With multiple nonzero angles the two composition orders give different
+        // matrices; each is still a rotation (Mᵀ·M = I).
+        let mut e = Euler3DTransform::new(0.4, -0.6, 0.8, [0.0; 3], [0.0; 3]);
+        let default = e.matrix().to_vec();
+        e.set_compute_zyx(true);
+        let zyx = e.matrix().to_vec();
+        assert!(default.iter().zip(&zyx).any(|(a, b)| (a - b).abs() > 1e-6));
+        for m in [&default, &zyx] {
+            for i in 0..3 {
+                for j in 0..3 {
+                    let dot: f64 = (0..3).map(|k| m[i * 3 + k] * m[j * 3 + k]).sum();
+                    let expect = if i == j { 1.0 } else { 0.0 };
+                    assert!((dot - expect).abs() < 1e-12, "not orthonormal");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn euler3d_jacobian_at_identity_is_so3_generators() {
+        // At zero angles, centre 0, point (2,3,5): columns are the standard
+        // so(3) generators applied to p, then the translation identity block.
+        let e = Euler3DTransform::identity();
+        let j = e.jacobian_wrt_parameters(&[2.0, 3.0, 5.0]);
+        // col0=(0,-pz,py), col1=(pz,0,-px), col2=(-py,px,0).
+        assert_eq!(
+            j,
+            vec![
+                0.0, 5.0, -3.0, 1.0, 0.0, 0.0, //
+                -5.0, 0.0, 2.0, 0.0, 1.0, 0.0, //
+                3.0, -2.0, 0.0, 0.0, 0.0, 1.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn euler3d_jacobian_is_finite_difference_consistent_both_orders() {
+        for zyx in [false, true] {
+            let base = [0.3, -0.5, 0.7, 1.0, -2.0, 0.5];
+            let center = [2.0, -1.0, 4.0];
+            let point = [4.0, 5.0, -3.0];
+            let mut e = Euler3DTransform::new(
+                base[0],
+                base[1],
+                base[2],
+                [base[3], base[4], base[5]],
+                center,
+            );
+            e.set_compute_zyx(zyx);
+            let jac = e.jacobian_wrt_parameters(&point);
+            let n = e.number_of_parameters();
+            let h = 1e-6;
+            for k in 0..n {
+                let mut pp = base;
+                pp[k] += h;
+                e.set_parameters(&pp);
+                let yp = e.transform_point(&point);
+                let mut pm = base;
+                pm[k] -= h;
+                e.set_parameters(&pm);
+                let ym = e.transform_point(&point);
+                for i in 0..3 {
+                    let fd = (yp[i] - ym[i]) / (2.0 * h);
+                    assert!(
+                        (fd - jac[i * n + k]).abs() < 1e-6,
+                        "zyx={zyx} param {k} dim {i}: fd {fd} vs analytic {}",
+                        jac[i * n + k]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn euler3d_parameters_roundtrip() {
+        let mut e = Euler3DTransform::identity();
+        e.set_parameters(&[0.1, 0.2, 0.3, 4.0, 5.0, 6.0]);
+        assert_eq!(e.parameters(), vec![0.1, 0.2, 0.3, 4.0, 5.0, 6.0]);
+        assert_eq!(e.angle_x(), 0.1);
+        assert_eq!(e.angle_y(), 0.2);
+        assert_eq!(e.angle_z(), 0.3);
+        assert_eq!(e.translation(), &[4.0, 5.0, 6.0]);
     }
 }

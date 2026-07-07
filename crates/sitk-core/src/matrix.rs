@@ -20,6 +20,25 @@ pub fn mat_vec(m: &[f64], v: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+/// Multiply two row-major `n x n` matrices: `out = a * b`.
+pub fn matmul(a: &[f64], b: &[f64], n: usize) -> Vec<f64> {
+    debug_assert_eq!(a.len(), n * n);
+    debug_assert_eq!(b.len(), n * n);
+    let mut out = vec![0.0; n * n];
+    for r in 0..n {
+        for k in 0..n {
+            let ark = a[r * n + k];
+            if ark == 0.0 {
+                continue;
+            }
+            for c in 0..n {
+                out[r * n + c] += ark * b[k * n + c];
+            }
+        }
+    }
+    out
+}
+
 /// Invert a row-major `n x n` matrix via Gauss–Jordan elimination with partial
 /// pivoting. Returns `None` if the matrix is singular (to within `eps`).
 pub fn invert(m: &[f64], n: usize) -> Option<Vec<f64>> {
@@ -137,5 +156,33 @@ mod tests {
         let m = [2.0, 0.0, 0.0, 3.0];
         let v = [5.0, 7.0];
         assert_eq!(mat_vec(&m, &v, 2), vec![10.0, 21.0]);
+    }
+
+    #[test]
+    fn matmul_identity_is_noop() {
+        let m = [1.2, -0.4, 0.3, 0.9];
+        assert_eq!(matmul(&identity(2), &m, 2), m.to_vec());
+        assert_eq!(matmul(&m, &identity(2), 2), m.to_vec());
+    }
+
+    #[test]
+    fn matmul_matches_manual_product() {
+        // [[1,2],[3,4]] * [[5,6],[7,8]] = [[19,22],[43,50]].
+        let a = [1.0, 2.0, 3.0, 4.0];
+        let b = [5.0, 6.0, 7.0, 8.0];
+        assert_eq!(matmul(&a, &b, 2), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn matmul_composes_like_mat_vec() {
+        // (A*B)*v == A*(B*v) for a 3×3 example.
+        let a = [1.0, 2.0, 0.0, 0.0, 1.0, 3.0, 4.0, 0.0, 1.0];
+        let b = [2.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 3.0, 1.0];
+        let v = [1.0, -2.0, 0.5];
+        let lhs = mat_vec(&matmul(&a, &b, 3), &v, 3);
+        let rhs = mat_vec(&a, &mat_vec(&b, &v, 3), 3);
+        for (l, r) in lhs.iter().zip(rhs.iter()) {
+            assert!((l - r).abs() < 1e-12, "{lhs:?} vs {rhs:?}");
+        }
     }
 }
