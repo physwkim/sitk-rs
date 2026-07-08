@@ -118,6 +118,7 @@
 pub mod convergence;
 pub mod error;
 pub mod initializer;
+pub mod lbfgsb;
 pub mod mattes;
 pub mod method;
 pub mod metric;
@@ -127,6 +128,7 @@ pub mod scales;
 pub use convergence::WindowConvergenceMonitor;
 pub use error::{RegistrationError, Result};
 pub use initializer::{CenteredTransformInitializer, OperationMode};
+pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};

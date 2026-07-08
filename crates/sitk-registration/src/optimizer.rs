@@ -30,12 +30,20 @@ pub enum StopReason {
     /// — a stationary point (`itk::RegularStepGradientDescentOptimizerv4`'s
     /// `GRADIENT_MAGNITUDE_TOLERANCE`).
     GradientConverged,
+    /// Reached the maximum number of objective evaluations
+    /// (`LBFGSB`'s `MaximumNumberOfFunctionEvaluations`).
+    MaxFunctionEvaluations,
+    /// The line search could not make progress (`LBFGSB`'s
+    /// `ABNORMAL_TERMINATION_IN_LNSRCH`).
+    LineSearchFailed,
 }
 
 /// Outcome of an optimization run.
 #[derive(Clone, Debug)]
 pub struct OptimizerResult {
-    /// Best parameters found (the last iterate).
+    /// Best parameters found. For the gradient-descent optimizers this is the
+    /// last iterate; [`LBFGSBOptimizer`](crate::LBFGSBOptimizer) returns the
+    /// lowest-value point ever evaluated, which may be an earlier iterate.
     pub parameters: Vec<f64>,
     /// Objective value at `parameters`.
     pub value: f64,
