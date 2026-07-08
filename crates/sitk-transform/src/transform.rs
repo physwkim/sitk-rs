@@ -1884,6 +1884,347 @@ impl CenteredTransform for ScaleSkewVersor3DTransform {
     }
 }
 
+/// A 3-D transform composing a versor rotation, per-axis scale, and an upper-
+/// triangular skew **multiplicatively** (`itk::ComposeScaleSkewVersor3DTransform`)
+/// — 12 parameters. This is the multiplicative sibling of the *additive*
+/// [`ScaleSkewVersor3DTransform`].
+///
+/// Parameters are `[v0, v1, v2, tx, ty, tz, s0, s1, s2, k0, k1, k2]`: versor right
+/// part (3), translation (3), per-axis scale (3), and **3** skew components (only
+/// the upper triangle). `(v0, v1, v2)` uses the same norm-clamping as
+/// [`VersorRigid3DTransform`]; `center` fixed.
+///
+/// # Matrix (multiplicative composition)
+///
+/// Unlike the additive variants, `ComputeMatrix` **multiplies** the rotation by a
+/// scale-then-skew factor:
+///
+/// ```text
+/// K = [ 1  k0 k1 ; 0  1  k2 ; 0  0  1 ]   (unit upper-triangular skew)
+/// M = R(versor) · diag(s0, s1, s2) · K
+/// ```
+///
+/// The offset is `translation + center − M·center`.
+///
+/// # Jacobian
+///
+/// The analytic Jacobian is ITK's `sympy`-derived expansion of `∂(R·S·K·(p−c))`.
+/// **It treats the versor scalar `w` as independent of `(v0, v1, v2)`** (no `1/w`
+/// chain-rule term, unlike [`VersorRigid3DTransform`]), so it is exact only in the
+/// limit and carries an `O(‖v‖²)` error away from the identity rotation — matching
+/// ITK, whose own test validates it only near the identity with a 10% relative
+/// tolerance. It is preserved verbatim for parity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComposeScaleSkewVersor3DTransform {
+    /// Normalized versor right part.
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    /// Normalized versor scalar part `√(1 − vx² − vy² − vz²)`.
+    vw: f64,
+    /// Per-axis scale, length 3.
+    scale: Vec<f64>,
+    /// Upper-triangular skew `{k0=(0,1), k1=(0,2), k2=(1,2)}`, length 3.
+    skew: Vec<f64>,
+    /// Length 3.
+    translation: Vec<f64>,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 `R · diag(scale) · K`.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl ComposeScaleSkewVersor3DTransform {
+    /// A transform composing: versor rotation `(vx, vy, vz)` about `center`, then
+    /// the multiplicative `diag(scale)·K` (upper-triangular skew), then
+    /// `translation`. A right part with norm `≥ 1` is scaled to just under 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        scale: [f64; 3],
+        skew: [f64; 3],
+        vx: f64,
+        vy: f64,
+        vz: f64,
+        translation: [f64; 3],
+        center: [f64; 3],
+    ) -> Self {
+        let mut t = Self {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            vw: 1.0,
+            scale: scale.to_vec(),
+            skew: skew.to_vec(),
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.set_versor(vx, vy, vz);
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (scale `(1,1,1)`, zero skew, versor `(0,0,0; w=1)`,
+    /// zero translation, center at origin).
+    pub fn identity() -> Self {
+        Self::new(
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        )
+    }
+
+    /// Versor right-part X (axis·sin(θ/2)).
+    pub fn versor_x(&self) -> f64 {
+        self.vx
+    }
+
+    /// Versor right-part Y.
+    pub fn versor_y(&self) -> f64 {
+        self.vy
+    }
+
+    /// Versor right-part Z.
+    pub fn versor_z(&self) -> f64 {
+        self.vz
+    }
+
+    /// Versor scalar part `w = √(1 − vx² − vy² − vz²)`.
+    pub fn versor_w(&self) -> f64 {
+        self.vw
+    }
+
+    /// The per-axis scale factors.
+    pub fn scale(&self) -> &[f64] {
+        &self.scale
+    }
+
+    /// The skew components `{k0=(0,1), k1=(0,2), k2=(1,2)}`.
+    pub fn skew(&self) -> &[f64] {
+        &self.skew
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 matrix `R · diag(scale) · K`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Set the normalized versor from a right part, mirroring
+    /// `itk::ComposeScaleSkewVersor3DTransform::SetParameters` (same clamp as
+    /// [`VersorRigid3DTransform`]).
+    fn set_versor(&mut self, vx: f64, vy: f64, vz: f64) {
+        const EPS: f64 = 1e-10;
+        let norm = (vx * vx + vy * vy + vz * vz).sqrt();
+        let (ax, ay, az) = if norm >= 1.0 - EPS {
+            let d = norm + EPS * norm;
+            (vx / d, vy / d, vz / d)
+        } else {
+            (vx, vy, vz)
+        };
+        self.vx = ax;
+        self.vy = ay;
+        self.vz = az;
+        self.vw = (1.0 - (ax * ax + ay * ay + az * az)).max(0.0).sqrt();
+    }
+
+    /// Rebuild the cached matrix `M = R · diag(scale) · K` (ITK's `ComputeMatrix`:
+    /// versor superclass rotation, times `Q = diag(scale)·K` with `K` unit upper-
+    /// triangular) and the offset.
+    fn recompute(&mut self) {
+        let (x, y, z, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (xx, yy, zz) = (x * x, y * y, z * z);
+        let (xy, xz, xw) = (x * y, x * z, x * w);
+        let (yz, yw, zw) = (y * z, y * w, z * w);
+        #[rustfmt::skip]
+        let r = vec![
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw),       2.0 * (xz + yw),
+            2.0 * (xy + zw),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw),
+            2.0 * (xz - yw),       2.0 * (yz + xw),       1.0 - 2.0 * (xx + yy),
+        ];
+        let (s0, s1, s2) = (self.scale[0], self.scale[1], self.scale[2]);
+        let (k0, k1, k2) = (self.skew[0], self.skew[1], self.skew[2]);
+        // Q = diag(scale) · [[1,k0,k1],[0,1,k2],[0,0,1]].
+        #[rustfmt::skip]
+        let q = vec![
+            s0,  s0 * k0, s0 * k1,
+            0.0, s1,      s1 * k2,
+            0.0, 0.0,     s2,
+        ];
+        let m = matrix::matmul(&r, &q, 3);
+        let m_center = matrix::mat_vec(&m, &self.center, 3);
+        self.offset = (0..3)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+        self.matrix = m;
+    }
+}
+
+impl Transform for ComposeScaleSkewVersor3DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for ComposeScaleSkewVersor3DTransform {
+    fn number_of_parameters(&self) -> usize {
+        12
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.vx,
+            self.vy,
+            self.vz,
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+            self.scale[0],
+            self.scale[1],
+            self.scale[2],
+            self.skew[0],
+            self.skew[1],
+            self.skew[2],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 12, "parameter length");
+        self.set_versor(params[0], params[1], params[2]);
+        self.translation[0] = params[3];
+        self.translation[1] = params[4];
+        self.translation[2] = params[5];
+        self.scale[0] = params[6];
+        self.scale[1] = params[7];
+        self.scale[2] = params[8];
+        self.skew[0] = params[9];
+        self.skew[1] = params[10];
+        self.skew[2] = params[11];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // itk::ComposeScaleSkewVersor3DTransform::ComputeJacobianWithRespectToParameters:
+        // the sympy-derived expansion of ∂(R·S·K·(p−c)) with the versor scalar w
+        // treated as INDEPENDENT of (v0,v1,v2) — preserved verbatim (see the struct
+        // docs for the resulting O(‖v‖²) deviation from a true finite difference).
+        let (v0, v1, v2, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (s0, s1, s2) = (self.scale[0], self.scale[1], self.scale[2]);
+        let (k0, k1, k2) = (self.skew[0], self.skew[1], self.skew[2]);
+        let x0 = point[0] - self.center[0];
+        let x1 = point[1] - self.center[1];
+        let x2 = point[2] - self.center[2];
+
+        let (v0v0, v0v1, v0v2, v0w) = (v0 * v0, v0 * v1, v0 * v2, v0 * w);
+        let (v1v1, v1v2, v1w) = (v1 * v1, v1 * v2, v1 * w);
+        let (v2v2, v2w) = (v2 * v2, v2 * w);
+
+        // Row-major 3×12.
+        let mut j = vec![0.0f64; 36];
+
+        // Versor columns 0, 1, 2.
+        j[0] = 2.0 * s1 * v1 * x1 + x2 * (2.0 * k2 * s1 * v1 + 2.0 * s2 * v2);
+        j[12] = 2.0 * s0 * v1 * x0 + x1 * (2.0 * k0 * s0 * v1 - 4.0 * s1 * v0)
+            - x2 * (-2.0 * k1 * s0 * v1 + 4.0 * k2 * s1 * v0 + 2.0 * s2 * w);
+        j[24] = 2.0 * s0 * v2 * x0
+            + 2.0 * x1 * (k0 * s0 * v2 + s1 * w)
+            + x2 * (2.0 * k1 * s0 * v2 + 2.0 * k2 * s1 * w - 4.0 * s2 * v0);
+
+        j[1] = -4.0 * s0 * v1 * x0 - x1 * (4.0 * k0 * s0 * v1 - 2.0 * s1 * v0)
+            + x2 * (-4.0 * k1 * s0 * v1 + 2.0 * k2 * s1 * v0 + 2.0 * s2 * w);
+        j[13] = 2.0 * k0 * s0 * v0 * x1 + 2.0 * s0 * v0 * x0
+            - x2 * (-2.0 * k1 * s0 * v0 - 2.0 * s2 * v2);
+        j[25] = -2.0 * s0 * w * x0
+            + 2.0 * x1 * (-k0 * s0 * w + s1 * v2)
+            + x2 * (-2.0 * k1 * s0 * w + 2.0 * k2 * s1 * v2 - 4.0 * s2 * v1);
+
+        j[2] = -4.0 * s0 * v2 * x0 - x1 * (4.0 * k0 * s0 * v2 + 2.0 * s1 * w)
+            + x2 * (-4.0 * k1 * s0 * v2 - 2.0 * k2 * s1 * w + 2.0 * s2 * v0);
+        j[14] = 2.0 * s0 * w * x0 + x1 * (2.0 * k0 * s0 * w - 4.0 * s1 * v2)
+            - x2 * (-2.0 * k1 * s0 * w + 4.0 * k2 * s1 * v2 - 2.0 * s2 * v1);
+        j[26] = 2.0 * s0 * v0 * x0
+            + 2.0 * x1 * (k0 * s0 * v0 + s1 * v1)
+            + x2 * (2.0 * k1 * s0 * v0 + 2.0 * k2 * s1 * v1);
+
+        // Translation identity block: columns 3, 4, 5.
+        j[3] = 1.0;
+        j[16] = 1.0;
+        j[29] = 1.0;
+
+        // Scale columns 6, 7, 8.
+        j[6] = -k0 * x1 * (2.0 * v1v1 + 2.0 * v2v2 - 1.0)
+            - k1 * x2 * (2.0 * v1v1 + 2.0 * v2v2 - 1.0)
+            - x0 * (2.0 * v1v1 + 2.0 * v2v2 - 1.0);
+        j[18] =
+            2.0 * k0 * x1 * (v0v1 + v2w) + 2.0 * k1 * x2 * (v0v1 + v2w) + 2.0 * x0 * (v0v1 + v2w);
+        j[30] =
+            2.0 * k0 * x1 * (v0v2 - v1w) + 2.0 * k1 * x2 * (v0v2 - v1w) + 2.0 * x0 * (v0v2 - v1w);
+
+        j[7] = 2.0 * k2 * x2 * (v0v1 - v2w) - x1 * (-2.0 * v0v1 + 2.0 * v2w);
+        j[19] = -k2 * x2 * (2.0 * v0v0 + 2.0 * v2v2 - 1.0) + x1 * (-2.0 * v0v0 - 2.0 * v2v2 + 1.0);
+        j[31] = 2.0 * k2 * x2 * (v0w + v1v2) + 2.0 * x1 * (v0w + v1v2);
+
+        j[8] = x2 * (2.0 * v0v2 + 2.0 * v1w);
+        j[20] = -x2 * (2.0 * v0w - 2.0 * v1v2);
+        j[32] = x2 * (-2.0 * v0v0 - 2.0 * v1v1 + 1.0);
+
+        // Skew columns 9, 10, 11.
+        j[9] = -s0 * x1 * (2.0 * v1v1 + 2.0 * v2v2 - 1.0);
+        j[21] = 2.0 * s0 * x1 * (v0v1 + v2w);
+        j[33] = 2.0 * s0 * x1 * (v0v2 - v1w);
+
+        j[10] = -s0 * x2 * (2.0 * v1v1 + 2.0 * v2v2 - 1.0);
+        j[22] = 2.0 * s0 * x2 * (v0v1 + v2w);
+        j[34] = 2.0 * s0 * x2 * (v0v2 - v1w);
+
+        j[11] = 2.0 * s1 * x2 * (v0v1 - v2w);
+        j[23] = -s1 * x2 * (2.0 * v0v0 + 2.0 * v2v2 - 1.0);
+        j[35] = 2.0 * s1 * x2 * (v0w + v1v2);
+        j
+    }
+}
+
+impl CenteredTransform for ComposeScaleSkewVersor3DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 3, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2750,6 +3091,133 @@ mod tests {
                     "param {k} dim {i}: fd {fd} vs analytic {}",
                     jac[i * n + k]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_identity_is_noop() {
+        let t = ComposeScaleSkewVersor3DTransform::identity();
+        assert_eq!(t.number_of_parameters(), 12);
+        assert_eq!(t.scale(), &[1.0, 1.0, 1.0]);
+        assert_eq!(t.skew(), &[0.0, 0.0, 0.0]);
+        assert_eq!(t.versor_w(), 1.0);
+        assert_eq!(t.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_matrix_is_multiplicative() {
+        // No rotation (R = I): M = diag(scale)·K with K = [[1,k0,k1],[0,1,k2],[0,0,1]].
+        // diag(2,3,4)·K = [[2, 2·0.5, 2·0.25],[0, 3, 3·0.1],[0, 0, 4]].
+        let t = ComposeScaleSkewVersor3DTransform::new(
+            [2.0, 3.0, 4.0],
+            [0.5, 0.25, 0.1],
+            0.0,
+            0.0,
+            0.0,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        #[rustfmt::skip]
+        let expect = [
+            2.0, 1.0, 0.5,
+            0.0, 3.0, 0.3,
+            0.0, 0.0, 4.0,
+        ];
+        for (a, b) in t.matrix().iter().zip(expect) {
+            assert!((a - b).abs() < 1e-12, "matrix {:?}", t.matrix());
+        }
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_matrix_differs_from_additive_scale_versor() {
+        use std::f64::consts::FRAC_PI_4;
+        // Rz(90°), scale [2,3,4], zero skew. The multiplicative compose gives
+        // M = R·diag(scale) = [0,-3,0; 2,0,0; 0,0,4], whereas the additive
+        // ScaleVersor3D gives R + diag(scale-1) = [1,-1,0; 1,2,0; 0,0,4].
+        let sz = FRAC_PI_4.sin();
+        let compose = ComposeScaleSkewVersor3DTransform::new(
+            [2.0, 3.0, 4.0],
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            sz,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        #[rustfmt::skip]
+        let expect = [
+            0.0, -3.0, 0.0,
+            2.0,  0.0, 0.0,
+            0.0,  0.0, 4.0,
+        ];
+        for (a, b) in compose.matrix().iter().zip(expect) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "compose matrix {:?}",
+                compose.matrix()
+            );
+        }
+        // The additive sibling produces a genuinely different matrix.
+        let additive =
+            ScaleVersor3DTransform::new([2.0, 3.0, 4.0], 0.0, 0.0, sz, [0.0; 3], [0.0; 3]);
+        let differs = compose
+            .matrix()
+            .iter()
+            .zip(additive.matrix())
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(differs, "compose and additive matrices unexpectedly equal");
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_parameters_roundtrip() {
+        let mut t = ComposeScaleSkewVersor3DTransform::identity();
+        let params = [
+            0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5, 0.05, -0.1, 0.15,
+        ];
+        t.set_parameters(&params);
+        let p = t.parameters();
+        assert!(
+            (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
+        );
+        assert_eq!(&p[3..6], &[4.0, 5.0, 6.0]);
+        assert_eq!(&p[6..9], &[1.2, 0.8, 1.5]);
+        assert_eq!(&p[9..12], &[0.05, -0.1, 0.15]);
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_jacobian_matches_finite_difference_near_identity() {
+        // Mirrors ITK's own Jacobian test: from the identity, bump one parameter to
+        // 0.1, then finite-difference every parameter. The sympy Jacobian treats w
+        // as independent, so it is only valid near identity and to a loose relative
+        // tolerance (ITK uses 10%).
+        let point = [10.0, 20.0, -10.0];
+        let n = 12;
+        let identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let h = 1e-6;
+        for mc in 0..n {
+            let mut params = identity;
+            params[mc] = 0.1;
+            let mut t = ComposeScaleSkewVersor3DTransform::identity();
+            t.set_parameters(&params);
+            let jac = t.jacobian_wrt_parameters(&point);
+            for i in 0..n {
+                let mut p1 = params;
+                p1[i] += h;
+                t.set_parameters(&p1);
+                let y1 = t.transform_point(&point);
+                let mut p2 = params;
+                p2[i] -= h;
+                t.set_parameters(&p2);
+                let y2 = t.transform_point(&point);
+                for d in 0..3 {
+                    let fd = (y1[d] - y2[d]) / (2.0 * h);
+                    let analytic = jac[d * n + i];
+                    assert!(
+                        (fd - analytic).abs() <= 0.1 * fd.abs() + 1e-6,
+                        "mc {mc} param {i} dim {d}: fd {fd} vs analytic {analytic}"
+                    );
+                }
             }
         }
     }
