@@ -34,7 +34,7 @@
 //!   and moving intensity ranges that size the histogram are the whole-image
 //!   ranges — matching ITK's dense, unmasked `Initialize()` path.
 //! * **Gradient source.** `∇M` is the exact gradient of the *linear
-//!   interpolant* ([`MovingImage::value_and_physical_gradient`]), so the metric
+//!   interpolant* (`MovingImage::value_and_physical_gradient`), so the metric
 //!   derivative is the true gradient of the interpolated MI value (an
 //!   optimizer's finite difference of the value reproduces it). This is the same
 //!   deliberate deviation the mean-squares metric documents: ITK defaults to a
