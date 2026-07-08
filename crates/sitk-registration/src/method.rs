@@ -16,18 +16,23 @@
 //! multi-modality), selected with
 //! [`set_metric_as_mean_squares`](ImageRegistrationMethod::set_metric_as_mean_squares)
 //! / [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information);
-//! interpolation is linear. The optimizer is either fixed-step gradient descent
-//! (`itk::GradientDescentOptimizerv4`) or regular-step gradient descent
-//! (`itk::RegularStepGradientDescentOptimizerv4`), the latter halving its step
-//! on each overshoot so it converges cleanly at an already-registered pyramid
-//! level and refines the finest one to high precision. More sampling strategies
-//! come later.
+//! interpolation is linear. The optimizer is fixed-step gradient descent
+//! (`itk::GradientDescentOptimizerv4`), regular-step gradient descent
+//! (`itk::RegularStepGradientDescentOptimizerv4`, halving its step on each
+//! overshoot so it converges cleanly at an already-registered pyramid level and
+//! refines the finest one to high precision), or bound-constrained limited-memory
+//! BFGS (`itk::LBFGSBOptimizerv4`, via
+//! [`set_optimizer_as_lbfgsb`](ImageRegistrationMethod::set_optimizer_as_lbfgsb) —
+//! a line-search quasi-Newton method that ignores parameter scales and drives the
+//! raw metric gradient, with optional per-parameter bounds). More sampling
+//! strategies come later.
 
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
 
 use crate::error::{RegistrationError, Result};
+use crate::lbfgsb::LBFGSBOptimizer;
 use crate::mattes::MattesMutualInformationMetric;
 use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 use crate::optimizer::{GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason};
@@ -127,6 +132,56 @@ enum OptimizerKind {
     /// a fixed step length halved on each direction reversal, converging to
     /// `minimum_step_length` and stopping cleanly at an already-converged level.
     RegularStep(RegularStepGradientDescentOptimizer),
+    /// Bound-constrained limited-memory BFGS (`itk::LBFGSBOptimizerv4`). Unlike
+    /// the gradient-descent optimizers it does **not** use parameter scales or a
+    /// learning rate — it drives the raw metric gradient through a line search —
+    /// and it optionally clamps every parameter to a scalar `[lower, upper]` box.
+    Lbfgsb(LbfgsbConfig),
+}
+
+/// Configuration for the L-BFGS-B optimizer, mirroring SimpleITK
+/// `SetOptimizerAsLBFGSB`. The bounds are **scalar**, applied to every parameter;
+/// a bound equal to its sentinel ([`f64::MIN`] lower, [`f64::MAX`] upper) means
+/// "unbounded on that side" (SimpleITK's `DBL_MIN`/`DBL_MAX` defaults).
+#[derive(Clone, Debug)]
+struct LbfgsbConfig {
+    gradient_convergence_tolerance: f64,
+    number_of_iterations: usize,
+    maximum_number_of_corrections: usize,
+    maximum_number_of_function_evaluations: usize,
+    cost_function_convergence_factor: f64,
+    lower_bound: f64,
+    upper_bound: f64,
+}
+
+impl LbfgsbConfig {
+    /// Build the optimizer for a transform with `nparams` parameters, translating
+    /// the scalar bounds into a per-parameter bound selection exactly as SimpleITK
+    /// does: `lower != f64::MIN` activates a lower bound, `upper != f64::MAX` an
+    /// upper bound, and the (lower, upper) activation maps to netlib's `nbd`
+    /// (`0` unbounded, `1` lower, `2` both, `3` upper).
+    fn build(&self, nparams: usize) -> LBFGSBOptimizer {
+        let mut opt = LBFGSBOptimizer::new(self.number_of_iterations);
+        opt.set_gradient_convergence_tolerance(self.gradient_convergence_tolerance)
+            .set_max_corrections(self.maximum_number_of_corrections)
+            .set_max_function_evaluations(self.maximum_number_of_function_evaluations)
+            .set_cost_function_convergence_factor(self.cost_function_convergence_factor);
+
+        let lower_active = self.lower_bound != f64::MIN;
+        let upper_active = self.upper_bound != f64::MAX;
+        let nbd: i32 = match (lower_active, upper_active) {
+            (false, false) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+        };
+        if nbd != 0 {
+            opt.set_bound_selection(vec![nbd; nparams])
+                .set_lower_bound(vec![self.lower_bound; nparams])
+                .set_upper_bound(vec![self.upper_bound; nparams]);
+        }
+        opt
+    }
 }
 
 /// SimpleITK `ImageRegistrationMethod` defaults for convergence monitoring in
@@ -297,6 +352,48 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Use the bound-constrained limited-memory BFGS optimizer
+    /// (`itk::LBFGSBOptimizerv4`), SimpleITK `SetOptimizerAsLBFGSB`. It drives the
+    /// raw metric gradient through a Moré–Thuente line search and, unlike the
+    /// gradient-descent optimizers, **ignores parameter scales and the
+    /// learning-rate estimator** (ITK forces LBFGSB's scales to identity), so any
+    /// [`set_optimizer_scales_from_physical_shift`](Self::set_optimizer_scales_from_physical_shift)
+    /// setting has no effect here.
+    ///
+    /// The bounds are **scalar**, applied to every parameter. Pass [`f64::MIN`]
+    /// for `lower_bound` and [`f64::MAX`] for `upper_bound` to run unbounded on
+    /// that side (SimpleITK's `DBL_MIN`/`DBL_MAX` defaults); any other value
+    /// activates the bound. Stopping is governed by `gradient_convergence_tolerance`
+    /// (projected-gradient infinity norm), `cost_function_convergence_factor`
+    /// (relative function decrease), `number_of_iterations`, and
+    /// `maximum_number_of_function_evaluations`; `maximum_number_of_corrections`
+    /// is the limited-memory depth.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_optimizer_as_lbfgsb(
+        &mut self,
+        gradient_convergence_tolerance: f64,
+        number_of_iterations: usize,
+        maximum_number_of_corrections: usize,
+        maximum_number_of_function_evaluations: usize,
+        cost_function_convergence_factor: f64,
+        lower_bound: f64,
+        upper_bound: f64,
+    ) -> &mut Self {
+        self.optimizer = OptimizerKind::Lbfgsb(LbfgsbConfig {
+            gradient_convergence_tolerance,
+            number_of_iterations,
+            maximum_number_of_corrections,
+            maximum_number_of_function_evaluations,
+            cost_function_convergence_factor,
+            lower_bound,
+            upper_bound,
+        });
+        // LBFGSB has no learning rate; drop any estimated-rate mode a previous
+        // optimizer selection may have set so no estimator is built for it.
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
     /// Set per-parameter optimizer scales manually. Length is validated against
     /// the transform's parameter count in [`execute`](Self::execute).
     pub fn set_optimizer_scales(&mut self, scales: Vec<f64>) -> &mut Self {
@@ -322,6 +419,9 @@ impl ImageRegistrationMethod {
             OptimizerKind::RegularStep(rs) => {
                 rs.set_minimum_step_length(tol);
             }
+            // LBFGSB has no scaled-step tolerance; it stops via its projected-
+            // gradient and function-decrease criteria instead.
+            OptimizerKind::Lbfgsb(_) => {}
         }
         self
     }
@@ -556,25 +656,35 @@ impl ImageRegistrationMethod {
         let start = transform.parameters();
         let backend = self.backend.as_ref();
 
+        // LBFGSB ignores parameter scales and the learning-rate estimator (ITK's
+        // LBFGSBOptimizerv4 forces identity scales), so neither is built for it —
+        // it drives the raw metric gradient directly.
+        let ignores_scales = matches!(self.optimizer, OptimizerKind::Lbfgsb(_));
+
         // A physical-shift estimator is needed if scales or the learning rate
         // are estimated. Jacobians are parameter-independent for these
         // transforms, so building it once at the initial transform is exact.
-        let needs_estimator = matches!(self.scales_mode, ScalesMode::PhysicalShift)
-            || matches!(self.learning_rate_mode, LearningRateMode::Estimate(_));
+        let needs_estimator = !ignores_scales
+            && (matches!(self.scales_mode, ScalesMode::PhysicalShift)
+                || matches!(self.learning_rate_mode, LearningRateMode::Estimate(_)));
         let estimator = needs_estimator.then(|| metric.physical_shift_scales(&transform));
 
-        let scales: Vec<f64> = match &self.scales_mode {
-            ScalesMode::Unit => vec![1.0; nparams],
-            ScalesMode::Manual(s) => {
-                if s.len() != nparams {
-                    return Err(RegistrationError::ScalesLength {
-                        got: s.len(),
-                        expected: nparams,
-                    });
+        let scales: Vec<f64> = if ignores_scales {
+            vec![1.0; nparams]
+        } else {
+            match &self.scales_mode {
+                ScalesMode::Unit => vec![1.0; nparams],
+                ScalesMode::Manual(s) => {
+                    if s.len() != nparams {
+                        return Err(RegistrationError::ScalesLength {
+                            got: s.len(),
+                            expected: nparams,
+                        });
+                    }
+                    s.clone()
                 }
-                s.clone()
+                ScalesMode::PhysicalShift => estimator.as_ref().unwrap().estimate_scales(),
             }
-            ScalesMode::PhysicalShift => estimator.as_ref().unwrap().estimate_scales(),
         };
 
         let scaled = |grad: &[f64]| -> Vec<f64> {
@@ -673,6 +783,12 @@ impl ImageRegistrationMethod {
                     }
                 }
             }
+            OptimizerKind::Lbfgsb(cfg) => {
+                // No scales, no learning-rate estimation: LBFGSB minimizes the raw
+                // metric directly under its own bound/convergence configuration.
+                let optimizer = cfg.build(nparams);
+                optimizer.optimize(start, objective!())
+            }
         };
 
         transform.set_parameters(&result.parameters);
@@ -733,6 +849,92 @@ mod tests {
             "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
             result.metric_value,
             result.iterations
+        );
+    }
+
+    #[test]
+    fn lbfgsb_recovers_a_translation() {
+        // Unbounded LBFGSB drives the raw metric gradient (no scales, no learning
+        // rate) through its line search and recovers the translation end-to-end.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        // Tight pgtol/factr so it converges to high precision on the smooth basin.
+        reg.set_optimizer_as_lbfgsb(1e-8, 500, 5, 2000, 1e3, f64::MIN, f64::MAX);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}, stop {:?}",
+            result.metric_value,
+            result.iterations,
+            result.stop_reason
+        );
+    }
+
+    #[test]
+    fn lbfgsb_respects_parameter_bounds() {
+        // The true shift (3, −2) lies outside the box [−1.5, 1.5]²; the
+        // box-constrained minimizer of the mean-squares objective (monotone within
+        // the box, which sits entirely on the basin's near side) is the nearest
+        // corner (1.5, −1.5). Verify the bounds bind and are respected.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_lbfgsb(1e-8, 500, 5, 2000, 1e5, -1.5, 1.5);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (-1.5 - 1e-9..=1.5 + 1e-9).contains(&p[0])
+                && (-1.5 - 1e-9..=1.5 + 1e-9).contains(&p[1]),
+            "recovered {p:?} outside the box [-1.5, 1.5]"
+        );
+        assert!(
+            (p[0] - 1.5).abs() < 1e-2 && (p[1] + 1.5).abs() < 1e-2,
+            "recovered {p:?}, expected the constrained corner [1.5, -1.5]"
+        );
+    }
+
+    #[test]
+    fn lbfgsb_lower_bound_only_binds_the_out_of_range_parameter() {
+        // A scalar lower bound of 0 (upper unbounded → nbd = 1, lower only) applied
+        // to both parameters. True shift (3, −2): p0 = 3 stays feasible and is
+        // recovered, while p1's free optimum −2 is below 0, so it pins to the
+        // lower bound. Exercises the lower-only bound-selection mapping end-to-end.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_lbfgsb(1e-8, 500, 5, 2000, 1e3, 0.0, f64::MAX);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            p[0] >= -1e-9 && p[1] >= -1e-9,
+            "recovered {p:?} below the lower bound 0"
+        );
+        // p1 is pinned exactly to the lower bound; p0 recovers near 3 (its
+        // residual is looser than the unbounded case because the x-gradient is
+        // weighted by the smaller y-overlap once p1 is held off the true −2).
+        assert!(
+            (p[0] - tx).abs() < 5e-2 && p[1].abs() < 1e-3,
+            "recovered {p:?}, expected p0≈{tx} (feasible) and p1 pinned to 0"
         );
     }
 
