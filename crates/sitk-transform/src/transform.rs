@@ -1570,6 +1570,320 @@ impl CenteredTransform for ScaleVersor3DTransform {
     }
 }
 
+/// A 3-D transform with a versor rotation, per-axis scale, **6-component skew**,
+/// and translation (`itk::ScaleSkewVersor3DTransform`) — 15 parameters, extending
+/// [`ScaleVersor3DTransform`] with the off-diagonal (shear) matrix entries.
+///
+/// Parameters are `[vx, vy, vz, tx, ty, tz, sx, sy, sz, k0, k1, k2, k3, k4, k5]`:
+/// versor right part (3), translation (3), per-axis scale (3), skew (6). `(vx, vy,
+/// vz)` uses the same norm-clamping as [`VersorRigid3DTransform`]; `center` fixed.
+///
+/// # Matrix (ITK's additive form)
+///
+/// As in [`ScaleVersor3DTransform`], scale and skew are **added** onto the versor
+/// rotation — `ComputeMatrix` calls the versor superclass then adds `scaleᵢ − 1` to
+/// each diagonal and the six skews to the off-diagonals in the order
+/// `{xy, xz, yx, yz, zx, zy}`:
+///
+/// ```text
+/// M = R(versor) + diag(sx−1, sy−1, sz−1) + [ 0  k0 k1 ; k2  0 k3 ; k4 k5  0 ]
+/// ```
+///
+/// The offset is `translation + center − M·center`.
+///
+/// # Jacobian
+///
+/// Since scale and skew enter only the (constant-w.r.t.-versor) matrix entries, the
+/// versor columns are exactly [`VersorRigid3DTransform`]'s (÷`w`, no scale factor),
+/// the translation columns are the identity, the scale column `k` is diagonal
+/// (`∂yₖ/∂sₖ = (p − center)ₖ`), and each skew column is the single `(p − center)`
+/// component multiplying that off-diagonal entry. The versor columns share ITK's
+/// `θ = π` (`w = 0`) singularity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScaleSkewVersor3DTransform {
+    /// Normalized versor right part.
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    /// Normalized versor scalar part `√(1 − vx² − vy² − vz²)`.
+    vw: f64,
+    /// Per-axis scale, length 3.
+    scale: Vec<f64>,
+    /// Skew `{xy, xz, yx, yz, zx, zy}`, length 6.
+    skew: Vec<f64>,
+    /// Length 3.
+    translation: Vec<f64>,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 `R + diag(scale − 1) + skew`.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl ScaleSkewVersor3DTransform {
+    /// A transform: rotate by versor right part `(vx, vy, vz)` about `center`, add
+    /// the per-axis `scale` and 6-component `skew` onto the rotation, then
+    /// `translation`. A right part with norm `≥ 1` is scaled to just under 1.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        scale: [f64; 3],
+        skew: [f64; 6],
+        vx: f64,
+        vy: f64,
+        vz: f64,
+        translation: [f64; 3],
+        center: [f64; 3],
+    ) -> Self {
+        let mut t = Self {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            vw: 1.0,
+            scale: scale.to_vec(),
+            skew: skew.to_vec(),
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.set_versor(vx, vy, vz);
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (scale `(1,1,1)`, zero skew, versor `(0,0,0; w=1)`,
+    /// zero translation, center at origin).
+    pub fn identity() -> Self {
+        Self::new(
+            [1.0, 1.0, 1.0],
+            [0.0; 6],
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        )
+    }
+
+    /// Versor right-part X (axis·sin(θ/2)).
+    pub fn versor_x(&self) -> f64 {
+        self.vx
+    }
+
+    /// Versor right-part Y.
+    pub fn versor_y(&self) -> f64 {
+        self.vy
+    }
+
+    /// Versor right-part Z.
+    pub fn versor_z(&self) -> f64 {
+        self.vz
+    }
+
+    /// Versor scalar part `w = √(1 − vx² − vy² − vz²)`.
+    pub fn versor_w(&self) -> f64 {
+        self.vw
+    }
+
+    /// The per-axis scale factors.
+    pub fn scale(&self) -> &[f64] {
+        &self.scale
+    }
+
+    /// The skew components `{xy, xz, yx, yz, zx, zy}`.
+    pub fn skew(&self) -> &[f64] {
+        &self.skew
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 matrix `R + diag(scale − 1) + skew`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Set the normalized versor from a right part, mirroring
+    /// `itk::ScaleSkewVersor3DTransform::SetParameters` (same clamp as
+    /// [`VersorRigid3DTransform`]).
+    fn set_versor(&mut self, vx: f64, vy: f64, vz: f64) {
+        const EPS: f64 = 1e-10;
+        let norm = (vx * vx + vy * vy + vz * vz).sqrt();
+        let (ax, ay, az) = if norm >= 1.0 - EPS {
+            let d = norm + EPS * norm;
+            (vx / d, vy / d, vz / d)
+        } else {
+            (vx, vy, vz)
+        };
+        self.vx = ax;
+        self.vy = ay;
+        self.vz = az;
+        self.vw = (1.0 - (ax * ax + ay * ay + az * az)).max(0.0).sqrt();
+    }
+
+    /// Rebuild the cached matrix `M = R + diag(scale − 1) + skew` (ITK's
+    /// `ComputeMatrix`: versor superclass rotation, then add scale to the diagonal
+    /// and the six skews to the off-diagonals in order `{xy, xz, yx, yz, zx, zy}`)
+    /// and the offset.
+    fn recompute(&mut self) {
+        let (x, y, z, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (xx, yy, zz) = (x * x, y * y, z * z);
+        let (xy, xz, xw) = (x * y, x * z, x * w);
+        let (yz, yw, zw) = (y * z, y * w, z * w);
+        #[rustfmt::skip]
+        let mut m = vec![
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw),       2.0 * (xz + yw),
+            2.0 * (xy + zw),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw),
+            2.0 * (xz - yw),       2.0 * (yz + xw),       1.0 - 2.0 * (xx + yy),
+        ];
+        // Additive scale on the diagonal.
+        m[0] += self.scale[0] - 1.0;
+        m[4] += self.scale[1] - 1.0;
+        m[8] += self.scale[2] - 1.0;
+        // Additive skew on the off-diagonals: {xy, xz, yx, yz, zx, zy}.
+        m[1] += self.skew[0]; // M[0][1]
+        m[2] += self.skew[1]; // M[0][2]
+        m[3] += self.skew[2]; // M[1][0]
+        m[5] += self.skew[3]; // M[1][2]
+        m[6] += self.skew[4]; // M[2][0]
+        m[7] += self.skew[5]; // M[2][1]
+        let m_center = matrix::mat_vec(&m, &self.center, 3);
+        self.offset = (0..3)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+        self.matrix = m;
+    }
+}
+
+impl Transform for ScaleSkewVersor3DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for ScaleSkewVersor3DTransform {
+    fn number_of_parameters(&self) -> usize {
+        15
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.vx,
+            self.vy,
+            self.vz,
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+            self.scale[0],
+            self.scale[1],
+            self.scale[2],
+            self.skew[0],
+            self.skew[1],
+            self.skew[2],
+            self.skew[3],
+            self.skew[4],
+            self.skew[5],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 15, "parameter length");
+        self.set_versor(params[0], params[1], params[2]);
+        self.translation[0] = params[3];
+        self.translation[1] = params[4];
+        self.translation[2] = params[5];
+        self.scale[0] = params[6];
+        self.scale[1] = params[7];
+        self.scale[2] = params[8];
+        self.skew.copy_from_slice(&params[9..15]);
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // itk::ScaleSkewVersor3DTransform::ComputeJacobianWithRespectToParameters:
+        //   cols 0..2 (versor) = the VersorRigid3D rotation Jacobian (÷w), no scale;
+        //   cols 3..5 (translation) = identity;
+        //   cols 6..8 (scale) = diagonal (p − center);
+        //   cols 9..14 (skew) = the (p − center) component of the off-diagonal entry
+        //     each skew fills: {xy, xz, yx, yz, zx, zy}.
+        let (vx, vy, vz, vw) = (self.vx, self.vy, self.vz, self.vw);
+        let (px, py, pz) = (
+            point[0] - self.center[0],
+            point[1] - self.center[1],
+            point[2] - self.center[2],
+        );
+        let (vxx, vyy, vzz, vww) = (vx * vx, vy * vy, vz * vz, vw * vw);
+        let (vxy, vxz, vxw) = (vx * vy, vx * vz, vx * vw);
+        let (vyz, vyw, vzw) = (vy * vz, vy * vw, vz * vw);
+
+        // Row-major 3×15.
+        let mut j = vec![0.0f64; 45];
+        j[0] = 2.0 * ((vyw + vxz) * py + (vzw - vxy) * pz) / vw;
+        j[15] = 2.0 * ((vyw - vxz) * px - 2.0 * vxw * py + (vxx - vww) * pz) / vw;
+        j[30] = 2.0 * ((vzw + vxy) * px + (vww - vxx) * py - 2.0 * vxw * pz) / vw;
+
+        j[1] = 2.0 * (-2.0 * vyw * px + (vxw + vyz) * py + (vww - vyy) * pz) / vw;
+        j[16] = 2.0 * ((vxw - vyz) * px + (vzw + vxy) * pz) / vw;
+        j[31] = 2.0 * ((vyy - vww) * px + (vzw - vxy) * py - 2.0 * vyw * pz) / vw;
+
+        j[2] = 2.0 * (-2.0 * vzw * px + (vzz - vww) * py + (vxw - vyz) * pz) / vw;
+        j[17] = 2.0 * ((vww - vzz) * px - 2.0 * vzw * py + (vyw + vxz) * pz) / vw;
+        j[32] = 2.0 * ((vxw + vyz) * px + (vyw - vxz) * py) / vw;
+
+        // Translation identity block: columns 3, 4, 5.
+        j[3] = 1.0;
+        j[19] = 1.0;
+        j[35] = 1.0;
+
+        // Scale columns 6, 7, 8: diagonal (p − center).
+        j[6] = px;
+        j[22] = py;
+        j[38] = pz;
+
+        // Skew columns 9..14: {xy, xz, yx, yz, zx, zy}.
+        j[9] = py; // ∂y0/∂k0 (M[0][1])
+        j[10] = pz; // ∂y0/∂k1 (M[0][2])
+        j[26] = px; // ∂y1/∂k2 (M[1][0])
+        j[27] = pz; // ∂y1/∂k3 (M[1][2])
+        j[43] = px; // ∂y2/∂k4 (M[2][0])
+        j[44] = py; // ∂y2/∂k5 (M[2][1])
+        j
+    }
+}
+
+impl CenteredTransform for ScaleSkewVersor3DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 3, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2300,6 +2614,117 @@ mod tests {
         let point = [4.0, 5.0, -3.0];
         let mut t = ScaleVersor3DTransform::new(
             [base[6], base[7], base[8]],
+            base[0],
+            base[1],
+            base[2],
+            [base[3], base[4], base[5]],
+            center,
+        );
+        let jac = t.jacobian_wrt_parameters(&point);
+        let n = t.number_of_parameters();
+        let h = 1e-7;
+        for k in 0..n {
+            let mut pp = base;
+            pp[k] += h;
+            t.set_parameters(&pp);
+            let yp = t.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            t.set_parameters(&pm);
+            let ym = t.transform_point(&point);
+            for i in 0..3 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-5,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_skew_versor3d_identity_is_noop() {
+        let t = ScaleSkewVersor3DTransform::identity();
+        assert_eq!(t.number_of_parameters(), 15);
+        assert_eq!(t.scale(), &[1.0, 1.0, 1.0]);
+        assert_eq!(t.skew(), &[0.0; 6]);
+        assert_eq!(t.versor_w(), 1.0);
+        assert_eq!(t.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn scale_skew_versor3d_matrix_adds_scale_and_skew() {
+        // No rotation (R = I): M = diag(scale) + skew off-diagonals in the order
+        // {xy, xz, yx, yz, zx, zy} → M[0][1],M[0][2],M[1][0],M[1][2],M[2][0],M[2][1].
+        let t = ScaleSkewVersor3DTransform::new(
+            [2.0, 3.0, 4.0],
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            0.0,
+            0.0,
+            0.0,
+            [0.0; 3],
+            [0.0; 3],
+        );
+        #[rustfmt::skip]
+        let expect = [
+            2.0, 0.1, 0.2,
+            0.3, 3.0, 0.4,
+            0.5, 0.6, 4.0,
+        ];
+        for (a, b) in t.matrix().iter().zip(expect) {
+            assert!((a - b).abs() < 1e-12, "matrix {:?}", t.matrix());
+        }
+    }
+
+    #[test]
+    fn scale_skew_versor3d_reduces_to_scale_versor_when_skew_zero() {
+        // With zero skew, ScaleSkewVersor3D must match ScaleVersor3D for the same
+        // versor/scale/translation/centre — the additive skew block is the only
+        // structural difference between the two transforms.
+        let (vx, vy, vz) = (0.1, -0.2, 0.15);
+        let scale = [1.3, 0.8, 1.5];
+        let tr = [4.0, -1.0, 2.0];
+        let c = [2.0, -3.0, 1.0];
+        let a = ScaleSkewVersor3DTransform::new(scale, [0.0; 6], vx, vy, vz, tr, c);
+        let b = ScaleVersor3DTransform::new(scale, vx, vy, vz, tr, c);
+        for (ma, mb) in a.matrix().iter().zip(b.matrix()) {
+            assert!((ma - mb).abs() < 1e-12, "matrix mismatch");
+        }
+        let p = [7.0, -3.0, 6.0];
+        for (ya, yb) in a.transform_point(&p).iter().zip(b.transform_point(&p)) {
+            assert!((ya - yb).abs() < 1e-12, "point mismatch");
+        }
+    }
+
+    #[test]
+    fn scale_skew_versor3d_parameters_roundtrip() {
+        let mut t = ScaleSkewVersor3DTransform::identity();
+        let params = [
+            0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5, 0.05, -0.1, 0.15, -0.2, 0.1, -0.05,
+        ];
+        t.set_parameters(&params);
+        let p = t.parameters();
+        assert!(
+            (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
+        );
+        assert_eq!(&p[3..6], &[4.0, 5.0, 6.0]);
+        assert_eq!(&p[6..9], &[1.2, 0.8, 1.5]);
+        assert_eq!(&p[9..15], &[0.05, -0.1, 0.15, -0.2, 0.1, -0.05]);
+    }
+
+    #[test]
+    fn scale_skew_versor3d_jacobian_is_finite_difference_consistent() {
+        // Small right part keeps ‖v‖ below 1; non-unit scale and non-zero skew
+        // exercise the versor, translation, diagonal-scale, and skew columns.
+        let base = [
+            0.12, -0.08, 0.1, 1.0, -2.0, 0.5, 1.3, 0.8, 1.5, 0.05, -0.1, 0.15, -0.2, 0.1, -0.05,
+        ];
+        let center = [2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let mut t = ScaleSkewVersor3DTransform::new(
+            [base[6], base[7], base[8]],
+            [base[9], base[10], base[11], base[12], base[13], base[14]],
             base[0],
             base[1],
             base[2],
