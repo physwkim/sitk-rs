@@ -1291,6 +1291,285 @@ impl CenteredTransform for Similarity3DTransform {
     }
 }
 
+/// A 3-D transform with a versor rotation, an **anisotropic** per-axis scale, and
+/// translation (`itk::ScaleVersor3DTransform`) — 9 DOF, richer than
+/// [`Similarity3DTransform`]'s single isotropic scale.
+///
+/// Parameters are `[vx, vy, vz, tx, ty, tz, sx, sy, sz]`: versor right part (3),
+/// translation (3), per-axis scale (3). `(vx, vy, vz)` uses the same norm-clamping
+/// as [`VersorRigid3DTransform`]; the `center` is fixed.
+///
+/// # Matrix (ITK's additive form, **not** `R·diag(scale)`)
+///
+/// ITK builds the matrix as the rotation with `(scaleᵢ − 1)` **added** to each
+/// diagonal entry — `ComputeMatrix` calls the versor superclass then does
+/// `M[i][i] += scaleᵢ − 1` — so
+///
+/// ```text
+/// M = R(versor) + diag(sx − 1, sy − 1, sz − 1)
+/// ```
+///
+/// This equals `diag(scale)` only when `R = I`; for a non-identity rotation it is
+/// an additive, not multiplicative, scale (a quirk inherited from
+/// `ScaleSkewVersor3DTransform`). The offset is `translation + center − M·center`.
+///
+/// # Jacobian
+///
+/// Because the scale enters only the (constant-w.r.t.-versor) diagonal, the versor
+/// columns are exactly [`VersorRigid3DTransform`]'s (divided by `w`, **no** scale
+/// factor — unlike `Similarity3DTransform`), the translation columns are the
+/// identity, and the scale column `k` is diagonal: `∂yₖ/∂sₖ = (p − center)ₖ`,
+/// off-diagonal zero. The versor columns share ITK's `θ = π` (`w = 0`) singularity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScaleVersor3DTransform {
+    /// Normalized versor right part.
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    /// Normalized versor scalar part `√(1 − vx² − vy² − vz²)`.
+    vw: f64,
+    /// Per-axis scale, length 3.
+    scale: Vec<f64>,
+    /// Length 3.
+    translation: Vec<f64>,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 `R + diag(scale − 1)`.
+    matrix: Vec<f64>,
+    /// Cached `translation + center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl ScaleVersor3DTransform {
+    /// A transform: rotate by versor right part `(vx, vy, vz)` (axis·sin(θ/2))
+    /// about `center`, apply the additive per-axis `scale`, then `translation`. A
+    /// right part with norm `≥ 1` is scaled to just under 1, matching ITK.
+    pub fn new(
+        scale: [f64; 3],
+        vx: f64,
+        vy: f64,
+        vz: f64,
+        translation: [f64; 3],
+        center: [f64; 3],
+    ) -> Self {
+        let mut t = Self {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            vw: 1.0,
+            scale: scale.to_vec(),
+            translation: translation.to_vec(),
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.set_versor(vx, vy, vz);
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (scale `(1,1,1)`, versor `(0,0,0; w=1)`, zero
+    /// translation, center at origin).
+    pub fn identity() -> Self {
+        Self::new(
+            [1.0, 1.0, 1.0],
+            0.0,
+            0.0,
+            0.0,
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        )
+    }
+
+    /// Versor right-part X (axis·sin(θ/2)).
+    pub fn versor_x(&self) -> f64 {
+        self.vx
+    }
+
+    /// Versor right-part Y.
+    pub fn versor_y(&self) -> f64 {
+        self.vy
+    }
+
+    /// Versor right-part Z.
+    pub fn versor_z(&self) -> f64 {
+        self.vz
+    }
+
+    /// Versor scalar part `w = √(1 − vx² − vy² − vz²)`.
+    pub fn versor_w(&self) -> f64 {
+        self.vw
+    }
+
+    /// The per-axis scale factors.
+    pub fn scale(&self) -> &[f64] {
+        &self.scale
+    }
+
+    /// The translation part.
+    pub fn translation(&self) -> &[f64] {
+        &self.translation
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 matrix `R + diag(scale − 1)`.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Translation offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Set the normalized versor from a right part, mirroring
+    /// `itk::ScaleVersor3DTransform::SetParameters` (same clamp as
+    /// [`VersorRigid3DTransform`]).
+    fn set_versor(&mut self, vx: f64, vy: f64, vz: f64) {
+        const EPS: f64 = 1e-10;
+        let norm = (vx * vx + vy * vy + vz * vz).sqrt();
+        let (ax, ay, az) = if norm >= 1.0 - EPS {
+            let d = norm + EPS * norm;
+            (vx / d, vy / d, vz / d)
+        } else {
+            (vx, vy, vz)
+        };
+        self.vx = ax;
+        self.vy = ay;
+        self.vz = az;
+        self.vw = (1.0 - (ax * ax + ay * ay + az * az)).max(0.0).sqrt();
+    }
+
+    /// Rebuild the cached matrix `M = R(versor) + diag(scale − 1)` (ITK's
+    /// `ComputeMatrix`: versor superclass rotation, then `M[i][i] += scaleᵢ − 1`)
+    /// and the offset.
+    fn recompute(&mut self) {
+        let (x, y, z, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (xx, yy, zz) = (x * x, y * y, z * z);
+        let (xy, xz, xw) = (x * y, x * z, x * w);
+        let (yz, yw, zw) = (y * z, y * w, z * w);
+        #[rustfmt::skip]
+        let mut m = vec![
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw),       2.0 * (xz + yw),
+            2.0 * (xy + zw),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw),
+            2.0 * (xz - yw),       2.0 * (yz + xw),       1.0 - 2.0 * (xx + yy),
+        ];
+        // Additive per-axis scale on the diagonal (not R·diag(scale)).
+        m[0] += self.scale[0] - 1.0;
+        m[4] += self.scale[1] - 1.0;
+        m[8] += self.scale[2] - 1.0;
+        let m_center = matrix::mat_vec(&m, &self.center, 3);
+        self.offset = (0..3)
+            .map(|i| self.translation[i] + self.center[i] - m_center[i])
+            .collect();
+        self.matrix = m;
+    }
+}
+
+impl Transform for ScaleVersor3DTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for ScaleVersor3DTransform {
+    fn number_of_parameters(&self) -> usize {
+        9
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![
+            self.vx,
+            self.vy,
+            self.vz,
+            self.translation[0],
+            self.translation[1],
+            self.translation[2],
+            self.scale[0],
+            self.scale[1],
+            self.scale[2],
+        ]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 9, "parameter length");
+        self.set_versor(params[0], params[1], params[2]);
+        self.translation[0] = params[3];
+        self.translation[1] = params[4];
+        self.translation[2] = params[5];
+        self.scale[0] = params[6];
+        self.scale[1] = params[7];
+        self.scale[2] = params[8];
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // itk::ScaleVersor3DTransform::ComputeJacobianWithRespectToParameters:
+        //   cols 0..2 (versor) = the VersorRigid3D rotation Jacobian (÷w), no
+        //     scale factor (scale enters only the constant-w.r.t.-versor diagonal);
+        //   cols 3..5 (translation) = identity;
+        //   cols 6..8 (scale) = diagonal (p − center): ∂yₖ/∂sₖ = ppₖ.
+        let (vx, vy, vz, vw) = (self.vx, self.vy, self.vz, self.vw);
+        let (px, py, pz) = (
+            point[0] - self.center[0],
+            point[1] - self.center[1],
+            point[2] - self.center[2],
+        );
+        let (vxx, vyy, vzz, vww) = (vx * vx, vy * vy, vz * vz, vw * vw);
+        let (vxy, vxz, vxw) = (vx * vy, vx * vz, vx * vw);
+        let (vyz, vyw, vzw) = (vy * vz, vy * vw, vz * vw);
+
+        // Row-major 3×9.
+        let mut j = vec![0.0f64; 27];
+        j[0] = 2.0 * ((vyw + vxz) * py + (vzw - vxy) * pz) / vw;
+        j[9] = 2.0 * ((vyw - vxz) * px - 2.0 * vxw * py + (vxx - vww) * pz) / vw;
+        j[18] = 2.0 * ((vzw + vxy) * px + (vww - vxx) * py - 2.0 * vxw * pz) / vw;
+
+        j[1] = 2.0 * (-2.0 * vyw * px + (vxw + vyz) * py + (vww - vyy) * pz) / vw;
+        j[10] = 2.0 * ((vxw - vyz) * px + (vzw + vxy) * pz) / vw;
+        j[19] = 2.0 * ((vyy - vww) * px + (vzw - vxy) * py - 2.0 * vyw * pz) / vw;
+
+        j[2] = 2.0 * (-2.0 * vzw * px + (vzz - vww) * py + (vxw - vyz) * pz) / vw;
+        j[11] = 2.0 * ((vww - vzz) * px - 2.0 * vzw * py + (vyw + vxz) * pz) / vw;
+        j[20] = 2.0 * ((vxw + vyz) * px + (vyw - vxz) * py) / vw;
+
+        // Translation identity block: columns 3, 4, 5.
+        j[3] = 1.0;
+        j[13] = 1.0;
+        j[23] = 1.0;
+
+        // Scale columns 6, 7, 8: diagonal (p − center).
+        j[6] = px;
+        j[16] = py;
+        j[26] = pz;
+        j
+    }
+}
+
+impl CenteredTransform for ScaleVersor3DTransform {
+    fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    fn set_translation(&mut self, translation: &[f64]) {
+        assert_eq!(translation.len(), 3, "translation length");
+        self.translation.copy_from_slice(translation);
+        self.recompute();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1923,6 +2202,104 @@ mod tests {
         let point = [4.0, 5.0, -3.0];
         let mut t = Similarity3DTransform::new(
             base[6],
+            base[0],
+            base[1],
+            base[2],
+            [base[3], base[4], base[5]],
+            center,
+        );
+        let jac = t.jacobian_wrt_parameters(&point);
+        let n = t.number_of_parameters();
+        let h = 1e-7;
+        for k in 0..n {
+            let mut pp = base;
+            pp[k] += h;
+            t.set_parameters(&pp);
+            let yp = t.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            t.set_parameters(&pm);
+            let ym = t.transform_point(&point);
+            for i in 0..3 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-5,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_versor3d_identity_is_noop() {
+        let t = ScaleVersor3DTransform::identity();
+        assert_eq!(t.number_of_parameters(), 9);
+        assert_eq!(t.scale(), &[1.0, 1.0, 1.0]);
+        assert_eq!(t.versor_w(), 1.0);
+        assert_eq!(t.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn scale_versor3d_anisotropic_scale_no_rotation() {
+        // versor 0 ⇒ R = I ⇒ M = diag(scale). With centre c and no translation,
+        // y = diag(scale)·(p − c) + c.
+        let c = [1.0, -1.0, 2.0];
+        let t = ScaleVersor3DTransform::new([2.0, 3.0, 0.5], 0.0, 0.0, 0.0, [0.0; 3], c);
+        let y = t.transform_point(&[3.0, 1.0, 4.0]);
+        // [2·(3−1)+1, 3·(1+1)−1, 0.5·(4−2)+2] = [5, 5, 3].
+        assert!(
+            (y[0] - 5.0).abs() < 1e-12 && (y[1] - 5.0).abs() < 1e-12 && (y[2] - 3.0).abs() < 1e-12,
+            "{y:?}"
+        );
+    }
+
+    #[test]
+    fn scale_versor3d_matrix_is_additive_not_multiplicative() {
+        use std::f64::consts::FRAC_PI_4;
+        // Rz(90°) with anisotropic scale [2,3,4]. ITK's additive form gives
+        // M = R + diag(scale − 1) = [1,−1,0; 1,2,0; 0,0,4], which differs from the
+        // multiplicative R·diag(scale) = [0,−3,0; 2,0,0; 0,0,4].
+        let t = ScaleVersor3DTransform::new(
+            [2.0, 3.0, 4.0],
+            0.0,
+            0.0,
+            FRAC_PI_4.sin(),
+            [0.0; 3],
+            [0.0; 3],
+        );
+        #[rustfmt::skip]
+        let additive = [1.0, -1.0, 0.0, 1.0, 2.0, 0.0, 0.0, 0.0, 4.0];
+        #[rustfmt::skip]
+        let multiplicative = [0.0, -3.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 4.0];
+        for (a, b) in t.matrix().iter().zip(additive) {
+            assert!((a - b).abs() < 1e-12, "matrix {:?}", t.matrix());
+        }
+        // Confirm the two forms are genuinely different (guards the parity note).
+        assert_ne!(additive, multiplicative);
+    }
+
+    #[test]
+    fn scale_versor3d_parameters_roundtrip() {
+        let mut t = ScaleVersor3DTransform::identity();
+        t.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5]);
+        let p = t.parameters();
+        assert!(
+            (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
+        );
+        assert_eq!(&p[3..6], &[4.0, 5.0, 6.0]);
+        assert_eq!(&p[6..9], &[1.2, 0.8, 1.5]);
+    }
+
+    #[test]
+    fn scale_versor3d_jacobian_is_finite_difference_consistent() {
+        // Small right part keeps ‖v‖ below 1; anisotropic non-unit scale exercises
+        // the versor columns (no scale factor) and the diagonal scale columns.
+        let base = [0.12, -0.08, 0.1, 1.0, -2.0, 0.5, 1.3, 0.8, 1.5];
+        let center = [2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let mut t = ScaleVersor3DTransform::new(
+            [base[6], base[7], base[8]],
             base[0],
             base[1],
             base[2],
