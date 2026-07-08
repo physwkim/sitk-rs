@@ -405,6 +405,97 @@ const GOLDEN_PHI: f64 = 1.618034;
 /// `2 − φ`, the golden-section probe fraction (ITK's `m_Resphi`).
 const GOLDEN_RESPHI: f64 = 2.0 - GOLDEN_PHI;
 
+/// Golden-section search for the learning rate that minimizes the objective along
+/// the descent direction (`itk::GradientDescentLineSearchOptimizerv4::
+/// GoldenSectionSearch`, shared by the conjugate-gradient subclass). `a` and `c`
+/// bracket the minimum, `b` is an interior point, `epsilon` sets the collapse
+/// resolution, and `max_line_search_iterations` caps the recursion depth.
+/// `metricb` caches the objective at `b` across the recursion (`None` means "not
+/// yet evaluated"); `line_value(x)` returns the objective at learning rate `x`.
+///
+/// ITK's fallback for a trial that yields no valid metric samples (its
+/// `metricx == max()` branch) is unreachable here: the objective evaluator always
+/// returns a finite value, with invalid-sample handling upstream in the metric
+/// rather than signaled through a sentinel, so it is omitted.
+#[allow(clippy::too_many_arguments)]
+fn golden_section_search(
+    epsilon: f64,
+    max_line_search_iterations: u32,
+    a: f64,
+    b: f64,
+    c: f64,
+    metricb: Option<f64>,
+    line_search_iterations: &mut u32,
+    line_value: &mut dyn FnMut(f64) -> f64,
+) -> f64 {
+    if *line_search_iterations > max_line_search_iterations {
+        return (c + a) / 2.0;
+    }
+    *line_search_iterations += 1;
+
+    let x = if c - b > b - a {
+        b + GOLDEN_RESPHI * (c - b)
+    } else {
+        b - GOLDEN_RESPHI * (b - a)
+    };
+    if (c - a).abs() < epsilon * (b.abs() + x.abs()) {
+        return (c + a) / 2.0;
+    }
+
+    let metricx = line_value(x);
+    // ITK evaluates the objective at b only when it is not already known, caching
+    // it down the recursion to avoid redundant evaluations.
+    let metricb = metricb.unwrap_or_else(|| line_value(b));
+
+    if metricx < metricb {
+        if c - b > b - a {
+            golden_section_search(
+                epsilon,
+                max_line_search_iterations,
+                b,
+                x,
+                c,
+                Some(metricx),
+                line_search_iterations,
+                line_value,
+            )
+        } else {
+            golden_section_search(
+                epsilon,
+                max_line_search_iterations,
+                a,
+                x,
+                b,
+                Some(metricx),
+                line_search_iterations,
+                line_value,
+            )
+        }
+    } else if c - b > b - a {
+        golden_section_search(
+            epsilon,
+            max_line_search_iterations,
+            a,
+            b,
+            x,
+            Some(metricb),
+            line_search_iterations,
+            line_value,
+        )
+    } else {
+        golden_section_search(
+            epsilon,
+            max_line_search_iterations,
+            x,
+            b,
+            c,
+            Some(metricb),
+            line_search_iterations,
+            line_value,
+        )
+    }
+}
+
 /// Gradient descent with a golden-section line search
 /// (`itk::GradientDescentLineSearchOptimizerv4`).
 ///
@@ -603,7 +694,9 @@ impl GradientDescentLineSearchOptimizer {
                     let trial: Vec<f64> = (0..n).map(|k| p_ref[k] - x * d_ref[k]).collect();
                     eval(&trial).0
                 };
-                self.golden_section_search(
+                golden_section_search(
+                    self.epsilon,
+                    self.maximum_line_search_iterations,
                     base_lr * self.lower_limit,
                     base_lr,
                     base_lr * self.upper_limit,
@@ -643,71 +736,256 @@ impl GradientDescentLineSearchOptimizer {
             stop_reason,
         }
     }
+}
 
-    /// Golden-section search for the learning rate that minimizes the objective
-    /// along the descent direction (`itk::GradientDescentLineSearchOptimizerv4::
-    /// GoldenSectionSearch`). `a` and `c` bracket the minimum, `b` is an interior
-    /// point, and `metricb` caches the objective at `b` across the recursion
-    /// (`None` means "not yet evaluated"). `line_value(x)` returns the objective
-    /// at learning rate `x`.
+/// Conjugate gradient descent with a golden-section line search
+/// (`itk::ConjugateGradientLineSearchOptimizerv4`).
+///
+/// A subclass of the golden-section line search
+/// ([`GradientDescentLineSearchOptimizer`]) that replaces the steepest-descent
+/// direction with a **conjugate** one: each iteration combines the current
+/// (scaled) gradient with the previous search direction, so successive steps do
+/// not undo one another and an elongated basin is descended far faster than plain
+/// gradient descent can manage. The learning rate along that direction is still
+/// chosen by the golden-section line search each iteration.
+///
+/// The direction is the modified Polak–Ribière update
+///
+/// ```text
+/// γ = 〈g − g_prev, g〉 / 〈g_prev, g_prev〉,   reset to 0 if γ ∉ (0, 5]
+/// d ← g + γ · d_prev
+/// ```
+///
+/// where `g` is the scaled gradient. `g_prev` and `d` start at zero, so the first
+/// step is plain steepest descent, and the restart (`γ = 0` outside `(0, 5]`)
+/// drops stale conjugacy — ITK's guard against a direction that is no longer a
+/// descent direction. The step is then `p ← p − learning_rate · d`.
+///
+/// Configuration, scales, stopping (`number_of_iterations`, `min_step_tolerance`,
+/// convergence monitoring), and best-value return match
+/// [`GradientDescentLineSearchOptimizer`].
+#[derive(Clone, Debug)]
+pub struct ConjugateGradientLineSearchOptimizer {
+    learning_rate: f64,
+    number_of_iterations: usize,
+    scales: Option<Vec<f64>>,
+    lower_limit: f64,
+    upper_limit: f64,
+    epsilon: f64,
+    maximum_line_search_iterations: u32,
+    min_step_tolerance: f64,
+    /// `(window_size, minimum_convergence_value)` when value-plateau monitoring
+    /// is enabled; `None` disables it (the default).
+    convergence: Option<(usize, f64)>,
+}
+
+impl ConjugateGradientLineSearchOptimizer {
+    /// A conjugate-gradient line-search optimizer with the given base learning
+    /// rate and iteration cap. The bracket limits (`0` and `5`), line-search
+    /// resolution `epsilon` (`0.01`), and maximum line-search recursion (`20`)
+    /// default to ITK's values; scales default to all-ones, the min-step
+    /// tolerance to `1e-8`, and convergence monitoring is disabled.
+    pub fn new(learning_rate: f64, number_of_iterations: usize) -> Self {
+        Self {
+            learning_rate,
+            number_of_iterations,
+            scales: None,
+            lower_limit: 0.0,
+            upper_limit: 5.0,
+            epsilon: 0.01,
+            maximum_line_search_iterations: 20,
+            min_step_tolerance: 1e-8,
+            convergence: None,
+        }
+    }
+
+    /// Set the base learning rate (ITK's `m_InitialLearningRate`), which the first
+    /// iteration's line search brackets.
+    pub fn set_learning_rate(&mut self, learning_rate: f64) -> &mut Self {
+        self.learning_rate = learning_rate;
+        self
+    }
+
+    /// Set per-parameter scales (length must equal the parameter count).
+    pub fn set_scales(&mut self, scales: Vec<f64>) -> &mut Self {
+        self.scales = Some(scales);
+        self
+    }
+
+    /// Set the lower and upper bracket limits: the line search adjusts the
+    /// learning rate within `[learning_rate · lower, learning_rate · upper]`
+    /// (ITK defaults `0` and `5`).
+    pub fn set_line_search_limits(&mut self, lower: f64, upper: f64) -> &mut Self {
+        self.lower_limit = lower;
+        self.upper_limit = upper;
+        self
+    }
+
+    /// Set the line-search resolution `epsilon` (ITK default `0.01`).
+    pub fn set_epsilon(&mut self, epsilon: f64) -> &mut Self {
+        self.epsilon = epsilon;
+        self
+    }
+
+    /// Set the maximum golden-section recursion depth per iteration (ITK default
+    /// `20`).
+    pub fn set_maximum_line_search_iterations(&mut self, iterations: u32) -> &mut Self {
+        self.maximum_line_search_iterations = iterations;
+        self
+    }
+
+    /// Set the minimum step length below which iteration stops early.
+    pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
+        self.min_step_tolerance = tol;
+        self
+    }
+
+    /// Enable value-plateau convergence monitoring
+    /// (`itk::WindowConvergenceMonitoringFunction`): stop once the windowed
+    /// metric value's trend flattens to at or below `minimum_convergence_value`.
+    pub fn set_convergence(
+        &mut self,
+        window_size: usize,
+        minimum_convergence_value: f64,
+    ) -> &mut Self {
+        self.convergence = Some((window_size, minimum_convergence_value));
+        self
+    }
+
+    /// Configured per-parameter scales, or `None` for all-ones.
+    pub fn scales(&self) -> Option<&[f64]> {
+        self.scales.as_deref()
+    }
+
+    /// Run conjugate-gradient descent with a per-iteration golden-section line
+    /// search from `initial`. `eval(p)` returns `(value, gradient)` of the
+    /// objective at `p`. Returns the lowest-value iterate visited.
     ///
-    /// ITK's fallback for a trial that yields no valid metric samples (its
-    /// `metricx == max()` branch) is unreachable here: the objective evaluator
-    /// always returns a finite value, with invalid-sample handling upstream in
-    /// the metric rather than signaled through a sentinel, so it is omitted.
-    #[allow(clippy::too_many_arguments)]
-    fn golden_section_search(
-        &self,
-        a: f64,
-        b: f64,
-        c: f64,
-        metricb: Option<f64>,
-        line_search_iterations: &mut u32,
-        line_value: &mut dyn FnMut(f64) -> f64,
-    ) -> f64 {
-        if *line_search_iterations > self.maximum_line_search_iterations {
-            return (c + a) / 2.0;
-        }
-        *line_search_iterations += 1;
-
-        let x = if c - b > b - a {
-            b + GOLDEN_RESPHI * (c - b)
-        } else {
-            b - GOLDEN_RESPHI * (b - a)
-        };
-        if (c - a).abs() < self.epsilon * (b.abs() + x.abs()) {
-            return (c + a) / 2.0;
-        }
-
-        let metricx = line_value(x);
-        // ITK evaluates the objective at b only when it is not already known,
-        // caching it down the recursion to avoid redundant evaluations.
-        let metricb = metricb.unwrap_or_else(|| line_value(b));
-
-        if metricx < metricb {
-            if c - b > b - a {
-                self.golden_section_search(
-                    b,
-                    x,
-                    c,
-                    Some(metricx),
-                    line_search_iterations,
-                    line_value,
-                )
-            } else {
-                self.golden_section_search(
-                    a,
-                    x,
-                    b,
-                    Some(metricx),
-                    line_search_iterations,
-                    line_value,
-                )
+    /// Panics if configured scales' length differs from `initial.len()`.
+    pub fn optimize<F>(&self, initial: Vec<f64>, mut eval: F) -> OptimizerResult
+    where
+        F: FnMut(&[f64]) -> (f64, Vec<f64>),
+    {
+        let n = initial.len();
+        let ones = vec![1.0; n];
+        let scales: &[f64] = match &self.scales {
+            Some(s) => {
+                assert_eq!(s.len(), n, "scales length must equal parameter count");
+                s
             }
-        } else if c - b > b - a {
-            self.golden_section_search(a, b, x, Some(metricb), line_search_iterations, line_value)
-        } else {
-            self.golden_section_search(x, b, c, Some(metricb), line_search_iterations, line_value)
+            None => &ones,
+        };
+
+        let mut monitor = self
+            .convergence
+            .map(|(window, _)| WindowConvergenceMonitor::new(window));
+
+        let mut p = initial;
+        let (mut value, mut grad) = eval(&p);
+        let mut best_value = value;
+        let mut best_params = p.clone();
+        let mut base_lr = self.learning_rate;
+
+        // Conjugate-gradient state (itk::ConjugateGradientLineSearchOptimizerv4):
+        // the previous scaled gradient and the running conjugate direction, both
+        // zero-initialized so the first step is plain steepest descent.
+        let mut last_scaled = vec![0.0; n];
+        let mut conjugate = vec![0.0; n];
+
+        let mut stop_reason = StopReason::MaxIterations;
+        let mut taken = 0usize;
+
+        loop {
+            if value < best_value {
+                best_value = value;
+                best_params.copy_from_slice(&p);
+            }
+
+            if let (Some(mon), Some((_, min_cv))) = (monitor.as_mut(), self.convergence) {
+                mon.add_energy_value(value);
+                if let Some(cv) = mon.convergence_value() {
+                    if cv <= min_cv {
+                        stop_reason = StopReason::Converged;
+                        break;
+                    }
+                }
+            }
+
+            if taken >= self.number_of_iterations {
+                // stop_reason is already MaxIterations.
+                break;
+            }
+
+            // Scaled gradient, then the modified Polak–Ribière conjugate
+            // direction: γ = 〈g − g_prev, g〉 / 〈g_prev, g_prev〉, reset to 0
+            // outside (0, 5], and d ← g + γ·d_prev.
+            let scaled: Vec<f64> = (0..n).map(|k| grad[k] / scales[k]).collect();
+            let gamma_denom: f64 = last_scaled.iter().map(|&x| x * x).sum();
+            let mut gamma = 0.0;
+            if gamma_denom > f64::EPSILON {
+                let num: f64 = (0..n)
+                    .map(|k| (scaled[k] - last_scaled[k]) * scaled[k])
+                    .sum();
+                gamma = num / gamma_denom;
+            }
+            if !(0.0..=5.0).contains(&gamma) {
+                gamma = 0.0;
+            }
+            last_scaled.copy_from_slice(&scaled);
+            for k in 0..n {
+                conjugate[k] = scaled[k] + gamma * conjugate[k];
+            }
+
+            // Golden-section search for the learning rate along the conjugate
+            // direction, then step p ← p − lr·d.
+            let mut line_search_iterations = 0u32;
+            let lr = {
+                let p_ref = &p;
+                let d_ref = &conjugate;
+                let mut line_value = |x: f64| -> f64 {
+                    let trial: Vec<f64> = (0..n).map(|k| p_ref[k] - x * d_ref[k]).collect();
+                    eval(&trial).0
+                };
+                golden_section_search(
+                    self.epsilon,
+                    self.maximum_line_search_iterations,
+                    base_lr * self.lower_limit,
+                    base_lr,
+                    base_lr * self.upper_limit,
+                    None,
+                    &mut line_search_iterations,
+                    &mut line_value,
+                )
+            };
+            base_lr = lr;
+
+            let mut step_sq = 0.0;
+            for k in 0..n {
+                let step = lr * conjugate[k];
+                p[k] -= step;
+                step_sq += step * step;
+            }
+            taken += 1;
+
+            let (v, g) = eval(&p);
+            value = v;
+            grad = g;
+
+            if step_sq.sqrt() < self.min_step_tolerance {
+                if value < best_value {
+                    best_value = value;
+                    best_params.copy_from_slice(&p);
+                }
+                stop_reason = StopReason::StepTooSmall;
+                break;
+            }
+        }
+
+        OptimizerResult {
+            parameters: best_params,
+            value: best_value,
+            iterations: taken,
+            stop_reason,
         }
     }
 }
@@ -884,6 +1162,88 @@ mod tests {
         // convergence check once the metric value flattens near the minimum,
         // mirroring the base GradientDescentOptimizerv4 stop condition.
         let mut opt = GradientDescentLineSearchOptimizer::new(1.0, 100_000);
+        opt.set_min_step_tolerance(0.0).set_convergence(5, 1e-8);
+        let r = opt.optimize(vec![0.0, 0.0], |p| {
+            let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];
+            let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
+            (v, g)
+        });
+        assert_eq!(r.stop_reason, StopReason::Converged);
+        assert!(r.iterations < 100_000);
+        assert!((r.parameters[0] - 3.0).abs() < 1e-3, "{:?}", r.parameters);
+        assert!((r.parameters[1] + 2.0).abs() < 1e-3, "{:?}", r.parameters);
+    }
+
+    #[test]
+    fn conjugate_gradient_minimizes_a_quadratic_bowl() {
+        // f(p) = (p0 − 3)² + (p1 + 2)², minimum at (3, −2).
+        let opt = ConjugateGradientLineSearchOptimizer::new(1.0, 100);
+        let r = opt.optimize(vec![0.0, 0.0], |p| {
+            let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];
+            let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
+            (v, g)
+        });
+        assert!((r.parameters[0] - 3.0).abs() < 1e-4, "{:?}", r.parameters);
+        assert!((r.parameters[1] + 2.0).abs() < 1e-4, "{:?}", r.parameters);
+        assert!(r.value < 1e-8);
+    }
+
+    #[test]
+    fn conjugate_gradient_descends_an_ill_conditioned_valley_faster_than_line_search() {
+        // f(p) = (p0 − 3)² + 50·(p1 + 2)² is an elongated valley (condition ~50)
+        // where steepest descent zig-zags. The conjugate direction combines
+        // successive gradients so it reaches the minimum in far fewer iterations
+        // than the plain golden-section line search on the identical problem.
+        let f = |p: &[f64]| {
+            let v = (p[0] - 3.0).powi(2) + 50.0 * (p[1] + 2.0).powi(2);
+            let g = vec![2.0 * (p[0] - 3.0), 100.0 * (p[1] + 2.0)];
+            (v, g)
+        };
+        let cg = ConjugateGradientLineSearchOptimizer::new(1.0, 1000).optimize(vec![0.0, 0.0], f);
+        let ls = GradientDescentLineSearchOptimizer::new(1.0, 1000).optimize(vec![0.0, 0.0], f);
+
+        assert!((cg.parameters[0] - 3.0).abs() < 1e-3, "{:?}", cg.parameters);
+        assert!((cg.parameters[1] + 2.0).abs() < 1e-3, "{:?}", cg.parameters);
+        assert!(
+            cg.iterations < ls.iterations,
+            "conjugate gradient took {} iterations, line search {}",
+            cg.iterations,
+            ls.iterations
+        );
+    }
+
+    #[test]
+    fn conjugate_gradient_scales_balance_anisotropic_conditioning() {
+        // f(p) = (p0 − 1)² + 1e6·(p1 − 1)². Scales = [1, 1e6] restore the
+        // conditioning so the conjugate search serves both axes at once.
+        let mut opt = ConjugateGradientLineSearchOptimizer::new(1.0, 500);
+        opt.set_scales(vec![1.0, 1e6]);
+        let r = opt.optimize(vec![0.0, 0.0], |p| {
+            let v = (p[0] - 1.0).powi(2) + 1e6 * (p[1] - 1.0).powi(2);
+            let g = vec![2.0 * (p[0] - 1.0), 2e6 * (p[1] - 1.0)];
+            (v, g)
+        });
+        assert!((r.parameters[0] - 1.0).abs() < 1e-3, "{:?}", r.parameters);
+        assert!((r.parameters[1] - 1.0).abs() < 1e-3, "{:?}", r.parameters);
+    }
+
+    #[test]
+    fn conjugate_gradient_stops_early_when_step_is_tiny() {
+        // Near the minimum the step shrinks below the min-step tolerance, stopping
+        // before the iteration cap.
+        let mut opt = ConjugateGradientLineSearchOptimizer::new(1.0, 100_000);
+        opt.set_min_step_tolerance(1e-6);
+        let r = opt.optimize(vec![0.0], |p| (p[0] * p[0], vec![2.0 * p[0]]));
+        assert_eq!(r.stop_reason, StopReason::StepTooSmall);
+        assert!(r.iterations < 100_000);
+        assert!(r.parameters[0].abs() < 1e-4, "{:?}", r.parameters);
+    }
+
+    #[test]
+    fn conjugate_gradient_stops_on_convergence_monitor() {
+        // With value-plateau monitoring enabled, the run stops on the windowed
+        // convergence check once the metric value flattens near the minimum.
+        let mut opt = ConjugateGradientLineSearchOptimizer::new(1.0, 100_000);
         opt.set_min_step_tolerance(0.0).set_convergence(5, 1e-8);
         let r = opt.optimize(vec![0.0, 0.0], |p| {
             let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];

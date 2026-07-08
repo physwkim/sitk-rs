@@ -133,7 +133,7 @@ pub use mattes::MattesMutualInformationMetric;
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 pub use optimizer::{
-    GradientDescentLineSearchOptimizer, GradientDescentOptimizer, OptimizerResult,
-    RegularStepGradientDescentOptimizer, StopReason,
+    ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
+    GradientDescentOptimizer, OptimizerResult, RegularStepGradientDescentOptimizer, StopReason,
 };
 pub use scales::PhysicalShiftScales;
