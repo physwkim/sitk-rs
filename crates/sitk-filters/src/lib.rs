@@ -37,6 +37,8 @@ pub mod label;
 pub mod logic;
 pub mod math;
 pub mod morphology;
+pub mod noise;
+mod random;
 pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod shrink;
@@ -79,6 +81,7 @@ pub use morphology::{
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
+pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
