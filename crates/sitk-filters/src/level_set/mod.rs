@@ -1,5 +1,6 @@
-//! Segmentation level-set filters: `GeodesicActiveContourLevelSetImageFilter`
-//! and `ShapeDetectionLevelSetImageFilter`.
+//! Segmentation level-set filters: `GeodesicActiveContourLevelSetImageFilter`,
+//! `ShapeDetectionLevelSetImageFilter` and
+//! `ThresholdSegmentationLevelSetImageFilter`.
 //!
 //! Ported from ITK's `Modules/Segmentation/LevelSets` and
 //! `Modules/Core/FiniteDifference`:
@@ -9,23 +10,58 @@
 //! | [`grid`] | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
 //! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx` |
 //! | [`sparse_field`] | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
-//! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx`, `itkGeodesicActiveContourLevelSetFunction.h/.hxx`, `itkGeodesicActiveContourLevelSetImageFilter.h/.hxx`, `itkShapeDetectionLevelSetFunction.h/.hxx`, `itkShapeDetectionLevelSetImageFilter.h/.hxx` |
+//! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx` plus each filter's `itk*LevelSetFunction.h/.hxx` + `itk*LevelSetImageFilter.h/.hxx` pair |
 //!
-//! Both filters take an **initial level set** — a real image whose zero
-//! crossing is the starting contour, negative inside — and a **feature image**,
-//! the edge potential map (near `0` on edges, near `1` inside homogeneous
-//! regions), typically `1 / (1 + |grad(G * I)|)`
+//! Every filter takes an **initial level set** — a real image whose zero
+//! crossing is the starting front, negative inside — and a **feature image**,
+//! from which that filter's `CalculateSpeedImage` derives the speed. The output
+//! is the evolved level set: negative inside the segmented region, positive
+//! outside, with the zero crossing on the front. (ITK's own
+//! `ThresholdSegmentationLevelSetImageFilter` header, copied into SimpleITK's
+//! yaml, states the opposite sign convention; the code follows the convention
+//! stated here, so the doc is simply wrong.)
+//!
+//! For [`geodesic_active_contour_level_set`] and [`shape_detection_level_set`]
+//! the feature image is an edge potential map (near `0` on edges, near `1`
+//! inside homogeneous regions), typically `1 / (1 + |grad(G * I)|)`
 //! ([`bounded_reciprocal`](crate::bounded_reciprocal) of
-//! [`gradient_magnitude_recursive_gaussian`](crate::gradient_magnitude_recursive_gaussian)).
-//! The output is the evolved level set: negative inside the segmented region,
-//! positive outside, with the zero crossing on the propagating front.
+//! [`gradient_magnitude_recursive_gaussian`](crate::gradient_magnitude_recursive_gaussian)),
+//! and the speed image is a verbatim copy of it. For
+//! [`threshold_segmentation_level_set`] the feature image is the raw image to
+//! segment.
 //!
-//! SimpleITK's yaml declares both for `RealPixelIDTypeList`; ITK's
+//! SimpleITK's yamls declare all three for `RealPixelIDTypeList`; ITK's
 //! `TOutputPixelType` template parameter defaults to `float`, so the output is
 //! always [`PixelId::Float32`] regardless of input type. `IsoSurfaceValue` is
-//! fixed at `0` by `SegmentationLevelSetImageFilter`'s constructor and neither
-//! SimpleITK filter exposes it, so the shifted image equals the initial level
-//! set.
+//! fixed at `0` by `SegmentationLevelSetImageFilter`'s constructor and none of
+//! these three SimpleITK filters exposes it, so the shifted image equals the
+//! initial level set.
+//!
+//! ## Upstream behaviour reproduced here
+//!
+//! * **The functions' `Initialize` weights never survive.** Each
+//!   `SegmentationLevelSetFunction` subclass's `Initialize(radius)` installs its
+//!   own default weights — `ThresholdSegmentationLevelSetFunction` sets the
+//!   propagation weight to `-1` and the curvature weight to `+1`. But
+//!   `Initialize` runs from `SetSegmentationFunction`, i.e. in the filter's
+//!   constructor (itkSegmentationLevelSetImageFilter.h:457-467), and SimpleITK's
+//!   generated `Execute` then calls `SetPropagationScaling`/`SetCurvatureScaling`
+//!   unconditionally. So the exposed scalings *are* the weights, and these ports
+//!   take them directly.
+//!
+//! * **`CurvatureSpeed` differs between the filters.** Only the geodesic active
+//!   contour and shape detection functions override it to return
+//!   `PropagationSpeed`; `ThresholdSegmentationLevelSetFunction` inherits
+//!   `LevelSetFunction::CurvatureSpeed`'s constant `1`, so its curvature term is
+//!   not damped by the speed image.
+//!
+//! * **`ThresholdSegmentationLevelSetFunction`'s `EdgeWeight` branch is dead.**
+//!   `CalculateSpeedImage` adds `m_EdgeWeight * Laplacian(GradientAnisotropicDiffusion(feature))`
+//!   when `m_EdgeWeight != 0`, controlled by `SmoothingIterations` (5),
+//!   `SmoothingConductance` (0.8) and `SmoothingTimeStep` (0.1). SimpleITK's
+//!   `ThresholdSegmentationLevelSetImageFilter.yaml` exposes none of the four,
+//!   and ITK's constructor sets `m_EdgeWeight = 0`, so the branch is
+//!   unreachable through the SimpleITK API and is not ported.
 
 mod function;
 mod grid;
@@ -35,7 +71,7 @@ use crate::canny::zero_crossing_values;
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
-use function::LevelSetFunction;
+use function::{CurvatureSpeed, LevelSetFunction};
 use sitk_core::{Image, PixelId};
 use sparse_field::SparseFieldSolver;
 
@@ -98,17 +134,27 @@ pub fn geodesic_active_contour_level_set(
     number_of_iterations: u32,
     reverse_expansion_direction: bool,
 ) -> Result<LevelSetResult> {
+    check_same_size(initial_level_set, feature_image)?;
+    let advection = if advection_scaling == 0.0 {
+        Vec::new()
+    } else {
+        advection_field(feature_image)?
+    };
     solve(
         initial_level_set,
-        feature_image,
-        Weights {
-            propagation: propagation_scaling,
-            curvature: curvature_scaling,
-            advection: advection_scaling,
+        Solve {
+            speed: feature_image.to_f64_vec(),
+            advection,
+            curvature_speed: CurvatureSpeed::Propagation,
+            weights: Weights {
+                propagation: propagation_scaling,
+                curvature: curvature_scaling,
+                advection: advection_scaling,
+            },
+            maximum_rms_error,
+            number_of_iterations,
+            reverse_expansion_direction,
         },
-        maximum_rms_error,
-        number_of_iterations,
-        reverse_expansion_direction,
     )
 }
 
@@ -142,17 +188,83 @@ pub fn shape_detection_level_set(
     number_of_iterations: u32,
     reverse_expansion_direction: bool,
 ) -> Result<LevelSetResult> {
+    check_same_size(initial_level_set, feature_image)?;
     solve(
         initial_level_set,
-        feature_image,
-        Weights {
-            propagation: propagation_scaling,
-            curvature: curvature_scaling,
-            advection: 0.0,
+        Solve {
+            speed: feature_image.to_f64_vec(),
+            advection: Vec::new(),
+            curvature_speed: CurvatureSpeed::Propagation,
+            weights: Weights {
+                propagation: propagation_scaling,
+                curvature: curvature_scaling,
+                advection: 0.0,
+            },
+            maximum_rms_error,
+            number_of_iterations,
+            reverse_expansion_direction,
         },
-        maximum_rms_error,
-        number_of_iterations,
-        reverse_expansion_direction,
+    )
+}
+
+/// `ThresholdSegmentationLevelSetImageFilter`: the speed is the feature
+/// image's distance to the nearer edge of the intensity window
+/// `[lower_threshold, upper_threshold]`, positive inside the window and
+/// negative outside, so the front locks onto the window's boundary.
+///
+/// `ThresholdSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:58-83)
+/// splits at the window's midpoint `mid = (U - L) / 2 + L`:
+///
+/// ```text
+/// speed(x) = g(x) - L   if g(x) < mid
+///          = U - g(x)   otherwise
+/// ```
+///
+/// The comparison is strict, so a feature value exactly at `mid` takes the
+/// upper branch. `lower_threshold > upper_threshold` is not rejected by ITK
+/// and is not rejected here; it simply makes the speed negative everywhere.
+///
+/// The update is `phi_t = -beta P(x) |grad(phi)| + gamma kappa |grad(phi)|`:
+/// there is no advection term (`Initialize` pins the advection weight to zero)
+/// and, unlike [`geodesic_active_contour_level_set`], the curvature term is
+/// *not* modulated by the speed — `SegmentationLevelSetFunction` leaves
+/// `CurvatureSpeed` at the base `LevelSetFunction`'s constant `1`.
+///
+/// Argument order follows SimpleITK's
+/// `ThresholdSegmentationLevelSetImageFilter.yaml`; its defaults are
+/// `lower_threshold = 0.0`, `upper_threshold = 255.0`,
+/// `maximum_rms_error = 0.02`, both scalings `1.0`,
+/// `number_of_iterations = 1000`, `reverse_expansion_direction = false`.
+///
+/// Errors if the two images differ in size.
+#[allow(clippy::too_many_arguments)]
+pub fn threshold_segmentation_level_set(
+    initial_level_set: &Image,
+    feature_image: &Image,
+    lower_threshold: f64,
+    upper_threshold: f64,
+    maximum_rms_error: f64,
+    propagation_scaling: f64,
+    curvature_scaling: f64,
+    number_of_iterations: u32,
+    reverse_expansion_direction: bool,
+) -> Result<LevelSetResult> {
+    check_same_size(initial_level_set, feature_image)?;
+    solve(
+        initial_level_set,
+        Solve {
+            speed: threshold_speed(feature_image, lower_threshold, upper_threshold),
+            advection: Vec::new(),
+            curvature_speed: CurvatureSpeed::Unit,
+            weights: Weights {
+                propagation: propagation_scaling,
+                curvature: curvature_scaling,
+                advection: 0.0,
+            },
+            maximum_rms_error,
+            number_of_iterations,
+            reverse_expansion_direction,
+        },
     )
 }
 
@@ -163,51 +275,51 @@ struct Weights {
     advection: f64,
 }
 
-/// `SegmentationLevelSetImageFilter::GenerateData` (hxx:65-102) plus the two
-/// concrete filters' `GenerateData` overrides, which force the speed image into
-/// existence when the propagation weight is zero but the curvature weight is
-/// not (both functions' `CurvatureSpeed` samples the speed image). Since the
-/// speed image is a verbatim copy of the feature image
-/// (`CalculateSpeedImage`), this port simply always holds it.
-fn solve(
-    initial_level_set: &Image,
-    feature_image: &Image,
+/// Everything the concrete filter hands to
+/// `SegmentationLevelSetImageFilter::GenerateData`: the already-generated speed
+/// and advection images, the term weights, and the stopping criteria.
+struct Solve {
+    /// `SegmentationLevelSetFunction::m_SpeedImage`, as each subclass's
+    /// `CalculateSpeedImage` produced it.
+    speed: Vec<f64>,
+    /// `m_AdvectionImage`, one buffer per axis. Empty when the advection weight
+    /// is zero — ITK never allocates the image then either.
+    advection: Vec<Vec<f64>>,
+    curvature_speed: CurvatureSpeed,
     weights: Weights,
     maximum_rms_error: f64,
     number_of_iterations: u32,
     reverse_expansion_direction: bool,
-) -> Result<LevelSetResult> {
-    if initial_level_set.size() != feature_image.size() {
-        return Err(FilterError::SizeMismatch {
-            a: initial_level_set.size().to_vec(),
-            b: feature_image.size().to_vec(),
-        });
-    }
+}
 
+/// `SegmentationLevelSetImageFilter::GenerateData` (hxx:64-101).
+///
+/// ITK generates the speed image only when the propagation weight is non-zero
+/// and the advection image only when the advection weight is non-zero. Every
+/// caller here has already generated both (the advection buffer is left empty
+/// when the weight is zero), because for the `CurvatureSpeed::Propagation`
+/// functions the curvature term samples the speed image even at a zero
+/// propagation weight — which is exactly why
+/// `GeodesicActiveContourLevelSetImageFilter::GenerateData` and
+/// `ShapeDetectionLevelSetImageFilter::GenerateData` override `GenerateData` to
+/// force the speed image into existence.
+fn solve(initial_level_set: &Image, s: Solve) -> Result<LevelSetResult> {
     // "A positive speed value causes surface expansion, the opposite of the
     // default. Flip the sign of the propagation and advection weights."
-    let sign = if reverse_expansion_direction {
+    let sign = if s.reverse_expansion_direction {
         -1.0
     } else {
         1.0
     };
-    let propagation_weight = sign * weights.propagation;
-    let advection_weight = sign * weights.advection;
-
-    let speed = feature_image.to_f64_vec();
-    let advection = if advection_weight != 0.0 {
-        advection_field(feature_image)?
-    } else {
-        Vec::new()
-    };
 
     let spacing = initial_level_set.spacing().to_vec();
     let func = LevelSetFunction::new(
-        speed,
-        advection,
-        advection_weight,
-        propagation_weight,
-        weights.curvature,
+        s.speed,
+        s.advection,
+        sign * s.weights.advection,
+        sign * s.weights.propagation,
+        s.weights.curvature,
+        s.curvature_speed,
         &spacing,
     );
 
@@ -223,7 +335,7 @@ fn solve(
         zero_crossings,
         func,
     );
-    let out = solver.run(maximum_rms_error, number_of_iterations);
+    let out = solver.run(s.maximum_rms_error, s.number_of_iterations);
 
     Ok(LevelSetResult {
         image: image_from_f64(
@@ -266,6 +378,35 @@ fn advection_field(feature_image: &Image) -> Result<Vec<Vec<f64>>> {
         );
     }
     Ok(fields)
+}
+
+/// The two inputs of every `SegmentationLevelSetImageFilter` must occupy the
+/// same grid.
+fn check_same_size(initial_level_set: &Image, feature_image: &Image) -> Result<()> {
+    if initial_level_set.size() != feature_image.size() {
+        return Err(FilterError::SizeMismatch {
+            a: initial_level_set.size().to_vec(),
+            b: feature_image.size().to_vec(),
+        });
+    }
+    Ok(())
+}
+
+/// `ThresholdSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:58-83)
+/// with `m_EdgeWeight == 0`.
+fn threshold_speed(feature_image: &Image, lower_threshold: f64, upper_threshold: f64) -> Vec<f64> {
+    let mid = ((upper_threshold - lower_threshold) / 2.0) + lower_threshold;
+    feature_image
+        .to_f64_vec()
+        .into_iter()
+        .map(|g| {
+            if g < mid {
+                g - lower_threshold
+            } else {
+                upper_threshold - g
+            }
+        })
+        .collect()
 }
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry.
@@ -659,5 +800,202 @@ mod tests {
             shape_detection_level_set(&initial, &constant_feature(1.0), 0.0, 1.0, 0.0, 1, false)
                 .unwrap();
         assert_eq!(result.image.pixel_id(), PixelId::Float32);
+    }
+
+    // ======================================================================
+    // ThresholdSegmentationLevelSetImageFilter
+    // ======================================================================
+
+    /// A `1 x 7` feature image carrying the six interesting positions of the
+    /// window `[50, 150]`, whose midpoint is `100`.
+    #[test]
+    fn threshold_speed_splits_at_the_window_midpoint() {
+        let feature =
+            Image::from_vec(&[7, 1], vec![0.0, 50.0, 99.0, 100.0, 150.0, 151.0, 200.0]).unwrap();
+        let speed = threshold_speed(&feature, 50.0, 150.0);
+
+        // g < 100: g - 50.  g >= 100: 150 - g.  Zero on both window edges,
+        // negative outside the window, peaking at 50 on the midpoint.
+        assert_eq!(speed, vec![-50.0, 0.0, 49.0, 50.0, 0.0, -1.0, -50.0]);
+    }
+
+    /// The speed is a tent: it rises as `g - L` up to the midpoint and falls as
+    /// `U - g` after it, peaking at `(U - L) / 2`. Both branches evaluate to the
+    /// half-width at `mid` itself, which is why the strict `<` in
+    /// `CalculateSpeedImage` is unobservable there. For `[0, 10]`, `mid = 5` and
+    /// the peak is `5`.
+    #[test]
+    fn threshold_speed_is_a_tent_peaking_at_the_midpoint() {
+        let feature = Image::from_vec(&[3, 1], vec![4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(threshold_speed(&feature, 0.0, 10.0), vec![4.0, 5.0, 4.0]);
+    }
+
+    /// `lower_threshold > upper_threshold` is not rejected by ITK; the tent
+    /// inverts and the speed is negative everywhere but the midpoint.
+    #[test]
+    fn threshold_speed_accepts_an_inverted_window() {
+        let feature = Image::from_vec(&[3, 1], vec![4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(threshold_speed(&feature, 10.0, 0.0), vec![-6.0, -5.0, -6.0]);
+    }
+
+    /// The intensity plateau the threshold filter is built to find: a disk of
+    /// value `100` on a background of `0`.
+    fn plateau(radius: f64) -> Image {
+        let mut values = vec![0.0; N * N];
+        for y in 0..N {
+            for x in 0..N {
+                if radius_from(x, y) <= radius {
+                    values[x + N * y] = 100.0;
+                }
+            }
+        }
+        image_from(values)
+    }
+
+    /// End to end: a seed circle of radius `4` inside a plateau of radius `12`
+    /// grows until it reaches the plateau boundary and stops there. With the
+    /// window `[50, 150]` the speed is `+50` on the plateau (`100 >= mid = 100`,
+    /// so `150 - 100`) and `-50` off it (`0 < 100`, so `0 - 50`), a stable
+    /// equilibrium exactly on the boundary.
+    #[test]
+    fn threshold_grows_a_seed_to_fill_an_intensity_plateau() {
+        let true_radius = 12.0;
+        let result = threshold_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(true_radius),
+            50.0,
+            150.0,
+            0.0,
+            1.0,
+            1.0,
+            200,
+            false,
+        )
+        .unwrap();
+
+        let radius = enclosed_radius(&result.image);
+        assert!(
+            (radius - true_radius).abs() <= 1.0,
+            "front settled at radius {radius}, expected {true_radius}"
+        );
+    }
+
+    /// `ReverseExpansionDirection` negates the propagation weight — and there is
+    /// no advection weight to negate — so it is indistinguishable from negating
+    /// `propagation_scaling`. Pinned as exact pixel equality.
+    #[test]
+    fn threshold_reverse_expansion_direction_negates_the_propagation_weight() {
+        let feature = plateau(12.0);
+        let reversed = threshold_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            50.0,
+            150.0,
+            0.0,
+            1.0,
+            1.0,
+            20,
+            true,
+        )
+        .unwrap();
+        let negated = threshold_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            50.0,
+            150.0,
+            0.0,
+            -1.0,
+            1.0,
+            20,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+        // And it really does reverse: forward growth, reversed shrinkage.
+        let forward = threshold_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            50.0,
+            150.0,
+            0.0,
+            1.0,
+            1.0,
+            20,
+            false,
+        )
+        .unwrap();
+        assert!(enclosed_radius(&forward.image) > 8.5);
+        assert!(enclosed_radius(&reversed.image) < 7.5);
+    }
+
+    /// Unlike the geodesic active contour, the threshold function inherits
+    /// `LevelSetFunction::CurvatureSpeed`'s constant `1`, so the curvature term
+    /// is alive even where the speed image is zero. A seed circle on a feature
+    /// image whose speed vanishes everywhere (`g == mid` is impossible; use
+    /// `g == lower == upper`) still shrinks under pure curvature flow.
+    #[test]
+    fn threshold_curvature_is_not_damped_by_a_vanishing_speed() {
+        let feature = constant_feature(50.0);
+        assert_eq!(threshold_speed(&feature, 50.0, 50.0), vec![0.0; N * N]);
+
+        let result = threshold_segmentation_level_set(
+            &circle_level_set(12.0),
+            &feature,
+            50.0,
+            50.0,
+            0.0,
+            1.0,
+            1.0,
+            30,
+            false,
+        )
+        .unwrap();
+
+        let radius = enclosed_radius(&result.image);
+        assert!(radius < 11.0, "curvature flow left the radius at {radius}");
+        assert!(radius > 0.0);
+    }
+
+    #[test]
+    fn threshold_zero_iterations_leaves_the_contour_where_it_started() {
+        let result = threshold_segmentation_level_set(
+            &circle_level_set(8.0),
+            &plateau(12.0),
+            50.0,
+            150.0,
+            0.02,
+            1.0,
+            1.0,
+            0,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.elapsed_iterations, 0);
+        assert_eq!(result.rms_change, 0.0);
+        assert!((enclosed_radius(&result.image) - 8.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn threshold_rejects_mismatched_input_sizes() {
+        let feature = Image::from_vec(&[8, 8], vec![1.0; 64]).unwrap();
+        assert_eq!(
+            threshold_segmentation_level_set(
+                &circle_level_set(8.0),
+                &feature,
+                0.0,
+                255.0,
+                0.02,
+                1.0,
+                1.0,
+                10,
+                false
+            ),
+            Err(FilterError::SizeMismatch {
+                a: vec![N, N],
+                b: vec![8, 8],
+            })
+        );
     }
 }

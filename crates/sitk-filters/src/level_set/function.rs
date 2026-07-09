@@ -10,20 +10,32 @@
 //! ```
 //!
 //! and `ComputeUpdate` returns `curvature - propagation - advection` (the
-//! Laplacian-smoothing term is dropped: neither
-//! `GeodesicActiveContourLevelSetFunction` nor `ShapeDetectionLevelSetFunction`
-//! ever gives it a non-zero weight). Inside the surface is negative, outside is
-//! positive.
+//! Laplacian-smoothing term is dropped: none of the concrete functions ported
+//! here ever gives it a non-zero weight). Inside the surface is negative,
+//! outside is positive.
 //!
-//! Both concrete functions ported here override `CurvatureSpeed` to return
+//! `Z(x)` is `CurvatureSpeed`. `LevelSetFunction::CurvatureSpeed` returns `1`
+//! (itkLevelSetFunction.h:216-220) and `SegmentationLevelSetFunction` does not
+//! override it, so the threshold, Laplacian and Canny functions all curve at
+//! unit speed. `GeodesicActiveContourLevelSetFunction` and
+//! `ShapeDetectionLevelSetFunction` *do* override it to return
 //! `PropagationSpeed` (itkGeodesicActiveContourLevelSetFunction.h:115-120,
-//! itkShapeDetectionLevelSetFunction.h:104-109), so a single [`speed`] buffer —
-//! a copy of the feature image, per each function's `CalculateSpeedImage` —
-//! feeds both terms.
+//! itkShapeDetectionLevelSetFunction.h:104-109), so for those two the [`speed`]
+//! buffer feeds both terms. [`CurvatureSpeed`] selects between the two.
 //!
 //! [`speed`]: LevelSetFunction::speed
 
 use super::grid::Grid;
+
+/// Which `CurvatureSpeed` override the concrete `SegmentationLevelSetFunction`
+/// subclass uses for the `Z(x)` factor of the curvature term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CurvatureSpeed {
+    /// `LevelSetFunction::CurvatureSpeed`, the un-overridden base: constant `1`.
+    Unit,
+    /// Overridden to return `PropagationSpeed`, i.e. the speed image.
+    Propagation,
+}
 
 /// `LevelSetFunction::GlobalDataStruct`: the derivatives cached by
 /// `ComputeUpdate` for the term helpers, plus the per-iteration maxima that
@@ -66,8 +78,10 @@ impl GlobalData {
 /// The segmentation level-set function: the three term weights plus the
 /// pre-generated speed and advection images they sample.
 pub(super) struct LevelSetFunction {
-    /// `SegmentationLevelSetFunction::m_SpeedImage`, sampled by both
-    /// `PropagationSpeed` and `CurvatureSpeed`.
+    /// `SegmentationLevelSetFunction::m_SpeedImage`, sampled by
+    /// `PropagationSpeed` — and by `CurvatureSpeed` too when
+    /// [`curvature_speed`](Self::curvature_speed) is
+    /// [`CurvatureSpeed::Propagation`].
     pub(super) speed: Vec<f64>,
     /// `SegmentationLevelSetFunction::m_AdvectionImage`, split into one `f64`
     /// buffer per axis so no vector pixel type is needed. Empty when the
@@ -78,6 +92,8 @@ pub(super) struct LevelSetFunction {
     pub(super) advection_weight: f64,
     pub(super) propagation_weight: f64,
     pub(super) curvature_weight: f64,
+    /// The `Z(x)` factor of the curvature term.
+    pub(super) curvature_speed: CurvatureSpeed,
     /// `FiniteDifferenceFunction::ComputeNeighborhoodScales()`:
     /// `ScaleCoefficients[d] / Radius[d]`, and with `UseImageSpacing` on (the
     /// ITK default) `ScaleCoefficients[d] == 1 / spacing[d]` and the radius is
@@ -97,6 +113,7 @@ impl LevelSetFunction {
         advection_weight: f64,
         propagation_weight: f64,
         curvature_weight: f64,
+        curvature_speed: CurvatureSpeed,
         spacing: &[f64],
     ) -> Self {
         let dim = spacing.len();
@@ -108,6 +125,7 @@ impl LevelSetFunction {
             advection_weight,
             propagation_weight,
             curvature_weight,
+            curvature_speed,
             neighborhood_scales: scale_coefficients,
             max_scale_coefficient,
             wave_dt: 1.0 / (2.0 * dim as f64),
@@ -209,11 +227,14 @@ impl LevelSetFunction {
         let mut coord = grid.coord(index);
         self.compute_derivatives(phi, grid, &mut coord, gd);
 
-        // Curvature: gamma * Z(x) * kappa * |grad(phi)|, with Z(x) the speed.
+        // Curvature: gamma * Z(x) * kappa * |grad(phi)|.
         let mut curvature_term = 0.0;
         if self.curvature_weight != 0.0 {
-            curvature_term =
-                Self::mean_curvature(gd, dim) * self.curvature_weight * self.speed[index];
+            let z = match self.curvature_speed {
+                CurvatureSpeed::Unit => 1.0,
+                CurvatureSpeed::Propagation => self.speed[index],
+            };
+            curvature_term = Self::mean_curvature(gd, dim) * self.curvature_weight * z;
             gd.max_curvature_change = gd.max_curvature_change.max(curvature_term.abs());
         }
 
@@ -293,6 +314,8 @@ mod tests {
     use super::*;
 
     /// A function with unit spacing, no advection, and the given weights.
+    /// `CurvatureSpeed::Propagation`, as the geodesic active contour and shape
+    /// detection functions use.
     fn function(
         n: usize,
         advection_weight: f64,
@@ -305,7 +328,21 @@ mod tests {
             advection_weight,
             propagation_weight,
             curvature_weight,
+            CurvatureSpeed::Propagation,
             &[1.0, 1.0],
+        )
+    }
+
+    /// The same, on a grid whose spacing is `spacing`.
+    fn spaced(n: usize, propagation_weight: f64, spacing: &[f64]) -> LevelSetFunction {
+        LevelSetFunction::new(
+            vec![1.0; n],
+            Vec::new(),
+            0.0,
+            propagation_weight,
+            0.0,
+            CurvatureSpeed::Propagation,
+            spacing,
         )
     }
 
@@ -418,6 +455,50 @@ mod tests {
         }
     }
 
+    /// `CurvatureSpeed::Unit` ignores the speed image; `CurvatureSpeed::
+    /// Propagation` multiplies the curvature term by it. On a circle of radius
+    /// `6` sampled on the interface, `kappa == 1/6`, so a speed of `3` triples
+    /// the term only in the `Propagation` case. The update is `+curvature`
+    /// because both other weights are zero.
+    #[test]
+    fn curvature_speed_selects_between_unit_and_the_speed_image() {
+        let n = 41usize;
+        let grid = Grid::new(&[n, n]);
+        let c = 20.0;
+        let radius = 6.0;
+        let mut phi = vec![0.0; n * n];
+        for y in 0..n {
+            for x in 0..n {
+                let dx = x as f64 - c;
+                let dy = y as f64 - c;
+                phi[x + n * y] = (dx * dx + dy * dy).sqrt() - radius;
+            }
+        }
+        let index = 26 + n * 20;
+
+        let mut unit = LevelSetFunction::new(
+            vec![3.0; n * n],
+            Vec::new(),
+            0.0,
+            0.0,
+            1.0,
+            CurvatureSpeed::Unit,
+            &[1.0, 1.0],
+        );
+        let mut gd = GlobalData::new(2);
+        let plain = unit.compute_update(&phi, &grid, index, &mut gd);
+
+        unit.curvature_speed = CurvatureSpeed::Propagation;
+        let mut gd = GlobalData::new(2);
+        let scaled = unit.compute_update(&phi, &grid, index, &mut gd);
+
+        assert!(
+            (plain - 1.0 / radius).abs() < 0.01,
+            "unit curvature {plain}"
+        );
+        assert!((scaled - 3.0 * plain).abs() < 1e-12, "scaled {scaled}");
+    }
+
     // ---- Advection upwinding ----------------------------------------------
 
     /// `phi` has a steep backward slope (5) and a shallow forward slope (1).
@@ -506,7 +587,7 @@ mod tests {
     /// so a half-pixel grid halves the step.
     #[test]
     fn time_step_is_divided_by_the_largest_scale_coefficient() {
-        let f = LevelSetFunction::new(vec![1.0], Vec::new(), 0.0, 1.0, 0.0, &[0.5, 1.0]);
+        let f = spaced(1, 1.0, &[0.5, 1.0]);
         let mut gd = GlobalData::new(2);
         gd.max_propagation_change = 1.0;
         // wave_dt / 1.0 == 0.25, then / max(2.0, 1.0)
@@ -533,12 +614,12 @@ mod tests {
         let phi = along_x([-2.0, -1.0, 0.0, 1.0, 2.0]);
         let grid = Grid::new(&[5, 5]);
 
-        let unit = LevelSetFunction::new(vec![1.0; 25], Vec::new(), 0.0, 0.0, 0.0, &[1.0, 1.0]);
+        let unit = spaced(25, 0.0, &[1.0, 1.0]);
         let mut gd = GlobalData::new(2);
         unit.compute_derivatives(&phi, &grid, &mut grid.coord(CENTER), &mut gd);
         assert_eq!(gd.dx[0], 1.0);
 
-        let half = LevelSetFunction::new(vec![1.0; 25], Vec::new(), 0.0, 0.0, 0.0, &[0.5, 1.0]);
+        let half = spaced(25, 0.0, &[0.5, 1.0]);
         let mut gd = GlobalData::new(2);
         half.compute_derivatives(&phi, &grid, &mut grid.coord(CENTER), &mut gd);
         assert_eq!(gd.dx[0], 2.0);
