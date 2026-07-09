@@ -1,11 +1,11 @@
-//! ITK's isolated-object morphology: dilation restricted to the
+//! ITK's isolated-object morphology: dilation/erosion restricted to the
 //! object/background boundary, evaluated only at object pixels that touch a
-//! differently-valued neighbor -- not a plain full-image binary dilate.
+//! differently-valued neighbor -- not a plain full-image binary dilate/erode.
 //!
 //! Verified against ITK's `Modules/Filtering/{MathematicalMorphology,
 //! BinaryMathematicalMorphology}/include/`: `itkObjectMorphologyImageFilter.h`
-//! / `.hxx` (the shared base class) and
-//! `itkDilateObjectMorphologyImageFilter.h` / `.hxx`.
+//! / `.hxx` (the shared base class), `itkDilateObjectMorphologyImageFilter.h`
+//! / `.hxx`, `itkErodeObjectMorphologyImageFilter.h` / `.hxx`.
 //!
 //! ## The base algorithm is boundary-only, not a full kernel sweep
 //!
@@ -28,11 +28,12 @@
 //! kernel radius passed to [`dilate_object_morphology`], with out-of-image
 //! neighbors ignored rather than substituted.
 //!
-//! `Evaluate` itself (`itkDilateObjectMorphologyImageFilter.hxx:31-48`) then
-//! paints every kernel-on offset around `p` -- using the *caller's* kernel
-//! radius, which may be larger than the radius-1 box used to detect the
-//! boundary -- via `NeighborhoodIterator::SetPixel(n, v, status)`, "a special
-//! SetPixel method which quietly ignores out-of-bounds attempts"
+//! `Evaluate` itself (`itkDilateObjectMorphologyImageFilter.hxx:31-48` /
+//! `itkErodeObjectMorphologyImageFilter.hxx:31-48`) then paints every
+//! kernel-on offset around `p` -- using the *caller's* kernel radius, which
+//! may be larger than the radius-1 box used to detect the boundary -- via
+//! `NeighborhoodIterator::SetPixel(n, v, status)`, "a special SetPixel method
+//! which quietly ignores out-of-bounds attempts"
 //! (`itkNeighborhoodIterator.h:277-280`): a kernel offset that lands outside
 //! the image is silently dropped, not clamped or wrapped.
 //!
@@ -54,34 +55,64 @@
 //! `DilateObjectMorphologyImageFilter`'s constructor
 //! (`itkDilateObjectMorphologyImageFilter.hxx:25-29`) sets a
 //! `ConstantBoundaryCondition` to `NumericTraits<PixelType>::NonpositiveMin()`
-//! and calls `OverrideBoundaryCondition`. But `IsObjectPixelOnBoundary` only
-//! ever *reads* that overridden condition (`iNIter.GetPixel(i)`, no
-//! `isInside` check) when `m_UseBoundaryCondition == true`
-//! (`itkObjectMorphologyImageFilter.h:162-172`: "Defaults to false ... if
-//! false ... does not consider that outside extent"); the constructor never
-//! calls `SetUseBoundaryCondition(true)`, and
-//! `DilateObjectMorphologyImageFilter.yaml` exposes no member for it. So,
-//! reached only through SimpleITK, this carefully-chosen sentinel boundary
-//! condition is set but **never consulted** -- the filter always takes the
+//! (`ErodeObjectMorphologyImageFilter.hxx:25-29`: `NumericTraits<PixelType>
+//! ::max()`) and calls `OverrideBoundaryCondition`. But
+//! `IsObjectPixelOnBoundary` only ever *reads* that overridden condition
+//! (`iNIter.GetPixel(i)`, no `isInside` check) when `m_UseBoundaryCondition
+//! == true` (`itkObjectMorphologyImageFilter.h:162-172`: "Defaults to false
+//! ... if false ... does not consider that outside extent"); neither
+//! constructor ever calls `SetUseBoundaryCondition(true)`, and neither
+//! `DilateObjectMorphologyImageFilter.yaml` nor
+//! `ErodeObjectMorphologyImageFilter.yaml` exposes a member for it. So,
+//! reached only through SimpleITK, these carefully-chosen sentinel boundary
+//! conditions are set but **never consulted** -- the filter always takes the
 //! `else` (`isInside`-gated) branch, i.e. always behaves as if
 //! `UseBoundaryCondition == false`. This port implements only that reachable
 //! behavior.
 //!
-//! ## Dilation never diverges from a plain binary dilate
+//! ## Dilation matches a plain binary dilate; erosion does not
 //!
 //! The base class's own doc comment
-//! (`itkObjectMorphologyImageFilter.h:36-40`) warns that the full
-//! `itk*Binary*MorphologicalImageFilters` "preserve background pixels based
-//! on values of neighboring background pixels -- potentially important
-//! during erosion" -- calling out erosion specifically. For dilation, this
-//! port never observed a difference from [`crate::morphology::binary_dilate`]
-//! on the same kernel: for any pixel `y` a full/naive dilate would paint,
-//! the object pixel nearest to `y` along the object always itself qualifies
-//! as a boundary pixel (it must border a non-object pixel somewhere between
-//! it and `y`, or be `y`'s own object source) and its kernel-radius reach
-//! covers `y` at least as well as any interior pixel's would -- a boundary
-//! pixel's reach always dominates. See
-//! `dilate_matches_plain_binary_dilate_on_an_isolated_point` below.
+//! (`itkObjectMorphologyImageFilter.h:36-40`) warns: "this filter operates
+//! significantly faster than itkBinaryMorphologicalImageFilters; however
+//! itk*Binary*MorphologicalImageFilters preserve background pixels based on
+//! values of neighboring background pixels -- potentially important during
+//! erosion." Concretely:
+//!
+//! - **Dilate never diverges** from [`crate::morphology::binary_dilate`] on
+//!   the same kernel: for any pixel `y` a full/naive dilate would paint, the
+//!   object pixel nearest to `y` along the object always itself qualifies as
+//!   a boundary pixel (it must border a non-object pixel somewhere between
+//!   it and `y`, or be `y`'s own object source) and its kernel-radius reach
+//!   covers `y` at least as well as any interior pixel's would -- a boundary
+//!   pixel's reach always dominates. See
+//!   `dilate_matches_plain_binary_dilate_on_an_isolated_point` below.
+//! - **Erode routinely over-erodes** relative to
+//!   [`crate::morphology::binary_erode`]: a boundary pixel's *own*
+//!   kernel-radius neighborhood is stamped to `background_value` wholesale,
+//!   including interior (non-boundary) object pixels that a true
+//!   structuring-element erosion would have kept (their *own* radius-1
+//!   neighbors are all still object). A solid rectangular block is the clean
+//!   case: with a radius-1 kernel, only the exact geometric center of a 5x5
+//!   block survives here, versus the correct 3x3 surviving core a real
+//!   erosion keeps -- see
+//!   `erode_solid_block_only_the_exact_center_survives_unlike_plain_binary_erode`
+//!   below, which pins this directly against [`crate::morphology::binary_erode`].
+//!
+//! ## `ErodeObjectMorphologyImageFilter`'s extra `background_value`
+//!
+//! `ErodeObjectMorphologyImageFilter.h:79-99` adds `SetErodeValue`/
+//! `GetErodeValue` (pure aliases for `ObjectValue`, "Added for API
+//! consistency with itkBinaryErode") and a genuinely new `BackgroundValue`
+//! member (default `0`, per `ErodeObjectMorphologyImageFilter.yaml`): the
+//! value `Evaluate` (`itkErodeObjectMorphologyImageFilter.hxx:31-48`) paints
+//! into every kernel-on position around a boundary object pixel, in place of
+//! `DilateObjectMorphologyImageFilter::Evaluate`'s `ObjectValue`. Setting it
+//! equal to `object_value` makes "erosion" paint the object value onto
+//! background neighbors instead of erasing anything -- functionally
+//! indistinguishable from dilation, a direct consequence of the shared
+//! formula below, not a special case (see
+//! `erode_object_value_equals_background_value_behaves_like_dilate`).
 
 use crate::error::{FilterError, Result};
 use crate::morphology::StructuringElement;
@@ -133,11 +164,13 @@ fn linear_index_if_inside(
     Some(q as usize)
 }
 
-/// Shared core for [`dilate_object_morphology`]
+/// Shared core for [`dilate_object_morphology`]/[`erode_object_morphology`]
 /// (`ObjectMorphologyImageFilter::DynamicThreadedGenerateData` +
 /// `IsObjectPixelOnBoundary` + the subclass's `Evaluate` -- see module docs).
 /// `paint_value` is the value `Evaluate` stamps into every kernel-on offset
-/// around a boundary object pixel -- `ObjectValue` for dilate.
+/// around a boundary object pixel -- `ObjectValue` for dilate,
+/// `BackgroundValue` for erode -- the only thing that differs between the
+/// two subclasses' `Evaluate`.
 fn object_morphology_typed<T: Scalar>(
     img: &Image,
     kernel: &StructuringElement,
@@ -235,10 +268,41 @@ pub fn dilate_object_morphology(
     )
 }
 
+fn erode_object_morphology_typed<T: Scalar>(
+    img: &Image,
+    kernel: &StructuringElement,
+    object_value: f64,
+    background_value: f64,
+) -> Result<Image> {
+    object_morphology_typed::<T>(img, kernel, object_value, background_value)
+}
+
+/// `ErodeObjectMorphologyImageFilter`: erodes the region equal to
+/// `object_value`, painting `background_value` into every kernel-on offset
+/// around each boundary object pixel (see module docs for exactly how, and
+/// why, this diverges from [`crate::morphology::binary_erode`]). Defaults
+/// per `ErodeObjectMorphologyImageFilter.yaml`: `object_value = 1`,
+/// `background_value = 0`, `kernel` = a `sitkBall` of radius `1` per axis.
+pub fn erode_object_morphology(
+    img: &Image,
+    kernel: &StructuringElement,
+    object_value: f64,
+    background_value: f64,
+) -> Result<Image> {
+    dispatch_scalar!(
+        img.pixel_id(),
+        erode_object_morphology_typed,
+        img,
+        kernel,
+        object_value,
+        background_value
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::morphology::binary_dilate;
+    use crate::morphology::{binary_dilate, binary_erode};
 
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -325,6 +389,146 @@ mod tests {
         let kernel = StructuringElement::box_(&[1]); // 1-D radius, 2-D image
         assert_eq!(
             dilate_object_morphology(&f, &kernel, 1.0).unwrap_err(),
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    // ---- erode_object_morphology ----
+
+    /// The headline divergence from the module docs: a solid 5x5 block of
+    /// `object_value`, margined by a 1-pixel background border (so the image
+    /// edge itself never enters into it -- see
+    /// `erode_identity_for_a_solid_object_touching_every_image_edge` for that
+    /// separate effect). Every block pixel at Chebyshev distance 2 from the
+    /// block's center is a boundary pixel (it borders the background
+    /// margin); its radius-1 kernel then stamps `background_value` onto
+    /// everything within Chebyshev distance 1 of *itself*, which reaches
+    /// every block pixel at distance 1 from the center too (nearest boundary
+    /// pixel is exactly `2 - 1 = 1` away). Only the exact center, at distance
+    /// 2 from every boundary pixel, survives. A true structuring-element
+    /// erosion (`binary_erode`) instead keeps the whole distance-<=1 core (a
+    /// pixel survives iff *its own* neighbors are all still object, which
+    /// holds for every distance-1 pixel here) -- the two disagree on all 8
+    /// of those distance-1 pixels.
+    #[test]
+    fn erode_solid_block_only_the_exact_center_survives_unlike_plain_binary_erode() {
+        #[rustfmt::skip]
+        let data = vec![
+            0, 0, 0, 0, 0, 0, 0,
+            0, 1, 1, 1, 1, 1, 0,
+            0, 1, 1, 1, 1, 1, 0,
+            0, 1, 1, 1, 1, 1, 0,
+            0, 1, 1, 1, 1, 1, 0,
+            0, 1, 1, 1, 1, 1, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        let f = img_u8(&[7, 7], data);
+        let kernel = StructuringElement::ball(&[1, 1]); // yaml default KernelType
+
+        let object_out = erode_object_morphology(&f, &kernel, 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(object_out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        let binary_out = binary_erode(&f, &kernel, 1.0, 0.0, true).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(binary_out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 1, 1, 0, 0,
+            0, 0, 1, 1, 1, 0, 0,
+            0, 0, 1, 1, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ]);
+
+        assert_ne!(
+            object_out.scalar_slice::<u8>().unwrap(),
+            binary_out.scalar_slice::<u8>().unwrap()
+        );
+    }
+
+    #[test]
+    fn erode_identity_when_no_object_pixels_present() {
+        let f = img_u8(&[3], vec![0, 0, 0]);
+        let kernel = StructuringElement::box_(&[1]);
+        let out = erode_object_morphology(&f, &kernel, 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[0, 0, 0]);
+    }
+
+    /// Dual of `dilate_identity_for_a_solid_object_touching_every_image_edge`:
+    /// the same "ignore out-of-image neighbors, don't substitute" default
+    /// means a solid block touching the edge is never eroded either, even
+    /// though a naive "the far side of the image edge is background" rule
+    /// would erode every border pixel.
+    #[test]
+    fn erode_identity_for_a_solid_object_touching_every_image_edge() {
+        let f = img_u8(&[3, 3], vec![1u8; 9]);
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let out = erode_object_morphology(&f, &kernel, 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1u8; 9]);
+    }
+
+    /// The boundary check is *always* the fixed radius-1 box (see module
+    /// docs), decoupled from the kernel's own radius: even at kernel radius
+    /// 0, a boundary object pixel (idx1, adjacent to background idx2) is
+    /// still detected and erased. `binary_erode` at radius 0 has no such
+    /// decoupling -- its kernel *is* the boundary check, so "survives iff
+    /// itself is object" is trivially true for every object pixel, making it
+    /// the identity. The two rules coincide at every other radius tested in
+    /// this module, but not here.
+    #[test]
+    fn erode_kernel_radius0_diverges_from_binary_erodes_radius0_identity() {
+        let f = img_u8(&[3], vec![1, 1, 0]);
+        let kernel = StructuringElement::box_(&[0]);
+
+        let object_out = erode_object_morphology(&f, &kernel, 1.0, 0.0).unwrap();
+        assert_eq!(object_out.scalar_slice::<u8>().unwrap(), &[1, 0, 0]);
+
+        let binary_out = binary_erode(&f, &kernel, 1.0, 0.0, true).unwrap();
+        assert_eq!(binary_out.scalar_slice::<u8>().unwrap(), &[1, 1, 0]);
+    }
+
+    #[test]
+    fn erode_custom_background_value_is_used_for_erased_pixels() {
+        let f = img_u8(&[3], vec![9, 9, 0]);
+        let kernel = StructuringElement::box_(&[1]);
+        let out = erode_object_morphology(&f, &kernel, 9.0, 7.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[7, 7, 7]);
+    }
+
+    /// Pins the module docs' `background_value == object_value` finding: the
+    /// shared core's `paint_value` becomes indistinguishable from
+    /// `object_value`, so "erosion" reproduces dilation exactly.
+    #[test]
+    fn erode_object_value_equals_background_value_behaves_like_dilate() {
+        let f = img_u8(&[5], vec![1, 1, 1, 0, 0]);
+        let kernel = StructuringElement::box_(&[1]);
+        let eroded = erode_object_morphology(&f, &kernel, 1.0, 1.0).unwrap();
+        let dilated = dilate_object_morphology(&f, &kernel, 1.0).unwrap();
+        assert_eq!(
+            eroded.scalar_slice::<u8>().unwrap(),
+            dilated.scalar_slice::<u8>().unwrap()
+        );
+        assert_eq!(eroded.scalar_slice::<u8>().unwrap(), &[1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn erode_rejects_a_kernel_radius_of_the_wrong_dimension() {
+        let f = img_u8(&[3, 3], vec![0u8; 9]);
+        let kernel = StructuringElement::box_(&[1]); // 1-D radius, 2-D image
+        assert_eq!(
+            erode_object_morphology(&f, &kernel, 1.0, 0.0).unwrap_err(),
             FilterError::DimensionLength {
                 expected: 2,
                 got: 1
