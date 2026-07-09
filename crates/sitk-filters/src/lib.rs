@@ -47,6 +47,7 @@ pub mod grid_utility;
 mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
+pub mod kmeans;
 pub mod label;
 pub mod label_fusion;
 pub mod label_shape;
@@ -111,6 +112,7 @@ pub use intensity::{
     normalize, otsu_multiple_thresholds, otsu_threshold, sigmoid, sigmoid_in_place,
     triangle_threshold,
 };
+pub use kmeans::{KmeansResult, scalar_image_kmeans};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use label_shape::{
     BoundingBox, LabelShapeStatisticsSettings, OrientedBoundingBox, ShapeStatistics,
