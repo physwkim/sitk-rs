@@ -56,6 +56,7 @@ pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod sharpening;
 pub mod shrink;
+pub mod slic;
 pub mod smoothing;
 pub mod threshold;
 pub mod watershed;
@@ -137,6 +138,7 @@ pub use region_growing::{
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+pub use slic::{SlicResult, SlicSettings, slic};
 pub use smoothing::smooth_gaussian;
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
