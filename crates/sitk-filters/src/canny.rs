@@ -200,7 +200,11 @@ fn positional_gate_field(smoothed: &Image, deriv_field: &Image) -> Result<Vec<f6
 /// counts on the *positive*-direction pass, so a symmetric sign change marks
 /// exactly one of the two pixels, never both. Any other pixel is
 /// `background`. Uses [`ZeroFluxNeumannBoundaryCondition`], matching ITK.
-fn zero_crossing_values(img: &Image, foreground: f64, background: f64) -> Result<Vec<f64>> {
+pub(crate) fn zero_crossing_values(
+    img: &Image,
+    foreground: f64,
+    background: f64,
+) -> Result<Vec<f64>> {
     let dim = img.dimension();
     let radius = vec![1usize; dim];
     let iter = NeighborhoodIterator::<f64, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;

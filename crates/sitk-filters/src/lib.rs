@@ -39,6 +39,7 @@ pub mod gradient;
 mod histogram;
 pub mod intensity;
 pub mod label;
+pub mod level_set;
 pub mod logic;
 pub mod math;
 pub mod morphology;
@@ -80,6 +81,7 @@ pub use intensity::{
     triangle_threshold,
 };
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
+pub use level_set::{LevelSetResult, geodesic_active_contour_level_set, shape_detection_level_set};
 pub use logic::{
     and, and_in_place, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
     maximum_in_place, minimum, minimum_in_place, not, not_in_place, or, or_in_place, xor,
