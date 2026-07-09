@@ -20,11 +20,15 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod distance;
 pub mod error;
 pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
+pub use distance::{
+    danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
+};
 pub use error::{FilterError, Result};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
