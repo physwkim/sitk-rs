@@ -28,6 +28,7 @@
 pub mod anisotropic_diffusion;
 pub mod binary_morphology;
 pub mod canny;
+pub mod clamp;
 pub mod convolution;
 pub mod denoise;
 pub mod distance;
@@ -68,6 +69,7 @@ pub use binary_morphology::{
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use clamp::clamp;
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
