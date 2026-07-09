@@ -45,6 +45,7 @@ pub mod binary_morphology;
 pub mod canny;
 pub mod change_label;
 pub mod clamp;
+pub mod colliding_fronts;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
@@ -55,6 +56,7 @@ pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
+pub mod fast_marching_upwind_gradient;
 mod fft;
 pub mod fft_correlation;
 pub mod functor;
@@ -110,6 +112,7 @@ pub use binary_morphology::{
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use change_label::change_label;
 pub use clamp::clamp;
+pub use colliding_fronts::colliding_fronts;
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{
@@ -127,6 +130,10 @@ pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
+pub use fast_marching_upwind_gradient::{
+    FastMarchingUpwindGradientResult, FastMarchingUpwindGradientSettings,
+    fast_marching_upwind_gradient,
+};
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};

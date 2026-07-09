@@ -224,6 +224,7 @@ pub fn fast_marching(
             normalization_factor,
             stopping_value,
             collect_points: false,
+            upwind: None,
         },
         &trial,
     )?;
@@ -248,6 +249,37 @@ pub(crate) struct MarchInput<'a> {
     /// `m_CollectPoints`. When set, [`MarchResult::processed`] records
     /// `GetProcessedPoints()`.
     pub(crate) collect_points: bool,
+    /// `FastMarchingUpwindGradientImageFilter`'s per-accepted-point work.
+    /// `None` runs the plain `FastMarchingImageFilter`.
+    pub(crate) upwind: Option<UpwindInput<'a>>,
+}
+
+/// `FastMarchingUpwindGradientImageFilterEnums::TargetCondition`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TargetCondition {
+    NoTargets,
+    OneTarget,
+    SomeTargets,
+    AllTargets,
+}
+
+/// The subclass state `FastMarchingUpwindGradientImageFilter::UpdateNeighbors`
+/// reads. Its `VerifyPreconditions` must already have passed: whenever
+/// `target_mode` is not [`TargetCondition::NoTargets`], `targets` is non-empty.
+pub(crate) struct UpwindInput<'a> {
+    /// `m_GenerateGradientImage`. When clear, `ComputeGradient` never runs and
+    /// [`MarchResult::gradient`] stays empty.
+    pub(crate) generate_gradient: bool,
+    /// `m_TargetPoints`, in container order. `None` marks an entry outside the
+    /// buffered region: ITK keeps such nodes in the container (so they count
+    /// towards `m_TargetPoints->Size()`) but their index never equals an
+    /// accepted one, so they are never reached.
+    pub(crate) targets: &'a [Option<usize>],
+    pub(crate) target_mode: TargetCondition,
+    /// `m_NumberOfTargets`, read only by [`TargetCondition::SomeTargets`].
+    pub(crate) number_of_targets: usize,
+    /// `m_TargetOffset`.
+    pub(crate) target_offset: f64,
 }
 
 pub(crate) struct MarchResult {
@@ -256,11 +288,18 @@ pub(crate) struct MarchResult {
     /// `m_ProcessedPoints`, the flat indices in the order they went alive.
     /// Empty unless [`MarchInput::collect_points`] was set.
     pub(crate) processed: Vec<usize>,
+    /// `m_GradientImage`, decomposed into one buffer per axis. Empty unless
+    /// [`UpwindInput::generate_gradient`] was set; otherwise `dim` buffers of
+    /// `size.product()` values each, zero at every never-accepted pixel
+    /// (`FillBuffer(GradientPixelType{})`).
+    pub(crate) gradient: Vec<Vec<f64>>,
+    /// `m_TargetValue`, `0.0` when no upwind state was given.
+    pub(crate) target_value: f64,
 }
 
 /// itkFastMarchingImageFilter.hxx `GenerateData()`: "Normalization Factor is
 /// null or negative".
-fn check_normalization_factor(normalization_factor: f64) -> Result<()> {
+pub(crate) fn check_normalization_factor(normalization_factor: f64) -> Result<()> {
     if normalization_factor < ITK_MATH_EPS {
         return Err(FilterError::InvalidNormalizationFactor(
             normalization_factor,
@@ -280,6 +319,17 @@ pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Resul
         f64::MAX / 2.0
     };
     let n: usize = input.size.iter().product();
+    let dim = input.size.len();
+
+    let generate_gradient = input.upwind.as_ref().is_some_and(|u| u.generate_gradient);
+    let upwind = input.upwind.map(|u| UpwindState {
+        generate_gradient: u.generate_gradient,
+        targets: u.targets.to_vec(),
+        mode: u.target_mode,
+        number_of_targets: u.number_of_targets,
+        target_offset: u.target_offset,
+        reached: 0,
+    });
 
     let mut solver = FastMarching {
         strides: strides(input.size),
@@ -295,6 +345,15 @@ pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Resul
         labels: vec![Label::Far; n],
         heap: BinaryHeap::new(),
         processed: Vec::new(),
+        upwind,
+        // `Initialize()`: `m_GradientImage->FillBuffer(GradientPixelType{})`.
+        gradient: if generate_gradient {
+            vec![vec![0.0; n]; dim]
+        } else {
+            Vec::new()
+        },
+        // `Initialize()`: "Need to reset the target value."
+        target_value: 0.0,
     };
 
     solver.seed(trial);
@@ -303,7 +362,22 @@ pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Resul
     Ok(MarchResult {
         values: solver.output,
         processed: solver.processed,
+        gradient: solver.gradient,
+        target_value: solver.target_value,
     })
+}
+
+/// [`UpwindInput`] plus the running `m_ReachedTargetPoints->Size()`.
+struct UpwindState {
+    generate_gradient: bool,
+    targets: Vec<Option<usize>>,
+    mode: TargetCondition,
+    number_of_targets: usize,
+    target_offset: f64,
+    /// `m_ReachedTargetPoints->Size()`. Only the *count* is tracked: nothing
+    /// downstream of `UpdateNeighbors` reads the nodes themselves, and
+    /// SimpleITK exposes no `GetReachedTargetPoints`.
+    reached: usize,
 }
 
 struct FastMarching {
@@ -312,6 +386,7 @@ struct FastMarching {
     spacing: Vec<f64>,
     speed: Vec<f64>,
     normalization_factor: f64,
+    /// `m_StoppingValue`. Mutable: a reached target lowers it mid-march.
     stopping_value: f64,
     large: f64,
     narrow_to_f32: bool,
@@ -320,6 +395,9 @@ struct FastMarching {
     labels: Vec<Label>,
     heap: BinaryHeap<TrialNode>,
     processed: Vec<usize>,
+    upwind: Option<UpwindState>,
+    gradient: Vec<Vec<f64>>,
+    target_value: f64,
 }
 
 impl FastMarching {
@@ -374,8 +452,123 @@ impl FastMarching {
             }
             self.labels[node.index] = Label::Alive;
             self.update_neighbors(node.index)?;
+            self.on_accepted(node.index);
         }
         Ok(())
+    }
+
+    /// The tail of `FastMarchingUpwindGradientImageFilter::UpdateNeighbors`,
+    /// which runs after `Superclass::UpdateNeighbors` for the point just made
+    /// alive: record its upwind gradient, then test the target condition.
+    fn on_accepted(&mut self, index: usize) {
+        let Some(mut upwind) = self.upwind.take() else {
+            return;
+        };
+        if upwind.generate_gradient {
+            for (axis, value) in self.compute_gradient(index).into_iter().enumerate() {
+                self.gradient[axis][index] = value;
+            }
+        }
+        self.check_targets(&mut upwind, index);
+        self.upwind = Some(upwind);
+    }
+
+    /// `ComputeGradient()`: one-sided differences taken only against *alive*
+    /// neighbors — "the front can only come from there" — then the upwind pick
+    /// between them.
+    ///
+    /// A neighbor that is outside the image, or inside but not yet alive,
+    /// contributes a difference of exactly `0`, and a pair of zero differences
+    /// falls through to `gradientPixel[j] = dx_forward`, i.e. `0`. That is why
+    /// the seed itself (accepted before any neighbor is alive) has a zero
+    /// gradient.
+    fn compute_gradient(&self, index: usize) -> Vec<f64> {
+        let center = self.output[index];
+        let coord = self.coords_of(index);
+
+        coord
+            .iter()
+            .enumerate()
+            .map(|(j, &c)| {
+                let base = index - c * self.strides[j];
+                let alive_value = |neighbor: usize| {
+                    let ni = base + neighbor * self.strides[j];
+                    (self.labels[ni] == Label::Alive).then(|| self.output[ni])
+                };
+
+                let dx_backward = match c.checked_sub(1).and_then(alive_value) {
+                    Some(back) => self.narrow(center - back),
+                    None => 0.0,
+                };
+                let dx_forward = match (c + 1 < self.size[j]).then(|| alive_value(c + 1)).flatten()
+                {
+                    Some(forward) => self.narrow(forward - center),
+                    None => 0.0,
+                };
+
+                // `std::max<LevelSetPixelType>(dx_backward, -dx_forward)`,
+                // spelled out so a `-0.0` forward difference cannot flip which
+                // argument `f64::max` returns.
+                let upwind = if dx_backward < -dx_forward {
+                    -dx_forward
+                } else {
+                    dx_backward
+                };
+                let gradient = if upwind < 0.0 {
+                    0.0
+                } else if dx_backward > -dx_forward {
+                    dx_backward
+                } else {
+                    dx_forward
+                };
+                self.narrow(gradient / self.spacing[j])
+            })
+            .collect()
+    }
+
+    /// The target half of `UpdateNeighbors`, for the point just made alive.
+    ///
+    /// Three upstream behaviors this reproduces rather than smooths over:
+    ///
+    /// - With no targets, `m_TargetValue` is overwritten at *every* accepted
+    ///   point, so it ends as the last (largest) Eikonal value — which is what
+    ///   `GetTargetValue`'s doc promises.
+    /// - Under `SomeTargets`/`AllTargets` the count test sits outside the
+    ///   target lookup, so once the count is met every subsequent accepted
+    ///   point — target or not — re-triggers `targetReached` and moves
+    ///   `m_TargetValue` forward. Only the *stopping value* is latched, since
+    ///   `newStoppingValue` then only ever grows.
+    /// - Under `OneTarget` a later accepted target likewise moves
+    ///   `m_TargetValue` forward, so it is the last reached target's arrival
+    ///   time, not the first's.
+    fn check_targets(&mut self, upwind: &mut UpwindState, index: usize) {
+        // `m_TargetReachedMode != NoTargets && m_TargetPoints`: SimpleITK
+        // always installs a (possibly empty) target container, and a non-empty
+        // one is what `VerifyPreconditions` demands of every other mode, so the
+        // pointer test collapses into the mode test.
+        if upwind.mode == TargetCondition::NoTargets {
+            self.target_value = self.output[index];
+            return;
+        }
+
+        let matched = upwind.targets.contains(&Some(index));
+        if matched {
+            upwind.reached += 1;
+        }
+        let target_reached = match upwind.mode {
+            TargetCondition::OneTarget => matched,
+            TargetCondition::SomeTargets => upwind.reached == upwind.number_of_targets,
+            TargetCondition::AllTargets => upwind.reached == upwind.targets.len(),
+            TargetCondition::NoTargets => unreachable!("returned above"),
+        };
+
+        if target_reached {
+            self.target_value = self.output[index];
+            let new_stopping_value = self.target_value + upwind.target_offset;
+            if new_stopping_value < self.stopping_value {
+                self.stopping_value = new_stopping_value;
+            }
+        }
     }
 
     /// `UpdateNeighbors()`. Transcribed with its index bookkeeping intact:

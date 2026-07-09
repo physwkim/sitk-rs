@@ -479,6 +479,15 @@ pub enum FilterError {
     #[error("seed index {seed:?} is out of bounds for an image of size {size:?}")]
     InvalidSeedIndex { seed: Vec<usize>, size: Vec<usize> },
 
+    /// `FastMarchingUpwindGradientImageFilter::VerifyTargetReachedModeConditions`:
+    /// "No target point set. Cannot set the target reached mode." Raised for
+    /// every target-reached mode but `NoTargets`, i.e. whenever
+    /// `number_of_targets` is non-zero and the target-point list is empty.
+    /// `colliding_fronts` hits it through the `stop_on_targets` marches, whose
+    /// targets are the *other* front's seeds.
+    #[error("target reached mode requires at least one target point")]
+    NoTargetPoints,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
