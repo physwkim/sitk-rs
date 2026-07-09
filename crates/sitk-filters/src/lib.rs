@@ -82,6 +82,7 @@ mod random;
 pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
+pub mod regional_extrema;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
@@ -199,6 +200,9 @@ pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussi
 pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
     neighborhood_connected,
+};
+pub use regional_extrema::{
+    ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
 };
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
