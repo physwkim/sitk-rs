@@ -85,6 +85,7 @@ pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod regional_extrema;
+pub mod scalar_connected_component;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
@@ -208,6 +209,7 @@ pub use region_growing::{
 pub use regional_extrema::{
     ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
 };
+pub use scalar_connected_component::scalar_connected_component;
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
