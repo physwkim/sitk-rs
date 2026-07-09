@@ -2225,6 +2225,399 @@ impl CenteredTransform for ComposeScaleSkewVersor3DTransform {
     }
 }
 
+/// A pure 3-D rotation about a fixed center, with **no translation
+/// parameter**: `y = R(versor)·(x − center) + center`, mirroring
+/// `itk::VersorTransform`.
+///
+/// Parameters are `[vx, vy, vz]` only — the versor's right part (axis·sin(θ/2)),
+/// with the same norm-clamping as [`VersorRigid3DTransform`]. Unlike
+/// `VersorRigid3DTransform`, there is no translation concept at all: ITK's own
+/// class docs carry a standing TODO — "Need to make sure that the translation
+/// parameters in the base class cannot be set to non-zero values"
+/// (`itkVersorTransform.h:40-41`) — so this port omits translation entirely
+/// rather than expose a base-class setter ITK itself flags as something that
+/// should never be used. Only the fixed `center` is settable, via the inherent
+/// [`VersorTransform::set_center`] (not [`CenteredTransform`], which would
+/// require a meaningful `set_translation`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersorTransform {
+    /// Normalized versor right part.
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    /// Normalized versor scalar part `√(1 − vx² − vy² − vz²)`.
+    vw: f64,
+    /// Length 3, fixed (not a parameter).
+    center: Vec<f64>,
+    /// Cached row-major 3×3 rotation.
+    matrix: Vec<f64>,
+    /// Cached `center − M·center`.
+    offset: Vec<f64>,
+}
+
+impl VersorTransform {
+    /// A pure rotation whose versor right part is `(vx, vy, vz)` (axis·sin(θ/2)),
+    /// about `center`. A right part with norm `≥ 1` is scaled to just under 1,
+    /// matching ITK's `SetParameters`.
+    pub fn new(vx: f64, vy: f64, vz: f64, center: [f64; 3]) -> Self {
+        let mut t = Self {
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            vw: 1.0,
+            center: center.to_vec(),
+            matrix: vec![0.0; 9],
+            offset: vec![0.0; 3],
+        };
+        t.set_versor(vx, vy, vz);
+        t.recompute();
+        t
+    }
+
+    /// The identity transform (versor `(0,0,0; w=1)`, center at the origin).
+    pub fn identity() -> Self {
+        Self::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0])
+    }
+
+    /// Versor right-part X (axis·sin(θ/2)).
+    pub fn versor_x(&self) -> f64 {
+        self.vx
+    }
+
+    /// Versor right-part Y.
+    pub fn versor_y(&self) -> f64 {
+        self.vy
+    }
+
+    /// Versor right-part Z.
+    pub fn versor_z(&self) -> f64 {
+        self.vz
+    }
+
+    /// Versor scalar part `w = √(1 − vx² − vy² − vz²)`.
+    pub fn versor_w(&self) -> f64 {
+        self.vw
+    }
+
+    /// The fixed center of rotation.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Row-major 3×3 rotation matrix.
+    pub fn matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+
+    /// Offset actually applied (`y = M·x + offset`).
+    pub fn offset(&self) -> &[f64] {
+        &self.offset
+    }
+
+    /// Set the fixed center of rotation (mirrors `itk::VersorTransform`'s
+    /// inherited `SetCenter`).
+    pub fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), 3, "center length");
+        self.center.copy_from_slice(center);
+        self.recompute();
+    }
+
+    /// Set the normalized versor from a right part, mirroring
+    /// `itk::VersorTransform::SetParameters` + `Versor::Set(axis)`: scale a
+    /// right part of norm `≥ 1 − ε` to just under 1, then `w = √(1 − ‖v‖²)`.
+    fn set_versor(&mut self, vx: f64, vy: f64, vz: f64) {
+        const EPS: f64 = 1e-10;
+        let norm = (vx * vx + vy * vy + vz * vz).sqrt();
+        let (ax, ay, az) = if norm >= 1.0 - EPS {
+            let d = norm + EPS * norm;
+            (vx / d, vy / d, vz / d)
+        } else {
+            (vx, vy, vz)
+        };
+        self.vx = ax;
+        self.vy = ay;
+        self.vz = az;
+        self.vw = (1.0 - (ax * ax + ay * ay + az * az)).max(0.0).sqrt();
+    }
+
+    /// Rebuild the cached rotation matrix (`itk::Versor::GetMatrix`) and offset.
+    fn recompute(&mut self) {
+        let (x, y, z, w) = (self.vx, self.vy, self.vz, self.vw);
+        let (xx, yy, zz) = (x * x, y * y, z * z);
+        let (xy, xz, xw) = (x * y, x * z, x * w);
+        let (yz, yw, zw) = (y * z, y * w, z * w);
+        #[rustfmt::skip]
+        let m = vec![
+            1.0 - 2.0 * (yy + zz), 2.0 * (xy - zw),       2.0 * (xz + yw),
+            2.0 * (xy + zw),       1.0 - 2.0 * (xx + zz), 2.0 * (yz - xw),
+            2.0 * (xz - yw),       2.0 * (yz + xw),       1.0 - 2.0 * (xx + yy),
+        ];
+        let m_center = matrix::mat_vec(&m, &self.center, 3);
+        self.offset = (0..3).map(|i| self.center[i] - m_center[i]).collect();
+        self.matrix = m;
+    }
+}
+
+impl Transform for VersorTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), 3);
+        let mx = matrix::mat_vec(&self.matrix, point, 3);
+        (0..3).map(|d| mx[d] + self.offset[d]).collect()
+    }
+
+    fn dimension(&self) -> usize {
+        3
+    }
+}
+
+impl ParametricTransform for VersorTransform {
+    fn number_of_parameters(&self) -> usize {
+        3
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        vec![self.vx, self.vy, self.vz]
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), 3, "parameter length");
+        self.set_versor(params[0], params[1], params[2]);
+        self.recompute();
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // Analytic ∂y/∂versor from itk::VersorTransform (divided by vw).
+        // Row-major 3×3 — no translation columns since translation is not a
+        // parameter (see struct docs).
+        let (vx, vy, vz, vw) = (self.vx, self.vy, self.vz, self.vw);
+        let (px, py, pz) = (
+            point[0] - self.center[0],
+            point[1] - self.center[1],
+            point[2] - self.center[2],
+        );
+        let (vxx, vyy, vzz, vww) = (vx * vx, vy * vy, vz * vz, vw * vw);
+        let (vxy, vxz, vxw) = (vx * vy, vx * vz, vx * vw);
+        let (vyz, vyw, vzw) = (vy * vz, vy * vw, vz * vw);
+
+        let mut j = vec![0.0f64; 9];
+        j[0] = 2.0 * ((vyw + vxz) * py + (vzw - vxy) * pz) / vw;
+        j[3] = 2.0 * ((vyw - vxz) * px - 2.0 * vxw * py + (vxx - vww) * pz) / vw;
+        j[6] = 2.0 * ((vzw + vxy) * px + (vww - vxx) * py - 2.0 * vxw * pz) / vw;
+
+        j[1] = 2.0 * (-2.0 * vyw * px + (vxw + vyz) * py + (vww - vyy) * pz) / vw;
+        j[4] = 2.0 * ((vxw - vyz) * px + (vzw + vxy) * pz) / vw;
+        j[7] = 2.0 * ((vyy - vww) * px + (vzw - vxy) * py - 2.0 * vyw * pz) / vw;
+
+        j[2] = 2.0 * (-2.0 * vzw * px + (vzz - vww) * py + (vxw - vyz) * pz) / vw;
+        j[5] = 2.0 * ((vww - vzz) * px - 2.0 * vzw * py + (vyw + vxz) * pz) / vw;
+        j[8] = 2.0 * ((vxw + vyz) * px + (vyw - vxz) * py) / vw;
+        j
+    }
+}
+
+/// An anisotropic per-axis scale about a fixed center:
+/// `y = (x − center) ⊙ scale + center`, mirroring `itk::ScaleTransform`.
+///
+/// Parameters are `[scale_0, ..., scale_{dim−1}]`. There is **no translation
+/// term**: ITK's own `TransformPoint` override
+/// (`itkScaleTransform.hxx:105-117`) computes `(x − center) ⊙ scale + center`
+/// directly and never references the inherited `MatrixOffsetTransformBase`
+/// translation/offset, so a translation set through that inherited (but
+/// otherwise-unused) base-class setter has no effect on this transform. This
+/// port therefore exposes only the inherent [`ScaleTransform::set_center`],
+/// not [`CenteredTransform`] (whose `set_translation` would be a silent
+/// no-op).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScaleTransform {
+    dim: usize,
+    /// Length `dim`.
+    scale: Vec<f64>,
+    /// Length `dim`, fixed (not a parameter).
+    center: Vec<f64>,
+}
+
+impl ScaleTransform {
+    /// An anisotropic scale by `scale` about `center`. Panics if the lengths
+    /// disagree or are empty.
+    pub fn new(scale: Vec<f64>, center: Vec<f64>) -> Self {
+        assert_eq!(
+            scale.len(),
+            center.len(),
+            "scale and center must have the same length"
+        );
+        assert!(!scale.is_empty(), "dimension must be >= 1");
+        Self {
+            dim: scale.len(),
+            scale,
+            center,
+        }
+    }
+
+    /// The identity scale transform of the given dimension (all scales 1,
+    /// center at the origin).
+    pub fn identity(dim: usize) -> Self {
+        Self {
+            dim,
+            scale: vec![1.0; dim],
+            center: vec![0.0; dim],
+        }
+    }
+
+    /// Per-axis scale factors.
+    pub fn scale(&self) -> &[f64] {
+        &self.scale
+    }
+
+    /// The fixed center scaling originates from.
+    pub fn center(&self) -> &[f64] {
+        &self.center
+    }
+
+    /// Set the fixed center of scaling (mirrors `itk::ScaleTransform`'s
+    /// inherited `SetCenter`; see the struct docs for why there is no paired
+    /// `set_translation`).
+    pub fn set_center(&mut self, center: &[f64]) {
+        assert_eq!(center.len(), self.dim, "center length");
+        self.center.copy_from_slice(center);
+    }
+}
+
+impl Transform for ScaleTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        debug_assert_eq!(point.len(), self.dim);
+        (0..self.dim)
+            .map(|d| (point[d] - self.center[d]) * self.scale[d] + self.center[d])
+            .collect()
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+}
+
+impl ParametricTransform for ScaleTransform {
+    fn number_of_parameters(&self) -> usize {
+        self.dim
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        self.scale.clone()
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        assert_eq!(params.len(), self.dim, "parameter length");
+        self.scale.copy_from_slice(params);
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // ∂yᵢ/∂scale_k = δᵢₖ · (xᵢ − centerᵢ) — itk::ScaleTransform
+        // ComputeJacobianWithRespectToParameters.
+        let mut j = vec![0.0; self.dim * self.dim];
+        for d in 0..self.dim {
+            j[d * self.dim + d] = point[d] - self.center[d];
+        }
+        j
+    }
+}
+
+/// A [`ScaleTransform`] whose optimizable parameters are `log(scale)` rather
+/// than `scale` itself, mirroring `itk::ScaleLogarithmicTransform`. Taking the
+/// log linearizes the parameterization: an additive optimizer step in
+/// log-space is a multiplicative step in scale-space, so growing and shrinking
+/// by the same step size become symmetric.
+///
+/// `transform_point`, `dimension`, and the fixed `center` behave exactly as
+/// [`ScaleTransform`] (this port also omits `CenteredTransform` for the same
+/// reason — see the `ScaleTransform` docs); only `parameters()` /
+/// `set_parameters()` / `jacobian_wrt_parameters()` differ.
+///
+/// **Deviation from `itkScaleLogarithmicTransform.hxx`:** ITK's
+/// `ComputeJacobianWithRespectToParameters` writes `scale[d] * p[d]`, omitting
+/// the `− center[d]` term that its own `ScaleTransform` superclass Jacobian
+/// applies three lines away in the sibling file. By the chain rule
+/// (`s = exp(u)` ⟹ `∂y/∂u = s·∂y/∂s`) the correct entry is
+/// `scale[d] * (p[d] − center[d])`, which is what this port computes: using
+/// ITK's literal formula would disagree with this port's own `transform_point`
+/// at any non-zero center, which the mandatory off-center finite-difference
+/// test below would catch. The bug only manifests when `center != 0`, which
+/// likely explains why it has gone unnoticed upstream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScaleLogarithmicTransform {
+    inner: ScaleTransform,
+}
+
+impl ScaleLogarithmicTransform {
+    /// A logarithmic-scale transform with (linear, not log) scale `scale`
+    /// about `center` — matching the crate's convention of constructing from
+    /// the transform's direct effect, not its parameter encoding.
+    pub fn new(scale: Vec<f64>, center: Vec<f64>) -> Self {
+        Self {
+            inner: ScaleTransform::new(scale, center),
+        }
+    }
+
+    /// The identity transform of the given dimension (all scales 1, center at
+    /// the origin).
+    pub fn identity(dim: usize) -> Self {
+        Self {
+            inner: ScaleTransform::identity(dim),
+        }
+    }
+
+    /// Per-axis scale factors (linear, not log).
+    pub fn scale(&self) -> &[f64] {
+        self.inner.scale()
+    }
+
+    /// The fixed center scaling originates from.
+    pub fn center(&self) -> &[f64] {
+        self.inner.center()
+    }
+
+    /// Set the fixed center of scaling.
+    pub fn set_center(&mut self, center: &[f64]) {
+        self.inner.set_center(center);
+    }
+}
+
+impl Transform for ScaleLogarithmicTransform {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        self.inner.transform_point(point)
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+}
+
+impl ParametricTransform for ScaleLogarithmicTransform {
+    fn number_of_parameters(&self) -> usize {
+        self.inner.number_of_parameters()
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        self.inner.scale().iter().map(|s| s.ln()).collect()
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        let scale: Vec<f64> = params.iter().map(|p| p.exp()).collect();
+        self.inner.set_parameters(&scale);
+    }
+
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        // ∂yᵢ/∂log(scale_k) = δᵢₖ · scale_i · (pᵢ − centerᵢ) — see the struct
+        // docs for the ITK center-omission this corrects.
+        let dim = self.inner.dimension();
+        let scale = self.inner.scale();
+        let center = self.inner.center();
+        let mut j = vec![0.0; dim * dim];
+        for d in 0..dim {
+            j[d * dim + d] = scale[d] * (point[d] - center[d]);
+        }
+        j
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3218,6 +3611,178 @@ mod tests {
                         "mc {mc} param {i} dim {d}: fd {fd} vs analytic {analytic}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn versor_identity_is_noop() {
+        let v = VersorTransform::identity();
+        assert_eq!(v.number_of_parameters(), 3);
+        assert_eq!(v.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn versor_90_degree_rotation_about_center() {
+        use std::f64::consts::FRAC_PI_4;
+        // Right part (0,0,sin(45°)) ⇒ Rz(90°) about a non-zero center.
+        let c = [1.0, 2.0, 3.0];
+        let v = VersorTransform::new(0.0, 0.0, FRAC_PI_4.sin(), c);
+        // The center maps to itself.
+        let yc = v.transform_point(&c);
+        for d in 0..3 {
+            assert!((yc[d] - c[d]).abs() < 1e-12, "center moved: {yc:?}");
+        }
+        // (c + (1,0,0)) rotates to c + (0,1,0) about c.
+        let p = [c[0] + 1.0, c[1], c[2]];
+        let y = v.transform_point(&p);
+        assert!(
+            (y[0] - c[0]).abs() < 1e-12
+                && (y[1] - (c[1] + 1.0)).abs() < 1e-12
+                && (y[2] - c[2]).abs() < 1e-12,
+            "{y:?}"
+        );
+    }
+
+    #[test]
+    fn versor_jacobian_is_finite_difference_consistent() {
+        // Small right part keeps ‖v‖ well below 1 (no renormalization), so the
+        // finite difference exercises the analytic w = √(1−‖v‖²) dependence.
+        let base = [0.12, -0.08, 0.1];
+        let center = [2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let mut v = VersorTransform::new(base[0], base[1], base[2], center);
+        let jac = v.jacobian_wrt_parameters(&point);
+        let n = v.number_of_parameters();
+        let h = 1e-7;
+        for k in 0..n {
+            let mut pp = base;
+            pp[k] += h;
+            v.set_parameters(&pp);
+            let yp = v.transform_point(&point);
+            let mut pm = base;
+            pm[k] -= h;
+            v.set_parameters(&pm);
+            let ym = v.transform_point(&point);
+            for i in 0..3 {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-5,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_identity_is_noop() {
+        let s = ScaleTransform::identity(3);
+        assert_eq!(s.number_of_parameters(), 3);
+        assert_eq!(s.transform_point(&[3.0, -4.0, 5.0]), vec![3.0, -4.0, 5.0]);
+    }
+
+    #[test]
+    fn scale_about_non_zero_center() {
+        let center = vec![1.0, -2.0, 3.0];
+        let scale = vec![2.0, 0.5, -3.0];
+        let s = ScaleTransform::new(scale.clone(), center.clone());
+        let p = [4.0, 1.0, -1.0];
+        let y = s.transform_point(&p);
+        for d in 0..3 {
+            let expect = center[d] + scale[d] * (p[d] - center[d]);
+            assert!((y[d] - expect).abs() < 1e-12, "dim {d}: {y:?}");
+        }
+        // The center maps to itself.
+        let yc = s.transform_point(&center);
+        for d in 0..3 {
+            assert!((yc[d] - center[d]).abs() < 1e-12, "center moved: {yc:?}");
+        }
+    }
+
+    #[test]
+    fn scale_jacobian_is_finite_difference_consistent() {
+        let base = vec![1.7, -0.6, 2.3];
+        let center = vec![2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let mut s = ScaleTransform::new(base.clone(), center);
+        let jac = s.jacobian_wrt_parameters(&point);
+        let n = s.number_of_parameters();
+        let h = 1e-6;
+        for k in 0..n {
+            let mut pp = base.clone();
+            pp[k] += h;
+            s.set_parameters(&pp);
+            let yp = s.transform_point(&point);
+            let mut pm = base.clone();
+            pm[k] -= h;
+            s.set_parameters(&pm);
+            let ym = s.transform_point(&point);
+            for i in 0..n {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-6,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scale_logarithmic_equals_scale_at_exp_params() {
+        let center = vec![1.0, -2.0, 3.0];
+        let log_scale: Vec<f64> = vec![0.3, -0.5, 0.1];
+        let scale: Vec<f64> = log_scale.iter().map(|v| v.exp()).collect();
+        let mut log_t = ScaleLogarithmicTransform::identity(3);
+        log_t.set_center(&center);
+        log_t.set_parameters(&log_scale);
+        let lin_t = ScaleTransform::new(scale, center);
+        let p = [10.0, -3.0, 7.0];
+        let y_log = log_t.transform_point(&p);
+        let y_lin = lin_t.transform_point(&p);
+        for d in 0..3 {
+            assert!(
+                (y_log[d] - y_lin[d]).abs() < 1e-12,
+                "dim {d}: log {y_log:?} vs lin {y_lin:?}"
+            );
+        }
+        // parameters() round-trips through log/exp.
+        let p_out = log_t.parameters();
+        for d in 0..3 {
+            assert!((p_out[d] - log_scale[d]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn scale_logarithmic_jacobian_is_finite_difference_consistent() {
+        // Off-center point: exercises the − center[d] chain-rule term this port
+        // corrects relative to ITK's literal `scale[d] * p[d]`.
+        let base: Vec<f64> = vec![0.3, -0.5, 0.9];
+        let center = vec![2.0, -1.0, 4.0];
+        let point = [4.0, 5.0, -3.0];
+        let scale: Vec<f64> = base.iter().map(|v| v.exp()).collect();
+        let mut t = ScaleLogarithmicTransform::new(scale, center);
+        t.set_parameters(&base);
+        let jac = t.jacobian_wrt_parameters(&point);
+        let n = t.number_of_parameters();
+        let h = 1e-6;
+        for k in 0..n {
+            let mut pp = base.clone();
+            pp[k] += h;
+            t.set_parameters(&pp);
+            let yp = t.transform_point(&point);
+            let mut pm = base.clone();
+            pm[k] -= h;
+            t.set_parameters(&pm);
+            let ym = t.transform_point(&point);
+            for i in 0..n {
+                let fd = (yp[i] - ym[i]) / (2.0 * h);
+                assert!(
+                    (fd - jac[i * n + k]).abs() < 1e-5,
+                    "param {k} dim {i}: fd {fd} vs analytic {}",
+                    jac[i * n + k]
+                );
             }
         }
     }

@@ -6,6 +6,7 @@
 //! remaining transform classes and interpolators follow in later phases.
 
 pub mod bspline;
+pub mod composite;
 pub mod displacement;
 pub mod error;
 pub mod interpolator;
@@ -13,12 +14,13 @@ pub mod resample;
 pub mod transform;
 
 pub use bspline::BSplineTransform;
+pub use composite::CompositeTransform;
 pub use displacement::DisplacementFieldTransform;
 pub use error::{Result, TransformError};
 pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform::{
     AffineTransform, CenteredTransform, ComposeScaleSkewVersor3DTransform, Euler2DTransform,
-    Euler3DTransform, ParametricTransform, ScaleSkewVersor3DTransform, ScaleVersor3DTransform,
-    Similarity2DTransform, Similarity3DTransform, Transform, TranslationTransform,
-    VersorRigid3DTransform,
+    Euler3DTransform, ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform,
+    ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform,
+    Transform, TranslationTransform, VersorRigid3DTransform, VersorTransform,
 };
