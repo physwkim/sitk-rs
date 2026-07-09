@@ -90,6 +90,7 @@ pub mod smoothing;
 pub mod sources;
 pub mod threshold;
 pub mod threshold_maximum_connected_components;
+pub mod toboggan;
 pub mod watershed;
 
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
@@ -218,6 +219,7 @@ pub use threshold::{
 pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
+pub use toboggan::toboggan;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
