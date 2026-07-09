@@ -171,6 +171,13 @@ pub enum FilterError {
     #[error("this filter requires an unsigned integer pixel type, got {0:?}")]
     RequiresUnsignedIntegerPixelType(PixelId),
 
+    /// `UnaryMinusImageFilter.yaml`'s `pixel_types` is `SignedPixelIDTypeList`
+    /// (plus a complex-pixel branch this crate does not support): ITK's
+    /// `Functor::UnaryMinus` doc comment notes "Assumed that the output type
+    /// is signed", and only instantiates for signed types in C++.
+    #[error("this filter requires a signed pixel type, got {0:?}")]
+    RequiresSignedPixelType(PixelId),
+
     /// `MultiLabelSTAPLEImageFilter::InitializePriorProbabilities` throws when
     /// the caller-supplied prior array is shorter than the number of labels.
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]

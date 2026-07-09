@@ -22,6 +22,19 @@
 //! `add`/`subtract`/`multiply`/`divide`, the `*_constant` ops, and `abs` are
 //! built on.
 //!
+//! [`unary_minus`] is the unary face of the same pixel-type-compute policy
+//! as `add`/`subtract`/`multiply`/`divide`/`modulus` (ITK's `UnaryMinus`
+//! functor, `itkArithmeticOpsFunctors.h`): `static_cast<T>(-a)`, computed in
+//! the pixel type with no `f64` promotion, so a signed integer's minimum
+//! value wraps back to itself (`i8::MIN.wrapping_neg() == i8::MIN`) instead
+//! of the C++ overflow being undefined behavior --- the same wraparound
+//! policy `add`/`subtract`/`multiply`/`divide`/`modulus` already use.
+//! `UnaryMinusImageFilter.yaml` restricts this to signed pixel types
+//! (`Functor::UnaryMinus`'s doc comment: "Assumed that the output type is
+//! signed"); this port checks [`PixelId::is_signed`] at runtime and returns
+//! [`FilterError::RequiresSignedPixelType`] in place of the C++ compile-time
+//! restriction.
+//!
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
@@ -101,7 +114,7 @@ pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
-pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use functor::{BinaryFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
@@ -125,9 +138,9 @@ pub use label_shape::{
 };
 pub use level_set::{LevelSetResult, geodesic_active_contour_level_set, shape_detection_level_set};
 pub use logic::{
-    and, and_in_place, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
-    maximum_in_place, minimum, minimum_in_place, not, not_in_place, or, or_in_place, xor,
-    xor_in_place,
+    and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place, mask,
+    mask_in_place, mask_negated, mask_negated_in_place, maximum, maximum_in_place, minimum,
+    minimum_in_place, not, not_in_place, or, or_in_place, xor, xor_in_place,
 };
 pub use math::{
     abs, abs_in_place, absolute_value_difference, absolute_value_difference_in_place, acos,
@@ -381,6 +394,73 @@ pub fn modulus(a: &Image, b: &Image) -> Result<Image> {
 pub fn modulus_in_place(a: Image, b: &Image) -> Result<Image> {
     logic::require_integer_pixel_type(&a)?;
     functor::binary_apply_in_place(a, b, &ModOp)
+}
+
+// ---- unary arithmetic (image only) -----------------------------------------
+
+/// `UnaryMinus` functor (`itkArithmeticOpsFunctors.h`): `-a`, computed
+/// directly in the pixel type (see the module docs for the wraparound and
+/// signed-only-pixel-type notes).
+struct UnaryMinusOp;
+
+macro_rules! impl_unary_minus_signed_int {
+    ($($t:ty),+ $(,)?) => {$(
+        impl UnaryPixelFunctor<$t> for UnaryMinusOp {
+            fn apply(&self, x: $t) -> $t { x.wrapping_neg() }
+        }
+    )+};
+}
+
+macro_rules! impl_unary_minus_float {
+    ($($t:ty),+ $(,)?) => {$(
+        impl UnaryPixelFunctor<$t> for UnaryMinusOp {
+            fn apply(&self, x: $t) -> $t { -x }
+        }
+    )+};
+}
+
+impl_unary_minus_signed_int!(i8, i16, i32, i64);
+impl_unary_minus_float!(f32, f64);
+impl UnaryPixelFunctor<u8> for UnaryMinusOp {
+    fn apply(&self, _x: u8) -> u8 {
+        unreachable!("gated to signed pixel types by require_signed_pixel_type")
+    }
+}
+impl UnaryPixelFunctor<u16> for UnaryMinusOp {
+    fn apply(&self, _x: u16) -> u16 {
+        unreachable!("gated to signed pixel types by require_signed_pixel_type")
+    }
+}
+impl UnaryPixelFunctor<u32> for UnaryMinusOp {
+    fn apply(&self, _x: u32) -> u32 {
+        unreachable!("gated to signed pixel types by require_signed_pixel_type")
+    }
+}
+impl UnaryPixelFunctor<u64> for UnaryMinusOp {
+    fn apply(&self, _x: u64) -> u64 {
+        unreachable!("gated to signed pixel types by require_signed_pixel_type")
+    }
+}
+
+fn require_signed_pixel_type(img: &Image) -> Result<()> {
+    if !img.pixel_id().is_signed() {
+        return Err(FilterError::RequiresSignedPixelType(img.pixel_id()));
+    }
+    Ok(())
+}
+
+/// `UnaryMinusImageFilter`: pixel-wise `-a`. Signed pixel types only (see
+/// the module docs); errors with [`FilterError::RequiresSignedPixelType`] on
+/// an unsigned image.
+pub fn unary_minus(img: &Image) -> Result<Image> {
+    require_signed_pixel_type(img)?;
+    functor::unary_pixel_apply(img, &UnaryMinusOp)
+}
+
+/// In-place variant of [`unary_minus`]: reuses `img`'s buffer.
+pub fn unary_minus_in_place(img: Image) -> Result<Image> {
+    require_signed_pixel_type(&img)?;
+    functor::unary_pixel_apply_in_place(img, &UnaryMinusOp)
 }
 
 // ---- binary arithmetic (image ⊕ constant) ---------------------------------
@@ -648,6 +728,52 @@ mod tests {
         let b = Image::from_vec(&[3, 1], vec![3i32, 3, 0]).unwrap();
         let allocated = modulus(&a, &b).unwrap();
         let in_place = modulus_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn unary_minus_basic_values() {
+        let a = Image::from_vec(&[3, 1], vec![0i32, 5, -5]).unwrap();
+        assert_eq!(
+            unary_minus(&a).unwrap().scalar_slice::<i32>().unwrap(),
+            &[0, -5, 5]
+        );
+    }
+
+    #[test]
+    fn unary_minus_min_value_wraps_to_itself() {
+        // -(i8::MIN) = 128 overflows i8 (undefined behavior in C++); this
+        // crate's wraparound policy gives i8::MIN.wrapping_neg() == i8::MIN.
+        let a = Image::from_vec(&[1, 1], vec![i8::MIN]).unwrap();
+        assert_eq!(
+            unary_minus(&a).unwrap().scalar_slice::<i8>().unwrap(),
+            &[i8::MIN]
+        );
+    }
+
+    #[test]
+    fn unary_minus_float() {
+        let a = Image::from_vec(&[2, 1], vec![3.5f32, -2.0]).unwrap();
+        assert_eq!(
+            unary_minus(&a).unwrap().scalar_slice::<f32>().unwrap(),
+            &[-3.5, 2.0]
+        );
+    }
+
+    #[test]
+    fn unary_minus_rejects_unsigned_pixel_type() {
+        let a = img_u8(&[1, 1], vec![5]);
+        assert_eq!(
+            unary_minus(&a),
+            Err(FilterError::RequiresSignedPixelType(a.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn unary_minus_in_place_matches_allocating() {
+        let a = Image::from_vec(&[3, 1], vec![0i32, 5, -5]).unwrap();
+        let allocated = unary_minus(&a).unwrap();
+        let in_place = unary_minus_in_place(a).unwrap();
         assert_eq!(allocated, in_place);
     }
 

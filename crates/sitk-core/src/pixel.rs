@@ -41,6 +41,15 @@ impl PixelId {
     pub const fn is_floating_point(self) -> bool {
         matches!(self, PixelId::Float32 | PixelId::Float64)
     }
+
+    /// `true` for pixel types that can represent a negative value: the
+    /// signed integer types and the two floating-point types.
+    pub const fn is_signed(self) -> bool {
+        !matches!(
+            self,
+            PixelId::UInt8 | PixelId::UInt16 | PixelId::UInt32 | PixelId::UInt64
+        )
+    }
 }
 
 /// A Rust scalar type that can back a pixel buffer.

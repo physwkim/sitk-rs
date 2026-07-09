@@ -3,7 +3,8 @@
 //! `itkBitwiseOpsFunctors.h`, `itkLogicOpsFunctors.h`, `itkAndImageFilter.h`,
 //! `itkOrImageFilter.h`, `itkXorImageFilter.h`, `itkNotImageFilter.h`,
 //! `itkMaskImageFilter.h`, `itkMaskNegatedImageFilter.h`,
-//! `itkMaximumImageFilter.h`, `itkMinimumImageFilter.h`.
+//! `itkMaximumImageFilter.h`, `itkMinimumImageFilter.h`, and under
+//! `Modules/Filtering/LabelMap/include/`: `itkBinaryNotImageFilter.h`.
 //!
 //! [`and`]/[`or`]/[`xor`] are pixel-type-compute (`functor.rs`'s policy
 //! (b)): ITK's `Functor::AND`/`OR`/`XOR` evaluate `&`/`|`/`^` directly in the
@@ -15,6 +16,9 @@
 //! [`FilterError::RequiresIntegerPixelType`] in place of the C++ compile
 //! error; [`BinaryFunctor`] impls for `f32`/`f64` exist only to satisfy the
 //! dispatch engine's blanket bound and `unreachable!()` if ever reached.
+//! [`bitwise_not`] is the unary face of the same policy (Rust's `!` on an
+//! integer is C++'s `~`, bitwise complement), built on
+//! [`crate::functor::UnaryPixelFunctor`] instead of [`BinaryFunctor`].
 //!
 //! [`not`] (`itkLogicOpsFunctors.h`'s `Functor::NOT`, integer-only for the
 //! same reason) maps to `0`/`1`, not a bitwise complement: `if (!A) return
@@ -23,6 +27,28 @@
 //! every integer pixel type this crate supports, so it's implemented on the
 //! [`UnaryFunctor`] (f64-compute) engine instead of adding a new
 //! single-image pixel-type-compute engine for one filter.
+//!
+//! [`binary_not`] (`itkBinaryNotImageFilter.h`, `ITKLabelMap` module,
+//! integer-only for the same reason as `and`/`or`/`xor`) is unrelated to
+//! [`bitwise_not`] despite the name: it flips a single image's pixels
+//! between `foreground_value` and `background_value` (`A ==
+//! ForegroundValue ? BackgroundValue : ForegroundValue`), so it runs on the
+//! pixel-type-compute engine like `mask`/`mask_negated` below rather than
+//! `bitwise_not`'s bit-complement. ITK's own C++ default is
+//! `ForegroundValue = NumericTraits<PixelType>::max()`, `BackgroundValue =
+//! NumericTraits<PixelType>::NonpositiveMin()`
+//! (`itkBinaryNotImageFilter.h`'s constructor); SimpleITK's yaml overrides
+//! this with its own default of `ForegroundValue = 1.0`, `BackgroundValue =
+//! 0.0` (`BinaryNotImageFilter.yaml`), set unconditionally by the generated
+//! wrapper regardless of the ITK-level default. This port takes both values
+//! as required parameters instead of hard-coding either default, matching
+//! [`mask`]/[`mask_negated`]'s precedent. Separately,
+//! `BinaryNotImageFilter.yaml`'s prose description ("output_pixel =
+//! static_cast<PixelType>( input1_pixel != input2_pixel )") describes a
+//! *two*-image `!=` comparison and does not match either the single-image
+//! `operator()` in `itkBinaryNotImageFilter.h` or `number_of_inputs: 1` in
+//! the same yaml file -- an upstream copy-paste error in the yaml's prose,
+//! not a behavior this port reproduces.
 //!
 //! [`mask`]/[`mask_negated`]/[`maximum`]/[`minimum`] are also
 //! pixel-type-compute, but defined for every pixel type
@@ -34,7 +60,7 @@
 //! `add`/`subtract`/... already have in `lib.rs`), so the mask image must be
 //! cast to the main image's pixel type first.
 
-use crate::functor::{self, BinaryFunctor, UnaryFunctor};
+use crate::functor::{self, BinaryFunctor, UnaryFunctor, UnaryPixelFunctor};
 use crate::{FilterError, Result};
 use sitk_core::{Image, Scalar};
 
@@ -151,6 +177,99 @@ pub fn not(img: &Image) -> Result<Image> {
 pub fn not_in_place(img: Image) -> Result<Image> {
     require_integer_pixel_type(&img)?;
     functor::unary_apply_in_place(img, &NotOp)
+}
+
+// ---- BitwiseNot (integer pixel types only) ---------------------------------
+
+/// `BitwiseNot` functor (`itkBitwiseOpsFunctors.h`): `~a`, evaluated
+/// directly in the pixel type (Rust's `!` on an integer is C++'s unary `~`).
+/// Integer pixel types only, for the same reason as `and`/`or`/`xor`.
+struct BitwiseNotOp;
+
+macro_rules! impl_bitwise_not_int {
+    ($($t:ty),+ $(,)?) => {$(
+        impl UnaryPixelFunctor<$t> for BitwiseNotOp {
+            fn apply(&self, x: $t) -> $t { !x }
+        }
+    )+};
+}
+
+impl_bitwise_not_int!(u8, i8, u16, i16, u32, i32, u64, i64);
+impl UnaryPixelFunctor<f32> for BitwiseNotOp {
+    fn apply(&self, _x: f32) -> f32 {
+        unreachable!("gated to integer pixel types by require_integer_pixel_type")
+    }
+}
+impl UnaryPixelFunctor<f64> for BitwiseNotOp {
+    fn apply(&self, _x: f64) -> f64 {
+        unreachable!("gated to integer pixel types by require_integer_pixel_type")
+    }
+}
+
+/// `BitwiseNotImageFilter`: pixel-wise `~a`. Integer pixel types only (see
+/// the module docs); errors with [`FilterError::RequiresIntegerPixelType`]
+/// on a floating-point image.
+pub fn bitwise_not(img: &Image) -> Result<Image> {
+    require_integer_pixel_type(img)?;
+    functor::unary_pixel_apply(img, &BitwiseNotOp)
+}
+
+/// In-place variant of [`bitwise_not`]: reuses `img`'s buffer.
+pub fn bitwise_not_in_place(img: Image) -> Result<Image> {
+    require_integer_pixel_type(&img)?;
+    functor::unary_pixel_apply_in_place(img, &BitwiseNotOp)
+}
+
+// ---- BinaryNot (integer pixel types only) ----------------------------------
+
+/// `BinaryNot` functor (`itkBinaryNotImageFilter.h`): `a == foreground_value
+/// ? background_value : foreground_value` -- flips between the two values;
+/// see the module docs for the semantics, the ITK-vs-SimpleITK default
+/// divergence, and why this is unrelated to [`bitwise_not`] despite the
+/// name. Integer pixel types only, for the same reason as `and`/`or`/`xor`.
+struct BinaryNotOp {
+    foreground_value: f64,
+    background_value: f64,
+}
+impl<T: Scalar> UnaryPixelFunctor<T> for BinaryNotOp {
+    fn apply(&self, x: T) -> T {
+        if x == T::from_f64(self.foreground_value) {
+            T::from_f64(self.background_value)
+        } else {
+            T::from_f64(self.foreground_value)
+        }
+    }
+}
+
+/// `BinaryNotImageFilter`: pixel-wise flip between `foreground_value` and
+/// `background_value` (see the module docs). Integer pixel types only;
+/// errors with [`FilterError::RequiresIntegerPixelType`] on a
+/// floating-point image.
+pub fn binary_not(img: &Image, foreground_value: f64, background_value: f64) -> Result<Image> {
+    require_integer_pixel_type(img)?;
+    functor::unary_pixel_apply(
+        img,
+        &BinaryNotOp {
+            foreground_value,
+            background_value,
+        },
+    )
+}
+
+/// In-place variant of [`binary_not`]: reuses `img`'s buffer.
+pub fn binary_not_in_place(
+    img: Image,
+    foreground_value: f64,
+    background_value: f64,
+) -> Result<Image> {
+    require_integer_pixel_type(&img)?;
+    functor::unary_pixel_apply_in_place(
+        img,
+        &BinaryNotOp {
+            foreground_value,
+            background_value,
+        },
+    )
 }
 
 // ---- mask / mask_negated (all pixel types) ---------------------------------
@@ -392,6 +511,78 @@ mod tests {
         let a = img_u8(&[3, 1], vec![0, 1, 255]);
         let allocated = not(&a).unwrap();
         let in_place = not_in_place(a).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- bitwise_not: 0 / MAX / mixed-bits boundaries ----
+
+    #[test]
+    fn bitwise_not_zero_max_and_mixed() {
+        let a = img_u8(&[3, 1], vec![0, u8::MAX, 0b1010_1010]);
+        assert_eq!(
+            bitwise_not(&a).unwrap().scalar_slice::<u8>().unwrap(),
+            &[u8::MAX, 0, 0b0101_0101]
+        );
+    }
+
+    #[test]
+    fn bitwise_not_rejects_float_pixel_type() {
+        let a = Image::from_vec(&[1, 1], vec![1.0f32]).unwrap();
+        assert_eq!(
+            bitwise_not(&a),
+            Err(FilterError::RequiresIntegerPixelType(a.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn bitwise_not_in_place_matches_allocating() {
+        let a = img_u8(&[3, 1], vec![0, u8::MAX, 0b1010_1010]);
+        let allocated = bitwise_not(&a).unwrap();
+        let in_place = bitwise_not_in_place(a).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- binary_not: equals-foreground vs not, default-like vs custom values ----
+
+    #[test]
+    fn binary_not_flips_between_foreground_and_background() {
+        // SimpleITK's own yaml default is foreground=1.0, background=0.0.
+        let a = img_u8(&[3, 1], vec![0, 1, 5]);
+        assert_eq!(
+            binary_not(&a, 1.0, 0.0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn binary_not_custom_foreground_and_background() {
+        let a = img_u8(&[3, 1], vec![100, 7, 3]);
+        assert_eq!(
+            binary_not(&a, 100.0, 7.0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[7, 100, 100]
+        );
+    }
+
+    #[test]
+    fn binary_not_rejects_float_pixel_type() {
+        let a = Image::from_vec(&[1, 1], vec![1.0f32]).unwrap();
+        assert_eq!(
+            binary_not(&a, 1.0, 0.0),
+            Err(FilterError::RequiresIntegerPixelType(a.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn binary_not_in_place_matches_allocating() {
+        let a = img_u8(&[3, 1], vec![0, 1, 5]);
+        let allocated = binary_not(&a, 1.0, 0.0).unwrap();
+        let in_place = binary_not_in_place(a, 1.0, 0.0).unwrap();
         assert_eq!(allocated, in_place);
     }
 
