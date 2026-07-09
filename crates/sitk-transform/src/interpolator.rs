@@ -596,6 +596,186 @@ mod tests {
         }
     }
 
+    /// A deterministic pseudo-random image — no fixed structure the spline
+    /// could reproduce by accident.
+    fn noisy(w: usize, h: usize) -> (Vec<f64>, Vec<usize>) {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut buf = vec![0.0f64; w * h];
+        for v in buf.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *v = (state >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 100.0;
+        }
+        (buf, vec![w, h])
+    }
+
+    #[test]
+    fn bspline_decomposition_of_a_constant_image_is_constant() {
+        // The IIR gain `(1 − z)(1 − 1/z)` and the mirror-boundary causal /
+        // anticausal initializations are together exactly the inverse of the
+        // discrete cubic B-spline kernel, whose taps sum to 1 — so the
+        // coefficients of a constant image are that same constant, on the
+        // boundary rows as much as in the interior.
+        let size = vec![7, 5];
+        let strides = strides(&size);
+        let buf = vec![7.25f64; 35];
+        let coeffs = bspline_coefficients(&buf, &size, &strides);
+        for (k, &c) in coeffs.iter().enumerate() {
+            assert!((c - 7.25).abs() < 1e-12, "coeff[{k}] = {c}, want 7.25");
+        }
+        // …and the interpolant reproduces the constant everywhere, including
+        // off-lattice at the very edge of the buffer.
+        for &cindex in &[[-0.49, -0.49], [0.0, 0.0], [3.7, 2.2], [6.49, 4.49]] {
+            let (value, grad) =
+                bspline_value_and_gradient(&coeffs, &size, &strides, &cindex).unwrap();
+            assert!((value - 7.25).abs() < 1e-12, "{cindex:?}: value {value}");
+            assert!(
+                grad.iter().all(|g| g.abs() < 1e-12),
+                "{cindex:?}: grad {grad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bspline_reproduces_every_sample_of_a_noisy_image_including_the_edges() {
+        // Prefiltering exists exactly so that the spline *interpolates*: at
+        // every integer index — corners and edges included, where the mirror
+        // fold is active — the value must be the original sample, to
+        // round-trip precision rather than a loose "close enough".
+        let (buf, size) = noisy(9, 7);
+        let strides = strides(&size);
+        let coeffs = bspline_coefficients(&buf, &size, &strides);
+        for y in 0..7 {
+            for x in 0..9 {
+                let (value, _) =
+                    bspline_value_and_gradient(&coeffs, &size, &strides, &[x as f64, y as f64])
+                        .unwrap();
+                let expected = buf[y * 9 + x];
+                assert!(
+                    (value - expected).abs() < 1e-11,
+                    "({x},{y}): value {value} vs sample {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bspline_ramp_is_exact_at_samples_but_bends_off_lattice_at_the_boundary() {
+        // The cubic spline reproduces a degree-1 polynomial exactly only where
+        // the mirror extension is itself that polynomial — i.e. in the
+        // interior. Mirroring a ramp about index 0 produces `|x|`, not `x`, so
+        // between the first two samples the spline follows the kink, not the
+        // ramp. This is ITK's behaviour (`ApplyMirrorBoundaryConditions`), not
+        // an approximation error: it is a half-unit-sized effect, not a
+        // rounding-sized one.
+        // The kink's influence decays geometrically in the pole |z| ≈ 0.268 per
+        // pixel of distance, so "interior" means many e-foldings from both
+        // edges: at 20 pixels, 0.268^20 ≈ 1e-11.
+        let n = 41usize;
+        let size = vec![n];
+        let strides = strides(&size);
+        let buf: Vec<f64> = (0..n).map(|i| 3.0 * i as f64 + 1.0).collect();
+        let coeffs = bspline_coefficients(&buf, &size, &strides);
+        let exact = |x: f64| 3.0 * x + 1.0;
+        let at = |x: f64| {
+            bspline_value_and_gradient(&coeffs, &size, &strides, &[x])
+                .unwrap()
+                .0
+        };
+
+        // Exact at every sample, edges included.
+        for i in 0..n {
+            let x = i as f64;
+            assert!((at(x) - exact(x)).abs() < 1e-11, "sample {i}: {}", at(x));
+        }
+        // Exact off-lattice in the interior.
+        for &x in &[19.5f64, 20.25, 20.5] {
+            assert!((at(x) - exact(x)).abs() < 1e-8, "interior {x}: {}", at(x));
+        }
+        // Not exact off-lattice in the first/last mesh cell: a half-unit error,
+        // three orders of magnitude above anything rounding could produce.
+        for &x in &[0.5f64, (n - 1) as f64 - 0.5] {
+            let err = (at(x) - exact(x)).abs();
+            assert!(err > 0.4, "boundary {x}: unexpectedly exact (err {err})");
+        }
+    }
+
+    #[test]
+    fn bspline_index_folding_mirrors_about_the_edge_samples() {
+        // `ApplyMirrorBoundaryConditions` folds `i < 0` to `−i` and
+        // `i > n − 1` to `2(n − 1) − i`, which makes the reconstructed spline
+        // exactly even about index 0 and about index n − 1. Asserting that
+        // symmetry pins the fold without hard-coding a tap table: an
+        // off-by-one in either fold breaks it immediately.
+        let (buf, _) = noisy(11, 1);
+        let size = vec![11usize];
+        let strides = strides(&size);
+        let coeffs = bspline_coefficients(&buf, &size, &strides);
+        let at = |x: f64| {
+            bspline_value_and_gradient(&coeffs, &size, &strides, &[x])
+                .unwrap()
+                .0
+        };
+        let last = 10.0f64;
+        for &t in &[0.1f64, 0.25, 0.49] {
+            assert!(
+                (at(-t) - at(t)).abs() < 1e-12,
+                "low fold: v(−{t}) {} vs v({t}) {}",
+                at(-t),
+                at(t)
+            );
+            assert!(
+                (at(last + t) - at(last - t)).abs() < 1e-12,
+                "high fold: v({}) {} vs v({}) {}",
+                last + t,
+                at(last + t),
+                last - t,
+                at(last - t)
+            );
+        }
+    }
+
+    #[test]
+    fn bspline_folds_a_size_one_axis_onto_index_zero() {
+        // ITK's `ApplyMirrorBoundaryConditions` special-cases `m_DataLength == 1`
+        // by pinning every tap to index 0 (the generic fold would run off the
+        // end). Such an axis is then constant, so a 2-D image with a degenerate
+        // second axis must interpolate exactly like the 1-D row it holds.
+        let (row, _) = noisy(6, 1);
+        let size2 = vec![6usize, 1];
+        let strides2 = strides(&size2);
+        let coeffs2 = bspline_coefficients(&row, &size2, &strides2);
+
+        let size1 = vec![6usize];
+        let strides1 = strides(&size1);
+        let coeffs1 = bspline_coefficients(&row, &size1, &strides1);
+
+        for &x in &[0.0f64, 1.3, 2.5, 5.0] {
+            let v2 = bspline_value_and_gradient(&coeffs2, &size2, &strides2, &[x, 0.0])
+                .unwrap()
+                .0;
+            let v1 = bspline_value_and_gradient(&coeffs1, &size1, &strides1, &[x])
+                .unwrap()
+                .0;
+            assert!((v2 - v1).abs() < 1e-12, "x={x}: 2-D {v2} vs 1-D {v1}");
+        }
+    }
+
+    #[test]
+    fn bspline_weights_at_a_half_index_are_the_hand_derived_cubic_taps() {
+        // At `frac = ½` the cubic B-spline taps are B₃(1.5), B₃(0.5), B₃(−0.5),
+        // B₃(−1.5) = 1/48, 23/48, 23/48, 1/48. Feed the coefficient buffer
+        // directly (no prefiltering) so the assertion is on the weights alone.
+        let coeffs = [2.0f64, -1.0, 5.0, 3.0, -4.0, 0.5];
+        let size = vec![6usize];
+        let strides = strides(&size);
+        // Support of cindex 2.5 is taps 1..=4, entirely interior — no folding.
+        let (value, _) = bspline_value_and_gradient(&coeffs, &size, &strides, &[2.5]).unwrap();
+        let expected = (coeffs[1] + 23.0 * coeffs[2] + 23.0 * coeffs[3] + coeffs[4]) / 48.0;
+        assert!((value - expected).abs() < 1e-14, "{value} vs {expected}");
+    }
+
     #[test]
     fn bspline_gradient_matches_finite_difference() {
         let (buf, size) = ramp(12, 12);
