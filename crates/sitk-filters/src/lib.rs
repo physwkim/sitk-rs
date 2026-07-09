@@ -45,6 +45,7 @@ mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
 pub mod label;
+pub mod label_fusion;
 pub mod label_shape;
 pub mod level_set;
 pub mod logic;
