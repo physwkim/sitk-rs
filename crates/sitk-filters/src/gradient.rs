@@ -95,7 +95,13 @@ pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image>
 /// ported operation-for-operation: the 1-D coefficients of the `order`-th
 /// central-difference operator, indexed `[-radius, radius]`. `order == 0`
 /// yields the identity, `[1.0]`.
-fn derivative_operator_coefficients(order: u32) -> Vec<f64> {
+///
+/// `pub(crate)`: also reused by [`crate::canny`], which applies this same
+/// `DerivativeOperator` (unflipped, unscaled — see that module's docs for why
+/// the sign convention doesn't matter there) directly inside its fused
+/// per-pixel neighborhood pass, rather than through this module's `derivative`
+/// filter function.
+pub(crate) fn derivative_operator_coefficients(order: u32) -> Vec<f64> {
     let w = (2 * order.div_ceil(2) + 1) as usize;
     let mut coeff = vec![0.0f64; w];
     coeff[w / 2] = 1.0;
