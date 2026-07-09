@@ -28,6 +28,7 @@
 pub mod distance;
 pub mod error;
 pub mod functor;
+pub mod gradient;
 pub mod label;
 pub mod morphology;
 pub mod recursive_gaussian;
@@ -39,6 +40,10 @@ pub use distance::{
 };
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use gradient::{
+    derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
+    laplacian_recursive_gaussian, sobel_edge_detection,
+};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,

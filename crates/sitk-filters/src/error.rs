@@ -42,6 +42,11 @@ pub enum FilterError {
     #[error("axis {axis} has {len} pixels; the recursive Gaussian needs at least 4")]
     AxisTooShortForRecursion { axis: usize, len: usize },
 
+    /// `DerivativeImageFilter`'s `direction` was not a valid axis of the
+    /// input image.
+    #[error("direction {direction} is out of range for a {dimension}-D image")]
+    InvalidDirection { direction: usize, dimension: usize },
+
     /// `RelabelComponentImageFilter` would need to assign more surviving
     /// objects than the output pixel type can represent
     /// (`NumericTraits<OutputPixelType>::max()`).
