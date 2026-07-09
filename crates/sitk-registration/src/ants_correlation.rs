@@ -85,8 +85,9 @@
 //!   `AfterThreadedExecution`, `TransformCategory != DisplacementField`
 //!   branch). A [local-support](sitk_transform::ParametricTransform::has_local_support)
 //!   [`sitk_transform::DisplacementFieldTransform`] instead writes each point's contribution
-//!   directly into *its own* parameter block via
-//!   [`local_support_jacobian`](sitk_transform::ParametricTransform::local_support_jacobian)
+//!   directly into *its own* parameter block via the block that
+//!   `metric::local_support_block` assembles from
+//!   [`sparse_jacobian_wrt_parameters`](sitk_transform::ParametricTransform::sparse_jacobian_wrt_parameters)
 //!   and is **not** divided by `N` — ITK skips that division for
 //!   `TransformCategory == DisplacementField` because each pixel already owns
 //!   a disjoint parameter block, so there is nothing to average.
@@ -104,7 +105,7 @@ use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{physical_to_index_matrix, strides};
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{FixedSamples, MetricValue, MovingImage};
+use crate::metric::{FixedSamples, MetricValue, MovingImage, local_support_block};
 use crate::scales::PhysicalShiftScales;
 
 /// Per-point windowed statistics: the local correlation and (when defined)
@@ -481,7 +482,7 @@ impl AntsNeighborhoodCorrelationMetric {
             let fp = &center_point[..];
 
             if local_support {
-                if let Some((offset, local_jac)) = transform.local_support_jacobian(fp) {
+                if let Some((offset, local_jac)) = local_support_block(transform, fp) {
                     let num_local = transform.number_of_local_parameters();
                     for mu in 0..num_local {
                         let mut acc = 0.0;

@@ -86,15 +86,16 @@
 //! `assert!`s the identical condition, calling `check_transform` as the single
 //! source of truth, and panics if it does not hold (see its `# Panics`
 //! section). Otherwise `evaluate` always takes the per-pixel
-//! [`local_support_jacobian`] path — there is no dense branch in this module
-//! at all. ITK's `ProcessPoint` does not multiply by a Jacobian either; it
-//! writes `speed · gradient[p] / denominator` directly into each of the
-//! `NumberOfLocalParameters` local slots, which is only correct when that
+//! [`local_support_block`](crate::metric) path — there is no dense branch in
+//! this module at all. ITK's `ProcessPoint` does not multiply by a Jacobian
+//! either; it writes `speed · gradient[p] / denominator` directly into each of
+//! the `NumberOfLocalParameters` local slots, which is only correct when that
 //! local Jacobian is the identity — true of every displacement-field local
-//! block (`DisplacementFieldTransform::local_support_jacobian`, the only
-//! `has_local_support` transform this crate has). This port does the same:
-//! [`local_support_jacobian`] is called only for its parameter-block `offset`,
-//! and the gradient components are written in directly, unprojected.
+//! block (`DisplacementFieldTransform::sparse_jacobian_wrt_parameters` returns
+//! unit columns, and a displacement field is the only `has_local_support`
+//! transform this crate has). This port does the same: `local_support_block` is
+//! called only for its parameter-block `offset`, and the gradient components
+//! are written in directly, unprojected.
 //!
 //! [`DemonsImageToImageMetricv4GetValueAndDerivativeThreader::ProcessPoint`]:
 //! <https://github.com/InsightSoftwareConsortium/ITK/blob/master/Modules/Registration/Metricsv4/include/itkDemonsImageToImageMetricv4GetValueAndDerivativeThreader.hxx>
@@ -103,13 +104,12 @@
 //! [`SetMetricAsDemons`]:
 //! <https://github.com/SimpleITK/SimpleITK/blob/main/Code/Registration/include/sitkImageRegistrationMethod.h>
 //! [`metric::CpuBackend::mean_squares`]: crate::metric::CpuBackend
-//! [`local_support_jacobian`]: ParametricTransform::local_support_jacobian
 
 use sitk_core::Image;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{FixedSamples, MetricValue, MovingImage};
+use crate::metric::{FixedSamples, MetricValue, MovingImage, local_support_block};
 use crate::scales::PhysicalShiftScales;
 
 /// Threshold below which the denominator `|∇|² + (F−M)²/normalizer` is treated
@@ -139,11 +139,77 @@ pub struct DemonsMetric {
 }
 
 impl DemonsMetric {
+    /// Build the metric from a **pre-built** sample set and moving image —
+    /// the entry point a registration driver uses once it has applied its
+    /// own metric sampling strategy to build `fixed` (see [`FixedSamples`]).
+    /// [`new`](Self::new) is the convenience wrapper that builds `fixed` from
+    /// a raw image with full (dense) sampling.
+    ///
+    /// `fixed_image` — the same image `fixed` was sampled from — is **also**
+    /// required, in addition to `fixed`, for two things this metric owns and
+    /// [`new`](Self::new) already derives from it rather than accepting from
+    /// a caller: the **fixed-image gradient sampler** (ITK's default
+    /// `GRADIENT_SOURCE_FIXED`) needs a dense interpolator over the *whole*
+    /// fixed image, which [`FixedSamples`] — a flat, possibly-sparse list of
+    /// sampled points/values — cannot supply; and **`normalizer`** is the
+    /// mean square of the fixed image's per-axis spacing (see the
+    /// [module docs](self)), a scalar this metric derives once from the raw
+    /// image geometry so a second caller cannot get it wrong. Under a
+    /// reduced (regular/random) sampling strategy, `fixed` is a strict subset
+    /// of the fixed image's voxel grid while `fixed_gradient` stays dense
+    /// over the whole image — exactly ITK's sparse-threader behaviour, which
+    /// re-samples the dense fixed gradient image at each sparse point rather
+    /// than reducing the gradient sampler itself.
+    ///
+    /// `fixed_image` and `fixed` are debug-asserted to agree in dimension.
+    /// `moving`'s dimension cannot be cross-checked here: `MovingImage` does
+    /// not currently expose its dimension outside `metric.rs` in this crate,
+    /// so a mismatched `moving` will surface as an out-of-bounds panic or a
+    /// nonsensical mapped point downstream rather than a
+    /// `DimensionMismatch` error.
+    ///
+    /// Fails if `fixed_image`'s direction matrix is singular.
+    pub fn from_samples(
+        fixed_image: &Image,
+        fixed: FixedSamples,
+        moving: MovingImage,
+        intensity_difference_threshold: f64,
+    ) -> Result<Self> {
+        debug_assert_eq!(
+            fixed_image.dimension(),
+            fixed.dim,
+            "from_samples: fixed_image and fixed samples have different dimension"
+        );
+        if fixed.dim != moving.dim() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dim,
+                moving: moving.dim(),
+            });
+        }
+        let dim = fixed_image.dimension();
+        let normalizer = fixed_image
+            .spacing()
+            .iter()
+            .take(dim)
+            .map(|s| s * s)
+            .sum::<f64>()
+            / dim as f64;
+
+        Ok(Self {
+            fixed,
+            fixed_gradient: MovingImage::from_image(fixed_image)?,
+            moving,
+            intensity_difference_threshold,
+            normalizer,
+        })
+    }
+
     /// Build the metric from a fixed and moving image and the intensity
     /// difference threshold below which two intensities are considered equal
     /// (ITK/SimpleITK default `0.001`, `SetMetricAsDemons`'s only parameter).
     /// Fails if dimensions disagree or either image's direction matrix is
-    /// singular.
+    /// singular. Delegates to [`from_samples`](Self::from_samples) with full
+    /// (dense) sampling.
     pub fn new(fixed: &Image, moving: &Image, intensity_difference_threshold: f64) -> Result<Self> {
         if fixed.dimension() != moving.dimension() {
             return Err(RegistrationError::DimensionMismatch {
@@ -151,16 +217,12 @@ impl DemonsMetric {
                 moving: moving.dimension(),
             });
         }
-        let dim = fixed.dimension();
-        let normalizer = fixed.spacing().iter().take(dim).map(|s| s * s).sum::<f64>() / dim as f64;
-
-        Ok(Self {
-            fixed: FixedSamples::from_image(fixed),
-            fixed_gradient: MovingImage::from_image(fixed)?,
-            moving: MovingImage::from_image(moving)?,
+        Self::from_samples(
+            fixed,
+            FixedSamples::from_image(fixed),
+            MovingImage::from_image(moving)?,
             intensity_difference_threshold,
-            normalizer,
-        })
+        )
     }
 
     /// Number of fixed sample points.
@@ -256,7 +318,7 @@ impl DemonsMetric {
             // *fixed*/virtual point, matching ITK's
             // ComputeParameterOffsetFromVirtualIndex); its local Jacobian is
             // ignored per the module docs' local-support note.
-            let (offset, _local_jac) = match transform.local_support_jacobian(fp) {
+            let (offset, _local_jac) = match local_support_block(transform, fp) {
                 Some(oj) => oj,
                 None => continue, // no local region governs this point
             };
@@ -346,6 +408,79 @@ mod tests {
             "expected all-zero derivative, got a nonzero entry"
         );
         assert_eq!(r.valid_points, 16 * 16);
+    }
+
+    #[test]
+    fn regular_sampling_reaches_the_metric_and_forces_only_the_sampled_blocks() {
+        use crate::metric::SamplingStrategy;
+
+        // A quarter-density regular sample set: stride ceil(1/0.25) = 4 over the
+        // 256 voxels in scan-line order, so 64 samples remain. ITK's sparse
+        // threader evaluates the same per-point force at exactly the sampled
+        // positions, and a displacement field's parameter block is per-pixel, so
+        // only the sampled pixels' blocks may receive a nonzero force.
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 9.0, 8.0, 3.0, 1.0);
+        let samples =
+            FixedSamples::from_image_with(&fixed, SamplingStrategy::Regular, 0.25, 0, None)
+                .unwrap();
+        assert_eq!(samples.len(), 64);
+
+        let metric = DemonsMetric::from_samples(
+            &fixed,
+            samples,
+            MovingImage::from_image(&moving).unwrap(),
+            0.001,
+        )
+        .unwrap();
+        assert_eq!(metric.sample_count(), 64);
+
+        let field = zero_field(&fixed);
+        let r = metric.evaluate(&field);
+        assert_eq!(r.valid_points, 64);
+        assert!(
+            r.derivative.iter().any(|&d| d != 0.0),
+            "sparse sampling produced an all-zero force"
+        );
+
+        // A 2-D field's parameters are [dx, dy] per pixel in scan-line order, so
+        // flat voxel `f` owns parameters `2f` and `2f + 1`. Regular sampling
+        // takes every 4th flat voxel; every other pixel's block must stay zero.
+        for f in 0..256 {
+            if f % 4 == 0 {
+                continue;
+            }
+            assert_eq!(
+                (r.derivative[2 * f], r.derivative[2 * f + 1]),
+                (0.0, 0.0),
+                "unsampled voxel {f} received a force"
+            );
+        }
+    }
+
+    #[test]
+    fn from_samples_rejects_a_moving_image_of_a_different_dimension() {
+        let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
+        let moving_3d = Image::from_vec(&[4, 4, 4], vec![1.0f64; 64]).unwrap();
+        let result = DemonsMetric::from_samples(
+            &fixed,
+            FixedSamples::from_image(&fixed),
+            MovingImage::from_image(&moving_3d).unwrap(),
+            0.001,
+        );
+        let Err(err) = result else {
+            panic!("a 3-D moving image against a 2-D fixed image must be rejected");
+        };
+        assert!(
+            matches!(
+                err,
+                RegistrationError::DimensionMismatch {
+                    fixed: 2,
+                    moving: 3
+                }
+            ),
+            "unexpected error {err:?}"
+        );
     }
 
     #[test]

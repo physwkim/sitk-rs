@@ -140,8 +140,6 @@ const PADDING: usize = 2;
 /// the `bins` value in the error is still correct.
 const MIN_BINS: usize = 2 * PADDING + 2;
 
-/// Default `VarianceForJointPDFSmoothing` (ITK ctor default `1.5`).
-const SMOOTHING_VARIANCE: f64 = 1.5;
 /// Default discrete-Gaussian maximum truncation error (ITK's `SetMaximumError
 /// (.01f)` call in `InitializeForIteration`).
 const SMOOTHING_MAX_ERROR: f64 = 0.01;
@@ -336,14 +334,25 @@ pub struct JointHistogramMutualInformationMetric {
     /// Joint-PDF axis spacing: `1 / (bins − 2·padding − 1)`, so a normalized
     /// intensity in `[0, 1]` maps to the bin range `[padding, bins−1−padding]`.
     spacing: f64,
+    /// `VarianceForJointPDFSmoothing`: the variance, in bins², of the discrete
+    /// Gaussian convolved over each joint-histogram axis before the PDF is read.
+    /// ITK's ctor default is `1.5`.
+    smoothing_variance: f64,
 }
 
 impl JointHistogramMutualInformationMetric {
-    /// Build the metric from a fixed and moving image and a histogram bin
-    /// count. Fails if dimensions disagree, the moving direction matrix is
-    /// singular, fewer than [`MIN_BINS`] bins are requested, or either image
-    /// is constant (MI is then undefined).
-    pub fn new(fixed: &Image, moving: &Image, number_of_histogram_bins: usize) -> Result<Self> {
+    /// Build the metric from a fixed and moving image, a histogram bin count,
+    /// and the joint-PDF smoothing variance (ITK's
+    /// `SetVarianceForJointPDFSmoothing`, default `1.5`). Fails if dimensions
+    /// disagree, the moving direction matrix is singular, fewer than `MIN_BINS`
+    /// (5) bins are requested, or either image is constant (MI is then
+    /// undefined).
+    pub fn new(
+        fixed: &Image,
+        moving: &Image,
+        number_of_histogram_bins: usize,
+        variance_for_joint_pdf_smoothing: f64,
+    ) -> Result<Self> {
         if fixed.dimension() != moving.dimension() {
             return Err(RegistrationError::DimensionMismatch {
                 fixed: fixed.dimension(),
@@ -352,18 +361,24 @@ impl JointHistogramMutualInformationMetric {
         }
         let fixed_samples = FixedSamples::from_image(fixed);
         let moving_image = MovingImage::from_image(moving)?;
-        Self::from_samples(fixed_samples, moving_image, number_of_histogram_bins)
+        Self::from_samples(
+            fixed_samples,
+            moving_image,
+            number_of_histogram_bins,
+            variance_for_joint_pdf_smoothing,
+        )
     }
 
     /// Build the metric from already-prepared fixed samples and moving image
     /// (e.g. from a caller applying its own sampling strategy, interpolator, or
     /// mask before handing off to the metric). Fails if fewer than
-    /// [`MIN_BINS`] bins are requested or either image is constant (MI is then
+    /// `MIN_BINS` (5) bins are requested or either image is constant (MI is then
     /// undefined).
     pub fn from_samples(
         fixed: FixedSamples,
         moving: MovingImage,
         number_of_histogram_bins: usize,
+        variance_for_joint_pdf_smoothing: f64,
     ) -> Result<Self> {
         if number_of_histogram_bins < MIN_BINS {
             return Err(RegistrationError::TooFewHistogramBins {
@@ -391,6 +406,7 @@ impl JointHistogramMutualInformationMetric {
             moving_true_min: moving_min,
             moving_true_max: moving_max,
             spacing,
+            smoothing_variance: variance_for_joint_pdf_smoothing,
         })
     }
 
@@ -565,7 +581,7 @@ impl JointHistogramMutualInformationMetric {
         }
 
         let kernel = discrete_gaussian_kernel(
-            SMOOTHING_VARIANCE,
+            self.smoothing_variance,
             SMOOTHING_MAX_ERROR,
             SMOOTHING_MAX_KERNEL_WIDTH,
         );
@@ -612,7 +628,7 @@ impl JointHistogramMutualInformationMetric {
     /// Evaluate `value = −MI` and its parameter-derivative for `transform`.
     ///
     /// Two passes over the fixed samples, exactly as ITK's two threaders: the
-    /// first ([`compute_joint_pdf`](Self::compute_joint_pdf)) builds the
+    /// first (the private `compute_joint_pdf`) builds the
     /// smoothed joint PDF and marginals (no gradients needed — only sample
     /// intensities); the second walks the samples again, this time with the
     /// moving image's physical gradient, to accumulate each sample's local
@@ -740,10 +756,10 @@ mod tests {
     fn too_few_bins_is_rejected() {
         let a = gaussian(10, 10, 5.0, 5.0, 2.0, 1.0);
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&a, &a, 5),
+            JointHistogramMutualInformationMetric::new(&a, &a, 5, 1.5),
             Err(RegistrationError::TooFewHistogramBins { bins: 5 })
         ));
-        assert!(JointHistogramMutualInformationMetric::new(&a, &a, 6).is_ok());
+        assert!(JointHistogramMutualInformationMetric::new(&a, &a, 6, 1.5).is_ok());
     }
 
     #[test]
@@ -751,11 +767,11 @@ mod tests {
         let flat = Image::from_vec(&[8, 8], vec![3.0; 64]).unwrap();
         let varied = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&flat, &varied, 20),
+            JointHistogramMutualInformationMetric::new(&flat, &varied, 20, 1.5),
             Err(RegistrationError::ConstantIntensity { which: "fixed" })
         ));
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&varied, &flat, 20),
+            JointHistogramMutualInformationMetric::new(&varied, &flat, 20, 1.5),
             Err(RegistrationError::ConstantIntensity { which: "moving" })
         ));
     }
@@ -764,7 +780,7 @@ mod tests {
     fn identical_images_are_optimal_at_identity_with_near_zero_derivative() {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let img = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&img, &img, 32).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(&img, &img, 32, 1.5).unwrap();
 
         let at = |dx: f64, dy: f64| {
             metric
@@ -816,7 +832,7 @@ mod tests {
             }
         }
         let moving = Image::from_vec(&[w, h], mv).unwrap();
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
 
         let at = |dx: f64, dy: f64| {
             metric
@@ -878,7 +894,7 @@ mod tests {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
 
         let p0 = [1.3f64, -0.7];
         let eval = |p: &[f64]| metric.evaluate(&TranslationTransform::new(p.to_vec()));
@@ -1001,7 +1017,7 @@ mod tests {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
 
         let p0 = [1.3f64, -0.7];
         let base = TranslationTransform::new(p0.to_vec());
@@ -1070,7 +1086,7 @@ mod tests {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 23.0, 20.0, sigma, 1.0); // true shift (3, 0)
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
 
         // Learning rate tuned empirically (not the crate's usual estimated
         // scales — see the module docs' local-support note): the analytic

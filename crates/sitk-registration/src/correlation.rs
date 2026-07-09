@@ -133,6 +133,22 @@ impl CorrelationMetric {
         self.fixed.physical_shift_scales(transform)
     }
 
+    /// This metric's transform-category precondition: it is global-transform
+    /// only. Mirrors `itkCorrelationImageToImageMetricv4.hxx:43-46`, whose
+    /// constructor throws `"does not support displacement field transforms!!"`.
+    ///
+    /// The single place the precondition is stated. Call it before optimizing;
+    /// [`evaluate`](Self::evaluate) asserts it.
+    pub fn check_transform(&self, transform: &dyn ParametricTransform) -> Result<()> {
+        if transform.has_local_support() {
+            Err(RegistrationError::RequiresGlobalTransform {
+                metric: "Correlation",
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Evaluate `value = −sfm²/(sff·smm)` and its parameter-derivative for
     /// `transform`, over the fixed samples that map inside the moving image
     /// under `transform`. See the [module docs](self) for the exact formulas
@@ -140,17 +156,16 @@ impl CorrelationMetric {
     ///
     /// # Panics
     ///
-    /// Panics if `transform` has
+    /// Panics if [`check_transform`](Self::check_transform) rejects
+    /// `transform` — that is, if it has
     /// [local support](ParametricTransform::has_local_support) (e.g. a
     /// [`DisplacementFieldTransform`](sitk_transform::DisplacementFieldTransform)).
     /// This metric is global-transform-only — see the
     /// [module docs](self#no-local-support-branch).
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
         assert!(
-            !transform.has_local_support(),
-            "CorrelationMetric is global-transform-only (itkCorrelationImageToImageMetricv4.hxx:43-46: \
-             the constructor throws when GetTransformCategory() == DisplacementField); \
-             got a transform with local support"
+            self.check_transform(transform).is_ok(),
+            "CorrelationMetric is global-transform-only; call check_transform first"
         );
 
         let dim = self.fixed.dim;
@@ -401,5 +416,29 @@ mod tests {
         let field = DisplacementFieldTransform::from_image_domain(&img).unwrap();
 
         let _ = metric.evaluate(&field);
+    }
+
+    #[test]
+    fn check_transform_rejects_a_displacement_field_before_evaluating() {
+        use sitk_transform::{DisplacementFieldTransform, TranslationTransform};
+
+        let (w, h, sigma) = (16usize, 16usize, 4.0);
+        let img = gaussian(w, h, 8.0, 8.0, sigma, 1.0);
+        let metric = CorrelationMetric::new(&img, &img).unwrap();
+
+        let field = DisplacementFieldTransform::from_image_domain(&img).unwrap();
+        let err = metric.check_transform(&field).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::RequiresGlobalTransform {
+                    metric: "Correlation"
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+
+        let global = TranslationTransform::new(vec![0.0, 0.0]);
+        assert!(metric.check_transform(&global).is_ok());
     }
 }

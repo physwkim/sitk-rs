@@ -106,6 +106,45 @@ pub enum RegistrationError {
     #[error("degenerate landmark configuration: normal-equations matrix is singular")]
     DegenerateLandmarks,
 
+    /// The ANTS neighborhood correlation metric's window (diameter
+    /// `2·radius + 1`) does not fit inside the fixed image along some axis —
+    /// every window in that dimension would be clipped from both sides
+    /// simultaneously, even at the image's own center. ITK's
+    /// `itk::ANTSNeighborhoodCorrelationImageToImageMetricv4` does not reject
+    /// this (its `ConstNeighborhoodIterator` silently tolerates ever-smaller
+    /// clipped windows at every voxel); this port rejects it explicitly
+    /// rather than silently computing a near-meaningless metric.
+    #[error(
+        "neighborhood radius {radius} (window diameter {window}) exceeds fixed image size {size} along axis {axis}"
+    )]
+    NeighborhoodRadiusExceedsImage {
+        /// The requested radius.
+        radius: usize,
+        /// `2·radius + 1`.
+        window: usize,
+        /// The fixed image's size along `axis`.
+        size: usize,
+        /// The offending axis.
+        axis: usize,
+    },
+
+    /// A metric that only defines a per-pixel force was given a transform with
+    /// global support. Mirrors `itk::DemonsImageToImageMetricv4::Initialize`,
+    /// which throws `"The moving transform must be a displacement field
+    /// transform"` when `GetTransformCategory() != DisplacementField`; unlike
+    /// the Mattes MI metric, Demons (and any other metric sharing this variant)
+    /// does not fall back to a dense/global path. The `metric` field names which
+    /// metric raised it.
+    #[error("{metric} metric requires a local-support (displacement field) transform")]
+    RequiresLocalSupportTransform { metric: &'static str },
+
+    /// A metric whose derivative is defined only over a whole-image reduction
+    /// was given a local-support (displacement field) transform. Mirrors
+    /// `itk::CorrelationImageToImageMetricv4`'s constructor, which throws
+    /// `"does not support displacement field transforms!!"`.
+    #[error("{metric} metric requires a global-support transform")]
+    RequiresGlobalTransform { metric: &'static str },
+
     /// A fixed or moving metric mask's size does not match its image's size
     /// (matches SimpleITK/ITK, which require the mask and image to share the
     /// same physical grid).

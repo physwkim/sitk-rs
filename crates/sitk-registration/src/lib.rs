@@ -115,10 +115,14 @@
 //! [`TranslationTransform`]: sitk_transform::TranslationTransform
 //! [`PhysicalShiftScales`]: crate::PhysicalShiftScales
 
+pub mod ants_correlation;
 pub mod convergence;
+pub mod correlation;
+pub mod demons;
 pub mod error;
 pub mod gradient_free;
 pub mod initializer;
+pub mod joint_histogram;
 pub mod landmark;
 pub mod lbfgs2;
 pub mod lbfgsb;
@@ -128,12 +132,16 @@ pub mod metric;
 pub mod optimizer;
 pub mod scales;
 
+pub use ants_correlation::AntsNeighborhoodCorrelationMetric;
 pub use convergence::WindowConvergenceMonitor;
+pub use correlation::CorrelationMetric;
+pub use demons::DemonsMetric;
 pub use error::{RegistrationError, Result};
 pub use gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
 };
 pub use initializer::{CenteredTransformInitializer, OperationMode};
+pub use joint_histogram::JointHistogramMutualInformationMetric;
 pub use landmark::LandmarkBasedTransformInitializer;
 pub use lbfgs2::{LBFGS2Optimizer, LineSearchMethod};
 pub use lbfgsb::LBFGSBOptimizer;
