@@ -71,6 +71,7 @@ pub mod logic;
 pub mod math;
 pub mod min_max_curvature_flow;
 pub mod morphology;
+pub mod morphology_reconstruction;
 pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
@@ -161,6 +162,11 @@ pub use morphology::{
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
     grayscale_morphological_closing, grayscale_morphological_opening, morphological_gradient,
     white_top_hat,
+};
+pub use morphology_reconstruction::{
+    binary_closing_by_reconstruction, binary_opening_by_reconstruction,
+    binary_reconstruction_by_dilation, binary_reconstruction_by_erosion, closing_by_reconstruction,
+    grayscale_connected_closing, grayscale_connected_opening, opening_by_reconstruction,
 };
 pub use n4_bias_field::{
     N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,

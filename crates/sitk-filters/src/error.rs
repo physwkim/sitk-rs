@@ -418,6 +418,17 @@ pub enum FilterError {
     #[error("slice step must be non-zero along every axis, got {0:?}")]
     InvalidSliceStep(Vec<i32>),
 
+    /// `GrayscaleConnectedOpeningImageFilter`/`GrayscaleConnectedClosingImageFilter`'s
+    /// `Seed` must be a valid index into the image. ITK's own `GenerateData`
+    /// dereferences `inputImage->GetPixel(m_Seed)` with no bounds check at
+    /// all (an out-of-range `Seed` is undefined behavior in C++, silently
+    /// reading whatever lies at the aliased offset); this port checks
+    /// instead, since an out-of-range multi-index could otherwise alias a
+    /// different in-bounds flat offset over this crate's linear pixel
+    /// buffer rather than simply crash.
+    #[error("seed index {seed:?} is out of bounds for an image of size {size:?}")]
+    InvalidSeedIndex { seed: Vec<usize>, size: Vec<usize> },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
