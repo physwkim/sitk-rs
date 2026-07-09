@@ -38,6 +38,7 @@ pub mod expand;
 pub mod fast_marching;
 mod fft;
 pub mod functor;
+pub mod geodesic_morphology;
 pub mod geometry;
 pub mod gradient;
 pub mod grid_utility;
@@ -88,6 +89,7 @@ pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
 };
