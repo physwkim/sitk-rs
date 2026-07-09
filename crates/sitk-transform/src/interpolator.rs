@@ -475,6 +475,232 @@ pub fn gaussian_value_and_gradient(
     Some((value, grad))
 }
 
+/// Kernel radius for [`windowed_sinc_value_and_gradient`], matching
+/// SimpleITK's `sitk*WindowedSinc` presets (`WindowingRadius` in
+/// `sitkCreateInterpolator.hxx`): `2 * `[`WINDOWED_SINC_RADIUS`] taps per axis.
+pub const WINDOWED_SINC_RADIUS: usize = 5;
+
+/// Window function paired with the sinc kernel by
+/// [`windowed_sinc_value_and_gradient`], one per SimpleITK `sitk*WindowedSinc`
+/// preset (`itk::Function::*WindowFunction`, `itkWindowedSincInterpolateImageFunction.h`).
+/// All formulas below are exact ports, evaluated at the fixed
+/// [`WINDOWED_SINC_RADIUS`] (`m` in the ITK formulas).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SincWindow {
+    /// `w(x) = 0.54 + 0.46 cos(pi x / m)` (`sitkHammingWindowedSinc`).
+    Hamming,
+    /// `w(x) = cos(pi x / (2 m))` (`sitkCosineWindowedSinc`).
+    Cosine,
+    /// `w(x) = 1 - (x / m)^2` (`sitkWelchWindowedSinc`).
+    Welch,
+    /// `w(x) = sinc(x / m)`, i.e. `sin(pi x / m) / (pi x / m)`
+    /// (`sitkLanczosWindowedSinc`).
+    Lanczos,
+    /// `w(x) = 0.42 + 0.5 cos(pi x / m) + 0.08 cos(2 pi x / m)`
+    /// (`sitkBlackmanWindowedSinc`).
+    Blackman,
+}
+
+impl SincWindow {
+    /// `w(x)`.
+    fn weight(self, x: f64) -> f64 {
+        let m = WINDOWED_SINC_RADIUS as f64;
+        match self {
+            SincWindow::Hamming => {
+                let factor = std::f64::consts::PI / m;
+                0.54 + 0.46 * (x * factor).cos()
+            }
+            SincWindow::Cosine => {
+                let factor = std::f64::consts::PI / (2.0 * m);
+                (x * factor).cos()
+            }
+            SincWindow::Welch => {
+                let factor = 1.0 / (m * m);
+                1.0 - x * factor * x
+            }
+            SincWindow::Lanczos => {
+                if x == 0.0 {
+                    1.0
+                } else {
+                    let factor = std::f64::consts::PI / m;
+                    let z = factor * x;
+                    z.sin() / z
+                }
+            }
+            SincWindow::Blackman => {
+                let factor1 = std::f64::consts::PI / m;
+                let factor2 = 2.0 * std::f64::consts::PI / m;
+                0.42 + 0.5 * (x * factor1).cos() + 0.08 * (x * factor2).cos()
+            }
+        }
+    }
+
+    /// `dw/dx`. Not part of ITK (which never differentiates this kernel);
+    /// each branch is the plain derivative of the corresponding [`weight`]
+    /// formula, needed so [`windowed_sinc_value_and_gradient`] can supply the
+    /// same value+gradient contract every other kernel in this module gives.
+    ///
+    /// [`weight`]: SincWindow::weight
+    fn dweight(self, x: f64) -> f64 {
+        let m = WINDOWED_SINC_RADIUS as f64;
+        match self {
+            SincWindow::Hamming => {
+                let factor = std::f64::consts::PI / m;
+                -0.46 * factor * (x * factor).sin()
+            }
+            SincWindow::Cosine => {
+                let factor = std::f64::consts::PI / (2.0 * m);
+                -factor * (x * factor).sin()
+            }
+            SincWindow::Welch => {
+                let factor = 1.0 / (m * m);
+                -2.0 * factor * x
+            }
+            SincWindow::Lanczos => {
+                if x == 0.0 {
+                    0.0
+                } else {
+                    let factor = std::f64::consts::PI / m;
+                    let z = factor * x;
+                    factor * (z.cos() * z - z.sin()) / (z * z)
+                }
+            }
+            SincWindow::Blackman => {
+                let factor1 = std::f64::consts::PI / m;
+                let factor2 = 2.0 * std::f64::consts::PI / m;
+                -0.5 * factor1 * (x * factor1).sin() - 0.08 * factor2 * (x * factor2).sin()
+            }
+        }
+    }
+}
+
+/// `itk::WindowedSincInterpolateImageFunction::Sinc`: `sin(pi x) / (pi x)`,
+/// `1` at `x == 0`.
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+/// `d(sinc)/dx`, `0` at `x == 0` (the removable singularity of `sinc`'s own
+/// formula; `sinc` is even, so this is its correct value there, not merely a
+/// guard).
+fn dsinc(x: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        std::f64::consts::PI * (px.cos() * px - px.sin()) / (px * px)
+    }
+}
+
+/// Windowed-sinc sample and its exact index-space gradient at continuous
+/// index `cindex`, or `None` if outside the buffer. Ports
+/// `itk::WindowedSincInterpolateImageFunction::EvaluateAtContinuousIndex` at
+/// the fixed [`WINDOWED_SINC_RADIUS`] radius SimpleITK bakes into its five
+/// `sitk*WindowedSinc` presets — `m_Radius` is a compile-time template
+/// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::interpolator::GAUSSIAN_SIGMA)
+/// it has no runtime setter to port.
+///
+/// Per axis, the kernel `K(t) = w(t) sinc(t)` (`w` from `window`) is sampled
+/// at the `2 * `[`WINDOWED_SINC_RADIUS`] taps surrounding the query point,
+/// exactly as the `.hxx` computes `xWeight`: **except** at `distance == 0`
+/// (query exactly on a grid point), where ITK overrides the taps with a hard
+/// `0`/`1` delta rather than relying on the general formula — `sinc` at a
+/// nonzero integer is mathematically `0` but not exactly so in floating point
+/// (`sin(pi n)` for a whole `n` isn't exactly `0`), so the override exists
+/// purely to reproduce the sample bit-exactly, not because of a real
+/// discontinuity.
+///
+/// ITK has no analytic gradient for this interpolator; the one computed here
+/// always uses the smooth per-tap formula (`w'(t) sinc(t) + w(t) sinc'(t)`,
+/// product rule), **without** the delta override, even when `distance == 0`.
+/// This is deliberate, not an oversight: `K` is even in `t` (every `w` here is
+/// even, and `sinc`/`d(sinc)` are each individually well-defined — see
+/// [`sinc`]/[`dsinc`] — at `t == 0`) so `K` is `C^1` straight through
+/// `distance == 0` with no kink for a delta-shaped gradient to model; the
+/// delta only ever existed to suppress the value's floating-point noise.
+///
+/// Neighbour indices are clamped into `[0, size − 1]` per axis, matching
+/// ITK's default `ZeroFluxNeumannBoundaryCondition` (`GetPixel`, edge
+/// replication — verified against `itkZeroFluxNeumannBoundaryCondition.hxx`),
+/// the same convention [`linear_at`] and [`linear_value_and_gradient`] use.
+pub fn windowed_sinc_value_and_gradient(
+    buf: &[f64],
+    size: &[usize],
+    strides: &[usize],
+    cindex: &[f64],
+    window: SincWindow,
+) -> Option<(f64, Vec<f64>)> {
+    if !is_inside(cindex, size) {
+        return None;
+    }
+    let dim = size.len();
+    let radius = WINDOWED_SINC_RADIUS;
+    let window_size = 2 * radius;
+
+    let mut base_index = vec![0isize; dim];
+    let mut distance = vec![0.0f64; dim];
+    for d in 0..dim {
+        let f = cindex[d].floor();
+        base_index[d] = f as isize;
+        distance[d] = cindex[d] - f;
+    }
+
+    let mut w = vec![vec![0.0f64; window_size]; dim];
+    let mut dw = vec![vec![0.0f64; window_size]; dim];
+    for d in 0..dim {
+        if distance[d] == 0.0 {
+            for (i, wi) in w[d].iter_mut().enumerate() {
+                *wi = if i == radius - 1 { 1.0 } else { 0.0 };
+            }
+        } else {
+            let mut x = distance[d] + radius as f64;
+            for wi in w[d].iter_mut() {
+                x -= 1.0;
+                *wi = window.weight(x) * sinc(x);
+            }
+        }
+        let mut x = distance[d] + radius as f64;
+        for dwi in dw[d].iter_mut() {
+            x -= 1.0;
+            *dwi = window.dweight(x) * sinc(x) + window.weight(x) * dsinc(x);
+        }
+    }
+
+    let mut value = 0.0;
+    let mut grad = vec![0.0f64; dim];
+    for corner in 0..window_size.pow(dim as u32) {
+        let mut rem = corner;
+        let mut tap = vec![0usize; dim];
+        for t in tap.iter_mut() {
+            *t = rem % window_size;
+            rem /= window_size;
+        }
+        let mut offset = 0usize;
+        let mut wprod = 1.0;
+        for d in 0..dim {
+            let k = tap[d] as isize - (radius as isize - 1);
+            let idx = (base_index[d] + k).clamp(0, size[d] as isize - 1) as usize;
+            offset += idx * strides[d];
+            wprod *= w[d][tap[d]];
+        }
+        let pixel = buf[offset];
+        value += wprod * pixel;
+        for (q, gq) in grad.iter_mut().enumerate() {
+            let mut gprod = 1.0;
+            for d in 0..dim {
+                gprod *= if d == q { dw[d][tap[d]] } else { w[d][tap[d]] };
+            }
+            *gq += gprod * pixel;
+        }
+    }
+    Some((value, grad))
+}
+
 /// `D · diag(spacing)`, row-major: maps a continuous index to a physical
 /// displacement from the origin.
 pub fn index_to_physical_matrix(direction: &[f64], spacing: &[f64], dim: usize) -> Vec<f64> {
@@ -887,5 +1113,186 @@ mod tests {
         // outside (not merely "far away").
         assert!(gaussian_value_and_gradient(&buf, &size, &strides, &[9.5, 5.0]).is_none());
         assert!(gaussian_value_and_gradient(&buf, &size, &strides, &[5.0, 5.0]).is_some());
+    }
+
+    const ALL_SINC_WINDOWS: [SincWindow; 5] = [
+        SincWindow::Hamming,
+        SincWindow::Cosine,
+        SincWindow::Welch,
+        SincWindow::Lanczos,
+        SincWindow::Blackman,
+    ];
+
+    #[test]
+    fn windowed_sinc_reproduces_every_sample_at_grid_points_for_every_window() {
+        // At `distance == 0` every non-own tap's weight is the hard `0.0`
+        // ITK's delta-branch sets (not merely a near-zero `sinc` residual), so
+        // the sum collapses to exactly `1.0 * sample` — bit-exact, not just
+        // close.
+        let (buf, size) = noisy(9, 7);
+        let strides = strides(&size);
+        for window in ALL_SINC_WINDOWS {
+            for y in 0..7 {
+                for x in 0..9 {
+                    let (value, _) = windowed_sinc_value_and_gradient(
+                        &buf,
+                        &size,
+                        &strides,
+                        &[x as f64, y as f64],
+                        window,
+                    )
+                    .unwrap();
+                    let expected = buf[y * 9 + x];
+                    assert_eq!(value, expected, "{window:?} ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_sinc_interpolant_is_symmetric_about_a_symmetric_lines_center() {
+        // K(t) = w(t) sinc(t) is even for every window here (`w` and `sinc`
+        // are each even), so reconstructing a sequence that is itself even
+        // about index 20 must give a continuous function that is even about
+        // cindex 20, off-lattice included.
+        let n = 41usize;
+        let mut buf = vec![0.0f64; n];
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for k in 0..=20usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let v = (state >> 11) as f64 / (1u64 << 53) as f64 * 100.0;
+            buf[20 + k] = v;
+            buf[20 - k] = v;
+        }
+        let size = vec![n];
+        let strides = strides(&size);
+        for window in ALL_SINC_WINDOWS {
+            for &t in &[0.1f64, 0.37, 0.49] {
+                let plus =
+                    windowed_sinc_value_and_gradient(&buf, &size, &strides, &[20.0 + t], window)
+                        .unwrap()
+                        .0;
+                let minus =
+                    windowed_sinc_value_and_gradient(&buf, &size, &strides, &[20.0 - t], window)
+                        .unwrap()
+                        .0;
+                assert!(
+                    (plus - minus).abs() < 1e-9,
+                    "{window:?} t={t}: v(20+t) {plus} vs v(20-t) {minus}"
+                );
+            }
+        }
+    }
+
+    /// Independent, brute-force reference for the theory formula in
+    /// `itkWindowedSincInterpolateImageFunction.h`'s class docs — `I(x) =
+    /// sum_i I_i K(x - i)` over the `2*radius` taps surrounding `x`, `K(t) =
+    /// w(t) sinc(t)` — written with its own index arithmetic (absolute pixel
+    /// index `i` and `t = cindex - i`, rather than the production code's
+    /// `distance`/tap-offset parameterization) so it cannot share a
+    /// transcription bug with [`windowed_sinc_value_and_gradient`].
+    fn brute_force_windowed_sinc_1d(buf: &[f64], cindex: f64, window: SincWindow) -> f64 {
+        let radius = WINDOWED_SINC_RADIUS as i64;
+        let base = cindex.floor() as i64;
+        let mut sum = 0.0;
+        for i in (base - radius + 1)..=(base + radius) {
+            let clamped = i.clamp(0, buf.len() as i64 - 1) as usize;
+            let t = cindex - i as f64;
+            sum += buf[clamped] * window.weight(t) * sinc(t);
+        }
+        sum
+    }
+
+    #[test]
+    fn windowed_sinc_matches_a_brute_force_evaluation_of_the_same_formula() {
+        let (buf, _) = noisy(12, 1);
+        for window in ALL_SINC_WINDOWS {
+            let size = vec![12usize];
+            let strides = strides(&size);
+            // Fractional points only: at an exact grid point ITK's own
+            // delta-branch (a floating-point-noise guard, see
+            // `windowed_sinc_value_and_gradient`'s docs) makes production and
+            // this naive reference differ by the `sinc(integer) != 0.0`
+            // rounding residual the guard exists to suppress — a ~1e-16-scale
+            // non-issue that grid-point exactness is already covered by
+            // `windowed_sinc_reproduces_every_sample_at_grid_points_for_every_window`.
+            for &cindex in &[3.3f64, 5.7, 0.5, 10.9] {
+                let got =
+                    windowed_sinc_value_and_gradient(&buf, &size, &strides, &[cindex], window)
+                        .unwrap()
+                        .0;
+                let want = brute_force_windowed_sinc_1d(&buf, cindex, window);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "{window:?} cindex={cindex}: {got} vs brute-force {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_sinc_gradient_matches_finite_difference_for_every_window() {
+        let (buf, size) = noisy(14, 14);
+        let strides = strides(&size);
+        let c0 = [6.4, 7.6];
+        // A tighter step than the other kernels' finite-difference tests use:
+        // the sinc/window product's higher-order derivatives scale with
+        // `(pi/radius)^n` across `2*radius` taps per axis, so at `h = 1e-4`
+        // the O(h^2) truncation error alone is close to 1e-6 — not a
+        // correctness margin, just this kernel's curvature. `h = 1e-6` cuts
+        // truncation error ~1e4x while `vp - vm` (~1e-4 scale here) stays
+        // many orders above f64 round-off.
+        let h = 1e-6;
+        for window in ALL_SINC_WINDOWS {
+            let analytic = windowed_sinc_value_and_gradient(&buf, &size, &strides, &c0, window)
+                .unwrap()
+                .1;
+            for k in 0..2 {
+                let mut cp = c0;
+                cp[k] += h;
+                let mut cm = c0;
+                cm[k] -= h;
+                let vp = windowed_sinc_value_and_gradient(&buf, &size, &strides, &cp, window)
+                    .unwrap()
+                    .0;
+                let vm = windowed_sinc_value_and_gradient(&buf, &size, &strides, &cm, window)
+                    .unwrap()
+                    .0;
+                let fd = (vp - vm) / (2.0 * h);
+                assert!(
+                    (fd - analytic[k]).abs() < 1e-6,
+                    "{window:?} axis {k}: fd {fd} vs analytic {}",
+                    analytic[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_sinc_respects_is_inside_bounds() {
+        let (buf, size) = noisy(10, 10);
+        let strides = strides(&size);
+        assert!(
+            windowed_sinc_value_and_gradient(
+                &buf,
+                &size,
+                &strides,
+                &[9.5, 5.0],
+                SincWindow::Hamming
+            )
+            .is_none()
+        );
+        assert!(
+            windowed_sinc_value_and_gradient(
+                &buf,
+                &size,
+                &strides,
+                &[5.0, 5.0],
+                SincWindow::Hamming
+            )
+            .is_some()
+        );
     }
 }

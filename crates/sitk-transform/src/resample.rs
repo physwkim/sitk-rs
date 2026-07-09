@@ -9,8 +9,9 @@ use sitk_core::{Image, PixelId, matrix};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{
-    affine_apply, bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
-    index_to_physical_matrix, linear_at, nearest_at, physical_to_index_matrix, strides,
+    SincWindow, affine_apply, bspline_coefficients, bspline_value_and_gradient,
+    gaussian_value_and_gradient, index_to_physical_matrix, linear_at, nearest_at,
+    physical_to_index_matrix, strides, windowed_sinc_value_and_gradient,
 };
 use crate::transform::Transform;
 
@@ -36,6 +37,29 @@ pub enum Interpolator {
     /// [`interpolator::GAUSSIAN_SIGMA`]: crate::interpolator::GAUSSIAN_SIGMA
     /// [`interpolator::GAUSSIAN_ALPHA`]: crate::interpolator::GAUSSIAN_ALPHA
     Gaussian,
+    /// Windowed sinc, Hamming window (`sitkHammingWindowedSinc`,
+    /// `itk::WindowedSincInterpolateImageFunction` with
+    /// `itk::Function::HammingWindowFunction`), fixed at SimpleITK's radius-5
+    /// preset ([`interpolator::WINDOWED_SINC_RADIUS`]). Interpolating.
+    ///
+    /// [`interpolator::WINDOWED_SINC_RADIUS`]: crate::interpolator::WINDOWED_SINC_RADIUS
+    HammingWindowedSinc,
+    /// Windowed sinc, Cosine window (`sitkCosineWindowedSinc`) — see
+    /// [`HammingWindowedSinc`](Self::HammingWindowedSinc) for the shared
+    /// radius/kernel notes.
+    CosineWindowedSinc,
+    /// Windowed sinc, Welch window (`sitkWelchWindowedSinc`) — see
+    /// [`HammingWindowedSinc`](Self::HammingWindowedSinc) for the shared
+    /// radius/kernel notes.
+    WelchWindowedSinc,
+    /// Windowed sinc, Lanczos window (`sitkLanczosWindowedSinc`) — see
+    /// [`HammingWindowedSinc`](Self::HammingWindowedSinc) for the shared
+    /// radius/kernel notes.
+    LanczosWindowedSinc,
+    /// Windowed sinc, Blackman window (`sitkBlackmanWindowedSinc`) — see
+    /// [`HammingWindowedSinc`](Self::HammingWindowedSinc) for the shared
+    /// radius/kernel notes.
+    BlackmanWindowedSinc,
 }
 
 /// `itk::ResampleImageFilter`: build an output grid and sample the input through
@@ -203,6 +227,51 @@ impl ResampleImageFilter {
                         .map(|(v, _)| v)
                         .unwrap_or(self.default_value)
                 }
+                Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
+                    &in_buf,
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                    SincWindow::Hamming,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
+                Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
+                    &in_buf,
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                    SincWindow::Cosine,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
+                Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
+                    &in_buf,
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                    SincWindow::Welch,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
+                Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
+                    &in_buf,
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                    SincWindow::Lanczos,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
+                Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
+                    &in_buf,
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                    SincWindow::Blackman,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
             };
 
             increment(&mut index, &out_size);
@@ -374,5 +443,63 @@ mod tests {
             out.scalar_slice::<f32>().unwrap(),
             &[-7.0, -7.0, -7.0, -7.0]
         );
+    }
+
+    #[test]
+    fn windowed_sinc_interpolation_reproduces_ramp_on_identity_for_every_window() {
+        // Smoke test for all five windowed-sinc dispatch branches: on an
+        // identity transform every output sample lands on an integer input
+        // index, which every window reproduces exactly (ITK's delta-weight
+        // branch at `distance == 0`; bit-exact check lives in
+        // `interpolator`'s own tests).
+        let img = ramp_2d(6, 1); // 0,1,2,3,4,5
+        let t = AffineTransform::identity(2);
+        for interp in [
+            Interpolator::HammingWindowedSinc,
+            Interpolator::CosineWindowedSinc,
+            Interpolator::WelchWindowedSinc,
+            Interpolator::LanczosWindowedSinc,
+            Interpolator::BlackmanWindowedSinc,
+        ] {
+            let out = ResampleImageFilter::new()
+                .set_reference_image(&img)
+                .set_interpolator(interp)
+                .execute(&img, &t)
+                .unwrap();
+            assert_eq!(
+                out.scalar_slice::<f32>().unwrap(),
+                img.scalar_slice::<f32>().unwrap(),
+                "{interp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windowed_sinc_interpolation_falls_back_to_default_outside_for_every_window() {
+        // Mirrors `gaussian_interpolation_smooths_toward_default_outside`: a
+        // point mapped well outside the input buffer makes
+        // `windowed_sinc_value_and_gradient` return `None` (via the shared
+        // `is_inside` gate), falling back to the default pixel value.
+        let img = ramp_2d(4, 1);
+        let t = TranslationTransform::new(vec![100.0, 0.0]);
+        for interp in [
+            Interpolator::HammingWindowedSinc,
+            Interpolator::CosineWindowedSinc,
+            Interpolator::WelchWindowedSinc,
+            Interpolator::LanczosWindowedSinc,
+            Interpolator::BlackmanWindowedSinc,
+        ] {
+            let out = ResampleImageFilter::new()
+                .set_reference_image(&img)
+                .set_default_pixel_value(-7.0)
+                .set_interpolator(interp)
+                .execute(&img, &t)
+                .unwrap();
+            assert_eq!(
+                out.scalar_slice::<f32>().unwrap(),
+                &[-7.0, -7.0, -7.0, -7.0],
+                "{interp:?}"
+            );
+        }
     }
 }
