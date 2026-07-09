@@ -36,8 +36,8 @@ use crate::lbfgsb::LBFGSBOptimizer;
 use crate::mattes::MattesMutualInformationMetric;
 use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
 use crate::optimizer::{
-    GradientDescentLineSearchOptimizer, GradientDescentOptimizer,
-    RegularStepGradientDescentOptimizer, StopReason,
+    ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
+    GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason,
 };
 use crate::scales::PhysicalShiftScales;
 
@@ -139,6 +139,10 @@ enum OptimizerKind {
     /// (`itk::GradientDescentLineSearchOptimizerv4`): each step's learning rate
     /// is chosen to most reduce the metric along the gradient.
     LineSearch(GradientDescentLineSearchOptimizer),
+    /// Conjugate gradient descent with a per-iteration golden-section line search
+    /// (`itk::ConjugateGradientLineSearchOptimizerv4`): the line search's
+    /// conjugate-direction variant, descending ill-conditioned basins faster.
+    ConjugateGradientLineSearch(ConjugateGradientLineSearchOptimizer),
     /// Bound-constrained limited-memory BFGS (`itk::LBFGSBOptimizerv4`). Unlike
     /// the gradient-descent optimizers it does **not** use parameter scales or a
     /// learning rate — it drives the raw metric gradient through a line search —
@@ -402,6 +406,46 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Use conjugate gradient descent with a per-iteration golden-section line
+    /// search (`itk::ConjugateGradientLineSearchOptimizerv4`, SimpleITK
+    /// `SetOptimizerAsConjugateGradientLineSearch`) at a caller-supplied base
+    /// learning rate. Like
+    /// [`set_optimizer_as_gradient_descent_line_search`](Self::set_optimizer_as_gradient_descent_line_search)
+    /// but the search direction is the modified Polak–Ribière conjugate of the
+    /// gradient, so successive steps do not undo one another and an elongated
+    /// basin is descended in far fewer iterations. Value-plateau monitoring stops
+    /// the run (SimpleITK always configures it for this optimizer).
+    pub fn set_optimizer_as_conjugate_gradient_line_search(
+        &mut self,
+        learning_rate: f64,
+        iterations: usize,
+    ) -> &mut Self {
+        let mut optimizer = ConjugateGradientLineSearchOptimizer::new(learning_rate, iterations);
+        optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
+        self.optimizer = OptimizerKind::ConjugateGradientLineSearch(optimizer);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Like [`set_optimizer_as_conjugate_gradient_line_search`](Self::set_optimizer_as_conjugate_gradient_line_search)
+    /// but the base learning rate is **estimated** from physical shift. As with
+    /// the plain line search, ITK estimates the base rate only once, at the first
+    /// iteration; the golden-section search then adapts it every iteration, so
+    /// there is no per-iteration re-estimation mode and no one-voxel step cap is
+    /// needed. Pair with
+    /// [`set_optimizer_scales_from_physical_shift`](Self::set_optimizer_scales_from_physical_shift).
+    pub fn set_optimizer_as_conjugate_gradient_line_search_estimated(
+        &mut self,
+        iterations: usize,
+    ) -> &mut Self {
+        // The stored base rate is a placeholder overwritten by the estimate.
+        let mut optimizer = ConjugateGradientLineSearchOptimizer::new(1.0, iterations);
+        optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
+        self.optimizer = OptimizerKind::ConjugateGradientLineSearch(optimizer);
+        self.learning_rate_mode = LearningRateMode::Estimate(EstimateLearningRate::Once);
+        self
+    }
+
     /// Use the bound-constrained limited-memory BFGS optimizer
     /// (`itk::LBFGSBOptimizerv4`), SimpleITK `SetOptimizerAsLBFGSB`. It drives the
     /// raw metric gradient through a Moré–Thuente line search and, unlike the
@@ -471,6 +515,9 @@ impl ImageRegistrationMethod {
             }
             OptimizerKind::LineSearch(ls) => {
                 ls.set_min_step_tolerance(tol);
+            }
+            OptimizerKind::ConjugateGradientLineSearch(cg) => {
+                cg.set_min_step_tolerance(tol);
             }
             // LBFGSB has no scaled-step tolerance; it stops via its projected-
             // gradient and function-decrease criteria instead.
@@ -862,6 +909,28 @@ impl ImageRegistrationMethod {
                     }
                 }
             }
+            OptimizerKind::ConjugateGradientLineSearch(cg) => {
+                let mut optimizer = cg.clone();
+                optimizer.set_scales(scales.clone());
+                match self.learning_rate_mode {
+                    // Caller-supplied fixed base rate; the golden-section search
+                    // adapts it each iteration along the conjugate direction.
+                    LearningRateMode::Manual => optimizer.optimize(start, objective!()),
+                    // Base rate estimated once from the initial gradient, exactly
+                    // as the plain line search does — ITK's conjugate optimizer
+                    // also calls EstimateLearningRate only at m_CurrentIteration
+                    // == 0, and the golden-section search adapts it thereafter, so
+                    // no per-iteration re-estimation or step cap is needed.
+                    LearningRateMode::Estimate(_) => {
+                        let est = estimator.as_ref().unwrap();
+                        transform.set_parameters(&start);
+                        let m0 = metric.evaluate(&transform, backend);
+                        let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
+                        optimizer.set_learning_rate(lr_once);
+                        optimizer.optimize(start, objective!())
+                    }
+                }
+            }
             OptimizerKind::Lbfgsb(cfg) => {
                 // No scales, no learning-rate estimation: LBFGSB minimizes the raw
                 // metric directly under its own bound/convergence configuration.
@@ -998,6 +1067,60 @@ mod tests {
         let mut reg = ImageRegistrationMethod::new();
         reg.set_optimizer_scales_from_physical_shift()
             .set_optimizer_as_gradient_descent_line_search(5.0, 300);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}, stop {:?}",
+            result.metric_value,
+            result.iterations,
+            result.stop_reason
+        );
+    }
+
+    #[test]
+    fn conjugate_gradient_line_search_recovers_a_translation_with_estimated_rate() {
+        // Conjugate-gradient line search with the base learning rate estimated
+        // once from physical shift recovers the translation end-to-end with no
+        // hand-tuned rate.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_conjugate_gradient_line_search_estimated(300);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}, stop {:?}",
+            result.metric_value,
+            result.iterations,
+            result.stop_reason
+        );
+    }
+
+    #[test]
+    fn conjugate_gradient_line_search_recovers_a_translation_with_manual_rate() {
+        // With a caller-supplied base rate and physical-shift scales, the
+        // conjugate-gradient line search aligns the images; the golden-section
+        // search tames a base rate larger than optimal each iteration.
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_conjugate_gradient_line_search(5.0, 300);
         let result = reg
             .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
             .unwrap();
