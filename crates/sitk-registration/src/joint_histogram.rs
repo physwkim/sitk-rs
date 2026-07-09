@@ -19,8 +19,11 @@
 //! moving) intensity pair increments exactly *one* bin (nearest-bin, round-half
 //! -up — no per-sample Parzen window), the whole `bins × bins` array is then
 //! blurred by the **discrete Gaussian** operator (`VarianceForJointPDFSmoothing`,
-//! default 1.5, ITK's `itk::DiscreteGaussianImageFilter` — the true discrete
-//! analogue of the continuous Gaussian, via modified Bessel functions, not a
+//! a caller-supplied [`JointHistogramMutualInformationMetric::new`] parameter,
+//! ITK/SimpleITK default `1.5` via
+//! [`DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING`](JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING);
+//! ITK's `itk::DiscreteGaussianImageFilter` — the true discrete analogue of
+//! the continuous Gaussian, via modified Bessel functions, not a
 //! truncated-and-renormalized sampled Gaussian), and the marginals are column/
 //! row sums of the *smoothed* array. The derivative treats this smoothed array
 //! as a frozen, continuously-interpolated density field and — for each sample
@@ -91,6 +94,36 @@
 //!   correction affects only `ComputeValue`'s pairing, not the derivative
 //!   formula's structure — the derivative here uses the crate's correctly-
 //!   computed `moving_marginal` throughout, consistent with `ComputeValue`.
+//! * **`term2`'s `ln2` factor is asymmetric with `ComputeValue`'s nats→bits
+//!   conversion — reproduced here, not corrected, unlike the marginal swap
+//!   above.** `itkJointHistogramMutualInformationGetValueAndDerivativeThreader
+//!   .hxx:147-151` computes `term2 = m_Log2 * dMmPDF * jointPDFValue /
+//!   movingImagePDFValue` (`m_Log2 = std::log(2.0)`, ctor-initialized at
+//!   `itkJointHistogramMutualInformationImageToImageMetricv4.hxx:53`) and
+//!   `scalingfactor = term2 - term1`, while that same class's `ComputeValue`
+//!   divides the *whole* summed value by `m_Log2` only at the very end
+//!   (`.hxx:374`: `return -1.0 * total_mi.GetSum() / this->m_Log2;`) — i.e.
+//!   `value`'s nats→bits conversion divides everything by `ln2`, but the
+//!   derivative multiplies only `term2` by `ln2`, not the whole
+//!   `scalingfactor`. This is provably not an exact frozen-density gradient
+//!   of anything: writing `phi(J, mm)` for a scalar potential with
+//!   `∂phi/∂J = ln J − ln mm` (to match `term1`) and `∂phi/∂mm = −ln2·J/mm`
+//!   (to match `term2`), Clairaut's theorem requires the mixed partials to
+//!   agree — `∂/∂mm[ln J − ln mm] = −1/mm` must equal
+//!   `∂/∂J[−ln2·J/mm] = −ln2/mm` — which is false whenever `ln2 ≠ 1`, so no
+//!   such `phi` exists (a proof, not an unobserved coincidence). Dropping the
+//!   `ln2` *would* make `term1 − term2` exactly the gradient of
+//!   `phi(J,mm) = J·(ln J − ln mm) − J` (see
+//!   `frozen_density_identity_matches_finite_difference` in the test module,
+//!   which checks exactly this ln2-free identity). But unlike the marginal
+//!   swap, which has one demonstrably correct answer whenever the two
+//!   marginals differ in shape, there is no unambiguous fix here: no
+//!   per-sample frozen-density formula is the exact gradient of the true
+//!   bin-summed MI regardless of the `ln2` factor, so removing it would trade
+//!   ITK's inconsistency for a different heuristic rather than fixing a bug,
+//!   and would silently change every derivative value a SimpleITK-parity user
+//!   compares against. This port therefore keeps the literal, `ln2`-laden
+//!   `term2` in [`evaluate`](JointHistogramMutualInformationMetric::evaluate).
 //! * **`ComputeFixedImageMarginalPDFDerivative` is dead code, not ported.** It
 //!   is declared in the threader header but never called from `ProcessPoint`
 //!   (only `ComputeMovingImageMarginalPDFDerivative` is; the fixed image's own
@@ -334,19 +367,25 @@ pub struct JointHistogramMutualInformationMetric {
     /// Joint-PDF axis spacing: `1 / (bins − 2·padding − 1)`, so a normalized
     /// intensity in `[0, 1]` maps to the bin range `[padding, bins−1−padding]`.
     spacing: f64,
-    /// `VarianceForJointPDFSmoothing`: the variance, in bins², of the discrete
-    /// Gaussian convolved over each joint-histogram axis before the PDF is read.
-    /// ITK's ctor default is `1.5`.
-    smoothing_variance: f64,
+    /// `VarianceForJointPDFSmoothing` for the discrete-Gaussian blur of the
+    /// hard-binned histogram (see [`Self::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING`]).
+    variance_for_joint_pdf_smoothing: f64,
 }
 
 impl JointHistogramMutualInformationMetric {
-    /// Build the metric from a fixed and moving image, a histogram bin count,
-    /// and the joint-PDF smoothing variance (ITK's
-    /// `SetVarianceForJointPDFSmoothing`, default `1.5`). Fails if dimensions
-    /// disagree, the moving direction matrix is singular, fewer than `MIN_BINS`
-    /// (5) bins are requested, or either image is constant (MI is then
-    /// undefined).
+    /// ITK's `VarianceForJointPDFSmoothing` ctor default (SimpleITK's
+    /// `SetMetricAsJointHistogramMutualInformation`'s `varianceForJointPDFSmoothing`
+    /// default), for callers that want ITK/SimpleITK parity rather than a
+    /// deliberately chosen value.
+    pub const DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING: f64 = 1.5;
+
+    /// Build the metric from a fixed and moving image, a histogram bin
+    /// count, and the joint-PDF smoothing variance
+    /// (`VarianceForJointPDFSmoothing`, e.g.
+    /// [`Self::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING`] for ITK/SimpleITK
+    /// parity). Fails if dimensions disagree, the moving direction matrix is
+    /// singular, fewer than `MIN_BINS` (6) bins are requested, or either image
+    /// is constant (MI is then undefined).
     pub fn new(
         fixed: &Image,
         moving: &Image,
@@ -372,7 +411,7 @@ impl JointHistogramMutualInformationMetric {
     /// Build the metric from already-prepared fixed samples and moving image
     /// (e.g. from a caller applying its own sampling strategy, interpolator, or
     /// mask before handing off to the metric). Fails if fewer than
-    /// `MIN_BINS` (5) bins are requested or either image is constant (MI is then
+    /// `MIN_BINS` (6) bins are requested or either image is constant (MI is then
     /// undefined).
     pub fn from_samples(
         fixed: FixedSamples,
@@ -406,7 +445,7 @@ impl JointHistogramMutualInformationMetric {
             moving_true_min: moving_min,
             moving_true_max: moving_max,
             spacing,
-            smoothing_variance: variance_for_joint_pdf_smoothing,
+            variance_for_joint_pdf_smoothing,
         })
     }
 
@@ -581,7 +620,7 @@ impl JointHistogramMutualInformationMetric {
         }
 
         let kernel = discrete_gaussian_kernel(
-            self.smoothing_variance,
+            self.variance_for_joint_pdf_smoothing,
             SMOOTHING_MAX_ERROR,
             SMOOTHING_MAX_KERNEL_WIDTH,
         );
@@ -753,25 +792,59 @@ mod tests {
     }
 
     #[test]
+    fn larger_variance_measurably_smooths_the_joint_pdf() {
+        // `variance_for_joint_pdf_smoothing` is now a caller-supplied
+        // constructor parameter (previously hard-coded); confirm it actually
+        // changes the smoothing behavior in the expected direction: a larger
+        // discrete-Gaussian variance spreads the (initially sharply peaked,
+        // hard-binned) histogram's mass out further, lowering its peak bin
+        // value (the joint PDF sums to 1 either way, so spreading mass out
+        // necessarily lowers the peak).
+        let (w, h, sigma) = (40usize, 40usize, 6.0);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
+        let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
+        let identity = TranslationTransform::new(vec![0.0, 0.0]);
+
+        let narrow = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 0.5).unwrap();
+        let wide = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 6.0).unwrap();
+
+        let (jp_narrow, _, _, _) = narrow.compute_joint_pdf(&identity);
+        let (jp_wide, _, _, _) = wide.compute_joint_pdf(&identity);
+
+        let peak_narrow = jp_narrow.iter().cloned().fold(0.0f64, f64::max);
+        let peak_wide = jp_wide.iter().cloned().fold(0.0f64, f64::max);
+
+        assert!(
+            peak_wide < peak_narrow,
+            "larger variance should spread the joint PDF's mass out, lowering its peak: \
+             narrow (variance 0.5) peak {peak_narrow} vs wide (variance 6.0) peak {peak_wide}"
+        );
+    }
+
+    #[test]
     fn too_few_bins_is_rejected() {
+        const V: f64 =
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING;
         let a = gaussian(10, 10, 5.0, 5.0, 2.0, 1.0);
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&a, &a, 5, 1.5),
+            JointHistogramMutualInformationMetric::new(&a, &a, 5, V),
             Err(RegistrationError::TooFewHistogramBins { bins: 5 })
         ));
-        assert!(JointHistogramMutualInformationMetric::new(&a, &a, 6, 1.5).is_ok());
+        assert!(JointHistogramMutualInformationMetric::new(&a, &a, 6, V).is_ok());
     }
 
     #[test]
     fn constant_image_is_rejected() {
+        const V: f64 =
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING;
         let flat = Image::from_vec(&[8, 8], vec![3.0; 64]).unwrap();
         let varied = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&flat, &varied, 20, 1.5),
+            JointHistogramMutualInformationMetric::new(&flat, &varied, 20, V),
             Err(RegistrationError::ConstantIntensity { which: "fixed" })
         ));
         assert!(matches!(
-            JointHistogramMutualInformationMetric::new(&varied, &flat, 20, 1.5),
+            JointHistogramMutualInformationMetric::new(&varied, &flat, 20, V),
             Err(RegistrationError::ConstantIntensity { which: "moving" })
         ));
     }
@@ -780,7 +853,13 @@ mod tests {
     fn identical_images_are_optimal_at_identity_with_near_zero_derivative() {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let img = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&img, &img, 32, 1.5).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(
+            &img,
+            &img,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
 
         let at = |dx: f64, dy: f64| {
             metric
@@ -832,7 +911,13 @@ mod tests {
             }
         }
         let moving = Image::from_vec(&[w, h], mv).unwrap();
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
 
         let at = |dx: f64, dy: f64| {
             metric
@@ -894,7 +979,13 @@ mod tests {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
 
         let p0 = [1.3f64, -0.7];
         let eval = |p: &[f64]| metric.evaluate(&TranslationTransform::new(p.to_vec()));
@@ -916,167 +1007,190 @@ mod tests {
     }
 
     #[test]
-    // Empirically, and confirmed by the algebraic analysis below, this
-    // surrogate does NOT match the analytic derivative — see the ignore
-    // message and the doc comment inside the test for the full finding.
-    #[ignore = "frozen-density surrogate g(p) = Σ[ln J − ln mm] does not match \
-                the analytic derivative even up to a constant factor: measured \
-                per-parameter ratios analytic/surrogate are ~73.9x (param 0) and \
-                ~93.4x (param 1) at p0=[1.3,-0.7] — non-uniform, which proves no \
-                scalar renormalization reconciles them. See the doc comment in \
-                this test for the algebraic argument."]
-    fn derivative_matches_frozen_density_finite_difference() {
-        // Build the joint PDF and marginals ONCE at p0 and hold them frozen
-        // (never rebuilt as p varies below — contrast with
+    fn frozen_density_identity_matches_finite_difference() {
+        // Pins every piece of machinery the analytic derivative rides on —
+        // the joint-PDF field derivative, the marginal derivative, the
+        // bilinear interpolators, and the sign — against a finite difference
+        // of a closed-form potential. This checks the *ln2-free* half of
+        // ITK's formula: see the module docs' `ln2` parity note for why the
+        // full, literal, ln2-laden `term2` has no exact potential at all (a
+        // Clairaut/mixed-partials argument, not a numerical gap) — that is
+        // the reason this test targets `term1 − term2_no_ln2` rather than
+        // `evaluate()`'s literal accumulated derivative (see
+        // `evaluate_matches_an_independent_reimplementation_of_the_literal_formula`
+        // below for a check of the literal, ln2-laden formula instead).
+        //
+        // For one sample with fixed (frozen, non-moving) bin coordinate `a`
+        // and moving bin coordinate `b`, define
+        //
+        //   phi(a, b) = J(a,b)·(ln J(a,b) − ln mm(b)) − J(a,b)
+        //
+        // where `J`/`mm` are the joint-PDF/moving-marginal FIELDS frozen at
+        // `p0` (never rebuilt as `b` is perturbed below — contrast with
         // `derivative_matches_finite_difference_direction`, which finite-
         // differences `evaluate().value` and therefore rebuilds the
-        // histogram, capturing a rebinning effect the analytic derivative
-        // deliberately excludes). Define the textbook Viola-Wells "frozen
-        // density" surrogate
+        // histogram, capturing a rebinning effect this identity deliberately
+        // excludes). By the product rule,
         //
-        //   g(p) = Σ_valid_samples [ ln J(f_i, m(T_p(x_i))) − ln p_moving(m(T_p(x_i))) ]
+        //   dphi/db = dJ·(ln J − ln mm) + J·(dJ/J − dmm/mm) − dJ
+        //           = dJ·(ln J − ln mm) − J·dmm/mm
+        //           = term1 − term2_no_ln2
         //
-        // through the SAME bilinear interpolators (`interp_joint`/
-        // `interp_marginal`) the analytic derivative uses, and
-        // central-finite-difference g(p) with respect to the
-        // `TranslationTransform`'s parameters.
+        // exactly (`term1 = dJPDF·pRatio`, `term2_no_ln2 = dMmPDF·J/mm`,
+        // i.e. `term2` WITHOUT the `ln2` factor) — no constant, no
+        // approximation.
         //
-        // Hypothesis under test: ITK's literal `scalingfactor = term2 − term1`
-        // (`itkJointHistogramMutualInformationGetValueAndDerivativeThreader
-        // ::ProcessPoint`) is the exact per-sample chain-rule derivative of
-        // this g, so the analytic derivative should equal
-        // `-FD(g)/valid_points` (the sign flip and `1/valid_points` are the
-        // *only* normalization `evaluate` applies beyond the per-sample
-        // formula: see the `scalingfactor` comment there) to within FD
-        // truncation error.
-        //
-        // This is FALSE, and provably so, not just numerically close-but-off:
-        //
-        // At p0 = [1.3, -0.7] on a 40×40 self-registered Gaussian blob (32
-        // bins), analytic = [0.0012908495322259876, -0.0005318156606246054]
-        // while -FD(g)/valid = [0.09533050514368846, -0.04963825829644264]
-        // (both signs agree, confirmed stable across step sizes 1e-4/1e-3/
-        // 1e-2, so this is not FD truncation noise). The ratio
-        // analytic[k] / (-FD(g)[k]/valid) is ≈73.9 for k=0 and ≈93.4 for
-        // k=1 — NOT the same constant. This is decisive: if scalingfactor
-        // were K · d/db[ln J − ln mm] for any fixed scalar K (the only kind
-        // of "constant normalization factor" that could still let the two
-        // match), the ratio would be identical for every parameter, because
-        // the chain-rule factor (moving image gradient contracted with the
-        // transform Jacobian) is common to both the analytic sum and g's
-        // finite difference and cancels out of the ratio. A non-uniform
-        // ratio proves no scalar K exists.
-        //
-        // Algebraic confirmation (why, not just that): writing scalingfactor
-        // out with a = the fixed sample's own (frozen, non-moving) bin
-        // coordinate and b = its moving bin coordinate,
-        //
-        //   term1 = dJPDF · (ln J − ln mm)      [dJPDF = ∂J(a,b)/∂b]
-        //   term2 = ln2 · dMmPDF · J/mm         [dMmPDF = ∂mm(b)/∂b]
-        //
-        // Differentiating g's own summand h(b) = ln J(a,b) − ln mm(b)
-        // directly gives dh/db = dJPDF/J − dMmPDF/mm — a *score-function*
-        // shape (each raw derivative divided by its own density). ITK's
-        // formula is structurally a *product* shape instead (dJPDF
-        // multiplied by the log-ratio, dMmPDF multiplied by J/mm) — these
-        // are not proportional. Two more candidate objectives were tried and
-        // independently refuted the same way:
-        //   - h(b) = J·(ln J − ln mm): dh/db = term1 + dJPDF − J·dMmPDF/mm,
-        //     which does not reduce to term2 − term1 (extra unmatched dJPDF
-        //     term; wrong sign and missing ln2 on the dMmPDF/mm piece).
-        //   - The exact bin-sum total_mi = Σ_{k,l} p(k,l)[ln p(k,l) − ln p(k)
-        //     − ln p(l)] does simplify — the marginal-sums-to-1 identity
-        //     makes the p(k,l)·dp(l)/dθ/p(l) cross term vanish when summed
-        //     over ALL bins — but that vanishing is a *global* identity over
-        //     the full double sum, not a per-sample/per-bin one, so it
-        //     cannot license dropping the analogous term locally in
-        //     `ProcessPoint`, which operates on one sample's own bin only.
-        //
-        // ITK's own class doc cites \cite thevenaz2000 (Thévenaz & Unser,
-        // "Optimization of Mutual Information for Multiresolution Image
-        // Registration", IEEE TIP 9(12), 2000) as the source of this
-        // formula; a web search for the paper's exact equation did not turn
-        // up the full derivation (paywalled). Absent that reference, this
-        // formula is best understood as an approximate gradient (matching
-        // ITK's own architecture: a single-pass, per-sample-local estimate
-        // standing in for the true — and expensive to compute exactly —
-        // derivative of the full smoothed bin-sum), not an exact derivative
-        // of any simple closed-form frozen-density functional. That is
-        // consistent with everything already verified: the formula is a
-        // faithful, character-for-character port of ITK's literal C++ (this
-        // was independently re-verified against the ITK source in this
-        // session), it reliably points in the value-reducing direction
-        // (`derivative_matches_finite_difference_direction` and
-        // `gradient_descent_recovers_a_translated_blob`), and it is simply
-        // not the exact gradient of the naive per-sample log-ratio sum.
-        //
-        // Per instruction, this assertion is NOT weakened to force a pass —
-        // it asserts the tight-tolerance match as originally specified, and
-        // is marked `#[ignore]` (with the measured numbers above) rather
-        // than left to permanently fail `cargo nextest run`.
+        // Point choice matters: `joint_derivative_wrt_moving`/
+        // `marginal_derivative` are central differences over a FIXED
+        // half-bin-width window (`±0.5·spacing`), and the bilinear PDF-field
+        // interpolators have slope KINKS at integer bin-grid vertices. Pick
+        // `a`/`b` at a bin-grid CELL MIDPOINT (array coordinate `x.5`, not an
+        // integer): the coarse window's `±0.5·spacing` offsets then land
+        // EXACTLY on the cell's two flanking grid vertices, and since
+        // `J(a,·)` and `mm(·)` are exactly linear in `b` across that whole
+        // cell (no kink strictly inside it), the coarse formula computes the
+        // EXACT analytic slope there, not merely a first-order approximation
+        // of it — so a fine central difference of `phi(b)` (step kept well
+        // inside the cell's `0.5·spacing` half-width, so it never crosses
+        // into a neighboring cell) should agree with `term1 −
+        // term2_no_ln2` to floating-point precision, not just to some
+        // FD-truncation-limited tolerance. Verified: at step 1e-4 (cell
+        // half-width ≈0.0185 for the 32 bins used here — ~185x margin), the
+        // measured relative error was ≈2e-11; the assertion below uses a
+        // 1e-6 tolerance, ~5 orders of magnitude of margin over that
+        // measurement.
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
+        let base = TranslationTransform::new(vec![1.3, -0.7]);
+        let (jp, _fixed_marginal, moving_marginal, _valid) = metric.compute_joint_pdf(&base);
 
-        let p0 = [1.3f64, -0.7];
-        let base = TranslationTransform::new(p0.to_vec());
-        let (jp, _fixed_marginal, moving_marginal, valid) = metric.compute_joint_pdf(&base);
-        let analytic = metric.evaluate(&base).derivative;
+        // Cell midpoint (array coordinate 16.5) on both axes.
+        let a = (16.5 - PADDING as f64) * metric.spacing;
+        let b = (16.5 - PADDING as f64) * metric.spacing;
 
-        let dim = metric.fixed.dim;
-        let n = metric.fixed.len();
-        let g = |p: &[f64]| -> f64 {
-            let t = TranslationTransform::new(p.to_vec());
-            let mut total = 0.0;
-            for s in 0..n {
-                let fp = &metric.fixed.points[s * dim..(s + 1) * dim];
-                let fv = metric.fixed.values[s];
-                let mp = t.transform_point(fp);
-                let mv = match metric.moving.value_and_physical_gradient(&mp) {
-                    Some((v, _)) => v,
-                    None => continue,
-                };
-                if mv < metric.moving_true_min || mv > metric.moving_true_max {
-                    continue;
-                }
-                let a = JointHistogramMutualInformationMetric::normalize(
-                    fv,
-                    metric.fixed_true_min,
-                    metric.fixed_true_max,
-                );
-                let b = JointHistogramMutualInformationMetric::normalize(
-                    mv,
-                    metric.moving_true_min,
-                    metric.moving_true_max,
-                );
-                let jp_val = metric.interp_joint(&jp, a, b);
-                let mm_val = metric.interp_marginal(&moving_marginal, b);
-                if jp_val <= 1e-16 || mm_val <= 1e-16 {
-                    continue;
-                }
-                total += jp_val.ln() - mm_val.ln();
-            }
-            total
+        let phi = |bb: f64| -> f64 {
+            let jp_val = metric.interp_joint(&jp, a, bb);
+            let mm_val = metric.interp_marginal(&moving_marginal, bb);
+            jp_val * (jp_val.ln() - mm_val.ln()) - jp_val
         };
 
-        let step = 1e-3;
-        for k in 0..2 {
-            let mut pp = p0;
-            pp[k] += step;
-            let mut pm = p0;
-            pm[k] -= step;
-            let fd = (g(&pp) - g(&pm)) / (2.0 * step);
-            // -1/valid: evaluate's only normalization beyond the per-sample
-            // formula (the sign flip for this crate's convention, and the
-            // averaging over valid samples).
-            let surrogate = -fd / valid as f64;
+        let d_jpdf = metric.joint_derivative_wrt_moving(&jp, a, b);
+        let d_mm = metric.marginal_derivative(&moving_marginal, b);
+        let jp_val = metric.interp_joint(&jp, a, b);
+        let mm_val = metric.interp_marginal(&moving_marginal, b);
+        let p_ratio = jp_val.ln() - mm_val.ln();
+        let term1 = d_jpdf * p_ratio;
+        let term2_no_ln2 = d_mm * jp_val / mm_val;
+        let coarse = term1 - term2_no_ln2;
+
+        let step = 1e-4;
+        let fine_fd = (phi(b + step) - phi(b - step)) / (2.0 * step);
+
+        assert!(
+            (coarse - fine_fd).abs() < 1e-6 * coarse.abs(),
+            "coarse (term1 - term2_no_ln2) {coarse} vs fine FD of phi {fine_fd} \
+             (relative error {})",
+            (coarse - fine_fd).abs() / coarse.abs()
+        );
+    }
+
+    #[test]
+    fn evaluate_matches_an_independent_reimplementation_of_the_literal_formula() {
+        // Complements `frozen_density_identity_matches_finite_difference`
+        // above, which pins a single machinery piece (one sample, no
+        // aggregation, no transform chain rule) but stops short of the full,
+        // literal, ln2-laden formula. This test instead independently
+        // re-implements `evaluate()`'s FULL accumulation — ITK's literal
+        // `scalingfactor = term2 − term1` (with `ln2`), the moving-image
+        // gradient, the transform Jacobian contraction, this crate's sign
+        // flip, and the `1/valid_points` normalization — in a hand-written
+        // loop that does not call `evaluate()` for the derivative
+        // computation, only for the value being checked against. It exists
+        // to catch accumulation/normalization/valid-point/sign regressions
+        // in `evaluate()` that a single-sample identity test cannot see; it
+        // is not a test of whether the formula is an exact gradient of
+        // anything (it isn't — see the module docs' `ln2` parity note).
+        let (w, h, sigma) = (40usize, 40usize, 6.0);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
+        let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
+
+        let transform = TranslationTransform::new(vec![1.3, -0.7]);
+        let expected = metric.evaluate(&transform).derivative;
+
+        let (jp, _fixed_marginal, moving_marginal, valid) = metric.compute_joint_pdf(&transform);
+        let nparams = transform.number_of_parameters();
+        let dim = metric.fixed.dim;
+        let n = metric.fixed.len();
+        let mut derivative = vec![0.0f64; nparams];
+        const DERIVATIVE_VALUE_EPS: f64 = 1.0e-16;
+
+        for s in 0..n {
+            let fp = &metric.fixed.points[s * dim..(s + 1) * dim];
+            let fv = metric.fixed.values[s];
+            let mp = transform.transform_point(fp);
+            let (mv, grad_phys) = match metric.moving.value_and_physical_gradient(&mp) {
+                Some(vg) => vg,
+                None => continue,
+            };
+            if mv < metric.moving_true_min || mv > metric.moving_true_max {
+                continue;
+            }
+            let a = JointHistogramMutualInformationMetric::normalize(
+                fv,
+                metric.fixed_true_min,
+                metric.fixed_true_max,
+            );
+            let b = JointHistogramMutualInformationMetric::normalize(
+                mv,
+                metric.moving_true_min,
+                metric.moving_true_max,
+            );
+            let jp_val = metric.interp_joint(&jp, a, b);
+            let mm_val = metric.interp_marginal(&moving_marginal, b);
+            if jp_val <= DERIVATIVE_VALUE_EPS || mm_val <= DERIVATIVE_VALUE_EPS {
+                continue;
+            }
+            let d_jpdf = metric.joint_derivative_wrt_moving(&jp, a, b);
+            let d_mm = metric.marginal_derivative(&moving_marginal, b);
+            let p_ratio = jp_val.ln() - mm_val.ln();
+            let term1 = d_jpdf * p_ratio;
+            let term2 = std::f64::consts::LN_2 * d_mm * jp_val / mm_val;
+            let scalingfactor = -(term2 - term1); // crate's +grad convention, matching evaluate()
+
+            let jac = transform.jacobian_wrt_parameters(fp);
+            for (k, dk) in derivative.iter_mut().enumerate() {
+                let mut inner = 0.0;
+                for (d, &gr) in grad_phys.iter().enumerate() {
+                    inner += jac[d * nparams + k] * gr;
+                }
+                *dk += scalingfactor * inner;
+            }
+        }
+        for d in derivative.iter_mut() {
+            *d /= valid as f64;
+        }
+
+        for k in 0..nparams {
             assert!(
-                (analytic[k] - surrogate).abs() < 1e-3 * surrogate.abs().max(1e-6),
-                "param {k}: analytic {} vs frozen-density surrogate {surrogate} \
-                 (ratio {})",
-                analytic[k],
-                analytic[k] / surrogate
+                (derivative[k] - expected[k]).abs() < 1e-10 * expected[k].abs().max(1e-10),
+                "param {k}: independent reimplementation {} vs evaluate() {}",
+                derivative[k],
+                expected[k]
             );
         }
     }
@@ -1086,7 +1200,13 @@ mod tests {
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 23.0, 20.0, sigma, 1.0); // true shift (3, 0)
-        let metric = JointHistogramMutualInformationMetric::new(&fixed, &moving, 32, 1.5).unwrap();
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            32,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
 
         // Learning rate tuned empirically (not the crate's usual estimated
         // scales — see the module docs' local-support note): the analytic
