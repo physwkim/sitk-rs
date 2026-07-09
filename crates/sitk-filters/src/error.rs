@@ -104,6 +104,14 @@ pub enum FilterError {
     )]
     InvalidThresholdCount { bins: u32, thresholds: u32 },
 
+    /// `BinaryThresholdImageFilter::BeforeThreadedGenerateData` throws "Lower
+    /// threshold cannot be greater than upper threshold." `DoubleThresholdImageFilter`
+    /// builds two independent `BinaryThresholdImageFilter` instances (narrow:
+    /// Threshold2/Threshold3, wide: Threshold1/Threshold4), each subject to
+    /// this same precondition on its own pair.
+    #[error("lower threshold {lower} cannot be greater than upper threshold {upper}")]
+    InvalidThresholdRange { lower: f64, upper: f64 },
+
     /// `RegionOfInterestImageFilter`'s requested region does not fit inside
     /// the input's `LargestPossibleRegion`.
     #[error(

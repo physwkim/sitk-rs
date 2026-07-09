@@ -144,8 +144,8 @@ pub use projection::{
     standard_deviation_projection, sum_projection,
 };
 pub use reconstruction::{
-    grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima, h_minima,
-    reconstruction_by_dilation, reconstruction_by_erosion,
+    double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
+    h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
 };
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
