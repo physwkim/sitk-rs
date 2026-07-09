@@ -32,6 +32,12 @@ pub enum FilterError {
     #[error("shrink factors must be >= 1, got {0:?}")]
     InvalidShrinkFactor(Vec<usize>),
 
+    /// `SLICImageFilter::SetSuperGridSize` was given a zero super-pixel size,
+    /// which would make the grid initialisation divide by zero (ITK feeds it
+    /// straight to `ShrinkImageFilter` as a shrink factor).
+    #[error("super grid sizes must be >= 1, got {0:?}")]
+    InvalidSuperGridSize(Vec<u32>),
+
     /// A smoothing sigma was negative.
     #[error("smoothing sigmas must be >= 0, got {0:?}")]
     InvalidSigma(Vec<f64>),
