@@ -32,6 +32,8 @@ pub mod geometry;
 pub mod gradient;
 pub mod intensity;
 pub mod label;
+pub mod logic;
+pub mod math;
 pub mod morphology;
 pub mod recursive_gaussian;
 pub mod shrink;
@@ -55,6 +57,18 @@ pub use intensity::{
     triangle_threshold,
 };
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
+pub use logic::{
+    and, and_in_place, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
+    maximum_in_place, minimum, minimum_in_place, not, not_in_place, or, or_in_place, xor,
+    xor_in_place,
+};
+pub use math::{
+    abs, abs_in_place, acos, acos_in_place, asin, asin_in_place, atan, atan_in_place,
+    bounded_reciprocal, bounded_reciprocal_in_place, cos, cos_in_place, exp, exp_in_place,
+    exp_negative, exp_negative_in_place, log, log_in_place, log10, log10_in_place, sin,
+    sin_in_place, sqrt, sqrt_in_place, square, square_in_place, squared_difference,
+    squared_difference_in_place, tan, tan_in_place,
+};
 pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
@@ -238,21 +252,6 @@ functor::unary_functor! {
 functor::unary_functor! {
     /// `a * c` for a scalar constant.
     pub fn multiply_constant, multiply_constant_in_place(c: f64) = MulConstant(c);
-}
-
-// ---- unary ----------------------------------------------------------------
-
-/// `AbsImageFilter`: pixel-wise absolute value, output type follows input.
-struct Abs;
-impl UnaryFunctor for Abs {
-    fn apply(&self, x: f64) -> f64 {
-        x.abs()
-    }
-}
-
-functor::unary_functor! {
-    /// `AbsImageFilter`: pixel-wise absolute value, output type follows input.
-    pub fn abs, abs_in_place() = Abs;
 }
 
 // ---- threshold ------------------------------------------------------------
@@ -469,12 +468,6 @@ mod tests {
     }
 
     #[test]
-    fn abs_negative_values() {
-        let a = Image::from_vec(&[3, 1], vec![-3i16, 0, 7]).unwrap();
-        assert_eq!(abs(&a).unwrap().scalar_slice::<i16>().unwrap(), &[3, 0, 7]);
-    }
-
-    #[test]
     fn add_constant_saturates_on_overflow_unlike_wrapping_add() {
         // Seam policy (a) (f64-compute, `add_constant`): 250 + 10.0 = 260.0,
         // which does not fit in u8, so `Scalar::from_f64` saturates to 255.
@@ -496,14 +489,6 @@ mod tests {
         let b = img_u8(&[2, 2], vec![10, 20, 10, 40]);
         let allocated = add(&a, &b).unwrap();
         let in_place = add_in_place(a, &b).unwrap();
-        assert_eq!(allocated, in_place);
-    }
-
-    #[test]
-    fn abs_in_place_matches_allocating() {
-        let a = Image::from_vec(&[3, 1], vec![-3i16, 0, 7]).unwrap();
-        let allocated = abs(&a).unwrap();
-        let in_place = abs_in_place(a).unwrap();
         assert_eq!(allocated, in_place);
     }
 

@@ -104,6 +104,15 @@ pub enum FilterError {
     #[error("order {0:?} is not a permutation of 0..{1}")]
     InvalidPermutation(Vec<usize>, usize),
 
+    /// A bitwise/logic filter (`And`/`Or`/`Xor`/`Not`) was given a
+    /// floating-point image. ITK's `BitwiseOperators`/`NotOperator` concept
+    /// checks only instantiate for integer pixel types (`itkAndImageFilter.h`
+    /// et al.; SimpleITK's generated wrappers restrict these to
+    /// `IntegerPixelIDTypeList`), which is a compile error in C++ and a
+    /// runtime error here.
+    #[error("bitwise/logic filters require an integer pixel type, got {0:?}")]
+    RequiresIntegerPixelType(PixelId),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
