@@ -6,7 +6,7 @@ use sitk_core::Image;
 use super::function::{CurvatureFlowFunction, DifferenceFunction};
 use super::{LevelSetResult, SolverSetup, SparseFieldSolver, UpdateRule};
 use crate::canny::zero_crossing_values;
-use crate::error::Result;
+use crate::error::{FilterError, Result};
 use crate::{image_from_f64, real_pixel_id};
 
 /// `AntiAliasBinaryImageFilter`: fit a smooth surface to a binary volume by
@@ -62,13 +62,23 @@ use crate::{image_from_f64, real_pixel_id};
 ///   solver then halts after one no-op iteration with an RMS change of zero.
 ///
 /// * **The output pixel type is `NumericTraits<InputPixelType>::RealType`** —
-///   `Float64` for the integer pixel types SimpleITK's yaml declares, and
-///   `Float32` for a `Float32` input. The solver itself runs in `f64`.
+///   `Float64` for every pixel type this filter accepts. The solver itself
+///   runs in `f64`.
+///
+/// # Errors
+///
+/// [`FilterError::RequiresIntegerPixelType`] for a floating-point input:
+/// `AntiAliasBinaryImageFilter.yaml` declares `pixel_types:
+/// IntegerPixelIDTypeList`, so SimpleITK never instantiates this filter for
+/// `Float32`/`Float64`.
 pub fn anti_alias_binary(
     image: &Image,
     maximum_rms_error: f64,
     number_of_iterations: u32,
 ) -> Result<LevelSetResult> {
+    if image.pixel_id().is_floating_point() {
+        return Err(FilterError::RequiresIntegerPixelType(image.pixel_id()));
+    }
     let input = image.to_f64_vec();
     let dim = image.dimension();
 
@@ -309,31 +319,26 @@ mod tests {
 
     // ---- Types and geometry --------------------------------------------------
 
-    /// `NumericTraits<InputPixelType>::RealType`.
+    /// `NumericTraits<InputPixelType>::RealType` is `double` for every integer
+    /// pixel type, and those are the only ones the yaml admits.
     #[test]
     fn the_output_pixel_type_is_the_inputs_real_type() {
-        let u8_in = diamond(6);
         assert_eq!(
-            anti_alias_binary(&u8_in, 0.07, 3).unwrap().image.pixel_id(),
-            PixelId::Float64
-        );
-
-        let f32_in = Image::from_vec(
-            &[N, N],
-            u8_in
-                .to_f64_vec()
-                .iter()
-                .map(|&v| v as f32)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        assert_eq!(
-            anti_alias_binary(&f32_in, 0.07, 3)
+            anti_alias_binary(&diamond(6), 0.07, 3)
                 .unwrap()
                 .image
                 .pixel_id(),
-            PixelId::Float32
+            PixelId::Float64
         );
+    }
+
+    /// `pixel_types: IntegerPixelIDTypeList`.
+    #[test]
+    fn a_floating_point_input_is_rejected() {
+        for id in [PixelId::Float32, PixelId::Float64] {
+            let err = anti_alias_binary(&Image::new(&[4, 4], id), 0.07, 3).unwrap_err();
+            assert!(matches!(err, FilterError::RequiresIntegerPixelType(got) if got == id));
+        }
     }
 
     /// Spacing carries to the output but never into the solver: `UseImageSpacing`
