@@ -177,6 +177,56 @@ impl MattesMutualInformationMetric {
         })
     }
 
+    /// Build the metric from an already-configured [`FixedSamples`] and
+    /// [`MovingImage`] — the seam for a custom sampling strategy, fixed/moving
+    /// mask, or interpolator (see [`FixedSamples::from_image_with`] and
+    /// [`MovingImage::from_image_with_interpolator`]). Fails if their spatial
+    /// dimensions disagree, fewer than five bins are requested, or either
+    /// sample set's intensity range is constant — the same checks [`new`](Self::new)
+    /// performs.
+    pub fn from_samples(
+        fixed: FixedSamples,
+        moving: MovingImage,
+        number_of_histogram_bins: usize,
+    ) -> Result<Self> {
+        if fixed.dim != moving.dim() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dim,
+                moving: moving.dim(),
+            });
+        }
+        if number_of_histogram_bins < 2 * PADDING + 1 {
+            return Err(RegistrationError::TooFewHistogramBins {
+                bins: number_of_histogram_bins,
+            });
+        }
+
+        let (fixed_min, fixed_max) = fixed.value_range();
+        let (moving_min, moving_max) = moving.value_range();
+        if fixed_max - fixed_min <= f64::EPSILON {
+            return Err(RegistrationError::ConstantIntensity { which: "fixed" });
+        }
+        if moving_max - moving_min <= f64::EPSILON {
+            return Err(RegistrationError::ConstantIntensity { which: "moving" });
+        }
+
+        let denom = (number_of_histogram_bins - 2 * PADDING) as f64;
+        let fixed_bin_size = (fixed_max - fixed_min) / denom;
+        let moving_bin_size = (moving_max - moving_min) / denom;
+
+        Ok(Self {
+            fixed,
+            moving,
+            num_bins: number_of_histogram_bins,
+            moving_true_min: moving_min,
+            moving_true_max: moving_max,
+            fixed_bin_size,
+            moving_bin_size,
+            fixed_normalized_min: fixed_min / fixed_bin_size - PADDING as f64,
+            moving_normalized_min: moving_min / moving_bin_size - PADDING as f64,
+        })
+    }
+
     /// Number of fixed sample points.
     pub fn sample_count(&self) -> usize {
         self.fixed.len()

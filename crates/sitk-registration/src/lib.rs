@@ -139,7 +139,7 @@ pub use lbfgs2::{LBFGS2Optimizer, LineSearchMethod};
 pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
 pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
-pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
+pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue, SamplingStrategy};
 pub use optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
     GradientDescentOptimizer, OptimizerResult, RegularStepGradientDescentOptimizer, StopReason,

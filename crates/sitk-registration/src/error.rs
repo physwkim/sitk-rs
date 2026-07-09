@@ -98,6 +98,16 @@ pub enum RegistrationError {
     /// so no unique affine transform fits the landmarks.
     #[error("degenerate landmark configuration: normal-equations matrix is singular")]
     DegenerateLandmarks,
+
+    /// A fixed or moving metric mask's size does not match its image's size
+    /// (matches SimpleITK/ITK, which require the mask and image to share the
+    /// same physical grid).
+    #[error("{which} mask size {mask:?} does not match {which} image size {image:?}")]
+    MaskSizeMismatch {
+        which: &'static str,
+        mask: Vec<usize>,
+        image: Vec<usize>,
+    },
 }
 
 /// Registration result alias.

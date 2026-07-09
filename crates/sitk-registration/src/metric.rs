@@ -44,13 +44,82 @@
 //! change to [`MeanSquaresMetric`] or the registration method above it.
 
 use sitk_core::Image;
+use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
-    index_to_physical_matrix, linear_value_and_gradient, physical_to_index_matrix, strides,
+    bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
+    index_to_physical_matrix, linear_value_and_gradient, nearest_value_and_gradient,
+    physical_to_index_matrix, strides,
 };
 
 use crate::error::{RegistrationError, Result};
 use crate::scales::PhysicalShiftScales;
+
+/// Fixed-image sampling strategy for the registration virtual domain
+/// (`itk::ImageRegistrationMethodv4::MetricSamplingStrategyEnum` / SimpleITK's
+/// `MetricSamplingStrategyType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingStrategy {
+    /// Every voxel (SimpleITK's default).
+    None,
+    /// Every `ceil(1/percentage)`-th voxel, in scan-line (dim-0-fastest)
+    /// traversal order.
+    Regular,
+    /// `floor(N * percentage)` voxels drawn uniformly with replacement.
+    Random,
+}
+
+/// A small, deterministic, seeded PRNG (SplitMix64, Vigna 2015, public
+/// domain) for reproducible [`SamplingStrategy::Random`] sampling. Not
+/// bit-parity with ITK's Mersenne Twister — the task only requires
+/// reproducibility for a fixed seed, not ITK-identical draws.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A uniform index in `[0, n)`. `n` must be nonzero.
+    fn next_below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+/// The physical point at multi-index `index`, via `origin + idx_to_phys ·
+/// index`. Shared by every [`FixedSamples`] sampling strategy.
+fn point_at(idx_to_phys: &[f64], origin: &[f64], dim: usize, index: &[usize]) -> Vec<f64> {
+    let mut p = vec![0.0; dim];
+    for (r, pr) in p.iter_mut().enumerate() {
+        let mut acc = origin[r];
+        for (c, &idx) in index.iter().enumerate() {
+            acc += idx_to_phys[r * dim + c] * idx as f64;
+        }
+        *pr = acc;
+    }
+    p
+}
+
+/// The multi-index (dim-0-fastest) of flat voxel index `flat`, the inverse of
+/// the traversal order [`increment`] produces.
+fn linear_to_multi(mut flat: usize, size: &[usize]) -> Vec<usize> {
+    let mut index = vec![0usize; size.len()];
+    for (d, id) in index.iter_mut().enumerate() {
+        *id = flat % size[d];
+        flat /= size[d];
+    }
+    index
+}
 
 /// The fixed image reduced to its sample set (the registration *virtual
 /// domain*): every pixel's value and its physical point, precomputed once.
@@ -80,13 +149,12 @@ impl FixedSamples {
         let mut points = vec![0.0; n * dim];
         let mut index = vec![0usize; dim];
         for s in 0..n {
-            for r in 0..dim {
-                let mut acc = origin[r];
-                for (c, &idx) in index.iter().enumerate() {
-                    acc += idx_to_phys[r * dim + c] * idx as f64;
-                }
-                points[s * dim + r] = acc;
-            }
+            points[s * dim..(s + 1) * dim].copy_from_slice(&point_at(
+                &idx_to_phys,
+                origin,
+                dim,
+                &index,
+            ));
             increment(&mut index, &size);
         }
 
@@ -102,6 +170,114 @@ impl FixedSamples {
             points,
             min_spacing,
         }
+    }
+
+    /// Reduce a fixed image to its sample set under an explicit sampling
+    /// `strategy`, optionally restricted to a fixed-image mask (ITK
+    /// `ImageRegistrationMethodv4::SampleFixedImageDomain` +
+    /// `ImageToImageMetricv4::SetFixedImageMask`).
+    ///
+    /// `percentage` and `seed` are used by [`SamplingStrategy::Regular`]
+    /// (stride `= ceil(1/percentage)`) and [`SamplingStrategy::Random`]
+    /// (`floor(N * percentage)` draws, uniform with replacement, seeded via a
+    /// small deterministic PRNG — see [`SplitMix64`]); both are ignored for
+    /// [`SamplingStrategy::None`]. `mask` is a binary image on the same grid
+    /// as `fixed` (any nonzero value is "inside"): a candidate sample whose
+    /// voxel is zero in the mask is dropped, exactly as ITK's
+    /// `IsInsideInWorldSpace` gate on the fixed mask.
+    ///
+    /// Unlike ITK, this does **not** perturb each sample by a sub-voxel
+    /// Gaussian jitter (`randomizer->GetNormalVariate() *
+    /// oneThirdVirtualSpacing`) — an intentional, documented deviation: every
+    /// sample lands exactly on a voxel center, which keeps `Regular`'s stride
+    /// and `Random`'s count exactly reproducible without porting a
+    /// normal-variate generator.
+    ///
+    /// Fails if `mask` does not share `fixed`'s size.
+    pub fn from_image_with(
+        fixed: &Image,
+        strategy: SamplingStrategy,
+        percentage: f64,
+        seed: u64,
+        mask: Option<&Image>,
+    ) -> Result<Self> {
+        let dim = fixed.dimension();
+        let size = fixed.size().to_vec();
+        let values_all = fixed.to_f64_vec();
+        let n = values_all.len();
+
+        let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
+        let origin = fixed.origin();
+
+        let mask_buf = match mask {
+            Some(m) => {
+                if m.size() != fixed.size() {
+                    return Err(RegistrationError::MaskSizeMismatch {
+                        which: "fixed",
+                        mask: m.size().to_vec(),
+                        image: fixed.size().to_vec(),
+                    });
+                }
+                Some(m.to_f64_vec())
+            }
+            None => None,
+        };
+        let mask_allows = |flat: usize| match &mask_buf {
+            None => true,
+            Some(m) => m[flat] != 0.0,
+        };
+
+        let mut values = Vec::new();
+        let mut points = Vec::new();
+
+        match strategy {
+            SamplingStrategy::None => {
+                let mut index = vec![0usize; dim];
+                for (s, &fv) in values_all.iter().enumerate() {
+                    if mask_allows(s) {
+                        values.push(fv);
+                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
+                    }
+                    increment(&mut index, &size);
+                }
+            }
+            SamplingStrategy::Regular => {
+                let stride = ((1.0 / percentage).ceil() as usize).max(1);
+                let mut index = vec![0usize; dim];
+                for (s, &fv) in values_all.iter().enumerate() {
+                    if s % stride == 0 && mask_allows(s) {
+                        values.push(fv);
+                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
+                    }
+                    increment(&mut index, &size);
+                }
+            }
+            SamplingStrategy::Random => {
+                let sample_count = (n as f64 * percentage) as usize;
+                let mut rng = SplitMix64::new(seed);
+                for _ in 0..sample_count {
+                    let flat = rng.next_below(n);
+                    if mask_allows(flat) {
+                        let index = linear_to_multi(flat, &size);
+                        values.push(values_all[flat]);
+                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
+                    }
+                }
+            }
+        }
+
+        let min_spacing = fixed
+            .spacing()
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+
+        Ok(Self {
+            dim,
+            values,
+            points,
+            min_spacing,
+        })
     }
 
     /// Number of samples `N`.
@@ -155,23 +331,72 @@ pub struct MovingImage {
     /// `diag(1/spacing) · D⁻¹`, row-major `dim × dim`: maps a physical
     /// displacement from the origin to a continuous index.
     phys_to_index: Vec<f64>,
+    interpolator: Interpolator,
+    /// Precomputed cubic B-spline coefficients, present only when
+    /// `interpolator == BSpline` (see [`bspline_coefficients`]).
+    bspline_coeffs: Option<Vec<f64>>,
+    /// Binary moving mask, same size/traversal order as `buf`. `None` = no
+    /// mask (every in-buffer point is valid).
+    mask: Option<Vec<bool>>,
 }
 
 impl MovingImage {
-    /// Prepare a moving image. Fails if its direction matrix is singular.
+    /// Prepare a moving image with linear interpolation and no mask. Fails if
+    /// its direction matrix is singular.
     pub fn from_image(moving: &Image) -> Result<Self> {
+        Self::from_image_with_interpolator(moving, Interpolator::Linear)
+    }
+
+    /// Prepare a moving image with an explicit interpolator (nearest
+    /// neighbor, linear, cubic B-spline, or Gaussian — see
+    /// [`sitk_transform::Interpolator`]). Fails if its direction matrix is
+    /// singular.
+    pub fn from_image_with_interpolator(
+        moving: &Image,
+        interpolator: Interpolator,
+    ) -> Result<Self> {
         let dim = moving.dimension();
         let size = moving.size().to_vec();
         let phys_to_index = physical_to_index_matrix(moving.direction(), moving.spacing(), dim)
             .ok_or(RegistrationError::SingularDirection)?;
+        let strides_v = strides(&size);
+        let buf = moving.to_f64_vec();
+        let bspline_coeffs = matches!(interpolator, Interpolator::BSpline)
+            .then(|| bspline_coefficients(&buf, &size, &strides_v));
         Ok(Self {
             dim,
-            buf: moving.to_f64_vec(),
-            strides: strides(&size),
+            buf,
+            strides: strides_v,
             size,
             origin: moving.origin().to_vec(),
             phys_to_index,
+            interpolator,
+            bspline_coeffs,
+            mask: None,
         })
+    }
+
+    /// Restrict this moving image to a binary mask on its own grid (ITK
+    /// `ImageToImageMetricv4::SetMovingImageMask`): any nonzero mask voxel is
+    /// "inside". A physical point that maps to a zero-mask voxel makes
+    /// [`value_and_physical_gradient`](Self::value_and_physical_gradient)
+    /// return `None`, exactly as if it fell outside the buffer. Fails if
+    /// `mask` does not share this image's size.
+    pub fn with_moving_mask(mut self, mask: &Image) -> Result<Self> {
+        if mask.size() != self.size.as_slice() {
+            return Err(RegistrationError::MaskSizeMismatch {
+                which: "moving",
+                mask: mask.size().to_vec(),
+                image: self.size.clone(),
+            });
+        }
+        self.mask = Some(mask.to_f64_vec().iter().map(|&v| v != 0.0).collect());
+        Ok(self)
+    }
+
+    /// Spatial dimension.
+    pub(crate) fn dim(&self) -> usize {
+        self.dim
     }
 
     /// Continuous index of physical point `p`: `M · (p − origin)`.
@@ -189,14 +414,52 @@ impl MovingImage {
         c
     }
 
-    /// Linear sample and its exact index-space gradient at continuous index
-    /// `c`, or `None` if outside the buffer.
-    fn value_and_gradient(&self, c: &[f64]) -> Option<(f64, Vec<f64>)> {
-        linear_value_and_gradient(&self.buf, &self.size, &self.strides, c)
+    /// Whether continuous index `c` is allowed by the moving mask (always
+    /// `true` when there is no mask). Rounds to the nearest voxel, matching
+    /// ITK's `ImageMaskSpatialObject` point-in-mask test.
+    fn mask_allows(&self, c: &[f64]) -> bool {
+        let mask = match &self.mask {
+            None => return true,
+            Some(m) => m,
+        };
+        let mut flat = 0usize;
+        for (d, &cd) in c.iter().enumerate() {
+            let r = cd.round();
+            if r < 0.0 || r as usize >= self.size[d] {
+                return false;
+            }
+            flat += r as usize * self.strides[d];
+        }
+        mask[flat]
     }
 
-    /// Linear sample of physical point `p` and its gradient expressed in
-    /// **physical space**, or `None` if `p` maps outside the buffer.
+    /// Sample and its exact index-space gradient at continuous index `c`
+    /// under this image's interpolator, or `None` if outside the buffer.
+    fn value_and_gradient(&self, c: &[f64]) -> Option<(f64, Vec<f64>)> {
+        match self.interpolator {
+            Interpolator::NearestNeighbor => {
+                nearest_value_and_gradient(&self.buf, &self.size, &self.strides, c)
+            }
+            Interpolator::Linear => {
+                linear_value_and_gradient(&self.buf, &self.size, &self.strides, c)
+            }
+            Interpolator::BSpline => bspline_value_and_gradient(
+                self.bspline_coeffs
+                    .as_deref()
+                    .expect("bspline_coeffs is Some whenever interpolator == BSpline"),
+                &self.size,
+                &self.strides,
+                c,
+            ),
+            Interpolator::Gaussian => {
+                gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, c)
+            }
+        }
+    }
+
+    /// Sample of physical point `p` under this image's interpolator and its
+    /// gradient expressed in **physical space**, or `None` if `p` maps
+    /// outside the buffer or onto a zero moving-mask voxel.
     ///
     /// With `cindex = M·(p − origin)`, the physical-space gradient is
     /// `∂M(value)/∂p_d = Σ_j (∂value/∂cindex_j) · M[j][d]`, i.e. the index-space
@@ -206,6 +469,9 @@ impl MovingImage {
     pub(crate) fn value_and_physical_gradient(&self, p: &[f64]) -> Option<(f64, Vec<f64>)> {
         let dim = self.dim;
         let cidx = self.continuous_index(p);
+        if !self.mask_allows(&cidx) {
+            return None;
+        }
         let (value, grad_index) = self.value_and_gradient(&cidx)?;
         let mut grad_phys = vec![0.0; dim];
         for (d, gp) in grad_phys.iter_mut().enumerate() {
@@ -344,6 +610,21 @@ impl MeanSquaresMetric {
         })
     }
 
+    /// Build the metric from an already-configured [`FixedSamples`] and
+    /// [`MovingImage`] — the seam for a custom sampling strategy, fixed/moving
+    /// mask, or interpolator (see [`FixedSamples::from_image_with`] and
+    /// [`MovingImage::from_image_with_interpolator`]). Fails if their spatial
+    /// dimensions disagree.
+    pub fn from_samples(fixed: FixedSamples, moving: MovingImage) -> Result<Self> {
+        if fixed.dim != moving.dim() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dim,
+                moving: moving.dim(),
+            });
+        }
+        Ok(Self { fixed, moving })
+    }
+
     /// Number of fixed sample points.
     pub fn sample_count(&self) -> usize {
         self.fixed.len()
@@ -441,5 +722,101 @@ mod tests {
                 analytic[k]
             );
         }
+    }
+
+    /// A flat-index-valued image: `v[i] = i`, so a sample's value pins down
+    /// exactly which flat voxel it came from.
+    fn indexed(w: usize, h: usize) -> Image {
+        let n = w * h;
+        let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    #[test]
+    fn regular_sampling_gives_expected_count_and_stride() {
+        let (w, h) = (10, 10);
+        let img = indexed(w, h);
+
+        // percentage 0.1 -> stride = ceil(1/0.1) = 10 -> samples at flat
+        // indices 0, 10, 20, ..., 90.
+        let samples =
+            FixedSamples::from_image_with(&img, SamplingStrategy::Regular, 0.1, 0, None).unwrap();
+        assert_eq!(samples.len(), 10);
+        let expected: Vec<f64> = (0..10).map(|k| (k * 10) as f64).collect();
+        assert_eq!(samples.values, expected);
+    }
+
+    #[test]
+    fn random_sampling_is_reproducible_and_matches_percentage() {
+        let (w, h) = (20, 20);
+        let n = w * h;
+        let img = indexed(w, h);
+        let percentage = 0.25;
+        let expected_count = (n as f64 * percentage) as usize;
+
+        let a = FixedSamples::from_image_with(&img, SamplingStrategy::Random, percentage, 42, None)
+            .unwrap();
+        let b = FixedSamples::from_image_with(&img, SamplingStrategy::Random, percentage, 42, None)
+            .unwrap();
+        assert_eq!(a.len(), expected_count);
+        assert_eq!(a.values, b.values, "same seed must draw the same samples");
+        assert_eq!(a.points, b.points);
+
+        let c = FixedSamples::from_image_with(&img, SamplingStrategy::Random, percentage, 43, None)
+            .unwrap();
+        assert_ne!(
+            a.values, c.values,
+            "a different seed should draw different samples"
+        );
+    }
+
+    #[test]
+    fn fixed_mask_halves_sample_count() {
+        let (w, h) = (10, 10);
+        let n = w * h;
+        let img = Image::from_vec(&[w, h], vec![1.0; n]).unwrap();
+        // Mask the first half of voxels (by flat, dim-0-fastest index) in.
+        let mut mv = vec![0.0f64; n];
+        mv[..n / 2].fill(1.0);
+        let mask = Image::from_vec(&[w, h], mv).unwrap();
+
+        let samples =
+            FixedSamples::from_image_with(&img, SamplingStrategy::None, 1.0, 0, Some(&mask))
+                .unwrap();
+        assert_eq!(samples.len(), n / 2);
+    }
+
+    #[test]
+    fn moving_mask_invalidates_previously_valid_points() {
+        let img = ramp(8, 8, 3.0, 5.0);
+        let t = TranslationTransform::new(vec![0.0, 0.0]);
+
+        let unmasked = MeanSquaresMetric::from_samples(
+            FixedSamples::from_image(&img),
+            MovingImage::from_image(&img).unwrap(),
+        )
+        .unwrap();
+        let before = unmasked.evaluate(&t, &CpuBackend).valid_points;
+        assert_eq!(before, 64);
+
+        // Mask out the right half of the moving image (x >= 4).
+        let mut mv = vec![0.0f64; 64];
+        for y in 0..8 {
+            for x in 0..4 {
+                mv[y * 8 + x] = 1.0;
+            }
+        }
+        let mask = Image::from_vec(&[8, 8], mv).unwrap();
+        let masked_moving = MovingImage::from_image(&img)
+            .unwrap()
+            .with_moving_mask(&mask)
+            .unwrap();
+        let masked =
+            MeanSquaresMetric::from_samples(FixedSamples::from_image(&img), masked_moving).unwrap();
+        let after = masked.evaluate(&t, &CpuBackend).valid_points;
+        assert!(
+            after < before,
+            "moving mask should drop previously-valid points: after {after} vs before {before}"
+        );
     }
 }

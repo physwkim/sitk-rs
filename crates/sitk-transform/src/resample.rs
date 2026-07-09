@@ -9,8 +9,8 @@ use sitk_core::{Image, PixelId, matrix};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{
-    affine_apply, index_to_physical_matrix, linear_at, nearest_at, physical_to_index_matrix,
-    strides,
+    affine_apply, bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
+    index_to_physical_matrix, linear_at, nearest_at, physical_to_index_matrix, strides,
 };
 use crate::transform::Transform;
 
@@ -21,6 +21,21 @@ pub enum Interpolator {
     NearestNeighbor,
     /// N-linear interpolation.
     Linear,
+    /// Cubic (order-3) B-spline, matching SimpleITK's `sitkBSpline` /
+    /// `sitkBSpline3` default (`itk::BSplineInterpolateImageFunction`).
+    /// Interpolating: reproduces the original samples exactly at integer
+    /// indices.
+    BSpline,
+    /// Gaussian-weighted local average
+    /// (`itk::GaussianInterpolateImageFunction`), fixed at SimpleITK's
+    /// `sitkGaussian` preset width ([`interpolator::GAUSSIAN_SIGMA`] /
+    /// [`interpolator::GAUSSIAN_ALPHA`], in continuous-index units). Unlike
+    /// the other three kernels this is *not* interpolating — it smooths
+    /// rather than reproducing samples exactly.
+    ///
+    /// [`interpolator::GAUSSIAN_SIGMA`]: crate::interpolator::GAUSSIAN_SIGMA
+    /// [`interpolator::GAUSSIAN_ALPHA`]: crate::interpolator::GAUSSIAN_ALPHA
+    Gaussian,
 }
 
 /// `itk::ResampleImageFilter`: build an output grid and sample the input through
@@ -151,6 +166,11 @@ impl ResampleImageFilter {
         let in_buf = input.to_f64_vec();
         let in_size = input.size().to_vec();
         let in_strides = strides(&in_size);
+        // Coefficient decomposition is global (mixes the whole line via the
+        // IIR recursion), so it is computed once up front rather than per
+        // output voxel.
+        let bspline_coeffs = matches!(self.interpolator, Interpolator::BSpline)
+            .then(|| bspline_coefficients(&in_buf, &in_size, &in_strides));
 
         let n_out: usize = out_size.iter().product();
         let mut out_vals = vec![0.0f64; n_out];
@@ -169,6 +189,19 @@ impl ResampleImageFilter {
                 }
                 Interpolator::Linear => {
                     linear_at(&in_buf, &in_size, &in_strides, &cindex).unwrap_or(self.default_value)
+                }
+                Interpolator::BSpline => bspline_value_and_gradient(
+                    bspline_coeffs.as_ref().expect("computed above for BSpline"),
+                    &in_size,
+                    &in_strides,
+                    &cindex,
+                )
+                .map(|(v, _)| v)
+                .unwrap_or(self.default_value),
+                Interpolator::Gaussian => {
+                    gaussian_value_and_gradient(&in_buf, &in_size, &in_strides, &cindex)
+                        .map(|(v, _)| v)
+                        .unwrap_or(self.default_value)
                 }
             };
 
@@ -295,6 +328,51 @@ mod tests {
         assert_eq!(
             out.scalar_slice::<f32>().unwrap(),
             &[0.0, 0.5, 1.0, 1.5, 2.0]
+        );
+    }
+
+    #[test]
+    fn bspline_interpolation_reproduces_ramp_on_identity() {
+        // Smoke test for the BSpline dispatch branch: on an identity
+        // transform every output sample lands on an integer input index,
+        // which the interpolating B-spline kernel reproduces up to
+        // coefficient round-trip floating-point noise (see the tighter,
+        // tolerance-based exact-reproduction check in `interpolator`'s own
+        // tests).
+        let img = ramp_2d(6, 1); // 0,1,2,3,4,5
+        let t = AffineTransform::identity(2);
+        let out = ResampleImageFilter::new()
+            .set_reference_image(&img)
+            .set_interpolator(Interpolator::BSpline)
+            .execute(&img, &t)
+            .unwrap();
+        for (got, want) in out
+            .scalar_slice::<f32>()
+            .unwrap()
+            .iter()
+            .zip(img.scalar_slice::<f32>().unwrap())
+        {
+            assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn gaussian_interpolation_smooths_toward_default_outside() {
+        // Smoke test for the Gaussian dispatch branch: a point mapped well
+        // outside the input buffer (beyond the kernel's own cutoff radius,
+        // so `gaussian_value_and_gradient` returns `None`) falls back to the
+        // default pixel value, exactly like the other three kernels.
+        let img = ramp_2d(4, 1);
+        let t = TranslationTransform::new(vec![100.0, 0.0]);
+        let out = ResampleImageFilter::new()
+            .set_reference_image(&img)
+            .set_default_pixel_value(-7.0)
+            .set_interpolator(Interpolator::Gaussian)
+            .execute(&img, &t)
+            .unwrap();
+        assert_eq!(
+            out.scalar_slice::<f32>().unwrap(),
+            &[-7.0, -7.0, -7.0, -7.0]
         );
     }
 }
