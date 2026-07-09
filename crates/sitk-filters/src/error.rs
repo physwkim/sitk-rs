@@ -136,6 +136,19 @@ pub enum FilterError {
     #[error("{which} must be non-empty")]
     EmptySeeds { which: &'static str },
 
+    /// A histogram-driven threshold calculator's `.hxx` throws via
+    /// `itkGenericExceptionMacro`/`itkExceptionStringMacro` on a numerical
+    /// degeneracy or non-convergence it cannot recover from:
+    /// `IntermodesThresholdCalculator`'s bimodal-smoothing iteration cap
+    /// (`itkIntermodesThresholdCalculator.hxx`) or
+    /// `KittlerIllingworthThresholdCalculator`'s division-by-near-zero
+    /// guards (`itkKittlerIllingworthThresholdCalculator.hxx`).
+    #[error("{calculator} threshold calculator failed: {reason}")]
+    ThresholdCalculatorFailed {
+        calculator: &'static str,
+        reason: &'static str,
+    },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
