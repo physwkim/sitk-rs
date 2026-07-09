@@ -13,6 +13,20 @@
 //!   entirely to [`valued_regional_maxima`] (it has no flooding logic of its
 //!   own), then either fills the whole output from `flat_is_maxima` (if the
 //!   input was flat) or thresholds the valued output at its marker value.
+//! - [`regional_minima`] — `itkRegionalMinimaImageFilter.hxx`: the mirror of
+//!   [`regional_maxima`], built the same way: delegates to
+//!   [`valued_regional_minima`], then either fills from `flat_is_minima` (if
+//!   flat) or thresholds the valued output at its marker value
+//!   (`NumericTraits<T>::max()` for minima, so *this* filter's threshold
+//!   check is `v == marker -> background_value` -- a non-minimum pixel still
+//!   holding the flood value -- `else -> foreground_value`, the same
+//!   `BinaryThresholdImageFilter` shape `RegionalMaximaImageFilter.hxx` uses,
+//!   just built on the minima marker). A private, non-parity `regional_minima`
+//!   helper already exists in [`crate::watershed`], restricted to that
+//!   module's own boolean flooding use case (see this module's own docs
+//!   above on why [`crate::watershed`]'s helper stays a separate,
+//!   unrefactored implementation); this is the unrelated, public,
+//!   SimpleITK-parity port of the real `RegionalMinimaImageFilter`.
 //!
 //! ## The flooding algorithm
 //!
@@ -247,6 +261,51 @@ pub fn regional_maxima(
     Ok(out_image)
 }
 
+/// `RegionalMinimaImageFilter`: a `UInt32` binary image where `foreground_value`
+/// marks the regional minima of `image` and `background_value` marks
+/// everything else. The mirror of [`regional_maxima`] -- see this module's
+/// docs for the exact threshold shape shared by both.
+pub fn regional_minima(
+    image: &Image,
+    fully_connected: bool,
+    flat_is_minima: bool,
+    foreground_value: u32,
+    background_value: u32,
+) -> Result<Image> {
+    let result = valued_regional_minima(image, fully_connected)?;
+    let size = image.size();
+    let total: usize = size.iter().product();
+
+    let out: Vec<u32> = if result.flat {
+        vec![
+            if flat_is_minima {
+                foreground_value
+            } else {
+                background_value
+            };
+            total
+        ]
+    } else {
+        let marker = ExtremaKind::Minima.marker_value(image.pixel_id());
+        result
+            .image
+            .to_f64_vec()
+            .iter()
+            .map(|&v| {
+                if v == marker {
+                    background_value
+                } else {
+                    foreground_value
+                }
+            })
+            .collect()
+    };
+
+    let mut out_image = Image::from_vec(size, out)?;
+    out_image.copy_geometry_from(image);
+    Ok(out_image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +455,56 @@ mod tests {
             0, 0, 0,
             0, 0, 0,
         ]);
+    }
+
+    // ---- regional_minima ----
+
+    /// The dual of `regional_maxima_thresholds_the_valued_output`: a valley
+    /// `[5,1,1,1,5]` keeps its 3-pixel minimum plateau as `foreground_value`,
+    /// the two higher ends become `background_value`.
+    #[test]
+    fn regional_minima_thresholds_the_valued_output() {
+        let image = img_i32(&[5, 1], vec![5, 1, 1, 1, 5]);
+        let out = regional_minima(&image, false, true, 1, 0).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt32);
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[0, 1, 1, 1, 0]);
+    }
+
+    /// Mirror parity: negating `regional_maxima`'s own raised-plateau fixture
+    /// turns the maximum plateau into a minimum plateau (surrounded by
+    /// strictly *higher* neighbors instead of lower ones), so
+    /// `regional_minima` on the negated image reproduces the exact same
+    /// foreground/background pattern `regional_maxima` computed on the
+    /// original.
+    #[test]
+    fn regional_minima_mirrors_regional_maxima_on_negated_fixture() {
+        let image = img_i32(&[5, 1], vec![1, 5, 5, 5, 1]);
+        let maxima = regional_maxima(&image, false, true, 1, 0).unwrap();
+
+        let negated = img_i32(&[5, 1], vec![-1, -5, -5, -5, -1]);
+        let minima = regional_minima(&negated, false, true, 1, 0).unwrap();
+
+        assert_eq!(
+            minima.scalar_slice::<u32>().unwrap(),
+            maxima.scalar_slice::<u32>().unwrap()
+        );
+    }
+
+    /// `FlatIsMinima` on a constant image: `true` fills every pixel with
+    /// `foreground_value`, bypassing the marker-value threshold entirely.
+    #[test]
+    fn regional_minima_flat_is_minima_true_fills_foreground() {
+        let image = img_i32(&[3, 1], vec![4, 4, 4]);
+        let out = regional_minima(&image, false, true, 1, 0).unwrap();
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 1, 1]);
+    }
+
+    /// `FlatIsMinima = false` on the same constant image fills every pixel
+    /// with `background_value` instead.
+    #[test]
+    fn regional_minima_flat_is_minima_false_fills_background() {
+        let image = img_i32(&[3, 1], vec![4, 4, 4]);
+        let out = regional_minima(&image, false, false, 1, 0).unwrap();
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[0, 0, 0]);
     }
 }

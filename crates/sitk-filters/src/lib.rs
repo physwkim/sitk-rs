@@ -212,7 +212,8 @@ pub use region_growing::{
     neighborhood_connected,
 };
 pub use regional_extrema::{
-    ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
+    ValuedRegionalExtremaResult, regional_maxima, regional_minima, valued_regional_maxima,
+    valued_regional_minima,
 };
 pub use reinitialize_level_set::reinitialize_level_set;
 pub use scalar_connected_component::scalar_connected_component;
