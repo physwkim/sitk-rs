@@ -238,6 +238,18 @@ pub enum FilterError {
     #[error("watershed level must be >= 0, got {0}")]
     InvalidWatershedLevel(f64),
 
+    /// `itk::watershed::SegmentTreeGenerator::CompileMergeList` throws
+    /// ("An unexpected and fatal error has occurred.") when a segment in the
+    /// table has an empty adjacency list, because it then dereferences
+    /// `edge_list.front()`. That happens exactly when the initial
+    /// segmentation found a single segment covering the whole image — a flat
+    /// image, or one whose `Threshold` flooded away every minimum but one.
+    #[error(
+        "the watershed initial segmentation produced a segment with no adjacencies \
+         (segment {label}); the image segments to a single region"
+    )]
+    WatershedSegmentWithoutEdges { label: u64 },
+
     /// `ReconstructionByErosionImageFilter`/`ReconstructionByDilationImageFilter`,
     /// via `itkReconstructionImageFilter.hxx`'s per-pixel precondition check
     /// ("be sure that the pixels in the images follow the preconditions"):

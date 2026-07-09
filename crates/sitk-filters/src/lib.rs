@@ -92,6 +92,7 @@ pub mod threshold;
 pub mod threshold_maximum_connected_components;
 pub mod toboggan;
 pub mod watershed;
+pub mod watershed_classic;
 
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
@@ -221,6 +222,7 @@ pub use threshold_maximum_connected_components::{
 };
 pub use toboggan::toboggan;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
+pub use watershed_classic::{WatershedTree, watershed};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //
