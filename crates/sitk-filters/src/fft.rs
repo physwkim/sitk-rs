@@ -19,7 +19,7 @@
 //! two, and a mixed-radix / Bluestein fallback would be unreachable code.
 
 use std::f64::consts::PI;
-use std::ops::{Add, Mul, Sub};
+use std::ops::{Add, Div, Mul, Sub};
 
 /// A complex number. Deliberately crate-private: the public convolution API is
 /// real-valued in both directions.
@@ -59,6 +59,17 @@ impl Mul for Complex {
     }
 }
 
+impl Div for Complex {
+    type Output = Complex;
+    fn div(self, rhs: Complex) -> Complex {
+        let d = rhs.re * rhs.re + rhs.im * rhs.im;
+        Complex::new(
+            (self.re * rhs.re + self.im * rhs.im) / d,
+            (self.im * rhs.re - self.re * rhs.im) / d,
+        )
+    }
+}
+
 /// The length `itkFFTPadImageFilter` would pad an axis of `n` pixels up to,
 /// for `SizeGreatestPrimeFactor == 2`: the smallest `m >= n` whose greatest
 /// prime factor is at most 2 (itkFFTPadImageFilter.hxx:55-63).
@@ -75,6 +86,33 @@ pub(crate) fn padded_length(n: usize) -> usize {
 /// `inverse` conjugates the twiddle factors and scales by `1 / len`, so
 /// `transform_1d(inverse=true)` inverts `transform_1d(inverse=false)`.
 fn transform_1d(buf: &mut [Complex], inverse: bool) {
+    transform_1d_unscaled(buf, inverse);
+    if inverse {
+        let scale = 1.0 / buf.len() as f64;
+        for x in buf.iter_mut() {
+            x.re *= scale;
+            x.im *= scale;
+        }
+    }
+}
+
+/// `itk::PocketFFTCommon::Transform1D(data, len, forward, /*scale=*/1)`: an
+/// unnormalized transform whose kernel is `exp(-2*pi*i*n*k/N)` when `forward`
+/// and `exp(+2*pi*i*n*k/N)` otherwise, matching pocketfft's `c2c` convention.
+///
+/// `N4BiasFieldCorrectionImageFilter::SharpenImage` needs both signs and
+/// neither normalization: it runs `Transform1D(..., false, 1)` where a
+/// textbook forward DFT would sit and `Transform1D(..., true, 1)` where the
+/// inverse would, so a round trip comes back scaled by `N`. That scale cancels
+/// in the `E(u|v)` numerator/denominator ratio, which is the only thing
+/// `SharpenImage` reads out.
+pub(crate) fn transform_1d_unnormalized(buf: &mut [Complex], forward: bool) {
+    transform_1d_unscaled(buf, !forward);
+}
+
+/// The shared butterfly, with `positive_exponent` selecting the twiddle sign
+/// and no scaling on either pass.
+fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
     let n = buf.len();
     debug_assert!(n.is_power_of_two(), "radix-2 needs a power-of-two length");
     if n < 2 {
@@ -95,7 +133,7 @@ fn transform_1d(buf: &mut [Complex], inverse: bool) {
         }
     }
 
-    let sign = if inverse { 1.0 } else { -1.0 };
+    let sign = if positive_exponent { 1.0 } else { -1.0 };
     let mut len = 2usize;
     while len <= n {
         let angle = sign * 2.0 * PI / len as f64;
@@ -114,14 +152,6 @@ fn transform_1d(buf: &mut [Complex], inverse: bool) {
             }
         }
         len <<= 1;
-    }
-
-    if inverse {
-        let scale = 1.0 / n as f64;
-        for x in buf.iter_mut() {
-            x.re *= scale;
-            x.im *= scale;
-        }
     }
 }
 
