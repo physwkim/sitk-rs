@@ -281,6 +281,54 @@ pub enum FilterError {
     )]
     EmptyHausdorffForegroundSet,
 
+    /// `BSplineScatteredDataPointSetToImageFilter::SetSplineOrder` and
+    /// `BSplineControlPointImageFilter::SetSplineOrder` both throw "The spline
+    /// order in each dimension must be greater than 0".
+    #[error("spline_order must be >= 1, got 0")]
+    InvalidSplineOrder,
+
+    /// `BSplineScatteredDataPointSetToImageFilter::GenerateData` throws "The
+    /// number of control points must be greater than the spline order" when
+    /// `m_NumberOfControlPoints[i] < m_SplineOrder[i] + 1` — a lattice that
+    /// short cannot support even one B-spline span.
+    #[error(
+        "axis {axis} has {control_points} control points, which must exceed the spline order {spline_order}"
+    )]
+    InvalidControlPointCount {
+        axis: usize,
+        control_points: usize,
+        spline_order: usize,
+    },
+
+    /// A B-spline filter's parametric reparameterization
+    /// (`r[i] = spans[i] / ((size[i] - 1) * spacing[i])`) divides by
+    /// `size[i] - 1`, so every axis needs at least two pixels.
+    #[error("b-spline fitting needs at least 2 pixels along every axis, got size {0:?}")]
+    BSplineAxisTooShort(Vec<usize>),
+
+    /// `BSplineScatteredDataPointSetToImageFilter::ThreadedGenerateDataForFitting`
+    /// and `BSplineControlPointImageFilter::DynamicThreadedGenerateData` both
+    /// throw "The ... point component ... is outside the corresponding
+    /// parametric domain of [0, spans)" for a sample that does not lie on the
+    /// parametric grid, after the `m_BSplineEpsilon` edge tolerance.
+    #[error(
+        "b-spline parametric coordinate {value} on axis {axis} is outside the domain [0, {spans})"
+    )]
+    BSplineParametricDomain { axis: usize, value: f64, spans: f64 },
+
+    /// `N4BiasFieldCorrectionImageFilter::SharpenImage` divides by
+    /// `m_NumberOfHistogramBins - 1` to build the histogram slope.
+    #[error("n4 number_of_histogram_bins must be >= 2, got {0}")]
+    N4InvalidHistogramBins(u32),
+
+    /// `N4BiasFieldCorrectionImageFilter::GenerateData` reaches the end of the
+    /// first fitting level with `m_LogBiasFieldControlPointLattice` still null
+    /// — and then dereferences it — whenever the inner iteration loop never
+    /// runs, i.e. `maximum_number_of_iterations` is empty or its first entry is
+    /// zero, or `convergence_threshold` is not below `RealType`'s maximum.
+    #[error("n4 completed its first fitting level without estimating a bias field")]
+    N4NoBiasFieldEstimated,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

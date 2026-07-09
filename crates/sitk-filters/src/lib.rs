@@ -47,6 +47,7 @@ pub mod level_set;
 pub mod logic;
 pub mod math;
 pub mod morphology;
+pub mod n4_bias_field;
 pub mod noise;
 pub mod overlap;
 pub mod projection;
@@ -115,6 +116,10 @@ pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
+};
+pub use n4_bias_field::{
+    N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,
+    n4_bias_field_correction_with_log_bias_field,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
 pub use overlap::{
