@@ -41,6 +41,7 @@ pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod shrink;
 pub mod smoothing;
+pub mod watershed;
 
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
@@ -87,6 +88,7 @@ pub use region_growing::{
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;
+pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //
