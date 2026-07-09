@@ -1,4 +1,6 @@
-//! `itk::WatershedImageFilter`: the classic segmentation-tree watershed.
+//! `itk::WatershedImageFilter`: the classic segmentation-tree watershed, and
+//! `itk::IsolatedWatershedImageFilter` ([`isolated_watershed`]), the one
+//! SimpleITK filter built on it.
 //!
 //! Port of `Modules/Segmentation/Watersheds/include/itkWatershedImageFilter.h`
 //! / `.hxx` and the three `itk::watershed::` component filters its
@@ -189,6 +191,8 @@
 //! `FloatAlmostEqual<float>`.
 
 use crate::error::{FilterError, Result};
+use crate::gradient::gradient_magnitude_values;
+use crate::image_from_f64;
 use sitk_core::{Image, PixelId};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
@@ -1265,6 +1269,195 @@ pub fn watershed(image: &Image, threshold: f64, level: f64) -> Result<Image> {
     Ok(result)
 }
 
+// ---- itk::IsolatedWatershedImageFilter ------------------------------------
+
+/// The non-seed parameters of [`isolated_watershed`], mirroring SimpleITK's
+/// `IsolatedWatershedImageFilter.yaml` members and their defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IsolatedWatershedSettings {
+    /// `Threshold`, the watershed threshold. Default `0.0`.
+    pub threshold: f64,
+    /// `UpperValueLimit`, where the bisection over the waterlevel starts.
+    /// Default `1.0`.
+    pub upper_value_limit: f64,
+    /// `IsolatedValueTolerance`, the bisection's stopping precision. Default
+    /// `0.001`.
+    pub isolated_value_tolerance: f64,
+    /// `ReplaceValue1`, painted over Seed1's basin. SimpleITK defaults it to
+    /// `1`; `itkIsolatedWatershedImageFilter.hxx`'s constructor agrees
+    /// (`NumericTraits<OutputImagePixelType>::OneValue()`).
+    pub replace_value1: u8,
+    /// `ReplaceValue2`, painted over Seed2's basin. SimpleITK's yaml defaults
+    /// it to `2`, **overriding** ITK's own constructor default of `0`
+    /// (`OutputImagePixelType{}`). This port follows SimpleITK.
+    pub replace_value2: u8,
+}
+
+impl Default for IsolatedWatershedSettings {
+    fn default() -> Self {
+        IsolatedWatershedSettings {
+            threshold: 0.0,
+            upper_value_limit: 1.0,
+            isolated_value_tolerance: 0.001,
+            replace_value1: 1,
+            replace_value2: 2,
+        }
+    }
+}
+
+/// The result of [`isolated_watershed`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct IsolatedWatershedResult {
+    /// `UInt8` image: `replace_value1` on Seed1's basin, `replace_value2` on
+    /// Seed2's, `0` elsewhere.
+    pub image: Image,
+    /// `GetIsolatedValue()`: the waterlevel the bisection settled on. This is
+    /// always the final `lower` bound, on every path through the filter,
+    /// including the ones where the seeds were never separated.
+    pub isolated_value: f64,
+}
+
+/// Validates `seed` against `size` and returns its flat offset.
+/// `IsolatedWatershedImageFilter::VerifyInputInformation` throws
+/// `"Seed1 is not within the input image!"` for an out-of-range seed.
+fn seed_flat_index(seed: &[usize], size: &[usize]) -> Result<usize> {
+    if seed.len() != size.len() {
+        return Err(FilterError::DimensionLength {
+            expected: size.len(),
+            got: seed.len(),
+        });
+    }
+    if seed.iter().zip(size).any(|(&s, &n)| s >= n) {
+        return Err(FilterError::InvalidSeedIndex {
+            seed: seed.to_vec(),
+            size: size.to_vec(),
+        });
+    }
+    let strides = strides(size);
+    Ok(seed.iter().zip(&strides).map(|(&s, &st)| s * st).sum())
+}
+
+/// `NumericTraits<InputPixelType>::RealType` — the pixel type of the
+/// `RealImageType` that `IsolatedWatershedImageFilter` runs its gradient
+/// magnitude and its watershed on. `float` stays `float`; everything else,
+/// integer types included, becomes `double`.
+fn real_pixel_type(pixel_id: PixelId) -> PixelId {
+    match pixel_id {
+        PixelId::Float32 => PixelId::Float32,
+        _ => PixelId::Float64,
+    }
+}
+
+/// `itk::IsolatedWatershedImageFilter`: bisect the watershed waterlevel until
+/// `seed1` and `seed2` fall in different basins, then paint those two basins.
+///
+/// The pipeline is `GradientMagnitudeImageFilter` → `WatershedImageFilter`,
+/// with **no** smoothing stage — no Gaussian blur, no anisotropic diffusion.
+/// The gradient magnitude is computed at `NumericTraits<InputPixelType>::RealType`
+/// precision (`double` for every integer input), not at the `float` that
+/// SimpleITK's standalone `gradient_magnitude` would give.
+///
+/// The bisection starts at `guess = upper_value_limit` and halves
+/// `[lower, upper]` while `lower + isolated_value_tolerance < guess`, where
+/// `lower` starts at `threshold`. Each iteration re-runs the watershed at
+/// `guess` and moves `upper` down when the seeds share a basin, `lower` up when
+/// they do not. Crucially, ITK reuses **one** `WatershedImageFilter` instance
+/// across the whole bisection, so its merge tree is computed once — at the
+/// first `guess`, which is the largest one — and every later iteration only
+/// re-runs the relabeler against that tree. This port does the same
+/// ([`WatershedTree`]), because the relabeler's cut is
+/// `level * tree.back().saliency` and a per-iteration tree would move that
+/// denominator.
+///
+/// ## When the seeds cannot be separated
+///
+/// If the loop never ran (`upper_value_limit <= threshold + tolerance`, so the
+/// watershed's buffered region never matched the output's — ITK's
+/// `GetBufferedRegion() != region` short-circuit), or if it ran and the seeds
+/// still share a basin, ITK re-runs the watershed at `lower`. The two seeds
+/// then carry the same label, and the painting loop's `value == seed1Label`
+/// branch wins first: the shared basin is painted entirely with
+/// `replace_value1` and **nothing** receives `replace_value2`.
+/// [`IsolatedWatershedResult::isolated_value`] is `lower` on every path.
+///
+/// Errors with [`FilterError::InvalidSeedIndex`] / [`FilterError::DimensionLength`]
+/// for a bad seed, and propagates [`FilterError::WatershedSegmentWithoutEdges`]
+/// when the gradient magnitude has a single watershed segment.
+pub fn isolated_watershed(
+    image: &Image,
+    seed1: &[usize],
+    seed2: &[usize],
+    settings: IsolatedWatershedSettings,
+) -> Result<IsolatedWatershedResult> {
+    let size = image.size().to_vec();
+    let seed1_offset = seed_flat_index(seed1, &size)?;
+    let seed2_offset = seed_flat_index(seed2, &size)?;
+
+    // `m_GradientMagnitude->SetInput(inputImage)`, output at RealType.
+    let gm_values = gradient_magnitude_values(image, true)?;
+    let gradient = image_from_f64(real_pixel_type(image.pixel_id()), &size, image, &gm_values)?;
+
+    let mut lower = settings.threshold;
+    let mut upper = settings.upper_value_limit;
+    let mut guess = upper;
+
+    let mut tree: Option<WatershedTree> = None;
+    let mut labels: Option<Vec<u64>> = None;
+
+    // Binary search for an upper waterlevel that separates the two seeds.
+    while lower + settings.isolated_value_tolerance < guess {
+        // `SetFloodLevel` only marks the tree generator modified when the new
+        // level exceeds the highest already computed, and the first `guess` is
+        // the largest one, so the tree is built exactly once.
+        if tree.is_none() {
+            tree = Some(watershed_tree(&gradient, settings.threshold, guess)?);
+        }
+        let current = tree.as_ref().expect("just built").relabel(guess);
+        if current[seed1_offset] == current[seed2_offset] {
+            upper = guess;
+        } else {
+            lower = guess;
+        }
+        guess = (upper + lower) / 2.0;
+        labels = Some(current);
+    }
+
+    // "If the watershed basins are not separated or if the upper/lower
+    // threshold were not valid, then use lower." The buffered-region test is
+    // true exactly when the loop never ran, and then no tree exists yet.
+    let final_labels = match labels {
+        Some(l) if l[seed1_offset] != l[seed2_offset] => l,
+        _ => {
+            let tree = match tree {
+                Some(t) => t,
+                None => watershed_tree(&gradient, settings.threshold, lower)?,
+            };
+            tree.relabel(lower)
+        }
+    };
+
+    let seed1_label = final_labels[seed1_offset];
+    let seed2_label = final_labels[seed2_offset];
+    let painted: Vec<u8> = final_labels
+        .iter()
+        .map(|&value| {
+            if value == seed1_label {
+                settings.replace_value1
+            } else if value == seed2_label {
+                settings.replace_value2
+            } else {
+                0
+            }
+        })
+        .collect();
+
+    let mut out = Image::from_vec(&size, painted)?;
+    out.copy_geometry_from(image);
+    Ok(IsolatedWatershedResult {
+        image: out,
+        isolated_value: lower,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1634,6 +1827,177 @@ mod tests {
         assert!(
             !AlmostEquals::for_pixel_type(PixelId::UInt8).eq(one as f64, four_ulps as f64),
             "integer comparison is exact `==`"
+        );
+    }
+
+    // ---- itk::IsolatedWatershedImageFilter --------------------------------
+
+    fn u8_img(size: &[usize], data: Vec<u8>) -> Image {
+        Image::from_vec(size, data).unwrap()
+    }
+
+    /// `[0, 0, 10, 10, 10, 0, 0]`, spacing 1. Central differences under a
+    /// zero-flux Neumann boundary give a gradient magnitude of
+    /// `[0, 5, 5, 0, 5, 5, 0]` (the y-derivative vanishes on a single row).
+    ///
+    /// That surface has three minima at 0 and two plateaus at 5. Each plateau
+    /// descends into the basin on its left, so the initial segmentation is
+    /// `[1, 1, 1, 3, 3, 3, 5]`. Every segment's lowest edge is at height 5 over
+    /// a minimum of 0, so every saliency equals `maximumDepth = 5 - 0`, and
+    /// `saliency < level * maximumDepth` is false for every `level <= 1`: the
+    /// merge tree is empty at any waterlevel and the three basins never merge.
+    fn two_blob_gradient_basins() -> Image {
+        u8_img(&[7, 1], vec![0, 0, 10, 10, 10, 0, 0])
+    }
+
+    /// The bisection's first `guess` is `upper_value_limit`, which already
+    /// separates the seeds, so `lower` rises to it and the loop exits after one
+    /// iteration. `GetIsolatedValue()` is that `lower`.
+    #[test]
+    fn separable_seeds_are_painted_with_both_replace_values() {
+        let out = isolated_watershed(
+            &two_blob_gradient_basins(),
+            &[0, 0],
+            &[6, 0],
+            IsolatedWatershedSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(out.image.pixel_id(), PixelId::UInt8);
+        assert_eq!(
+            out.image.scalar_slice::<u8>().unwrap(),
+            &[1, 1, 1, 0, 0, 0, 2],
+            "seed1's basin takes ReplaceValue1, seed2's ReplaceValue2,              the middle basin neither"
+        );
+        assert_eq!(out.isolated_value, 1.0);
+    }
+
+    /// Both seeds sit in basin 1, and no waterlevel splits it, so the loop
+    /// halves `guess` down to the tolerance without ever raising `lower`.
+    ///
+    /// `seed1Label == seed2Label` then makes the painting loop's
+    /// `value == seed1Label` branch win first: the shared basin is painted
+    /// entirely with `ReplaceValue1` and **nothing** receives `ReplaceValue2`.
+    #[test]
+    fn inseparable_seeds_paint_only_replace_value1() {
+        let out = isolated_watershed(
+            &two_blob_gradient_basins(),
+            &[0, 0],
+            &[1, 0],
+            IsolatedWatershedSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.image.scalar_slice::<u8>().unwrap(),
+            &[1, 1, 1, 0, 0, 0, 0],
+            "ReplaceValue2 never appears"
+        );
+        assert_eq!(out.isolated_value, 0.0, "lower never moved");
+    }
+
+    /// `ReplaceValue1` and `ReplaceValue2` are plumbed straight through, and
+    /// everything outside the two seeded basins gets `OutputImagePixelType{}`.
+    #[test]
+    fn replace_values_are_plumbed_through() {
+        let settings = IsolatedWatershedSettings {
+            replace_value1: 7,
+            replace_value2: 9,
+            ..IsolatedWatershedSettings::default()
+        };
+        let out =
+            isolated_watershed(&two_blob_gradient_basins(), &[0, 0], &[6, 0], settings).unwrap();
+        assert_eq!(
+            out.image.scalar_slice::<u8>().unwrap(),
+            &[7, 7, 7, 0, 0, 0, 9]
+        );
+    }
+
+    /// When `upper_value_limit <= threshold + tolerance` the `while` never runs.
+    /// ITK detects this by the watershed's buffered region still being empty and
+    /// re-runs it at `lower`; the seeds may well be separated there anyway, but
+    /// `GetIsolatedValue()` still reports `lower` — the bisection never refined
+    /// anything.
+    #[test]
+    fn a_bisection_that_never_iterates_still_segments_at_lower() {
+        let settings = IsolatedWatershedSettings {
+            threshold: 0.0,
+            upper_value_limit: 0.001,
+            isolated_value_tolerance: 0.001,
+            ..IsolatedWatershedSettings::default()
+        };
+        let out =
+            isolated_watershed(&two_blob_gradient_basins(), &[0, 0], &[6, 0], settings).unwrap();
+        assert_eq!(
+            out.image.scalar_slice::<u8>().unwrap(),
+            &[1, 1, 1, 0, 0, 0, 2]
+        );
+        assert_eq!(out.isolated_value, 0.0);
+    }
+
+    /// `VerifyInputInformation`: "Seed1 is not within the input image!"
+    #[test]
+    fn a_seed_outside_the_image_is_an_error() {
+        let input = two_blob_gradient_basins();
+        let settings = IsolatedWatershedSettings::default();
+        for seed in [[7, 0], [0, 1]] {
+            let err = isolated_watershed(&input, &seed, &[6, 0], settings).unwrap_err();
+            assert!(
+                matches!(err, FilterError::InvalidSeedIndex { .. }),
+                "seed {seed:?}: {err:?}"
+            );
+        }
+        let err = isolated_watershed(&input, &[0, 0], &[6, 6], settings).unwrap_err();
+        assert!(
+            matches!(err, FilterError::InvalidSeedIndex { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A seed with the wrong number of components never reaches ITK's bounds
+    /// check, because `IndexType` is dimension-typed.
+    #[test]
+    fn a_seed_of_the_wrong_dimension_is_an_error() {
+        let input = two_blob_gradient_basins();
+        let err = isolated_watershed(&input, &[0], &[6, 0], IsolatedWatershedSettings::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FilterError::DimensionLength {
+                    expected: 2,
+                    got: 1
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The gradient magnitude runs at `NumericTraits<InputPixelType>::RealType`,
+    /// which is `double` for every integer input and `float` only for a `float`
+    /// input. SimpleITK's standalone `GradientMagnitudeImageFilter` yaml instead
+    /// fixes the output at `float`, so this is not the same seam.
+    #[test]
+    fn the_gradient_magnitude_runs_at_real_type() {
+        assert_eq!(real_pixel_type(PixelId::UInt8), PixelId::Float64);
+        assert_eq!(real_pixel_type(PixelId::Int16), PixelId::Float64);
+        assert_eq!(real_pixel_type(PixelId::Float64), PixelId::Float64);
+        assert_eq!(real_pixel_type(PixelId::Float32), PixelId::Float32);
+    }
+
+    /// A constant image has a zero gradient magnitude everywhere, which is the
+    /// flat-image single-segment error, propagated out of the watershed.
+    #[test]
+    fn a_constant_image_propagates_the_single_segment_error() {
+        let input = u8_img(&[4, 1], vec![3; 4]);
+        let err = isolated_watershed(
+            &input,
+            &[0, 0],
+            &[3, 0],
+            IsolatedWatershedSettings::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FilterError::WatershedSegmentWithoutEdges { label: 1 }),
+            "{err:?}"
         );
     }
 

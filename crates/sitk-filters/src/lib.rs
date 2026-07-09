@@ -222,7 +222,10 @@ pub use threshold_maximum_connected_components::{
 };
 pub use toboggan::toboggan;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
-pub use watershed_classic::{WatershedTree, watershed};
+pub use watershed_classic::{
+    IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
+    watershed,
+};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //
