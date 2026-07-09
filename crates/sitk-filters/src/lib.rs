@@ -25,6 +25,7 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod canny;
 pub mod denoise;
 pub mod distance;
 pub mod error;
@@ -40,6 +41,7 @@ pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
+pub use canny::{canny_edge_detection, zero_crossing};
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
 pub use distance::{
     danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
