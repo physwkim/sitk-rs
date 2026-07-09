@@ -57,6 +57,7 @@ pub mod expand;
 pub mod fast_marching;
 mod fft;
 pub mod fft_correlation;
+pub mod fft_shift;
 pub mod functor;
 pub mod geodesic_morphology;
 pub mod geometry;
@@ -128,6 +129,7 @@ pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
+pub use fft_shift::fft_shift;
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
