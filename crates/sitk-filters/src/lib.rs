@@ -40,6 +40,7 @@
 
 pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
+pub mod attribute_morphology;
 pub mod binary_morphology;
 pub mod canny;
 pub mod clamp;
@@ -97,6 +98,7 @@ pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
+pub use attribute_morphology::{area_closing, area_opening};
 pub use binary_morphology::{
     binary_fillhole, binary_grind_peak, binary_thinning, voting_binary,
     voting_binary_iterative_hole_filling,
