@@ -114,7 +114,7 @@ pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
-pub use functor::{BinaryFunctor, UnaryFunctor, UnaryPixelFunctor};
+pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
@@ -138,9 +138,10 @@ pub use label_shape::{
 };
 pub use level_set::{LevelSetResult, geodesic_active_contour_level_set, shape_detection_level_set};
 pub use logic::{
-    and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place, mask,
-    mask_in_place, mask_negated, mask_negated_in_place, maximum, maximum_in_place, minimum,
-    minimum_in_place, not, not_in_place, or, or_in_place, xor, xor_in_place,
+    and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place,
+    greater_equal, less_equal, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
+    maximum_in_place, minimum, minimum_in_place, not, not_equal, not_in_place, or, or_in_place,
+    xor, xor_in_place,
 };
 pub use math::{
     abs, abs_in_place, absolute_value_difference, absolute_value_difference_in_place, acos,

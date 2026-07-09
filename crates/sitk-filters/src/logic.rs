@@ -6,6 +6,18 @@
 //! `itkMaximumImageFilter.h`, `itkMinimumImageFilter.h`, and under
 //! `Modules/Filtering/LabelMap/include/`: `itkBinaryNotImageFilter.h`.
 //!
+//! [`greater_equal`]/[`less_equal`]/[`not_equal`] (`itkLogicOpsFunctors.h`'s
+//! `LogicOpBase`-derived `GreaterEqual`/`LessEqual`/`NotEqual`: `A op B ?
+//! foreground_value : background_value`) are the crate's
+//! [`crate::functor::ComparisonFunctor`] policy: pixel-type-compute like
+//! `and`/`or`/`xor`, but the output pixel type is always `UInt8` regardless
+//! of the (shared) input pixel type, so there is no integer-only gate (every
+//! pixel type this crate supports has a total order) and no in-place variant
+//! (matching `divide_real`'s precedent in `math.rs`). ITK's own header also
+//! declares sibling `Greater`/`Less`/`Equal` functors
+//! (`GreaterImageFilter.yaml`/`LessImageFilter.yaml`/`EqualImageFilter.yaml`)
+//! that this port does not implement, as they were not in this port's scope.
+//!
 //! [`and`]/[`or`]/[`xor`] are pixel-type-compute (`functor.rs`'s policy
 //! (b)): ITK's `Functor::AND`/`OR`/`XOR` evaluate `&`/`|`/`^` directly in the
 //! pixel type (`static_cast<TOutput>(A & B)`), which C++ only defines for
@@ -60,7 +72,7 @@
 //! `add`/`subtract`/... already have in `lib.rs`), so the mask image must be
 //! cast to the main image's pixel type first.
 
-use crate::functor::{self, BinaryFunctor, UnaryFunctor, UnaryPixelFunctor};
+use crate::functor::{self, BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 use crate::{FilterError, Result};
 use sitk_core::{Image, Scalar};
 
@@ -270,6 +282,77 @@ pub fn binary_not_in_place(
             background_value,
         },
     )
+}
+
+// ---- comparisons (all pixel types, u8 output) ------------------------------
+
+/// `GreaterEqual` functor (`itkLogicOpsFunctors.h`): `a >= b ?
+/// foreground_value : background_value`, compared directly in the pixel
+/// type (no promotion; see the module docs).
+struct GreaterEqualOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for GreaterEqualOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a >= b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+/// `LessEqual` functor (`itkLogicOpsFunctors.h`): `a <= b ? foreground_value
+/// : background_value`, compared directly in the pixel type (no promotion;
+/// see the module docs).
+struct LessEqualOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for LessEqualOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a <= b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+/// `NotEqual` functor (`itkLogicOpsFunctors.h`): `a != b ? foreground_value
+/// : background_value`, compared directly in the pixel type (no promotion;
+/// see the module docs).
+struct NotEqualOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for NotEqualOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a != b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+functor::comparison_functor! {
+    /// `GreaterEqualImageFilter`: pixel-wise `a >= b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn greater_equal(foreground_value: u8, background_value: u8) = GreaterEqualOp { foreground_value, background_value };
+}
+
+functor::comparison_functor! {
+    /// `LessEqualImageFilter`: pixel-wise `a <= b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn less_equal(foreground_value: u8, background_value: u8) = LessEqualOp { foreground_value, background_value };
+}
+
+functor::comparison_functor! {
+    /// `NotEqualImageFilter`: pixel-wise `a != b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn not_equal(foreground_value: u8, background_value: u8) = NotEqualOp { foreground_value, background_value };
 }
 
 // ---- mask / mask_negated (all pixel types) ---------------------------------
@@ -584,6 +667,82 @@ mod tests {
         let allocated = binary_not(&a, 1.0, 0.0).unwrap();
         let in_place = binary_not_in_place(a, 1.0, 0.0).unwrap();
         assert_eq!(allocated, in_place);
+    }
+
+    // ---- greater_equal / less_equal / not_equal: >, ==, < boundaries ----
+
+    #[test]
+    fn greater_equal_above_equal_and_below_boundaries() {
+        let a = Image::from_vec(&[3, 1], vec![5i32, 3, 3]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 5]).unwrap();
+        assert_eq!(
+            greater_equal(&a, &b, 1, 0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[1, 1, 0]
+        );
+    }
+
+    #[test]
+    fn less_equal_above_equal_and_below_boundaries() {
+        let a = Image::from_vec(&[3, 1], vec![5i32, 3, 3]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 5]).unwrap();
+        assert_eq!(
+            less_equal(&a, &b, 1, 0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[0, 1, 1]
+        );
+    }
+
+    #[test]
+    fn not_equal_equal_and_unequal_boundaries() {
+        let a = Image::from_vec(&[3, 1], vec![1i32, 2, 2]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![1i32, 3, 2]).unwrap();
+        assert_eq!(
+            not_equal(&a, &b, 1, 0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn comparisons_use_custom_foreground_and_background_values() {
+        let a = Image::from_vec(&[2, 1], vec![5i32, 3]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![3i32, 5]).unwrap();
+        assert_eq!(
+            greater_equal(&a, &b, 100, 7)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[100, 7]
+        );
+    }
+
+    #[test]
+    fn comparisons_output_is_always_uint8_regardless_of_input_type() {
+        let a = Image::from_vec(&[2, 1], vec![5.0f32, 3.0]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![3.0f32, 5.0]).unwrap();
+        let out = greater_equal(&a, &b, 1, 0).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::UInt8);
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 0]);
+    }
+
+    #[test]
+    fn comparisons_reject_mismatched_pixel_types() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            greater_equal(&a, &b, 1, 0),
+            Err(FilterError::TypeMismatch {
+                a: a.pixel_id(),
+                b: b.pixel_id()
+            })
+        );
     }
 
     // ---- mask: mask zero vs nonzero vs explicit masking_value ----

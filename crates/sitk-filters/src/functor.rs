@@ -26,14 +26,23 @@
 //!   the one-image face of this same policy (`UnaryMinus`,
 //!   `itkBitwiseOpsFunctors.h`'s `BitwiseNot`), as [`UnaryFunctor`] is the
 //!   one-image face of f64-compute.
+//! - **comparison** ([`ComparisonFunctor`]): [`BinaryFunctor`]'s sibling for
+//!   ITK's `LogicOpBase`-derived comparisons (`itkLogicOpsFunctors.h`'s
+//!   `GreaterEqual`, `LessEqual`, `NotEqual`, ...): still pixel-type-compute
+//!   (`A op B` runs in `T`, no promotion, so `u64`/`i64` comparisons stay
+//!   exact where an `f64` promotion could lose precision above 2^53), but
+//!   the output type is always `u8` instead of `T`.
 //!
 //! [`unary_functor!`] and [`binary_functor!`] each wire a functor value to a
 //! pair of public functions: an allocating one taking `&Image`, and an
 //! in-place one that consumes an owned `Image` and reuses its buffer,
 //! mirroring the fact that both `UnaryFunctorImageFilter` and
 //! `BinaryFunctorImageFilter` derive from `InPlaceImageFilter` in ITK.
-//! [`UnaryPixelFunctor`] has no such macro: every current consumer
-//! (`unary_minus`, `bitwise_not`, `binary_not`) needs a pixel-type
+//! [`comparison_functor!`] emits only the allocating function: the output
+//! pixel type (`u8`) can differ from the (shared) input pixel type, so
+//! there is no buffer to reuse in place (matching `divide_real`'s precedent
+//! in `math.rs`). [`UnaryPixelFunctor`] has no such macro: every current
+//! consumer (`unary_minus`, `bitwise_not`, `binary_not`) needs a pixel-type
 //! precondition check before dispatch, so they call [`unary_pixel_apply`] /
 //! [`unary_pixel_apply_in_place`] directly instead, the same way
 //! `and`/`or`/`xor`/`not` bypass `binary_functor!`/`unary_functor!` for the
@@ -137,6 +146,76 @@ impl<F> AllScalarsUnaryPixelFunctor for F where
         + UnaryPixelFunctor<f32>
         + UnaryPixelFunctor<f64>
 {
+}
+
+/// A per-pixel comparison of two images, computed directly in the pixel
+/// type `T` and mapped to a `u8` — [`BinaryFunctor`]'s comparison sibling:
+/// ITK's `static_cast<TOutput>(A op B)` policy where `op` and `TOutput` are
+/// evaluated separately (`op` in `T`, `TOutput` fixed to `u8`), used by the
+/// `LogicOpBase`-derived comparison functors (`GreaterEqual`, `LessEqual`,
+/// `NotEqual`, ...; see `itkLogicOpsFunctors.h`).
+pub trait ComparisonFunctor<T: Scalar> {
+    /// Evaluate the functor at `(a, b)`, comparing in the pixel type and
+    /// returning the `u8` foreground/background result.
+    fn apply(&self, a: T, b: T) -> u8;
+}
+
+/// Implements [`ComparisonFunctor`] for every pixel scalar type this crate
+/// supports; see [`AllScalarsBinaryFunctor`] for why this blanket bound
+/// exists (the same `dispatch_scalar!` requirement applies here).
+pub(crate) trait AllScalarsComparisonFunctor:
+    ComparisonFunctor<u8>
+    + ComparisonFunctor<i8>
+    + ComparisonFunctor<u16>
+    + ComparisonFunctor<i16>
+    + ComparisonFunctor<u32>
+    + ComparisonFunctor<i32>
+    + ComparisonFunctor<u64>
+    + ComparisonFunctor<i64>
+    + ComparisonFunctor<f32>
+    + ComparisonFunctor<f64>
+{
+}
+
+impl<F> AllScalarsComparisonFunctor for F where
+    F: ComparisonFunctor<u8>
+        + ComparisonFunctor<i8>
+        + ComparisonFunctor<u16>
+        + ComparisonFunctor<i16>
+        + ComparisonFunctor<u32>
+        + ComparisonFunctor<i32>
+        + ComparisonFunctor<u64>
+        + ComparisonFunctor<i64>
+        + ComparisonFunctor<f32>
+        + ComparisonFunctor<f64>
+{
+}
+
+// ---- comparison (pixel-type-compute policy, u8 output) engine ----------
+
+fn comparison_apply_typed<T: Scalar>(
+    a: &Image,
+    b: &Image,
+    f: &dyn ComparisonFunctor<T>,
+) -> Result<Image> {
+    let sa = a.scalar_slice::<T>().expect("dispatch guarantees type");
+    let sb = b.scalar_slice::<T>().expect("dispatch guarantees type");
+    let out: Vec<u8> = sa.iter().zip(sb).map(|(&x, &y)| f.apply(x, y)).collect();
+    let mut img = Image::from_vec(a.size(), out)?;
+    img.copy_geometry_from(a);
+    Ok(img)
+}
+
+/// Apply a [`ComparisonFunctor`] pixel-wise over `a` and `b`, allocating a
+/// new `UInt8` [`Image`]. Errors if `a` and `b` differ in pixel type or
+/// size.
+pub(crate) fn comparison_apply<F: AllScalarsComparisonFunctor>(
+    a: &Image,
+    b: &Image,
+    f: &F,
+) -> Result<Image> {
+    require_same_shape(a, b)?;
+    dispatch_scalar!(a.pixel_id(), comparison_apply_typed, a, b, f)
 }
 
 // ---- unary (pixel-type-compute policy) engine --------------------------
@@ -310,12 +389,30 @@ macro_rules! binary_functor {
     };
 }
 
+/// Emit a `pub fn $name(a: &Image, b: &Image, ...) -> Result<Image>`, backed
+/// by a [`ComparisonFunctor`] value — ITK's `LogicOpBase`-derived
+/// comparisons (see the module docs and `itkLogicOpsFunctors.h`). No
+/// in-place variant (see the module docs for why).
+macro_rules! comparison_functor {
+    (
+        $(#[$doc:meta])*
+        pub fn $name:ident ( $($p:ident : $pt:ty),* $(,)? ) = $functor:expr;
+    ) => {
+        $(#[$doc])*
+        pub fn $name(a: &Image, b: &Image $(, $p: $pt)*) -> Result<Image> {
+            $crate::functor::comparison_apply(a, b, &($functor))
+        }
+    };
+}
+
 pub(crate) use binary_functor;
+pub(crate) use comparison_functor;
 pub(crate) use unary_functor;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sitk_core::PixelId;
 
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -420,5 +517,41 @@ mod tests {
         let allocated = binary_apply(&a, &b, &WrappingAddU8).unwrap();
         let in_place = binary_apply_in_place(a, &b, &WrappingAddU8).unwrap();
         assert_eq!(allocated, in_place);
+    }
+
+    /// A trivial comparison functor: `a > b`, mapped to `1u8`/`0u8`. Stands
+    /// in for a comparison filter like `GreaterEqualImageFilter` to pin down
+    /// the comparison policy's fixed `u8` output in isolation from any real
+    /// filter's semantics.
+    struct GreaterThanU8;
+    macro_rules! impl_comparison_greater_than {
+        ($($t:ty),+) => {$(
+            impl ComparisonFunctor<$t> for GreaterThanU8 {
+                fn apply(&self, a: $t, b: $t) -> u8 { if a > b { 1 } else { 0 } }
+            }
+        )+};
+    }
+    impl_comparison_greater_than!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
+    #[test]
+    fn comparison_policy_produces_u8_output_regardless_of_input_type() {
+        // policy (comparison): input is i32, output is always u8, matching
+        // ITK's fixed `output_pixel_type: uint8_t` for GreaterEqual/LessEqual/
+        // NotEqual regardless of the (shared) input pixel type.
+        let a = Image::from_vec(&[2, 1], vec![5i32, 1]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![3i32, 9]).unwrap();
+        let out = comparison_apply(&a, &b, &GreaterThanU8).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt8);
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 0]);
+    }
+
+    #[test]
+    fn comparison_rejects_mismatched_shape() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = img_u8(&[3, 1], vec![1, 2, 3]);
+        assert!(matches!(
+            comparison_apply(&a, &b, &GreaterThanU8),
+            Err(crate::FilterError::SizeMismatch { .. })
+        ));
     }
 }
