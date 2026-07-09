@@ -2659,8 +2659,10 @@ impl ParametricTransform for ScaleTransform {
 /// `scale[d] * (p[d] − center[d])`, which is what this port computes: using
 /// ITK's literal formula would disagree with this port's own `transform_point`
 /// at any non-zero center, which the mandatory off-center finite-difference
-/// test below would catch. The bug only manifests when `center != 0`, which
-/// likely explains why it has gone unnoticed upstream.
+/// test below would catch. The bug only manifests when `center != 0`, and
+/// `itkScaleLogarithmicTransformTest` exercised no Jacobian at all, which
+/// explains why it went unnoticed upstream. Fixed upstream in
+/// <https://github.com/InsightSoftwareConsortium/ITK/pull/6569>.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScaleLogarithmicTransform {
     inner: ScaleTransform,
