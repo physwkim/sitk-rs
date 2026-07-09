@@ -45,6 +45,7 @@ pub mod region_growing;
 pub mod shrink;
 pub mod smoothing;
 pub mod threshold;
+pub mod watershed;
 
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
@@ -97,6 +98,7 @@ pub use threshold::{
     li_threshold, maximum_entropy_threshold, moments_threshold, renyi_entropy_threshold,
     shanbhag_threshold, threshold, yen_threshold,
 };
+pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //

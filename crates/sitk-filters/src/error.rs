@@ -149,6 +149,14 @@ pub enum FilterError {
         reason: &'static str,
     },
 
+    /// `MorphologicalWatershedImageFilter`'s `Level`, cast to the input pixel
+    /// type, was negative. A negative level would make the `HMinimaImageFilter`
+    /// marker (`input + level`) fall below its mask (`input`), which
+    /// `itkReconstructionImageFilter.hxx` rejects outright ("Marker pixels must
+    /// be <= mask pixels.").
+    #[error("watershed level must be >= 0, got {0}")]
+    InvalidWatershedLevel(f64),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
