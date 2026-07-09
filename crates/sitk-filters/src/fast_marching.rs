@@ -180,6 +180,11 @@ pub fn fast_marching(
     normalization_factor: f64,
     stopping_value: f64,
 ) -> Result<Image> {
+    // ITK checks this before it ever looks at the seeds, and a wrong-length
+    // seed is not an error it can express (its indices are dimension-typed),
+    // so the normalization factor takes precedence when both are invalid.
+    check_normalization_factor(normalization_factor)?;
+
     let size = speed.size();
     let dim = size.len();
     for point in trial_points {
@@ -253,16 +258,21 @@ pub(crate) struct MarchResult {
     pub(crate) processed: Vec<usize>,
 }
 
+/// itkFastMarchingImageFilter.hxx `GenerateData()`: "Normalization Factor is
+/// null or negative".
+fn check_normalization_factor(normalization_factor: f64) -> Result<()> {
+    if normalization_factor < ITK_MATH_EPS {
+        return Err(FilterError::InvalidNormalizationFactor(
+            normalization_factor,
+        ));
+    }
+    Ok(())
+}
+
 /// `FastMarchingImageFilter::GenerateData()` over flat `(index, value)` trial
 /// seeds. Seeds must already be inside the image.
 pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Result<MarchResult> {
-    // itkFastMarchingImageFilter.hxx GenerateData(): "Normalization Factor is
-    // null or negative".
-    if input.normalization_factor < ITK_MATH_EPS {
-        return Err(FilterError::InvalidNormalizationFactor(
-            input.normalization_factor,
-        ));
-    }
+    check_normalization_factor(input.normalization_factor)?;
 
     let large = if input.narrow_to_f32 {
         (f32::MAX / 2.0) as f64
@@ -674,6 +684,16 @@ mod tests {
                 expected: 2,
                 got: 3
             })
+        );
+    }
+
+    /// Both invalid: the normalization factor is checked first, as in ITK.
+    #[test]
+    fn the_normalization_factor_outranks_the_seed_length() {
+        let speed = speed_f64(&[3, 3], 1.0);
+        assert_eq!(
+            fast_marching(&speed, &[vec![1, 1, 1]], &[], 0.0, 1.0).err(),
+            Some(FilterError::InvalidNormalizationFactor(0.0))
         );
     }
 }
