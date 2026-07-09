@@ -55,6 +55,7 @@ pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
+pub mod fast_marching_upwind_gradient;
 mod fft;
 pub mod fft_correlation;
 pub mod functor;
@@ -127,6 +128,10 @@ pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
+pub use fast_marching_upwind_gradient::{
+    FastMarchingUpwindGradientResult, FastMarchingUpwindGradientSettings,
+    fast_marching_upwind_gradient,
+};
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
