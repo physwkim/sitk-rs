@@ -50,13 +50,14 @@ use crate::transform::{ParametricTransform, Transform};
 /// of an earlier (more-recently-added) sub-transform's parameters correctly
 /// propagates through every transform applied afterwards.
 ///
-/// [`ParametricTransform`] has no analytic spatial-Jacobian accessor, so that
-/// per-transform `dimension × dimension` matrix is obtained by central finite
-/// differences on `transform_point`. This is the one place this port deviates
-/// from ITK's analytic implementation; the Jacobian finite-difference test in
-/// this module cross-checks the whole assembly (including this piece) against
-/// `transform_point` directly, independent of how the spatial Jacobian itself
-/// is computed.
+/// That spatial Jacobian comes from [`Transform::jacobian_wrt_position`], which
+/// every matrix-offset, translation and scale transform answers in closed form
+/// (ITK's `ComputeJacobianWithRespectToPosition`); only [`BSplineTransform`] and
+/// [`DisplacementFieldTransform`] fall back to the trait's finite-difference
+/// default.
+///
+/// [`BSplineTransform`]: crate::BSplineTransform
+/// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
 ///
 /// A sub-transform with [`ParametricTransform::has_local_support`] (e.g. a
 /// dense displacement field) still composes *correctly* here — its own
@@ -102,28 +103,6 @@ impl CompositeTransform {
     }
 }
 
-/// Central-finite-difference spatial Jacobian `d(transform_point(x))/dx`,
-/// row-major `dim × dim`. [`ParametricTransform`] has no analytic accessor for
-/// this — see the struct docs for why that's an acceptable, tested,
-/// trade-off.
-fn spatial_jacobian(transform: &dyn ParametricTransform, point: &[f64]) -> Vec<f64> {
-    let dim = transform.dimension();
-    let h = 1e-6;
-    let mut jac = vec![0.0; dim * dim];
-    for j in 0..dim {
-        let mut p_plus = point.to_vec();
-        let mut p_minus = point.to_vec();
-        p_plus[j] += h;
-        p_minus[j] -= h;
-        let f_plus = transform.transform_point(&p_plus);
-        let f_minus = transform.transform_point(&p_minus);
-        for i in 0..dim {
-            jac[i * dim + j] = (f_plus[i] - f_minus[i]) / (2.0 * h);
-        }
-    }
-    jac
-}
-
 impl Transform for CompositeTransform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         let mut out = point.to_vec();
@@ -136,6 +115,45 @@ impl Transform for CompositeTransform {
     fn dimension(&self) -> usize {
         self.dimension
     }
+
+    /// The chain rule over the queue in application order (last-added first):
+    /// `dT/dx = J_{T₀} · … · J_{T_{N−1}}`, each evaluated at the point its own
+    /// sub-transform sees.
+    fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
+        let dim = self.dimension;
+        let mut acc = diagonal_ones(dim);
+        let mut current = point.to_vec();
+        for t in self.transforms.iter().rev() {
+            let spatial = t.jacobian_wrt_position(&current);
+            acc = mat_mul(&spatial, &acc, dim);
+            current = t.transform_point(&current);
+        }
+        acc
+    }
+}
+
+/// The row-major `n × n` identity.
+fn diagonal_ones(n: usize) -> Vec<f64> {
+    let mut m = vec![0.0; n * n];
+    for d in 0..n {
+        m[d * n + d] = 1.0;
+    }
+    m
+}
+
+/// Row-major `n × n` matrix product `a · b`.
+fn mat_mul(a: &[f64], b: &[f64], n: usize) -> Vec<f64> {
+    let mut out = vec![0.0; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            let mut sum = 0.0;
+            for k in 0..n {
+                sum += a[r * n + k] * b[k * n + c];
+            }
+            out[r * n + c] = sum;
+        }
+    }
+    out
 }
 
 impl ParametricTransform for CompositeTransform {
@@ -194,7 +212,7 @@ impl ParametricTransform for CompositeTransform {
                 // A perturbation of any earlier (already-inserted) block
                 // propagates through this transform too, so left-multiply
                 // those columns by this transform's spatial Jacobian.
-                let spatial = spatial_jacobian(transform.as_ref(), &transformed_point);
+                let spatial = transform.jacobian_wrt_position(&transformed_point);
                 for c in 0..offset_last {
                     let mut col = vec![0.0; dim];
                     for (r, slot) in col.iter_mut().enumerate() {
@@ -328,6 +346,46 @@ mod tests {
                     (fd - jac[i * n + k]).abs() < 1e-4,
                     "param {k} dim {i}: fd {fd} vs analytic {}",
                     jac[i * n + k]
+                );
+            }
+        }
+    }
+
+    /// The composite's own `jacobian_wrt_position` is a product of its
+    /// sub-transforms' spatial Jacobians; check it against a finite difference
+    /// of the assembled `transform_point`.
+    #[test]
+    fn position_jacobian_matches_finite_difference() {
+        let mut c = CompositeTransform::new(2);
+        c.add_transform(Box::new(TranslationTransform::new(vec![0.3, -0.8])));
+        c.add_transform(Box::new(Euler2DTransform::new(
+            0.37,
+            [0.5, -0.4],
+            [0.4, 0.9],
+        )));
+        c.add_transform(Box::new(ScaleTransform::new(
+            vec![1.3, 0.7],
+            vec![0.4, 0.9],
+        )));
+
+        let point = [1.7f64, -0.6];
+        let analytic = c.jacobian_wrt_position(&point);
+
+        let dim = 2;
+        for col in 0..dim {
+            let h = 1e-6 * point[col].abs().max(1.0);
+            let mut plus = point.to_vec();
+            let mut minus = point.to_vec();
+            plus[col] += h;
+            minus[col] -= h;
+            let f_plus = c.transform_point(&plus);
+            let f_minus = c.transform_point(&minus);
+            for row in 0..dim {
+                let fd = (f_plus[row] - f_minus[row]) / (2.0 * h);
+                let a = analytic[row * dim + col];
+                assert!(
+                    (a - fd).abs() < 1e-6,
+                    "entry ({row},{col}): analytic {a} vs finite difference {fd}"
                 );
             }
         }

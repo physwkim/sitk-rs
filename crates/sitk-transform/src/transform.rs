@@ -12,6 +12,64 @@ pub trait Transform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64>;
     /// Spatial dimension the transform operates on.
     fn dimension(&self) -> usize;
+
+    /// Jacobian `∂(transform_point(point))ᵢ / ∂pointⱼ`, row-major
+    /// `dimension × dimension` — ITK's
+    /// `Transform::ComputeJacobianWithRespectToPosition`. This is what
+    /// [`CompositeTransform`] chain-rules through when it assembles the
+    /// parameter Jacobian of a stack.
+    ///
+    /// The default is a central finite difference of [`transform_point`], exact
+    /// only to `O(h²)`. Every transform whose spatial derivative is known in
+    /// closed form overrides it: a matrix-offset transform returns its matrix,
+    /// a translation the identity, a scale its diagonal. The default stands for
+    /// [`BSplineTransform`] and [`DisplacementFieldTransform`], whose spatial
+    /// derivative is a B-spline / field derivative this crate does not yet
+    /// expose.
+    ///
+    /// [`transform_point`]: Transform::transform_point
+    /// [`CompositeTransform`]: crate::CompositeTransform
+    /// [`BSplineTransform`]: crate::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
+        let dim = self.dimension();
+        let mut jac = vec![0.0; dim * dim];
+        for (c, &pc) in point.iter().enumerate().take(dim) {
+            // Scale the step to the coordinate so a far-from-origin point does
+            // not lose the perturbation to f64 cancellation.
+            let h = 1e-6 * pc.abs().max(1.0);
+            let mut plus = point.to_vec();
+            let mut minus = point.to_vec();
+            plus[c] += h;
+            minus[c] -= h;
+            let f_plus = self.transform_point(&plus);
+            let f_minus = self.transform_point(&minus);
+            for r in 0..dim {
+                jac[r * dim + c] = (f_plus[r] - f_minus[r]) / (2.0 * h);
+            }
+        }
+        jac
+    }
+}
+
+/// The row-major `n × n` matrix with `v` on its diagonal.
+fn diagonal(v: &[f64]) -> Vec<f64> {
+    let n = v.len();
+    let mut m = vec![0.0; n * n];
+    for (d, &vd) in v.iter().enumerate() {
+        m[d * n + d] = vd;
+    }
+    m
+}
+
+/// `dT/dx` of a matrix-offset transform `T(x) = M·x + offset` is exactly `M`
+/// (`itk::MatrixOffsetTransformBase::ComputeJacobianWithRespectToPosition`).
+macro_rules! matrix_jacobian_wrt_position {
+    () => {
+        fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
+            self.matrix.clone()
+        }
+    };
 }
 
 /// A transform whose action is controlled by a flat parameter vector, and which
@@ -120,6 +178,16 @@ impl TranslationTransform {
 }
 
 impl Transform for TranslationTransform {
+    /// `T(x) = x + t`, so `dT/dx` is the identity.
+    fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
+        let dim = self.translation.len();
+        let mut jac = vec![0.0; dim * dim];
+        for d in 0..dim {
+            jac[d * dim + d] = 1.0;
+        }
+        jac
+    }
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), self.translation.len());
         point
@@ -238,6 +306,8 @@ impl AffineTransform {
 }
 
 impl Transform for AffineTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), self.dim);
         let ax = matrix::mat_vec(&self.matrix, point, self.dim);
@@ -375,6 +445,8 @@ impl Euler2DTransform {
 }
 
 impl Transform for Euler2DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 2);
         let mx = matrix::mat_vec(&self.matrix, point, 2);
@@ -516,6 +588,8 @@ impl Similarity2DTransform {
 }
 
 impl Transform for Similarity2DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 2);
         let mx = matrix::mat_vec(&self.matrix, point, 2);
@@ -719,6 +793,8 @@ impl Euler3DTransform {
 }
 
 impl Transform for Euler3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -956,6 +1032,8 @@ impl VersorRigid3DTransform {
 }
 
 impl Transform for VersorRigid3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -1195,6 +1273,8 @@ impl Similarity3DTransform {
 }
 
 impl Transform for Similarity3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -1471,6 +1551,8 @@ impl ScaleVersor3DTransform {
 }
 
 impl Transform for ScaleVersor3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -1769,6 +1851,8 @@ impl ScaleSkewVersor3DTransform {
 }
 
 impl Transform for ScaleSkewVersor3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -2082,6 +2166,8 @@ impl ComposeScaleSkewVersor3DTransform {
 }
 
 impl Transform for ComposeScaleSkewVersor3DTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -2359,6 +2445,8 @@ impl VersorTransform {
 }
 
 impl Transform for VersorTransform {
+    matrix_jacobian_wrt_position!();
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
         let mx = matrix::mat_vec(&self.matrix, point, 3);
@@ -2483,6 +2571,12 @@ impl ScaleTransform {
 }
 
 impl Transform for ScaleTransform {
+    /// `T(x)ᵢ = (xᵢ − cᵢ)·sᵢ + cᵢ`, so `dT/dx = diag(s)`
+    /// (`itk::ScaleTransform::ComputeJacobianWithRespectToPosition`).
+    fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
+        diagonal(&self.scale)
+    }
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), self.dim);
         (0..self.dim)
@@ -2581,6 +2675,12 @@ impl ScaleLogarithmicTransform {
 }
 
 impl Transform for ScaleLogarithmicTransform {
+    /// Identical to [`ScaleTransform`]: the logarithmic parameterization changes
+    /// the parameter Jacobian, not the spatial one.
+    fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
+        self.inner.jacobian_wrt_position(point)
+    }
+
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         self.inner.transform_point(point)
     }
@@ -3785,5 +3885,136 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Central finite difference of `transform_point` — the same formula the
+    /// `Transform::jacobian_wrt_position` default uses, recomputed here so the
+    /// analytic overrides are checked against the thing they replace rather
+    /// than against themselves.
+    fn fd_position_jacobian(t: &dyn Transform, point: &[f64]) -> Vec<f64> {
+        let dim = t.dimension();
+        let mut jac = vec![0.0; dim * dim];
+        for (c, &pc) in point.iter().enumerate().take(dim) {
+            let h = 1e-6 * pc.abs().max(1.0);
+            let mut plus = point.to_vec();
+            let mut minus = point.to_vec();
+            plus[c] += h;
+            minus[c] -= h;
+            let f_plus = t.transform_point(&plus);
+            let f_minus = t.transform_point(&minus);
+            for r in 0..dim {
+                jac[r * dim + c] = (f_plus[r] - f_minus[r]) / (2.0 * h);
+            }
+        }
+        jac
+    }
+
+    fn assert_position_jacobian_matches_fd(t: &dyn Transform, point: &[f64], label: &str) {
+        let analytic = t.jacobian_wrt_position(point);
+        let fd = fd_position_jacobian(t, point);
+        assert_eq!(analytic.len(), fd.len(), "{label}: jacobian length");
+        for (k, (&a, &f)) in analytic.iter().zip(fd.iter()).enumerate() {
+            assert!(
+                (a - f).abs() < 1e-5,
+                "{label}: entry {k}: analytic {a} vs finite difference {f}"
+            );
+        }
+    }
+
+    /// Every transform that overrides `jacobian_wrt_position` analytically must
+    /// agree with the finite-difference default it replaces. Evaluated at an
+    /// off-center, off-lattice point so a dropped center term or a transposed
+    /// matrix cannot pass.
+    #[test]
+    fn analytic_position_jacobians_match_finite_difference() {
+        let p2 = [1.7f64, -0.6];
+        let p3 = [1.7f64, -0.6, 2.3];
+        let c2 = [0.4f64, 0.9];
+        let c3 = [0.4f64, 0.9, -1.1];
+
+        assert_position_jacobian_matches_fd(
+            &TranslationTransform::new(vec![0.3, -0.8]),
+            &p2,
+            "translation",
+        );
+        assert_position_jacobian_matches_fd(
+            &AffineTransform::new(2, vec![1.1, 0.2, -0.3, 0.9], vec![0.5, -0.4], c2.to_vec()),
+            &p2,
+            "affine",
+        );
+        assert_position_jacobian_matches_fd(
+            &Euler2DTransform::new(0.37, [0.5, -0.4], c2),
+            &p2,
+            "euler2d",
+        );
+        assert_position_jacobian_matches_fd(
+            &Similarity2DTransform::new(1.3, 0.37, [0.5, -0.4], c2),
+            &p2,
+            "similarity2d",
+        );
+        assert_position_jacobian_matches_fd(
+            &Euler3DTransform::new(0.2, -0.35, 0.44, [0.5, -0.4, 0.7], c3),
+            &p3,
+            "euler3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &VersorRigid3DTransform::new(0.1, -0.2, 0.15, [0.5, -0.4, 0.7], c3),
+            &p3,
+            "versorrigid3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &Similarity3DTransform::new(1.2, 0.1, -0.2, 0.15, [0.5, -0.4, 0.7], c3),
+            &p3,
+            "similarity3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &VersorTransform::new(0.1, -0.2, 0.15, c3),
+            &p3,
+            "versor",
+        );
+        // The three additive-matrix versors (M = R + diag(scale − 1) [+ skew])
+        // and the multiplicative compose variant: `matrix()` is still exactly
+        // dT/dx because transform_point is M·x + offset for all of them.
+        assert_position_jacobian_matches_fd(
+            &ScaleVersor3DTransform::new([1.2, 0.8, 1.05], 0.1, -0.2, 0.15, [0.5, -0.4, 0.7], c3),
+            &p3,
+            "scaleversor3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &ScaleSkewVersor3DTransform::new(
+                [1.2, 0.8, 1.05],
+                [0.03, -0.02, 0.04, 0.01, -0.05, 0.02],
+                0.1,
+                -0.2,
+                0.15,
+                [0.5, -0.4, 0.7],
+                c3,
+            ),
+            &p3,
+            "scaleskewversor3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &ComposeScaleSkewVersor3DTransform::new(
+                [1.2, 0.8, 1.05],
+                [0.03, -0.02, 0.04],
+                0.1,
+                -0.2,
+                0.15,
+                [0.5, -0.4, 0.7],
+                c3,
+            ),
+            &p3,
+            "composescaleskewversor3d",
+        );
+        assert_position_jacobian_matches_fd(
+            &ScaleTransform::new(vec![1.3, 0.7, 2.1], c3.to_vec()),
+            &p3,
+            "scale",
+        );
+        assert_position_jacobian_matches_fd(
+            &ScaleLogarithmicTransform::new(vec![1.3, 0.7, 2.1], c3.to_vec()),
+            &p3,
+            "scale_logarithmic",
+        );
     }
 }
