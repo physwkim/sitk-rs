@@ -49,6 +49,7 @@ pub mod grid_utility;
 mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
+pub mod kmeans;
 pub mod label;
 pub mod label_fusion;
 pub mod label_shape;
@@ -72,6 +73,7 @@ pub mod slic;
 pub mod slice;
 pub mod smoothing;
 pub mod threshold;
+pub mod threshold_maximum_connected_components;
 pub mod watershed;
 
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
@@ -114,6 +116,7 @@ pub use intensity::{
     normalize, otsu_multiple_thresholds, otsu_threshold, sigmoid, sigmoid_in_place,
     triangle_threshold,
 };
+pub use kmeans::{KmeansResult, scalar_image_kmeans};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use label_shape::{
     BoundingBox, LabelShapeStatisticsSettings, OrientedBoundingBox, ShapeStatistics,
@@ -172,6 +175,9 @@ pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
     li_threshold, maximum_entropy_threshold, moments_threshold, renyi_entropy_threshold,
     shanbhag_threshold, threshold, yen_threshold,
+};
+pub use threshold_maximum_connected_components::{
+    ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 
