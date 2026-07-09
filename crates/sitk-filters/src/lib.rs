@@ -198,8 +198,8 @@ pub use overlap::{
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
 };
 pub use projection::{
-    binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
-    standard_deviation_projection, sum_projection,
+    binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
+    median_projection, minimum_projection, standard_deviation_projection, sum_projection,
 };
 pub use rank::fast_approximate_rank;
 pub use reconstruction::{
