@@ -97,7 +97,7 @@ pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
 pub use binary_morphology::{
-    binary_fillhole, binary_grind_peak, binary_thinning, voting_binary,
+    binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
