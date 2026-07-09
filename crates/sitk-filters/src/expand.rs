@@ -174,7 +174,7 @@ pub fn expand(img: &Image, factors: &[usize], interpolator: Interpolator) -> Res
         *o += acc;
     }
 
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(out.size(), img.size());
         assert_eq!(out.spacing(), img.spacing());
         assert_eq!(out.origin(), img.origin());
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -225,7 +225,7 @@ mod tests {
         let img = Image::from_vec(&[2], vec![10.0, 20.0]).unwrap();
         let out = expand(&img, &[2], Interpolator::Linear).unwrap();
         assert_eq!(out.size(), &[4]);
-        let got = out.to_f64_vec();
+        let got = out.to_f64_vec().unwrap();
         let expected = [10.0, 12.5, 17.5, 20.0];
         for (g, e) in got.iter().zip(&expected) {
             assert!((g - e).abs() < 1e-12, "{got:?} vs {expected:?}");
@@ -264,7 +264,7 @@ mod tests {
         // nearest neighbor never interpolates between them.
         let img = Image::from_vec(&[3], vec![1.0, 2.0, 3.0]).unwrap();
         let out = expand(&img, &[4], Interpolator::NearestNeighbor).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!([1.0, 2.0, 3.0].contains(&v), "unexpected blended value {v}");
         }
     }

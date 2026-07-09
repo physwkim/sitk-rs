@@ -115,7 +115,7 @@ pub fn adaptive_histogram_equalization(
         });
     }
 
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let (mut input_minimum, mut input_maximum) = (f64::INFINITY, f64::NEG_INFINITY);
     for &v in &vals {
         input_minimum = input_minimum.min(v);
@@ -196,7 +196,7 @@ mod tests {
         for (alpha, beta) in [(0.3, 0.3), (0.0, 0.0), (1.0, 1.0), (1.0, 0.0)] {
             let out = adaptive_histogram_equalization(&img, &[1, 1], alpha, beta).unwrap();
             assert!(
-                out.to_f64_vec().iter().all(|v| v.is_nan()),
+                out.to_f64_vec().unwrap().iter().all(|v| v.is_nan()),
                 "alpha={alpha} beta={beta} did not produce all-NaN output"
             );
         }
@@ -209,7 +209,7 @@ mod tests {
         let data: Vec<f64> = (0..64).map(|v| ((v * 37) % 97) as f64).collect();
         let img = Image::from_vec(&[8, 8], data.clone()).unwrap();
         let out = adaptive_histogram_equalization(&img, &[5, 5], 1.0, 1.0).unwrap();
-        let got = out.to_f64_vec();
+        let got = out.to_f64_vec().unwrap();
         for (g, e) in got.iter().zip(&data) {
             assert!((g - e).abs() < 1e-9, "{got:?} vs {data:?}");
         }
@@ -226,8 +226,8 @@ mod tests {
         let img = Image::from_vec(&[4, 4], data).unwrap();
         let covering = adaptive_histogram_equalization(&img, &[3, 3], 0.3, 0.3).unwrap();
         let larger = adaptive_histogram_equalization(&img, &[8, 8], 0.3, 0.3).unwrap();
-        let a = covering.to_f64_vec();
-        let b = larger.to_f64_vec();
+        let a = covering.to_f64_vec().unwrap();
+        let b = larger.to_f64_vec().unwrap();
         for (x, y) in a.iter().zip(&b) {
             assert!((x - y).abs() < 1e-12, "{a:?} vs {b:?}");
         }

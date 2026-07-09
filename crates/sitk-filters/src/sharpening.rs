@@ -11,7 +11,7 @@ use sitk_core::{Image, PixelId};
 /// internal (smoothed/second-derivative) computation stays full-precision
 /// instead of narrowing to `img`'s own pixel type midway through.
 fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
     Ok(scratch)
 }
@@ -110,8 +110,8 @@ pub fn unsharp_mask(
     }
 
     let scratch = scratch_f64(img)?;
-    let blurred = recursive_gaussian(&scratch, sigmas)?.to_f64_vec();
-    let original = img.to_f64_vec();
+    let blurred = recursive_gaussian(&scratch, sigmas)?.to_f64_vec()?;
+    let original = img.to_f64_vec()?;
     let target = img.pixel_id();
 
     let out: Vec<f64> = original
@@ -183,7 +183,7 @@ pub fn unsharp_mask(
 /// `Image::new`/`from_vec` default every axis to spacing `1.0`, so no
 /// `Image` value this crate can construct ever has zero spacing.
 pub fn laplacian_sharpening(img: &Image, use_image_spacing: bool) -> Result<Image> {
-    let original = img.to_f64_vec();
+    let original = img.to_f64_vec()?;
     let n = original.len();
     if n == 0 {
         return Err(FilterError::DegenerateRange);
@@ -200,7 +200,7 @@ pub fn laplacian_sharpening(img: &Image, use_image_spacing: bool) -> Result<Imag
     let input_scale = input_max - input_min;
 
     let scratch = scratch_f64(img)?;
-    let filtered = crate::laplacian(&scratch, use_image_spacing)?.to_f64_vec();
+    let filtered = crate::laplacian(&scratch, use_image_spacing)?.to_f64_vec()?;
 
     let (mut filtered_min, mut filtered_max) = (f64::INFINITY, f64::NEG_INFINITY);
     for &v in &filtered {
@@ -249,7 +249,7 @@ mod tests {
         let data: Vec<f64> = vec![0.0, 0.0, 0.0, 0.0, 100.0, 100.0, 100.0, 100.0];
         let img = Image::from_vec(&[8], data.clone()).unwrap();
         let out = unsharp_mask(&img, &[1.0], 0.0, 0.0, false).unwrap();
-        assert_eq!(out.to_f64_vec(), data);
+        assert_eq!(out.to_f64_vec().unwrap(), data);
     }
 
     #[test]
@@ -262,7 +262,8 @@ mod tests {
         let img = Image::from_vec(&[8], data).unwrap();
         let out = unsharp_mask(&img, &[1.0], 1.0e6, 0.0, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out[3], 0.0, "pre-edge pixel should saturate low: {out:?}");
         assert_eq!(
             out[4], 255.0,
@@ -276,10 +277,12 @@ mod tests {
         let img = Image::from_vec(&[8], data).unwrap();
         let clamped = unsharp_mask(&img, &[1.0], 1.0e6, 0.0, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let wrapped = unsharp_mask(&img, &[1.0], 1.0e6, 0.0, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         // Whatever the exact wrapped values are, they must not equal the
         // saturated 0/255 boundary that `clamp` produces for the same input
         // (a value that overflows u8 essentially never wraps back to
@@ -333,7 +336,7 @@ mod tests {
         // degenerate case the module doc's NaN-avoidance guard targets.
         let img = Image::from_vec(&[6, 6], vec![7.0f64; 36]).unwrap();
         let out = laplacian_sharpening(&img, true).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 7.0).abs() < 1e-9, "expected 7.0, got {v}");
         }
     }
@@ -346,7 +349,7 @@ mod tests {
         let data: Vec<f64> = (0..64).map(|v| ((v * 37) % 97) as f64).collect();
         let img = Image::from_vec(&[8, 8], data).unwrap();
         let out = laplacian_sharpening(&img, true).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((0.0..=96.0).contains(&v), "{v} outside input range");
         }
     }
@@ -357,9 +360,15 @@ mod tests {
         // so anisotropic spacing must not affect the result at all.
         let data: Vec<f64> = (0..64).map(|v| ((v * 37) % 97) as f64).collect();
         let mut img = Image::from_vec(&[8, 8], data.clone()).unwrap();
-        let isotropic = laplacian_sharpening(&img, false).unwrap().to_f64_vec();
+        let isotropic = laplacian_sharpening(&img, false)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         img.set_spacing(&[1.0, 3.0]).unwrap();
-        let anisotropic = laplacian_sharpening(&img, false).unwrap().to_f64_vec();
+        let anisotropic = laplacian_sharpening(&img, false)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(isotropic, anisotropic);
     }
 

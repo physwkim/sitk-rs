@@ -150,7 +150,7 @@ fn project(
     let in_spacing = img.spacing();
     let in_origin = img.origin();
 
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let out_vals = project_lines(&in_vals, in_size, axis, &reduce);
 
     let mut out_size = in_size.to_vec();
@@ -476,15 +476,15 @@ mod tests {
         for f in [mean_projection, sum_projection] {
             let out = f(&img, 1).unwrap();
             assert_eq!(out.size(), img.size());
-            assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+            assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
         }
         let out = median_projection(&img, 1).unwrap();
         assert_eq!(out.size(), img.size());
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
         let out = maximum_projection(&img, 1).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
         let out = minimum_projection(&img, 1).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     // ---- binary_projection ----

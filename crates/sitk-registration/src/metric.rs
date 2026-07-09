@@ -137,10 +137,13 @@ pub struct FixedSamples {
 impl FixedSamples {
     /// Reduce a fixed image to its full sample set (sampling strategy = None:
     /// every pixel, matching SimpleITK's default).
-    pub fn from_image(fixed: &Image) -> Self {
+    ///
+    /// Fails on a vector `fixed` image, like every scalar consumer of
+    /// [`sitk_core::Image::to_f64_vec`].
+    pub fn from_image(fixed: &Image) -> Result<Self> {
         let dim = fixed.dimension();
         let size = fixed.size().to_vec();
-        let values = fixed.to_f64_vec();
+        let values = fixed.to_f64_vec()?;
         let n = values.len();
 
         // point = origin + (D · diag(spacing)) · index
@@ -165,12 +168,12 @@ impl FixedSamples {
             .copied()
             .fold(f64::INFINITY, f64::min);
 
-        Self {
+        Ok(Self {
             dim,
             values,
             points,
             min_spacing,
-        }
+        })
     }
 
     /// Reduce a fixed image to its sample set under an explicit sampling
@@ -204,7 +207,7 @@ impl FixedSamples {
     ) -> Result<Self> {
         let dim = fixed.dimension();
         let size = fixed.size().to_vec();
-        let values_all = fixed.to_f64_vec();
+        let values_all = fixed.to_f64_vec()?;
         let n = values_all.len();
 
         let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
@@ -219,7 +222,7 @@ impl FixedSamples {
                         image: fixed.size().to_vec(),
                     });
                 }
-                Some(m.to_f64_vec())
+                Some(m.to_f64_vec()?)
             }
             None => None,
         };
@@ -361,7 +364,7 @@ impl MovingImage {
         let phys_to_index = physical_to_index_matrix(moving.direction(), moving.spacing(), dim)
             .ok_or(RegistrationError::SingularDirection)?;
         let strides_v = strides(&size);
-        let buf = moving.to_f64_vec();
+        let buf = moving.to_f64_vec()?;
         let bspline_coeffs = matches!(interpolator, Interpolator::BSpline)
             .then(|| bspline_coefficients(&buf, &size, &strides_v));
         Ok(Self {
@@ -391,7 +394,7 @@ impl MovingImage {
                 image: self.size.clone(),
             });
         }
-        self.mask = Some(mask.to_f64_vec().iter().map(|&v| v != 0.0).collect());
+        self.mask = Some(mask.to_f64_vec()?.iter().map(|&v| v != 0.0).collect());
         Ok(self)
     }
 
@@ -789,7 +792,7 @@ impl MeanSquaresMetric {
             });
         }
         Ok(Self {
-            fixed: FixedSamples::from_image(fixed),
+            fixed: FixedSamples::from_image(fixed)?,
             moving: MovingImage::from_image(moving)?,
         })
     }
@@ -1030,7 +1033,7 @@ mod tests {
         let t = TranslationTransform::new(vec![0.0, 0.0]);
 
         let unmasked = MeanSquaresMetric::from_samples(
-            FixedSamples::from_image(&img),
+            FixedSamples::from_image(&img).unwrap(),
             MovingImage::from_image(&img).unwrap(),
         )
         .unwrap();
@@ -1050,7 +1053,8 @@ mod tests {
             .with_moving_mask(&mask)
             .unwrap();
         let masked =
-            MeanSquaresMetric::from_samples(FixedSamples::from_image(&img), masked_moving).unwrap();
+            MeanSquaresMetric::from_samples(FixedSamples::from_image(&img).unwrap(), masked_moving)
+                .unwrap();
         let after = masked.evaluate(&t, &CpuBackend).valid_points;
         assert!(
             after < before,
@@ -1122,7 +1126,7 @@ mod tests {
 
         let fixed = ramp(16, 16, 3.0, 5.0);
         let moving = ramp(16, 16, 3.0, 5.0);
-        let fixed_samples = FixedSamples::from_image(&fixed);
+        let fixed_samples = FixedSamples::from_image(&fixed).unwrap();
         let moving_image = MovingImage::from_image(&moving).unwrap();
 
         let mut t = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
@@ -1152,7 +1156,7 @@ mod tests {
         use sitk_transform::DisplacementFieldTransform;
 
         let img = ramp(8, 8, 3.0, 5.0);
-        let fixed_samples = FixedSamples::from_image(&img);
+        let fixed_samples = FixedSamples::from_image(&img).unwrap();
         let moving_image = MovingImage::from_image(&img).unwrap();
 
         let mut t = DisplacementFieldTransform::from_image_domain(&img).unwrap();

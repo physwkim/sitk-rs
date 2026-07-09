@@ -79,7 +79,7 @@ pub fn anti_alias_binary(
     if image.pixel_id().is_floating_point() {
         return Err(FilterError::RequiresIntegerPixelType(image.pixel_id()));
     }
-    let input = image.to_f64_vec();
+    let input = image.to_f64_vec()?;
     let dim = image.dimension();
 
     // `MinimumMaximumImageCalculator` over the input, then
@@ -156,8 +156,9 @@ mod tests {
     fn assert_sides_preserved(input: &Image, output: &Image, iso: f64) {
         for (i, (&b, &u)) in input
             .to_f64_vec()
+            .unwrap()
             .iter()
-            .zip(&output.to_f64_vec())
+            .zip(&output.to_f64_vec().unwrap())
             .enumerate()
         {
             if b - iso > 0.0 {
@@ -189,12 +190,12 @@ mod tests {
     fn the_constraint_pins_a_staircase_corner_at_zero() {
         let input = diamond(8);
         let result = anti_alias_binary(&input, 0.0, 200).unwrap();
-        let out = result.image.to_f64_vec();
+        let out = result.image.to_f64_vec().unwrap();
 
         // (12, 4) is the diamond's top vertex, a single inside pixel with three
         // outside face neighbors: curvature flow pulls it hard outward.
         let vertex = 12 + N * 4;
-        assert_eq!(input.to_f64_vec()[vertex], 1.0);
+        assert_eq!(input.to_f64_vec().unwrap()[vertex], 1.0);
         assert!(
             out[vertex] >= 0.0,
             "the vertex escaped its side: {}",
@@ -202,7 +203,7 @@ mod tests {
         );
         // Its outside neighbor directly above is pinned on the other side.
         let above = 12 + N * 3;
-        assert_eq!(input.to_f64_vec()[above], 0.0);
+        assert_eq!(input.to_f64_vec().unwrap()[above], 0.0);
         assert!(out[above] <= 0.0, "the neighbor escaped: {}", out[above]);
     }
 
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn the_vertex_relaxes_further_than_the_face() {
         let result = anti_alias_binary(&diamond(8), 0.0, 200).unwrap();
-        let out = result.image.to_f64_vec();
+        let out = result.image.to_f64_vec().unwrap();
         let vertex = 12 + N * 4; // on the interface, at the tip
         let face = 8 + N * 8; // on the interface, mid-face
         assert!(
@@ -240,7 +241,7 @@ mod tests {
         // `InitializeActiveLayerValues` clamps the active layer into
         // `[-g/2, g/2]` with `g == 1`; the layers step by `g` from there, and
         // `PostProcessOutput` flattens the rest to `(2 + 1) * 1`.
-        let out = result.image.to_f64_vec();
+        let out = result.image.to_f64_vec().unwrap();
         assert_eq!(out[0], -3.0);
         assert_eq!(out[12 + N * 12], 3.0); // deep inside
         assert!(out.iter().all(|&v| (-3.0..=3.0).contains(&v)));
@@ -291,7 +292,7 @@ mod tests {
         for fill in [0u8, 1, 255] {
             let image = Image::from_vec(&[8, 8], vec![fill; 64]).unwrap();
             let result = anti_alias_binary(&image, 0.07, 1000).unwrap();
-            assert_eq!(result.image.to_f64_vec(), vec![-3.0; 64]);
+            assert_eq!(result.image.to_f64_vec().unwrap(), vec![-3.0; 64]);
             // One no-op iteration: the active layer is empty, so `counter == 0`
             // and the RMS change is zero, which trips `Halt` on the next pass.
             assert_eq!(result.elapsed_iterations, 1);
@@ -355,7 +356,7 @@ mod tests {
 
         assert_eq!(b.image.spacing(), &[3.0, 0.5]);
         assert_eq!(b.image.origin(), &[-2.0, 5.0]);
-        assert_eq!(a.image.to_f64_vec(), b.image.to_f64_vec());
+        assert_eq!(a.image.to_f64_vec().unwrap(), b.image.to_f64_vec().unwrap());
         assert_eq!(a.elapsed_iterations, b.elapsed_iterations);
     }
 
@@ -386,7 +387,8 @@ mod tests {
         let out = anti_alias_binary(&ball, 0.07, 5)
             .unwrap()
             .image
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         assert_eq!(out[0], -4.0);
         assert!(out.iter().all(|&v| (-4.0..=4.0).contains(&v)));

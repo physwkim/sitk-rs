@@ -187,7 +187,7 @@ impl ResampleImageFilter {
             .ok_or(TransformError::SingularDirection)?;
         let in_origin = input.origin().to_vec();
 
-        let in_buf = input.to_f64_vec();
+        let in_buf = input.to_f64_vec()?;
         let in_size = input.size().to_vec();
         let in_strides = strides(&in_size);
         // Coefficient decomposition is global (mixes the whole line via the

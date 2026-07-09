@@ -219,7 +219,7 @@ pub fn fast_marching(
         MarchInput {
             size,
             spacing: speed.spacing(),
-            speed: &speed.to_f64_vec(),
+            speed: &speed.to_f64_vec()?,
             narrow_to_f32: out_id == PixelId::Float32,
             normalization_factor,
             stopping_value,
@@ -490,6 +490,7 @@ mod tests {
         fast_marching(speed, seeds, &[], 1.0, f64::MAX / 2.0)
             .unwrap()
             .to_f64_vec()
+            .unwrap()
     }
 
     fn assert_close(actual: &[f64], expected: &[f64]) {
@@ -525,13 +526,15 @@ mod tests {
         // speed 2 / F 2 == speed 1 / F 1, pixel for pixel.
         let scaled = fast_marching(&speed_f64(&[3, 3], 2.0), &[vec![1, 1]], &[], 2.0, f64::MAX)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&scaled, &march(&speed_f64(&[3, 3], 1.0), &[vec![1, 1]]));
 
         // ...and F 4 on speed 2 halves the speed, doubling every arrival time.
         let halved = fast_marching(&speed_f64(&[3, 3], 2.0), &[vec![1, 1]], &[], 4.0, f64::MAX)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(
             &halved,
             &[
@@ -566,7 +569,8 @@ mod tests {
             f64::MAX / 2.0,
         )
         .unwrap()
-        .to_f64_vec();
+        .to_f64_vec()
+        .unwrap();
         assert_close(&out, &[0.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0]);
     }
 
@@ -579,7 +583,8 @@ mod tests {
         let large = large_value(speed.pixel_id());
         let out = fast_marching(&speed, &[vec![2, 2]], &[], 1.0, 1.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let at = |x: usize, y: usize| out[x + 5 * y];
 
         assert_eq!(at(2, 2), 0.0);

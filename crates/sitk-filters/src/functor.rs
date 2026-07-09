@@ -262,7 +262,7 @@ pub(crate) fn unary_pixel_apply_in_place<F: AllScalarsUnaryPixelFunctor>(
 /// Apply a [`UnaryFunctor`] over `img`, allocating a new [`Image`] of the
 /// same pixel type.
 pub(crate) fn unary_apply<F: UnaryFunctor>(img: &Image, f: &F) -> Result<Image> {
-    let vals: Vec<f64> = img.to_f64_vec().iter().map(|&v| f.apply(v)).collect();
+    let vals: Vec<f64> = img.to_f64_vec()?.iter().map(|&v| f.apply(v)).collect();
     crate::image_from_f64(img.pixel_id(), img.size(), img, &vals)
 }
 

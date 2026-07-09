@@ -205,7 +205,7 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
     let xsize = size[0];
     let linecount = total / xsize;
 
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let is_fg: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
 
     // Pass 1: run-length encode every scanline; temporary labels are handed
@@ -345,7 +345,11 @@ fn pixel_id_max_label(id: PixelId) -> u64 {
 /// value. Objects with fewer than `minimum_object_size` pixels are dropped
 /// to background; `minimum_object_size == 0` means no minimum.
 pub fn relabel_component(img: &Image, minimum_object_size: u64) -> Result<Image> {
-    let labels: Vec<i64> = img.to_f64_vec().iter().map(|&v| v.round() as i64).collect();
+    let labels: Vec<i64> = img
+        .to_f64_vec()?
+        .iter()
+        .map(|&v| v.round() as i64)
+        .collect();
 
     // `std::map<LabelType, ...>` iterates in ascending-key order, so the
     // pre-sort vector ITK builds is already in ascending original-label
@@ -440,9 +444,9 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
     let size = img.size();
     let dim = size.len();
     let strides_ = strides(size);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let labels: Vec<i64> = label_img
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .map(|&v| v.round() as i64)
         .collect();

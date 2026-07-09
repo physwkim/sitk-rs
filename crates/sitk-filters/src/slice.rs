@@ -148,7 +148,7 @@ pub fn slice(img: &Image, start: &[i32], stop: &[i32], step: &[i32]) -> Result<I
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let mut out_vals = vec![0.0f64; out_count];
     for (o, slot) in out_vals.iter_mut().enumerate() {
         let mut in_flat = 0usize;
@@ -182,7 +182,7 @@ mod tests {
         let src = img(&[4, 3], (0..12).map(|v| v as f64).collect());
         let out = slice(&src, &[0, 0], &[i32::MAX, i32::MAX], &[1, 1]).unwrap();
         assert_eq!(out.size(), src.size());
-        assert_eq!(out.to_f64_vec(), src.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), src.to_f64_vec().unwrap());
         assert_eq!(out.origin(), src.origin());
         assert_eq!(out.spacing(), src.spacing());
         assert_eq!(out.direction(), src.direction());
@@ -222,7 +222,7 @@ mod tests {
     fn stop_clamped_to_size_includes_the_last_pixel() {
         let src = img(&[5, 1], (0..5).map(|v| v as f64).collect());
         let out = slice(&src, &[2, 0], &[i32::MAX, i32::MAX], &[1, 1]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![2.0, 3.0, 4.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![2.0, 3.0, 4.0]);
     }
 
     // ---- Python-slice-like sub-ranges, hand-derived ----
@@ -232,7 +232,7 @@ mod tests {
         // Python: list(range(10))[1:8:2] == [1, 3, 5, 7]
         let src = img(&[10, 1], (0..10).map(|v| v as f64).collect());
         let out = slice(&src, &[1, 0], &[8, i32::MAX], &[2, 1]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![1.0, 3.0, 5.0, 7.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 3.0, 5.0, 7.0]);
     }
 
     // ---- negative step reverses ----
@@ -242,7 +242,7 @@ mod tests {
         // Python: list(range(5))[4::-1] == [4, 3, 2, 1, 0]
         let src = img(&[5, 1], (0..5).map(|v| v as f64).collect());
         let out = slice(&src, &[4, 0], &[-1, i32::MAX], &[-1, 1]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![4.0, 3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![4.0, 3.0, 2.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -250,7 +250,7 @@ mod tests {
         // Python: list(range(10))[7:2:-2] == [7, 5, 3]
         let src = img(&[10, 1], (0..10).map(|v| v as f64).collect());
         let out = slice(&src, &[7, 0], &[2, i32::MAX], &[-2, 1]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![7.0, 5.0, 3.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![7.0, 5.0, 3.0]);
     }
 
     // ---- geometry: origin moves to the first sampled pixel ----
@@ -291,7 +291,7 @@ mod tests {
         src.set_spacing(&[1.5, 1.0]).unwrap();
         let out = slice(&src, &[0, 0], &[i32::MAX, i32::MAX], &[3, 1]).unwrap();
         assert_eq!(out.spacing()[0], 4.5);
-        assert_eq!(out.to_f64_vec(), vec![0.0, 3.0, 6.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![0.0, 3.0, 6.0]);
     }
 
     // ---- 2-D: only the sliced axis is affected ----
@@ -306,7 +306,10 @@ mod tests {
         ]);
         let out = slice(&src, &[0, 1], &[i32::MAX, i32::MAX], &[1, 1]).unwrap();
         assert_eq!(out.size(), &[3, 2]);
-        assert_eq!(out.to_f64_vec(), vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
     }
 
     #[test]

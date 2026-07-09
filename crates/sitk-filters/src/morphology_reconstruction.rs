@@ -232,9 +232,9 @@ fn seed_flat_index(seed: &[usize], size: &[usize]) -> Result<usize> {
 /// `PreserveIntensities`: `source`'s own value wherever `a == b`, `else_value`
 /// everywhere else.
 fn select_where_equal(a: &Image, b: &Image, source: &Image, else_value: f64) -> Result<Image> {
-    let a_vals = a.to_f64_vec();
-    let b_vals = b.to_f64_vec();
-    let source_vals = source.to_f64_vec();
+    let a_vals = a.to_f64_vec()?;
+    let b_vals = b.to_f64_vec()?;
+    let source_vals = source.to_f64_vec()?;
     let out: Vec<f64> = a_vals
         .iter()
         .zip(&b_vals)
@@ -297,7 +297,7 @@ pub fn grayscale_connected_opening(
 ) -> Result<Image> {
     let flat = seed_flat_index(seed, image.size())?;
     let (min_value, _) = crate::minimum_maximum(image)?;
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let seed_value = vals[flat];
     if seed_value == min_value {
         let out = vec![min_value; vals.len()];
@@ -319,7 +319,7 @@ pub fn grayscale_connected_closing(
 ) -> Result<Image> {
     let flat = seed_flat_index(seed, image.size())?;
     let (_, max_value) = crate::minimum_maximum(image)?;
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let seed_value = vals[flat];
     if seed_value == max_value {
         let out = vec![max_value; vals.len()];
@@ -453,8 +453,8 @@ pub fn binary_reconstruction_by_dilation(
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
     let out = reconstruct_by_dilation_components(
-        &marker_image.to_f64_vec(),
-        &mask_image.to_f64_vec(),
+        &marker_image.to_f64_vec()?,
+        &mask_image.to_f64_vec()?,
         mask_image.size(),
         foreground_value,
         background_value,
@@ -476,8 +476,8 @@ pub fn binary_reconstruction_by_erosion(
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
     let out = reconstruct_by_erosion_components(
-        &marker_image.to_f64_vec(),
-        &mask_image.to_f64_vec(),
+        &marker_image.to_f64_vec()?,
+        &mask_image.to_f64_vec()?,
         mask_image.size(),
         foreground_value,
         background_value,

@@ -2250,7 +2250,12 @@ mod tests {
         let bright = gaussian(w, h, 24.0 + tx, 24.0 + ty, sigma, amp);
         let moving = Image::from_vec(
             &[w, h],
-            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+            bright
+                .to_f64_vec()
+                .unwrap()
+                .iter()
+                .map(|v| amp - v)
+                .collect(),
         )
         .unwrap();
 
@@ -2295,7 +2300,12 @@ mod tests {
         let bright = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
         let moving = Image::from_vec(
             &[w, h],
-            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+            bright
+                .to_f64_vec()
+                .unwrap()
+                .iter()
+                .map(|v| amp - v)
+                .collect(),
         )
         .unwrap();
 
@@ -3109,7 +3119,12 @@ mod tests {
         let shifted = gaussian(w, h, 24.0 + tx, 24.0 + ty, 6.0, 1.0);
         let moving = Image::from_vec(
             &[w, h],
-            shifted.to_f64_vec().iter().map(|v| 2.1 * v + 0.4).collect(),
+            shifted
+                .to_f64_vec()
+                .unwrap()
+                .iter()
+                .map(|v| 2.1 * v + 0.4)
+                .collect(),
         )
         .unwrap();
         (fixed, moving, tx, ty)
@@ -3229,7 +3244,12 @@ mod tests {
         let bright = gaussian(w, h, 24.0 + tx, 24.0 + ty, sigma, amp);
         let moving = Image::from_vec(
             &[w, h],
-            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+            bright
+                .to_f64_vec()
+                .unwrap()
+                .iter()
+                .map(|v| amp - v)
+                .collect(),
         )
         .unwrap();
 

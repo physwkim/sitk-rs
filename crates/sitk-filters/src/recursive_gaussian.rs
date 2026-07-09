@@ -139,7 +139,7 @@ pub fn recursive_gaussian_with_order(
     let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
     let strides = strides(&size);
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
 
     for d in 0..dim {
         if sigma[d] <= 0.0 {
@@ -493,7 +493,7 @@ mod tests {
     fn zero_sigma_is_identity() {
         let img = Image::from_vec(&[6, 5], (0..30).map(|v| v as f64).collect()).unwrap();
         let out = recursive_gaussian(&img, &[0.0, 0.0]).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -502,7 +502,7 @@ mod tests {
         // keep a constant exactly.
         let img = Image::from_vec(&[10, 10], vec![5.0; 100]).unwrap();
         let out = recursive_gaussian(&img, &[2.0, 2.0]).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 5.0).abs() < 1e-10, "constant not preserved: {v}");
         }
     }
@@ -512,7 +512,7 @@ mod tests {
         // A single line stresses the boundary coefficients directly.
         let img = Image::from_vec(&[16, 1], vec![3.5; 16]).unwrap();
         let out = recursive_gaussian(&img, &[1.5, 0.0]).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 3.5).abs() < 1e-10, "1-D constant not preserved: {v}");
         }
     }
@@ -529,7 +529,10 @@ mod tests {
         let mut data = vec![0.0f64; n * n];
         data[c * n + c] = 100.0;
         let img = Image::from_vec(&[n, n], data).unwrap();
-        let v = recursive_gaussian(&img, &[2.0, 2.0]).unwrap().to_f64_vec();
+        let v = recursive_gaussian(&img, &[2.0, 2.0])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
 
         let total: f64 = v.iter().sum();
         assert!((total - 100.0).abs() < 1e-6, "mass not conserved: {total}");
@@ -565,7 +568,8 @@ mod tests {
         let sigma = 4.0;
         let out = recursive_gaussian(&img, &[sigma, 0.0])
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         // On this grid (edges at 25*sigma) the tails are fully contained, so the
         // DC gain (unit mass) shows to near machine precision.
@@ -598,10 +602,14 @@ mod tests {
         }
         let img = Image::from_vec(&[n, n], data).unwrap();
 
-        let rec = recursive_gaussian(&img, &[2.0, 2.0]).unwrap().to_f64_vec();
+        let rec = recursive_gaussian(&img, &[2.0, 2.0])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         let fir = crate::smooth_gaussian(&img, &[2.0, 2.0])
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         // Compare the interior (away from the borders) where both are accurate.
         let mut max_abs = 0.0f64;
@@ -626,10 +634,14 @@ mod tests {
         let mut coarse = Image::from_vec(&[n, n], data).unwrap();
         coarse.set_spacing(&[2.0, 2.0]).unwrap();
 
-        let peak_fine = recursive_gaussian(&fine, &[2.0, 2.0]).unwrap().to_f64_vec()[20 * n + 20];
+        let peak_fine = recursive_gaussian(&fine, &[2.0, 2.0])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()[20 * n + 20];
         let peak_coarse = recursive_gaussian(&coarse, &[2.0, 2.0])
             .unwrap()
-            .to_f64_vec()[20 * n + 20];
+            .to_f64_vec()
+            .unwrap()[20 * n + 20];
         assert!(
             peak_coarse > peak_fine,
             "coarser spacing should blur less: {peak_coarse} vs {peak_fine}"
@@ -673,7 +685,7 @@ mod tests {
         // A short axis is only a problem if it is actually filtered (sigma > 0).
         let img = Image::from_vec(&[3, 8], vec![2.0; 24]).unwrap();
         let out = recursive_gaussian(&img, &[0.0, 1.0]).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 2.0).abs() < 1e-10);
         }
     }
@@ -692,6 +704,7 @@ mod tests {
         )
         .unwrap()
         .to_f64_vec()
+        .unwrap()
     }
 
     #[test]
@@ -862,7 +875,8 @@ mod tests {
             false,
         )
         .unwrap()
-        .to_f64_vec();
+        .to_f64_vec()
+        .unwrap();
         // Empirically the observed peak relative error here is ~0.38%; 1.5%
         // (same margin as the 1-D SecondOrder case) covers the 2-D case's
         // extra separable-product rounding.
@@ -887,7 +901,8 @@ mod tests {
             false,
         )
         .unwrap()
-        .to_f64_vec();
+        .to_f64_vec()
+        .unwrap();
         for yi in (30..n - 30).step_by(10) {
             for xi in (30..n - 30).step_by(10) {
                 let (x, y) = (xi as f64 - c, yi as f64 - c);

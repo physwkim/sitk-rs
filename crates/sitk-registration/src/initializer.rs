@@ -126,7 +126,7 @@ fn geometric_center(img: &Image) -> Vec<f64> {
 fn center_of_gravity(img: &Image, which: &'static str) -> Result<Vec<f64>> {
     let dim = img.dimension();
     let size = img.size();
-    let values = img.to_f64_vec();
+    let values = img.to_f64_vec()?;
 
     let mut strides = vec![1usize; dim];
     for d in 1..dim {

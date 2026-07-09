@@ -49,7 +49,7 @@ pub fn noise(img: &Image, radius: &[usize]) -> Result<Image> {
         });
     }
 
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
 
     let iter =

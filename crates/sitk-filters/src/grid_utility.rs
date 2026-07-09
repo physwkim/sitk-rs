@@ -59,8 +59,8 @@ pub fn checker_board(image1: &Image, image2: &Image, checker_pattern: &[u32]) ->
     }
 
     let strides = strides(size);
-    let vals1 = image1.to_f64_vec();
-    let vals2 = image2.to_f64_vec();
+    let vals1 = image1.to_f64_vec()?;
+    let vals2 = image2.to_f64_vec()?;
     let out: Vec<f64> = (0..image1.number_of_pixels())
         .map(|flat| {
             let mut sum = 0usize;
@@ -135,12 +135,12 @@ pub fn paste(
         };
     }
 
-    let mut out_vals = destination.to_f64_vec();
+    let mut out_vals = destination.to_f64_vec()?;
     if clipped_size.iter().all(|&s| s > 0) {
         let dest_strides = strides(dest_size);
         let src_strides = strides(source_extent);
         let clipped_strides = strides(&clipped_size);
-        let src_vals = source.to_f64_vec();
+        let src_vals = source.to_f64_vec()?;
         let count: usize = clipped_size.iter().product();
         for o in 0..count {
             let mut dest_flat = 0usize;
@@ -233,7 +233,7 @@ pub fn tile(images: &[&Image], layout: &[usize], default_pixel_value: f64) -> Re
     for (t, img) in images.iter().enumerate().take(total_tiles) {
         let img_size = img.size();
         let img_strides = strides(img_size);
-        let img_vals = img.to_f64_vec();
+        let img_vals = img.to_f64_vec()?;
         let mut cell_index = vec![0usize; dim];
         for (d, cell_index_d) in cell_index.iter_mut().enumerate() {
             let coord_d = (t / tile_strides[d]) % layout[d];
@@ -271,7 +271,7 @@ mod tests {
         let a = img(&[4, 4], vec![1.0; 16]);
         let b = img(&[4, 4], vec![2.0; 16]);
         let out = checker_board(&a, &b, &[1, 1]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![1.0; 16]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0; 16]);
     }
 
     #[test]
@@ -280,7 +280,10 @@ mod tests {
         // (0,0)->0 image1, (1,0)->1 image2, (0,1)->1 image2, (1,1)->2 image1.
         let a = img(&[4, 4], vec![1.0; 16]);
         let b = img(&[4, 4], vec![2.0; 16]);
-        let out = checker_board(&a, &b, &[2, 2]).unwrap().to_f64_vec();
+        let out = checker_board(&a, &b, &[2, 2])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         let strides = strides(&[4, 4]);
         for row in 0..4 {
             for col in 0..4 {
@@ -302,7 +305,10 @@ mod tests {
         // 2,3 odd(image2); 4 even(image1).
         let a = img(&[5, 1], vec![1.0; 5]);
         let b = img(&[5, 1], vec![2.0; 5]);
-        let out = checker_board(&a, &b, &[2, 1]).unwrap().to_f64_vec();
+        let out = checker_board(&a, &b, &[2, 1])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out, vec![1.0, 1.0, 2.0, 2.0, 1.0]);
     }
 
@@ -334,7 +340,8 @@ mod tests {
         let src = img(&[2, 2], vec![9.0; 4]);
         let out = paste(&dest, &src, &[0, 0], &[2, 2], &[1, 1])
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let strides = strides(&[4, 4]);
         for row in 0..4 {
             for col in 0..4 {
@@ -352,7 +359,8 @@ mod tests {
         let src = img(&[2, 2], vec![9.0; 4]);
         let out = paste(&dest, &src, &[0, 0], &[2, 2], &[2, 2])
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out.iter().filter(|&&v| v == 9.0).count(), 4);
     }
 
@@ -364,7 +372,8 @@ mod tests {
         let src = img(&[2, 2], vec![9.0; 4]);
         let out = paste(&dest, &src, &[0, 0], &[2, 2], &[3, 3])
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         // Only index (3,3) receives the paste; (4,3)/(3,4)/(4,4) are outside.
         let strides = strides(&[4, 4]);
         assert_eq!(out[3 * strides[0] + 3 * strides[1]], 9.0);
@@ -377,8 +386,9 @@ mod tests {
         let src = img(&[2, 2], vec![9.0; 4]);
         let out = paste(&dest, &src, &[0, 0], &[2, 2], &[4, 4])
             .unwrap()
-            .to_f64_vec();
-        assert_eq!(out, dest.to_f64_vec());
+            .to_f64_vec()
+            .unwrap();
+        assert_eq!(out, dest.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -420,7 +430,10 @@ mod tests {
         let c = img(&[2, 1], vec![3.0, 3.0]);
         let out = tile(&[&a, &b, &c], &[3, 1], -1.0).unwrap();
         assert_eq!(out.size(), &[6, 1]);
-        assert_eq!(out.to_f64_vec(), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        );
     }
 
     #[test]
@@ -438,7 +451,7 @@ mod tests {
         assert_eq!(out.size(), &[4, 3]);
         let s = strides(&[4, 3]);
         let at = |x: usize, y: usize, v: &[f64]| v[x * s[0] + y * s[1]];
-        let v = out.to_f64_vec();
+        let v = out.to_f64_vec().unwrap();
         // Row 0 (y=0): a fills x=0..2, b fills x=2 only (its cell is 2 wide,
         // so x=3 is a gap filled with default 0.0).
         assert_eq!(at(0, 0, &v), 1.0);
@@ -462,7 +475,7 @@ mod tests {
         // layout [2, 0] with 3 images: last axis = (3-1)/2 + 1 = 2 rows.
         let out = tile(&[&a, &b, &c], &[2, 0], 9.0).unwrap();
         assert_eq!(out.size(), &[2, 2]);
-        assert_eq!(out.to_f64_vec(), vec![1.0, 2.0, 3.0, 9.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 2.0, 3.0, 9.0]);
     }
 
     #[test]

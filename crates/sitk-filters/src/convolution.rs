@@ -126,7 +126,7 @@ pub(crate) fn ravel(index: &[usize], size: &[usize]) -> usize {
 /// share one pixel type (ITK casts to `InternalImageType` for the same reason,
 /// itkFFTConvolutionImageFilter.hxx:284-291).
 pub(crate) fn as_f64_image(img: &Image) -> Result<Image> {
-    Ok(Image::from_vec(img.size(), img.to_f64_vec())?)
+    Ok(Image::from_vec(img.size(), img.to_f64_vec()?)?)
 }
 
 /// Kernel values as `f64`, normalized to unit sum when asked.
@@ -145,7 +145,7 @@ pub(crate) fn prepare_kernel(image: &Image, kernel: &Image, normalize: bool) -> 
         return Err(FilterError::EmptyKernel(kernel.size().to_vec()));
     }
 
-    let mut values = kernel.to_f64_vec();
+    let mut values = kernel.to_f64_vec()?;
     if normalize {
         let sum: f64 = values.iter().sum();
         if sum == 0.0 {

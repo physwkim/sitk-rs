@@ -580,11 +580,22 @@ impl Image {
         })
     }
 
-    /// Copy the buffer into an `f64` vector regardless of stored pixel type.
-    /// A typed accessor, not an algorithm — filters and resampling both widen to
-    /// `f64` to compute uniformly.
-    pub fn to_f64_vec(&self) -> Vec<f64> {
-        self.buffer.to_f64_vec()
+    /// Copy a scalar image's buffer into an `f64` vector regardless of stored
+    /// pixel type, one element per pixel. A typed accessor, not an algorithm —
+    /// filters and resampling both widen to `f64` to compute uniformly.
+    ///
+    /// Errors with [`Error::RequiresScalarPixelType`] on a vector image. Every
+    /// caller of this function indexes the result by pixel, and a vector image's
+    /// buffer is `components_per_pixel` values per pixel; returning it here
+    /// would silently misalign every one of them. Vector callers want
+    /// [`Image::components_to_f64_vec`].
+    ///
+    /// Together with [`Image::scalar_slice`] this is the whole scalar read
+    /// surface of `Image`, so a filter cannot reach pixel data without passing
+    /// the guard.
+    pub fn to_f64_vec(&self) -> Result<Vec<f64>> {
+        self.require_scalar()?;
+        Ok(self.buffer.to_f64_vec())
     }
 
     /// Copy the interleaved component buffer into an `f64` vector, for scalar

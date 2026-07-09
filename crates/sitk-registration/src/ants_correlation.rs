@@ -250,7 +250,7 @@ impl AntsNeighborhoodCorrelationMetric {
             }
         }
 
-        let raster = FixedSamples::from_image(fixed_image);
+        let raster = FixedSamples::from_image(fixed_image)?;
         let raster_strides = strides(&raster_size);
 
         // Invert the fixed image's index-to-physical map so each (possibly
@@ -309,7 +309,7 @@ impl AntsNeighborhoodCorrelationMetric {
         }
         Self::from_samples(
             fixed,
-            FixedSamples::from_image(fixed),
+            FixedSamples::from_image(fixed)?,
             MovingImage::from_image(moving)?,
             radius,
         )
@@ -634,8 +634,8 @@ mod tests {
     /// tiny and test-local rather than importing a sibling metric module —
     /// this crate does not (yet) export a global-NCC metric to depend on.
     fn global_ncc(a: &Image, b: &Image) -> f64 {
-        let av = a.to_f64_vec();
-        let bv = b.to_f64_vec();
+        let av = a.to_f64_vec().unwrap();
+        let bv = b.to_f64_vec().unwrap();
         let n = av.len() as f64;
         let a_mean = av.iter().sum::<f64>() / n;
         let b_mean = bv.iter().sum::<f64>() / n;
@@ -756,7 +756,7 @@ mod tests {
         let fixed = texture(w, h);
         let moving = fixed.clone();
 
-        let mv = moving.to_f64_vec();
+        let mv = moving.to_f64_vec().unwrap();
         let mut gained = vec![0.0f64; mv.len()];
         for y in 0..h {
             for x in 0..w {

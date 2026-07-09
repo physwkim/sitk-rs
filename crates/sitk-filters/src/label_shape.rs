@@ -225,7 +225,11 @@ pub fn label_shape_statistics(
     let origin = img.origin();
     let direction = img.direction();
 
-    let labels: Vec<i64> = img.to_f64_vec().iter().map(|&v| v.round() as i64).collect();
+    let labels: Vec<i64> = img
+        .to_f64_vec()?
+        .iter()
+        .map(|&v| v.round() as i64)
+        .collect();
     let background = settings.background_value as i64;
     let line_sets = extract_lines(&labels, size, background);
 

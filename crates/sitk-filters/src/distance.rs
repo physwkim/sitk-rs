@@ -350,7 +350,7 @@ pub fn signed_maurer_distance_map(
 ) -> Result<Image> {
     let geo = Geometry::new(img, use_image_spacing);
     let n = geo.n();
-    let input_vals = img.to_f64_vec();
+    let input_vals = img.to_f64_vec()?;
     let is_object: Vec<bool> = input_vals.iter().map(|&v| v != background_value).collect();
     let offsets = full_connectivity_offsets(geo.dim);
 
@@ -553,7 +553,7 @@ pub fn danielsson_distance_map(
     use_image_spacing: bool,
 ) -> Result<Image> {
     let geo = Geometry::new(img, use_image_spacing);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let is_object: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
 
     let comp = danielsson_propagate(&is_object, &geo);
@@ -581,7 +581,7 @@ pub fn signed_danielsson_distance_map(
     use_image_spacing: bool,
 ) -> Result<Image> {
     let geo = Geometry::new(img, use_image_spacing);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let is_object: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
 
     let comp1 = danielsson_propagate(&is_object, &geo);
@@ -752,7 +752,7 @@ fn iso_contour_values(
 /// precision").
 pub fn iso_contour_distance(img: &Image, level_set_value: f64, far_value: f64) -> Result<Image> {
     let geo = Geometry::new(img, true);
-    let input = img.to_f64_vec();
+    let input = img.to_f64_vec()?;
     let out_vals = iso_contour_values(&input, &geo, level_set_value, far_value)?;
 
     let mut out = Image::from_vec(&geo.size, out_vals)?;
@@ -912,7 +912,7 @@ pub fn approximate_signed_distance_map(
     let level_set_value = (inside + outside) / 2.0;
     let far_value = (maximum_distance + 1) as f64;
 
-    let input = img.to_f64_vec();
+    let input = img.to_f64_vec()?;
     let mut vals = iso_contour_values(&input, &geo, level_set_value, far_value)?;
     fast_chamfer_distance(&mut vals, &geo, maximum_distance as f64);
 

@@ -372,7 +372,7 @@ fn require_same_shape(a: &Image, b: &Image) -> Result<()> {
 /// `CastImageFilter`: convert an image to another pixel type (`static_cast`
 /// semantics via [`Scalar::from_f64`]).
 pub fn cast(img: &Image, target: PixelId) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     image_from_f64(target, img.size(), img, &vals)
 }
 
@@ -577,7 +577,7 @@ pub fn binary_threshold(
     inside: u8,
     outside: u8,
 ) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let out: Vec<u8> = vals
         .iter()
         .map(|&v| {
@@ -598,7 +598,7 @@ pub fn binary_threshold(
 /// `RescaleIntensityImageFilter`: linearly remap the actual `[min, max]` of the
 /// image onto `[output_min, output_max]`. Output pixel type follows input.
 pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     if vals.is_empty() {
         return Err(FilterError::DegenerateRange);
     }
@@ -634,7 +634,7 @@ pub struct Statistics {
 
 /// `StatisticsImageFilter`: min / max / mean / variance / sigma / sum.
 pub fn statistics(img: &Image) -> Result<Statistics> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let n = vals.len();
     if n == 0 {
         return Err(FilterError::DegenerateRange);

@@ -282,8 +282,8 @@ fn two_image_f64_with_output(
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<Image> {
     require_same_shape(a, b)?;
-    let va = a.to_f64_vec();
-    let vb = b.to_f64_vec();
+    let va = a.to_f64_vec()?;
+    let vb = b.to_f64_vec()?;
     let out: Vec<f64> = va.iter().zip(&vb).map(|(&x, &y)| f(x, y)).collect();
     image_from_f64(output_id, a.size(), a, &out)
 }
@@ -306,7 +306,7 @@ fn two_image_f64_typed_in_place<T: Scalar>(
 
 fn two_image_f64_in_place(mut a: Image, b: &Image, f: &dyn Fn(f64, f64) -> f64) -> Result<Image> {
     require_same_shape(&a, b)?;
-    let vb = b.to_f64_vec();
+    let vb = b.to_f64_vec()?;
     dispatch_scalar!(a.pixel_id(), two_image_f64_typed_in_place, &mut a, &vb, f)?;
     Ok(a)
 }
@@ -464,7 +464,7 @@ fn nary_reduce_f64(images: &[&Image], init: f64, f: impl Fn(f64, f64) -> f64) ->
     let first = images[0];
     let mut out = vec![init; first.size().iter().product()];
     for img in images {
-        for (o, x) in out.iter_mut().zip(img.to_f64_vec()) {
+        for (o, x) in out.iter_mut().zip(img.to_f64_vec()?) {
             *o = f(*o, x);
         }
     }
@@ -495,9 +495,9 @@ fn three_image_f64(
 ) -> Result<Image> {
     require_same_shape(a, b)?;
     require_same_shape(a, c)?;
-    let va = a.to_f64_vec();
-    let vb = b.to_f64_vec();
-    let vc = c.to_f64_vec();
+    let va = a.to_f64_vec()?;
+    let vb = b.to_f64_vec()?;
+    let vc = c.to_f64_vec()?;
     let out: Vec<f64> = va
         .iter()
         .zip(&vb)
@@ -528,8 +528,8 @@ fn three_image_f64_in_place(
 ) -> Result<Image> {
     require_same_shape(&a, b)?;
     require_same_shape(&a, c)?;
-    let vb = b.to_f64_vec();
-    let vc = c.to_f64_vec();
+    let vb = b.to_f64_vec()?;
+    let vc = c.to_f64_vec()?;
     dispatch_scalar!(
         a.pixel_id(),
         three_image_f64_typed_in_place,

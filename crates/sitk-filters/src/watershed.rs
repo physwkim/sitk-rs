@@ -158,7 +158,7 @@ pub fn morphological_watershed_from_markers(
     let size = image.size();
     let total = image.number_of_pixels();
     let markers: Vec<i64> = marker_image
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .map(|&v| v.round() as i64)
         .collect();
@@ -166,7 +166,7 @@ pub fn morphological_watershed_from_markers(
     let out = if total == 0 {
         Vec::new()
     } else {
-        let (ranks, num_ranks) = value_ranks(&image.to_f64_vec());
+        let (ranks, num_ranks) = value_ranks(&image.to_f64_vec()?);
         if mark_watershed_line {
             flood_meyer(size, &ranks, num_ranks, &markers, fully_connected)
         } else {
@@ -383,9 +383,9 @@ pub fn morphological_watershed(
     }
 
     let size = image.size();
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let minima_source = if height != 0.0 {
-        crate::reconstruction::h_minima(image, height, fully_connected)?.to_f64_vec()
+        crate::reconstruction::h_minima(image, height, fully_connected)?.to_f64_vec()?
     } else {
         vals
     };

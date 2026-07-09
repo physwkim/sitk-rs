@@ -90,7 +90,7 @@ pub fn shrink(img: &Image, factors: &[usize]) -> Result<Image> {
         *o += acc;
     }
 
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
@@ -208,7 +208,7 @@ pub fn bin_shrink(img: &Image, factors: &[usize]) -> Result<Image> {
     let in_strides = strides(&in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let bin_count = factors.iter().product::<usize>() as f64;
     let round_integer_output = !img.pixel_id().is_floating_point();
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(out.size(), img.size());
         assert_eq!(out.spacing(), img.spacing());
         assert_eq!(out.origin(), img.origin());
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -268,7 +268,7 @@ mod tests {
         let img = Image::from_vec(&[4, 1], vec![10.0, 11.0, 12.0, 13.0]).unwrap();
         let out = shrink(&img, &[2, 1]).unwrap();
         assert_eq!(out.size(), &[2, 1]);
-        assert_eq!(out.to_f64_vec(), vec![11.0, 13.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![11.0, 13.0]);
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(out.size(), img.size());
         assert_eq!(out.spacing(), img.spacing());
         assert_eq!(out.origin(), img.origin());
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
         //   {8,9,12,13}->10.5 {10,11,14,15}->12.5
         let img = Image::from_vec(&[4, 4], (0..16).map(|v| v as f64).collect()).unwrap();
         let out = bin_shrink(&img, &[2, 2]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![2.5, 4.5, 10.5, 12.5]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![2.5, 4.5, 10.5, 12.5]);
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
         // 10, 12 a plain truncating cast would produce.
         let img = Image::from_vec(&[4, 4], (0..16u8).collect()).unwrap();
         let out = bin_shrink(&img, &[2, 2]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![3.0, 5.0, 11.0, 13.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![3.0, 5.0, 11.0, 13.0]);
     }
 
     #[test]
@@ -370,7 +370,7 @@ mod tests {
         let out = bin_shrink(&img, &[2, 1]).unwrap();
         assert_eq!(out.size(), &[2, 4]);
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5]
         );
     }

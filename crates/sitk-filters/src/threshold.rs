@@ -46,7 +46,7 @@ use sitk_core::Image;
 /// upstream in low-order bits for integer types wider than `f64`'s 53-bit
 /// mantissa.
 pub fn threshold(img: &Image, lower: f64, upper: f64, outside_value: f64) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let out: Vec<f64> = vals
         .iter()
         .map(|&v| {
@@ -180,7 +180,7 @@ pub fn huang_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = huang_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -275,7 +275,7 @@ pub fn intermodes_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = intermodes_threshold_value(&hist)?;
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -338,7 +338,7 @@ pub fn isodata_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = isodata_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -477,7 +477,7 @@ pub fn kittler_illingworth_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = kittler_illingworth_threshold_value(&hist)?;
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -573,7 +573,7 @@ pub fn li_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = li_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -677,7 +677,7 @@ pub fn maximum_entropy_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = maximum_entropy_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -737,7 +737,7 @@ pub fn moments_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = moments_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -905,7 +905,7 @@ pub fn renyi_entropy_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = renyi_entropy_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -961,7 +961,7 @@ pub fn shanbhag_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = shanbhag_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
@@ -1033,7 +1033,7 @@ pub fn yen_threshold(
     outside_value: u8,
     number_of_histogram_bins: u32,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = yen_threshold_value(&hist);
     binarize_and_finish(img, &vals, threshold, inside_value, outside_value)

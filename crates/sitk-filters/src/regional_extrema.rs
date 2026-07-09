@@ -167,7 +167,7 @@ fn valued_regional_extrema_image(
     kind: ExtremaKind,
 ) -> Result<ValuedRegionalExtremaResult> {
     let size = image.size();
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let marker = kind.marker_value(image.pixel_id());
     let (out, flat) = valued_regional_extrema(&vals, size, fully_connected, kind, marker);
     let img = image_from_f64(image.pixel_id(), size, image, &out)?;
@@ -230,7 +230,7 @@ pub fn regional_maxima(
         let marker = ExtremaKind::Maxima.marker_value(image.pixel_id());
         result
             .image
-            .to_f64_vec()
+            .to_f64_vec()?
             .iter()
             .map(|&v| {
                 if v == marker {

@@ -365,7 +365,7 @@ fn min_max_flow(
     let operator = stencil_operator(dim, stencil_radius);
     let size = img.size().to_vec();
     let radius = vec![stencil_radius; dim];
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
 
     for _ in 0..number_of_iterations {
         let mut snapshot = Image::from_vec(&size, buf.clone())?;
@@ -740,14 +740,16 @@ mod tests {
         assert_close(
             &min_max_curvature_flow(&img, 0, 0.05, 2, true)
                 .unwrap()
-                .to_f64_vec(),
-            &img.to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
+            &img.to_f64_vec().unwrap(),
         );
         assert_close(
             &binary_min_max_curvature_flow(&img, 0, 0.05, 2, 3.0, true)
                 .unwrap()
-                .to_f64_vec(),
-            &img.to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
+            &img.to_f64_vec().unwrap(),
         );
     }
 
@@ -758,13 +760,15 @@ mod tests {
         assert_close(
             &min_max_curvature_flow(&img, 5, 0.05, 2, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &[3.5; 49],
         );
         assert_close(
             &binary_min_max_curvature_flow(&img, 5, 0.05, 2, 3.5, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &[3.5; 49],
         );
     }
@@ -778,13 +782,15 @@ mod tests {
         assert_close(
             &min_max_curvature_flow(&img, 5, 0.05, 2, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &data,
         );
         assert_close(
             &binary_min_max_curvature_flow(&img, 5, 0.05, 2, 3.0, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &data,
         );
     }
@@ -806,11 +812,15 @@ mod tests {
         assert_close(
             &min_max_curvature_flow(&img, 5, 0.05, 2, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &data,
         );
         assert_close(
-            &curvature_flow(&img, 5, 0.05, true).unwrap().to_f64_vec(),
+            &curvature_flow(&img, 5, 0.05, true)
+                .unwrap()
+                .to_f64_vec()
+                .unwrap(),
             &data,
         );
     }
@@ -825,7 +835,8 @@ mod tests {
         assert_close(
             &min_max_curvature_flow(&img, 3, 0.4, 2, true)
                 .unwrap()
-                .to_f64_vec(),
+                .to_f64_vec()
+                .unwrap(),
             &data,
         );
     }
@@ -847,9 +858,10 @@ mod tests {
         let time_step = 0.1;
         let out = min_max_curvature_flow(&img, 1, time_step, 2, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
-        let mut expected = img.to_f64_vec();
+        let mut expected = img.to_f64_vec().unwrap();
         for y in 2..4 {
             for x in 2..4 {
                 expected[x + 6 * y] = 1.0 + time_step * -0.3125;
@@ -868,8 +880,9 @@ mod tests {
         // survives, exactly as the min/max variant's local threshold produced.
         let below = binary_min_max_curvature_flow(&img, 1, time_step, 2, 0.5, false)
             .unwrap()
-            .to_f64_vec();
-        let mut expected = img.to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
+        let mut expected = img.to_f64_vec().unwrap();
         for y in 2..4 {
             for x in 2..4 {
                 expected[x + 6 * y] = 1.0 + time_step * -0.3125;
@@ -881,8 +894,9 @@ mod tests {
         // is clamped to 0 and the image is stationary.
         let above = binary_min_max_curvature_flow(&img, 1, time_step, 2, 0.2, false)
             .unwrap()
-            .to_f64_vec();
-        assert_close(&above, &img.to_f64_vec());
+            .to_f64_vec()
+            .unwrap();
+        assert_close(&above, &img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -897,14 +911,17 @@ mod tests {
 
         let plain = curvature_flow(&img, 1, time_step, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         let min_side = binary_min_max_curvature_flow(&img, 1, time_step, 1, 1e30, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let max_side = binary_min_max_curvature_flow(&img, 1, time_step, 1, -1e30, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         let expect_min: Vec<f64> = data
             .iter()
@@ -930,15 +947,18 @@ mod tests {
         let img = block_2x2();
         let zero = min_max_curvature_flow(&img, 2, 0.2, 0, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let one = min_max_curvature_flow(&img, 2, 0.2, 1, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&zero, &one);
         // and it is *not* the radius-2 answer.
         let two = min_max_curvature_flow(&img, 2, 0.2, 2, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert!(zero.iter().zip(&two).any(|(a, b)| (a - b).abs() > 1e-9));
     }
 
@@ -948,12 +968,12 @@ mod tests {
         // clamped to the nearest voxel, as ITK's ZeroFluxNeumann does.
         let img = Image::from_vec(&[3, 3], vec![2.0f64; 9]).unwrap();
         let out = min_max_curvature_flow(&img, 3, 0.05, 4, true).unwrap();
-        assert_close(&out.to_f64_vec(), &[2.0; 9]);
+        assert_close(&out.to_f64_vec().unwrap(), &[2.0; 9]);
 
         let data: Vec<f64> = vec![0.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 0.0];
         let img = Image::from_vec(&[3, 3], data).unwrap();
         let out = min_max_curvature_flow(&img, 3, 0.05, 4, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|v| v.is_finite()));
+        assert!(out.to_f64_vec().unwrap().iter().all(|v| v.is_finite()));
     }
 
     // ---- spacing ----
@@ -972,12 +992,14 @@ mod tests {
         let time_step = 0.1;
         let unit = min_max_curvature_flow(&img_unit, 1, time_step, 2, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let spaced = min_max_curvature_flow(&img_spaced, 1, time_step, 2, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
-        let base = img_unit.to_f64_vec();
+        let base = img_unit.to_f64_vec().unwrap();
         for i in 0..base.len() {
             let delta_unit = unit[i] - base[i];
             let delta_spaced = spaced[i] - base[i];

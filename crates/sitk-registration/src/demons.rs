@@ -219,7 +219,7 @@ impl DemonsMetric {
         }
         Self::from_samples(
             fixed,
-            FixedSamples::from_image(fixed),
+            FixedSamples::from_image(fixed)?,
             MovingImage::from_image(moving)?,
             intensity_difference_threshold,
         )
@@ -517,7 +517,7 @@ mod tests {
         let moving_3d = Image::from_vec(&[4, 4, 4], vec![1.0f64; 64]).unwrap();
         let result = DemonsMetric::from_samples(
             &fixed,
-            FixedSamples::from_image(&fixed),
+            FixedSamples::from_image(&fixed).unwrap(),
             MovingImage::from_image(&moving_3d).unwrap(),
             0.001,
         );

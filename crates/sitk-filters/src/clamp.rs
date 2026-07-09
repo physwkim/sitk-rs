@@ -75,7 +75,7 @@ pub fn clamp(
         return Err(FilterError::InvalidClampBounds { lower, upper });
     }
 
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let out: Vec<f64> = vals
         .iter()
         .map(|&v| {

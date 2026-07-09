@@ -40,7 +40,7 @@ use sitk_core::{Image, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCon
 /// An `f64` copy of `img`'s pixels with `img`'s geometry (spacing in
 /// particular), used as the working buffer for every filter in this module.
 fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
     Ok(scratch)
 }
@@ -351,7 +351,7 @@ pub fn gradient_magnitude_recursive_gaussian(
         orders[d] = GaussianOrder::FirstOrder;
         let deriv =
             recursive_gaussian_with_order(&scratch, &sigma_array, &orders, normalize_across_scale)?;
-        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()) {
+        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()?) {
             let g = v / spacing[d];
             *a += g * g;
         }
@@ -389,7 +389,7 @@ pub fn laplacian_recursive_gaussian(
         let deriv =
             recursive_gaussian_with_order(&scratch, &sigma_array, &orders, normalize_across_scale)?;
         let inv_spacing_sq = 1.0 / (spacing[d] * spacing[d]);
-        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()) {
+        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()?) {
             *a += v * inv_spacing_sq;
         }
     }
@@ -417,14 +417,14 @@ mod tests {
     fn gradient_magnitude_constant_image_is_zero_2d() {
         let img = Image::from_vec(&[5, 5], vec![7.0f64; 25]).unwrap();
         let out = gradient_magnitude(&img, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v == 0.0));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v == 0.0));
     }
 
     #[test]
     fn gradient_magnitude_constant_image_is_zero_3d() {
         let img = Image::from_vec(&[3, 3, 3], vec![7.0f64; 27]).unwrap();
         let out = gradient_magnitude(&img, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v == 0.0));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -434,7 +434,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = gradient_magnitude(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // interior point: dI/dx = slope/spacing_x = 1.5, dI/dy = 0.
         let expected = slope / 2.0;
         assert!((vals[3 * w + 3] - expected).abs() < 1e-9);
@@ -447,7 +447,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = gradient_magnitude(&img, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[w + 1] - slope).abs() < 1e-9);
     }
 
@@ -458,7 +458,7 @@ mod tests {
         let w = 5;
         let img = Image::from_vec(&[w, 1], vec![0.0f64, 1.0, 4.0, 9.0, 16.0]).unwrap();
         let out = gradient_magnitude(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // at x=0: neighbors clamp to (0, 1) -> (1-0)/2 = 0.5.
         assert!((vals[0] - 0.5).abs() < 1e-9);
         // at x=4 (last): neighbors clamp to (9, 16) -> (16-9)/2 = 3.5.
@@ -478,7 +478,7 @@ mod tests {
     fn derivative_constant_image_is_zero() {
         let img = Image::from_vec(&[5, 5], vec![7.0f64; 25]).unwrap();
         let out = derivative(&img, 0, 1, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-12));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-12));
     }
 
     #[test]
@@ -488,7 +488,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = derivative(&img, 0, 1, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[3 * w + 3] - slope / 2.0).abs() < 1e-9);
     }
 
@@ -499,7 +499,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = derivative(&img, 0, 1, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[3 * w + 3] - slope).abs() < 1e-9);
     }
 
@@ -508,7 +508,7 @@ mod tests {
         let (w, h) = (9usize, 3usize);
         let img = Image::from_vec(&[w, h], ramp_2d(w, h, 5.0)).unwrap();
         let out = derivative(&img, 0, 2, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!(vals[w + 4].abs() < 1e-9);
     }
 
@@ -527,7 +527,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], data).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = derivative(&img, 0, 2, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[w + 4] - 1.0).abs() < 1e-9);
     }
 
@@ -536,7 +536,7 @@ mod tests {
         let w = 5;
         let img = Image::from_vec(&[w, 1], vec![0.0f64, 1.0, 4.0, 9.0, 16.0]).unwrap();
         let out = derivative(&img, 0, 1, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[0] - 0.5).abs() < 1e-9);
         assert!((vals[1] - 2.0).abs() < 1e-9);
     }
@@ -569,7 +569,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h, d], data).unwrap();
         img.set_spacing(&[4.0, 1.0, 1.0]).unwrap();
         let out = derivative(&img, 0, 1, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let idx = w * h + w + 3;
         assert!((vals[idx] - slope / 4.0).abs() < 1e-9);
     }
@@ -580,7 +580,7 @@ mod tests {
     fn laplacian_constant_image_is_zero() {
         let img = Image::from_vec(&[5, 5], vec![7.0f64; 25]).unwrap();
         let out = laplacian(&img, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-12));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-12));
     }
 
     #[test]
@@ -596,7 +596,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h], data).unwrap();
         let out = laplacian(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[3 * w + 3] - 4.0).abs() < 1e-9);
     }
 
@@ -612,7 +612,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], data).unwrap();
         img.set_spacing(&[2.0, 0.5]).unwrap();
         let out = laplacian(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // 2/spacing_x^2 + 2/spacing_y^2 = 2/4 + 2/0.25 = 0.5 + 8.0 = 8.5.
         assert!((vals[3 * w + 3] - 8.5).abs() < 1e-9);
     }
@@ -629,7 +629,7 @@ mod tests {
         let mut img = Image::from_vec(&[w, h], data).unwrap();
         img.set_spacing(&[2.0, 0.5]).unwrap();
         let out = laplacian(&img, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[3 * w + 3] - 4.0).abs() < 1e-9);
     }
 
@@ -638,7 +638,7 @@ mod tests {
         let w = 5;
         let img = Image::from_vec(&[w, 1], vec![0.0f64, 1.0, 4.0, 9.0, 16.0]).unwrap();
         let out = laplacian(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // at x=0: neighbors clamp to (0,1); (0+1-0)/1 - wait compute directly:
         // plus=1 (x=1), minus=0 (clamped x=0), center=0 -> (1+0-0)=1... but
         // ITK direction weight also applies per-axis; here it's the sum over
@@ -663,7 +663,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h, d], data).unwrap();
         let out = laplacian(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let idx = 2 * w * h + 2 * w + 2;
         assert!((vals[idx] - 6.0).abs() < 1e-9);
     }
@@ -674,7 +674,7 @@ mod tests {
     fn sobel_constant_image_is_zero() {
         let img = Image::from_vec(&[5, 5], vec![7.0f64; 25]).unwrap();
         let out = sobel_edge_detection(&img, false).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-9));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-9));
     }
 
     #[test]
@@ -686,7 +686,7 @@ mod tests {
         let k = 2.0;
         let img = Image::from_vec(&[w, h], ramp_2d(w, h, k)).unwrap();
         let out = sobel_edge_detection(&img, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         assert!((vals[3 * w + 3] - 8.0 * k).abs() < 1e-9);
     }
 
@@ -704,7 +704,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h, d], data).unwrap();
         let out = sobel_edge_detection(&img, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let idx = 2 * w * h + 2 * w + 2;
         // separable weight sum along x: derivative[-1,0,1] * smoothing_y[1,2,1]
         // * smoothing_z[1,2,1], net factor 4*4=16 per unit slope difference,
@@ -726,7 +726,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h, d], data).unwrap();
         let out = sobel_edge_detection(&img, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let idx = 2 * w * h + 2 * w + 2;
         assert!((vals[idx] - 44.0 * k).abs() < 1e-9);
     }
@@ -742,7 +742,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h], data).unwrap();
         let out = sobel_edge_detection(&img, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // top-left corner (0,0) under zero-flux clamp: the x-kernel
         // [-1,0,1;-2,0,2;-1,0,1] against clamped neighbors (0,0,1;0,0,1;10,10,11)
         // gives gx = 1+2-10+11 = 4; the y-kernel [-1,-2,-1;0,0,0;1,2,1] gives
@@ -767,7 +767,7 @@ mod tests {
     fn gmrg_constant_image_is_near_zero() {
         let img = Image::from_vec(&[41, 41], vec![7.0f64; 41 * 41]).unwrap();
         let out = gradient_magnitude_recursive_gaussian(&img, 2.0, false).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-6));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-6));
     }
 
     #[test]
@@ -778,7 +778,7 @@ mod tests {
         let mut img = Image::from_vec(&[n, n], ramp_2d(n, n, slope)).unwrap();
         img.set_spacing(&[2.0, 1.0]).unwrap();
         let out = gradient_magnitude_recursive_gaussian(&img, 3.0, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let expected = slope / 2.0;
         for y in margin..(n - margin) {
             for x in margin..(n - margin) {
@@ -816,8 +816,8 @@ mod tests {
         };
         let out1 = gradient_magnitude_recursive_gaussian(&img1, 3.0, false).unwrap();
         let out2 = gradient_magnitude_recursive_gaussian(&img2, 6.0, false).unwrap();
-        let v1 = out1.to_f64_vec();
-        let v2 = out2.to_f64_vec();
+        let v1 = out1.to_f64_vec().unwrap();
+        let v2 = out2.to_f64_vec().unwrap();
         for y in (10..n - 10).step_by(7) {
             for x in (10..n - 10).step_by(7) {
                 let i = y * n + x;
@@ -842,7 +842,7 @@ mod tests {
     fn gmrg_3d_constant_image_is_near_zero() {
         let img = Image::from_vec(&[9, 9, 9], vec![3.0f64; 9 * 9 * 9]).unwrap();
         let out = gradient_magnitude_recursive_gaussian(&img, 1.0, false).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-5));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-5));
     }
 
     // ---- laplacian_recursive_gaussian ----
@@ -851,7 +851,7 @@ mod tests {
     fn lrg_constant_image_is_near_zero() {
         let img = Image::from_vec(&[41, 41], vec![7.0f64; 41 * 41]).unwrap();
         let out = laplacian_recursive_gaussian(&img, 2.0, false).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-5));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-5));
     }
 
     #[test]
@@ -861,7 +861,7 @@ mod tests {
         let mut img = Image::from_vec(&[n, n], ramp_2d(n, n, 2.5)).unwrap();
         img.set_spacing(&[1.5, 1.0]).unwrap();
         let out = laplacian_recursive_gaussian(&img, 3.0, false).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         for y in margin..(n - margin) {
             for x in margin..(n - margin) {
                 let v = vals[y * n + x];
@@ -892,8 +892,8 @@ mod tests {
         };
         let out1 = laplacian_recursive_gaussian(&img1, 3.0, false).unwrap();
         let out2 = laplacian_recursive_gaussian(&img2, 6.0, false).unwrap();
-        let v1 = out1.to_f64_vec();
-        let v2 = out2.to_f64_vec();
+        let v1 = out1.to_f64_vec().unwrap();
+        let v2 = out2.to_f64_vec().unwrap();
         let mid = 60 * n + 60;
         assert!(
             (v1[mid] - 4.0 * v2[mid]).abs() < 1e-4,
@@ -914,6 +914,6 @@ mod tests {
     fn lrg_3d_constant_image_is_near_zero() {
         let img = Image::from_vec(&[9, 9, 9], vec![3.0f64; 9 * 9 * 9]).unwrap();
         let out = laplacian_recursive_gaussian(&img, 1.0, false).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v.abs() < 1e-4));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-4));
     }
 }

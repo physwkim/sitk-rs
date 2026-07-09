@@ -213,13 +213,15 @@ impl<'a> N4<'a> {
         }
 
         // `CastImageToITK<MaskImageType>`: the mask reaches ITK as `uint8`.
-        let mask: Option<Vec<f64>> = mask_image.map(|m| {
-            m.to_f64_vec()
-                .into_iter()
-                .map(|v| quantize_to_pixel_type(PixelId::UInt8, v))
-                .collect()
-        });
-        let confidence: Option<Vec<f64>> = confidence_image.map(|c| c.to_f64_vec());
+        let mask: Option<Vec<f64>> = mask_image
+            .map(|m| -> Result<Vec<f64>> {
+                Ok(m.to_f64_vec()?
+                    .into_iter()
+                    .map(|v| quantize_to_pixel_type(PixelId::UInt8, v))
+                    .collect())
+            })
+            .transpose()?;
+        let confidence: Option<Vec<f64>> = confidence_image.map(|c| c.to_f64_vec()).transpose()?;
 
         let label = f64::from(settings.mask_label);
         let included: Vec<bool> = (0..image.number_of_pixels())
@@ -260,7 +262,7 @@ impl<'a> N4<'a> {
 
     /// `N4BiasFieldCorrectionImageFilter::GenerateData`.
     fn run(&self) -> Result<N4BiasFieldCorrectionResult> {
-        let input = self.image.to_f64_vec();
+        let input = self.image.to_f64_vec()?;
         let size = self.image.size();
         let spacing = self.image.spacing();
         let dim = size.len();
@@ -699,10 +701,11 @@ mod tests {
     #[test]
     fn correction_shrinks_the_within_tissue_coefficient_of_variation() {
         let (image, _) = phantom();
-        let before = image.to_f64_vec();
+        let before = image.to_f64_vec().unwrap();
         let after = n4_bias_field_correction(&image, None, None, &settings())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         for (name, select) in [
             ("blob", &in_blob as &dyn Fn(usize, usize) -> bool),
@@ -722,7 +725,7 @@ mod tests {
         let (image, truth) = phantom();
         let result =
             n4_bias_field_correction_with_log_bias_field(&image, None, None, &settings()).unwrap();
-        let recovered = result.log_bias_field.to_f64_vec();
+        let recovered = result.log_bias_field.to_f64_vec().unwrap();
         let r = pearson(&recovered, &truth);
         assert!(r > 0.99, "log-bias-field correlation was only {r}");
     }
@@ -732,11 +735,11 @@ mod tests {
     #[test]
     fn the_corrected_image_is_the_input_divided_by_the_exponentiated_field() {
         let (image, _) = phantom();
-        let input = image.to_f64_vec();
+        let input = image.to_f64_vec().unwrap();
         let result =
             n4_bias_field_correction_with_log_bias_field(&image, None, None, &settings()).unwrap();
-        let corrected = result.corrected.to_f64_vec();
-        let field = result.log_bias_field.to_f64_vec();
+        let corrected = result.corrected.to_f64_vec().unwrap();
+        let field = result.log_bias_field.to_f64_vec().unwrap();
         for i in 0..input.len() {
             let expected = (input[i] / field[i].exp()) as f32 as f64;
             assert!(
@@ -771,10 +774,12 @@ mod tests {
 
         let a = n4_bias_field_correction(&image, Some(&mask), None, &label_only)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let b = n4_bias_field_correction(&image, Some(&mask), None, &all_nonzero)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert!(
             a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-6),
             "the two mask semantics produced identical corrections"
@@ -787,7 +792,8 @@ mod tests {
         };
         let c = n4_bias_field_correction(&image, Some(&mask), None, &other_label)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert!(a.iter().zip(&c).any(|(x, y)| (x - y).abs() > 1e-6));
     }
 
@@ -805,10 +811,12 @@ mod tests {
 
         let by_confidence = n4_bias_field_correction(&image, None, Some(&confidence), &settings())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let by_mask = n4_bias_field_correction(&image, Some(&mask), None, &settings())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(by_confidence, by_mask);
     }
 
@@ -824,10 +832,12 @@ mod tests {
 
         let weighted = n4_bias_field_correction(&image, None, Some(&confidence), &settings())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let plain = n4_bias_field_correction(&image, None, None, &settings())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert!(
             weighted
                 .iter()
@@ -851,8 +861,8 @@ mod tests {
         };
         let a = n4_bias_field_correction_with_log_bias_field(&image, None, None, &one).unwrap();
         let b = n4_bias_field_correction_with_log_bias_field(&image, None, None, &three).unwrap();
-        let fa = a.log_bias_field.to_f64_vec();
-        let fb = b.log_bias_field.to_f64_vec();
+        let fa = a.log_bias_field.to_f64_vec().unwrap();
+        let fb = b.log_bias_field.to_f64_vec().unwrap();
         assert!(fa.iter().zip(&fb).any(|(x, y)| (x - y).abs() > 1e-6));
 
         // The refined lattice resolves the injected field strictly better.
@@ -1018,10 +1028,11 @@ mod tests {
             maximum_number_of_iterations: vec![10, 10],
             ..Default::default()
         };
-        let before = image.to_f64_vec();
+        let before = image.to_f64_vec().unwrap();
         let after = n4_bias_field_correction(&image, None, None, &s)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let cv = |v: &[f64]| {
             let n = v.len() as f64;
             let m = v.iter().sum::<f64>() / n;

@@ -49,7 +49,7 @@ pub fn change_label(image: &Image, change_map: &[(f64, f64)]) -> Result<Image> {
         lookup.insert(key.to_bits(), value);
     }
 
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let out: Vec<f64> = vals
         .iter()
         .map(|&v| lookup.get(&v.to_bits()).copied().unwrap_or(v))

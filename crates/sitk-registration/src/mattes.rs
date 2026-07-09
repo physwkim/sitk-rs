@@ -161,7 +161,7 @@ impl MattesMutualInformationMetric {
             });
         }
 
-        let fixed_samples = FixedSamples::from_image(fixed);
+        let fixed_samples = FixedSamples::from_image(fixed)?;
         let moving_image = MovingImage::from_image(moving)?;
 
         let (fixed_min, fixed_max) = fixed_samples.value_range();
