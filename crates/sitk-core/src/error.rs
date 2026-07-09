@@ -42,13 +42,8 @@ pub enum Error {
     /// declares `pixel_types: BasicPixelIDTypeList` is never instantiated for a
     /// `VectorPixelID`, so calling it on a vector image throws from the
     /// generated wrapper's member-function factory.
-    #[error(
-        "this operation requires a scalar pixel type, got {pixel_id:?} with {components_per_pixel} components per pixel"
-    )]
-    RequiresScalarPixelType {
-        pixel_id: PixelId,
-        components_per_pixel: usize,
-    },
+    #[error("this operation requires a scalar pixel type, got {0:?}")]
+    RequiresScalarPixelType(PixelId),
 
     /// A vector-only accessor or filter was handed a scalar image.
     #[error("this operation requires a vector pixel type, got {0:?}")]

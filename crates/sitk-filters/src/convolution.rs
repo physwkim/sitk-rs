@@ -61,7 +61,7 @@
 
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, NeighborhoodIterator,
-    PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
+    PeriodicBoundaryCondition, ScalarView, ZeroFluxNeumannBoundaryCondition,
 };
 
 use crate::error::{FilterError, Result};
@@ -215,7 +215,7 @@ pub(crate) fn output_region(
 /// routing every sample — in-bounds or not — through the boundary condition.
 /// All three conditions read straight through for an in-bounds index.
 fn sample_region<B: BoundaryCondition<f64>>(
-    img: &Image,
+    img: &ScalarView<'_, f64>,
     index: &[i64],
     size: &[usize],
     boundary: &B,
@@ -395,7 +395,7 @@ fn pad_input_with<B: BoundaryCondition<f64>>(
         .collect();
     let roi = Image::from_vec(
         &roi_size,
-        sample_region(img, &roi_index, &roi_size, boundary),
+        sample_region(&img.scalar_view::<f64>()?, &roi_index, &roi_size, boundary),
     )?;
 
     let size: Vec<usize> = roi_size.iter().map(|&s| fft::padded_length(s)).collect();
@@ -406,7 +406,7 @@ fn pad_input_with<B: BoundaryCondition<f64>>(
         .map(|(&p, &s)| (p - s) / 2)
         .collect();
     let pad_index: Vec<i64> = lower.iter().map(|&l| -(l as i64)).collect();
-    let values = sample_region(&roi, &pad_index, &size, boundary);
+    let values = sample_region(&roi.scalar_view::<f64>()?, &pad_index, &size, boundary);
 
     Ok(PaddedInput {
         values,

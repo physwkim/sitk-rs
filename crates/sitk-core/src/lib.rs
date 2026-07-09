@@ -18,7 +18,7 @@ pub use boundary::{
     PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
 };
 pub use error::{Error, Result};
-pub use image::{Image, PixelBuffer};
+pub use image::{Image, PixelBuffer, ScalarView};
 pub use neighborhood::{Neighborhood, NeighborhoodIterator};
 pub use pixel::{PixelId, Scalar};
 
@@ -204,10 +204,7 @@ mod tests {
         assert!(scalar.scalar_slice::<f32>().is_ok());
         assert_eq!(
             vector.scalar_slice::<f32>(),
-            Err(Error::RequiresScalarPixelType {
-                pixel_id: PixelId::VectorFloat32,
-                components_per_pixel: 1,
-            })
+            Err(Error::RequiresScalarPixelType(PixelId::VectorFloat32))
         );
     }
 
@@ -233,10 +230,7 @@ mod tests {
     #[test]
     fn scalar_accessors_reject_vector_images() {
         let mut img = Image::from_vec_vector(&[2, 2], 3, vec![0.0f64; 12]).unwrap();
-        let expected = || Error::RequiresScalarPixelType {
-            pixel_id: PixelId::VectorFloat64,
-            components_per_pixel: 3,
-        };
+        let expected = || Error::RequiresScalarPixelType(PixelId::VectorFloat64);
         assert_eq!(img.scalar_slice::<f64>(), Err(expected()));
         assert_eq!(img.scalar_vec_mut::<f64>().err(), Some(expected()));
         // Component-aware accessors see the whole interleaved buffer.
@@ -386,10 +380,7 @@ mod tests {
         let already_vector = Image::from_vec_vector(&[2, 2], 2, vec![0.0f32; 8]).unwrap();
         assert_eq!(
             Image::from_component_images(&[&already_vector]),
-            Err(Error::RequiresScalarPixelType {
-                pixel_id: PixelId::VectorFloat32,
-                components_per_pixel: 2,
-            })
+            Err(Error::RequiresScalarPixelType(PixelId::VectorFloat32))
         );
     }
 

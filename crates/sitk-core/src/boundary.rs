@@ -5,7 +5,7 @@
 //! value ITK would return for an index that has walked off the edge of the
 //! image while sliding a neighborhood window across it.
 
-use crate::image::Image;
+use crate::image::ScalarView;
 use crate::pixel::Scalar;
 
 /// Supplies a pixel value for a (possibly) out-of-bounds ND `index` into
@@ -14,16 +14,13 @@ use crate::pixel::Scalar;
 /// `index` is signed and may be negative or `>= image.size()[d]` along any
 /// axis `d`; each implementation decides how to remap it back onto the image
 /// (itkImageBoundaryCondition.h:153-154, `GetPixel`).
+///
+/// `image` is a [`ScalarView`], not an [`Image`](crate::Image): the read is
+/// infallible only because the view already proves the image is scalar and has
+/// pixel type `T`. Callers discharge that proof once, with
+/// [`Image::scalar_view`](crate::Image::scalar_view), outside the pixel loop.
 pub trait BoundaryCondition<T: Scalar> {
-    fn get_pixel(&self, index: &[i64], image: &Image) -> T;
-}
-
-/// Reads the pixel at an already-valid ND `index`.
-fn pixel_at<T: Scalar>(image: &Image, index: &[usize]) -> T {
-    let pixels: &[T] = image.scalar_slice::<T>().expect(
-        "NeighborhoodIterator only constructs a BoundaryCondition<T> for an image whose pixel type is T",
-    );
-    pixels[image.linear_index(index)]
+    fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T;
 }
 
 /// ITK's default boundary condition: clamps the out-of-bounds index to the
@@ -34,13 +31,13 @@ fn pixel_at<T: Scalar>(image: &Image, index: &[usize]) -> T {
 pub struct ZeroFluxNeumannBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for ZeroFluxNeumannBoundaryCondition {
-    fn get_pixel(&self, index: &[i64], image: &Image) -> T {
+    fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
         let clamped: Vec<usize> = index
             .iter()
             .zip(image.size())
             .map(|(&i, &size)| i.clamp(0, size as i64 - 1) as usize)
             .collect();
-        pixel_at(image, &clamped)
+        image.at(&clamped)
     }
 }
 
@@ -70,7 +67,7 @@ impl<T> ConstantBoundaryCondition<T> {
 }
 
 impl<T: Scalar> BoundaryCondition<T> for ConstantBoundaryCondition<T> {
-    fn get_pixel(&self, index: &[i64], image: &Image) -> T {
+    fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
         let inside = index
             .iter()
             .zip(image.size())
@@ -79,7 +76,7 @@ impl<T: Scalar> BoundaryCondition<T> for ConstantBoundaryCondition<T> {
             return self.constant;
         }
         let idx: Vec<usize> = index.iter().map(|&i| i as usize).collect();
-        pixel_at(image, &idx)
+        image.at(&idx)
     }
 }
 
@@ -90,13 +87,13 @@ impl<T: Scalar> BoundaryCondition<T> for ConstantBoundaryCondition<T> {
 pub struct PeriodicBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for PeriodicBoundaryCondition {
-    fn get_pixel(&self, index: &[i64], image: &Image) -> T {
+    fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
         let wrapped: Vec<usize> = index
             .iter()
             .zip(image.size())
             .map(|(&i, &size)| i.rem_euclid(size as i64) as usize)
             .collect();
-        pixel_at(image, &wrapped)
+        image.at(&wrapped)
     }
 }
 
@@ -116,7 +113,7 @@ impl<T: Scalar> BoundaryCondition<T> for PeriodicBoundaryCondition {
 pub struct MirrorBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
-    fn get_pixel(&self, index: &[i64], image: &Image) -> T {
+    fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
         let mapped: Vec<usize> = index
             .iter()
             .zip(image.size())
@@ -126,7 +123,7 @@ impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
                 (if m < size as i64 { m } else { period - 1 - m }) as usize
             })
             .collect();
-        pixel_at(image, &mapped)
+        image.at(&mapped)
     }
 }
 
@@ -134,6 +131,11 @@ impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
 mod tests {
     use super::*;
     use crate::image::Image;
+
+    /// Discharges the scalar-and-type proof `get_pixel` now requires.
+    fn view<T: Scalar>(img: &Image) -> ScalarView<'_, T> {
+        img.scalar_view::<T>().unwrap()
+    }
 
     // 1-D: values equal their index, size 5, so a pinned value doubles as
     // the source index it was clamped/wrapped/defaulted from.
@@ -145,20 +147,32 @@ mod tests {
     fn zero_flux_neumann_clamps_1d_left_and_right_corners() {
         let img = image_1d();
         let bc = ZeroFluxNeumannBoundaryCondition;
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &img), 0);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[5], &img), 4);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-100], &img), 0);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[100], &img), 4);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &view(&img)),
+            0
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[5], &view(&img)),
+            4
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-100], &view(&img)),
+            0
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[100], &view(&img)),
+            4
+        );
     }
 
     #[test]
     fn constant_returns_constant_only_out_of_bounds_1d() {
         let img = image_1d();
         let bc = ConstantBoundaryCondition::new(99u32);
-        assert_eq!(bc.get_pixel(&[-1], &img), 99);
-        assert_eq!(bc.get_pixel(&[5], &img), 99);
-        assert_eq!(bc.get_pixel(&[0], &img), 0);
-        assert_eq!(bc.get_pixel(&[4], &img), 4);
+        assert_eq!(bc.get_pixel(&[-1], &view(&img)), 99);
+        assert_eq!(bc.get_pixel(&[5], &view(&img)), 99);
+        assert_eq!(bc.get_pixel(&[0], &view(&img)), 0);
+        assert_eq!(bc.get_pixel(&[4], &view(&img)), 4);
     }
 
     #[test]
@@ -171,11 +185,23 @@ mod tests {
     fn periodic_wraps_1d_left_and_right_corners() {
         let img = image_1d();
         let bc = PeriodicBoundaryCondition;
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &img), 4);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[5], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &view(&img)),
+            4
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[5], &view(&img)),
+            0
+        );
         // Multi-wrap: -11 is 4 mod 5 (itkPeriodicBoundaryCondition.hxx:190-195).
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-11], &img), 4);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[11], &img), 1);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-11], &view(&img)),
+            4
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[11], &view(&img)),
+            1
+        );
     }
 
     #[test]
@@ -183,17 +209,38 @@ mod tests {
         let img = image_1d();
         let bc = MirrorBoundaryCondition;
         // Edge pixel repeats: index -1 and index 0 both read pixel 0.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &img), 0);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-2], &img), 1);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-5], &img), 4);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &view(&img)),
+            0
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-2], &view(&img)),
+            1
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-5], &view(&img)),
+            4
+        );
         // Symmetric on the right: index `size` repeats the last pixel.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[5], &img), 4);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[6], &img), 3);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[5], &view(&img)),
+            4
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[6], &view(&img)),
+            3
+        );
         // Second period (itkMirrorPadImageTest.cxx ground truth: index -9 on
         // an 8-pixel axis reads pixel 7, i.e. a direct, unflipped copy one
         // full period back). Mirrored here at size 5: period = 10.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-6], &img), 4);
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-10], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-6], &view(&img)),
+            4
+        );
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-10], &view(&img)),
+            0
+        );
     }
 
     #[test]
@@ -201,7 +248,10 @@ mod tests {
         let img = Image::from_vec(&[1], vec![7u32]).unwrap();
         let bc = MirrorBoundaryCondition;
         for i in [-3, -2, -1, 0, 1, 2, 3] {
-            assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[i], &img), 7);
+            assert_eq!(
+                BoundaryCondition::<u32>::get_pixel(&bc, &[i], &view(&img)),
+                7
+            );
         }
     }
 
@@ -225,7 +275,7 @@ mod tests {
         ];
         for (index, expected) in cases {
             assert_eq!(
-                BoundaryCondition::<u32>::get_pixel(&bc, &[index], &img),
+                BoundaryCondition::<u32>::get_pixel(&bc, &[index], &view(&img)),
                 expected,
                 "index {index}"
             );
@@ -249,20 +299,29 @@ mod tests {
         let img = image_2d();
         let bc = ZeroFluxNeumannBoundaryCondition;
         // Corner (-1, -1) clamps to (0, 0) = 0.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &view(&img)),
+            0
+        );
         // Opposite corner (4, 3) clamps to (3, 2) = 23.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[4, 3], &img), 23);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[4, 3], &view(&img)),
+            23
+        );
         // Top edge (1, -1) clamps y only -> (1, 0) = 1.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &img), 1);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &view(&img)),
+            1
+        );
     }
 
     #[test]
     fn constant_2d_out_of_bounds_if_any_axis_spills() {
         let img = image_2d();
         let bc = ConstantBoundaryCondition::new(99u32);
-        assert_eq!(bc.get_pixel(&[-1, -1], &img), 99);
-        assert_eq!(bc.get_pixel(&[1, -1], &img), 99); // x in-bounds, y not.
-        assert_eq!(bc.get_pixel(&[1, 0], &img), 1); // both in-bounds.
+        assert_eq!(bc.get_pixel(&[-1, -1], &view(&img)), 99);
+        assert_eq!(bc.get_pixel(&[1, -1], &view(&img)), 99); // x in-bounds, y not.
+        assert_eq!(bc.get_pixel(&[1, 0], &view(&img)), 1); // both in-bounds.
     }
 
     #[test]
@@ -271,13 +330,19 @@ mod tests {
         let bc = PeriodicBoundaryCondition;
         // (-1, -1) wraps to (3, 2) = 23.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &view(&img)),
             23
         );
         // (1, -1) wraps y only -> (1, 2) = 21.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &img), 21);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &view(&img)),
+            21
+        );
         // (4, 0) wraps x only -> (0, 0) = 0.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &view(&img)),
+            0
+        );
     }
 
     #[test]
@@ -285,13 +350,25 @@ mod tests {
         let img = image_2d();
         let bc = MirrorBoundaryCondition;
         // (-1, -1) repeats the (0, 0) corner = 0.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &view(&img)),
+            0
+        );
         // (-1, 0) repeats x only -> (0, 0) = 0.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1, 0], &img), 0);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, 0], &view(&img)),
+            0
+        );
         // (1, -1) repeats y only -> (1, 0) = 1.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &img), 1);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &view(&img)),
+            1
+        );
         // (4, 0) (one past the right edge, w=4) repeats x -> (3, 0) = 3.
-        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &img), 3);
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &view(&img)),
+            3
+        );
     }
 
     // 3-D: value(x, y, z) = x + 10*y + 100*z.
@@ -314,17 +391,17 @@ mod tests {
         let bc = ZeroFluxNeumannBoundaryCondition;
         // Corner (-1,-1,-1) clamps to (0,0,0) = 0.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &view(&img)),
             0
         );
         // Opposite corner (3,3,3) clamps to (2,2,2) = 222.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[3, 3, 3], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[3, 3, 3], &view(&img)),
             222
         );
         // Edge (1,-1,-1): x in-bounds, y and z clamp -> (1,0,0) = 1.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &view(&img)),
             1
         );
     }
@@ -333,10 +410,10 @@ mod tests {
     fn constant_3d_out_of_bounds_if_any_axis_spills() {
         let img = image_3d();
         let bc = ConstantBoundaryCondition::new(99u32);
-        assert_eq!(bc.get_pixel(&[-1, -1, -1], &img), 99);
-        assert_eq!(bc.get_pixel(&[1, -1, -1], &img), 99); // only x in-bounds.
-        assert_eq!(bc.get_pixel(&[1, 1, -1], &img), 99); // x, y in-bounds, z not.
-        assert_eq!(bc.get_pixel(&[1, 1, 1], &img), 111); // all in-bounds.
+        assert_eq!(bc.get_pixel(&[-1, -1, -1], &view(&img)), 99);
+        assert_eq!(bc.get_pixel(&[1, -1, -1], &view(&img)), 99); // only x in-bounds.
+        assert_eq!(bc.get_pixel(&[1, 1, -1], &view(&img)), 99); // x, y in-bounds, z not.
+        assert_eq!(bc.get_pixel(&[1, 1, 1], &view(&img)), 111); // all in-bounds.
     }
 
     #[test]
@@ -345,12 +422,12 @@ mod tests {
         let bc = PeriodicBoundaryCondition;
         // (-1,-1,-1) wraps every axis -> (2,2,2) = 222.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &view(&img)),
             222
         );
         // (1,-1,-1): x in-bounds, y and z wrap -> (1,2,2) = 221.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &view(&img)),
             221
         );
     }
@@ -361,12 +438,12 @@ mod tests {
         let bc = MirrorBoundaryCondition;
         // (-1,-1,-1) repeats the (0,0,0) corner = 0.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &view(&img)),
             0
         );
         // (1,-1,-1): x in-bounds, y and z repeat -> (1,0,0) = 1.
         assert_eq!(
-            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &img),
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &view(&img)),
             1
         );
     }

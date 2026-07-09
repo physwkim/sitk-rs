@@ -21,7 +21,7 @@ use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, MirrorBoundaryCondition,
-    PeriodicBoundaryCondition, PixelId, Scalar, dispatch_scalar, matrix,
+    PeriodicBoundaryCondition, PixelId, Scalar, ScalarView, dispatch_scalar, matrix,
 };
 
 /// First-index-fastest strides for a size vector.
@@ -266,7 +266,7 @@ fn pad_geometry(img: &Image, lower: &[usize], upper: &[usize]) -> (Vec<usize>, V
 }
 
 fn pad_fill<T: Scalar, B: BoundaryCondition<T>>(
-    img: &Image,
+    img: &ScalarView<'_, T>,
     lower: &[usize],
     out_size: &[usize],
     boundary: &B,
@@ -293,17 +293,27 @@ fn constant_pad_typed<T: Scalar>(
     constant: f64,
 ) -> Result<Image> {
     let bc = ConstantBoundaryCondition::new(T::from_f64(constant));
-    let vals = pad_fill(img, lower, out_size, &bc);
+    let vals = pad_fill(&img.scalar_view::<T>()?, lower, out_size, &bc);
     Ok(Image::from_vec(out_size, vals)?)
 }
 
 fn mirror_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
-    let vals: Vec<T> = pad_fill(img, lower, out_size, &MirrorBoundaryCondition);
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &MirrorBoundaryCondition,
+    );
     Ok(Image::from_vec(out_size, vals)?)
 }
 
 fn wrap_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
-    let vals: Vec<T> = pad_fill(img, lower, out_size, &PeriodicBoundaryCondition);
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &PeriodicBoundaryCondition,
+    );
     Ok(Image::from_vec(out_size, vals)?)
 }
 

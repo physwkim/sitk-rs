@@ -536,10 +536,8 @@ fn require_same_size(a: &Image, b: &Image) -> Result<()> {
 }
 
 fn masked_assign_typed<T: Scalar>(image: &Image, mask: &[u8], assign: &Image) -> Result<Image> {
-    let s = image.scalar_slice::<T>().expect("dispatch guarantees type");
-    let a = assign
-        .scalar_slice::<T>()
-        .expect("require_same_shape guarantees type");
+    let s = image.scalar_slice::<T>()?;
+    let a = assign.scalar_slice::<T>()?;
     let out: Vec<T> = s
         .iter()
         .zip(mask)
@@ -556,12 +554,8 @@ fn masked_assign_typed_in_place<T: Scalar>(
     mask: &[u8],
     assign: &Image,
 ) -> Result<Image> {
-    let a = assign
-        .scalar_slice::<T>()
-        .expect("require_same_shape guarantees type");
-    let v = image
-        .scalar_vec_mut::<T>()
-        .expect("dispatch guarantees type");
+    let a = assign.scalar_slice::<T>()?;
+    let v = image.scalar_vec_mut::<T>()?;
     for ((x, &m), &av) in v.iter_mut().zip(mask).zip(a) {
         if m != 0 {
             *x = av;
@@ -577,7 +571,7 @@ pub fn masked_assign(image: &Image, mask: &Image, assign: &Image) -> Result<Imag
     require_uint8_mask(mask)?;
     require_same_size(image, mask)?;
     require_same_shape(image, assign)?;
-    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_typed,
@@ -592,7 +586,7 @@ pub fn masked_assign_in_place(image: Image, mask: &Image, assign: &Image) -> Res
     require_uint8_mask(mask)?;
     require_same_size(&image, mask)?;
     require_same_shape(&image, assign)?;
-    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_typed_in_place,
@@ -607,7 +601,7 @@ fn masked_assign_constant_typed<T: Scalar>(
     mask: &[u8],
     assign_constant: f64,
 ) -> Result<Image> {
-    let s = image.scalar_slice::<T>().expect("dispatch guarantees type");
+    let s = image.scalar_slice::<T>()?;
     let av = T::from_f64(assign_constant);
     let out: Vec<T> = s
         .iter()
@@ -625,9 +619,7 @@ fn masked_assign_constant_typed_in_place<T: Scalar>(
     assign_constant: f64,
 ) -> Result<Image> {
     let av = T::from_f64(assign_constant);
-    let v = image
-        .scalar_vec_mut::<T>()
-        .expect("dispatch guarantees type");
+    let v = image.scalar_vec_mut::<T>()?;
     for (x, &m) in v.iter_mut().zip(mask) {
         if m != 0 {
             *x = av;
@@ -645,7 +637,7 @@ fn masked_assign_constant_typed_in_place<T: Scalar>(
 pub fn masked_assign_constant(image: &Image, mask: &Image, assign_constant: f64) -> Result<Image> {
     require_uint8_mask(mask)?;
     require_same_size(image, mask)?;
-    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_constant_typed,
@@ -663,7 +655,7 @@ pub fn masked_assign_constant_in_place(
 ) -> Result<Image> {
     require_uint8_mask(mask)?;
     require_same_size(&image, mask)?;
-    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_constant_typed_in_place,

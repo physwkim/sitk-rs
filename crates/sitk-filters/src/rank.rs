@@ -117,10 +117,7 @@ fn fast_approximate_rank_typed<T: Scalar>(
     let dim = img.dimension();
     let size = img.size().to_vec();
     let strides_ = strides(&size);
-    let mut buf: Vec<T> = img
-        .scalar_slice::<T>()
-        .expect("dispatch guarantees T matches pixel_id")
-        .to_vec();
+    let mut buf: Vec<T> = img.scalar_slice::<T>()?.to_vec();
 
     for (axis, &r) in radius.iter().enumerate() {
         let axis_rank = if axis == dim - 1 { 0.5 } else { rank };

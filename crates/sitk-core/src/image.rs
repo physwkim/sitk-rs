@@ -147,6 +147,61 @@ pub struct Image {
     direction: Vec<f64>,
 }
 
+/// An [`Image`] borrow carrying static proof that the image is scalar (one
+/// component per pixel) and that its pixel type is `T`.
+///
+/// The proof is discharged once, at [`Image::scalar_view`] — the only
+/// constructor — and the fields are private, so a `ScalarView` cannot be
+/// forged. Consumers that must read pixels from an infallible signature take a
+/// `&ScalarView<'_, T>` instead of a `&Image`; they then cannot be handed a
+/// vector image at all, so they need no runtime guard and have no panic path.
+///
+/// It also hoists the buffer lookup out of per-pixel loops.
+#[derive(Debug)]
+pub struct ScalarView<'a, T> {
+    image: &'a Image,
+    pixels: &'a [T],
+}
+
+// Derived `Clone`/`Copy` would demand `T: Clone`/`T: Copy`; the view only ever
+// copies two shared borrows.
+impl<T> Clone for ScalarView<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for ScalarView<'_, T> {}
+
+impl<'a, T: Scalar> ScalarView<'a, T> {
+    /// The image this view borrows.
+    pub fn image(&self) -> &'a Image {
+        self.image
+    }
+
+    /// The image's pixels, one element per pixel, dimension-0-fastest.
+    pub fn pixels(&self) -> &'a [T] {
+        self.pixels
+    }
+
+    /// Per-dimension size of the image.
+    pub fn size(&self) -> &'a [usize] {
+        self.image.size()
+    }
+
+    /// Number of image dimensions.
+    pub fn dimension(&self) -> usize {
+        self.image.dimension()
+    }
+
+    /// Reads the pixel at an in-bounds ND `index`.
+    ///
+    /// Panics if `index` is out of bounds, exactly as indexing a slice does.
+    pub fn at(&self, index: &[usize]) -> T {
+        self.pixels[self.image.linear_index(index)]
+    }
+}
+
 impl Image {
     /// The single construction seam. Every `Image` in this workspace is built
     /// here, so the type's invariant (see the type docs) cannot be violated by
@@ -328,10 +383,7 @@ impl Image {
         };
         for img in images {
             if img.pixel_id.is_vector() {
-                return Err(Error::RequiresScalarPixelType {
-                    pixel_id: img.pixel_id,
-                    components_per_pixel: img.components_per_pixel,
-                });
+                return Err(Error::RequiresScalarPixelType(img.pixel_id));
             }
             if img.pixel_id != first.pixel_id {
                 return Err(Error::PixelTypeMismatch {
@@ -525,10 +577,7 @@ impl Image {
     /// pixel.
     fn require_scalar(&self) -> Result<()> {
         if self.pixel_id.is_vector() {
-            return Err(Error::RequiresScalarPixelType {
-                pixel_id: self.pixel_id,
-                components_per_pixel: self.components_per_pixel,
-            });
+            return Err(Error::RequiresScalarPixelType(self.pixel_id));
         }
         Ok(())
     }
@@ -543,6 +592,20 @@ impl Image {
         T::buffer_ref(&self.buffer).ok_or(Error::PixelTypeMismatch {
             expected: self.pixel_id,
             requested: T::PIXEL_ID,
+        })
+    }
+
+    /// Borrow this image together with proof that it is scalar with pixel type
+    /// `T`, as a [`ScalarView`].
+    ///
+    /// Errors exactly as [`Image::scalar_slice`]. This is the only way to build
+    /// a `ScalarView`, which is why an API that takes one — such as
+    /// [`BoundaryCondition::get_pixel`](crate::BoundaryCondition::get_pixel) —
+    /// can read pixels infallibly without a runtime type or component check.
+    pub fn scalar_view<T: Scalar>(&self) -> Result<ScalarView<'_, T>> {
+        Ok(ScalarView {
+            image: self,
+            pixels: self.scalar_slice::<T>()?,
         })
     }
 
