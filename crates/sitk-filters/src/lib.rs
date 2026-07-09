@@ -38,6 +38,7 @@ pub mod logic;
 pub mod math;
 pub mod morphology;
 pub mod recursive_gaussian;
+pub mod region_growing;
 pub mod shrink;
 pub mod smoothing;
 
@@ -79,6 +80,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
+pub use region_growing::{
+    IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
+    neighborhood_connected,
+};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;
