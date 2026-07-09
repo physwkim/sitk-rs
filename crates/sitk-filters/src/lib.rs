@@ -145,8 +145,8 @@ pub use morphology::{
     white_top_hat,
 };
 pub use morphology_reconstruction::{
-    closing_by_reconstruction, grayscale_connected_closing, grayscale_connected_opening,
-    opening_by_reconstruction,
+    binary_reconstruction_by_dilation, binary_reconstruction_by_erosion, closing_by_reconstruction,
+    grayscale_connected_closing, grayscale_connected_opening, opening_by_reconstruction,
 };
 pub use n4_bias_field::{
     N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,
