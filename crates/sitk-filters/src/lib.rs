@@ -84,6 +84,7 @@ pub mod morphology_reconstruction;
 pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
+pub mod object_morphology;
 pub mod overlap;
 pub mod projection;
 mod random;
