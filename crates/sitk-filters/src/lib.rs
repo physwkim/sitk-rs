@@ -30,6 +30,7 @@ pub mod anisotropic_diffusion;
 pub mod binary_morphology;
 pub mod canny;
 pub mod clamp;
+pub mod contour;
 pub mod convolution;
 pub mod denoise;
 pub mod distance;
@@ -77,6 +78,7 @@ pub use binary_morphology::{
 };
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use clamp::clamp;
+pub use contour::{binary_contour, binary_pruning, label_contour};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };

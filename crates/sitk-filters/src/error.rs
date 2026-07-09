@@ -173,6 +173,15 @@ pub enum FilterError {
     #[error("this filter requires a floating-point pixel type, got {0:?}")]
     RequiresRealPixelType(PixelId),
 
+    /// `BinaryPruningImageFilter.yaml`'s `pixel_types` is
+    /// `typelist2::typelist<BasicPixelID<uint8_t>>` -- SimpleITK's generated
+    /// `BinaryPruning()` wrapper only instantiates the filter for `UInt8`,
+    /// even though the underlying ITK template also accepts other unsigned
+    /// integer and real pixel types (`itkBinaryPruningImageFilter.wrap`'s
+    /// `WRAP_ITK_USIGN_INT`/`WRAP_ITK_REAL` groups).
+    #[error("binary_pruning only supports UInt8 images, got {0:?}")]
+    RequiresUInt8PixelType(PixelId),
+
     /// `AnisotropicDiffusionImageFilter::InitializeIteration` gates the
     /// conductance recalibration on
     /// `GetElapsedIterations() % m_ConductanceScalingUpdateInterval == 0`, so a
@@ -295,6 +304,14 @@ pub enum FilterError {
     /// instantiation would not even compile in C++.
     #[error("binary_thinning only supports 2-D images, got {0}-D")]
     UnsupportedThinningDimension(usize),
+
+    /// `BinaryPruningImageFilter::ComputePruneImage` hardcodes 2-D 8-neighbor
+    /// offsets (`itkBinaryPruningImageFilter.hxx`'s `offset1`..`offset8`,
+    /// each a 2-element `OffsetType`), and both ITK and SimpleITK only wrap
+    /// this filter for 2-D images (`itkBinaryPruningImageFilter.wrap`'s
+    /// `itk_wrap_image_filter(..., 2, 2)`).
+    #[error("binary_pruning only supports 2-D images, got {0}-D")]
+    UnsupportedPruningDimension(usize),
 
     /// `ShapeLabelMapFilter::PerimeterFromInterceptCount` has hand-tuned
     /// direction-weight overloads for 2-D and 3-D only
