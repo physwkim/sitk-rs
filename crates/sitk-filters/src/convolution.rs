@@ -104,7 +104,7 @@ pub enum OutputRegionMode {
 
 /// Decompose linear offset `i` into a multi-index of `size`, first index
 /// fastest (matching [`Image`]'s layout).
-fn unravel(mut i: usize, size: &[usize], out: &mut [usize]) {
+pub(crate) fn unravel(mut i: usize, size: &[usize], out: &mut [usize]) {
     for (o, &s) in out.iter_mut().zip(size) {
         *o = i % s;
         i /= s;
@@ -112,7 +112,7 @@ fn unravel(mut i: usize, size: &[usize], out: &mut [usize]) {
 }
 
 /// Linear offset of a multi-index within `size`, first index fastest.
-fn ravel(index: &[usize], size: &[usize]) -> usize {
+pub(crate) fn ravel(index: &[usize], size: &[usize]) -> usize {
     let mut offset = 0usize;
     let mut stride = 1usize;
     for (&i, &s) in index.iter().zip(size) {

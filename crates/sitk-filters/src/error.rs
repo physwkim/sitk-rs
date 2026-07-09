@@ -15,6 +15,12 @@ pub enum FilterError {
     #[error("input images have different pixel types: {a:?} vs {b:?}")]
     TypeMismatch { a: PixelId, b: PixelId },
 
+    /// Two-input filter whose inputs may differ in size but not in
+    /// dimensionality (`MaskedFFTNormalizedCorrelationImageFilter`, whose
+    /// `ImageDimension` is one compile-time constant shared by both inputs).
+    #[error("input images have different dimensions: {a} vs {b}")]
+    ImageDimensionMismatch { a: usize, b: usize },
+
     /// A rescale/threshold could not proceed because the input range is empty.
     #[error("input intensity range is degenerate (min == max) or image is empty")]
     DegenerateRange,
