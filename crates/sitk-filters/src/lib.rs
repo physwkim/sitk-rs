@@ -233,7 +233,7 @@ pub use threshold::{
 pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
-pub use vector::{compose, vector_index_selection_cast};
+pub use vector::{compose, vector_index_selection_cast, vector_magnitude};
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------

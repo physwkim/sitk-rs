@@ -11,7 +11,7 @@
 //! buffer through [`Image::component_slice`] and the component primitives
 //! [`Image::from_component_images`] / [`Image::extract_component`].
 
-use sitk_core::{Image, PixelId};
+use sitk_core::{Error, Image, PixelId, Scalar, dispatch_scalar};
 
 use crate::Result;
 
@@ -79,6 +79,64 @@ pub fn vector_index_selection_cast(
         Some(target) => crate::cast(&component, target.component_id()),
         None => Ok(component),
     }
+}
+
+/// `VectorMagnitudeImageFilter` (`itkVectorMagnitudeImageFilter.h`): the
+/// Euclidean norm of every pixel's component vector, as a scalar image.
+///
+/// The output pixel type is the input's *component* type, not its real type:
+/// the yaml's `filter_type` names `itk::Image<typename itk::NumericTraits<
+/// typename InputImageType::PixelType>::ValueType, ...>`, and the `ValueType` of
+/// a `VariableLengthVector<T>` is `T`. A `VectorUInt8` input therefore yields a
+/// `UInt8` image.
+///
+/// The norm accumulates in `VariableLengthVector::RealValueType` =
+/// `NumericTraits<T>::RealType` (itkVariableLengthVector.hxx:391-399,
+/// `GetSquaredNorm`), which is `f32` for an `f32` component type and `f64` for
+/// every other one — so an `f32` input sums its squares in `f32`, as ITK does,
+/// and an integer input sums in `f64`.
+///
+/// The functor is `static_cast<TOutput>(A.GetNorm())`; that cast is undefined
+/// in C++ when the norm exceeds an integer output's range, and saturates here.
+/// Truncation toward zero is shared with C++ (`u8` norm `1.9` becomes `1`).
+///
+/// Errors with [`Error::RequiresVectorPixelType`] on a scalar image
+/// (`pixel_types: VectorPixelIDTypeList`).
+pub fn vector_magnitude(img: &Image) -> Result<Image> {
+    if !img.pixel_id().is_vector() {
+        return Err(Error::RequiresVectorPixelType(img.pixel_id()).into());
+    }
+    dispatch_scalar!(img.pixel_id(), vector_magnitude_typed, img)
+}
+
+fn vector_magnitude_typed<T: Scalar>(img: &Image) -> Result<Image> {
+    let n = img.number_of_components_per_pixel();
+    let components = img.component_slice::<T>()?;
+
+    // `RealValueType` is `float` only for a `float` component type.
+    let norm: fn(&[T]) -> f64 = if T::PIXEL_ID == PixelId::Float32 {
+        |pixel| {
+            let sum: f32 = pixel.iter().map(|&c| (c.as_f64() as f32).powi(2)).sum();
+            f64::from(sum.sqrt())
+        }
+    } else {
+        |pixel| {
+            pixel
+                .iter()
+                .map(|&c| c.as_f64().powi(2))
+                .sum::<f64>()
+                .sqrt()
+        }
+    };
+
+    let out: Vec<T> = components
+        .chunks_exact(n)
+        .map(|pixel| T::from_f64(norm(pixel)))
+        .collect();
+
+    let mut result = Image::from_vec(img.size(), out)?;
+    result.copy_geometry_from(img);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -251,5 +309,77 @@ mod tests {
         let v = Image::from_vec_vector(&[2], 1, vec![-5.0f32, 400.0]).unwrap();
         let c = vector_index_selection_cast(&v, 0, Some(PixelId::UInt8)).unwrap();
         assert_eq!(c.scalar_slice::<u8>().unwrap(), &[0, 255]);
+    }
+
+    /// 3-4-5 triangle, so the norm is exact in every pixel type.
+    #[test]
+    fn magnitude_is_the_euclidean_norm_and_keeps_the_component_type() {
+        let v = Image::from_vec_vector(&[2], 2, vec![3.0f32, 4.0, 6.0, 8.0]).unwrap();
+        let m = vector_magnitude(&v).unwrap();
+        assert_eq!(m.pixel_id(), PixelId::Float32);
+        assert_eq!(m.number_of_components_per_pixel(), 1);
+        assert_eq!(m.scalar_slice::<f32>().unwrap(), &[5.0, 10.0]);
+    }
+
+    /// The output type is `NumericTraits<PixelType>::ValueType` — the component
+    /// type — not its RealType. An integer input keeps an integer output.
+    #[test]
+    fn magnitude_of_an_integer_vector_stays_integer_and_truncates() {
+        let v = Image::from_vec_vector(&[2], 2, vec![3u8, 4, 1, 1]).unwrap();
+        let m = vector_magnitude(&v).unwrap();
+        assert_eq!(m.pixel_id(), PixelId::UInt8);
+        // sqrt(2) == 1.414... truncates toward zero, as `static_cast<uint8_t>`.
+        assert_eq!(m.scalar_slice::<u8>().unwrap(), &[5, 1]);
+    }
+
+    /// C++ leaves the out-of-range `static_cast` undefined; this port saturates.
+    #[test]
+    fn magnitude_saturates_an_out_of_range_integer_output() {
+        let v = Image::from_vec_vector(&[1], 2, vec![200u8, 200]).unwrap();
+        // sqrt(200^2 + 200^2) == 282.8, past u8::MAX.
+        assert_eq!(
+            vector_magnitude(&v).unwrap().scalar_slice::<u8>().unwrap(),
+            &[255]
+        );
+    }
+
+    /// A one-component vector image's norm is the absolute value of its only
+    /// component.
+    #[test]
+    fn magnitude_of_a_one_component_vector_is_the_absolute_value() {
+        let v = Image::from_vec_vector(&[2], 1, vec![-3.0f64, 4.0]).unwrap();
+        assert_eq!(
+            vector_magnitude(&v).unwrap().scalar_slice::<f64>().unwrap(),
+            &[3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn magnitude_copies_geometry() {
+        let mut v = Image::from_vec_vector(&[2], 2, vec![0.0f32; 4]).unwrap();
+        v.set_spacing(&[2.5]).unwrap();
+        v.set_origin(&[-1.0]).unwrap();
+        let m = vector_magnitude(&v).unwrap();
+        assert_eq!(m.spacing(), &[2.5]);
+        assert_eq!(m.origin(), &[-1.0]);
+    }
+
+    #[test]
+    fn magnitude_rejects_a_scalar_image() {
+        let s = Image::new(&[2], PixelId::Float32);
+        assert!(matches!(
+            vector_magnitude(&s).unwrap_err(),
+            crate::FilterError::Core(Error::RequiresVectorPixelType(PixelId::Float32))
+        ));
+    }
+
+    /// `compose` then `vector_magnitude` is the pipeline the two filters exist
+    /// to support: per-component scalar images to a magnitude image.
+    #[test]
+    fn compose_then_magnitude_round_trips_through_the_vector_image() {
+        let x = Image::from_vec(&[2], vec![3.0f64, 5.0]).unwrap();
+        let y = Image::from_vec(&[2], vec![4.0f64, 12.0]).unwrap();
+        let m = vector_magnitude(&compose(&[&x, &y]).unwrap()).unwrap();
+        assert_eq!(m.scalar_slice::<f64>().unwrap(), &[5.0, 13.0]);
     }
 }
