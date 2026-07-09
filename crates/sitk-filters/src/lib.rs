@@ -40,6 +40,7 @@ pub mod logic;
 pub mod math;
 pub mod morphology;
 pub mod noise;
+pub mod projection;
 mod random;
 pub mod recursive_gaussian;
 pub mod region_growing;
@@ -87,6 +88,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use projection::{
+    binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
+    standard_deviation_projection, sum_projection,
+};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,

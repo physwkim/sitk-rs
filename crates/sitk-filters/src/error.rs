@@ -58,8 +58,11 @@ pub enum FilterError {
     #[error("axis {axis} has {len} pixels; the recursive Gaussian needs at least 4")]
     AxisTooShortForRecursion { axis: usize, len: usize },
 
-    /// `DerivativeImageFilter`'s `direction` was not a valid axis of the
-    /// input image.
+    /// An axis-index parameter was not a valid axis of the input image:
+    /// `DerivativeImageFilter`'s `direction`, or a projection filter's
+    /// `ProjectionDimension` (`itkProjectionImageFilter.hxx`'s
+    /// `GenerateOutputInformation`/`DynamicThreadedGenerateData`, both of
+    /// which throw when `m_ProjectionDimension >= InputImageDimension`).
     #[error("direction {direction} is out of range for a {dimension}-D image")]
     InvalidDirection { direction: usize, dimension: usize },
 
