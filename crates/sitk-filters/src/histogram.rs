@@ -92,6 +92,62 @@ impl Histogram {
         Ok(hist)
     }
 
+    /// `itkHistogram::Initialize(size, lowerBound, upperBound)` as used by
+    /// `itkHistogramMatchingImageFilter.hxx`'s `ConstructHistogramFromIntensityRange`:
+    /// unlike [`from_values`](Self::from_values), the bin range is caller-supplied
+    /// (`[lower, upper]`, no automatic margin) and only values inside that
+    /// closed range are counted (matching the `.hxx`'s explicit
+    /// `if (value >= lowerBound && value <= upperBound)` guard before
+    /// binning), so `total` is the count actually inserted, not `vals.len()`.
+    /// `true_min`/`true_max` overwrite the first bin's minimum and the last
+    /// bin's maximum after uniform bin edges are laid out, matching the
+    /// `.hxx`'s `SetBinMin(0, trueMin)`/`SetBinMax(size-1, trueMax)` override.
+    ///
+    /// Deviates from ITK the same way [`from_values`](Self::from_values) does: bin
+    /// edges are computed uniformly in `f64` rather than ITK's hardcoded
+    /// `float`-precision `Initialize`.
+    pub(crate) fn from_bounds(
+        vals: &[f64],
+        bins: u32,
+        lower: f64,
+        upper: f64,
+        true_min: f64,
+        true_max: f64,
+    ) -> Result<Self> {
+        if bins == 0 {
+            return Err(FilterError::InvalidHistogramBins(0));
+        }
+        if vals.is_empty() {
+            return Err(FilterError::DegenerateRange);
+        }
+        let bins = bins as usize;
+        let interval = (upper - lower) / bins as f64;
+
+        let mut bin_min = Vec::with_capacity(bins);
+        let mut bin_max = Vec::with_capacity(bins);
+        for j in 0..bins {
+            bin_min.push(lower + j as f64 * interval);
+            bin_max.push(lower + (j + 1) as f64 * interval);
+        }
+        bin_min[0] = true_min;
+        bin_max[bins - 1] = true_max;
+
+        let mut hist = Self {
+            bin_min,
+            bin_max,
+            frequency: vec![0; bins],
+            total: 0,
+        };
+        for &v in vals {
+            if v >= lower && v <= upper {
+                let idx = hist.bin_index(v);
+                hist.frequency[idx] += 1;
+                hist.total += 1;
+            }
+        }
+        Ok(hist)
+    }
+
     /// `itkHistogram.hxx`'s `GetIndex`, specialized to one dimension with
     /// `ClipBinsAtEnds == true` (the default both upstream generators leave
     /// it at whenever the marginal-scale computation doesn't overflow, which

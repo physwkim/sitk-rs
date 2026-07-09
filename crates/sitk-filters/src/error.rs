@@ -200,6 +200,25 @@ pub enum FilterError {
     #[error("normalize requires a convolution kernel whose pixels sum to a non-zero value")]
     ZeroKernelSum,
 
+    /// `CheckerBoardImageFilter::GenerateData` computes `factors[d] =
+    /// size[d] / checker_pattern[d]` (integer division) and later divides an
+    /// index by `factors[d]`; a pattern count of `0`, or one exceeding the
+    /// image size along that axis (making `factors[d]` truncate to `0`),
+    /// would be an integer division by zero in the C++.
+    #[error(
+        "checker_pattern {pattern:?} must be >= 1 and <= the image size {size:?} along every axis"
+    )]
+    InvalidCheckerPattern { pattern: Vec<u32>, size: Vec<usize> },
+
+    /// `TileImageFilter` was given zero input images to lay out.
+    #[error("tile requires at least one input image")]
+    EmptyImageList,
+
+    /// `UnsharpMaskImageFilter::VerifyPreconditions` throws "Threshold must
+    /// be non-negative!" when `Threshold < 0`.
+    #[error("unsharp_mask threshold must be >= 0, got {0}")]
+    InvalidUnsharpThreshold(f64),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
