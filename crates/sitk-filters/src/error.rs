@@ -50,6 +50,34 @@ pub enum FilterError {
     #[error("expand factors must be >= 1, got {0:?}")]
     InvalidExpandFactor(Vec<usize>),
 
+    /// A bin-shrink factor was zero (must be a positive integer). Distinct
+    /// from [`FilterError::InvalidShrinkFactor`] because it names the filter
+    /// that actually rejected it -- `BinShrinkImageFilter`'s vector-form
+    /// `SetShrinkFactors(ShrinkFactorsType)` (the one the `dim_vec`
+    /// procedural setter uses) does not clamp to `>= 1` the way its scalar
+    /// convenience setter does, so an unclamped `0` would otherwise reach
+    /// `GenerateOutputInformation`'s division and cast the resulting
+    /// infinity to an integer type, which is undefined behavior in the
+    /// original C++.
+    #[error("bin shrink factors must be >= 1, got {0:?}")]
+    InvalidBinShrinkFactor(Vec<usize>),
+
+    /// `BinShrinkImageFilter::GenerateOutputInformation` throws "InputImage
+    /// is too small! An output pixel does not map to a whole input bin."
+    /// when `floor(inputSize[axis]/factor) < 1` -- i.e. the shrink factor
+    /// exceeds the image's size along that axis. Unlike
+    /// [`FilterError::InvalidShrinkFactor`]'s filter (`ShrinkImageFilter`
+    /// silently clamps the output size to a minimum of 1 pixel instead),
+    /// `BinShrinkImageFilter` throws outright, so this port does too.
+    #[error(
+        "bin shrink factor {factor} on axis {axis} exceeds input size {size} (output size would be < 1)"
+    )]
+    BinShrinkFactorTooLarge {
+        axis: usize,
+        size: usize,
+        factor: usize,
+    },
+
     /// `itk::Functor::Clamp::SetBounds` throws when, after intersecting the
     /// caller's requested bounds with the output pixel type's own
     /// representable range, `lower > upper`.

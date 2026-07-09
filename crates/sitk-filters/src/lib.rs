@@ -203,7 +203,7 @@ pub use region_growing::{
     neighborhood_connected,
 };
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
-pub use shrink::shrink;
+pub use shrink::{bin_shrink, shrink};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
