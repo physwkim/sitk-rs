@@ -28,6 +28,7 @@
 pub mod distance;
 pub mod error;
 pub mod functor;
+pub mod intensity;
 pub mod label;
 pub mod recursive_gaussian;
 pub mod shrink;
@@ -38,6 +39,11 @@ pub use distance::{
 };
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use intensity::{
+    intensity_windowing, intensity_windowing_in_place, invert_intensity, invert_intensity_in_place,
+    normalize, otsu_multiple_thresholds, otsu_threshold, sigmoid, sigmoid_in_place,
+    triangle_threshold,
+};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
