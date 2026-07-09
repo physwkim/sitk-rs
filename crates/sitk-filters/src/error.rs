@@ -291,6 +291,12 @@ pub enum FilterError {
     #[error("discriminant of the fast marching quadratic equation is negative")]
     NegativeDiscriminant,
 
+    /// `RegularizedHeavisideStepFunction::SetEpsilon` throws unless
+    /// `epsilon > NumericTraits<double>::epsilon()`. Only the regularised
+    /// variants validate it; `HeavisideStepFunction` ignores `epsilon`.
+    #[error("epsilon must be > f64::EPSILON for a regularized Heaviside, got {0}")]
+    InvalidHeavisideEpsilon(f64),
+
     /// `IsoContourDistanceImageFilter::ComputeValue` throws
     /// `itkGenericExceptionMacro("diff " << diff << " < NumericTraits<
     /// PixelRealType >::min()")` when the two endpoints of a level-set

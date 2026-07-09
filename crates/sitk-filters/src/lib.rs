@@ -44,6 +44,7 @@ pub mod attribute_morphology;
 pub mod binary_morphology;
 pub mod bspline_decomposition;
 pub mod canny;
+pub mod chan_vese;
 pub mod change_label;
 pub mod clamp;
 pub mod coherence_enhancing_diffusion;
@@ -115,6 +116,10 @@ pub use binary_morphology::{
 };
 pub use bspline_decomposition::{bspline_decomposition, bspline_spline_poles};
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use chan_vese::{
+    ChanAndVeseParams, ChanAndVeseResult, HeavisideStepFunction,
+    scalar_chan_and_vese_dense_level_set,
+};
 pub use change_label::change_label;
 pub use clamp::clamp;
 pub use coherence_enhancing_diffusion::{
