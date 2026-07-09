@@ -12,6 +12,7 @@ pub mod error;
 pub mod interpolator;
 pub mod resample;
 pub mod transform;
+pub mod transform_geometry;
 
 pub use bspline::BSplineTransform;
 pub use composite::CompositeTransform;
@@ -24,3 +25,4 @@ pub use transform::{
     ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform,
     Transform, TranslationTransform, VersorRigid3DTransform, VersorTransform,
 };
+pub use transform_geometry::transform_geometry;

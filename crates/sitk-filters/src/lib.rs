@@ -59,6 +59,7 @@ pub mod fast_marching;
 pub mod fast_marching_upwind_gradient;
 mod fft;
 pub mod fft_correlation;
+pub mod fft_shift;
 pub mod functor;
 pub mod geodesic_morphology;
 pub mod geometry;
@@ -135,6 +136,7 @@ pub use fast_marching_upwind_gradient::{
     fast_marching_upwind_gradient,
 };
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
+pub use fft_shift::fft_shift;
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
@@ -203,8 +205,8 @@ pub use overlap::{
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
 };
 pub use projection::{
-    binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
-    standard_deviation_projection, sum_projection,
+    binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
+    median_projection, minimum_projection, standard_deviation_projection, sum_projection,
 };
 pub use rank::fast_approximate_rank;
 pub use reconstruction::{
@@ -217,7 +219,8 @@ pub use region_growing::{
     neighborhood_connected,
 };
 pub use regional_extrema::{
-    ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
+    ValuedRegionalExtremaResult, regional_maxima, regional_minima, valued_regional_maxima,
+    valued_regional_minima,
 };
 pub use reinitialize_level_set::reinitialize_level_set;
 pub use scalar_connected_component::scalar_connected_component;
