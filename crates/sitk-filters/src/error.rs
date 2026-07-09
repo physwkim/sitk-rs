@@ -419,6 +419,15 @@ pub enum FilterError {
     #[error("spline_order must be >= 1, got 0")]
     InvalidSplineOrder,
 
+    /// `BSplineDecompositionImageFilter::SetPoles` throws "SplineOrder must be
+    /// between 0 and 5. Requested spline order has not been implemented yet."
+    /// Unlike [`FilterError::InvalidSplineOrder`], order 0 *is* valid here (it
+    /// has no poles and the decomposition is the identity); only the upper
+    /// bound is enforced, because ITK tabulates poles for orders 0 through 5
+    /// only.
+    #[error("spline order must be between 0 and 5, got {0}")]
+    UnsupportedSplineOrder(u32),
+
     /// `BSplineScatteredDataPointSetToImageFilter::GenerateData` throws "The
     /// number of control points must be greater than the spline order" when
     /// `m_NumberOfControlPoints[i] < m_SplineOrder[i] + 1` — a lattice that
