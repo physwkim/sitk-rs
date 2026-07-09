@@ -181,7 +181,11 @@ fn bounds_typed<T: Bounds>() -> (f64, f64) {
 /// even at the integer extremes: Rust's saturating float-to-int cast (see
 /// [`sitk_core::Scalar::from_f64`]) clamps back to the true `MAX`/`MIN` for
 /// any value `as_f64()` rounds up past them (`u64::MAX`, `i64::MAX`).
-fn bounds_for(id: PixelId) -> (f64, f64) {
+///
+/// `pub(crate)`: also used by [`crate::region_growing`] for
+/// `ConfidenceConnectedImageFilter`'s "clamp to the valid range of the
+/// input pixel type" step.
+pub(crate) fn bounds_for(id: PixelId) -> (f64, f64) {
     dispatch_scalar!(id, bounds_typed)
 }
 

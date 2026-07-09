@@ -104,6 +104,13 @@ pub enum FilterError {
     #[error("order {0:?} is not a permutation of 0..{1}")]
     InvalidPermutation(Vec<usize>, usize),
 
+    /// `IsolatedConnectedImageFilter::GenerateData` requires both seed lists
+    /// to be non-empty (`itkIsolatedConnectedImageFilter.hxx` errors out via
+    /// `itkExceptionMacro` when either is empty, rather than silently
+    /// producing an empty output as the flood-fill-only filters do).
+    #[error("{which} must be non-empty")]
+    EmptySeeds { which: &'static str },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
