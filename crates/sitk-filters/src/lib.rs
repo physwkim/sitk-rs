@@ -87,7 +87,7 @@ pub use binary_morphology::{
 };
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use clamp::clamp;
-pub use contour::{binary_contour, binary_pruning, label_contour};
+pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
