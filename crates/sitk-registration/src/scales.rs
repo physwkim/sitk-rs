@@ -140,11 +140,7 @@ impl PhysicalShiftScales {
         max_step_size: f64,
     ) -> Self {
         let nparams = transform.number_of_parameters();
-        let n = if dim == 0 {
-            0
-        } else {
-            sample_points.len() / dim
-        };
+        let n = sample_points.len().checked_div(dim).unwrap_or(0);
 
         let jac = if transform.has_local_support() {
             let num_local = transform.number_of_local_parameters();
