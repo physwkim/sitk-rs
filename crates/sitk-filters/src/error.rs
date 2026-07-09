@@ -132,6 +132,24 @@ pub enum FilterError {
     #[error("bitwise/logic filters require an integer pixel type, got {0:?}")]
     RequiresIntegerPixelType(PixelId),
 
+    /// A filter whose SimpleITK yaml declares `pixel_types: RealPixelIDTypeList`
+    /// (`GradientAnisotropicDiffusionImageFilter`,
+    /// `CurvatureAnisotropicDiffusionImageFilter`) was given a non-floating-point
+    /// image. SimpleITK never instantiates those wrappers for integer pixel
+    /// types, which is a compile-time restriction in C++ and a runtime error
+    /// here; ITK's `FiniteDifferenceImageFilter::GenerateData` separately warns
+    /// "Output pixel type MUST be float or double to prevent computational
+    /// errors".
+    #[error("this filter requires a floating-point pixel type, got {0:?}")]
+    RequiresRealPixelType(PixelId),
+
+    /// `AnisotropicDiffusionImageFilter::InitializeIteration` gates the
+    /// conductance recalibration on
+    /// `GetElapsedIterations() % m_ConductanceScalingUpdateInterval == 0`, so a
+    /// zero interval is a division by zero.
+    #[error("conductance_scaling_update_interval must be >= 1, got 0")]
+    ZeroConductanceScalingUpdateInterval,
+
     /// `IsolatedConnectedImageFilter::GenerateData` requires both seed lists
     /// to be non-empty (`itkIsolatedConnectedImageFilter.hxx` errors out via
     /// `itkExceptionMacro` when either is empty, rather than silently
