@@ -43,6 +43,7 @@ pub mod anisotropic_diffusion;
 pub mod attribute_morphology;
 pub mod binary_morphology;
 pub mod canny;
+pub mod change_label;
 pub mod clamp;
 pub mod contour;
 pub mod contour_extractor_2d;
@@ -104,6 +105,7 @@ pub use binary_morphology::{
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use change_label::change_label;
 pub use clamp::clamp;
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
