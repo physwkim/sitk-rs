@@ -386,6 +386,13 @@ pub enum FilterError {
     #[error("n4 completed its first fitting level without estimating a bias field")]
     N4NoBiasFieldEstimated,
 
+    /// `SliceImageFilter::VerifyInputInformation` throws "Step size is zero"
+    /// when any axis's `step` is `0` (`GenerateOutputInformation`'s size
+    /// formula divides by `step`, and a stride of zero could never advance
+    /// the source index).
+    #[error("slice step must be non-zero along every axis, got {0:?}")]
+    InvalidSliceStep(Vec<i32>),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

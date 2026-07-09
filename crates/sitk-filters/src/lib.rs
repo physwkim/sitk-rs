@@ -40,6 +40,7 @@ pub mod expand;
 pub mod fast_marching;
 mod fft;
 pub mod functor;
+pub mod geodesic_morphology;
 pub mod geometry;
 pub mod gradient;
 pub mod grid_utility;
@@ -66,6 +67,7 @@ pub mod region_growing;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
+pub mod slice;
 pub mod smoothing;
 pub mod threshold;
 pub mod watershed;
@@ -94,6 +96,7 @@ pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
 };
@@ -130,7 +133,8 @@ pub use min_max_curvature_flow::{binary_min_max_curvature_flow, min_max_curvatur
 pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
-    grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
+    grayscale_morphological_closing, grayscale_morphological_opening, morphological_gradient,
+    white_top_hat,
 };
 pub use n4_bias_field::{
     N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,
@@ -159,6 +163,7 @@ pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use slic::{SlicResult, SlicSettings, slic};
+pub use slice::slice;
 pub use smoothing::smooth_gaussian;
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
