@@ -23,6 +23,11 @@ pub enum FilterError {
     #[error("expected {expected} values (one per dimension), got {got}")]
     DimensionLength { expected: usize, got: usize },
 
+    /// `StructuringElement::from_mask` was given a mask whose length doesn't
+    /// match `radius`'s implied window size (`Π (2*radius[d]+1)`).
+    #[error("structuring element mask expected {expected} values (Π 2*radius[d]+1), got {got}")]
+    MaskLengthMismatch { expected: usize, got: usize },
+
     /// A shrink factor was zero (must be a positive integer).
     #[error("shrink factors must be >= 1, got {0:?}")]
     InvalidShrinkFactor(Vec<usize>),
