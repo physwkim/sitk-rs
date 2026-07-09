@@ -11,7 +11,7 @@
 //! buffer through [`Image::component_slice`] and the component primitives
 //! [`Image::from_component_images`] / [`Image::extract_component`].
 
-use sitk_core::Image;
+use sitk_core::{Image, PixelId};
 
 use crate::Result;
 
@@ -32,6 +32,53 @@ use crate::Result;
 /// distinct from `Float32` — the vector-ness is in the pixel id, not the count.
 pub fn compose(images: &[&Image]) -> Result<Image> {
     Ok(Image::from_component_images(images)?)
+}
+
+/// `VectorIndexSelectionCastImageFilter`
+/// (`itkVectorIndexSelectionCastImageFilter.h`): extract component `index` of a
+/// vector image as a scalar image, cast to `output_pixel_type`.
+///
+/// `output_pixel_type` is SimpleITK's `OutputPixelType` member, whose default
+/// `sitkUnknown` means "the input's own component type" — the yaml's
+/// `custom_type2` reads `type2 = (m_OutputPixelType != sitkUnknown) ?
+/// m_OutputPixelType : type1`, and its `output_pixel_type` is `typename
+/// InputImageType2::InternalPixelType`. `None` is that default. Because the
+/// output type is taken as `type2`'s *internal* pixel type, a vector
+/// `output_pixel_type` selects its component type; `pixel_types2` explicitly
+/// admits both lists (`typelist2::append<BasicPixelIDTypeList,
+/// VectorPixelIDTypeList>`).
+///
+/// The functor is `static_cast<TOutput>(A[m_Index])`. This port's cast is
+/// [`crate::cast`]'s: saturating on float→int, where C++'s out-of-range
+/// `static_cast` is undefined.
+///
+/// # Deviation: the bounds check
+///
+/// ITK's `BeforeThreadedGenerateData` rejects `index >= numberOfComponents`,
+/// where `numberOfComponents` is the *larger* of the run-time component count
+/// and `sizeof(PixelRealType) / sizeof(PixelScalarRealType)`. That second term
+/// is a component count only for a fixed-length pixel such as `itk::Vector<T,
+/// N>`. For the `VectorImage` this filter is instantiated on in SimpleITK the
+/// pixel type is `VariableLengthVector<T>`, whose `RealType` is
+/// `VariableLengthVector<double>` — a two-word struct holding a pointer and a
+/// length — so the term is `sizeof(VariableLengthVector<double>) /
+/// sizeof(double)`, unrelated to the vector's length, and it can only raise the
+/// accepted bound. An `index` inside the widened gap passes the check and then
+/// reads past the pixel's components in the functor.
+///
+/// This port checks the documented intent — `index >=
+/// number_of_components_per_pixel()` — and returns
+/// [`Error::ComponentIndexOutOfRange`](sitk_core::Error::ComponentIndexOutOfRange).
+pub fn vector_index_selection_cast(
+    img: &Image,
+    index: usize,
+    output_pixel_type: Option<PixelId>,
+) -> Result<Image> {
+    let component = img.extract_component(index)?;
+    match output_pixel_type {
+        Some(target) => crate::cast(&component, target.component_id()),
+        None => Ok(component),
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +162,94 @@ mod tests {
             compose(&[&a, &v]).unwrap_err(),
             crate::FilterError::Core(Error::RequiresScalarPixelType(PixelId::VectorFloat32))
         ));
+    }
+
+    fn rgb() -> Image {
+        // Pixel p has components (p, 10 + p, 100 + p).
+        let mut data = Vec::new();
+        for p in 0..4u8 {
+            data.extend_from_slice(&[p, 10 + p, 100 + p]);
+        }
+        Image::from_vec_vector(&[2, 2], 3, data).unwrap()
+    }
+
+    #[test]
+    fn index_selection_extracts_the_requested_component() {
+        let blue = vector_index_selection_cast(&rgb(), 2, None).unwrap();
+        assert_eq!(blue.pixel_id(), PixelId::UInt8);
+        assert_eq!(blue.number_of_components_per_pixel(), 1);
+        assert_eq!(blue.scalar_slice::<u8>().unwrap(), &[100, 101, 102, 103]);
+    }
+
+    /// `None` means the input's own component type, not the input's pixel id.
+    #[test]
+    fn index_selection_defaults_to_the_component_type() {
+        let v = Image::from_vec_vector(&[2], 2, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let c = vector_index_selection_cast(&v, 0, None).unwrap();
+        assert_eq!(c.pixel_id(), PixelId::Float32);
+        assert_eq!(c.scalar_slice::<f32>().unwrap(), &[1.0, 3.0]);
+    }
+
+    #[test]
+    fn index_selection_casts_to_the_requested_output_type() {
+        let g = vector_index_selection_cast(&rgb(), 1, Some(PixelId::Float64)).unwrap();
+        assert_eq!(g.pixel_id(), PixelId::Float64);
+        assert_eq!(g.scalar_slice::<f64>().unwrap(), &[10.0, 11.0, 12.0, 13.0]);
+    }
+
+    /// A vector `output_pixel_type` names its component type, mirroring
+    /// `InputImageType2::InternalPixelType`.
+    #[test]
+    fn index_selection_takes_a_vector_output_type_as_its_component_type() {
+        let g = vector_index_selection_cast(&rgb(), 1, Some(PixelId::VectorFloat32)).unwrap();
+        assert_eq!(g.pixel_id(), PixelId::Float32);
+        assert_eq!(g.number_of_components_per_pixel(), 1);
+    }
+
+    #[test]
+    fn index_selection_at_the_last_component_is_in_range() {
+        assert!(vector_index_selection_cast(&rgb(), 2, None).is_ok());
+    }
+
+    #[test]
+    fn index_selection_at_the_component_count_is_out_of_range() {
+        assert!(matches!(
+            vector_index_selection_cast(&rgb(), 3, None).unwrap_err(),
+            crate::FilterError::Core(Error::ComponentIndexOutOfRange {
+                index: 3,
+                components_per_pixel: 3
+            })
+        ));
+    }
+
+    /// Index 0 of a one-component vector image is its only component.
+    #[test]
+    fn index_selection_on_a_one_component_vector_image() {
+        let v = Image::from_vec_vector(&[2], 1, vec![7.0f32, 8.0]).unwrap();
+        assert_eq!(
+            vector_index_selection_cast(&v, 0, None)
+                .unwrap()
+                .scalar_slice::<f32>()
+                .unwrap(),
+            &[7.0, 8.0]
+        );
+        assert!(vector_index_selection_cast(&v, 1, None).is_err());
+    }
+
+    #[test]
+    fn index_selection_rejects_a_scalar_image() {
+        let s = Image::new(&[2], PixelId::Float32);
+        assert!(matches!(
+            vector_index_selection_cast(&s, 0, None).unwrap_err(),
+            crate::FilterError::Core(Error::RequiresVectorPixelType(PixelId::Float32))
+        ));
+    }
+
+    /// The cast saturates rather than being undefined, per this crate's policy.
+    #[test]
+    fn index_selection_cast_saturates_out_of_range_values() {
+        let v = Image::from_vec_vector(&[2], 1, vec![-5.0f32, 400.0]).unwrap();
+        let c = vector_index_selection_cast(&v, 0, Some(PixelId::UInt8)).unwrap();
+        assert_eq!(c.scalar_slice::<u8>().unwrap(), &[0, 255]);
     }
 }
