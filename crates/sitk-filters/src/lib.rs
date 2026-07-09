@@ -48,6 +48,7 @@ pub mod logic;
 pub mod math;
 pub mod morphology;
 pub mod noise;
+pub mod overlap;
 pub mod projection;
 mod random;
 pub mod reconstruction;
@@ -116,6 +117,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use overlap::{
+    DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
+    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
+};
 pub use projection::{
     binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
     standard_deviation_projection, sum_projection,
