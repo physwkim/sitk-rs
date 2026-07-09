@@ -62,9 +62,12 @@
 //!   definition is applied along the first image axis and no other. This port
 //!   reproduces that. (`noise_scale`'s `K_σ` *is* isotropic: it goes through
 //!   `GradientRecursiveGaussianImageFilter`, which does smooth every axis.)
-//! - **The class doc's CED/EED formulas are swapped** relative to the code, in
-//!   both `itkCoherenceEnhancingDiffusionImageFilter.h` and SimpleITK's yaml.
-//!   The code is authoritative and is what this port follows:
+//! - **SimpleITK's yaml doc has the CED/EED formulas swapped** relative to the
+//!   code: the "Coherence Enhancing Diffusion" heading carries the EED formula
+//!   `g(μᵢ − μ_min)` with `g(s) = 1 − (1−α)·exp(−(λ/s)^m)` and vice versa. The
+//!   current `itkCoherenceEnhancingDiffusionImageFilter.h` class doc matches
+//!   the code; only the yaml (generated from an older doc revision) is
+//!   swapped. The code is authoritative and is what this port follows:
 //!   [`Enhancement::Ced`] uses `g_CED(μ_max − μᵢ)` and [`Enhancement::Eed`]
 //!   uses `g_EED(μᵢ − μ_min)`. See [`Enhancement`] for each formula.
 //! - **`Adimensionize` on a constant image divides by zero.** It turns on
