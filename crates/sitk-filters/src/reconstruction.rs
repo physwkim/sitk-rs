@@ -491,6 +491,70 @@ pub fn h_concave(image: &Image, height: f64, fully_connected: bool) -> Result<Im
     crate::subtract(&hmin, image)
 }
 
+// ---- double_threshold -------------------------------------------------
+
+/// `DoubleThresholdImageFilter` (`itkDoubleThresholdImageFilter.hxx`):
+/// binarize `image` using a *narrow* threshold range `[threshold2,
+/// threshold3]` as a marker and a *wide* range `[threshold1, threshold4]` as
+/// a mask, then reconstruct the marker by dilation under the mask — keeping
+/// only the wide-range objects that contain at least one narrow-range
+/// (marker) pixel, while dropping wide-range objects that never touch the
+/// narrow range.
+///
+/// `GenerateData()` builds this from two `BinaryThresholdImageFilter`s
+/// (`narrowThreshold` on `[threshold2, threshold3]`, `wideThreshold` on
+/// `[threshold1, threshold4]`, both with `InsideValue`/`OutsideValue`) and
+/// one `ReconstructionByDilationImageFilter` (`MarkerImage = narrowThreshold`,
+/// `MaskImage = wideThreshold`, `FullyConnected = fully_connected`) — reused
+/// here as [`crate::binary_threshold`] (inclusive `[lower, upper]`, matching
+/// `BinaryThresholdImageFilter`'s own comparison) and
+/// [`reconstruction_by_dilation`].
+///
+/// The `.hxx` documents `Threshold1 <= Threshold2 <= Threshold3 <=
+/// Threshold4` as a caller contract but never checks the *cross* relation
+/// (`Threshold1 <= Threshold2`, `Threshold3 <= Threshold4`) itself — that
+/// relation only matters indirectly, through whether the narrow range ends up
+/// a pixelwise subset of the wide range; when it isn't,
+/// [`reconstruction_by_dilation`]'s own marker-`<=`-mask precondition surfaces
+/// as [`FilterError::InvalidReconstructionMarker`], exactly mirroring
+/// `itkReconstructionImageFilter.hxx`'s own runtime check — this port adds no
+/// upfront cross-range validation of its own to match.
+///
+/// What *is* checked upfront, independently for each pair, is each
+/// `BinaryThresholdImageFilter`'s own `BeforeThreadedGenerateData`
+/// precondition (`Threshold2 <= Threshold3`, `Threshold1 <= Threshold4`):
+/// violating either is [`FilterError::InvalidThresholdRange`].
+///
+/// `thresholds` is `[Threshold1, Threshold2, Threshold3, Threshold4]` in the
+/// `.hxx`'s own order, grouped into one array to keep the parameter count
+/// down.
+pub fn double_threshold(
+    image: &Image,
+    thresholds: [f64; 4],
+    inside_value: u8,
+    outside_value: u8,
+    fully_connected: bool,
+) -> Result<Image> {
+    let [threshold1, threshold2, threshold3, threshold4] = thresholds;
+    if threshold2 > threshold3 {
+        return Err(FilterError::InvalidThresholdRange {
+            lower: threshold2,
+            upper: threshold3,
+        });
+    }
+    if threshold1 > threshold4 {
+        return Err(FilterError::InvalidThresholdRange {
+            lower: threshold1,
+            upper: threshold4,
+        });
+    }
+
+    let narrow =
+        crate::binary_threshold(image, threshold2, threshold3, inside_value, outside_value)?;
+    let wide = crate::binary_threshold(image, threshold1, threshold4, inside_value, outside_value)?;
+    reconstruction_by_dilation(&narrow, &wide, fully_connected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +842,69 @@ mod tests {
         let mask = img_i32(&[5, 1], vec![0, 3, 1, 3, 0]);
         let out = h_concave(&mask, 2.0, false).unwrap();
         assert_eq!(out.scalar_slice::<i32>().unwrap(), &[2, 0, 2, 0, 2]);
+    }
+
+    // ---- double_threshold ----
+
+    /// Two bumps: `[0,5,10,5,0]` peaks at `10` (reaches the narrow range
+    /// `[8,10]`), `[0,6,6,6,0]` peaks at `6` (inside the wide range `[1,10]`
+    /// but never the narrow one). Only the first bump is a "narrow-seeded"
+    /// wide component, so only it survives reconstruction; the second is
+    /// dropped in full even though every one of its pixels passed the wide
+    /// threshold.
+    #[test]
+    fn double_threshold_keeps_inner_seeded_component_drops_outer_only_one() {
+        let image = img_i32(&[10, 1], vec![0, 5, 10, 5, 0, 0, 6, 6, 6, 0]);
+        let out = double_threshold(&image, [1.0, 8.0, 10.0, 10.0], 1, 0, false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u8>().unwrap(),
+            &[0, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn double_threshold_output_is_always_uint8() {
+        let image = img_i32(&[3, 1], vec![0, 5, 0]);
+        let out = double_threshold(&image, [1.0, 4.0, 10.0, 10.0], 1, 0, false).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::UInt8);
+    }
+
+    /// `BinaryThresholdImageFilter::BeforeThreadedGenerateData` throws when a
+    /// pair's own lower threshold exceeds its own upper threshold — checked
+    /// independently for the narrow pair (`Threshold2`/`Threshold3`) and the
+    /// wide pair (`Threshold1`/`Threshold4`), before reconstruction ever runs.
+    #[test]
+    fn double_threshold_rejects_an_inverted_pair() {
+        let image = img_i32(&[3, 1], vec![0, 5, 0]);
+        assert_eq!(
+            double_threshold(&image, [0.0, 9.0, 8.0, 10.0], 1, 0, false).unwrap_err(),
+            FilterError::InvalidThresholdRange {
+                lower: 9.0,
+                upper: 8.0
+            }
+        );
+        assert_eq!(
+            double_threshold(&image, [9.0, 1.0, 2.0, 8.0], 1, 0, false).unwrap_err(),
+            FilterError::InvalidThresholdRange {
+                lower: 9.0,
+                upper: 8.0
+            }
+        );
+    }
+
+    /// The `.hxx` never validates `Threshold1 <= Threshold2` /
+    /// `Threshold3 <= Threshold4` up front — a narrow range that is *not* a
+    /// pixelwise subset of the wide range only surfaces once
+    /// [`reconstruction_by_dilation`]'s own marker-`<=`-mask precondition
+    /// rejects it. Here `threshold2 = 0 < threshold1 = 5` makes the narrow
+    /// range mark pixels (value `3`, at index 1) the wide range excludes.
+    #[test]
+    fn double_threshold_surfaces_reconstruction_marker_error_for_non_subset_ranges() {
+        let image = img_i32(&[5, 1], vec![0, 3, 7, 3, 0]);
+        assert_eq!(
+            double_threshold(&image, [5.0, 0.0, 10.0, 10.0], 1, 0, false).unwrap_err(),
+            FilterError::InvalidReconstructionMarker { relation: "<=" }
+        );
     }
 
     // ---- connectivity helpers ----

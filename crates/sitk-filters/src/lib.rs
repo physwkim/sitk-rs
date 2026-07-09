@@ -34,6 +34,7 @@ pub mod contour;
 pub mod convolution;
 pub mod denoise;
 pub mod distance;
+pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
@@ -55,6 +56,7 @@ pub mod min_max_curvature_flow;
 pub mod morphology;
 pub mod n4_bias_field;
 pub mod noise;
+pub mod noise_estimate;
 pub mod overlap;
 pub mod projection;
 mod random;
@@ -87,6 +89,7 @@ pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
     signed_danielsson_distance_map, signed_maurer_distance_map,
 };
+pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
@@ -134,6 +137,7 @@ pub use n4_bias_field::{
     n4_bias_field_correction_with_log_bias_field,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use noise_estimate::noise;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
@@ -143,8 +147,8 @@ pub use projection::{
     standard_deviation_projection, sum_projection,
 };
 pub use reconstruction::{
-    grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima, h_minima,
-    reconstruction_by_dilation, reconstruction_by_erosion,
+    double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
+    h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
 };
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
