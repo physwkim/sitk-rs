@@ -57,8 +57,8 @@
 //!   the identical result — finite-difference verified, and cross-checked
 //!   against the dense path to `1e-12` on a shared B-spline problem — through
 //!   a different, purely internal computation:
-//!   [`evaluate`](Self::evaluate) dispatches to
-//!   [`evaluate_sparse_support`](Self::evaluate_sparse_support) for any
+//!   [`MattesMutualInformationMetric::evaluate`] dispatches to a private
+//!   `evaluate_sparse_support` for any
 //!   transform implementing
 //!   [`ParametricTransform::sparse_jacobian_wrt_parameters`] — currently
 //!   [`BSplineTransform`] and [`DisplacementFieldTransform`] — which
@@ -71,7 +71,7 @@
 //!   pixel touched by at most one sample, so the accumulation re-walks the
 //!   samples in a second pass once the joint histogram is known, rather than
 //!   caching one contributing sample per parameter — see
-//!   [`evaluate_sparse_support`](Self::evaluate_sparse_support) for why that
+//!   `evaluate_sparse_support`'s own comments for why that
 //!   is necessary, not just a rewrite. A test proves it still reproduces the
 //!   (unchanged) dense path's derivative for a displacement field, exactly as
 //!   the branch it replaces did.
