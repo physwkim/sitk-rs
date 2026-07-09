@@ -132,6 +132,27 @@ impl MersenneTwister {
     pub(crate) fn get_variate_open_upper(&mut self) -> f64 {
         self.get_integer_variate() as f64 / 4_294_967_296.0
     }
+
+    /// `GetVariateWithOpenRange()`: uniform in `(0, 1)`.
+    fn get_variate_open_range(&mut self) -> f64 {
+        (self.get_integer_variate() as f64 + 0.5) / 4_294_967_296.0
+    }
+
+    /// `GetNormalVariate(mean, variance)`: the Mersenne Twister's *own*
+    /// Box-Muller normal deviate, consuming exactly two tempered integers per
+    /// call (one for `GetVariateWithOpenRange`, one for
+    /// `GetVariateWithOpenUpperRange`). Distinct from
+    /// [`NormalVariateGenerator`], which is a different algorithm entirely —
+    /// see this module's doc comment. Only the cosine branch is used; the
+    /// sine half of the Box-Muller pair is discarded, exactly as upstream.
+    ///
+    /// The second parameter really is the *variance*, not the standard
+    /// deviation: `r = sqrt(-2·ln(1−u)·variance)`.
+    pub(crate) fn get_normal_variate(&mut self, mean: f64, variance: f64) -> f64 {
+        let r = (-2.0 * (1.0 - self.get_variate_open_range()).ln() * variance).sqrt();
+        let phi = 2.0 * std::f64::consts::PI * self.get_variate_open_upper();
+        mean + r * phi.cos()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -570,6 +591,45 @@ mod tests {
         let seq_a: Vec<f64> = (0..2000).map(|_| a.get_variate()).collect();
         let seq_b: Vec<f64> = (0..2000).map(|_| b.get_variate()).collect();
         assert_eq!(seq_a, seq_b);
+    }
+
+    /// The first ten tempered `uint32_t` outputs of the reference MT19937
+    /// (`init_genrand(0)`), from Matsumoto & Nishimura's own `mt19937ar.c`.
+    /// ITK's generator is that same MT19937, so these pin the port to the
+    /// published stream rather than merely to itself.
+    #[test]
+    fn mersenne_twister_seed_zero_matches_reference_mt19937() {
+        let mut mt = MersenneTwister::new(0);
+        let expected = [
+            2_357_136_044u32,
+            2_546_248_239,
+            3_071_714_933,
+            3_626_093_760,
+            2_588_848_963,
+            3_684_848_379,
+            2_340_255_427,
+            3_638_918_503,
+            1_819_583_497,
+            2_678_185_683,
+        ];
+        let got: Vec<u32> = (0..10).map(|_| mt.get_integer_variate()).collect();
+        assert_eq!(got, expected);
+    }
+
+    /// `GetNormalVariate` = `mean + sqrt(-2·ln(1−(i₀+0.5)/2³²)·variance) ·
+    /// cos(2π·i₁/2³²)`, evaluated by hand on the first two reference integers.
+    #[test]
+    fn mersenne_twister_normal_variate_matches_box_muller_by_hand() {
+        let i0 = 2_357_136_044.0f64;
+        let i1 = 2_546_248_239.0f64;
+        let two32 = 4_294_967_296.0f64;
+        let u = (i0 + 0.5) / two32;
+        let r = (-2.0 * (1.0 - u).ln() * 400.0).sqrt();
+        let phi = 2.0 * std::f64::consts::PI * (i1 / two32);
+        let expected = 7.0 + r * phi.cos();
+
+        let mut mt = MersenneTwister::new(0);
+        assert_eq!(mt.get_normal_variate(7.0, 400.0), expected);
     }
 
     #[test]

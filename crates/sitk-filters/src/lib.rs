@@ -87,6 +87,7 @@ pub mod noise;
 pub mod noise_estimate;
 pub mod object_morphology;
 pub mod overlap;
+pub mod patch_based_denoising;
 pub mod projection;
 mod random;
 pub mod rank;
@@ -216,6 +217,7 @@ pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
 };
+pub use patch_based_denoising::{NoiseModel, PatchBasedDenoisingSettings, patch_based_denoising};
 pub use projection::{
     binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
     median_projection, minimum_projection, standard_deviation_projection, sum_projection,
