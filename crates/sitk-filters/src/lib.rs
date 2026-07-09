@@ -44,6 +44,7 @@ pub mod binary_morphology;
 pub mod canny;
 pub mod clamp;
 pub mod contour;
+pub mod contour_extractor_2d;
 pub mod convolution;
 pub mod deconvolution;
 pub mod denoise;
@@ -101,11 +102,15 @@ pub use binary_morphology::{
 };
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use clamp::clamp;
-pub use contour::{binary_contour, binary_pruning, label_contour};
+pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
+pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
-pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
+pub use denoise::{
+    bilateral, binomial_blur, curvature_flow, discrete_gaussian, discrete_gaussian_derivative,
+    mean, median,
+};
 pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
     signed_danielsson_distance_map, signed_maurer_distance_map,

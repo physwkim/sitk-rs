@@ -1,5 +1,11 @@
 //! Label/binary boundary filters: `BinaryContourImageFilter`,
-//! `LabelContourImageFilter`, and `BinaryPruningImageFilter`.
+//! `LabelContourImageFilter`, `BinaryPruningImageFilter`, and
+//! `SimpleContourExtractorImageFilter`.
+//!
+//! [`simple_contour_extractor`] is the odd one out: a plain box-neighborhood
+//! scan (`Modules/Filtering/ImageFeature/include/itkSimpleContourExtractorImageFilter.hxx`),
+//! not a scanline RLE, and it emits a `UInt8` mask rather than the input's own
+//! values. See its own docs.
 //!
 //! ## `binary_contour` / `label_contour`
 //!
@@ -114,7 +120,10 @@
 //! every `+=` in the C++.
 
 use crate::error::{FilterError, Result};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use crate::quantize_to_pixel_type;
+use sitk_core::{
+    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition, dispatch_scalar,
+};
 
 fn require_integer_pixel_type(image: &Image) -> Result<()> {
     if image.pixel_id().is_floating_point() {
@@ -588,6 +597,96 @@ pub fn binary_pruning(image: &Image, iteration: u32) -> Result<Image> {
     Ok(result)
 }
 
+// ---- simple_contour_extractor ---------------------------------------------
+
+fn simple_contour_extractor_typed<T: Scalar>(
+    image: &Image,
+    input_foreground_value: f64,
+    input_background_value: f64,
+    radius: &[usize],
+    output_foreground_value: u8,
+    output_background_value: u8,
+) -> Result<Image> {
+    let foreground = T::from_f64(input_foreground_value);
+    let background = T::from_f64(input_background_value);
+
+    let iter = NeighborhoodIterator::<T, _>::new(image, radius, ZeroFluxNeumannBoundaryCondition)?;
+    let output: Vec<u8> = iter
+        .map(|(_, nb)| {
+            if nb.center_value() != foreground {
+                return output_background_value;
+            }
+            if nb.values().contains(&background) {
+                output_foreground_value
+            } else {
+                output_background_value
+            }
+        })
+        .collect();
+
+    let mut result = Image::from_vec(image.size(), output)?;
+    result.copy_geometry_from(image);
+    Ok(result)
+}
+
+/// `SimpleContourExtractorImageFilter`: mark every pixel that *is* foreground
+/// (`== input_foreground_value`) and has at least one pixel equal to
+/// `input_background_value` inside its box neighborhood of `radius`, under
+/// [`ZeroFluxNeumannBoundaryCondition`] (`bit.OverrideBoundaryCondition(&nbc)`
+/// in the `.hxx`, so the image border replicates rather than supplying
+/// background — a foreground blob running off the edge has no contour there).
+/// Marked pixels get `output_foreground_value`, everything else — including
+/// every non-foreground pixel — gets `output_background_value`.
+///
+/// Output is always [`PixelId::UInt8`] (`output_pixel_type: uint8_t` in
+/// `SimpleContourExtractorImageFilter.yaml`), and the four values are cast to
+/// their respective pixel types before use (`pixeltype: Input` / `Output` in the
+/// yaml, which SimpleITK renders as `static_cast<…ImageType::PixelType>`), so
+/// `input_foreground_value = 1.5` on an integer image really does become `1`.
+///
+/// Two literal details from the `.hxx`, both load-bearing:
+///
+/// * the "at least one background neighbour" scan runs over the **whole**
+///   neighbourhood, `for (i = 0; i < neighborhoodSize; ++i)` — the *center*
+///   pixel is included. So when `input_foreground_value ==
+///   input_background_value`, every foreground pixel is its own background
+///   neighbour and the entire foreground is marked.
+/// * `radius` is per axis, and a `radius` of all zeros leaves only the center
+///   in the window — again yielding the whole foreground under the equal-values
+///   case above, and nothing otherwise.
+///
+/// Errors if `radius.len() != image.dimension()`.
+pub fn simple_contour_extractor(
+    image: &Image,
+    input_foreground_value: f64,
+    input_background_value: f64,
+    radius: &[usize],
+    output_foreground_value: f64,
+    output_background_value: f64,
+) -> Result<Image> {
+    let dim = image.dimension();
+    if radius.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: radius.len(),
+        });
+    }
+    let output_foreground_value = u8::from_f64(output_foreground_value);
+    let output_background_value = u8::from_f64(output_background_value);
+    let input_foreground_value = quantize_to_pixel_type(image.pixel_id(), input_foreground_value);
+    let input_background_value = quantize_to_pixel_type(image.pixel_id(), input_background_value);
+    dispatch_scalar!(
+        image.pixel_id(),
+        simple_contour_extractor_typed,
+        image,
+        input_foreground_value,
+        input_background_value,
+        radius,
+        output_foreground_value,
+        output_background_value
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +916,203 @@ mod tests {
         assert_eq!(
             binary_pruning(&image, 3).unwrap_err(),
             FilterError::RequiresUInt8PixelType(PixelId::UInt16)
+        );
+    }
+
+    // ---- simple_contour_extractor ----
+
+    /// A 9x9 image whose `[2, 6] x [2, 6]` block is foreground.
+    fn filled_square() -> Image {
+        let mut data = vec![0u8; 81];
+        for y in 2..7 {
+            for x in 2..7 {
+                data[y * 9 + x] = 1;
+            }
+        }
+        img_u8(&[9, 9], data)
+    }
+
+    /// `radius = 1`: the contour of a filled 5x5 square is its one-pixel border
+    /// ring -- a foreground pixel is marked exactly when its 3x3 box reaches a
+    /// background pixel, i.e. when `x` or `y` is on the block's edge. Every
+    /// pixel pinned.
+    #[test]
+    fn simple_contour_extractor_of_a_filled_square_is_its_border_ring() {
+        let out = simple_contour_extractor(&filled_square(), 1.0, 0.0, &[1, 1], 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+    }
+
+    /// `radius = 2` thickens the ring inward by one pixel: only the block's
+    /// exact centre `(4, 4)` keeps an all-foreground 5x5 box.
+    #[test]
+    fn simple_contour_extractor_radius_two_thickens_the_ring() {
+        let out = simple_contour_extractor(&filled_square(), 1.0, 0.0, &[2, 2], 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 1, 1, 0, 1, 1, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 1, 1, 1, 1, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+    }
+
+    /// A per-axis `radius` reaches only along the axes it is nonzero on: with
+    /// `[1, 0]` the 5x5 block's marked pixels are its left and right columns.
+    #[test]
+    fn simple_contour_extractor_radius_is_per_axis() {
+        let out = simple_contour_extractor(&filled_square(), 1.0, 0.0, &[1, 0], 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+    }
+
+    /// "Foreground" and "background" are two independent value tests, not a
+    /// binary partition: `7` is neither, so it never marks a neighbour and is
+    /// itself written as output background. The `1`-column touching only `7`s
+    /// stays unmarked; the one touching a `0` is marked.
+    #[test]
+    fn simple_contour_extractor_foreground_and_background_values_are_independent() {
+        #[rustfmt::skip]
+        let image = img_u8(&[5, 3], vec![
+            7, 1, 7, 1, 0,
+            7, 1, 7, 1, 0,
+            7, 1, 7, 1, 0,
+        ]);
+        let out = simple_contour_extractor(&image, 1.0, 0.0, &[1, 1], 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[
+            0, 0, 0, 1, 0,
+            0, 0, 0, 1, 0,
+            0, 0, 0, 1, 0,
+        ]);
+    }
+
+    /// The output values are plumbed through verbatim (cast to `uint8_t`), and
+    /// they are not required to be `1`/`0`.
+    #[test]
+    fn simple_contour_extractor_output_values_are_plumbed_through() {
+        let out =
+            simple_contour_extractor(&filled_square(), 1.0, 0.0, &[1, 1], 255.0, 3.0).unwrap();
+        let data = out.scalar_slice::<u8>().unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt8);
+        assert_eq!(data[2 * 9 + 2], 255); // ring corner
+        assert_eq!(data[4 * 9 + 4], 3); // block interior
+        assert_eq!(data[0], 3); // outside the block
+    }
+
+    /// Output is `UInt8` whatever the input pixel type, and the *input* values
+    /// are cast to the input pixel type first (`pixeltype: Input`), so `1.9`
+    /// and `1.0` name the same foreground on an integer image.
+    #[test]
+    fn simple_contour_extractor_casts_input_values_to_the_input_pixel_type() {
+        let image = img_u16(&[5, 3], vec![0, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1, 1, 1, 0]);
+        let exact = simple_contour_extractor(&image, 1.0, 0.0, &[1, 1], 1.0, 0.0).unwrap();
+        let truncated = simple_contour_extractor(&image, 1.9, 0.4, &[1, 1], 1.0, 0.0).unwrap();
+        assert_eq!(exact.pixel_id(), PixelId::UInt8);
+        assert_eq!(
+            exact.scalar_slice::<u8>().unwrap(),
+            truncated.scalar_slice::<u8>().unwrap()
+        );
+    }
+
+    /// The boundary is `ZeroFluxNeumannBoundaryCondition`, not a background
+    /// halo: a foreground band flush against the left edge sees only replicated
+    /// foreground there, so its own left column is *not* a contour. Only the
+    /// column facing the real background is marked.
+    #[test]
+    fn simple_contour_extractor_border_replicates_rather_than_supplying_background() {
+        #[rustfmt::skip]
+        let image = img_u8(&[3, 3], vec![
+            1, 1, 0,
+            1, 1, 0,
+            1, 1, 0,
+        ]);
+        let out = simple_contour_extractor(&image, 1.0, 0.0, &[1, 1], 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[
+            0, 1, 0,
+            0, 1, 0,
+            0, 1, 0,
+        ]);
+    }
+
+    /// An all-foreground image has no background pixel anywhere and the border
+    /// replicates, so nothing is ever marked.
+    #[test]
+    fn simple_contour_extractor_all_foreground_image_has_no_contour() {
+        let image = img_u8(&[3, 3], vec![1; 9]);
+        let out = simple_contour_extractor(&image, 1.0, 0.0, &[1, 1], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[0u8; 9]);
+    }
+
+    /// An all-background image has no foreground pixel, so every pixel takes the
+    /// `else` branch and is written as output background.
+    #[test]
+    fn simple_contour_extractor_all_background_image_has_no_contour() {
+        let image = img_u8(&[3, 3], vec![0; 9]);
+        let out = simple_contour_extractor(&image, 1.0, 0.0, &[1, 1], 1.0, 9.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[9u8; 9]);
+    }
+
+    /// The neighbour scan includes the centre pixel (`i` runs over the whole
+    /// neighbourhood), so `input_foreground == input_background` marks every
+    /// foreground pixel -- even one whose entire box is foreground, and even at
+    /// `radius = 0`, where the box *is* the centre.
+    #[test]
+    fn simple_contour_extractor_equal_foreground_and_background_marks_all_foreground() {
+        let image = img_u8(&[3, 3], vec![1, 0, 1, 0, 1, 0, 1, 0, 1]);
+        for radius in [[1, 1], [0, 0]] {
+            let out = simple_contour_extractor(&image, 1.0, 1.0, &radius, 1.0, 0.0).unwrap();
+            assert_eq!(
+                out.scalar_slice::<u8>().unwrap(),
+                &[1, 0, 1, 0, 1, 0, 1, 0, 1],
+                "radius {radius:?}"
+            );
+        }
+    }
+
+    /// With distinct values and `radius = 0` the window holds only the centre,
+    /// which is foreground and therefore never background: nothing is marked.
+    #[test]
+    fn simple_contour_extractor_zero_radius_marks_nothing() {
+        let out = simple_contour_extractor(&filled_square(), 1.0, 0.0, &[0, 0], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[0u8; 81]);
+    }
+
+    #[test]
+    fn simple_contour_extractor_rejects_wrong_radius_length() {
+        let image = img_u8(&[3, 3], vec![1; 9]);
+        assert_eq!(
+            simple_contour_extractor(&image, 1.0, 0.0, &[1], 1.0, 0.0).unwrap_err(),
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
         );
     }
 }

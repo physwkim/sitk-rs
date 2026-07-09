@@ -27,6 +27,18 @@
 //! [`gaussian_operator_kernel`]) separably, one axis at a time, truncated by
 //! `maximum_error`/`maximum_kernel_width`.
 //!
+//! [`discrete_gaussian_derivative`]
+//! (`Modules/Filtering/ImageFeature/include/itkDiscreteGaussianDerivativeImageFilter.hxx`
+//! over `Core/Common/include/itkGaussianDerivativeOperator.h`/`.hxx`) is its
+//! `Order`-th-derivative sibling: same Lindeberg Gaussian, convolved with
+//! `DerivativeOperator`'s difference stencil. It shares nothing but the Bessel
+//! functions with [`discrete_gaussian`] — the Gaussian construction, the
+//! truncation rule, and the Bessel recurrence seed all differ between
+//! `GaussianOperator` and `GaussianDerivativeOperator`. Three upstream
+//! behaviours (negated odd derivatives, spacing affecting only the variance,
+//! and intermediate images typed as the *output* pixel type) are documented on
+//! [`discrete_gaussian_derivative`] itself.
+//!
 //! [`binomial_blur`] reproduces `BinomialBlurImageFilter`'s imperative
 //! forward+reverse index-walk (not a closed-form convolution) exactly:
 //! per repetition, per axis, a forward pass averages each non-last pixel
@@ -71,7 +83,8 @@
 //! pixel type this crate has *except* `long double`, which none of ours are).
 
 use crate::error::{FilterError, Result};
-use crate::image_from_f64;
+use crate::gradient::derivative_operator_coefficients;
+use crate::{image_from_f64, quantize_to_pixel_type};
 use sitk_core::{
     Image, Neighborhood, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
     dispatch_scalar,
@@ -204,11 +217,14 @@ fn modified_bessel_i1(y: f64) -> f64 {
     if y < 0.0 { -accumulator } else { accumulator }
 }
 
-/// `GaussianOperator::ModifiedBesselI`: the modified Bessel function `Iₙ(y)`
-/// for `n >= 2`, via Numerical Recipes' downward recurrence.
-fn modified_bessel_i(n: i32, y: f64) -> f64 {
+/// Numerical Recipes' downward recurrence for the modified Bessel function
+/// `Iₙ(y)`, `n >= 2`, starting the recurrence at `j_start`. The two ITK
+/// operators that use it seed `j_start` differently — see
+/// [`modified_bessel_i`] and [`modified_bessel_i_derivative_operator`] — and
+/// the recurrence is only approximate, so the seed is observable in the last
+/// bits of the result.
+fn modified_bessel_i_from(n: i32, y: f64, j_start: i32) -> f64 {
     debug_assert!(n >= 2, "modified_bessel_i is only valid for n >= 2");
-    const ACCURACY: f64 = 40.0;
     if y == 0.0 {
         return 0.0;
     }
@@ -218,7 +234,7 @@ fn modified_bessel_i(n: i32, y: f64) -> f64 {
     let mut accumulator = 0.0f64;
     let mut qi = 1.0f64;
 
-    let mut j = 2 * (n + (ACCURACY * n as f64).sqrt() as i32);
+    let mut j = j_start;
     while j > 0 {
         let qim = qip + j as f64 * toy * qi;
         qip = qi;
@@ -241,6 +257,23 @@ fn modified_bessel_i(n: i32, y: f64) -> f64 {
     } else {
         accumulator
     }
+}
+
+/// `GaussianOperator::ModifiedBesselI` (itkGaussianOperator.hxx): seeds the
+/// recurrence at `2·(n + ⌊√(40·n)⌋)`.
+fn modified_bessel_i(n: i32, y: f64) -> f64 {
+    const ACCURACY: f64 = 40.0;
+    modified_bessel_i_from(n, y, 2 * (n + (ACCURACY * n as f64).sqrt() as i32))
+}
+
+/// `GaussianDerivativeOperator::ModifiedBesselI`
+/// (itkGaussianDerivativeOperator.hxx): seeds the recurrence at
+/// `2·(n + ⌊10·√n⌋)` — i.e. `⌊√(100·n)⌋` where [`modified_bessel_i`] uses
+/// `⌊√(40·n)⌋`. The two ITK operators really do differ here; neither is a
+/// transcription slip.
+fn modified_bessel_i_derivative_operator(n: i32, y: f64) -> f64 {
+    const DIGITS: f64 = 10.0;
+    modified_bessel_i_from(n, y, 2 * (n + (DIGITS * (n as f64).sqrt()) as i32))
 }
 
 /// `GaussianOperator::GenerateCoefficients`: the symmetric discrete-Gaussian
@@ -391,6 +424,285 @@ pub(crate) fn discrete_gaussian_f64(
     }
 
     Ok(current)
+}
+
+// ---- discrete_gaussian_derivative -----------------------------------------
+
+/// `GaussianDerivativeOperator::SetMaximumError`: unlike
+/// `GaussianOperator::SetMaximumError` (which *throws* outside `(0, 1)`, hence
+/// [`FilterError::InvalidMaximumError`] in [`discrete_gaussian`]), this one
+/// silently clamps to `[0.00001, 0.99999]`.
+fn clamp_maximum_error(maximum_error: f64) -> f64 {
+    const MIN: f64 = 0.00001;
+    maximum_error.clamp(MIN, 1.0 - MIN)
+}
+
+/// `GaussianDerivativeOperator::GenerateGaussianCoefficients`: the symmetric
+/// discrete-Gaussian kernel for an index-space `pixel_variance`.
+///
+/// This is *not* [`gaussian_operator_kernel`] with different constants — the
+/// two ITK operators diverge in three places, all reproduced here:
+///
+/// * the tail loop breaks when `coeff[i] < sum · f64::EPSILON` (the coefficient
+///   is too small to move `sum` any closer to `cap`), where `GaussianOperator`
+///   breaks on `coeff[i] <= 0`;
+/// * the width cap `coeff.len() > maximum_kernel_width` is checked *after* that
+///   epsilon break, so a kernel may exceed `maximum_kernel_width` by one tap
+///   before the check fires;
+/// * the normalizing sum is re-accumulated smallest-to-largest
+///   (`accumulate(rbegin, rend - 1)` — i.e. taps `[len-1 ..= 1]`, doubled, plus
+///   tap `0`) rather than reusing the loop's running `sum`.
+///
+/// ITK accumulates through `CompensatedSummation<double>` (Kahan); this port
+/// uses plain `f64` addition, as [`gaussian_operator_kernel`] already does. The
+/// two differ only in the last bits of `sum`, which can in principle shift the
+/// `sum < cap` termination by one tap for a `cap` landing exactly on a partial
+/// sum.
+fn gaussian_derivative_gaussian_coefficients(
+    pixel_variance: f64,
+    maximum_error: f64,
+    maximum_kernel_width: u32,
+) -> Vec<f64> {
+    let et = (-pixel_variance).exp();
+    let cap = 1.0 - maximum_error;
+
+    let mut coeff = vec![et * modified_bessel_i0(pixel_variance)];
+    let mut sum = coeff[0];
+    coeff.push(et * modified_bessel_i1(pixel_variance));
+    sum += coeff[1] * 2.0;
+
+    let mut i: i32 = 2;
+    while sum < cap {
+        let v = et * modified_bessel_i_derivative_operator(i, pixel_variance);
+        coeff.push(v);
+        sum += v * 2.0;
+        if v < sum * f64::EPSILON {
+            break;
+        }
+        if coeff.len() as u32 > maximum_kernel_width {
+            break;
+        }
+        i += 1;
+    }
+
+    // Re-accumulate from smallest to largest for maximum precision.
+    let tail: f64 = coeff[1..].iter().rev().sum();
+    let total = 2.0 * tail + coeff[0];
+    for v in &mut coeff {
+        *v /= total;
+    }
+
+    let s = coeff.len() - 1;
+    let mut kernel = vec![0.0f64; 2 * s + 1];
+    for (k, &ck) in coeff.iter().enumerate() {
+        kernel[s + k] = ck;
+        kernel[s - k] = ck;
+    }
+    kernel
+}
+
+/// `GaussianDerivativeOperator::GenerateCoefficients`: the `order`-th discrete
+/// derivative of [`gaussian_derivative_gaussian_coefficients`]'s kernel, formed
+/// by *convolving* it with [`derivative_operator_coefficients`]'s `order`-th
+/// difference stencil over an edge-clamped padding of `2N - 1` taps per side
+/// (`N = (stencil.len() - 1) / 2`), then scaling by `norm`.
+///
+/// `pixel_variance` is already in index units: the filter divides by `spacing²`
+/// itself before constructing the operator (see
+/// [`discrete_gaussian_derivative`]).
+///
+/// Two sign/scale facts, both load-bearing:
+///
+/// * The inner loop indexes the stencil *reversed* (`derivOp[Size - 1 - j]`),
+///   making this a convolution. `DiscreteGaussianDerivativeImageFilter` then
+///   *correlates* the image with the result and — unlike `DerivativeImageFilter`
+///   and `GradientImageFilter` — never calls `NeighborhoodOperator::FlipAxes`.
+///   The two flips do not cancel, so for **odd** `order` the filter's output is
+///   the negation of the usual central-difference derivative. See
+///   [`discrete_gaussian_derivative`]'s docs.
+/// * `norm = variance^(order/2)` under `normalize_across_scale`, then
+///   `norm /= spacing^order`. But the operator's own `m_Spacing` is left at its
+///   default `1.0` by `DiscreteGaussianDerivativeImageFilter::GenerateData`
+///   (which only calls `SetVariance(variance / spacing²)`), so that second
+///   division is always by `1.0`. The `variance` raised to `order/2` is
+///   therefore the *index-space* variance.
+///
+/// `order == 0` returns the plain Gaussian, with `norm` never applied — so
+/// `NormalizeAcrossScale` has no effect at order 0.
+///
+/// The edge-clamped padding is not a neutral convenience: it *attenuates* the
+/// kernel. Writing `G` for the normalized, truncated Gaussian on `[-s, s]`, the
+/// padding replaces `G(±(s+1))` by `G(±s)` rather than by the true Gaussian
+/// tail, which shifts the resulting stencil's moments to
+///
+/// * order 1: `Σ k[m]·m = -(1 - (2s+1)·G(s))`, not `-1`;
+/// * order 2: `Σ k[m]·m² = 2·(1 - (2s+1)·G(s))`, not `2`;
+///
+/// while `Σ k[m] = 0` stays exact. So a first derivative of a unit-slope ramp
+/// comes back as `-(1 - (2s+1)·G(s))`, short of `-1` by a term that scales with
+/// `maximum_error` (at `maximum_error = 0.01`, pixel variance 1, that factor is
+/// `0.9428`). Only at `variance == 0`, where `G` collapses to `[0, 1, 0]` and
+/// `G(s) = 0`, are the moments exact. The tests pin both regimes.
+fn gaussian_derivative_operator_coefficients(
+    pixel_variance: f64,
+    maximum_error: f64,
+    maximum_kernel_width: u32,
+    order: u32,
+    normalize_across_scale: bool,
+) -> Vec<f64> {
+    let coeff = gaussian_derivative_gaussian_coefficients(
+        pixel_variance,
+        maximum_error,
+        maximum_kernel_width,
+    );
+    if order == 0 {
+        return coeff;
+    }
+
+    let norm = if normalize_across_scale {
+        pixel_variance.powf(f64::from(order) / 2.0)
+    } else {
+        1.0
+    };
+
+    let deriv = derivative_operator_coefficients(order);
+    let width = deriv.len();
+    let n = (width - 1) / 2;
+
+    // Copy the Gaussian into the middle of a buffer padded by `2N - 1` clamped
+    // taps on each side (the `2N`-long fills each overwrite one already-copied
+    // tap with its own value).
+    let mut padded = vec![0.0f64; coeff.len() + 4 * n - 2];
+    padded[2 * n - 1..2 * n - 1 + coeff.len()].copy_from_slice(&coeff);
+    let (front, back) = (coeff[0], coeff[coeff.len() - 1]);
+    padded[..2 * n].fill(front);
+    let padded_len = padded.len();
+    padded[padded_len - 2 * n..].fill(back);
+
+    (n..padded_len - n)
+        .map(|i| {
+            let conv: f64 = (0..width)
+                .map(|j| padded[i + j - width / 2] * deriv[width - 1 - j])
+                .sum();
+            norm * conv
+        })
+        .collect()
+}
+
+/// `DiscreteGaussianDerivativeImageFilter`: separable convolution with
+/// [`gaussian_derivative_operator_coefficients`], one axis at a time, under
+/// [`ZeroFluxNeumannBoundaryCondition`].
+///
+/// `variance` and `order` are per axis; `maximum_error` and
+/// `maximum_kernel_width` are scalars shared by every axis (matching
+/// `DiscreteGaussianDerivativeImageFilter.yaml`, where — unlike
+/// `DiscreteGaussianImageFilter.yaml` — `MaximumError` is *not* `dim_vec`).
+/// Output keeps `img`'s pixel type.
+///
+/// Three upstream behaviours worth stating outright, because each will look
+/// like a bug to a caller who expects the textbook filter:
+///
+/// 1. **Odd orders come out negated.** `order = [1, 0]` on a ramp rising in `+x`
+///    returns `-slope`, not `+slope`. `GaussianDerivativeOperator` builds its
+///    coefficients as a convolution kernel, and the filter applies them by
+///    correlation without the `FlipAxes()` call that `DerivativeImageFilter`
+///    makes. Even orders are unaffected (their stencils are symmetric).
+/// 2. **`use_image_spacing` rescales the variance but not the derivative.**
+///    ITK divides `variance[d]` by `spacing[d]²` and stops there; the
+///    `norm /= spacing^order` line inside the operator divides by the operator's
+///    own `m_Spacing`, which `GenerateData` never sets away from `1.0`. So the
+///    result is a derivative per *index* step, never per physical unit, and
+///    `use_image_spacing` only changes how wide the Gaussian is.
+/// 3. **Intermediate images carry the *output* pixel type, not a real type.**
+///    `GenerateData` declares `RealOutputImageType = Image<OutputPixelType, …>`
+///    — `RealOutputPixelType` is used for the operator's value type but never
+///    for the intermediate image. Each axis's result is therefore
+///    `static_cast` back to the pixel type before the next axis reads it. On an
+///    integer image that truncates every partial derivative toward zero, which
+///    typically annihilates the whole result. The axes are convolved last-first
+///    (`oper[0]` has direction `ImageDimension - 1`), so the truncation is not
+///    even order-symmetric. This port reproduces the round-trip exactly.
+///
+/// `maximum_error` is clamped to `[0.00001, 0.99999]` rather than rejected (see
+/// [`clamp_maximum_error`]). Errors if `variance.len()` or `order.len()` differ
+/// from `img.dimension()`, or any `variance` is negative.
+pub fn discrete_gaussian_derivative(
+    img: &Image,
+    variance: &[f64],
+    order: &[u32],
+    maximum_error: f64,
+    maximum_kernel_width: u32,
+    use_image_spacing: bool,
+    normalize_across_scale: bool,
+) -> Result<Image> {
+    let dim = img.dimension();
+    if variance.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: variance.len(),
+        });
+    }
+    if order.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: order.len(),
+        });
+    }
+    if variance.iter().any(|&v| v < 0.0) {
+        return Err(FilterError::InvalidVariance(variance.to_vec()));
+    }
+
+    let maximum_error = clamp_maximum_error(maximum_error);
+    let spacing = img.spacing().to_vec();
+    let size = img.size().to_vec();
+    let pixel_id = img.pixel_id();
+    let mut current = scratch_f64(img)?;
+
+    // `oper[reverse_i]` has direction `i`, and the mini-pipeline applies
+    // `oper[0] .. oper[dim - 1]` in order: the last axis is convolved first.
+    for d in (0..dim).rev() {
+        let pixel_variance = if use_image_spacing {
+            variance[d] / (spacing[d] * spacing[d])
+        } else {
+            variance[d]
+        };
+        let kernel = gaussian_derivative_operator_coefficients(
+            pixel_variance,
+            maximum_error,
+            maximum_kernel_width,
+            order[d],
+            normalize_across_scale,
+        );
+        let half = kernel.len() / 2;
+        let mut radius = vec![0usize; dim];
+        radius[d] = half;
+
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &current,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )?;
+        let out: Vec<f64> = iter
+            .map(|(_, nb)| {
+                let mut off = vec![0i64; dim];
+                let acc: f64 = kernel
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &c)| {
+                        off[d] = k as i64 - half as i64;
+                        c * nb.get(&off)
+                    })
+                    .sum();
+                // `Image<OutputPixelType, …>` intermediate: static_cast every stage.
+                quantize_to_pixel_type(pixel_id, acc)
+            })
+            .collect();
+
+        current = Image::from_vec(&size, out)?;
+        current.copy_geometry_from(img);
+    }
+
+    image_from_f64(pixel_id, &size, img, &current.to_f64_vec())
 }
 
 // ---- binomial_blur ----------------------------------------------------
@@ -836,6 +1148,301 @@ mod tests {
         }
         let sum: f64 = kernel.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9, "kernel sum {sum}");
+    }
+
+    // ---- discrete_gaussian_derivative ----
+
+    /// A 21x5 `Float64` image carrying `f(x, y) = a·x + b·y`, spacing 1.
+    fn linear_ramp(a: f64, b: f64, w: usize, h: usize) -> Image {
+        let data = (0..w * h)
+            .map(|p| a * (p % w) as f64 + b * (p / w) as f64)
+            .collect::<Vec<f64>>();
+        Image::from_vec(&[w, h], data).unwrap()
+    }
+
+    /// With a zero variance the Gaussian collapses to `[0, 1, 0]`, so the
+    /// operator is exactly `DerivativeOperator`'s own stencil -- and the
+    /// convolution in `GenerateCoefficients` leaves it *unreversed*, which is
+    /// where the odd-order sign flip comes from.
+    #[test]
+    fn gaussian_derivative_operator_at_zero_variance_is_the_bare_stencil() {
+        assert_eq!(
+            gaussian_derivative_operator_coefficients(0.0, 0.01, 32, 1, false),
+            vec![0.5, 0.0, -0.5]
+        );
+        assert_eq!(
+            gaussian_derivative_operator_coefficients(0.0, 0.01, 32, 2, false),
+            vec![1.0, -2.0, 1.0]
+        );
+    }
+
+    /// `NormalizeAcrossScale` multiplies every tap by `variance^(order/2)` --
+    /// `variance = 4`, `order = 1` gives exactly `2`, `order = 2` exactly `4`.
+    #[test]
+    fn normalize_across_scale_scales_the_kernel_by_variance_to_the_half_order() {
+        for (order, factor) in [(1u32, 2.0f64), (2, 4.0)] {
+            let plain = gaussian_derivative_operator_coefficients(4.0, 0.01, 32, order, false);
+            let normalized = gaussian_derivative_operator_coefficients(4.0, 0.01, 32, order, true);
+            assert_eq!(plain.len(), normalized.len());
+            for (p, n) in plain.iter().zip(&normalized) {
+                assert!(
+                    (factor * p - n).abs() < 1e-15,
+                    "order {order}: {n} != {factor} * {p}"
+                );
+            }
+        }
+    }
+
+    /// At `order == 0` `GenerateCoefficients` returns before `norm` is ever
+    /// computed, so `NormalizeAcrossScale` is a no-op and the kernel still sums
+    /// to one.
+    #[test]
+    fn normalize_across_scale_is_ignored_at_order_zero() {
+        let plain = gaussian_derivative_operator_coefficients(4.0, 0.01, 32, 0, false);
+        let normalized = gaussian_derivative_operator_coefficients(4.0, 0.01, 32, 0, true);
+        assert_eq!(plain, normalized);
+        assert!((plain.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    /// The clamped-padding attenuation `1 - (2s + 1)·G(s)` derived in
+    /// [`gaussian_derivative_operator_coefficients`]'s docs, read off the
+    /// Gaussian alone.
+    fn clamped_padding_attenuation(pixel_variance: f64, maximum_error: f64) -> f64 {
+        let g = gaussian_derivative_gaussian_coefficients(pixel_variance, maximum_error, 32);
+        let s = (g.len() - 1) / 2;
+        1.0 - (2 * s + 1) as f64 * g[g.len() - 1]
+    }
+
+    /// The identity the operator doc claims: the padded convolution's stencil
+    /// has `Σ k[m] = 0` exactly, first moment `-(1 - (2s+1)·G(s))` at order 1,
+    /// and second moment `2·(1 - (2s+1)·G(s))` at order 2.
+    #[test]
+    fn clamped_padding_shifts_the_stencil_moments() {
+        let attenuation = clamped_padding_attenuation(1.0, 0.01);
+        assert!((attenuation - 0.942_785_177_159_576).abs() < 1e-12);
+
+        for (order, expected_moment) in [(1u32, -attenuation), (2, 2.0 * attenuation)] {
+            let k = gaussian_derivative_operator_coefficients(1.0, 0.01, 32, order, false);
+            let c = (k.len() - 1) as f64 / 2.0;
+            let sum: f64 = k.iter().sum();
+            let moment: f64 = k
+                .iter()
+                .enumerate()
+                .map(|(m, &w)| w * (m as f64 - c).powi(order as i32))
+                .sum();
+            assert!(sum.abs() < 1e-15, "order {order}: sum of taps = {sum}");
+            assert!(
+                (moment - expected_moment).abs() < 1e-12,
+                "order {order}: moment {moment} != {expected_moment}"
+            );
+        }
+    }
+
+    /// At `variance == 0` the Gaussian collapses to `[0, 1, 0]`, `G(s) = 0`, and
+    /// the stencil moments are exact -- so the first derivative of a ramp of
+    /// slope 3 is exactly `-3` on every interior pixel. Negative, because the
+    /// operator is never flipped.
+    #[test]
+    fn first_derivative_of_a_ramp_is_the_negated_slope_at_zero_variance() {
+        let img = linear_ramp(3.0, 0.0, 21, 5);
+        let out = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[1, 0], 0.01, 32, false, false)
+            .unwrap();
+        let v = out.to_f64_vec();
+        for y in 0..5 {
+            for x in 1..20 {
+                let got = v[y * 21 + x];
+                assert!(
+                    (got - -3.0).abs() < 1e-12,
+                    "({x},{y}): expected -3.0, got {got}"
+                );
+            }
+        }
+    }
+
+    /// `use_image_spacing` divides the *variance* by `spacing²` and does nothing
+    /// else: physical variance 4 at spacing 2 reproduces the pixel-variance-1
+    /// result at spacing 1, tap for tap. The derivative stays per index step --
+    /// were it also divided by `spacing^order`, these two would differ by 2.
+    #[test]
+    fn use_image_spacing_rescales_only_the_variance() {
+        let mut coarse = linear_ramp(3.0, 0.0, 21, 5);
+        coarse.set_spacing(&[2.0, 2.0]).unwrap();
+        let fine = linear_ramp(3.0, 0.0, 21, 5);
+
+        let a = discrete_gaussian_derivative(&coarse, &[4.0, 4.0], &[1, 0], 0.01, 32, true, false)
+            .unwrap()
+            .to_f64_vec();
+        let b = discrete_gaussian_derivative(&fine, &[1.0, 1.0], &[1, 0], 0.01, 32, false, false)
+            .unwrap()
+            .to_f64_vec();
+        assert_eq!(a, b);
+
+        // The shared value is the attenuated slope: neither -3.0 nor -1.5.
+        let expected = -3.0 * clamped_padding_attenuation(1.0, 0.01);
+        assert!((expected - -2.828_355_531_478_728).abs() < 1e-12);
+        assert!((a[2 * 21 + 10] - expected).abs() < 1e-12);
+    }
+
+    /// Even orders have symmetric stencils, so no sign flip: the second
+    /// derivative of `x²` is `+2` at zero variance, and `2·attenuation` once the
+    /// Gaussian has width.
+    #[test]
+    fn second_derivative_of_a_quadratic_is_the_positive_constant() {
+        let data = (0..21 * 5)
+            .map(|p| {
+                let x = (p % 21) as f64;
+                x * x
+            })
+            .collect::<Vec<f64>>();
+        let img = Image::from_vec(&[21, 5], data).unwrap();
+
+        let sharp =
+            discrete_gaussian_derivative(&img, &[0.0, 0.0], &[2, 0], 0.01, 32, false, false)
+                .unwrap()
+                .to_f64_vec()[2 * 21 + 10];
+        assert!((sharp - 2.0).abs() < 1e-9, "expected 2.0, got {sharp}");
+
+        let smooth =
+            discrete_gaussian_derivative(&img, &[1.0, 1.0], &[2, 0], 0.01, 32, false, false)
+                .unwrap()
+                .to_f64_vec()[2 * 21 + 10];
+        let expected = 2.0 * clamped_padding_attenuation(1.0, 0.01);
+        assert!(
+            (smooth - expected).abs() < 1e-9,
+            "expected {expected}, got {smooth}"
+        );
+    }
+
+    /// On `f(x, y) = 3x + 5y` the x-order picks out `-3` and the y-order `-5`:
+    /// `order` really is indexed per axis, and the smoothed axis annihilates the
+    /// other term (a derivative kernel sums to zero).
+    #[test]
+    fn order_selects_the_axis_it_is_indexed_on() {
+        let img = linear_ramp(3.0, 5.0, 21, 21);
+        let center = 10 * 21 + 10;
+
+        let dx = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[1, 0], 0.01, 32, false, false)
+            .unwrap()
+            .to_f64_vec()[center];
+        assert!((dx - -3.0).abs() < 1e-12, "expected -3.0, got {dx}");
+
+        let dy = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[0, 1], 0.01, 32, false, false)
+            .unwrap()
+            .to_f64_vec()[center];
+        assert!((dy - -5.0).abs() < 1e-12, "expected -5.0, got {dy}");
+    }
+
+    /// `NormalizeAcrossScale` end to end: pixel variance 4 scales the
+    /// first-derivative response by exactly `sqrt(4) = 2`, attenuation and all.
+    #[test]
+    fn normalize_across_scale_scales_the_ramp_derivative() {
+        let img = linear_ramp(3.0, 0.0, 41, 9);
+        let center = 4 * 41 + 20;
+        let plain =
+            discrete_gaussian_derivative(&img, &[4.0, 4.0], &[1, 0], 0.01, 32, false, false)
+                .unwrap()
+                .to_f64_vec()[center];
+        let normalized =
+            discrete_gaussian_derivative(&img, &[4.0, 4.0], &[1, 0], 0.01, 32, false, true)
+                .unwrap()
+                .to_f64_vec()[center];
+
+        let expected = -3.0 * clamped_padding_attenuation(4.0, 0.01);
+        assert!(
+            (plain - expected).abs() < 1e-12,
+            "expected {expected}, got {plain}"
+        );
+        assert!(
+            (normalized - 2.0 * expected).abs() < 1e-12,
+            "expected {}, got {normalized}",
+            2.0 * expected
+        );
+    }
+
+    /// The `Image<OutputPixelType, …>` intermediate (module docs, quirk 3):
+    /// smoothing a unit impulse in an `Int32` image annihilates it, because the
+    /// peak tap of a normalized Gaussian is `< 1` and the *intermediate* is
+    /// `static_cast` back to `Int32` after the first axis. The same data as
+    /// `Float64` keeps a nonzero centre.
+    #[test]
+    fn integer_intermediates_are_truncated_between_axes() {
+        let mut data = vec![0i32; 25];
+        data[2 * 5 + 2] = 1;
+        let integral = Image::from_vec(&[5, 5], data).unwrap();
+        let out =
+            discrete_gaussian_derivative(&integral, &[1.0, 1.0], &[0, 0], 0.01, 32, false, false)
+                .unwrap();
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[0i32; 25]);
+
+        let mut real = vec![0.0f64; 25];
+        real[2 * 5 + 2] = 1.0;
+        let real = Image::from_vec(&[5, 5], real).unwrap();
+        let out = discrete_gaussian_derivative(&real, &[1.0, 1.0], &[0, 0], 0.01, 32, false, false)
+            .unwrap();
+        assert!(out.to_f64_vec()[2 * 5 + 2] > 0.0);
+    }
+
+    /// `GaussianDerivativeOperator::SetMaximumError` clamps to
+    /// `[0.00001, 0.99999]` instead of throwing, so out-of-range values are
+    /// accepted (contrast [`discrete_gaussian`], whose `GaussianOperator`
+    /// throws).
+    #[test]
+    fn maximum_error_is_clamped_not_rejected() {
+        assert_eq!(clamp_maximum_error(5.0), 0.99999);
+        assert_eq!(clamp_maximum_error(-1.0), 0.00001);
+        assert_eq!(clamp_maximum_error(0.01), 0.01);
+
+        let img = linear_ramp(3.0, 0.0, 21, 5);
+        for maximum_error in [-1.0, 0.0, 1.0, 5.0] {
+            assert!(
+                discrete_gaussian_derivative(
+                    &img,
+                    &[1.0, 1.0],
+                    &[1, 0],
+                    maximum_error,
+                    32,
+                    false,
+                    false
+                )
+                .is_ok(),
+                "maximum_error {maximum_error} should be clamped, not rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn discrete_gaussian_derivative_rejects_wrong_variance_length() {
+        let img = Image::new(&[4, 4], PixelId::Float64);
+        assert_eq!(
+            discrete_gaussian_derivative(&img, &[1.0], &[1, 0], 0.01, 32, false, false)
+                .unwrap_err(),
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    #[test]
+    fn discrete_gaussian_derivative_rejects_wrong_order_length() {
+        let img = Image::new(&[4, 4], PixelId::Float64);
+        assert_eq!(
+            discrete_gaussian_derivative(&img, &[1.0, 1.0], &[1], 0.01, 32, false, false)
+                .unwrap_err(),
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    #[test]
+    fn discrete_gaussian_derivative_rejects_negative_variance() {
+        let img = Image::new(&[4, 4], PixelId::Float64);
+        assert!(matches!(
+            discrete_gaussian_derivative(&img, &[-1.0, 1.0], &[1, 0], 0.01, 32, false, false),
+            Err(FilterError::InvalidVariance(_))
+        ));
     }
 
     #[test]
