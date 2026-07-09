@@ -517,6 +517,52 @@ pub enum FilterError {
     #[error("target reached mode requires at least one target point")]
     NoTargetPoints,
 
+    /// `PatchBasedDenoisingImageFilter::Initialize` throws "Patch is larger
+    /// than the entire image (in at least one dimension)" when the index
+    /// `2 * PatchRadiusInVoxels` falls outside the largest possible region,
+    /// i.e. when some axis is shorter than the patch diameter.
+    #[error("patch diameter {diameter:?} does not fit in an image of size {size:?}")]
+    PatchLargerThanImage {
+        size: Vec<usize>,
+        diameter: Vec<usize>,
+    },
+
+    /// `PatchBasedDenoisingImageFilter::EnforceConstraints` throws "Each image
+    /// component must be nonconstant" — the kernel-bandwidth rescale factor is
+    /// `100 / (max - min)`, which a constant image would divide by zero.
+    #[error("patch-based denoising requires a nonconstant image; every pixel has the value {0}")]
+    ConstantImage(f64),
+
+    /// `PatchBasedDenoisingImageFilter::EnforceConstraints` throws when the
+    /// POISSON or RICIAN noise model is selected and the image has a negative
+    /// value.
+    #[error("the POISSON and RICIAN noise models require a nonnegative image; the minimum is {0}")]
+    NegativeIntensityForNoiseModel(f64),
+
+    /// `PatchBasedDenoisingImageFilter::Initialize` throws "Gaussian kernel
+    /// sigma ... must be larger than" `MinSigma`
+    /// (`NumericTraits<double>::min() * 100`).
+    #[error("kernel bandwidth sigma {0} must be larger than {1}")]
+    KernelBandwidthSigmaTooSmall(f64, f64),
+
+    /// `PatchBasedDenoisingImageFilter::InitializePatchWeightsSmoothDisc`
+    /// throws "Center pixel's weight ... must be greater than 0.0" when the
+    /// resampled smooth-disc mask has a nonpositive centre.
+    #[error("the smooth-disc patch mask has a nonpositive center weight {0}")]
+    PatchCenterWeightNotPositive(f64),
+
+    /// `PatchBasedDenoisingImageFilter::ThreadedComputeSigmaUpdate`'s
+    /// `itkAssertOrThrowMacro(probJointEntropy[ic] > 0.0, ...)`. Reached when
+    /// `NumberOfSamplePatches` is zero, so the per-pixel probability is `0/0`.
+    #[error("kernel bandwidth estimation sampled no patches; NumberOfSamplePatches must be >= 1")]
+    NoPatchesSampled,
+
+    /// SimpleITK's `PatchBasedDenoisingImageFilter` derives the sampler radius
+    /// as `Math::Floor<unsigned int>(sqrt(SampleVariance) * 2.5)`, which is
+    /// undefined for a negative variance.
+    #[error("sample variance must be nonnegative, got {0}")]
+    InvalidSampleVariance(f64),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
