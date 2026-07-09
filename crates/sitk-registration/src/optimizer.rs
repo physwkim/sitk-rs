@@ -16,6 +16,54 @@
 
 use crate::convergence::WindowConvergenceMonitor;
 
+/// The scalar objective the line-search optimizers minimize.
+///
+/// They probe [`value`](Self::value) many times per iteration — once per
+/// golden-section refinement — and read no gradient on those probes. A caller
+/// passing a plain `(value, gradient)` closure to `optimize` therefore computes
+/// and drops a gradient at every probe, because a closure has no value-only
+/// kernel. A caller that *has* one — as every metric in this crate does —
+/// implements this trait, overrides `value`, and calls `optimize_objective`.
+pub trait Objective {
+    /// `(value, gradient)` at `p`.
+    fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>);
+
+    /// The value at `p` alone. Override whenever it is cheaper than throwing
+    /// away `value_and_gradient`'s gradient.
+    fn value(&mut self, p: &[f64]) -> f64 {
+        self.value_and_gradient(p).0
+    }
+}
+
+/// So an objective can be driven by an optimizer and still be read afterwards
+/// (mirrors `impl FnMut for &mut F`). Forwards both methods, so a `&mut O`
+/// keeps `O`'s value-only kernel.
+impl<O: Objective + ?Sized> Objective for &mut O {
+    fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
+        (**self).value_and_gradient(p)
+    }
+
+    fn value(&mut self, p: &[f64]) -> f64 {
+        (**self).value(p)
+    }
+}
+
+/// Adapts a `(value, gradient)` closure to [`Objective`], for the `optimize`
+/// entry points that take one. It cannot override [`Objective::value`] — a
+/// closure has no value-only kernel — so every line-search probe through this
+/// adapter computes a gradient and drops it. That is what
+/// `optimize_objective` exists to avoid.
+struct FnObjective<F>(F);
+
+impl<F> Objective for FnObjective<F>
+where
+    F: FnMut(&[f64]) -> (f64, Vec<f64>),
+{
+    fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
+        (self.0)(p)
+    }
+}
+
 /// Why the optimizer stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -626,11 +674,28 @@ impl GradientDescentLineSearchOptimizer {
     /// `initial`. `eval(p)` returns `(value, gradient)` of the objective at `p`.
     /// Returns the lowest-value iterate visited.
     ///
+    /// Each iteration takes one gradient to find the descent direction, then up
+    /// to `maximum_line_search_iterations` **value-only** probes along it. A
+    /// closure has no value-only kernel, so those probes compute and discard a
+    /// gradient; a caller that has one should call
+    /// [`optimize_objective`](Self::optimize_objective) instead.
+    ///
     /// Panics if configured scales' length differs from `initial.len()`.
-    pub fn optimize<F>(&self, initial: Vec<f64>, mut eval: F) -> OptimizerResult
+    pub fn optimize<F>(&self, initial: Vec<f64>, eval: F) -> OptimizerResult
     where
         F: FnMut(&[f64]) -> (f64, Vec<f64>),
     {
+        self.run(initial, FnObjective(eval))
+    }
+
+    /// [`optimize`](Self::optimize) driven by an explicit [`Objective`], so the
+    /// line search's value probes reach [`Objective::value`] rather than the
+    /// blanket closure implementation's discard-the-gradient fallback.
+    pub fn optimize_objective<O: Objective>(&self, initial: Vec<f64>, eval: O) -> OptimizerResult {
+        self.run(initial, eval)
+    }
+
+    fn run<O: Objective>(&self, initial: Vec<f64>, mut eval: O) -> OptimizerResult {
         let n = initial.len();
         let ones = vec![1.0; n];
         let scales: &[f64] = match &self.scales {
@@ -646,7 +711,7 @@ impl GradientDescentLineSearchOptimizer {
             .map(|(window, _)| WindowConvergenceMonitor::new(window));
 
         let mut p = initial;
-        let (mut value, mut grad) = eval(&p);
+        let (mut value, mut grad) = eval.value_and_gradient(&p);
         // ITK's line search sets ReturnBestParametersAndValue = true: keep the
         // lowest-value iterate, correctly paired with its parameters.
         let mut best_value = value;
@@ -692,7 +757,7 @@ impl GradientDescentLineSearchOptimizer {
                 let d_ref = &d;
                 let mut line_value = |x: f64| -> f64 {
                     let trial: Vec<f64> = (0..n).map(|k| p_ref[k] - x * d_ref[k]).collect();
-                    eval(&trial).0
+                    eval.value(&trial)
                 };
                 golden_section_search(
                     self.epsilon,
@@ -715,7 +780,7 @@ impl GradientDescentLineSearchOptimizer {
             }
             taken += 1;
 
-            let (v, g) = eval(&p);
+            let (v, g) = eval.value_and_gradient(&p);
             value = v;
             grad = g;
 
@@ -861,11 +926,25 @@ impl ConjugateGradientLineSearchOptimizer {
     /// search from `initial`. `eval(p)` returns `(value, gradient)` of the
     /// objective at `p`. Returns the lowest-value iterate visited.
     ///
+    /// As with the plain line search, each iteration is one gradient plus a run
+    /// of value-only probes along the conjugate direction — see
+    /// [`optimize_objective`](Self::optimize_objective).
+    ///
     /// Panics if configured scales' length differs from `initial.len()`.
-    pub fn optimize<F>(&self, initial: Vec<f64>, mut eval: F) -> OptimizerResult
+    pub fn optimize<F>(&self, initial: Vec<f64>, eval: F) -> OptimizerResult
     where
         F: FnMut(&[f64]) -> (f64, Vec<f64>),
     {
+        self.run(initial, FnObjective(eval))
+    }
+
+    /// [`optimize`](Self::optimize) driven by an explicit [`Objective`], so the
+    /// line search's value probes reach [`Objective::value`].
+    pub fn optimize_objective<O: Objective>(&self, initial: Vec<f64>, eval: O) -> OptimizerResult {
+        self.run(initial, eval)
+    }
+
+    fn run<O: Objective>(&self, initial: Vec<f64>, mut eval: O) -> OptimizerResult {
         let n = initial.len();
         let ones = vec![1.0; n];
         let scales: &[f64] = match &self.scales {
@@ -881,7 +960,7 @@ impl ConjugateGradientLineSearchOptimizer {
             .map(|(window, _)| WindowConvergenceMonitor::new(window));
 
         let mut p = initial;
-        let (mut value, mut grad) = eval(&p);
+        let (mut value, mut grad) = eval.value_and_gradient(&p);
         let mut best_value = value;
         let mut best_params = p.clone();
         let mut base_lr = self.learning_rate;
@@ -944,7 +1023,7 @@ impl ConjugateGradientLineSearchOptimizer {
                 let d_ref = &conjugate;
                 let mut line_value = |x: f64| -> f64 {
                     let trial: Vec<f64> = (0..n).map(|k| p_ref[k] - x * d_ref[k]).collect();
-                    eval(&trial).0
+                    eval.value(&trial)
                 };
                 golden_section_search(
                     self.epsilon,
@@ -967,7 +1046,7 @@ impl ConjugateGradientLineSearchOptimizer {
             }
             taken += 1;
 
-            let (v, g) = eval(&p);
+            let (v, g) = eval.value_and_gradient(&p);
             value = v;
             grad = g;
 
@@ -1254,5 +1333,51 @@ mod tests {
         assert!(r.iterations < 100_000);
         assert!((r.parameters[0] - 3.0).abs() < 1e-3, "{:?}", r.parameters);
         assert!((r.parameters[1] + 2.0).abs() < 1e-3, "{:?}", r.parameters);
+    }
+
+    /// Counts how the line searches split their work between the two
+    /// `Objective` methods.
+    #[derive(Debug)]
+    struct CountingObjective {
+        gradients: usize,
+        values: usize,
+    }
+
+    impl Objective for CountingObjective {
+        fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
+            self.gradients += 1;
+            let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
+            (v, vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)])
+        }
+
+        fn value(&mut self, p: &[f64]) -> f64 {
+            self.values += 1;
+            (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2)
+        }
+    }
+
+    #[test]
+    fn line_search_probes_the_value_only_kernel() {
+        // Every golden-section probe must reach `Objective::value`. If the
+        // probes went through `value_and_gradient` instead, `values` would be 0
+        // and each probe would have paid for a gradient it never reads.
+        let opt = GradientDescentLineSearchOptimizer::new(1.0, 5);
+        let mut obj = CountingObjective {
+            gradients: 0,
+            values: 0,
+        };
+        let r = opt.optimize_objective(vec![0.0, 0.0], &mut obj);
+        assert!(obj.values > obj.gradients, "{obj:?}");
+        // One gradient per iteration (plus the initial evaluation), no more.
+        assert!(obj.gradients <= r.iterations + 2, "{obj:?}");
+
+        let opt = ConjugateGradientLineSearchOptimizer::new(1.0, 5);
+        let mut obj = CountingObjective {
+            gradients: 0,
+            values: 0,
+        };
+        let r = opt.optimize_objective(vec![0.0, 0.0], &mut obj);
+        assert!(obj.values > obj.gradients, "{obj:?}");
+        assert!(obj.gradients <= r.iterations + 2, "{obj:?}");
     }
 }

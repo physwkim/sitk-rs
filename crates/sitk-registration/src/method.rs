@@ -48,7 +48,7 @@ use crate::metric::{
 };
 use crate::optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
-    GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason,
+    GradientDescentOptimizer, Objective, RegularStepGradientDescentOptimizer, StopReason,
 };
 use crate::scales::PhysicalShiftScales;
 
@@ -129,6 +129,33 @@ enum ActiveMetric {
     AntsNeighborhoodCorrelation(AntsNeighborhoodCorrelationMetric),
     JointHistogram(JointHistogramMutualInformationMetric),
     Demons(DemonsMetric),
+}
+
+/// The registration objective handed to the line-search optimizers: set the
+/// transform's parameters, then ask the metric.
+///
+/// This exists rather than a closure so that [`Objective::value`] routes to
+/// [`ActiveMetric::value`]. The line searches probe the value up to
+/// `maximum_line_search_iterations` times per iteration and read no gradient on
+/// those probes; a closure has no value-only kernel, so each probe would pay
+/// for a derivative it never reads.
+struct MetricObjective<'a, T: ParametricTransform> {
+    transform: &'a mut T,
+    metric: &'a ActiveMetric,
+    backend: &'a dyn MetricBackend,
+}
+
+impl<T: ParametricTransform> Objective for MetricObjective<'_, T> {
+    fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
+        self.transform.set_parameters(p);
+        let m = self.metric.evaluate(&*self.transform, self.backend);
+        (m.value, m.derivative)
+    }
+
+    fn value(&mut self, p: &[f64]) -> f64 {
+        self.transform.set_parameters(p);
+        self.metric.value(&*self.transform, self.backend)
+    }
 }
 
 impl ActiveMetric {
@@ -1335,6 +1362,18 @@ impl ImageRegistrationMethod {
                 }
             };
         }
+        // The line searches take an `Objective` so their golden-section probes
+        // reach `ActiveMetric::value` instead of the closure adapter's
+        // discard-the-gradient fallback.
+        macro_rules! line_search_objective {
+            () => {
+                MetricObjective {
+                    transform: &mut transform,
+                    metric: &metric,
+                    backend,
+                }
+            };
+        }
         // The same objective for the gradient-free optimizers, which consume the
         // value alone.
         macro_rules! value_objective {
@@ -1429,7 +1468,9 @@ impl ImageRegistrationMethod {
                 match self.learning_rate_mode {
                     // Caller-supplied fixed base rate; the golden-section search
                     // adapts it each iteration.
-                    LearningRateMode::Manual => optimizer.optimize(start, objective!()),
+                    LearningRateMode::Manual => {
+                        optimizer.optimize_objective(start, line_search_objective!())
+                    }
                     // ITK's line search estimates the base rate once, at the
                     // first iteration; the golden-section search then adapts it
                     // every step. No per-iteration re-estimation and no one-voxel
@@ -1445,7 +1486,7 @@ impl ImageRegistrationMethod {
                         let m0 = metric.evaluate(&transform, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
-                        optimizer.optimize(start, objective!())
+                        optimizer.optimize_objective(start, line_search_objective!())
                     }
                 }
             }
@@ -1455,7 +1496,9 @@ impl ImageRegistrationMethod {
                 match self.learning_rate_mode {
                     // Caller-supplied fixed base rate; the golden-section search
                     // adapts it each iteration along the conjugate direction.
-                    LearningRateMode::Manual => optimizer.optimize(start, objective!()),
+                    LearningRateMode::Manual => {
+                        optimizer.optimize_objective(start, line_search_objective!())
+                    }
                     // Base rate estimated once from the initial gradient, exactly
                     // as the plain line search does — ITK's conjugate optimizer
                     // also calls EstimateLearningRate only at m_CurrentIteration
@@ -1467,7 +1510,7 @@ impl ImageRegistrationMethod {
                         let m0 = metric.evaluate(&transform, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
-                        optimizer.optimize(start, objective!())
+                        optimizer.optimize_objective(start, line_search_objective!())
                     }
                 }
             }

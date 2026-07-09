@@ -150,6 +150,7 @@ pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResu
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue, SamplingStrategy};
 pub use optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
-    GradientDescentOptimizer, OptimizerResult, RegularStepGradientDescentOptimizer, StopReason,
+    GradientDescentOptimizer, Objective, OptimizerResult, RegularStepGradientDescentOptimizer,
+    StopReason,
 };
 pub use scales::PhysicalShiftScales;
