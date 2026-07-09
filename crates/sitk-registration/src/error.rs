@@ -68,6 +68,36 @@ pub enum RegistrationError {
     /// information is undefined (matches ITK, which throws in this case).
     #[error("Mattes mutual information is undefined: {which} image has a constant intensity value")]
     ConstantIntensity { which: &'static str },
+
+    /// `LandmarkBasedTransformInitializer`: the fixed and moving landmark
+    /// containers have different lengths (matches ITK's
+    /// `itkExceptionStringMacro("Different number of fixed and moving
+    /// landmarks")`).
+    #[error("landmark count mismatch: {fixed} fixed vs {moving} moving")]
+    LandmarkCountMismatch { fixed: usize, moving: usize },
+
+    /// `LandmarkBasedTransformInitializer`: fewer landmarks were supplied
+    /// than the requested transform needs to be uniquely determined — a
+    /// rigid transform needs at least `dimension` landmarks to compute a
+    /// rotation, an affine transform needs at least `dimension + 1`. Unlike
+    /// ITK, which silently falls back to an identity rotation when a rigid
+    /// transform is under-supplied, this port rejects the input.
+    #[error("insufficient landmarks: got {got}, need at least {required}")]
+    InsufficientLandmarks { got: usize, required: usize },
+
+    /// `LandmarkBasedTransformInitializer`: the landmark weight vector's
+    /// length does not match the number of landmarks (matches ITK's
+    /// `itkExceptionStringMacro("size mismatch between number of landmarks
+    /// pairs and weights")`, checked only for the affine path, which is the
+    /// only path that reads landmark weights).
+    #[error("landmark weight length {got} != number of landmarks {expected}")]
+    LandmarkWeightLength { got: usize, expected: usize },
+
+    /// `LandmarkBasedTransformInitializer`: the affine least-squares normal
+    /// equations matrix is singular (e.g. collinear or coplanar landmarks),
+    /// so no unique affine transform fits the landmarks.
+    #[error("degenerate landmark configuration: normal-equations matrix is singular")]
+    DegenerateLandmarks,
 }
 
 /// Registration result alias.

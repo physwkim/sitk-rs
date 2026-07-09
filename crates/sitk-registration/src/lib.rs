@@ -117,6 +117,7 @@
 
 pub mod convergence;
 pub mod error;
+pub mod gradient_free;
 pub mod initializer;
 pub mod lbfgsb;
 pub mod mattes;
@@ -127,6 +128,9 @@ pub mod scales;
 
 pub use convergence::WindowConvergenceMonitor;
 pub use error::{RegistrationError, Result};
+pub use gradient_free::{
+    AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
+};
 pub use initializer::{CenteredTransformInitializer, OperationMode};
 pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
