@@ -357,6 +357,31 @@ pub enum FilterError {
     #[error("this filter requires at least one input image")]
     EmptyImageList,
 
+    /// `ImageToImageFilter::VerifyInputInformation` (`itkImageToImageFilter.hxx`)
+    /// throws "Inputs do not occupy the same physical space!" when an input's
+    /// origin, spacing or direction differs from the primary input's by more
+    /// than `GlobalDefaultCoordinateTolerance`/`GlobalDefaultDirectionTolerance`
+    /// (both `1e-6` by default). `JoinSeriesImageFilter` does not override this
+    /// base check, so it still applies across every joined input.
+    #[error("input image {index} does not occupy the same physical space as the first input")]
+    PhysicalSpaceMismatch { index: usize },
+
+    /// An input to a multi-input filter is smaller, along some axis, than the
+    /// primary (first) input, whose extent determines the filter's requested
+    /// region for every input. Upstream this surfaces as ITK's
+    /// `InvalidRequestedRegionError`, thrown when the pipeline propagates the
+    /// primary input's region onto an input too small to contain it -- e.g.
+    /// `JoinSeriesImageFilter::GenerateInputRequestedRegion`, which copies the
+    /// output region (sized from the first input) onto every input unchanged.
+    #[error(
+        "input image {index} has size {size:?}, smaller than the primary input's size {primary_size:?}"
+    )]
+    InputSmallerThanPrimary {
+        index: usize,
+        size: Vec<usize>,
+        primary_size: Vec<usize>,
+    },
+
     /// `MaskedAssignImageFilter.yaml`'s `filter_type` fixes the mask image's
     /// ITK template parameter to `itk::Image<std::uint8_t, ...>`, with no
     /// fallback casting path the way `MaskImageFilter.yaml`'s `MaskImage`
