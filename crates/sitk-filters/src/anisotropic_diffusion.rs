@@ -1,0 +1,798 @@
+//! ITK's Perona-Malik anisotropic diffusion family, ported from
+//! `Modules/Filtering/AnisotropicSmoothing/include/`
+//! (`itkAnisotropicDiffusionFunction.h`, `itkAnisotropicDiffusionImageFilter.hxx`,
+//! `itkScalarAnisotropicDiffusionFunction.hxx`,
+//! `itkGradientAnisotropicDiffusionImageFilter.h` →
+//! `itkGradientNDAnisotropicDiffusionFunction.hxx`,
+//! `itkCurvatureAnisotropicDiffusionImageFilter.h` →
+//! `itkCurvatureNDAnisotropicDiffusionFunction.hxx`) plus the shared solver in
+//! `Core/FiniteDifference/include/` (`itkFiniteDifferenceImageFilter.hxx`,
+//! `itkDenseFiniteDifferenceImageFilter.hxx`).
+//!
+//! # The shared driver
+//!
+//! Both filters are `DenseFiniteDifferenceImageFilter` explicit-Euler solvers:
+//! the input is copied to the output, then `number_of_iterations` rounds of
+//! "compute the whole update buffer from a frozen snapshot, then
+//! `output += time_step · update`" run (`GenerateData`'s `while (!Halt())`
+//! loop, `CalculateChange` then `ApplyUpdate`). Zero iterations therefore
+//! leaves the cast copy of the input untouched. Every neighborhood read uses
+//! [`ZeroFluxNeumannBoundaryCondition`], the default boundary condition of
+//! ITK's `ConstNeighborhoodIterator`, and the ND functions both set
+//! `radius = 1` along every axis, so the stencil is the full `3^dim` window.
+//!
+//! `FiniteDifferenceImageFilter::InitializeFunctionCoefficients` sets the
+//! per-axis scale coefficients to `1/spacing[d]` when `m_UseImageSpacing`
+//! (`true` by default, and never overridden by SimpleITK) and to `1`
+//! otherwise; every finite difference below is multiplied by them.
+//!
+//! # The conductance normalization `K`
+//!
+//! `AnisotropicDiffusionImageFilter::InitializeIteration` calls
+//! `CalculateAverageGradientMagnitudeSquared(output)` whenever
+//! `elapsed_iterations % conductance_scaling_update_interval == 0`, and each ND
+//! function's `InitializeIteration` then forms
+//!
+//! ```text
+//! K = average_gradient_magnitude_squared · conductance² · (−2)
+//! ```
+//!
+//! so the conductance terms `exp(g²/K)` are ITK's spelling of
+//! `exp(−g²/(2·conductance²·⟨|∇u|²⟩))`. `itkScalarAnisotropicDiffusionFunction.hxx`'s
+//! estimator ([`average_gradient_magnitude_squared`]) is the mean over *every*
+//! pixel of the current solution (interior and zero-flux boundary faces alike,
+//! `counter` counting pixels, not pixel×axis) of
+//! `Σᵢ (scale[i]·(u[p+eᵢ] − u[p−eᵢ]) / −2)²`. When `K == 0` — a constant image,
+//! or `conductance == 0` — both `.hxx` files take the `if (m_K != 0.0)` false
+//! branch and leave the conductances at `0.0`, which makes a constant image an
+//! exact fixed point of both filters.
+//!
+//! # Time step
+//!
+//! `InitializeIteration` compares `time_step` against
+//! `min(spacing) / 2^(dim+1)` (with `min(spacing)` replaced by `1` when
+//! `use_image_spacing` is off) and, when it is larger, emits an
+//! `itkWarningMacro` and *proceeds anyway* — the commented-out clamp right
+//! above the warning shows ITK deliberately does not correct it. These
+//! functions reproduce that: an unstable `time_step` is accepted and computed
+//! with. [`stable_time_step_bound`] exposes the bound so callers can check it
+//! themselves. This diverges from [`crate::curvature_flow`], which rejects an
+//! unstable step with [`FilterError::UnstableTimeStep`]; there the bound is
+//! this crate's own derivation, whereas here it is ITK's, and ITK only warns.
+//!
+//! # Pixel types
+//!
+//! Both SimpleITK yaml files declare `pixel_types: RealPixelIDTypeList`, so the
+//! wrappers only instantiate for `float` and `double` and the output type
+//! equals the input type. Anything else is [`FilterError::RequiresRealPixelType`]
+//! here (a compile error in C++; `FiniteDifferenceImageFilter::GenerateData`
+//! additionally warns "Output pixel type MUST be float or double"). All
+//! arithmetic is done in `f64` and narrowed on store, so a `Float32` input
+//! differs from ITK in rounding only, not in the update equation.
+
+use crate::error::{FilterError, Result};
+use crate::image_from_f64;
+use sitk_core::{
+    Image, Neighborhood, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition,
+};
+
+/// `CurvatureNDAnisotropicDiffusionFunction::m_MIN_NORM`, the additive floor
+/// under the square root that keeps the normalized first-order differences
+/// finite where the gradient vanishes. (`GradientNDAnisotropicDiffusionFunction`
+/// declares the same constant but never reads it.)
+const MIN_NORM: f64 = 1.0e-10;
+
+/// `AnisotropicDiffusionImageFilter::InitializeIteration`'s stability bound,
+/// `min(spacing) / 2^(dim+1)` — with `min(spacing)` taken as `1` when
+/// `use_image_spacing` is off, exactly as the `.hxx` does. ITK only warns when
+/// `time_step` exceeds this; these filters likewise accept and compute.
+pub fn stable_time_step_bound(img: &Image, use_image_spacing: bool) -> f64 {
+    let min_spacing = if use_image_spacing {
+        img.spacing().iter().copied().fold(f64::INFINITY, f64::min)
+    } else {
+        1.0
+    };
+    min_spacing / 2.0f64.powi(img.dimension() as i32 + 1)
+}
+
+/// The per-axis scale coefficients of
+/// `FiniteDifferenceImageFilter::InitializeFunctionCoefficients`.
+fn scale_coefficients(img: &Image, use_image_spacing: bool) -> Vec<f64> {
+    img.spacing()
+        .iter()
+        .map(|&s| if use_image_spacing { 1.0 / s } else { 1.0 })
+        .collect()
+}
+
+/// `ScalarAnisotropicDiffusionFunction::CalculateAverageGradientMagnitudeSquared`:
+/// the mean over every pixel of the current solution of the squared,
+/// spacing-scaled centered gradient. Boundary faces read through
+/// [`ZeroFluxNeumannBoundaryCondition`]; `counter` advances once per *pixel*,
+/// while `accumulator` takes one squared term per pixel *and axis*.
+fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result<f64> {
+    let dim = snapshot.dimension();
+    let radius = vec![1usize; dim];
+    let iter =
+        NeighborhoodIterator::<f64, _>::new(snapshot, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    let mut accumulator = 0.0f64;
+    let mut counter = 0usize;
+    let mut off = vec![0i64; dim];
+
+    for (_, nb) in iter {
+        counter += 1;
+        for (i, &s) in scale.iter().enumerate() {
+            off[i] = 1;
+            let plus = nb.get(&off);
+            off[i] = -1;
+            let minus = nb.get(&off);
+            off[i] = 0;
+            let val = (plus - minus) / -2.0 * s;
+            accumulator += val * val;
+        }
+    }
+
+    if counter == 0 {
+        return Ok(0.0);
+    }
+    Ok(accumulator / counter as f64)
+}
+
+/// `GradientNDAnisotropicDiffusionFunction::ComputeUpdate`: the classic
+/// Perona-Malik update, with the gradient magnitude entering each per-axis
+/// conductance as the half-difference along that axis plus the averaged
+/// cross-axis centered differences (`0.25·(dx[j] + dx_aug)²`), which is the
+/// "more robust technique for gradient magnitude estimation" the class doc
+/// refers to.
+fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+    let dim = scale.len();
+    let center = nb.center_value();
+    let mut off = vec![0i64; dim];
+
+    // Centralized derivatives, one per dimension.
+    let mut dx = vec![0.0f64; dim];
+    for (i, d) in dx.iter_mut().enumerate() {
+        off[i] = 1;
+        let plus = nb.get(&off);
+        off[i] = -1;
+        let minus = nb.get(&off);
+        off[i] = 0;
+        *d = (plus - minus) / 2.0 * scale[i];
+    }
+
+    let mut delta = 0.0f64;
+    for i in 0..dim {
+        off[i] = 1;
+        let plus_i = nb.get(&off);
+        off[i] = -1;
+        let minus_i = nb.get(&off);
+        off[i] = 0;
+
+        // "Half" directional derivatives.
+        let mut dx_forward = (plus_i - center) * scale[i];
+        let mut dx_backward = (center - minus_i) * scale[i];
+
+        // The conductance varies per axis because the gradient magnitude
+        // approximation is different along each axis.
+        let mut accum = 0.0f64;
+        let mut accum_d = 0.0f64;
+        for j in 0..dim {
+            if j == i {
+                continue;
+            }
+            off[i] = 1;
+            off[j] = 1;
+            let aug_plus = nb.get(&off);
+            off[j] = -1;
+            let aug_minus = nb.get(&off);
+            off[i] = -1;
+            let dim_minus = nb.get(&off);
+            off[j] = 1;
+            let dim_plus = nb.get(&off);
+            off[i] = 0;
+            off[j] = 0;
+
+            let dx_aug = (aug_plus - aug_minus) / 2.0 * scale[j];
+            let dx_dim = (dim_plus - dim_minus) / 2.0 * scale[j];
+            accum += 0.25 * (dx[j] + dx_aug).powi(2);
+            accum_d += 0.25 * (dx[j] + dx_dim).powi(2);
+        }
+
+        let (cx, cxd) = if k != 0.0 {
+            (
+                ((dx_forward * dx_forward + accum) / k).exp(),
+                ((dx_backward * dx_backward + accum_d) / k).exp(),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        // Conductance modified first order derivatives, differenced into a
+        // conductance modified second order derivative.
+        dx_forward *= cx;
+        dx_backward *= cxd;
+        delta += dx_forward - dx_backward;
+    }
+
+    delta
+}
+
+/// `CurvatureNDAnisotropicDiffusionFunction::ComputeUpdate`: the modified
+/// curvature diffusion equation. The conductance-modified first-order
+/// differences are normalized by the local gradient magnitude before being
+/// differenced into `speed`, and the result is multiplied by an upwind
+/// `|∇u|` chosen by the sign of `speed`.
+///
+/// ITK's centered differences here come from a `NeighborhoodInnerProduct` with
+/// a first-order `DerivativeOperator`, whose coefficients are `{0.5, 0, −0.5}`
+/// — i.e. the *negated* centered difference. They are only ever consumed as
+/// `(dx[j] + dx_aug)²`, with both terms produced the same way, so this port
+/// uses the un-negated centered difference for both and the square is
+/// identical.
+fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+    let dim = scale.len();
+    let center = nb.center_value();
+    let mut off = vec![0i64; dim];
+
+    let mut dx_forward = vec![0.0f64; dim];
+    let mut dx_backward = vec![0.0f64; dim];
+    let mut dx = vec![0.0f64; dim];
+    for i in 0..dim {
+        off[i] = 1;
+        let plus = nb.get(&off);
+        off[i] = -1;
+        let minus = nb.get(&off);
+        off[i] = 0;
+
+        dx_forward[i] = (plus - center) * scale[i];
+        dx_backward[i] = (center - minus) * scale[i];
+        dx[i] = (plus - minus) / 2.0 * scale[i];
+    }
+
+    let mut speed = 0.0f64;
+    for i in 0..dim {
+        // Gradient magnitude approximations.
+        let mut grad_mag_sq = dx_forward[i] * dx_forward[i];
+        let mut grad_mag_sq_d = dx_backward[i] * dx_backward[i];
+        for j in 0..dim {
+            if j == i {
+                continue;
+            }
+            off[i] = 1;
+            off[j] = 1;
+            let aug_plus = nb.get(&off);
+            off[j] = -1;
+            let aug_minus = nb.get(&off);
+            off[i] = -1;
+            let dim_minus = nb.get(&off);
+            off[j] = 1;
+            let dim_plus = nb.get(&off);
+            off[i] = 0;
+            off[j] = 0;
+
+            let dx_aug = (aug_plus - aug_minus) / 2.0 * scale[j];
+            let dx_dim = (dim_plus - dim_minus) / 2.0 * scale[j];
+            grad_mag_sq += 0.25 * (dx[j] + dx_aug).powi(2);
+            grad_mag_sq_d += 0.25 * (dx[j] + dx_dim).powi(2);
+        }
+
+        let grad_mag = (MIN_NORM + grad_mag_sq).sqrt();
+        let grad_mag_d = (MIN_NORM + grad_mag_sq_d).sqrt();
+
+        let (cx, cxd) = if k != 0.0 {
+            ((grad_mag_sq / k).exp(), (grad_mag_sq_d / k).exp())
+        } else {
+            (0.0, 0.0)
+        };
+
+        // First order normalized finite-difference conductance products,
+        // differenced into a second order conductance-modified curvature.
+        speed += (dx_forward[i] / grad_mag) * cx - (dx_backward[i] / grad_mag_d) * cxd;
+    }
+
+    // "Upwind" gradient magnitude term.
+    let mut propagation_gradient = 0.0f64;
+    for i in 0..dim {
+        propagation_gradient += if speed > 0.0 {
+            dx_backward[i].min(0.0).powi(2) + dx_forward[i].max(0.0).powi(2)
+        } else {
+            dx_backward[i].max(0.0).powi(2) + dx_forward[i].min(0.0).powi(2)
+        };
+    }
+
+    propagation_gradient.sqrt() * speed
+}
+
+/// `AnisotropicDiffusionImageFilter`'s iteration loop, shared by both filters:
+/// per iteration, refresh `K` when `elapsed % interval == 0`, compute the whole
+/// update buffer from the frozen previous solution, then add `time_step ·
+/// update` to it.
+fn diffuse(
+    img: &Image,
+    time_step: f64,
+    conductance_parameter: f64,
+    conductance_scaling_update_interval: u32,
+    number_of_iterations: u32,
+    use_image_spacing: bool,
+    update: fn(&Neighborhood<f64>, &[f64], f64) -> f64,
+) -> Result<Image> {
+    let pixel_id = img.pixel_id();
+    if !matches!(pixel_id, PixelId::Float32 | PixelId::Float64) {
+        return Err(FilterError::RequiresRealPixelType(pixel_id));
+    }
+    if conductance_scaling_update_interval == 0 {
+        return Err(FilterError::ZeroConductanceScalingUpdateInterval);
+    }
+
+    let dim = img.dimension();
+    let scale = scale_coefficients(img, use_image_spacing);
+    let size = img.size().to_vec();
+    let radius = vec![1usize; dim];
+    let mut buf = img.to_f64_vec();
+    let mut k = 0.0f64;
+
+    for elapsed in 0..number_of_iterations {
+        let mut snapshot = Image::from_vec(&size, buf.clone())?;
+        snapshot.copy_geometry_from(img);
+
+        if elapsed % conductance_scaling_update_interval == 0 {
+            let average = average_gradient_magnitude_squared(&snapshot, &scale)?;
+            k = average * conductance_parameter * conductance_parameter * -2.0;
+        }
+
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &snapshot,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )?;
+        for ((_, nb), v) in iter.zip(buf.iter_mut()) {
+            *v += time_step * update(&nb, &scale, k);
+        }
+    }
+
+    image_from_f64(pixel_id, &size, img, &buf)
+}
+
+/// `GradientAnisotropicDiffusionImageFilter`: the classic Perona-Malik
+/// gradient-magnitude-driven anisotropic diffusion, in N dimensions.
+///
+/// SimpleITK defaults: `time_step = 0.125`, `conductance_parameter = 3.0`,
+/// `conductance_scaling_update_interval = 1`, `number_of_iterations = 5`.
+/// `use_image_spacing` is not exposed by SimpleITK; ITK's default is `true`.
+///
+/// An unstable `time_step` (one above [`stable_time_step_bound`]) is accepted
+/// and computed with, as ITK's `itkWarningMacro`-and-proceed does.
+///
+/// Errors if `img`'s pixel type is not `Float32`/`Float64`
+/// (`RealPixelIDTypeList`), or if `conductance_scaling_update_interval` is `0`
+/// (the `.hxx` would divide by zero).
+pub fn gradient_anisotropic_diffusion(
+    img: &Image,
+    time_step: f64,
+    conductance_parameter: f64,
+    conductance_scaling_update_interval: u32,
+    number_of_iterations: u32,
+    use_image_spacing: bool,
+) -> Result<Image> {
+    diffuse(
+        img,
+        time_step,
+        conductance_parameter,
+        conductance_scaling_update_interval,
+        number_of_iterations,
+        use_image_spacing,
+        gradient_update,
+    )
+}
+
+/// `CurvatureAnisotropicDiffusionImageFilter`: the modified curvature
+/// diffusion equation (MCDE), in N dimensions.
+///
+/// SimpleITK defaults: `time_step = 0.0625`, `conductance_parameter = 3.0`,
+/// `conductance_scaling_update_interval = 1`, `number_of_iterations = 5`.
+/// `use_image_spacing` is not exposed by SimpleITK; ITK's default is `true`.
+///
+/// An unstable `time_step` (one above [`stable_time_step_bound`]) is accepted
+/// and computed with, as ITK's `itkWarningMacro`-and-proceed does.
+///
+/// Errors if `img`'s pixel type is not `Float32`/`Float64`
+/// (`RealPixelIDTypeList`), or if `conductance_scaling_update_interval` is `0`.
+pub fn curvature_anisotropic_diffusion(
+    img: &Image,
+    time_step: f64,
+    conductance_parameter: f64,
+    conductance_scaling_update_interval: u32,
+    number_of_iterations: u32,
+    use_image_spacing: bool,
+) -> Result<Image> {
+    diffuse(
+        img,
+        time_step,
+        conductance_parameter,
+        conductance_scaling_update_interval,
+        number_of_iterations,
+        use_image_spacing,
+        curvature_update,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variance(vals: &[f64]) -> f64 {
+        let n = vals.len() as f64;
+        let mean = vals.iter().sum::<f64>() / n;
+        vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n
+    }
+
+    /// A 9x9 image of deterministic high-frequency noise around a mean of 50.
+    ///
+    /// Deliberately *not* a checkerboard: a checkerboard has a zero centered
+    /// difference at every pixel, so `average_gradient_magnitude_squared` would
+    /// be `0`, `K` would be `0`, and every filter here would be the identity.
+    fn ripple() -> Image {
+        let n = 9;
+        let data: Vec<f64> = (0..n * n)
+            .map(|idx| 42.0 + ((idx * 37) % 17) as f64)
+            .collect();
+        Image::from_vec(&[n, n], data).unwrap()
+    }
+
+    // ---- pixel type / parameter guards ----
+
+    #[test]
+    fn non_real_pixel_type_is_rejected() {
+        let img = Image::from_vec(&[3, 3], vec![1i16; 9]).unwrap();
+        assert_eq!(
+            gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 5, true),
+            Err(FilterError::RequiresRealPixelType(PixelId::Int16))
+        );
+        assert_eq!(
+            curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 5, true),
+            Err(FilterError::RequiresRealPixelType(PixelId::Int16))
+        );
+    }
+
+    #[test]
+    fn float32_input_yields_float32_output() {
+        let img = Image::from_vec(&[5, 5], vec![1.0f32; 25]).unwrap();
+        let out = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 2, true).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+        let out = curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 2, true).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    #[test]
+    fn zero_conductance_scaling_update_interval_is_rejected() {
+        let img = ripple();
+        assert_eq!(
+            gradient_anisotropic_diffusion(&img, 0.125, 3.0, 0, 5, true),
+            Err(FilterError::ZeroConductanceScalingUpdateInterval)
+        );
+        assert_eq!(
+            curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 0, 5, true),
+            Err(FilterError::ZeroConductanceScalingUpdateInterval)
+        );
+    }
+
+    #[test]
+    fn unstable_time_step_is_accepted_not_rejected() {
+        let img = ripple();
+        // 2-D, unit spacing: the bound is 1/2^3 = 0.125.
+        assert_eq!(stable_time_step_bound(&img, true), 0.125);
+        assert!(gradient_anisotropic_diffusion(&img, 10.0, 3.0, 1, 1, true).is_ok());
+        assert!(curvature_anisotropic_diffusion(&img, 10.0, 3.0, 1, 1, true).is_ok());
+    }
+
+    #[test]
+    fn stable_time_step_bound_tracks_min_spacing_and_dimension() {
+        let mut img = Image::from_vec(&[3, 3, 3], vec![0.0f64; 27]).unwrap();
+        img.set_spacing(&[2.0, 0.5, 3.0]).unwrap();
+        // min spacing 0.5, dim 3 -> 0.5 / 2^4.
+        assert_eq!(stable_time_step_bound(&img, true), 0.5 / 16.0);
+        // spacing off -> 1 / 2^4.
+        assert_eq!(stable_time_step_bound(&img, false), 1.0 / 16.0);
+    }
+
+    // ---- fixed points and identity ----
+
+    #[test]
+    fn constant_image_is_a_fixed_point() {
+        let img = Image::from_vec(&[6, 5], vec![7.0f64; 30]).unwrap();
+        for out in [
+            gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 5, true).unwrap(),
+            curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 5, true).unwrap(),
+        ] {
+            assert!(out.to_f64_vec().iter().all(|&v| v == 7.0));
+        }
+    }
+
+    #[test]
+    fn zero_conductance_is_a_fixed_point() {
+        // K = 0 forces both conductance terms to 0.0 in the `.hxx`'s
+        // `if (m_K != 0.0)` guard.
+        let img = ripple();
+        let before = img.to_f64_vec();
+        for out in [
+            gradient_anisotropic_diffusion(&img, 0.125, 0.0, 1, 3, true).unwrap(),
+            curvature_anisotropic_diffusion(&img, 0.0625, 0.0, 1, 3, true).unwrap(),
+        ] {
+            assert_eq!(out.to_f64_vec(), before);
+        }
+    }
+
+    #[test]
+    fn zero_iterations_is_identity() {
+        let img = ripple();
+        let before = img.to_f64_vec();
+        for out in [
+            gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 0, true).unwrap(),
+            curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 0, true).unwrap(),
+        ] {
+            assert_eq!(out.to_f64_vec(), before);
+            assert_eq!(out.pixel_id(), PixelId::Float64);
+        }
+    }
+
+    // ---- hand-derived single-iteration stencil ----
+
+    /// A 5x5 image, zero but for `v = 1` at the center, unit spacing.
+    ///
+    /// The average gradient magnitude squared is `accumulator / counter` with
+    /// `counter = 25` and only the four axis neighbors of the hot pixel
+    /// contributing `(v/2)²` each: `avg = 4·(1/4)·v² / 25 = v²/25`. Hence
+    /// `K = −2·c²·v²/25` and `v²/K = −25/(2c²)`.
+    ///
+    /// For `gradient_update`, the diagonal neighbors get exactly zero (their
+    /// `dx_forward`/`dx_backward` both vanish along both axes, and the update
+    /// is a sum of those two terms scaled by conductances), the center gets
+    /// `−4·v·E` and each axis neighbor `+v·E`, where `E = exp(−25/(2c²))`.
+    #[test]
+    fn gradient_hot_pixel_spreads_to_the_plus_stencil_only() {
+        let n = 5;
+        let mut data = vec![0.0f64; n * n];
+        data[2 * n + 2] = 1.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+
+        let c = 3.0;
+        let dt = 0.125;
+        let out = gradient_anisotropic_diffusion(&img, dt, c, 1, 1, true).unwrap();
+        let vals = out.to_f64_vec();
+
+        let e = (-25.0 / (2.0 * c * c)).exp();
+        let expect_center = 1.0 + dt * (-4.0 * e);
+        let expect_axis = dt * e;
+
+        for y in 0..n {
+            for x in 0..n {
+                let expected = match (x.abs_diff(2), y.abs_diff(2)) {
+                    (0, 0) => expect_center,
+                    (1, 0) | (0, 1) => expect_axis,
+                    _ => 0.0,
+                };
+                assert!(
+                    (vals[y * n + x] - expected).abs() < 1e-12,
+                    "({x},{y}): {} != {expected}",
+                    vals[y * n + x]
+                );
+            }
+        }
+        // Gradient AD's update is a divergence, so it conserves total mass.
+        assert!((vals.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    /// Same image under `curvature_update`. Writing `g = sqrt(MIN_NORM + v²)`
+    /// and `E = exp(−25/(2c²))`: the center has `speed = −4vE/g` and upwind
+    /// `|∇u| = 2v`, so its update is `−8v²E/g`; each axis neighbor has
+    /// `speed = +vE/g` and upwind `|∇u| = v`, so its update is `+v²E/g`; the
+    /// diagonals have `speed = 0` and a zero upwind term. Unlike gradient AD,
+    /// MCDE does not conserve mass.
+    #[test]
+    fn curvature_hot_pixel_spreads_to_the_plus_stencil_only() {
+        let n = 5;
+        let mut data = vec![0.0f64; n * n];
+        data[2 * n + 2] = 1.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+
+        let c = 3.0;
+        let dt = 0.0625;
+        let out = curvature_anisotropic_diffusion(&img, dt, c, 1, 1, true).unwrap();
+        let vals = out.to_f64_vec();
+
+        let e = (-25.0 / (2.0 * c * c)).exp();
+        let g = (MIN_NORM + 1.0).sqrt();
+        let expect_center = 1.0 + dt * (-8.0 * e / g);
+        let expect_axis = dt * (e / g);
+
+        for y in 0..n {
+            for x in 0..n {
+                let expected = match (x.abs_diff(2), y.abs_diff(2)) {
+                    (0, 0) => expect_center,
+                    (1, 0) | (0, 1) => expect_axis,
+                    _ => 0.0,
+                };
+                assert!(
+                    (vals[y * n + x] - expected).abs() < 1e-12,
+                    "({x},{y}): {} != {expected}",
+                    vals[y * n + x]
+                );
+            }
+        }
+    }
+
+    // ---- edge preservation ----
+
+    /// The defining invariant of Perona-Malik: the conductance
+    /// `exp(−g²/(2c²⟨|∇u|²⟩))` is strictly decreasing in the local gradient, so
+    /// within a single image (one shared `K`) a high-contrast step loses a far
+    /// smaller *fraction* of its contrast than a low-contrast step does.
+    ///
+    /// Comparing a step against a linear ramp of equal total magnitude would not
+    /// test this: a linear ramp has zero second difference, so it is nearly a
+    /// fixed point of any diffusion regardless of conductance. The contrast
+    /// ratio below isolates the conductance term itself.
+    #[test]
+    fn gradient_ad_preserves_a_strong_edge_far_better_than_a_weak_one() {
+        // 20 columns, 3 rows, constant along y: a weak pulse of height 2 and a
+        // strong pulse of height 100, each 4 columns wide and separated from
+        // everything else by 4 flat columns.
+        let (w, h) = (20usize, 3usize);
+        let profile: Vec<f64> = (0..w)
+            .map(|x| match x {
+                4..=7 => 2.0,
+                12..=15 => 100.0,
+                _ => 0.0,
+            })
+            .collect();
+        let data: Vec<f64> = (0..w * h).map(|idx| profile[idx % w]).collect();
+        let img = Image::from_vec(&[w, h], data).unwrap();
+
+        let out = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 5, true).unwrap();
+        let vals = out.to_f64_vec();
+        let row = |x: usize| vals[w + x]; // middle row
+
+        let weak_kept = (row(4) - row(3)) / 2.0;
+        let strong_kept = (row(12) - row(11)) / 100.0;
+
+        // Both edges share one `K = −2·c²·⟨|∇u|²⟩ ≈ −9004` (the mean is
+        // dominated by the four `±100` jumps: `4·(100/2)²·3 rows / 60 pixels ≈
+        // 500`). The weak edge then sees `exp(−2²/9004) ≈ 1` — it diffuses at
+        // essentially the full isotropic rate — while the strong edge sees
+        // `exp(−100²/9004) ≈ 0.33`. Measured: the weak edge keeps 0.374 of its
+        // contrast, the strong edge 0.670.
+        assert!(
+            strong_kept > weak_kept,
+            "conductance must decrease with gradient: weak {weak_kept}, strong {strong_kept}"
+        );
+        assert!(
+            weak_kept < 0.45,
+            "weak edge kept {weak_kept}; expected substantial diffusion"
+        );
+        assert!(
+            strong_kept > 0.6,
+            "strong edge kept only {strong_kept} of its contrast"
+        );
+    }
+
+    // ---- conductance sweep: isotropic limit ----
+
+    /// As `conductance → ∞`, `K → −∞` and every conductance term tends to
+    /// `exp(0) = 1`, leaving the plain explicit heat equation; as
+    /// `conductance → 0`, `K → 0⁻` and every conductance term tends to `0`,
+    /// leaving the identity. Variance reduction is monotone between the two.
+    #[test]
+    fn large_conductance_smooths_isotropically_small_conductance_barely_moves() {
+        let img = ripple();
+        let v0 = variance(&img.to_f64_vec());
+
+        let small = gradient_anisotropic_diffusion(&img, 0.125, 0.01, 1, 3, true).unwrap();
+        let large = gradient_anisotropic_diffusion(&img, 0.125, 1.0e4, 1, 3, true).unwrap();
+
+        let v_small = variance(&small.to_f64_vec());
+        let v_large = variance(&large.to_f64_vec());
+
+        assert!(
+            (v_small - v0).abs() / v0 < 1e-6,
+            "small conductance changed variance from {v0} to {v_small}"
+        );
+        // Measured: 24.51 -> 1.49, a 94% reduction.
+        assert!(
+            v_large < 0.1 * v0,
+            "large conductance only reduced variance from {v0} to {v_large}"
+        );
+    }
+
+    // ---- spacing ----
+
+    #[test]
+    fn use_image_spacing_off_ignores_spacing() {
+        let mut coarse = ripple();
+        coarse.set_spacing(&[2.0, 3.0]).unwrap();
+        let unit = ripple();
+
+        let a = gradient_anisotropic_diffusion(&coarse, 0.02, 3.0, 1, 3, false).unwrap();
+        let b = gradient_anisotropic_diffusion(&unit, 0.02, 3.0, 1, 3, false).unwrap();
+        assert_eq!(a.to_f64_vec(), b.to_f64_vec());
+
+        // ... and with spacing on, the same pixel data diffuses differently.
+        let c = gradient_anisotropic_diffusion(&coarse, 0.02, 3.0, 1, 3, true).unwrap();
+        assert!(
+            c.to_f64_vec()
+                .iter()
+                .zip(b.to_f64_vec())
+                .any(|(x, y)| (x - y).abs() > 1e-9)
+        );
+    }
+
+    #[test]
+    fn use_image_spacing_on_matches_unit_spacing_when_spacing_is_unit() {
+        let img = ripple();
+        let a = curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 3, true).unwrap();
+        let b = curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 3, false).unwrap();
+        assert_eq!(a.to_f64_vec(), b.to_f64_vec());
+    }
+
+    // ---- conductance scaling update interval ----
+
+    /// `elapsed % interval == 0` gates the `K` refresh, so an interval of `2`
+    /// reuses iteration 0's `K` for iteration 1 and must differ from an
+    /// interval of `1` once the solution has moved.
+    #[test]
+    fn conductance_scaling_update_interval_gates_the_k_refresh() {
+        let img = ripple();
+        let every = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 3, true).unwrap();
+        let every_other = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 2, 3, true).unwrap();
+        assert!(
+            every
+                .to_f64_vec()
+                .iter()
+                .zip(every_other.to_f64_vec())
+                .any(|(a, b)| (a - b).abs() > 1e-12)
+        );
+
+        // A single iteration only ever uses the `elapsed == 0` refresh, so
+        // every interval agrees there.
+        let one_a = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 1, true).unwrap();
+        let one_b = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 7, 1, true).unwrap();
+        assert_eq!(one_a.to_f64_vec(), one_b.to_f64_vec());
+    }
+
+    // ---- average gradient magnitude squared ----
+
+    /// `counter` counts pixels, not pixel×axis, and boundary faces are included
+    /// under zero-flux Neumann. For the hot-pixel image that makes the mean
+    /// `v²/25` rather than `v²/50` (per-axis) or `v²/9` (interior only).
+    #[test]
+    fn average_gradient_magnitude_squared_averages_over_pixels_not_axes() {
+        let n = 5;
+        let mut data = vec![0.0f64; n * n];
+        data[2 * n + 2] = 1.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+        let avg = average_gradient_magnitude_squared(&img, &[1.0, 1.0]).unwrap();
+        assert!((avg - 1.0 / 25.0).abs() < 1e-15);
+    }
+
+    /// A linear ramp along x with slope `s` per pixel has centered gradient `s`
+    /// everywhere in the interior; under zero-flux Neumann the two boundary
+    /// columns see a half-difference of `s/2`. With unit scale this pins the
+    /// estimator exactly.
+    #[test]
+    fn average_gradient_magnitude_squared_uses_zero_flux_neumann_at_the_boundary() {
+        let (w, h) = (4usize, 2usize);
+        let s = 3.0;
+        let data: Vec<f64> = (0..w * h).map(|i| s * (i % w) as f64).collect();
+        let img = Image::from_vec(&[w, h], data).unwrap();
+
+        // Per pixel: x-term is s² in the two interior columns and (s/2)² in the
+        // two boundary columns; the y-term is 0 everywhere (rows are equal,
+        // and zero-flux makes both rows' y-neighbors identical).
+        let expected = h as f64 * (2.0 * s * s + 2.0 * (s / 2.0).powi(2)) / (w * h) as f64;
+        let avg = average_gradient_magnitude_squared(&img, &[1.0, 1.0]).unwrap();
+        assert!((avg - expected).abs() < 1e-12, "{avg} != {expected}");
+
+        // Scale coefficients enter squared: halving them quarters the mean.
+        let scaled = average_gradient_magnitude_squared(&img, &[0.5, 0.5]).unwrap();
+        assert!((scaled - expected / 4.0).abs() < 1e-12);
+    }
+}
