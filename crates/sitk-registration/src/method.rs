@@ -32,9 +32,16 @@ use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
 
 use crate::error::{RegistrationError, Result};
+use crate::gradient_free::{
+    AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
+};
+use crate::lbfgs2::LBFGS2Optimizer;
 use crate::lbfgsb::LBFGSBOptimizer;
 use crate::mattes::MattesMutualInformationMetric;
-use crate::metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue};
+use crate::metric::{
+    CpuBackend, FixedSamples, MeanSquaresMetric, MetricBackend, MetricValue, MovingImage,
+    SamplingStrategy,
+};
 use crate::optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
     GradientDescentOptimizer, RegularStepGradientDescentOptimizer, StopReason,
@@ -116,6 +123,17 @@ impl ActiveMetric {
         }
     }
 
+    /// Value alone at `transform`, for the gradient-free optimizers.
+    ///
+    /// No metric in this crate has a value-only kernel, so this computes the
+    /// parameter-derivative and discards it. That is a wasted `O(nsamples ·
+    /// nparams)` accumulation per evaluation, not a wrong answer; adding a
+    /// value-only reduction means a new [`MetricBackend`] method, which a GPU
+    /// backend would want in any case.
+    fn value(&self, transform: &dyn ParametricTransform, backend: &dyn MetricBackend) -> f64 {
+        self.evaluate(transform, backend).value
+    }
+
     /// Physical-shift scale/learning-rate estimator over the fixed samples.
     fn physical_shift_scales(&self, transform: &dyn ParametricTransform) -> PhysicalShiftScales {
         match self {
@@ -148,6 +166,29 @@ enum OptimizerKind {
     /// learning rate — it drives the raw metric gradient through a line search —
     /// and it optionally clamps every parameter to a scalar `[lower, upper]` box.
     Lbfgsb(LbfgsbConfig),
+    /// Unconstrained limited-memory BFGS (`itk::LBFGS2Optimizerv4`). Like
+    /// [`Lbfgsb`](Self::Lbfgsb) it ignores parameter scales and the learning
+    /// rate, driving the raw metric gradient through its own line search.
+    Lbfgs2(LBFGS2Optimizer),
+    /// Nelder–Mead downhill simplex (`itk::AmoebaOptimizerv4`).
+    Amoeba(AmoebaOptimizer),
+    /// Powell's direction-set method (`itk::PowellOptimizerv4`).
+    Powell(PowellOptimizer),
+    /// (1+1) evolutionary strategy (`itk::OnePlusOneEvolutionaryOptimizerv4`).
+    OnePlusOneEvolutionary(OnePlusOneEvolutionaryOptimizer),
+    /// Brute-force scan of a regular parameter grid centered on the initial
+    /// transform (`itk::ExhaustiveOptimizerv4`).
+    Exhaustive(ExhaustiveOptimizer),
+}
+
+impl OptimizerKind {
+    /// Whether this optimizer ignores parameter scales and the learning-rate
+    /// estimator. Both L-BFGS variants force identity scales in ITK
+    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the raw
+    /// metric gradient directly.
+    fn ignores_scales(&self) -> bool {
+        matches!(self, OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_))
+    }
 }
 
 /// Configuration for the L-BFGS-B optimizer, mirroring SimpleITK
@@ -226,6 +267,22 @@ pub struct ImageRegistrationMethod {
     scales_mode: ScalesMode,
     learning_rate_mode: LearningRateMode,
     backend: Box<dyn MetricBackend>,
+    /// Interpolator used to read the moving image at a mapped fixed point
+    /// (SimpleITK `SetInterpolator`). Defaults to linear.
+    interpolator: Interpolator,
+    /// How the fixed (virtual-domain) samples are drawn (SimpleITK
+    /// `SetMetricSamplingStrategy`). Defaults to every voxel.
+    sampling_strategy: SamplingStrategy,
+    /// Sampling percentage, one entry per resolution level. Empty means 1.0 at
+    /// every level; a single entry applies to every level.
+    sampling_percentage_per_level: Vec<f64>,
+    /// Seed for [`SamplingStrategy::Random`].
+    sampling_seed: u64,
+    /// Binary mask on the fixed image's grid; zero voxels are never sampled.
+    fixed_mask: Option<Image>,
+    /// Binary mask on the moving image's grid; a fixed point that maps into a
+    /// zero voxel counts as outside.
+    moving_mask: Option<Image>,
     /// One shrink factor per resolution level (applied to every dimension),
     /// coarsest first. Empty means a single full-resolution level.
     shrink_factors_per_level: Vec<usize>,
@@ -245,6 +302,12 @@ impl Default for ImageRegistrationMethod {
             scales_mode: ScalesMode::Unit,
             learning_rate_mode: LearningRateMode::Manual,
             backend: Box::new(CpuBackend),
+            interpolator: Interpolator::Linear,
+            sampling_strategy: SamplingStrategy::None,
+            sampling_percentage_per_level: Vec::new(),
+            sampling_seed: 0,
+            fixed_mask: None,
+            moving_mask: None,
             shrink_factors_per_level: Vec::new(),
             smoothing_sigmas_per_level: Vec::new(),
             smoothing_sigmas_in_physical_units: true,
@@ -488,6 +551,141 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Use **unconstrained** limited-memory BFGS (`itk::LBFGS2Optimizerv4`),
+    /// SimpleITK `SetOptimizerAsLBFGS2`. Like [`set_optimizer_as_lbfgsb`] it
+    /// ignores parameter scales and the learning rate. `number_of_iterations ==
+    /// 0` means "iterate until convergence" (SimpleITK's default).
+    ///
+    /// The remaining line-search knobs keep SimpleITK's defaults
+    /// (`MoreThuente`, Wolfe coefficient `0.9`, gradient accuracy `0.9`,
+    /// machine-precision tolerance `1e-16`); reach for
+    /// [`LBFGS2Optimizer`](crate::LBFGS2Optimizer) directly to change them.
+    ///
+    /// [`set_optimizer_as_lbfgsb`]: Self::set_optimizer_as_lbfgsb
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_optimizer_as_lbfgs2(
+        &mut self,
+        solution_accuracy: f64,
+        number_of_iterations: usize,
+        hessian_approximate_accuracy: usize,
+        delta_convergence_distance: usize,
+        delta_convergence_tolerance: f64,
+        line_search_maximum_evaluations: usize,
+        line_search_minimum_step: f64,
+        line_search_maximum_step: f64,
+        line_search_accuracy: f64,
+    ) -> &mut Self {
+        let mut opt = LBFGS2Optimizer::new();
+        opt.set_solution_accuracy(solution_accuracy)
+            .set_number_of_iterations(number_of_iterations)
+            .set_hessian_approximate_accuracy(hessian_approximate_accuracy)
+            .set_delta_convergence_distance(delta_convergence_distance)
+            .set_delta_convergence_tolerance(delta_convergence_tolerance)
+            .set_line_search_maximum_evaluations(line_search_maximum_evaluations)
+            .set_line_search_minimum_step(line_search_minimum_step)
+            .set_line_search_maximum_step(line_search_maximum_step)
+            .set_line_search_accuracy(line_search_accuracy);
+        self.optimizer = OptimizerKind::Lbfgs2(opt);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Use the **Nelder–Mead downhill simplex** (`itk::AmoebaOptimizerv4`),
+    /// SimpleITK `SetOptimizerAsAmoeba`. Gradient-free: the metric derivative is
+    /// never computed. `simplex_delta` is added to and subtracted from the
+    /// initial parameters to build the starting simplex, and is divided by the
+    /// optimizer scales per parameter.
+    pub fn set_optimizer_as_amoeba(
+        &mut self,
+        simplex_delta: f64,
+        number_of_iterations: usize,
+        parameters_convergence_tolerance: f64,
+        function_convergence_tolerance: f64,
+        with_restarts: bool,
+    ) -> &mut Self {
+        let mut opt = AmoebaOptimizer::new(simplex_delta, number_of_iterations);
+        opt.set_parameters_convergence_tolerance(parameters_convergence_tolerance)
+            .set_function_convergence_tolerance(function_convergence_tolerance)
+            .set_with_restarts(with_restarts);
+        self.optimizer = OptimizerKind::Amoeba(opt);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Use **Powell's direction-set method** (`itk::PowellOptimizerv4`),
+    /// SimpleITK `SetOptimizerAsPowell`. Gradient-free: the metric derivative is
+    /// never computed.
+    pub fn set_optimizer_as_powell(
+        &mut self,
+        number_of_iterations: usize,
+        maximum_line_iterations: usize,
+        step_length: f64,
+        step_tolerance: f64,
+        value_tolerance: f64,
+    ) -> &mut Self {
+        let mut opt = PowellOptimizer::new();
+        opt.set_number_of_iterations(number_of_iterations)
+            .set_maximum_line_iterations(maximum_line_iterations)
+            .set_step_length(step_length)
+            .set_step_tolerance(step_tolerance)
+            .set_value_tolerance(value_tolerance);
+        self.optimizer = OptimizerKind::Powell(opt);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Use the **(1+1) evolutionary strategy**
+    /// (`itk::OnePlusOneEvolutionaryOptimizerv4`), SimpleITK
+    /// `SetOptimizerAsOnePlusOneEvolutionary`. Gradient-free: the metric
+    /// derivative is never computed.
+    ///
+    /// A non-positive `growth_factor` or `shrink_factor` selects ITK's
+    /// `epsilon`-derived default (SimpleITK passes `-1.0` for both). Unlike
+    /// SimpleITK, `seed` has no wall-clock default: it is required, so every run
+    /// is reproducible.
+    pub fn set_optimizer_as_one_plus_one_evolutionary(
+        &mut self,
+        number_of_iterations: usize,
+        epsilon: f64,
+        initial_radius: f64,
+        growth_factor: f64,
+        shrink_factor: f64,
+        seed: i32,
+    ) -> &mut Self {
+        let mut opt = OnePlusOneEvolutionaryOptimizer::new(number_of_iterations, seed);
+        opt.set_epsilon(epsilon).set_initial_radius(initial_radius);
+        if growth_factor > 0.0 {
+            opt.set_growth_factor(growth_factor);
+        }
+        if shrink_factor > 0.0 {
+            opt.set_shrink_factor(shrink_factor);
+        }
+        self.optimizer = OptimizerKind::OnePlusOneEvolutionary(opt);
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
+    /// Use the **exhaustive grid scan** (`itk::ExhaustiveOptimizerv4`),
+    /// SimpleITK `SetOptimizerAsExhaustive`. Gradient-free: the metric
+    /// derivative is never computed.
+    ///
+    /// `number_of_steps` has one entry per transform parameter; parameter `k` is
+    /// swept over `2·number_of_steps[k] + 1` grid points spaced
+    /// `step_length / scales[k]` apart and centered on the initial value, so the
+    /// scan costs `∏ (2·steps[k] + 1)` metric evaluations. The result is the
+    /// grid point of least metric value — no local refinement follows, so this
+    /// is normally an initializer for another optimizer, not a final stage.
+    pub fn set_optimizer_as_exhaustive(
+        &mut self,
+        number_of_steps: Vec<usize>,
+        step_length: f64,
+    ) -> &mut Self {
+        self.optimizer =
+            OptimizerKind::Exhaustive(ExhaustiveOptimizer::new(number_of_steps, step_length));
+        self.learning_rate_mode = LearningRateMode::Manual;
+        self
+    }
+
     /// Set per-parameter optimizer scales manually. Length is validated against
     /// the transform's parameter count in [`execute`](Self::execute).
     pub fn set_optimizer_scales(&mut self, scales: Vec<f64>) -> &mut Self {
@@ -519,9 +717,17 @@ impl ImageRegistrationMethod {
             OptimizerKind::ConjugateGradientLineSearch(cg) => {
                 cg.set_min_step_tolerance(tol);
             }
-            // LBFGSB has no scaled-step tolerance; it stops via its projected-
-            // gradient and function-decrease criteria instead.
-            OptimizerKind::Lbfgsb(_) => {}
+            // Neither L-BFGS variant has a scaled-step tolerance; they stop via
+            // their projected-gradient and function-decrease criteria instead.
+            OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_) => {}
+            // Amoeba and Powell have their own parameter-convergence tolerances
+            // (`set_parameters_convergence_tolerance`, `set_step_tolerance`),
+            // set through their own SimpleITK setters; (1+1) evolutionary stops
+            // on its search radius (`epsilon`) and Exhaustive on its grid.
+            OptimizerKind::Amoeba(_)
+            | OptimizerKind::Powell(_)
+            | OptimizerKind::OnePlusOneEvolutionary(_)
+            | OptimizerKind::Exhaustive(_) => {}
         }
         self
     }
@@ -559,20 +765,137 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Set the interpolator used to read the moving image at a mapped fixed
+    /// point (SimpleITK `SetInterpolator`). Defaults to
+    /// [`Interpolator::Linear`].
+    ///
+    /// [`Interpolator::NearestNeighbor`] makes the metric piecewise constant, so
+    /// its analytic derivative is zero almost everywhere — usable with the
+    /// gradient-free optimizers, useless with the gradient-descent ones.
+    /// [`Interpolator::BSpline`] (cubic) and [`Interpolator::Gaussian`] are
+    /// smoother than linear and give a better-conditioned gradient at a higher
+    /// per-sample cost.
+    pub fn set_interpolator(&mut self, interpolator: Interpolator) -> &mut Self {
+        self.interpolator = interpolator;
+        self
+    }
+
+    /// Choose how the fixed image's virtual domain is sampled (SimpleITK
+    /// `SetMetricSamplingStrategy`). Defaults to [`SamplingStrategy::None`] —
+    /// every voxel. `Regular` and `Random` use the percentage set by
+    /// [`set_metric_sampling_percentage`](Self::set_metric_sampling_percentage).
+    pub fn set_metric_sampling_strategy(&mut self, strategy: SamplingStrategy) -> &mut Self {
+        self.sampling_strategy = strategy;
+        self
+    }
+
+    /// Set the fraction of virtual-domain voxels sampled at every level
+    /// (SimpleITK `SetMetricSamplingPercentage`). The percentage is of the voxel
+    /// count *after* the level's shrink factor is applied. `seed` seeds
+    /// [`SamplingStrategy::Random`]; it is ignored by the other strategies.
+    pub fn set_metric_sampling_percentage(&mut self, percentage: f64, seed: u64) -> &mut Self {
+        self.sampling_percentage_per_level = vec![percentage];
+        self.sampling_seed = seed;
+        self
+    }
+
+    /// Set the sampling fraction per resolution level, coarsest first
+    /// (SimpleITK `SetMetricSamplingPercentagePerLevel`). Must have one entry
+    /// per level; a length mismatch is reported by [`execute`](Self::execute) as
+    /// [`RegistrationError::SamplingPercentageLength`].
+    pub fn set_metric_sampling_percentage_per_level(
+        &mut self,
+        percentage: Vec<f64>,
+        seed: u64,
+    ) -> &mut Self {
+        self.sampling_percentage_per_level = percentage;
+        self.sampling_seed = seed;
+        self
+    }
+
+    /// Restrict fixed-image sampling to the nonzero voxels of `mask`, a binary
+    /// image on the fixed image's grid (SimpleITK `SetMetricFixedMask`).
+    ///
+    /// SimpleITK takes a mask in the fixed image's *physical space* and wraps it
+    /// in an `itk::ImageMaskSpatialObject`, evaluated at each virtual point. In
+    /// a multi-resolution run this crate resamples the mask onto each level's
+    /// coarse virtual grid with nearest-neighbor interpolation, which evaluates
+    /// the same physical-space predicate at the same points.
+    ///
+    /// Errors at [`execute`](Self::execute) if `mask` does not share the fixed
+    /// image's size.
+    pub fn set_metric_fixed_mask(&mut self, mask: &Image) -> &mut Self {
+        self.fixed_mask = Some(mask.clone());
+        self
+    }
+
+    /// Treat a fixed point that maps into a zero voxel of `mask` as outside the
+    /// moving image (SimpleITK `SetMetricMovingMask`). `mask` is a binary image
+    /// on the moving image's grid.
+    ///
+    /// Errors at [`execute`](Self::execute) if `mask` does not share the moving
+    /// image's size.
+    pub fn set_metric_moving_mask(&mut self, mask: &Image) -> &mut Self {
+        self.moving_mask = Some(mask.clone());
+        self
+    }
+
+    /// The sampling percentage for level `level`. An empty schedule means 1.0
+    /// (every candidate voxel); a single entry applies to every level.
+    fn sampling_percentage(&self, level: usize) -> f64 {
+        match self.sampling_percentage_per_level.len() {
+            0 => 1.0,
+            1 => self.sampling_percentage_per_level[0],
+            _ => self.sampling_percentage_per_level[level],
+        }
+    }
+
     /// Construct the metric selected by [`MetricKind`] for one resolution
-    /// level's fixed/moving pair.
-    fn build_metric(&self, fixed: &Image, moving: &Image) -> Result<ActiveMetric> {
+    /// level's fixed/moving pair, applying the sampling strategy (with the
+    /// level's percentage and the resampled fixed mask), the interpolator, and
+    /// the moving mask.
+    fn build_metric(
+        &self,
+        fixed: &Image,
+        moving: &Image,
+        fixed_mask: Option<&Image>,
+        level: usize,
+    ) -> Result<ActiveMetric> {
+        if fixed.dimension() != moving.dimension() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dimension(),
+                moving: moving.dimension(),
+            });
+        }
+        let samples = FixedSamples::from_image_with(
+            fixed,
+            self.sampling_strategy,
+            self.sampling_percentage(level),
+            self.sampling_seed,
+            fixed_mask,
+        )?;
+        if samples.is_empty() {
+            return Err(RegistrationError::NoValidSamples);
+        }
+        let mut moving_image =
+            MovingImage::from_image_with_interpolator(moving, self.interpolator)?;
+        if let Some(mask) = &self.moving_mask {
+            moving_image = moving_image.with_moving_mask(mask)?;
+        }
+
         match &self.metric_kind {
-            MetricKind::MeanSquares => Ok(ActiveMetric::MeanSquares(MeanSquaresMetric::new(
-                fixed, moving,
-            )?)),
+            MetricKind::MeanSquares => Ok(ActiveMetric::MeanSquares(
+                MeanSquaresMetric::from_samples(samples, moving_image)?,
+            )),
             MetricKind::MattesMutualInformation {
                 number_of_histogram_bins,
-            } => Ok(ActiveMetric::Mattes(MattesMutualInformationMetric::new(
-                fixed,
-                moving,
-                *number_of_histogram_bins,
-            )?)),
+            } => Ok(ActiveMetric::Mattes(
+                MattesMutualInformationMetric::from_samples(
+                    samples,
+                    moving_image,
+                    *number_of_histogram_bins,
+                )?,
+            )),
         }
     }
 
@@ -646,13 +969,38 @@ impl ImageRegistrationMethod {
         let dim = fixed.dimension();
         let schedule = self.level_schedule(fixed)?;
 
+        if let Some(mask) = &self.fixed_mask
+            && mask.size() != fixed.size()
+        {
+            return Err(RegistrationError::MaskSizeMismatch {
+                which: "fixed",
+                mask: mask.size().to_vec(),
+                image: fixed.size().to_vec(),
+            });
+        }
+        // One percentage for every level, or one shared by all levels, or none.
+        if self.sampling_percentage_per_level.len() > 1
+            && self.sampling_percentage_per_level.len() != schedule.len()
+        {
+            return Err(RegistrationError::SamplingPercentageLength {
+                got: self.sampling_percentage_per_level.len(),
+                expected: schedule.len(),
+            });
+        }
+
         let mut transform = initial;
         let mut diagnostics = None;
-        for (level_factors, level_sigma) in &schedule {
+        for (level, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             let sigma = self.physical_sigma(fixed, *level_sigma);
-            let (fixed_level, moving_level) =
+            let (fixed_level, moving_level, fixed_mask_level) =
                 self.prepare_level(fixed, moving, &sigma, level_factors, dim)?;
-            let r = self.run_single_level(&fixed_level, &moving_level, transform)?;
+            let r = self.run_single_level(
+                &fixed_level,
+                &moving_level,
+                fixed_mask_level.as_ref(),
+                level,
+                transform,
+            )?;
             diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
             transform = r.transform;
         }
@@ -723,6 +1071,11 @@ impl ImageRegistrationMethod {
     /// that filter's output origin (from the real-valued center shift) and its
     /// sampling offset (that shift rounded to an integer) intentionally differ by
     /// up to half a voxel.
+    /// A configured fixed mask is carried to the level by resampling it onto the
+    /// same coarse grid with **nearest-neighbor** interpolation and no
+    /// smoothing: the mask is a binary predicate over physical space, so it is
+    /// re-evaluated at the coarse voxel centers rather than blurred and
+    /// re-thresholded.
     fn prepare_level(
         &self,
         fixed: &Image,
@@ -730,7 +1083,7 @@ impl ImageRegistrationMethod {
         sigma: &[f64],
         factors: &[usize],
         dim: usize,
-    ) -> Result<(Image, Image)> {
+    ) -> Result<(Image, Image, Option<Image>)> {
         let smoothed_fixed = recursive_gaussian(fixed, sigma)?;
         let coarse_grid = shrink(&smoothed_fixed, factors)?;
         let mut resampler = ResampleImageFilter::new();
@@ -739,7 +1092,19 @@ impl ImageRegistrationMethod {
             .set_interpolator(Interpolator::Linear);
         let fixed_level = resampler.execute(&smoothed_fixed, &AffineTransform::identity(dim))?;
         let moving_level = recursive_gaussian(moving, sigma)?;
-        Ok((fixed_level, moving_level))
+
+        let fixed_mask_level = match &self.fixed_mask {
+            None => None,
+            Some(mask) if factors.iter().all(|&f| f == 1) => Some(mask.clone()),
+            Some(mask) => {
+                let mut mask_resampler = ResampleImageFilter::new();
+                mask_resampler
+                    .set_reference_image(&coarse_grid)
+                    .set_interpolator(Interpolator::NearestNeighbor);
+                Some(mask_resampler.execute(mask, &AffineTransform::identity(dim))?)
+            }
+        };
+        Ok((fixed_level, moving_level, fixed_mask_level))
     }
 
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair
@@ -748,18 +1113,21 @@ impl ImageRegistrationMethod {
         &self,
         fixed: &Image,
         moving: &Image,
+        fixed_mask: Option<&Image>,
+        level: usize,
         initial: T,
     ) -> Result<RegistrationResult<T>> {
-        let metric = self.build_metric(fixed, moving)?;
+        let metric = self.build_metric(fixed, moving, fixed_mask, level)?;
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
         let backend = self.backend.as_ref();
 
-        // LBFGSB ignores parameter scales and the learning-rate estimator (ITK's
-        // LBFGSBOptimizerv4 forces identity scales), so neither is built for it —
-        // it drives the raw metric gradient directly.
-        let ignores_scales = matches!(self.optimizer, OptimizerKind::Lbfgsb(_));
+        // Both L-BFGS variants ignore parameter scales and the learning-rate
+        // estimator (ITK's LBFGSBOptimizerv4/LBFGS2Optimizerv4 force identity
+        // scales), so neither is built for them — they drive the raw metric
+        // gradient directly.
+        let ignores_scales = self.optimizer.ignores_scales();
 
         // A physical-shift estimator is needed if scales or the learning rate
         // are estimated. Jacobians are parameter-independent for these
@@ -802,6 +1170,16 @@ impl ImageRegistrationMethod {
                     transform.set_parameters(p);
                     let m = metric.evaluate(&transform, backend);
                     (m.value, m.derivative)
+                }
+            };
+        }
+        // The same objective for the gradient-free optimizers, which consume the
+        // value alone.
+        macro_rules! value_objective {
+            () => {
+                |p: &[f64]| {
+                    transform.set_parameters(p);
+                    metric.value(&transform, backend)
                 }
             };
         }
@@ -936,6 +1314,36 @@ impl ImageRegistrationMethod {
                 // metric directly under its own bound/convergence configuration.
                 let optimizer = cfg.build(nparams);
                 optimizer.optimize(start, objective!())
+            }
+            OptimizerKind::Lbfgs2(l) => {
+                // Unbounded L-BFGS; like LBFGSB it ignores scales and drives the
+                // raw metric gradient through its own line search.
+                l.optimize(start, objective!())
+            }
+            // The four gradient-free optimizers below take the *unscaled*
+            // parameters and apply `scales` themselves — each ports ITK's
+            // `SingleValuedVnlCostFunctionAdaptorv4` internal/external mapping
+            // (`internal = external · scales`) — so the driver neither pre-scales
+            // the start point nor post-scales the result.
+            OptimizerKind::Amoeba(a) => {
+                let mut optimizer = a.clone();
+                optimizer.set_scales(scales.clone());
+                optimizer.optimize(start, value_objective!())
+            }
+            OptimizerKind::Powell(p) => {
+                let mut optimizer = p.clone();
+                optimizer.set_scales(scales.clone());
+                optimizer.optimize(start, value_objective!())
+            }
+            OptimizerKind::OnePlusOneEvolutionary(e) => {
+                let mut optimizer = e.clone();
+                optimizer.set_scales(scales.clone());
+                optimizer.optimize(start, value_objective!())
+            }
+            OptimizerKind::Exhaustive(e) => {
+                let mut optimizer = e.clone();
+                optimizer.set_scales(scales.clone());
+                optimizer.optimize(start, value_objective!())
             }
         };
 
@@ -1192,6 +1600,382 @@ mod tests {
         assert!(
             (p[0] - tx).abs() < 5e-2 && p[1].abs() < 1e-3,
             "recovered {p:?}, expected p0≈{tx} (feasible) and p1 pinned to 0"
+        );
+    }
+
+    /// The registration used by every gradient-free / interpolator / sampling
+    /// test below: a 40×40 Gaussian blob shifted by `(3, −2)`, recovered as a
+    /// translation from the identity.
+    fn shifted_blob_pair() -> (Image, Image, f64, f64) {
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
+        let moving = gaussian(40, 40, 20.0 + tx, 20.0 + ty, 7.0, 1.0);
+        (fixed, moving, tx, ty)
+    }
+
+    #[test]
+    fn amoeba_recovers_a_translation() {
+        // Gradient-free: the simplex never asks the metric for a derivative.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_amoeba(2.0, 400, 1e-10, 1e-12, false);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}",
+            result.metric_value
+        );
+    }
+
+    #[test]
+    fn powell_recovers_a_translation() {
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_powell(100, 100, 1.0, 1e-8, 1e-10);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}",
+            result.metric_value
+        );
+    }
+
+    #[test]
+    fn one_plus_one_evolutionary_recovers_a_translation() {
+        // Seeded, so the stochastic search is reproducible run to run.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_one_plus_one_evolutionary(800, 1.5e-4, 1.01, -1.0, -1.0, 42);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-2 && (p[1] - ty).abs() < 1e-2,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}",
+            result.metric_value
+        );
+    }
+
+    #[test]
+    fn exhaustive_lands_on_the_exact_grid_point() {
+        // The true shift (3, −2) is a point of the ±4-step unit grid centred on
+        // the identity, and the metric there is exactly zero, so the brute-force
+        // scan must return it exactly — no local refinement, no tolerance.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_exhaustive(vec![4, 4], 1.0);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert_eq!((p[0], p[1]), (tx, ty), "recovered {p:?}");
+    }
+
+    #[test]
+    fn lbfgs2_recovers_a_translation() {
+        // Unconstrained L-BFGS on the raw metric gradient: no scales, no
+        // learning rate. `number_of_iterations == 0` means "run to convergence".
+        // `solution_accuracy` is tightened from SimpleITK's 1e-5 default: it is
+        // a *gradient-norm* tolerance (‖g‖ ≤ eps·max(1, ‖x‖)), and the mean-
+        // squares gradient of a σ=7 blob is small enough that 1e-5 stops about
+        // 1e-3 short of the true shift.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_lbfgs2(1e-8, 0, 6, 0, 1e-5, 40, 1e-20, 1e20, 1e-4);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}",
+            result.metric_value
+        );
+    }
+
+    #[test]
+    fn nearest_neighbor_interpolator_drives_the_exhaustive_scan() {
+        // Nearest neighbor makes the metric piecewise constant, so its analytic
+        // derivative is zero almost everywhere and gradient descent cannot move.
+        // A grid scan is exactly the optimizer that does not care: on the
+        // integer grid the nearest-neighbor read is the moving voxel itself, so
+        // the true shift still scores an exact zero.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_interpolator(Interpolator::NearestNeighbor)
+            .set_optimizer_as_exhaustive(vec![4, 4], 1.0);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert_eq!((p[0], p[1]), (tx, ty), "recovered {p:?}");
+        assert!(
+            result.metric_value < 1e-24,
+            "metric {} at the exact shift",
+            result.metric_value
+        );
+    }
+
+    #[test]
+    fn bspline_and_gaussian_interpolators_recover_a_translation() {
+        // Both are smoother than linear; each must drive the same gradient
+        // descent to the same shift.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        for interp in [Interpolator::BSpline, Interpolator::Gaussian] {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_interpolator(interp)
+                .set_optimizer_scales_from_physical_shift()
+                .set_optimizer_as_gradient_descent_estimated(500, EstimateLearningRate::Once);
+            let result = reg
+                .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap();
+
+            let p = result.transform.parameters();
+            assert!(
+                (p[0] - tx).abs() < 5e-3 && (p[1] - ty).abs() < 5e-3,
+                "{interp:?} recovered {p:?}, expected [{tx}, {ty}]"
+            );
+        }
+    }
+
+    /// The number of fixed samples `reg` draws, counted by evaluating the metric
+    /// once at the identity — where every sample maps inside the moving image,
+    /// so `valid_points` is exactly the sample count. (At a nonzero shift the
+    /// samples near the trailing border map out and are dropped, which is why
+    /// the recovered run's `valid_points` is always smaller.)
+    fn sample_count_at_identity(reg: &mut ImageRegistrationMethod, fixed: &Image) -> usize {
+        reg.set_optimizer_as_gradient_descent(0.0, 1);
+        reg.execute(fixed, fixed, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap()
+            .valid_points
+    }
+
+    #[test]
+    fn regular_sampling_uses_every_fourth_voxel_and_still_registers() {
+        // 25% regular sampling strides by ceil(1/0.25) = 4 over the 1600 voxels,
+        // so exactly 400 samples remain.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut counter = ImageRegistrationMethod::new();
+        counter
+            .set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage(0.25, 0);
+        assert_eq!(sample_count_at_identity(&mut counter, &fixed), 400);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage(0.25, 0)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_gradient_descent_estimated(500, EstimateLearningRate::Once);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-2 && (p[1] - ty).abs() < 1e-2,
+            "recovered {p:?}, expected [{tx}, {ty}]"
+        );
+    }
+
+    #[test]
+    fn random_sampling_draws_the_requested_count_and_still_registers() {
+        // 25% of 1600 = 400 draws (with replacement), seeded for reproducibility.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut counter = ImageRegistrationMethod::new();
+        counter
+            .set_metric_sampling_strategy(SamplingStrategy::Random)
+            .set_metric_sampling_percentage(0.25, 7);
+        assert_eq!(sample_count_at_identity(&mut counter, &fixed), 400);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_sampling_strategy(SamplingStrategy::Random)
+            .set_metric_sampling_percentage(0.25, 7)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_gradient_descent_estimated(500, EstimateLearningRate::Once);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 5e-2 && (p[1] - ty).abs() < 5e-2,
+            "recovered {p:?}, expected [{tx}, {ty}]"
+        );
+    }
+
+    /// A binary mask on a `w × h` grid that is 1 inside `[lo, hi)` on both axes.
+    fn box_mask(w: usize, h: usize, lo: usize, hi: usize) -> Image {
+        let mut v = vec![0.0f64; w * h];
+        for (y, row) in v.chunks_mut(w).enumerate().take(hi).skip(lo) {
+            for value in row.iter_mut().take(hi).skip(lo) {
+                *value = 1.0;
+            }
+            let _ = y;
+        }
+        Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    #[test]
+    fn fixed_mask_restricts_sampling_to_its_nonzero_voxels() {
+        // A 20×20 box mask leaves 400 of the 1600 fixed voxels sampled, and the
+        // blob is entirely inside the box, so the shift is still recovered.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mask = box_mask(40, 40, 10, 30);
+        let mut counter = ImageRegistrationMethod::new();
+        counter.set_metric_fixed_mask(&mask);
+        assert_eq!(sample_count_at_identity(&mut counter, &fixed), 400);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_fixed_mask(&mask)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_gradient_descent_estimated(500, EstimateLearningRate::Once);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-2 && (p[1] - ty).abs() < 1e-2,
+            "recovered {p:?}, expected [{tx}, {ty}]"
+        );
+    }
+
+    #[test]
+    fn moving_mask_drops_the_samples_that_map_into_its_zero_voxels() {
+        // Without a moving mask every one of the 1600 fixed samples maps inside.
+        // Masking the moving image to a 20×20 box drops every sample that lands
+        // outside it, so the valid-point count falls to the box's area.
+        let (fixed, moving, _, _) = shifted_blob_pair();
+        let mask = box_mask(40, 40, 10, 30);
+
+        let mut unmasked = ImageRegistrationMethod::new();
+        unmasked.set_optimizer_as_gradient_descent(0.0, 1);
+        let base = unmasked
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        assert_eq!(base.valid_points, 1600);
+
+        let mut masked = ImageRegistrationMethod::new();
+        masked
+            .set_metric_moving_mask(&mask)
+            .set_optimizer_as_gradient_descent(0.0, 1);
+        let result = masked
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        assert_eq!(result.valid_points, 400);
+    }
+
+    #[test]
+    fn fixed_mask_size_mismatch_is_rejected() {
+        let (fixed, moving, _, _) = shifted_blob_pair();
+        let mask = box_mask(30, 30, 5, 25);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_fixed_mask(&mask);
+        let err = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::MaskSizeMismatch { which: "fixed", .. }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn moving_mask_size_mismatch_is_rejected() {
+        let (fixed, moving, _, _) = shifted_blob_pair();
+        let mask = box_mask(30, 30, 5, 25);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_moving_mask(&mask);
+        let err = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::MaskSizeMismatch {
+                    which: "moving",
+                    ..
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn per_level_sampling_percentage_length_must_match_the_level_count() {
+        let (fixed, moving, _, _) = shifted_blob_pair();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage_per_level(vec![0.5, 0.25, 0.1], 0);
+        let err = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::SamplingPercentageLength {
+                    got: 3,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn per_level_sampling_percentage_applies_to_the_shrunk_virtual_domain() {
+        // Level 0 shrinks 40×40 by 2 to 20×20 (400 voxels) and samples 50% of
+        // them at stride 2; level 1 is full resolution (1600 voxels) at 25%,
+        // stride 4. The percentage applies to the *shrunk* virtual domain, so
+        // the finest level's sample count is 400 — the same number the coarse
+        // level would give at 100%, which is why the per-level list matters.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let mut counter = ImageRegistrationMethod::new();
+        counter
+            .set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage_per_level(vec![0.5, 0.25], 0);
+        assert_eq!(sample_count_at_identity(&mut counter, &fixed), 400);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage_per_level(vec![0.5, 0.25], 0)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-4,
+                300,
+                1e-6,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 5e-2 && (p[1] - ty).abs() < 5e-2,
+            "recovered {p:?}, expected [{tx}, {ty}]"
         );
     }
 

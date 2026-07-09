@@ -33,6 +33,13 @@ pub enum RegistrationError {
     )]
     PyramidScheduleLength { shrink: usize, sigma: usize },
 
+    /// The metric sampling percentages were supplied per level but their count
+    /// does not match the number of resolution levels (SimpleITK's
+    /// `SetMetricSamplingPercentagePerLevel`: "the number of entries must match
+    /// the number of shrink factors and smoothing sigmas").
+    #[error("metric sampling percentage length {got} != number of levels {expected}")]
+    SamplingPercentageLength { got: usize, expected: usize },
+
     /// Wrapped core error (e.g. constructing the output image).
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
