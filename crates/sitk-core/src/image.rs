@@ -325,9 +325,14 @@ impl Image {
 /// identifier, so a turbofish can be appended); the same `R` is returned for
 /// every arm. The first argument is the [`PixelId`] to switch on.
 ///
-/// ```ignore
+/// ```
+/// use sitk_core::{Image, Scalar, dispatch_scalar};
+///
 /// fn count<T: Scalar>(img: &Image) -> usize { img.number_of_pixels() }
+///
+/// let img = Image::from_vec(&[2, 3], vec![0.0f64; 6]).unwrap();
 /// let n = dispatch_scalar!(img.pixel_id(), count, &img);
+/// assert_eq!(n, 6);
 /// ```
 #[macro_export]
 macro_rules! dispatch_scalar {
