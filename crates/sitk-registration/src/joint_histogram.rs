@@ -32,28 +32,32 @@
 //! the sample's own bilinearly-interpolated location:
 //!
 //! ```text
-//! scalingfactor = ln2 · (∂p_M/∂m)/p_M(m) · p(f,m)/p_M(m)  −  (∂p/∂m) · ln(p(f,m)/p_M(m))
-//! ∂value/∂pₖ    = Σ_samples scalingfactor · ( ∇M(T(x))·J_T(x) )ₖ   (÷ N, sign per below)
+//! scalingfactor = [ (∂p_M/∂m)/p_M(m) − (∂p/∂m)/p(f,m) ] / ln 2     (= ∂value/∂m)
+//! ∂value/∂pₖ    = (1/N) Σ_samples scalingfactor · ( ∇M(T(x))·J_T(x) )ₖ
 //! ```
 //!
-//! This is the standard Viola–Wells "frozen density" gradient estimate: because
-//! the histogram is *hard*-binned (not a smooth Parzen kernel), `value` is
-//! technically a step function of the transform parameters — as a sample's
-//! transformed position crosses a bin boundary it *rebins* into a different
-//! histogram cell — so no classical analytic gradient of `value` exists
-//! everywhere. The formula above is a smooth surrogate that deliberately
-//! excludes the rebinning contribution: it differentiates the already-built,
-//! already-smoothed density surface as if it stayed fixed while only the
-//! sample's own evaluation point moves, matching ITK's literal
-//! `ProcessPoint`. Empirically (see the test module), this makes the
-//! surrogate's *magnitude* diverge from a literal finite difference of
-//! `value` — and the gap widens, not narrows, with more histogram bins,
-//! confirming it is the (structurally excluded) rebinning term rather than a
-//! resolution artifact. ITK's own unit test for this metric does not check
-//! the derivative against a finite difference either. What the surrogate
-//! does preserve is *direction*: it reliably points in the direction that
-//! reduces `value`, which is what `gradient_descent_recovers_a_translated_blob`
-//! demonstrates and is what actually matters for gradient-based optimization.
+//! This is the standard Viola–Wells "frozen density" gradient estimate: the
+//! bracket is `−∂/∂m ln( p(f,m) / (p_F(f)·p_M(m)) )`, the moving-axis
+//! derivative of the sample's own log-likelihood ratio (`p_F(f)` drops out —
+//! the fixed intensity does not move with the transform), and `value = −MI`
+//! supplies the sign. Because the histogram is *hard*-binned (not a smooth
+//! Parzen kernel), `value` is technically a step function of the transform
+//! parameters — as a sample's transformed position crosses a bin boundary it
+//! *rebins* into a different histogram cell — so no classical analytic
+//! gradient of `value` exists everywhere. The formula above is a smooth
+//! surrogate that deliberately excludes the rebinning contribution: it
+//! differentiates the already-built, already-smoothed density surface as if it
+//! stayed fixed while only the sample's own evaluation point moves. It is
+//! therefore not an exact finite-difference match — measured at a generic
+//! point with 32 bins, `analytic / fd` is `0.958` (dx) and `0.870` (dy), the
+//! residual being that excluded rebinning term (see
+//! `derivative_matches_finite_difference_direction` in the test module). What
+//! it does deliver is a derivative that vanishes at the value's own argmin:
+//! `gradient_descent_recovers_a_translated_blob` lands on the true shift to
+//! within 0.002 px for any learning rate across a decade.
+//!
+//! **This is not ITK's literal formula**, which is not an MI gradient at all —
+//! see the `scalingfactor` parity note below.
 //!
 //! ## Parity notes vs ITK
 //!
@@ -94,36 +98,51 @@
 //!   correction affects only `ComputeValue`'s pairing, not the derivative
 //!   formula's structure — the derivative here uses the crate's correctly-
 //!   computed `moving_marginal` throughout, consistent with `ComputeValue`.
-//! * **`term2`'s `ln2` factor is asymmetric with `ComputeValue`'s nats→bits
-//!   conversion — reproduced here, not corrected, unlike the marginal swap
-//!   above.** `itkJointHistogramMutualInformationGetValueAndDerivativeThreader
-//!   .hxx:147-151` computes `term2 = m_Log2 * dMmPDF * jointPDFValue /
-//!   movingImagePDFValue` (`m_Log2 = std::log(2.0)`, ctor-initialized at
-//!   `itkJointHistogramMutualInformationImageToImageMetricv4.hxx:53`) and
-//!   `scalingfactor = term2 - term1`, while that same class's `ComputeValue`
-//!   divides the *whole* summed value by `m_Log2` only at the very end
-//!   (`.hxx:374`: `return -1.0 * total_mi.GetSum() / this->m_Log2;`) — i.e.
-//!   `value`'s nats→bits conversion divides everything by `ln2`, but the
-//!   derivative multiplies only `term2` by `ln2`, not the whole
-//!   `scalingfactor`. This is provably not an exact frozen-density gradient
-//!   of anything: writing `phi(J, mm)` for a scalar potential with
-//!   `∂phi/∂J = ln J − ln mm` (to match `term1`) and `∂phi/∂mm = −ln2·J/mm`
-//!   (to match `term2`), Clairaut's theorem requires the mixed partials to
-//!   agree — `∂/∂mm[ln J − ln mm] = −1/mm` must equal
-//!   `∂/∂J[−ln2·J/mm] = −ln2/mm` — which is false whenever `ln2 ≠ 1`, so no
-//!   such `phi` exists (a proof, not an unobserved coincidence). Dropping the
-//!   `ln2` *would* make `term1 − term2` exactly the gradient of
-//!   `phi(J,mm) = J·(ln J − ln mm) − J` (see
-//!   `frozen_density_identity_matches_finite_difference` in the test module,
-//!   which checks exactly this ln2-free identity). But unlike the marginal
-//!   swap, which has one demonstrably correct answer whenever the two
-//!   marginals differ in shape, there is no unambiguous fix here: no
-//!   per-sample frozen-density formula is the exact gradient of the true
-//!   bin-summed MI regardless of the `ln2` factor, so removing it would trade
-//!   ITK's inconsistency for a different heuristic rather than fixing a bug,
-//!   and would silently change every derivative value a SimpleITK-parity user
-//!   compares against. This port therefore keeps the literal, `ln2`-laden
-//!   `term2` in [`evaluate`](JointHistogramMutualInformationMetric::evaluate).
+//!   Fixed upstream in
+//!   <https://github.com/InsightSoftwareConsortium/ITK/pull/6569>.
+//! * **ITK's `scalingfactor` is not an MI gradient — corrected here, like the
+//!   marginal swap above.** `itkJointHistogramMutualInformationGetValueAndDeriv
+//!   ativeThreader.hxx:147-151` weights each sample by
+//!
+//!   ```text
+//!   scalingfactor = ln2 · dMmPDF · J/Pm  −  dJPDF · (ln J − ln Pm)
+//!   ```
+//!
+//!   (`m_Log2 = std::log(2.0)`, ctor-initialized at
+//!   `itkJointHistogramMutualInformationImageToImageMetricv4.hxx:53`). This is
+//!   the differential of nothing. Three independent things are wrong with it:
+//!   the marginal term carries the opposite sign to the joint term rather than
+//!   the same one; the joint term is weighted by a log ratio instead of `1/J`;
+//!   and `ln2` multiplies one term only, while `ComputeValue` divides the
+//!   *whole* sum by `ln2` at the very end (`.hxx:374`:
+//!   `return -1.0 * total_mi.GetSum() / this->m_Log2;`). The last of these
+//!   alone already rules out any scalar potential, by Clairaut: writing
+//!   `phi(J, mm)` with `∂phi/∂J = ln J − ln mm` (to match the joint term) and
+//!   `∂phi/∂mm = −ln2·J/mm` (to match the marginal term), the mixed partials
+//!   must agree — `∂/∂mm[ln J − ln mm] = −1/mm` against
+//!   `∂/∂J[−ln2·J/mm] = −ln2/mm` — and they do not whenever `ln2 ≠ 1`. So no
+//!   such `phi` exists (a proof, not an unobserved coincidence).
+//!
+//!   The frozen-density MI gradient (Viola & Wells) has one derivation and one
+//!   answer: differentiate the sample's own log-likelihood ratio along the
+//!   moving axis, holding the density field fixed, which gives
+//!   `∂/∂m ln( J/(pf·pm) ) = dJPDF/J − dMmPDF/Pm` (`pf` drops — it does not
+//!   depend on the moving intensity). [`evaluate`](JointHistogramMutualInformationMetric::evaluate)
+//!   uses that, `/ln 2` for the bits `ComputeValue` reports, negated for this
+//!   crate's `+∇value` convention. `frozen_density_identity_matches_finite_difference`
+//!   in the test module pins it against a finite difference of the closed-form
+//!   potential `ln J − ln mm` to ~1e-11 relative.
+//!
+//!   The consequence of ITK's version is not cosmetic. At a generic point with
+//!   32 bins its derivative is `[1.29e-3, -5.32e-4]` where the finite
+//!   difference of its own value is `[0.140, -0.0802]` — 108x and 151x too
+//!   small — and on ITK's own registration test the field it produces vanishes
+//!   a full pixel away from the optimum, which is where gradient descent then
+//!   stops. Fixed upstream in
+//!   <https://github.com/InsightSoftwareConsortium/ITK/pull/6569>; until that
+//!   merges, this port's derivative differs numerically from a stock
+//!   SimpleITK's for this metric (its *value* already did, via the marginal
+//!   fix above).
 //! * **`ComputeFixedImageMarginalPDFDerivative` is dead code, not ported.** It
 //!   is declared in the threader header but never called from `ProcessPoint`
 //!   (only `ComputeMovingImageMarginalPDFDerivative` is; the fixed image's own
@@ -734,16 +753,22 @@ impl JointHistogramMutualInformationMetric {
 
             let d_jpdf = self.joint_derivative_wrt_moving(&jp, a, b);
             let d_mm = self.marginal_derivative(&moving_marginal, b);
-            let p_ratio = jp_val.ln() - mm_val.ln();
-            let term1 = d_jpdf * p_ratio;
-            let term2 = std::f64::consts::LN_2 * d_mm * jp_val / mm_val;
-            // Sign vs ITK: ITK's v4 optimizers ADD the returned derivative
-            // (metrics store the descent direction, −∇value); this crate's
-            // optimizers SUBTRACT, so every metric stores the true gradient
-            // +∇value instead — the same convention flip documented in
-            // `mattes.rs`'s `n_factor` note. Hence the negation here relative
-            // to ITK's literal `term2 − term1`.
-            let scalingfactor = -(term2 - term1);
+            // Viola–Wells per-sample weight: the frozen-density derivative of
+            // this sample's own log-likelihood ratio along the moving axis,
+            //
+            //   ∂/∂m ln( p(f,m) / (p_F(f)·p_M(m)) ) = (∂p/∂m)/p − (∂p_M/∂m)/p_M
+            //
+            // (`p_F(f)` drops out: the fixed intensity does not move with the
+            // transform), divided by `ln 2` for the same nats→bits convention
+            // `compute_value` uses. That quantity is `∂MI/∂m`, and
+            // `value = −MI`, so negating it gives `∂value/∂m` — which is
+            // already this crate's `+∇value` convention: ITK's v4 optimizers
+            // ADD the returned derivative, so its metrics store the descent
+            // direction `−∇value`, while this crate's optimizers SUBTRACT (the
+            // same convention flip documented in `mattes.rs`'s `n_factor`
+            // note). See the module docs' parity note for why ITK's own
+            // `term2 − term1` is not this and is not an MI gradient at all.
+            let scalingfactor = (d_mm / mm_val - d_jpdf / jp_val) / std::f64::consts::LN_2;
 
             let jac = transform.jacobian_wrt_parameters(fp);
             for (k, dk) in derivative.iter_mut().enumerate() {
@@ -949,45 +974,41 @@ mod tests {
     #[test]
     fn derivative_matches_finite_difference_direction() {
         // Fixed and moving are the same blob; evaluate at a generic
-        // translation (off pixel and bin boundaries) and compare the
-        // analytic derivative's *direction* to a central finite difference
-        // of the value.
+        // translation (off pixel and bin boundaries) and compare the analytic
+        // derivative to a central finite difference of the value.
         //
         // Unlike Mattes (continuous cubic B-spline Parzen window on both
         // axes, so `value` is continuously differentiable and the analytic
         // derivative matches a finite difference to within ~1e-3 at
-        // `h=1e-3`), this metric's histogram is *hard*-binned: a sample's
-        // bin membership is a step function of the transform parameters, so
-        // `value` is a piecewise-constant step function of the transform
-        // parameters in the classical sense, and the analytic formula ported
-        // here (`itkJointHistogramMutualInformationGetValueAndDerivativeThreader
-        // ::ProcessPoint`) is deliberately an *approximate* Viola–Wells
-        // "frozen density" gradient — it differentiates the smoothed density
-        // surface at each sample's own location, holding that density fixed,
-        // and explicitly does not account for samples re-binning into
-        // different histogram cells as the transform changes (that
-        // "rebinning" contribution is exactly what a literal finite
-        // difference of `value` also captures, since it rebuilds the
-        // histogram from scratch at every perturbed parameter).
-        //
-        // This was verified empirically, not assumed: sweeping the bin
-        // count from 10 to 256 at a fixed step (`h=0.02`) shows the finite
-        // difference growing roughly 20x (0.015 → 0.33, more bins ⇒ finer
-        // rebinning-boundary crossings ⇒ bigger rebinning contribution)
-        // while the analytic derivative stays essentially flat (~0.0005 to
-        // ~0.0013, since the frozen-density surface's shape is set by
-        // `VarianceForJointPDFSmoothing`, not bin count) — the gap widens
-        // with resolution rather than narrowing, which is the signature of
-        // an intentionally-excluded rebinning term, not a transcription bug.
-        // ITK's own unit test for this metric
+        // `h=1e-3`), this metric's histogram is *hard*-binned: a sample's bin
+        // membership is a step function of the transform parameters, so
+        // `value` is piecewise-constant in the classical sense, and the
+        // Viola–Wells weight used here is a *frozen-density* gradient — it
+        // differentiates the smoothed density surface at each sample's own
+        // location, holding that surface fixed, and does not account for
+        // samples re-binning into different histogram cells as the transform
+        // changes. That "rebinning" contribution *is* captured by a literal
+        // finite difference of `value`, which rebuilds the histogram at every
+        // perturbed parameter, so an exact match is not expected here and the
+        // finite difference itself jitters with the step size. Measured at
+        // this point with 32 bins: `analytic / fd` is `0.958` (dx) and `0.870`
+        // (dy) at `h=0.02`, and `0.865` / `0.789` at `h=0.05` — the same
+        // magnitude, the residual gap being the excluded rebinning term. ITK's
+        // own unit test for this metric
         // (`itkJointHistogramMutualInformationImageToImageMetricv4Test.cxx`)
-        // does not check the derivative against a finite difference either.
+        // does not check the derivative against a finite difference at all.
         //
-        // What *does* hold, and is what actually matters for gradient
-        // descent (see `gradient_descent_recovers_a_translated_blob` below,
-        // which is the stronger, practical version of this check): the
-        // analytic derivative's *sign* — i.e. which way to step to reduce
-        // `value` — agrees with the finite difference's sign.
+        // The assertion below is therefore sign agreement plus a
+        // same-order-of-magnitude bound, deliberately loose enough to survive
+        // the rebinning gap and the finite difference's own step-size jitter.
+        // The stronger, practical statement is
+        // `gradient_descent_recovers_a_translated_blob` below: the derivative
+        // vanishes at the value's own argmin.
+        //
+        // (ITK's literal formula could not pass this test's magnitude bound at
+        // all: at this same point and bin count it returns `[1.29e-3,
+        // -5.32e-4]` against a finite difference of `[0.140, -0.0802]` — 108x
+        // and 151x too small. See the module docs' parity note.)
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
@@ -1015,6 +1036,13 @@ mod tests {
                 "param {k}: fd {fd} and analytic {} should agree in sign and be non-negligible",
                 analytic[k]
             );
+            let ratio = analytic[k] / fd;
+            assert!(
+                (0.5..2.0).contains(&ratio),
+                "param {k}: analytic {} and fd {fd} should be the same order \
+                 (ratio {ratio})",
+                analytic[k]
+            );
         }
     }
 
@@ -1023,34 +1051,31 @@ mod tests {
         // Pins every piece of machinery the analytic derivative rides on —
         // the joint-PDF field derivative, the marginal derivative, the
         // bilinear interpolators, and the sign — against a finite difference
-        // of a closed-form potential. This checks the *ln2-free* half of
-        // ITK's formula: see the module docs' `ln2` parity note for why the
-        // full, literal, ln2-laden `term2` has no exact potential at all (a
-        // Clairaut/mixed-partials argument, not a numerical gap) — that is
-        // the reason this test targets `term1 − term2_no_ln2` rather than
-        // `evaluate()`'s literal accumulated derivative (see
-        // `evaluate_matches_an_independent_reimplementation_of_the_literal_formula`
-        // below for a check of the literal, ln2-laden formula instead).
+        // of the closed-form potential the per-sample weight is the exact
+        // derivative of. (See `evaluate_matches_an_independent_reimplementation`
+        // below for the full accumulated derivative, Jacobian contraction and
+        // normalization included.)
         //
         // For one sample with fixed (frozen, non-moving) bin coordinate `a`
-        // and moving bin coordinate `b`, define
+        // and moving bin coordinate `b`, the Viola–Wells weight is the
+        // moving-axis derivative of that sample's log-likelihood ratio
         //
-        //   phi(a, b) = J(a,b)·(ln J(a,b) − ln mm(b)) − J(a,b)
+        //   phi(a, b) = ln J(a,b) − ln mm(b)
         //
-        // where `J`/`mm` are the joint-PDF/moving-marginal FIELDS frozen at
-        // `p0` (never rebuilt as `b` is perturbed below — contrast with
+        // (the fixed marginal `ln pf(a)` is a `b`-independent constant and is
+        // dropped, exactly as `evaluate` drops it), where `J`/`mm` are the
+        // joint-PDF/moving-marginal FIELDS frozen at `p0` — never rebuilt as
+        // `b` is perturbed below, in contrast with
         // `derivative_matches_finite_difference_direction`, which finite-
-        // differences `evaluate().value` and therefore rebuilds the
-        // histogram, capturing a rebinning effect this identity deliberately
-        // excludes). By the product rule,
+        // differences `evaluate().value` and therefore rebuilds the histogram,
+        // capturing a rebinning effect this identity deliberately excludes.
+        // Then
         //
-        //   dphi/db = dJ·(ln J − ln mm) + J·(dJ/J − dmm/mm) − dJ
-        //           = dJ·(ln J − ln mm) − J·dmm/mm
-        //           = term1 − term2_no_ln2
+        //   dphi/db = dJ/J − dmm/mm
         //
-        // exactly (`term1 = dJPDF·pRatio`, `term2_no_ln2 = dMmPDF·J/mm`,
-        // i.e. `term2` WITHOUT the `ln2` factor) — no constant, no
-        // approximation.
+        // exactly — no constant, no approximation. `evaluate`'s per-sample
+        // `scalingfactor` is `−dphi/db / ln2` (negated because `value = −MI`,
+        // scaled because `value` is in bits).
         //
         // Point choice matters: `joint_derivative_wrt_moving`/
         // `marginal_derivative` are central differences over a FIXED
@@ -1064,13 +1089,12 @@ mod tests {
         // EXACT analytic slope there, not merely a first-order approximation
         // of it — so a fine central difference of `phi(b)` (step kept well
         // inside the cell's `0.5·spacing` half-width, so it never crosses
-        // into a neighboring cell) should agree with `term1 −
-        // term2_no_ln2` to floating-point precision, not just to some
-        // FD-truncation-limited tolerance. Verified: at step 1e-4 (cell
-        // half-width ≈0.0185 for the 32 bins used here — ~185x margin), the
-        // measured relative error was ≈2e-11; the assertion below uses a
-        // 1e-6 tolerance, ~5 orders of magnitude of margin over that
-        // measurement.
+        // into a neighboring cell) should agree with `dJ/J − dmm/mm` to
+        // floating-point precision, not just to some FD-truncation-limited
+        // tolerance. Verified: at step 1e-4 (cell half-width ≈0.0185 for the
+        // 32 bins used here — ~185x margin), the measured relative error was
+        // ≈4e-11; the assertion below uses a 1e-6 tolerance, ~5 orders of
+        // magnitude of margin over that measurement.
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
@@ -1091,45 +1115,47 @@ mod tests {
         let phi = |bb: f64| -> f64 {
             let jp_val = metric.interp_joint(&jp, a, bb);
             let mm_val = metric.interp_marginal(&moving_marginal, bb);
-            jp_val * (jp_val.ln() - mm_val.ln()) - jp_val
+            jp_val.ln() - mm_val.ln()
         };
 
         let d_jpdf = metric.joint_derivative_wrt_moving(&jp, a, b);
         let d_mm = metric.marginal_derivative(&moving_marginal, b);
         let jp_val = metric.interp_joint(&jp, a, b);
         let mm_val = metric.interp_marginal(&moving_marginal, b);
-        let p_ratio = jp_val.ln() - mm_val.ln();
-        let term1 = d_jpdf * p_ratio;
-        let term2_no_ln2 = d_mm * jp_val / mm_val;
-        let coarse = term1 - term2_no_ln2;
+        let coarse = d_jpdf / jp_val - d_mm / mm_val;
 
         let step = 1e-4;
         let fine_fd = (phi(b + step) - phi(b - step)) / (2.0 * step);
 
         assert!(
             (coarse - fine_fd).abs() < 1e-6 * coarse.abs(),
-            "coarse (term1 - term2_no_ln2) {coarse} vs fine FD of phi {fine_fd} \
+            "coarse (dJ/J - dmm/mm) {coarse} vs fine FD of phi {fine_fd} \
              (relative error {})",
             (coarse - fine_fd).abs() / coarse.abs()
+        );
+
+        // And `evaluate`'s per-sample weight is exactly `−dphi/db / ln2`.
+        let scalingfactor = (d_mm / mm_val - d_jpdf / jp_val) / std::f64::consts::LN_2;
+        assert!(
+            (scalingfactor + coarse / std::f64::consts::LN_2).abs() <= 1e-12 * scalingfactor.abs(),
+            "scalingfactor {scalingfactor} should be -({coarse})/ln2"
         );
     }
 
     #[test]
-    fn evaluate_matches_an_independent_reimplementation_of_the_literal_formula() {
+    fn evaluate_matches_an_independent_reimplementation() {
         // Complements `frozen_density_identity_matches_finite_difference`
         // above, which pins a single machinery piece (one sample, no
-        // aggregation, no transform chain rule) but stops short of the full,
-        // literal, ln2-laden formula. This test instead independently
-        // re-implements `evaluate()`'s FULL accumulation — ITK's literal
-        // `scalingfactor = term2 − term1` (with `ln2`), the moving-image
-        // gradient, the transform Jacobian contraction, this crate's sign
-        // flip, and the `1/valid_points` normalization — in a hand-written
-        // loop that does not call `evaluate()` for the derivative
-        // computation, only for the value being checked against. It exists
-        // to catch accumulation/normalization/valid-point/sign regressions
-        // in `evaluate()` that a single-sample identity test cannot see; it
-        // is not a test of whether the formula is an exact gradient of
-        // anything (it isn't — see the module docs' `ln2` parity note).
+        // aggregation, no transform chain rule) but stops short of the full
+        // accumulation. This test instead independently re-implements
+        // `evaluate()`'s FULL accumulation — the Viola–Wells per-sample
+        // weight, the moving-image gradient, the transform Jacobian
+        // contraction, the sign convention, and the `1/valid_points`
+        // normalization — in a hand-written loop that does not call
+        // `evaluate()` for the derivative computation, only for the value
+        // being checked against. It exists to catch accumulation /
+        // normalization / valid-point / sign regressions in `evaluate()` that
+        // a single-sample identity test cannot see.
         let (w, h, sigma) = (40usize, 40usize, 6.0);
         let fixed = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
         let moving = gaussian(w, h, 20.0, 20.0, sigma, 1.0);
@@ -1179,10 +1205,8 @@ mod tests {
             }
             let d_jpdf = metric.joint_derivative_wrt_moving(&jp, a, b);
             let d_mm = metric.marginal_derivative(&moving_marginal, b);
-            let p_ratio = jp_val.ln() - mm_val.ln();
-            let term1 = d_jpdf * p_ratio;
-            let term2 = std::f64::consts::LN_2 * d_mm * jp_val / mm_val;
-            let scalingfactor = -(term2 - term1); // crate's +grad convention, matching evaluate()
+            // crate's +∇value convention, matching evaluate()
+            let scalingfactor = (d_mm / mm_val - d_jpdf / jp_val) / std::f64::consts::LN_2;
 
             let jac = transform.jacobian_wrt_parameters(fp);
             for (k, dk) in derivative.iter_mut().enumerate() {
@@ -1221,13 +1245,14 @@ mod tests {
         .unwrap();
 
         // Learning rate tuned empirically (not the crate's usual estimated
-        // scales — see the module docs' local-support note): the analytic
-        // derivative here is the Viola-Wells frozen-density gradient, whose
-        // magnitude is set by the smoothing bandwidth rather than by the
-        // metric's value scale, so it is far smaller than e.g. Mattes' at a
-        // comparable image/blob size. `lr=20, 500 iterations` converges
-        // cleanly to within 0.01px on this test's fixed geometry.
-        let opt = crate::optimizer::GradientDescentOptimizer::new(20.0, 500);
+        // scales — see the module docs' local-support note). The Viola–Wells
+        // weight is of the same magnitude as the value's own slope, so any
+        // `lr` in `[0.5, 5]` lands on the same equilibrium here; `lr=1, 200
+        // iterations` is the middle of that plateau. The recovered shift is
+        // `[2.9984, -0.0016]`, i.e. the derivative's zero coincides with the
+        // value's own argmin to 0.002px — the tolerance below is 0.05px, not
+        // the 0.5px the pre-fix formula needed.
+        let opt = crate::optimizer::GradientDescentOptimizer::new(1.0, 200);
         let result = opt.optimize(vec![0.0, 0.0], |p| {
             let t = TranslationTransform::new(p.to_vec());
             let r = metric.evaluate(&t);
@@ -1235,12 +1260,12 @@ mod tests {
         });
 
         assert!(
-            (result.parameters[0] - 3.0).abs() < 0.5,
+            (result.parameters[0] - 3.0).abs() < 0.05,
             "recovered dx {} (expected ~3.0)",
             result.parameters[0]
         );
         assert!(
-            result.parameters[1].abs() < 0.5,
+            result.parameters[1].abs() < 0.05,
             "recovered dy {} (expected ~0.0)",
             result.parameters[1]
         );
