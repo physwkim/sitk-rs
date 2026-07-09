@@ -308,6 +308,29 @@ pub fn discrete_gaussian(
     maximum_kernel_width: u32,
     use_image_spacing: bool,
 ) -> Result<Image> {
+    let smoothed = discrete_gaussian_f64(
+        img,
+        variance,
+        maximum_error,
+        maximum_kernel_width,
+        use_image_spacing,
+    )?;
+    image_from_f64(img.pixel_id(), img.size(), img, &smoothed.to_f64_vec())
+}
+
+/// [`discrete_gaussian`]'s validation and separable-convolution core, stopping
+/// before the narrow-back-to-input-type step: returns the always-`f64`
+/// intermediate image. `canny_edge_detection`'s smoothing stage
+/// (`CannyEdgeDetectionImageFilter`'s `m_GaussianFilter`) consumes this
+/// directly — its derivative stages need the full `f64` field, not a
+/// round-trip through the input pixel type.
+pub(crate) fn discrete_gaussian_f64(
+    img: &Image,
+    variance: &[f64],
+    maximum_error: &[f64],
+    maximum_kernel_width: u32,
+    use_image_spacing: bool,
+) -> Result<Image> {
     let dim = img.dimension();
     if variance.len() != dim {
         return Err(FilterError::DimensionLength {
@@ -367,7 +390,7 @@ pub fn discrete_gaussian(
         current.copy_geometry_from(img);
     }
 
-    image_from_f64(img.pixel_id(), &size, img, &current.to_f64_vec())
+    Ok(current)
 }
 
 // ---- binomial_blur ----------------------------------------------------
@@ -792,6 +815,23 @@ mod tests {
     }
 
     // ---- discrete_gaussian ----
+
+    #[test]
+    fn gaussian_operator_kernel_zero_variance_is_identity() {
+        let kernel = gaussian_operator_kernel(0.0, 0.01, 32);
+        assert_eq!(kernel, vec![0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn gaussian_operator_kernel_is_symmetric_and_normalized() {
+        let kernel = gaussian_operator_kernel(4.0, 0.01, 32);
+        let radius = kernel.len() / 2;
+        for k in 0..=radius {
+            assert!((kernel[radius - k] - kernel[radius + k]).abs() < 1e-15);
+        }
+        let sum: f64 = kernel.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "kernel sum {sum}");
+    }
 
     #[test]
     fn discrete_gaussian_variance_zero_is_identity() {

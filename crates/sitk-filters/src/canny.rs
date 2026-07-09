@@ -6,7 +6,8 @@
 //! `itkCannyEdgeDetectionImageFilter.hxx` top to bottom, `GenerateData` runs:
 //!
 //! 1. **Smoothing** (`m_GaussianFilter`, a `DiscreteGaussianImageFilter`) —
-//!    [`discrete_gaussian_smooth`], private to this module (see below).
+//!    [`crate::denoise::discrete_gaussian_f64`], the `f64` core shared with
+//!    the public [`crate::denoise::discrete_gaussian`] (see below).
 //! 2. **`ComputeCannyEdge`** — the second directional derivative of the
 //!    smoothed image along its own gradient direction,
 //!    `D_uu f = (∇f)ᵀ H (∇f) / |∇f|²` with `u = ∇f/|∇f|`, evaluated per pixel
@@ -51,156 +52,17 @@
 //! index space, exactly as ITK's source does (no `ScaleCoefficients` call
 //! anywhere in `itkCannyEdgeDetectionImageFilter.hxx`).
 //!
-//! **`DiscreteGaussianImageFilter` is not yet ported elsewhere in this
-//! workspace.** [`discrete_gaussian_smooth`] and its Bessel-function kernel
-//! generator ([`discrete_gaussian_kernel_1d`], `GaussianOperator::
-//! GenerateCoefficients` in `itkGaussianOperator.hxx`) are implemented
-//! privately in this module for Canny's own use, matching that filter's
-//! default `MaximumKernelWidth` (32) and `ZeroFluxNeumannBoundaryCondition`;
-//! they are not exported, to avoid colliding with a future public port.
+//! The smoothing stage delegates to [`crate::denoise`]'s
+//! `DiscreteGaussianImageFilter` port via its `f64` core
+//! ([`crate::denoise::discrete_gaussian_f64`]), pinned to the only
+//! configuration ITK's Canny ever uses: `UseImageSpacing` on and the default
+//! `MaximumKernelWidth` of 32, under `ZeroFluxNeumannBoundaryCondition`.
 
+use crate::denoise::discrete_gaussian_f64;
 use crate::error::{FilterError, Result};
 use crate::gradient::derivative_operator_coefficients;
 use crate::image_from_f64;
 use sitk_core::{Image, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition};
-
-// ==== private discrete Gaussian (GaussianOperator + DiscreteGaussianImageFilter) ====
-//
-// Not exported: a sibling port of `DiscreteGaussianImageFilter` is expected
-// elsewhere in the workspace, and this crate must not expose a second,
-// colliding `discrete_gaussian` name.
-
-/// `GaussianOperator::ModifiedBesselI0` (itkGaussianOperator.hxx): the
-/// Abramowitz & Stegun polynomial approximation of the modified Bessel
-/// function `I0`.
-fn bessel_i0(y: f64) -> f64 {
-    let d = y.abs();
-    if d < 3.75 {
-        let mut m = y / 3.75;
-        m *= m;
-        1.0 + m
-            * (3.5156229
-                + m * (3.0899424
-                    + m * (1.2067492 + m * (0.2659732 + m * (0.360768e-1 + m * 0.45813e-2)))))
-    } else {
-        let m = 3.75 / d;
-        (d.exp() / d.sqrt())
-            * (0.39894228
-                + m * (0.1328592e-1
-                    + m * (0.225319e-2
-                        + m * (-0.157565e-2
-                            + m * (0.916281e-2
-                                + m * (-0.2057706e-1
-                                    + m * (0.2635537e-1
-                                        + m * (-0.1647633e-1 + m * 0.392377e-2))))))))
-    }
-}
-
-/// `GaussianOperator::ModifiedBesselI1` (itkGaussianOperator.hxx).
-fn bessel_i1(y: f64) -> f64 {
-    let d = y.abs();
-    let accumulator = if d < 3.75 {
-        let mut m = y / 3.75;
-        m *= m;
-        d * (0.5
-            + m * (0.87890594
-                + m * (0.51498869
-                    + m * (0.15084934 + m * (0.2658733e-1 + m * (0.301532e-2 + m * 0.32411e-3))))))
-    } else {
-        let m = 3.75 / d;
-        let mut acc = 0.2282967e-1 + m * (-0.2895312e-1 + m * (0.1787654e-1 - m * 0.420059e-2));
-        acc = 0.39894228
-            + m * (-0.3988024e-1
-                + m * (-0.362018e-2 + m * (0.163801e-2 + m * (-0.1031555e-1 + m * acc))));
-        acc * (d.exp() / d.sqrt())
-    };
-    if y < 0.0 { -accumulator } else { accumulator }
-}
-
-/// `GaussianOperator::ModifiedBesselI` (itkGaussianOperator.hxx), `n >= 2`:
-/// downward recurrence (Miller's algorithm) for the modified Bessel function
-/// of integer order `n`.
-fn bessel_i(n: i32, y: f64) -> f64 {
-    debug_assert!(n >= 2);
-    if y == 0.0 {
-        return 0.0;
-    }
-    const ACCURACY: f64 = 40.0;
-    let toy = 2.0 / y.abs();
-    let mut qip = 0.0f64;
-    let mut accumulator = 0.0f64;
-    let mut qi = 1.0f64;
-
-    let mut j = 2 * (n + (ACCURACY * n as f64).sqrt() as i32);
-    while j > 0 {
-        let qim = qip + j as f64 * toy * qi;
-        qip = qi;
-        qi = qim;
-        if qi.abs() > 1.0e10 {
-            accumulator *= 1.0e-10;
-            qi *= 1.0e-10;
-            qip *= 1.0e-10;
-        }
-        if j == n {
-            accumulator = qip;
-        }
-        j -= 1;
-    }
-
-    accumulator *= bessel_i0(y) / qi;
-
-    if y < 0.0 && (n & 1) == 1 {
-        -accumulator
-    } else {
-        accumulator
-    }
-}
-
-/// `GaussianOperator::GenerateCoefficients` (itkGaussianOperator.hxx): the
-/// symmetric 1-D discrete Gaussian kernel for `variance`, built from the
-/// modified-Bessel-function identity `1 = e^-t * sum_{k=-inf}^{inf} I_k(t)`.
-/// One-sided taps are added (`I0`, then `I1`, `I2`, ...) until their
-/// cumulative (unnormalized) sum reaches `1 - maximum_error`, or the one-sided
-/// tap count exceeds `maximum_kernel_width`
-/// (`DiscreteGaussianImageFilter`'s default of 32) — whichever comes first.
-/// The result is normalized to sum to 1 and mirrored:
-/// `kernel[radius + k] == kernel[radius - k]`.
-fn discrete_gaussian_kernel_1d(
-    variance: f64,
-    maximum_error: f64,
-    maximum_kernel_width: usize,
-) -> Vec<f64> {
-    let et = (-variance).exp();
-    let mut raw = vec![et * bessel_i0(variance), et * bessel_i1(variance)];
-    let mut sum = raw[0] + raw[1] * 2.0;
-
-    let cap = 1.0 - maximum_error;
-    let mut i: i32 = 2;
-    while sum < cap {
-        let c = et * bessel_i(i, variance);
-        raw.push(c);
-        sum += c * 2.0;
-        if c <= 0.0 {
-            break;
-        }
-        if raw.len() > maximum_kernel_width {
-            break;
-        }
-        i += 1;
-    }
-
-    for c in &mut raw {
-        *c /= sum;
-    }
-
-    let radius = raw.len() - 1;
-    let mut kernel = vec![0.0; 2 * radius + 1];
-    for (k, &c) in raw.iter().enumerate() {
-        kernel[radius - k] = c;
-        kernel[radius + k] = c;
-    }
-    kernel
-}
 
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
@@ -209,65 +71,6 @@ fn strides(size: &[usize]) -> Vec<usize> {
         s[d] = s[d - 1] * size[d - 1];
     }
     s
-}
-
-/// Convolve `buf` along axis `d` with `kernel` under a clamped
-/// (`ZeroFluxNeumannBoundaryCondition`) boundary — `DiscreteGaussianImageFilter`'s
-/// default boundary for both its input and its real-valued intermediate
-/// buffers.
-fn convolve_axis(
-    buf: &[f64],
-    size: &[usize],
-    strides: &[usize],
-    d: usize,
-    kernel: &[f64],
-    radius: usize,
-) -> Vec<f64> {
-    let stride = strides[d];
-    let size_d = size[d] as isize;
-    let mut out = vec![0.0f64; buf.len()];
-    for (p, slot) in out.iter_mut().enumerate() {
-        let coord_d = (p / stride) % size[d];
-        let line_base = p - coord_d * stride;
-        let mut acc = 0.0;
-        for (ki, &w) in kernel.iter().enumerate() {
-            let c =
-                (coord_d as isize + ki as isize - radius as isize).clamp(0, size_d - 1) as usize;
-            acc += w * buf[line_base + c * stride];
-        }
-        *slot = acc;
-    }
-    out
-}
-
-/// `DiscreteGaussianImageFilter` (itkDiscreteGaussianImageFilter.h(.hxx)),
-/// restricted to what `canny_edge_detection` needs from it: separable
-/// convolution with [`discrete_gaussian_kernel_1d`], one axis at a time.
-/// `variance` is in physical units (`UseImageSpacing` on by default, the only
-/// setting ITK's Canny filter ever uses): each axis's kernel variance is
-/// `variance[d] / spacing[d]^2` (`GetKernelVarianceArray`). Returns an
-/// always-`f64` image (this crate's scratch-then-narrow-once convention, see
-/// [`crate::gradient`]'s module docs); geometry is copied from `img`.
-fn discrete_gaussian_smooth(img: &Image, variance: &[f64], maximum_error: &[f64]) -> Result<Image> {
-    const MAXIMUM_KERNEL_WIDTH: usize = 32;
-
-    let dim = img.dimension();
-    let size = img.size().to_vec();
-    let spacing = img.spacing().to_vec();
-    let strides_v = strides(&size);
-    let mut buf = img.to_f64_vec();
-
-    for d in 0..dim {
-        let kernel_variance = variance[d] / (spacing[d] * spacing[d]);
-        let kernel =
-            discrete_gaussian_kernel_1d(kernel_variance, maximum_error[d], MAXIMUM_KERNEL_WIDTH);
-        let radius = kernel.len() / 2;
-        buf = convolve_axis(&buf, &size, &strides_v, d, &kernel, radius);
-    }
-
-    let mut out = Image::from_vec(&size, buf)?;
-    out.copy_geometry_from(img);
-    Ok(out)
 }
 
 // ==== ComputeCannyEdge / ThreadedCompute2ndDerivativePos ====
@@ -577,8 +380,10 @@ pub fn canny_edge_detection(
 
     let size = img.size().to_vec();
 
-    // 1. Gaussian smoothing.
-    let smoothed = discrete_gaussian_smooth(img, variance, maximum_error)?;
+    // 1. Gaussian smoothing (m_GaussianFilter): ITK's Canny leaves the
+    //    DiscreteGaussianImageFilter at its defaults — MaximumKernelWidth 32,
+    //    UseImageSpacing on.
+    let smoothed = discrete_gaussian_f64(img, variance, maximum_error, 32, true)?;
 
     // 2. Second directional derivative field (ComputeCannyEdge).
     let deriv_vals = second_directional_derivative_field(&smoothed)?;
@@ -610,25 +415,6 @@ pub fn canny_edge_detection(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- discrete_gaussian_kernel_1d ----
-
-    #[test]
-    fn discrete_gaussian_kernel_zero_variance_is_identity() {
-        let kernel = discrete_gaussian_kernel_1d(0.0, 0.01, 32);
-        assert_eq!(kernel, vec![0.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn discrete_gaussian_kernel_is_symmetric_and_normalized() {
-        let kernel = discrete_gaussian_kernel_1d(4.0, 0.01, 32);
-        let radius = kernel.len() / 2;
-        for k in 0..=radius {
-            assert!((kernel[radius - k] - kernel[radius + k]).abs() < 1e-15);
-        }
-        let sum: f64 = kernel.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9, "kernel sum {sum}");
-    }
 
     // ---- zero_crossing_values (direct, sign-comparison rule) ----
 
