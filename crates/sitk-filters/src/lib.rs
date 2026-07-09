@@ -124,7 +124,8 @@ pub use min_max_curvature_flow::{binary_min_max_curvature_flow, min_max_curvatur
 pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
-    grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
+    grayscale_morphological_closing, grayscale_morphological_opening, morphological_gradient,
+    white_top_hat,
 };
 pub use n4_bias_field::{
     N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,

@@ -206,7 +206,11 @@ impl StructuringElement {
         &self.radius
     }
 
-    fn on(&self) -> &[bool] {
+    /// The on/off mask itself, dimension-0-fastest (see the struct docs).
+    /// `pub(crate)`: also used by [`crate::geodesic_morphology`], which needs
+    /// the exact same kernel-position selection this module's grayscale
+    /// erode/dilate use, just against a different boundary condition.
+    pub(crate) fn on(&self) -> &[bool] {
         &self.on
     }
 
@@ -349,6 +353,39 @@ pub fn grayscale_erode(img: &Image, kernel: &StructuringElement) -> Result<Image
 /// `NumericTraits<T>::NonpositiveMin()` (see module docs).
 pub fn grayscale_dilate(img: &Image, kernel: &StructuringElement) -> Result<Image> {
     dispatch_scalar!(img.pixel_id(), grayscale_dilate_typed, img, kernel)
+}
+
+// ---- morphological gradient ---------------------------------------------
+
+/// `MorphologicalGradientImageFilter` (`itkMorphologicalGradientImageFilter.hxx`):
+/// `dilate(img) - erode(img)` for the same kernel.
+///
+/// `GenerateData` actually dispatches to one of four internal minipipelines —
+/// `BASIC` (`BasicDilateImageFilter`/`BasicErodeImageFilter`, exactly
+/// [`grayscale_dilate`]/[`grayscale_erode`]), `HISTO`
+/// (`MovingHistogramDilateImageFilter`, `SetKernel`'s default whenever the
+/// histogram filter supports the kernel), `ANCHOR`, or `VHGW` — chosen by
+/// `SetKernel` from the kernel's decomposability and a size heuristic, not
+/// user-selectable through SimpleITK (SimpleITK's yaml has no `Algorithm`
+/// member). All four are alternate-but-exact implementations of the same
+/// grayscale dilation/erosion over the same flat structuring element (that
+/// interchangeability is `MorphologicalGradientImageFilter::SetAlgorithm`'s
+/// whole premise — swapping the algorithm must not change the result), so
+/// this port always takes the `BASIC` path via the crate's own
+/// already-verified [`grayscale_dilate`]/[`grayscale_erode`], which is both
+/// what the task calls for and bit-identical to whichever algorithm ITK
+/// would actually have picked.
+///
+/// The final subtraction is `SubtractFilterType::New()` wired as
+/// `sub->SetInput1(dilate); sub->SetInput2(erode);` with no SafeBorder
+/// padding — i.e. exactly [`crate::subtract`] (`SubtractImageFilter`,
+/// `static_cast<T>(a - b)`: wraps on integer pixel types, since
+/// `MorphologicalGradientImageFilter`'s output pixel type is the same as its
+/// input per SimpleITK's `BasicPixelIDTypeList`).
+pub fn morphological_gradient(img: &Image, kernel: &StructuringElement) -> Result<Image> {
+    let dilated = grayscale_dilate(img, kernel)?;
+    let eroded = grayscale_erode(img, kernel)?;
+    subtract(&dilated, &eroded)
 }
 
 // ---- pad / crop (SafeBorder) -------------------------------------------
@@ -953,5 +990,53 @@ mod tests {
         let f = img_u8(&[5], vec![1, 0, 5, 0, 0]);
         let closed = binary_morphological_closing(&f, &se, 1.0).unwrap();
         assert_eq!(closed.scalar_slice::<u8>().unwrap(), &[1, 0, 5, 0, 0]);
+    }
+
+    // ---- morphological_gradient ----
+
+    #[test]
+    fn morphological_gradient_of_a_step_edge_is_a_hand_derived_dilate_minus_erode_band() {
+        // f = [0,0,0,10,10,10], box radius 1: dilate = [0,0,10,10,10,10],
+        // erode = [0,0,0,0,10,10] (boundary sentinels never win, so an
+        // out-of-range neighbor is effectively absent from the reduction);
+        // gradient = dilate - erode is a width-2 band straddling the edge.
+        let se = StructuringElement::box_(&[1]);
+        let f = img_u8(&[6], vec![0, 0, 0, 10, 10, 10]);
+        let gradient = morphological_gradient(&f, &se).unwrap();
+        assert_eq!(
+            gradient.scalar_slice::<u8>().unwrap(),
+            &[0, 0, 10, 10, 0, 0]
+        );
+    }
+
+    #[test]
+    fn morphological_gradient_ball_vs_box_kernel_differ_at_the_excluded_corner() {
+        // A single bright pixel sits at the exact corner offset (2,2) from
+        // the evaluated center (2,2) in a 5x5 grid. A radius-2 box kernel's
+        // dilate reaches it; a radius-2 ball's does not (see this module's
+        // own `ball_radius2_2d_excludes_corner_but_includes_near_corner`
+        // test) — erode is 0 either way (a single distant bright pixel
+        // cannot raise a min), so only dilate, and hence the gradient,
+        // differs between the two kernels at that center pixel.
+        let mut data = vec![0u8; 25];
+        data[4 * 5 + 4] = 100; // (x=4, y=4), corner offset (2,2) from (2,2)
+        let f = img_u8(&[5, 5], data);
+        let center = 2 + 5 * 2;
+
+        let box_kernel = StructuringElement::box_(&[2, 2]);
+        let box_gradient = morphological_gradient(&f, &box_kernel).unwrap();
+        assert_eq!(box_gradient.scalar_slice::<u8>().unwrap()[center], 100);
+
+        let ball_kernel = StructuringElement::ball(&[2, 2]);
+        let ball_gradient = morphological_gradient(&f, &ball_kernel).unwrap();
+        assert_eq!(ball_gradient.scalar_slice::<u8>().unwrap()[center], 0);
+    }
+
+    #[test]
+    fn morphological_gradient_is_zero_on_a_flat_image() {
+        let se = StructuringElement::ball(&[1, 1]);
+        let f = img_u8(&[4, 3], vec![7; 12]);
+        let gradient = morphological_gradient(&f, &se).unwrap();
+        assert_eq!(gradient.scalar_slice::<u8>().unwrap(), &[0u8; 12]);
     }
 }
