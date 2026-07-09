@@ -1,37 +1,41 @@
-//! Unary math and squared-difference filters for sitk-rs, verified against
-//! the ITK v6 source under `Modules/Filtering/ImageIntensity/include/`
-//! (`itkAbsImageFilter.h`, `itkAcosImageFilter.h`, `itkAsinImageFilter.h`,
-//! `itkAtanImageFilter.h`, `itkCosImageFilter.h`, `itkSinImageFilter.h`,
-//! `itkTanImageFilter.h`, `itkExpImageFilter.h`, `itkExpNegativeImageFilter.h`,
-//! `itkLogImageFilter.h`, `itkLog10ImageFilter.h`, `itkSqrtImageFilter.h`,
-//! `itkSquareImageFilter.h`, `itkBoundedReciprocalImageFilter.h`) and
-//! `Modules/Filtering/ImageCompare/include/itkSquaredDifferenceImageFilter.h`.
+//! Unary math and multi-image f64-compute filters for sitk-rs, verified
+//! against the ITK v6 source under
+//! `Modules/Filtering/ImageIntensity/include/` (`itkAbsImageFilter.h`,
+//! `itkAcosImageFilter.h`, `itkAsinImageFilter.h`, `itkAtanImageFilter.h`,
+//! `itkCosImageFilter.h`, `itkSinImageFilter.h`, `itkTanImageFilter.h`,
+//! `itkExpImageFilter.h`, `itkExpNegativeImageFilter.h`, `itkLogImageFilter.h`,
+//! `itkLog10ImageFilter.h`, `itkSqrtImageFilter.h`, `itkSquareImageFilter.h`,
+//! `itkBoundedReciprocalImageFilter.h`, `itkAtan2ImageFilter.h`,
+//! `itkBinaryMagnitudeImageFilter.h`, `itkArithmeticOpsFunctors.h`'s
+//! `DivFloor`/`DivReal`) and
+//! `Modules/Filtering/ImageCompare/include/itkSquaredDifferenceImageFilter.h`
+//! / `itkAbsoluteValueDifferenceImageFilter.h`.
 //!
-//! Every filter here except [`squared_difference`] is f64-compute
-//! (`functor.rs`'s policy (a)): each ITK functor promotes its input to
-//! `double`, applies a `<cmath>` function, and `static_cast`s back down
-//! (`itkAcosImageFilter.h`'s `Acos`: `static_cast<TOutput>(std::acos(
-//! static_cast<double>(A)))`), matching this crate's [`UnaryFunctor`] /
-//! [`functor::unary_functor!`] seam exactly. Out-of-domain inputs (`sqrt` of
-//! a negative, `log` of `0`) produce `NaN`/`-inf` in `f64`, which
-//! [`sitk_core::Scalar::from_f64`] then narrows: integer outputs saturate
-//! (`NaN` maps to `0`, `-inf` maps to the type's minimum), float outputs
-//! keep the `NaN`/`-inf` exactly.
+//! The single-image filters are f64-compute (`functor.rs`'s policy (a)):
+//! each ITK functor promotes its input to `double`, applies a `<cmath>`
+//! function, and `static_cast`s back down (`itkAcosImageFilter.h`'s `Acos`:
+//! `static_cast<TOutput>(std::acos(static_cast<double>(A)))`), matching this
+//! crate's [`UnaryFunctor`] / [`functor::unary_functor!`] seam exactly.
+//! Out-of-domain inputs (`sqrt` of a negative, `log` of `0`) produce
+//! `NaN`/`-inf` in `f64`, which [`sitk_core::Scalar::from_f64`] then narrows:
+//! integer outputs saturate (`NaN` maps to `0`, `-inf` maps to the type's
+//! minimum), float outputs keep the `NaN`/`-inf` exactly.
 //!
-//! [`squared_difference`] is also f64-compute but over *two* images
-//! (`itkSquaredDifferenceImageFilter.h`'s `SquaredDifference2` functor:
-//! `diff = double(A) - double(B); static_cast<TOutput>(diff * diff)`), which
-//! is outside both `functor.rs` traits ([`UnaryFunctor`] takes one image;
-//! [`BinaryFunctor`] computes in the pixel type rather than `f64`). Doing
-//! the subtraction in the pixel type would be wrong for unsigned inputs
-//! (`5u8 - 10u8` wraps instead of producing `-5`), so it's implemented
-//! directly against `to_f64_vec`/`image_from_f64`, the same way
-//! `rescale_intensity` and `statistics` in `lib.rs` handle multi-image or
-//! reduction f64 math that falls outside the functor seam.
+//! Everything from [`squared_difference`] on is also f64-compute but over
+//! *two* images (e.g. `itkSquaredDifferenceImageFilter.h`'s
+//! `SquaredDifference2` functor: `diff = double(A) - double(B);
+//! static_cast<TOutput>(diff * diff)`), which is outside both `functor.rs`
+//! traits ([`UnaryFunctor`] takes one image; [`BinaryFunctor`] computes in
+//! the pixel type rather than `f64`). Doing the subtraction in the pixel
+//! type would be wrong for unsigned inputs (`5u8 - 10u8` wraps instead of
+//! producing `-5`), so these are implemented directly against
+//! `to_f64_vec`/`image_from_f64`, the same way `rescale_intensity` and
+//! `statistics` in `lib.rs` handle multi-image or reduction f64 math that
+//! falls outside the functor seam.
 
 use crate::functor::{self, UnaryFunctor};
 use crate::{Result, image_from_f64, require_same_shape};
-use sitk_core::{Image, Scalar, dispatch_scalar};
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
 // ---- abs --------------------------------------------------------------
 
@@ -227,41 +231,175 @@ functor::unary_functor! {
     pub fn bounded_reciprocal, bounded_reciprocal_in_place() = BoundedReciprocal;
 }
 
+// ---- two-image f64-compute shared helpers ------------------------------
+//
+// Shared by every two-image filter below (squared_difference,
+// absolute_value_difference, atan2, binary_magnitude, divide_floor): cast
+// both operands to `f64`, combine, narrow once. `divide_real` needs a
+// different output pixel type (its `NumericTraits<T>::RealType` promotion),
+// so it takes `output_id` explicitly instead of defaulting to `a`'s.
+
+fn two_image_f64_with_output(
+    a: &Image,
+    b: &Image,
+    output_id: PixelId,
+    f: impl Fn(f64, f64) -> f64,
+) -> Result<Image> {
+    require_same_shape(a, b)?;
+    let va = a.to_f64_vec();
+    let vb = b.to_f64_vec();
+    let out: Vec<f64> = va.iter().zip(&vb).map(|(&x, &y)| f(x, y)).collect();
+    image_from_f64(output_id, a.size(), a, &out)
+}
+
+fn two_image_f64(a: &Image, b: &Image, f: impl Fn(f64, f64) -> f64) -> Result<Image> {
+    two_image_f64_with_output(a, b, a.pixel_id(), f)
+}
+
+fn two_image_f64_typed_in_place<T: Scalar>(
+    img: &mut Image,
+    other: &[f64],
+    f: &dyn Fn(f64, f64) -> f64,
+) -> Result<()> {
+    let v = img.scalar_vec_mut::<T>()?;
+    for (x, &y) in v.iter_mut().zip(other) {
+        *x = T::from_f64(f(x.as_f64(), y));
+    }
+    Ok(())
+}
+
+fn two_image_f64_in_place(mut a: Image, b: &Image, f: &dyn Fn(f64, f64) -> f64) -> Result<Image> {
+    require_same_shape(&a, b)?;
+    let vb = b.to_f64_vec();
+    dispatch_scalar!(a.pixel_id(), two_image_f64_typed_in_place, &mut a, &vb, f)?;
+    Ok(a)
+}
+
 // ---- squared difference (two images, f64-compute) --------------------------
 
 /// `SquaredDifferenceImageFilter`: pixel-wise `(a - b)^2`, computed in `f64`
 /// (`itkSquaredDifferenceImageFilter.h`'s `SquaredDifference2` functor). See
 /// the module docs for why this bypasses the `BinaryFunctor` seam.
 pub fn squared_difference(a: &Image, b: &Image) -> Result<Image> {
-    require_same_shape(a, b)?;
-    let va = a.to_f64_vec();
-    let vb = b.to_f64_vec();
-    let out: Vec<f64> = va
-        .iter()
-        .zip(&vb)
-        .map(|(&x, &y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .collect();
-    image_from_f64(a.pixel_id(), a.size(), a, &out)
-}
-
-fn squared_difference_typed_in_place<T: Scalar>(img: &mut Image, other: &[f64]) -> Result<()> {
-    let v = img.scalar_vec_mut::<T>()?;
-    for (x, &y) in v.iter_mut().zip(other) {
-        let diff = x.as_f64() - y;
-        *x = T::from_f64(diff * diff);
-    }
-    Ok(())
+    two_image_f64(a, b, |x, y| {
+        let diff = x - y;
+        diff * diff
+    })
 }
 
 /// In-place variant of [`squared_difference`]: reuses `a`'s buffer.
-pub fn squared_difference_in_place(mut a: Image, b: &Image) -> Result<Image> {
-    require_same_shape(&a, b)?;
-    let vb = b.to_f64_vec();
-    dispatch_scalar!(a.pixel_id(), squared_difference_typed_in_place, &mut a, &vb)?;
-    Ok(a)
+pub fn squared_difference_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| {
+        let diff = x - y;
+        diff * diff
+    })
+}
+
+// ---- absolute value difference (two images, f64-compute) ------------------
+
+/// `AbsoluteValueDifferenceImageFilter`
+/// (`itkAbsoluteValueDifferenceImageFilter.h`'s `AbsoluteValueDifference2`
+/// functor): pixel-wise `|a - b|`, computed in `f64`
+/// (`dA = double(A); dB = double(B); diff = dA - dB; abs = diff > 0 ? diff :
+/// -diff`).
+pub fn absolute_value_difference(a: &Image, b: &Image) -> Result<Image> {
+    two_image_f64(a, b, |x, y| (x - y).abs())
+}
+
+/// In-place variant of [`absolute_value_difference`]: reuses `a`'s buffer.
+pub fn absolute_value_difference_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| (x - y).abs())
+}
+
+// ---- atan2 (two images, f64-compute) ---------------------------------------
+
+/// `Atan2ImageFilter` (`itkAtan2ImageFilter.h`'s `Atan2` functor): pixel-wise
+/// two-argument inverse tangent, `std::atan2(double(a), double(b))` — `a` is
+/// the first input (`SetInput1`, the `y` argument), `b` the second
+/// (`SetInput2`, the `x` argument).
+pub fn atan2(a: &Image, b: &Image) -> Result<Image> {
+    two_image_f64(a, b, |x, y| x.atan2(y))
+}
+
+/// In-place variant of [`atan2`]: reuses `a`'s buffer.
+pub fn atan2_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| x.atan2(y))
+}
+
+// ---- binary magnitude (two images, f64-compute) ----------------------------
+
+/// `BinaryMagnitudeImageFilter` (`itkBinaryMagnitudeImageFilter.h`'s
+/// `Modulus2` functor): pixel-wise `sqrt(a^2 + b^2)`, computed in `f64`
+/// (`dA = double(A); dB = double(B); sqrt(dA*dA + dB*dB)`).
+pub fn binary_magnitude(a: &Image, b: &Image) -> Result<Image> {
+    two_image_f64(a, b, |x, y| (x * x + y * y).sqrt())
+}
+
+/// In-place variant of [`binary_magnitude`]: reuses `a`'s buffer.
+pub fn binary_magnitude_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| (x * x + y * y).sqrt())
+}
+
+// ---- divide floor / divide real (two images, f64-compute) -----------------
+
+/// `DivideFloorImageFilter` (`itkArithmeticOpsFunctors.h`'s `DivFloor`
+/// functor): pixel-wise `floor(double(a) / double(b))`, output pixel type is
+/// `a`'s own type (SimpleITK's `filter_type` pins the C++ output image type
+/// to `InputImageType`, not a promoted `OutputImageType`).
+///
+/// ITK special-cases an infinite `floor` result for integral output types
+/// (`b == 0` with `a != 0`) to `NumericTraits<TOutput>::max()`/
+/// `NonpositiveMin()` rather than a UB `static_cast<TOutput>(inf)`; this
+/// crate's [`Scalar::from_f64`] narrows `f64::INFINITY`/`NEG_INFINITY` to
+/// exactly those same type-max/type-min values via Rust's saturating `as`
+/// cast, so no separate branch is needed here — the general f64-compute
+/// narrowing already reproduces ITK's special case. The genuine `0 / 0`
+/// case (`a == 0 && b == 0`) is `NaN` after `floor`; ITK's `isinf(NaN)` check
+/// is false there, so it falls through to a UB `static_cast<TOutput>(NaN)`
+/// (unspecified in C++), while this crate's saturating cast defines it as
+/// `0` for integer outputs (matching this crate's established
+/// `NaN`-narrows-to-`0` policy, e.g. `math::sqrt`'s negative-input tests) and
+/// preserves `NaN` exactly for float outputs.
+pub fn divide_floor(a: &Image, b: &Image) -> Result<Image> {
+    two_image_f64(a, b, |x, y| (x / y).floor())
+}
+
+/// In-place variant of [`divide_floor`]: reuses `a`'s buffer.
+pub fn divide_floor_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| (x / y).floor())
+}
+
+/// `NumericTraits<T>::RealType` pixel-type mapping used by [`divide_real`]:
+/// stays `Float32` for a `Float32` input, promotes everything else (every
+/// integer type, and `Float64` itself) to `Float64`. Mirrors
+/// `intensity::real_type`/`projection::real_type`.
+fn real_type(id: PixelId) -> PixelId {
+    match id {
+        PixelId::Float32 => PixelId::Float32,
+        _ => PixelId::Float64,
+    }
+}
+
+/// `DivideRealImageFilter` (`itkArithmeticOpsFunctors.h`'s `DivReal`
+/// functor): pixel-wise `RealType(a) / RealType(b)`. The output pixel type
+/// is `a`'s `NumericTraits<T>::RealType` (see [`real_type`]), matching
+/// `DivideRealImageFilter.yaml`'s `output_pixel_type` override -- unlike
+/// [`divide_floor`], the output is always real, so there is no
+/// integer-narrowing special case: `b == 0` naturally yields `+inf`/`-inf`/
+/// `NaN` under IEEE 754, preserved exactly since the output pixel type is
+/// always floating-point. This crate computes the division itself in `f64`
+/// for every input type rather than `DivReal`'s per-type `RealType(A) /
+/// RealType(B)` (which divides in `f32` precision when the input is
+/// `Float32`); this is a known ULP-level precision simplification, matching
+/// how `intensity::normalize` and other multi-image reductions in this
+/// crate already promote uniformly to `f64` (see the module docs).
+///
+/// No in-place variant: like [`intensity::normalize`](crate::intensity::normalize),
+/// the output pixel type does not generally match the input's, so there is
+/// no buffer to reuse.
+pub fn divide_real(a: &Image, b: &Image) -> Result<Image> {
+    let output_id = real_type(a.pixel_id());
+    two_image_f64_with_output(a, b, output_id, |x, y| x / y)
 }
 
 #[cfg(test)]
@@ -429,5 +567,169 @@ mod tests {
             squared_difference(&a, &b),
             Err(crate::FilterError::TypeMismatch { .. })
         ));
+    }
+
+    // ---- absolute_value_difference ----
+
+    #[test]
+    fn absolute_value_difference_basic() {
+        let a = img_u8(&[3, 1], vec![5, 10, 250]);
+        let b = img_u8(&[3, 1], vec![10, 5, 10]);
+        assert_eq!(
+            absolute_value_difference(&a, &b)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[5, 5, 240]
+        );
+    }
+
+    #[test]
+    fn absolute_value_difference_in_place_matches_allocating() {
+        let a = img_u8(&[3, 1], vec![5, 10, 250]);
+        let b = img_u8(&[3, 1], vec![10, 5, 10]);
+        let allocated = absolute_value_difference(&a, &b).unwrap();
+        let in_place = absolute_value_difference_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- atan2 ----
+
+    #[test]
+    fn atan2_basic_values_and_argument_order() {
+        // Atan2(A, B) = std::atan2(double(A), double(B)): A is the first
+        // input (the `y` argument), B the second (the `x` argument), so
+        // atan2(1, 0) != atan2(0, 1).
+        let a = Image::from_vec(&[2, 1], vec![1.0f64, 0.0]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![0.0f64, 1.0]).unwrap();
+        let out = atan2(&a, &b).unwrap();
+        assert_eq!(
+            out.scalar_slice::<f64>().unwrap(),
+            &[std::f64::consts::FRAC_PI_2, 0.0]
+        );
+    }
+
+    #[test]
+    fn atan2_in_place_matches_allocating() {
+        let a = Image::from_vec(&[2, 1], vec![1.0f64, -1.0]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![1.0f64, 0.0]).unwrap();
+        let allocated = atan2(&a, &b).unwrap();
+        let in_place = atan2_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- binary_magnitude ----
+
+    #[test]
+    fn binary_magnitude_3_4_5_triangle() {
+        let a = img_u8(&[1, 1], vec![3]);
+        let b = img_u8(&[1, 1], vec![4]);
+        assert_eq!(
+            binary_magnitude(&a, &b)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[5]
+        );
+    }
+
+    #[test]
+    fn binary_magnitude_in_place_matches_allocating() {
+        let a = img_u8(&[1, 1], vec![3]);
+        let b = img_u8(&[1, 1], vec![4]);
+        let allocated = binary_magnitude(&a, &b).unwrap();
+        let in_place = binary_magnitude_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- divide_floor ----
+
+    #[test]
+    fn divide_floor_basic_and_negative() {
+        let a = Image::from_vec(&[2, 1], vec![7i32, -7]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![2i32, 2]).unwrap();
+        // floor(7/2) = 3; floor(-7/2) = floor(-3.5) = -4 (not truncation).
+        assert_eq!(
+            divide_floor(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
+            &[3, -4]
+        );
+    }
+
+    #[test]
+    fn divide_floor_by_zero_saturates_to_type_max_or_min_on_integer_output() {
+        let a = Image::from_vec(&[2, 1], vec![5i32, -5]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![0i32, 0]).unwrap();
+        // floor(5.0/0.0) = floor(+inf) = +inf -> i32::MAX (NumericTraits::max);
+        // floor(-5.0/0.0) = floor(-inf) = -inf -> i32::MIN (NonpositiveMin).
+        assert_eq!(
+            divide_floor(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
+            &[i32::MAX, i32::MIN]
+        );
+    }
+
+    #[test]
+    fn divide_floor_zero_by_zero_is_zero_on_integer_output_nan_on_float_output() {
+        let a = img_u8(&[1, 1], vec![0]);
+        let b = img_u8(&[1, 1], vec![0]);
+        // floor(0.0/0.0) = floor(NaN) = NaN; ITK's isinf(NaN) check is false,
+        // so it falls through to a UB static_cast<TOutput>(NaN) in C++. This
+        // crate's Scalar::from_f64 defines NaN -> 0 for integer outputs.
+        assert_eq!(
+            divide_floor(&a, &b).unwrap().scalar_slice::<u8>().unwrap(),
+            &[0]
+        );
+
+        let af = Image::from_vec(&[1, 1], vec![0.0f64]).unwrap();
+        let bf = Image::from_vec(&[1, 1], vec![0.0f64]).unwrap();
+        assert!(
+            divide_floor(&af, &bf)
+                .unwrap()
+                .scalar_slice::<f64>()
+                .unwrap()[0]
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn divide_floor_in_place_matches_allocating() {
+        let a = Image::from_vec(&[2, 1], vec![7i32, -7]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![2i32, 2]).unwrap();
+        let allocated = divide_floor(&a, &b).unwrap();
+        let in_place = divide_floor_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- divide_real ----
+
+    #[test]
+    fn divide_real_promotes_integer_input_to_float64() {
+        let a = img_u8(&[1, 1], vec![1]);
+        let b = img_u8(&[1, 1], vec![4]);
+        let out = divide_real(&a, &b).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::Float64);
+        assert_eq!(out.scalar_slice::<f64>().unwrap(), &[0.25]);
+    }
+
+    #[test]
+    fn divide_real_keeps_float32_output_as_float32() {
+        let a = Image::from_vec(&[1, 1], vec![1.0f32]).unwrap();
+        let b = Image::from_vec(&[1, 1], vec![4.0f32]).unwrap();
+        let out = divide_real(&a, &b).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::Float32);
+        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[0.25]);
+    }
+
+    #[test]
+    fn divide_real_by_zero_is_infinite_not_saturated() {
+        // Unlike divide_floor, DivReal's output is always real, so b == 0
+        // just yields IEEE 754 +-inf / NaN, never a NumericTraits max/min
+        // substitution.
+        let a = img_u8(&[3, 1], vec![5, 0, 0]);
+        let b = img_u8(&[3, 1], vec![0, 0, 5]);
+        let out = divide_real(&a, &b).unwrap();
+        let vals = out.scalar_slice::<f64>().unwrap();
+        assert_eq!(vals[0], f64::INFINITY);
+        assert!(vals[1].is_nan());
+        assert_eq!(vals[2], 0.0);
     }
 }

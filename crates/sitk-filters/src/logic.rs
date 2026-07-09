@@ -38,7 +38,7 @@ use crate::functor::{self, BinaryFunctor, UnaryFunctor};
 use crate::{FilterError, Result};
 use sitk_core::{Image, Scalar};
 
-fn require_integer_pixel_type(img: &Image) -> Result<()> {
+pub(crate) fn require_integer_pixel_type(img: &Image) -> Result<()> {
     if img.pixel_id().is_floating_point() {
         return Err(FilterError::RequiresIntegerPixelType(img.pixel_id()));
     }

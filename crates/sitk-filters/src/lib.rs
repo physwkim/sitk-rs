@@ -130,8 +130,10 @@ pub use logic::{
     xor_in_place,
 };
 pub use math::{
-    abs, abs_in_place, acos, acos_in_place, asin, asin_in_place, atan, atan_in_place,
-    bounded_reciprocal, bounded_reciprocal_in_place, cos, cos_in_place, exp, exp_in_place,
+    abs, abs_in_place, absolute_value_difference, absolute_value_difference_in_place, acos,
+    acos_in_place, asin, asin_in_place, atan, atan_in_place, atan2, atan2_in_place,
+    binary_magnitude, binary_magnitude_in_place, bounded_reciprocal, bounded_reciprocal_in_place,
+    cos, cos_in_place, divide_floor, divide_floor_in_place, divide_real, exp, exp_in_place,
     exp_negative, exp_negative_in_place, log, log_in_place, log10, log10_in_place, sin,
     sin_in_place, sqrt, sqrt_in_place, square, square_in_place, squared_difference,
     squared_difference_in_place, tan, tan_in_place,
@@ -327,6 +329,58 @@ functor::binary_functor! {
     /// type's largest finite value (`NumericTraits<T>::max()`), matching ITK's `Div`
     /// functor.
     pub fn divide, divide_in_place = DivOp;
+}
+
+/// `Modulus` functor (`itkArithmeticOpsFunctors.h`): `a % b`, or the type's
+/// max value when `b == 0` (`NumericTraits<TOutput>::max(static_cast<
+/// TOutput>(A))`, which for every scalar type this crate supports ignores
+/// its argument and returns the type's plain maximum -- see
+/// `itkNumericTraits.h`'s `ITK_NUMERIC_TRAITS_MIN_MAX` macro). Integer pixel
+/// types only (`ModulusImageFilter.yaml`'s `pixel_types:
+/// IntegerPixelIDTypeList`); floats have no `%` operator in C++.
+///
+/// C++'s `%` on a `TInput1::MIN % -1` overflows (undefined behavior,
+/// typically a SIGFPE trap); this crate uses `wrapping_rem`, matching this
+/// module's `AddOp`/`SubOp`/`MulOp`/`DivOp` policy of defining C++'s
+/// undefined integer-overflow behavior as 2's-complement wraparound rather
+/// than panicking (Rust's plain `%` panics on this same input in debug
+/// builds).
+struct ModOp;
+
+macro_rules! impl_modulus_int {
+    ($($t:ty),+ $(,)?) => {$(
+        impl BinaryFunctor<$t> for ModOp {
+            fn apply(&self, a: $t, b: $t) -> $t {
+                if b == 0 { <$t>::MAX } else { a.wrapping_rem(b) }
+            }
+        }
+    )+};
+}
+
+impl_modulus_int!(u8, i8, u16, i16, u32, i32, u64, i64);
+impl BinaryFunctor<f32> for ModOp {
+    fn apply(&self, _a: f32, _b: f32) -> f32 {
+        unreachable!("gated to integer pixel types by logic::require_integer_pixel_type")
+    }
+}
+impl BinaryFunctor<f64> for ModOp {
+    fn apply(&self, _a: f64, _b: f64) -> f64 {
+        unreachable!("gated to integer pixel types by logic::require_integer_pixel_type")
+    }
+}
+
+/// `ModulusImageFilter`: pixel-wise `a % b`; where `b == 0` yields the
+/// output type's largest value. Integer pixel types only; errors with
+/// [`FilterError::RequiresIntegerPixelType`] on a floating-point image.
+pub fn modulus(a: &Image, b: &Image) -> Result<Image> {
+    logic::require_integer_pixel_type(a)?;
+    functor::binary_apply(a, b, &ModOp)
+}
+
+/// In-place variant of [`modulus`]: reuses `a`'s buffer.
+pub fn modulus_in_place(a: Image, b: &Image) -> Result<Image> {
+    logic::require_integer_pixel_type(&a)?;
+    functor::binary_apply_in_place(a, b, &ModOp)
 }
 
 // ---- binary arithmetic (image ⊕ constant) ---------------------------------
@@ -551,6 +605,50 @@ mod tests {
             divide(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
             &[i32::MAX, 4]
         );
+    }
+
+    #[test]
+    fn modulus_basic_and_zero_divisor() {
+        let a = Image::from_vec(&[3, 1], vec![10i32, -7, 20]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 0]).unwrap();
+        // 10 % 3 = 1; -7 % 3 = -1 (Rust `%` and C++ `%` both truncate toward
+        // zero, sign follows the dividend); 20 % 0 -> i32::MAX.
+        assert_eq!(
+            modulus(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
+            &[1, -1, i32::MAX]
+        );
+    }
+
+    #[test]
+    fn modulus_min_dividend_by_negative_one_does_not_panic() {
+        // i32::MIN % -1 would overflow (and panic in debug Rust); ModOp uses
+        // wrapping_rem, matching this crate's established policy of defining
+        // C++'s undefined integer-overflow behavior as 2's-complement wrap.
+        let a = Image::from_vec(&[1, 1], vec![i32::MIN]).unwrap();
+        let b = Image::from_vec(&[1, 1], vec![-1i32]).unwrap();
+        assert_eq!(
+            modulus(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
+            &[0]
+        );
+    }
+
+    #[test]
+    fn modulus_rejects_float_pixel_type() {
+        let a = Image::from_vec(&[1, 1], vec![1.0f32]).unwrap();
+        let b = Image::from_vec(&[1, 1], vec![1.0f32]).unwrap();
+        assert_eq!(
+            modulus(&a, &b),
+            Err(FilterError::RequiresIntegerPixelType(a.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn modulus_in_place_matches_allocating() {
+        let a = Image::from_vec(&[3, 1], vec![10i32, -7, 20]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 0]).unwrap();
+        let allocated = modulus(&a, &b).unwrap();
+        let in_place = modulus_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
     }
 
     #[test]
