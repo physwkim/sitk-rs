@@ -183,13 +183,18 @@ pub enum FilterError {
     #[error("order {0:?} is not a permutation of 0..{1}")]
     InvalidPermutation(Vec<usize>, usize),
 
-    /// A bitwise/logic filter (`And`/`Or`/`Xor`/`Not`) was given a
-    /// floating-point image. ITK's `BitwiseOperators`/`NotOperator` concept
-    /// checks only instantiate for integer pixel types (`itkAndImageFilter.h`
-    /// et al.; SimpleITK's generated wrappers restrict these to
-    /// `IntegerPixelIDTypeList`), which is a compile error in C++ and a
-    /// runtime error here.
-    #[error("bitwise/logic filters require an integer pixel type, got {0:?}")]
+    /// A filter whose SimpleITK yaml declares `pixel_types:
+    /// IntegerPixelIDTypeList` was given a floating-point image. SimpleITK
+    /// never instantiates those wrappers for `Float32`/`Float64`, which is a
+    /// compile-time restriction in C++ and a runtime error here.
+    ///
+    /// For the bitwise/logic filters (`And`/`Or`/`Xor`/`Not`) the restriction
+    /// also comes from ITK itself: the `BitwiseOperators`/`NotOperator`
+    /// concept checks only instantiate for integer pixel types
+    /// (`itkAndImageFilter.h` et al.). Other users of this variant --
+    /// `AntiAliasBinaryImageFilter`, `LabelShapeStatisticsImageFilter`,
+    /// `LabelOverlapMeasuresImageFilter` -- are restricted by the yaml alone.
+    #[error("this filter requires an integer pixel type, got {0:?}")]
     RequiresIntegerPixelType(PixelId),
 
     /// A filter whose SimpleITK yaml restricts it to the unsigned integer

@@ -26,6 +26,94 @@
 //! [`speed`]: LevelSetFunction::speed
 
 use super::grid::Grid;
+use crate::denoise::curvature_flow_update_at;
+
+/// The `FiniteDifferenceFunction` a `SparseFieldLevelSetImageFilter` subclass
+/// installs with `SetDifferenceFunction`.
+///
+/// The five segmentation filters install a `SegmentationLevelSetFunction`
+/// ([`LevelSetFunction`]); `AntiAliasBinaryImageFilter` installs a
+/// `CurvatureFlowFunction` ([`CurvatureFlowFunction`]) instead.
+pub(super) enum DifferenceFunction {
+    LevelSet(LevelSetFunction),
+    CurvatureFlow(CurvatureFlowFunction),
+}
+
+impl DifferenceFunction {
+    /// `FiniteDifferenceFunction::ComputeNeighborhoodScales()`, read by
+    /// `SparseFieldLevelSetImageFilter::InitializeActiveLayerValues`.
+    pub(super) fn neighborhood_scales(&self) -> &[f64] {
+        match self {
+            DifferenceFunction::LevelSet(f) => &f.neighborhood_scales,
+            DifferenceFunction::CurvatureFlow(f) => &f.neighborhood_scales,
+        }
+    }
+
+    pub(super) fn compute_update(
+        &self,
+        phi: &[f64],
+        grid: &Grid,
+        index: usize,
+        gd: &mut GlobalData,
+    ) -> f64 {
+        match self {
+            DifferenceFunction::LevelSet(f) => f.compute_update(phi, grid, index, gd),
+            DifferenceFunction::CurvatureFlow(f) => f.compute_update(phi, grid, index),
+        }
+    }
+
+    pub(super) fn compute_global_time_step(&self, gd: &mut GlobalData) -> f64 {
+        match self {
+            DifferenceFunction::LevelSet(f) => f.compute_global_time_step(gd),
+            DifferenceFunction::CurvatureFlow(f) => f.time_step,
+        }
+    }
+}
+
+/// `CurvatureFlowFunction` (itkCurvatureFlowFunction.h/.hxx): pure `kappa *
+/// |grad(phi)|` at a constant time step. `ComputeGlobalTimeStep` returns
+/// `m_TimeStep` regardless of the global data, and `ComputeUpdate` ignores it
+/// entirely.
+pub(super) struct CurvatureFlowFunction {
+    /// As [`LevelSetFunction::neighborhood_scales`]. The function's own radius
+    /// is `1` on every axis, so this is `ScaleCoefficients` verbatim.
+    pub(super) neighborhood_scales: Vec<f64>,
+    /// `m_TimeStep`, whose constructor default is `0.05`. No
+    /// `SparseFieldLevelSetImageFilter` subclass in this crate changes it.
+    pub(super) time_step: f64,
+}
+
+/// `CurvatureFlowFunction`'s constructor default for `m_TimeStep`
+/// (itkCurvatureFlowFunction.hxx:38): `m_TimeStep = 0.05f`, a `float` literal
+/// widened into a `double` member (`FiniteDifferenceFunction::TimeStepType`).
+/// The widening is not exact, so the step is `0.05000000074505806`, not `0.05`.
+pub(super) const CURVATURE_FLOW_TIME_STEP: f64 = 0.05f32 as f64;
+
+impl CurvatureFlowFunction {
+    pub(super) fn new(neighborhood_scales: Vec<f64>) -> Self {
+        CurvatureFlowFunction {
+            neighborhood_scales,
+            time_step: CURVATURE_FLOW_TIME_STEP,
+        }
+    }
+
+    /// `CurvatureFlowFunction::ComputeUpdate` (hxx:50-127), shared with
+    /// [`crate::denoise::curvature_flow`] through
+    /// [`curvature_flow_update_at`]. Neighbor reads clamp at the image border,
+    /// matching the `ZeroFluxNeumannBoundaryCondition` of ITK's
+    /// `NeighborhoodIterator`.
+    fn compute_update(&self, phi: &[f64], grid: &Grid, index: usize) -> f64 {
+        let dim = grid.dim();
+        let center = grid.coord(index);
+        let mut coord = vec![0i64; dim];
+        curvature_flow_update_at(dim, &self.neighborhood_scales, |offset| {
+            for d in 0..dim {
+                coord[d] = center[d] + offset[d];
+            }
+            phi[grid.clamped_index(&coord)]
+        })
+    }
+}
 
 /// Which `CurvatureSpeed` override the concrete `SegmentationLevelSetFunction`
 /// subclass uses for the `Z(x)` factor of the curvature term.

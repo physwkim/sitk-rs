@@ -70,14 +70,14 @@ use std::collections::BinaryHeap;
 use sitk_core::{Image, PixelId};
 
 use crate::error::{FilterError, Result};
-use crate::image_from_f64;
+use crate::{image_from_f64, real_pixel_id};
 
 /// `itk::Math::eps` (`itkMath.h`), the bound `GenerateData` rejects
 /// `m_NormalizationFactor` below.
 const ITK_MATH_EPS: f64 = f64::EPSILON;
 
 /// First-index-fastest strides for a size vector.
-fn strides(size: &[usize]) -> Vec<usize> {
+pub(crate) fn strides(size: &[usize]) -> Vec<usize> {
     let mut s = vec![1usize; size.len()];
     for d in 1..size.len() {
         s[d] = s[d - 1] * size[d - 1];
@@ -140,10 +140,7 @@ impl Eq for TrialNode {}
 /// `output_pixel_type: NumericTraits<InputPixelType>::RealType`, i.e. `float`
 /// for a `float` speed image and `double` for everything else.
 pub fn output_pixel_id(speed: PixelId) -> PixelId {
-    match speed {
-        PixelId::Float32 => PixelId::Float32,
-        _ => PixelId::Float64,
-    }
+    real_pixel_id(speed)
 }
 
 /// The value unreached (far) pixels hold: ITK's `m_LargeValue`,
@@ -183,15 +180,12 @@ pub fn fast_marching(
     normalization_factor: f64,
     stopping_value: f64,
 ) -> Result<Image> {
-    // itkFastMarchingImageFilter.hxx GenerateData(): "Normalization Factor is
-    // null or negative".
-    if normalization_factor < ITK_MATH_EPS {
-        return Err(FilterError::InvalidNormalizationFactor(
-            normalization_factor,
-        ));
-    }
+    // ITK checks this before it ever looks at the seeds, and a wrong-length
+    // seed is not an error it can express (its indices are dimension-typed),
+    // so the normalization factor takes precedence when both are invalid.
+    check_normalization_factor(normalization_factor)?;
 
-    let size = speed.size().to_vec();
+    let size = speed.size();
     let dim = size.len();
     for point in trial_points {
         if point.len() != dim {
@@ -203,27 +197,113 @@ pub fn fast_marching(
     }
 
     let out_id = output_pixel_id(speed.pixel_id());
-    let large = large_value(speed.pixel_id());
-    let n: usize = size.iter().product();
+    let strides = strides(size);
+
+    // `Initialize()` drops seeds outside the buffered region; the survivors
+    // keep their `initial_trial_values` entry, defaulting to `0.0`.
+    let trial: Vec<(usize, f64)> = trial_points
+        .iter()
+        .enumerate()
+        .filter(|(_, point)| point.iter().zip(size).all(|(&c, &e)| (c as usize) < e))
+        .map(|(i, point)| {
+            let index = point
+                .iter()
+                .zip(&strides)
+                .map(|(&c, &s)| c as usize * s)
+                .sum();
+            (index, initial_trial_values.get(i).copied().unwrap_or(0.0))
+        })
+        .collect();
+
+    let result = march_flat(
+        MarchInput {
+            size,
+            spacing: speed.spacing(),
+            speed: &speed.to_f64_vec(),
+            narrow_to_f32: out_id == PixelId::Float32,
+            normalization_factor,
+            stopping_value,
+            collect_points: false,
+        },
+        &trial,
+    )?;
+
+    image_from_f64(out_id, size, speed, &result.values)
+}
+
+/// The march's inputs, as `FastMarchingImageFilter`'s members hold them, on a
+/// bare buffer rather than an `Image`. `narrow_to_f32` stands for the level-set
+/// `PixelType`: it selects both `m_LargeValue` and the `static_cast<PixelType>`
+/// every written value passes through.
+pub(crate) struct MarchInput<'a> {
+    pub(crate) size: &'a [usize],
+    pub(crate) spacing: &'a [f64],
+    /// The speed image. ITK's no-speed-image branch (`cc = m_InverseSpeed`,
+    /// from `m_SpeedConstant`) is not modelled: pass a constant buffer, which
+    /// is arithmetically identical.
+    pub(crate) speed: &'a [f64],
+    pub(crate) narrow_to_f32: bool,
+    pub(crate) normalization_factor: f64,
+    pub(crate) stopping_value: f64,
+    /// `m_CollectPoints`. When set, [`MarchResult::processed`] records
+    /// `GetProcessedPoints()`.
+    pub(crate) collect_points: bool,
+}
+
+pub(crate) struct MarchResult {
+    /// The arrival-time field; unreached pixels hold `m_LargeValue`.
+    pub(crate) values: Vec<f64>,
+    /// `m_ProcessedPoints`, the flat indices in the order they went alive.
+    /// Empty unless [`MarchInput::collect_points`] was set.
+    pub(crate) processed: Vec<usize>,
+}
+
+/// itkFastMarchingImageFilter.hxx `GenerateData()`: "Normalization Factor is
+/// null or negative".
+fn check_normalization_factor(normalization_factor: f64) -> Result<()> {
+    if normalization_factor < ITK_MATH_EPS {
+        return Err(FilterError::InvalidNormalizationFactor(
+            normalization_factor,
+        ));
+    }
+    Ok(())
+}
+
+/// `FastMarchingImageFilter::GenerateData()` over flat `(index, value)` trial
+/// seeds. Seeds must already be inside the image.
+pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Result<MarchResult> {
+    check_normalization_factor(input.normalization_factor)?;
+
+    let large = if input.narrow_to_f32 {
+        (f32::MAX / 2.0) as f64
+    } else {
+        f64::MAX / 2.0
+    };
+    let n: usize = input.size.iter().product();
 
     let mut solver = FastMarching {
-        strides: strides(&size),
-        spacing: speed.spacing().to_vec(),
-        speed: speed.to_f64_vec(),
-        size,
-        normalization_factor,
-        stopping_value,
+        strides: strides(input.size),
+        spacing: input.spacing.to_vec(),
+        speed: input.speed.to_vec(),
+        size: input.size.to_vec(),
+        normalization_factor: input.normalization_factor,
+        stopping_value: input.stopping_value,
         large,
-        narrow_to_f32: out_id == PixelId::Float32,
+        narrow_to_f32: input.narrow_to_f32,
+        collect_points: input.collect_points,
         output: vec![large; n],
         labels: vec![Label::Far; n],
         heap: BinaryHeap::new(),
+        processed: Vec::new(),
     };
 
-    solver.seed(trial_points, initial_trial_values);
+    solver.seed(trial);
     solver.march()?;
 
-    image_from_f64(out_id, speed.size(), speed, &solver.output)
+    Ok(MarchResult {
+        values: solver.output,
+        processed: solver.processed,
+    })
 }
 
 struct FastMarching {
@@ -235,9 +315,11 @@ struct FastMarching {
     stopping_value: f64,
     large: f64,
     narrow_to_f32: bool,
+    collect_points: bool,
     output: Vec<f64>,
     labels: Vec<Label>,
     heap: BinaryHeap<TrialNode>,
+    processed: Vec<usize>,
 }
 
 impl FastMarching {
@@ -262,24 +344,11 @@ impl FastMarching {
         coord.iter().zip(&self.strides).map(|(&c, &s)| c * s).sum()
     }
 
-    /// `Initialize()`, trial-point half: seeds inside the buffered region get
-    /// their value and the `InitialTrialPoint` label and go on the heap; the
-    /// rest are dropped.
-    fn seed(&mut self, trial_points: &[Vec<u32>], initial_trial_values: &[f64]) {
-        for (i, point) in trial_points.iter().enumerate() {
-            if point
-                .iter()
-                .zip(&self.size)
-                .any(|(&c, &extent)| c as usize >= extent)
-            {
-                continue;
-            }
-            let index = point
-                .iter()
-                .zip(&self.strides)
-                .map(|(&c, &s)| c as usize * s)
-                .sum();
-            let value = self.narrow(initial_trial_values.get(i).copied().unwrap_or(0.0));
+    /// `Initialize()`, trial-point half: each seed gets its value and the
+    /// `InitialTrialPoint` label and goes on the heap.
+    fn seed(&mut self, trial: &[(usize, f64)]) {
+        for &(index, value) in trial {
+            let value = self.narrow(value);
             self.labels[index] = Label::InitialTrial;
             self.output[index] = value;
             self.heap.push(TrialNode { value, index });
@@ -299,6 +368,9 @@ impl FastMarching {
             }
             if node.value > self.stopping_value {
                 break;
+            }
+            if self.collect_points {
+                self.processed.push(node.index);
             }
             self.labels[node.index] = Label::Alive;
             self.update_neighbors(node.index)?;
@@ -612,6 +684,16 @@ mod tests {
                 expected: 2,
                 got: 3
             })
+        );
+    }
+
+    /// Both invalid: the normalization factor is checked first, as in ITK.
+    #[test]
+    fn the_normalization_factor_outranks_the_seed_length() {
+        let speed = speed_f64(&[3, 3], 1.0);
+        assert_eq!(
+            fast_marching(&speed, &[vec![1, 1, 1]], &[], 0.0, 1.0).err(),
+            Some(FilterError::InvalidNormalizationFactor(0.0))
         );
     }
 }
