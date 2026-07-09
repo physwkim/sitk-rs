@@ -47,9 +47,10 @@ use sitk_core::Image;
 use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
-    bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
+    SincWindow, bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
     index_to_physical_matrix, linear_at, linear_value_and_gradient, nearest_at,
     nearest_value_and_gradient, physical_to_index_matrix, strides,
+    windowed_sinc_value_and_gradient,
 };
 
 use crate::error::{RegistrationError, Result};
@@ -454,6 +455,41 @@ impl MovingImage {
             Interpolator::Gaussian => {
                 gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, c)
             }
+            Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                c,
+                SincWindow::Hamming,
+            ),
+            Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                c,
+                SincWindow::Cosine,
+            ),
+            Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                c,
+                SincWindow::Welch,
+            ),
+            Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                c,
+                SincWindow::Lanczos,
+            ),
+            Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                c,
+                SincWindow::Blackman,
+            ),
         }
     }
 
@@ -522,6 +558,46 @@ impl MovingImage {
                 gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, &cidx)
                     .map(|(v, _)| v)
             }
+            Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                &cidx,
+                SincWindow::Hamming,
+            )
+            .map(|(v, _)| v),
+            Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                &cidx,
+                SincWindow::Cosine,
+            )
+            .map(|(v, _)| v),
+            Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                &cidx,
+                SincWindow::Welch,
+            )
+            .map(|(v, _)| v),
+            Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                &cidx,
+                SincWindow::Lanczos,
+            )
+            .map(|(v, _)| v),
+            Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
+                &self.buf,
+                &self.size,
+                &self.strides,
+                &cidx,
+                SincWindow::Blackman,
+            )
+            .map(|(v, _)| v),
         }
     }
 
