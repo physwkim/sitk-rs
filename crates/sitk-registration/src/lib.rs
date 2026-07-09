@@ -119,6 +119,7 @@ pub mod convergence;
 pub mod error;
 pub mod gradient_free;
 pub mod initializer;
+pub mod landmark;
 pub mod lbfgs2;
 pub mod lbfgsb;
 pub mod mattes;
@@ -133,6 +134,7 @@ pub use gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
 };
 pub use initializer::{CenteredTransformInitializer, OperationMode};
+pub use landmark::LandmarkBasedTransformInitializer;
 pub use lbfgs2::{LBFGS2Optimizer, LineSearchMethod};
 pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
