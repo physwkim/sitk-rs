@@ -1,5 +1,6 @@
 //! ITK's binary-morphology utility filters: hole filling/peak grinding on a
-//! foreground indicator, neighborhood voting, and 2-D skeleton thinning.
+//! foreground indicator, neighborhood voting, a binary-optimized median, and
+//! 2-D skeleton thinning.
 //!
 //! Verified against ITK's `Modules/Filtering/LabelMap/include/`,
 //! `Modules/Segmentation/LabelVoting/include/`, and
@@ -55,6 +56,22 @@
 //!   until either `maximum_number_of_iterations` passes have run or a pass
 //!   changes zero pixels (`m_NumberOfPixelsChanged == 0`, counted only for
 //!   birth-triggered flips, exactly as the `.hxx` does).
+//! - [`binary_median`] — `itkBinaryMedianImageFilter.h`/`.hxx`: a
+//!   `ZeroFluxNeumannBoundaryCondition` box neighborhood vote, like
+//!   [`voting_binary`], but with a fixed rule and no birth/survival split:
+//!   `count` is the number of neighborhood positions (including the center)
+//!   equal to `foreground_value`; the output is `foreground_value` when
+//!   `count > neighborhoodSize / 2` (integer division — for the always-odd
+//!   `Π(2·radius[d]+1)` window this is the true majority, but the `.hxx`
+//!   itself computes it as a plain truncating division, not a parity-aware
+//!   median rule), else `background_value` unconditionally. Unlike
+//!   [`voting_binary`], a center pixel equal to neither `foreground_value`
+//!   nor `background_value` does *not* pass through: the `.hxx` only ever
+//!   counts foreground matches and always writes one of the two output
+//!   values (`DynamicThreadedGenerateData`'s `if (count > medianPosition) ...
+//!   else ...` has no third branch), so such a pixel becomes
+//!   `background_value` (it contributes nothing to `count`, so `count` can
+//!   only fail the majority test).
 //! - [`binary_thinning`] — `itkBinaryThinningImageFilter.h`/`.hxx`: the
 //!   Gonzalez–Woods sequential thinning algorithm. ITK only wraps this filter
 //!   for 2-D images (`itkBinaryThinningImageFilter.wrap`'s
@@ -365,6 +382,59 @@ pub fn voting_binary_iterative_hole_filling(
         }
     }
     Ok(current)
+}
+
+// ---- binary_median ------------------------------------------------------------
+
+fn binary_median_typed<T: Scalar>(
+    img: &Image,
+    radius: &[usize],
+    foreground: f64,
+    background: f64,
+) -> Result<Image> {
+    let foreground = T::from_f64(foreground);
+    let background = T::from_f64(background);
+    let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
+    let median_position = iter.len() / 2;
+    let mut out = Vec::with_capacity(img.number_of_pixels());
+    for (_, nb) in iter {
+        let count = nb.values().iter().filter(|&&v| v == foreground).count();
+        out.push(if count > median_position {
+            foreground
+        } else {
+            background
+        });
+    }
+    let mut result = Image::from_vec(img.size(), out)?;
+    result.copy_geometry_from(img);
+    Ok(result)
+}
+
+/// `BinaryMedianImageFilter` (`itkBinaryMedianImageFilter.hxx`): the binary
+/// majority-vote median over a box neighborhood of the given per-axis
+/// `radius`, `ZeroFluxNeumannBoundaryCondition` at the image border (see
+/// module docs for the exact majority rule and the neither-value case).
+pub fn binary_median(
+    img: &Image,
+    radius: &[usize],
+    foreground_value: f64,
+    background_value: f64,
+) -> Result<Image> {
+    let dim = img.dimension();
+    if radius.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: radius.len(),
+        });
+    }
+    dispatch_scalar!(
+        img.pixel_id(),
+        binary_median_typed,
+        img,
+        radius,
+        foreground_value,
+        background_value
+    )
 }
 
 // ---- binary_thinning ---------------------------------------------------------
@@ -692,6 +762,74 @@ mod tests {
             out.scalar_slice::<u8>().unwrap(),
             image.scalar_slice::<u8>().unwrap()
         );
+    }
+
+    // ---- binary_median ----
+
+    /// 1-D radius-1 window (3 pixels incl. center), `neighborhoodSize = 3`,
+    /// `medianPosition = 3 / 2 = 1`: `count > 1` i.e. `count >= 2` is required
+    /// for foreground, so exactly 2-of-3 flips a background center but 1-of-3
+    /// does not.
+    #[test]
+    fn binary_median_tie_rule_is_strict_majority_not_tie() {
+        // center=0, neighbors=[1,1]: count=2 > medianPosition(1) -> foreground.
+        let two_on = img_u8(&[3], vec![1, 0, 1]);
+        let out = binary_median(&two_on, &[1], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap()[1], 1);
+
+        // center=0, neighbors=[1,0]: count=1, not > medianPosition(1) -> background.
+        let one_on = img_u8(&[3], vec![1, 0, 0]);
+        let out = binary_median(&one_on, &[1], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap()[1], 0);
+    }
+
+    #[test]
+    fn binary_median_removes_a_lone_salt_and_pepper_pixel() {
+        let image = img_u8(&[7, 1], vec![5, 5, 5, 99, 5, 5, 5]);
+        let out = binary_median(&image, &[1, 0], 99.0, 5.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[5, 5, 5, 5, 5, 5, 5]);
+    }
+
+    /// A pixel equal to neither `foreground_value` nor `background_value`
+    /// contributes nothing to `count` and is always overwritten -- there is
+    /// no pass-through branch (see module docs).
+    #[test]
+    fn binary_median_neither_value_is_overwritten_to_background() {
+        let image = img_u8(&[3], vec![1, 5, 1]);
+        let out = binary_median(&image, &[1], 1.0, 0.0).unwrap();
+        // center=5 (neither); neighbors=[1,1]: count=2 > medianPosition(1)
+        // -> foreground, even though the center itself was never foreground.
+        assert_eq!(out.scalar_slice::<u8>().unwrap()[1], 1);
+    }
+
+    #[test]
+    fn binary_median_zero_flux_neumann_clamps_at_the_border() {
+        // index0's radius-1 window clamps to [self, self, index1] = [1,1,0]:
+        // its own foreground value counts twice -> count=2 > medianPosition(1).
+        let image = img_u8(&[3], vec![1, 0, 0]);
+        let out = binary_median(&image, &[1], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn binary_median_radius_zero_is_identity_relabeled_to_fg_bg() {
+        // neighborhoodSize=1, medianPosition=0: count>0 iff the pixel itself
+        // is foreground, so this just relabels foreground/background exactly.
+        let image = img_u8(&[4], vec![1, 0, 1, 1]);
+        let out = binary_median(&image, &[0], 1.0, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn binary_median_wrong_radius_length_is_rejected() {
+        let image = img_u8(&[3, 3], vec![0; 9]);
+        assert!(matches!(
+            binary_median(&image, &[1], 1.0, 0.0),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        ));
     }
 
     // ---- binary_thinning ----

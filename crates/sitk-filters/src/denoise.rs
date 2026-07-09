@@ -1,7 +1,8 @@
 //! ITK's smoothing / denoising family, verified against
 //! `Modules/Filtering/Smoothing/include/` (`itkMeanImageFilter.h`/`.hxx`,
 //! `itkMedianImageFilter.h`/`.hxx`, `itkDiscreteGaussianImageFilter.h`/`.hxx`,
-//! `itkBinomialBlurImageFilter.h`/`.hxx`), `Core/Common/include/`
+//! `itkBinomialBlurImageFilter.h`/`.hxx`, `itkBoxMeanImageFilter.h`/`.hxx`,
+//! `itkBoxSigmaImageFilter.h`/`.hxx`, `itkBoxUtilities.h`), `Core/Common/include/`
 //! (`itkGaussianOperator.h`/`.hxx`, the discrete Gaussian's Bessel-function
 //! kernel), `Modules/Filtering/ImageFeature/include/itkBilateralImageFilter.h`/
 //! `.hxx` (plus `Filtering/ImageSources/include/itkGaussianImageSource.hxx`
@@ -20,6 +21,13 @@
 //! here happens to be odd-length (`Π (2·radius[d]+1)`), but [`select_median`]
 //! itself is exercised directly against an even-length slice in the tests to
 //! prove that convention.
+//!
+//! [`box_mean`] and [`box_sigma`] are also box-neighborhood filters, but with
+//! a *different* boundary rule than [`mean`]/[`median`]: `itkBoxUtilities.h`'s
+//! accumulator arithmetic clips the window to the pixels that actually lie
+//! inside the image rather than zero-flux-replicating the edge, so the
+//! effective window shrinks at the border instead of reusing the edge value
+//! multiple times — see [`box_accumulate`]'s doc comment for the derivation.
 //!
 //! [`discrete_gaussian`] convolves a Lindeberg discrete-Gaussian kernel
 //! (`GaussianOperator::GenerateCoefficients`'s modified-Bessel-function
@@ -167,6 +175,135 @@ pub fn median(img: &Image, radius: &[usize]) -> Result<Image> {
         });
     }
     dispatch_scalar!(img.pixel_id(), median_typed, img, radius)
+}
+
+// ---- box_mean / box_sigma ----------------------------------------------
+
+/// `Σ` and `Σ²` of `vals` over the box of the given per-axis `radius`
+/// centered at ND index `center`, each axis independently *clipped* to `[0,
+/// size[d]-1]` (never reflected/replicated), plus the box's pixel count.
+///
+/// `itkBoxUtilities.h`'s `BoxAccumulateFunction`/`BoxSquareAccumulateFunction`
+/// plus `BoxMeanCalculatorFunction`/`BoxSigmaCalculatorFunction` compute this
+/// same quantity through a summed-area-table (integral image) built from
+/// corner differences purely as a performance optimization; hand-tracing
+/// that corner arithmetic for an interior pixel (`sum = acc[x+r] - acc[x-r-1]`)
+/// and for a border pixel (leading corners clamped to `regionLimit`, trailing
+/// corners dropped via `includeCorner = false` when they fall before
+/// `regionStart`) both reduce to exactly "average/variance over the box
+/// intersected with the image" -- **not** [`mean`]/[`median`]'s
+/// `ZeroFluxNeumannBoundaryCondition` (which would replicate the edge pixel
+/// instead of shrinking the window). [`box_mean`] and [`box_sigma`] compute
+/// both moments in one pass rather than reproducing ITK's two separate
+/// accumulator images, since this port has no need for the SAT's incremental
+/// update.
+fn box_accumulate(
+    vals: &[f64],
+    size: &[usize],
+    strides: &[usize],
+    center: &[usize],
+    radius: &[usize],
+) -> (f64, f64, usize) {
+    let dim = size.len();
+    let mut lo = vec![0usize; dim];
+    let mut hi = vec![0usize; dim];
+    let mut count = 1usize;
+    for d in 0..dim {
+        lo[d] = center[d].saturating_sub(radius[d]);
+        hi[d] = (center[d] + radius[d]).min(size[d] - 1);
+        count *= hi[d] - lo[d] + 1;
+    }
+
+    let mut sum = 0.0f64;
+    let mut sumsq = 0.0f64;
+    let mut idx = lo.clone();
+    loop {
+        let flat: usize = idx.iter().zip(strides).map(|(&i, &s)| i * s).sum();
+        let v = vals[flat];
+        sum += v;
+        sumsq += v * v;
+
+        let mut d = 0;
+        loop {
+            idx[d] += 1;
+            if idx[d] <= hi[d] {
+                break;
+            }
+            idx[d] = lo[d];
+            d += 1;
+            if d == dim {
+                return (sum, sumsq, count);
+            }
+        }
+    }
+}
+
+/// `BoxMeanImageFilter`: the box average over a per-axis `radius`
+/// neighborhood, *clipped* to the image at the border rather than
+/// zero-flux-replicated (see [`box_accumulate`]'s doc comment). Narrowed
+/// back to `img`'s own pixel type.
+///
+/// Errors if `radius.len() != img.dimension()`.
+pub fn box_mean(img: &Image, radius: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    if radius.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: radius.len(),
+        });
+    }
+
+    let size = img.size().to_vec();
+    let strides_ = strides(&size);
+    let vals = img.to_f64_vec();
+
+    let out: Vec<f64> = (0..img.number_of_pixels())
+        .map(|flat| {
+            let center: Vec<usize> = (0..dim).map(|d| (flat / strides_[d]) % size[d]).collect();
+            let (sum, _sumsq, count) = box_accumulate(&vals, &size, &strides_, &center, radius);
+            sum / count as f64
+        })
+        .collect();
+
+    image_from_f64(img.pixel_id(), &size, img, &out)
+}
+
+/// `BoxSigmaImageFilter`: the box sample standard deviation (`N - 1`
+/// divisor, `BoxSigmaCalculatorFunction`'s `sqrt((Σ² - Σ²/N) / (N - 1))`)
+/// over a per-axis `radius` neighborhood, clipped to the image at the border
+/// exactly like [`box_mean`] (see [`box_accumulate`]'s doc comment).
+/// Narrowed back to `img`'s own pixel type.
+///
+/// At `radius = [0, ..., 0]` every box has `N = 1`, so `N - 1 = 0`: the
+/// numerator is `0.0` too (`Σ² == Σ²/1` exactly for a single sample), giving
+/// `0.0 / 0.0 = NaN` for every output pixel. `itkBoxUtilities.h` does not
+/// guard this division either, so this port reproduces the NaN rather than
+/// special-casing it away.
+///
+/// Errors if `radius.len() != img.dimension()`.
+pub fn box_sigma(img: &Image, radius: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    if radius.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: radius.len(),
+        });
+    }
+
+    let size = img.size().to_vec();
+    let strides_ = strides(&size);
+    let vals = img.to_f64_vec();
+
+    let out: Vec<f64> = (0..img.number_of_pixels())
+        .map(|flat| {
+            let center: Vec<usize> = (0..dim).map(|d| (flat / strides_[d]) % size[d]).collect();
+            let (sum, sumsq, count) = box_accumulate(&vals, &size, &strides_, &center, radius);
+            let count_f = count as f64;
+            ((sumsq - sum * sum / count_f) / (count_f - 1.0)).sqrt()
+        })
+        .collect();
+
+    image_from_f64(img.pixel_id(), &size, img, &out)
 }
 
 // ---- discrete_gaussian ----------------------------------------------------
@@ -1128,6 +1265,116 @@ mod tests {
     fn median_output_pixel_type_follows_input() {
         let img = Image::from_vec(&[3, 3], vec![1.0f32; 9]).unwrap();
         let out = median(&img, &[1, 1]).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    // ---- box_mean ----
+
+    #[test]
+    fn box_mean_radius_zero_is_identity() {
+        let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
+        let out = box_mean(&img, &[0, 0]).unwrap();
+        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+    }
+
+    /// `box_mean` *clips* the window to the image at the border instead of
+    /// zero-flux-replicating like [`mean`] -- pinned by hand:
+    /// `x0: [10,20]/2=15`, `x1: [10,20,30]/3=20`, `x2: [20,30,40]/3=30`,
+    /// `x3: [30,40,50]/3=40`, `x4: [40,50]/2=45`. [`mean`] on the same input
+    /// gives `13.33` at `x0` (replicating `10` twice), never `15`.
+    #[test]
+    fn box_mean_clips_the_window_at_the_border_unlike_mean() {
+        let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
+        let out = box_mean(&img, &[1, 0]).unwrap();
+        assert_eq!(out.to_f64_vec(), vec![15.0, 20.0, 30.0, 40.0, 45.0]);
+
+        let replicated = mean(&img, &[1, 0]).unwrap();
+        assert!((replicated.to_f64_vec()[0] - 40.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn box_mean_per_axis_radius_blurs_only_the_nonzero_axis() {
+        let n = 5;
+        let mut data = vec![0.0f64; n * n];
+        data[2 * n + 2] = 90.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+        let out = box_mean(&img, &[1, 0]).unwrap();
+        let vals = out.to_f64_vec();
+        // Interior of the nonzero axis: same as `mean`'s box (all 3 pixels valid).
+        for x in 1..=3 {
+            assert!((vals[2 * n + x] - 30.0).abs() < 1e-12);
+        }
+        assert!(vals[n + 2].abs() < 1e-12);
+        assert!(vals[3 * n + 2].abs() < 1e-12);
+    }
+
+    #[test]
+    fn box_mean_wrong_radius_length_is_rejected() {
+        let img = Image::new(&[4, 4], PixelId::Float64);
+        assert!(matches!(
+            box_mean(&img, &[1]),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn box_mean_output_pixel_type_follows_input() {
+        let img = Image::from_vec(&[3, 3], vec![1.0f32; 9]).unwrap();
+        let out = box_mean(&img, &[1, 1]).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    // ---- box_sigma ----
+
+    /// Full interior window `[1,2,3]`: mean=2, `Σ²=14`,
+    /// `variance=(14 - 6·6/3)/(3-1) = 1`, `sigma = 1.0` (sample, `N-1`
+    /// divisor -- the population divisor `N` would give `2/3`).
+    #[test]
+    fn box_sigma_interior_matches_hand_derived_sample_stddev() {
+        let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+        let out = box_sigma(&img, &[1, 0]).unwrap();
+        assert!((out.to_f64_vec()[1] - 1.0).abs() < 1e-12);
+    }
+
+    /// Edge window `[1,2]` (clipped, not replicated): mean=1.5, `Σ²=5`,
+    /// `variance=(5 - 3·3/2)/(2-1) = 0.5`, `sigma = sqrt(0.5)`.
+    #[test]
+    fn box_sigma_clips_the_window_at_the_border() {
+        let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+        let out = box_sigma(&img, &[1, 0]).unwrap();
+        assert!((out.to_f64_vec()[0] - 0.5f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// `radius = [0, 0]`: every box has `N = 1`, so the `N - 1` divisor is
+    /// `0` and the (also-zero) numerator gives `0.0 / 0.0 = NaN` -- an
+    /// upstream quirk this port reproduces rather than guards against (see
+    /// [`box_sigma`]'s doc comment).
+    #[test]
+    fn box_sigma_radius_zero_is_nan_everywhere() {
+        let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
+        let out = box_sigma(&img, &[0, 0]).unwrap();
+        assert!(out.to_f64_vec().iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn box_sigma_wrong_radius_length_is_rejected() {
+        let img = Image::new(&[4, 4], PixelId::Float64);
+        assert!(matches!(
+            box_sigma(&img, &[1]),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn box_sigma_output_pixel_type_follows_input() {
+        let img = Image::from_vec(&[3, 3], vec![1.0f32; 9]).unwrap();
+        let out = box_sigma(&img, &[1, 1]).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float32);
     }
 

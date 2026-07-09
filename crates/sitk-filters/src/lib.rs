@@ -79,6 +79,7 @@ pub mod noise_estimate;
 pub mod overlap;
 pub mod projection;
 mod random;
+pub mod rank;
 pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
@@ -97,7 +98,7 @@ pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
 pub use binary_morphology::{
-    binary_fillhole, binary_grind_peak, binary_thinning, voting_binary,
+    binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
@@ -108,8 +109,8 @@ pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
 pub use denoise::{
-    bilateral, binomial_blur, curvature_flow, discrete_gaussian, discrete_gaussian_derivative,
-    mean, median,
+    bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
+    discrete_gaussian_derivative, mean, median,
 };
 pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
@@ -191,6 +192,7 @@ pub use projection::{
     binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
     standard_deviation_projection, sum_projection,
 };
+pub use rank::fast_approximate_rank;
 pub use reconstruction::{
     double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
     h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
@@ -201,7 +203,7 @@ pub use region_growing::{
     neighborhood_connected,
 };
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
-pub use shrink::shrink;
+pub use shrink::{bin_shrink, shrink};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
