@@ -335,6 +335,23 @@ pub enum FilterError {
     #[error("label_shape_statistics only supports 2-D and 3-D images, got {0}-D")]
     UnsupportedShapeDimension(usize),
 
+    /// `ContourExtractor2DImageFilter` is `itkConceptMacro(DimensionShouldBe2,
+    /// ...)`-constrained, and SimpleITK's `custom_register:
+    /// factory.RegisterMemberFunctions<PixelIDTypeList, 2, 2>()` only
+    /// instantiates it for 2-D images.
+    #[error("contour_extractor_2d only supports 2-D images, got {0}-D")]
+    UnsupportedContourExtractorDimension(usize),
+
+    /// `ContourExtractor2DImageFilter::GenerateDataForLabels` searches for a
+    /// label value that does not occur in the image, to use as the
+    /// out-of-bounds constant, and throws
+    /// `"Need at least one unused value in the space of labels"` when the
+    /// image's labels exhaust the pixel type's whole value range.
+    #[error(
+        "contour_extractor_2d with label_contours needs at least one unused value in the {0:?} label space, but every representable value occurs in the image"
+    )]
+    ContourExtractorNoUnusedLabel(PixelId),
+
     /// `DirectedHausdorffDistanceImageFilter::AfterThreadedGenerateData`
     /// throws `"pixelcount is equal to 0"` via `itkGenericExceptionMacro`
     /// when the first input image has no non-zero pixels (the "from" set
