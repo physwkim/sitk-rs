@@ -29,6 +29,7 @@ pub mod canny;
 pub mod denoise;
 pub mod distance;
 pub mod error;
+pub mod fast_marching;
 pub mod functor;
 pub mod geometry;
 pub mod gradient;
@@ -53,6 +54,7 @@ pub use distance::{
     danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
 };
 pub use error::{FilterError, Result};
+pub use fast_marching::fast_marching;
 pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
