@@ -25,6 +25,7 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod distance;
 pub mod error;
 pub mod functor;
 pub mod label;
@@ -32,6 +33,9 @@ pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
+pub use distance::{
+    danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
+};
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
