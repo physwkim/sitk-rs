@@ -446,6 +446,12 @@ impl Transform for BSplineTransform {
     fn dimension(&self) -> usize {
         self.dim
     }
+
+    /// `BSplineBaseTransform::GetTransformCategory()` returns `BSpline`, not
+    /// `Linear`.
+    fn is_linear(&self) -> bool {
+        false
+    }
 }
 
 impl ParametricTransform for BSplineTransform {

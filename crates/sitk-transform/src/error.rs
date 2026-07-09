@@ -24,6 +24,21 @@ pub enum TransformError {
     #[error("invalid displacement-field domain (inconsistent per-dimension geometry)")]
     InvalidDisplacementFieldDomain,
 
+    /// `TransformGeometryImageFilter::VerifyPreconditions` requires
+    /// `Transform::IsLinear()`; a B-spline, displacement-field, or
+    /// not-fully-linear composite transform fails this precondition.
+    #[error("transform must be linear for TransformGeometryImageFilter")]
+    NonLinearTransform,
+
+    /// The transform's own linear map could not be inverted.
+    /// `itkTransformGeometryImageFilter.hxx` calls `GetInverseTransform()`,
+    /// which for a singular `MatrixOffsetTransformBase` returns a null
+    /// pointer in C++ that the filter then dereferences unchecked (a latent
+    /// crash upstream); this port returns an error instead of reproducing
+    /// that undefined behavior.
+    #[error("transform matrix is singular; cannot invert for TransformGeometryImageFilter")]
+    NonInvertibleTransform,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
