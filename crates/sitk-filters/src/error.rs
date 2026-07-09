@@ -37,6 +37,12 @@ pub enum FilterError {
     #[error("axis {axis} has {len} pixels; the recursive Gaussian needs at least 4")]
     AxisTooShortForRecursion { axis: usize, len: usize },
 
+    /// `RelabelComponentImageFilter` would need to assign more surviving
+    /// objects than the output pixel type can represent
+    /// (`NumericTraits<OutputPixelType>::max()`).
+    #[error("relabel needs more than {max} object labels, exceeding the output pixel type's range")]
+    TooManyObjects { max: u64 },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

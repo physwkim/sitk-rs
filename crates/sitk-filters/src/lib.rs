@@ -27,12 +27,14 @@
 
 pub mod error;
 pub mod functor;
+pub mod label;
 pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
