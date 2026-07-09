@@ -38,6 +38,18 @@ pub enum FilterError {
     #[error("super grid sizes must be >= 1, got {0:?}")]
     InvalidSuperGridSize(Vec<u32>),
 
+    /// An expand factor was zero (must be a positive integer). Distinct from
+    /// [`FilterError::InvalidShrinkFactor`] because it names the filter that
+    /// actually rejected it.
+    #[error("expand factors must be >= 1, got {0:?}")]
+    InvalidExpandFactor(Vec<usize>),
+
+    /// `itk::Functor::Clamp::SetBounds` throws when, after intersecting the
+    /// caller's requested bounds with the output pixel type's own
+    /// representable range, `lower > upper`.
+    #[error("invalid clamp bounds: [{lower}; {upper}]")]
+    InvalidClampBounds { lower: f64, upper: f64 },
+
     /// A smoothing sigma was negative.
     #[error("smoothing sigmas must be >= 0, got {0:?}")]
     InvalidSigma(Vec<f64>),

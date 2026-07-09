@@ -25,13 +25,16 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
 pub mod binary_morphology;
 pub mod canny;
+pub mod clamp;
 pub mod convolution;
 pub mod denoise;
 pub mod distance;
 pub mod error;
+pub mod expand;
 pub mod fast_marching;
 mod fft;
 pub mod functor;
@@ -63,6 +66,7 @@ pub mod smoothing;
 pub mod threshold;
 pub mod watershed;
 
+pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
@@ -71,6 +75,7 @@ pub use binary_morphology::{
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use clamp::clamp;
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
@@ -80,6 +85,7 @@ pub use distance::{
     signed_danielsson_distance_map, signed_maurer_distance_map,
 };
 pub use error::{FilterError, Result};
+pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use geometry::{
