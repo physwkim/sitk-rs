@@ -33,6 +33,7 @@ pub mod convolution;
 pub mod denoise;
 pub mod distance;
 pub mod error;
+pub mod expand;
 pub mod fast_marching;
 mod fft;
 pub mod functor;
@@ -79,6 +80,7 @@ pub use distance::{
     signed_danielsson_distance_map, signed_maurer_distance_map,
 };
 pub use error::{FilterError, Result};
+pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
 pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use geometry::{
