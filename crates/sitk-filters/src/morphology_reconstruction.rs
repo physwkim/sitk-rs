@@ -7,10 +7,13 @@
 //! - [`opening_by_reconstruction`] / [`closing_by_reconstruction`] —
 //!   `itkOpeningByReconstructionImageFilter.h` / `.hxx`,
 //!   `itkClosingByReconstructionImageFilter.h` / `.hxx`.
+//! - [`grayscale_connected_opening`] / [`grayscale_connected_closing`] —
+//!   `itkGrayscaleConnectedOpeningImageFilter.h` / `.hxx`,
+//!   `itkGrayscaleConnectedClosingImageFilter.h` / `.hxx`.
 //!
-//! (`GrayscaleConnectedOpening`/`Closing`, `BinaryOpeningByReconstruction`/
-//! `BinaryClosingByReconstruction`, and `BinaryReconstructionByDilation`/
-//! `Erosion` land in this module in later commits.)
+//! (`BinaryOpeningByReconstruction`/`BinaryClosingByReconstruction` and
+//! `BinaryReconstructionByDilation`/`Erosion` land in this module in later
+//! commits.)
 //!
 //! ## Reconstruction engine reuse
 //!
@@ -60,14 +63,72 @@
 //! reconstruct by erosion under the input; `PreserveIntensities`'s second
 //! marker compares against that first reconstruction's own output too, using
 //! `NumericTraits<T>::max()` as its "affected" fill instead.
+//!
+//! ## Grayscale connected opening/closing
+//!
+//! `GrayscaleConnectedOpeningImageFilter::GenerateData`: read `seedValue =
+//! inputImage->GetPixel(m_Seed)`. If `seedValue` equals the image's global
+//! minimum, `.hxx` fills the *entire* output with that minimum (a degenerate
+//! case: a marker of all-minimum reconstructs to all-minimum, since
+//! reconstruction-by-dilation's floor is the marker itself) — this is the
+//! "seed outside any object" edge case: a seed sitting on the background
+//! never touches anything, so nothing survives. Otherwise `.hxx` builds a
+//! marker holding the image's global minimum everywhere except `seedValue` at
+//! `m_Seed`, and reconstructs by dilation under the input — keeping only the
+//! object touching the seed, at its original height, and suppressing every
+//! other object to the background minimum. `GrayscaleConnectedClosingImageFilter`
+//! is the dual (global maximum, reconstruct by erosion).
+//!
+//! `.hxx`'s `GetPixel(m_Seed)` performs no bounds check at all — an
+//! out-of-range `Seed` is undefined behavior in C++ (it may alias an
+//! arbitrary offset via pointer arithmetic on the underlying buffer). This
+//! port checks instead ([`FilterError::InvalidSeedIndex`] /
+//! [`FilterError::DimensionLength`]), since the same out-of-range multi-index
+//! could otherwise alias a different in-bounds flat offset over this crate's
+//! linear pixel buffer rather than simply crash.
 
-use crate::error::Result;
+use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::morphology::{StructuringElement, bounds_for, grayscale_dilate, grayscale_erode};
 use crate::reconstruction::{reconstruction_by_dilation, reconstruction_by_erosion};
 use sitk_core::Image;
 
 // ---- shared helpers --------------------------------------------------
+
+/// First-index-fastest strides for a size vector (see [`seed_flat_index`]).
+fn strides(size: &[usize]) -> Vec<usize> {
+    let mut s = vec![1usize; size.len()];
+    for d in 1..size.len() {
+        s[d] = s[d - 1] * size[d - 1];
+    }
+    s
+}
+
+/// Validates `seed` against `size` and returns its flat (dimension-0-fastest)
+/// offset. `GrayscaleConnectedOpeningImageFilter`/`...ClosingImageFilter`'s
+/// `.hxx` never checks `m_Seed` before dereferencing it (see the module
+/// docs); this port returns [`FilterError::DimensionLength`] for a
+/// wrong-length seed and [`FilterError::InvalidSeedIndex`] for one that's
+/// the right length but out of range on some axis.
+fn seed_flat_index(seed: &[usize], size: &[usize]) -> Result<usize> {
+    if seed.len() != size.len() {
+        return Err(FilterError::DimensionLength {
+            expected: size.len(),
+            got: seed.len(),
+        });
+    }
+    if seed.iter().zip(size).any(|(&s, &n)| s >= n) {
+        return Err(FilterError::InvalidSeedIndex {
+            seed: seed.to_vec(),
+            size: size.to_vec(),
+        });
+    }
+    Ok(seed
+        .iter()
+        .zip(&strides(size))
+        .map(|(&s, &st)| s * st)
+        .sum())
+}
 
 /// The `tempImage` `OpeningByReconstructionImageFilter::GenerateData` /
 /// `ClosingByReconstructionImageFilter::GenerateData` build for
@@ -127,10 +188,55 @@ pub fn closing_by_reconstruction(
     reconstruction_by_erosion(&marker, image, fully_connected)
 }
 
+// ---- grayscale connected opening / closing ---------------------------
+
+/// `GrayscaleConnectedOpeningImageFilter` (see module docs): keep only the
+/// object touching `seed`, at its original height, and suppress every other
+/// object to `image`'s global minimum.
+pub fn grayscale_connected_opening(
+    image: &Image,
+    seed: &[usize],
+    fully_connected: bool,
+) -> Result<Image> {
+    let flat = seed_flat_index(seed, image.size())?;
+    let (min_value, _) = crate::minimum_maximum(image)?;
+    let vals = image.to_f64_vec();
+    let seed_value = vals[flat];
+    if seed_value == min_value {
+        let out = vec![min_value; vals.len()];
+        return image_from_f64(image.pixel_id(), image.size(), image, &out);
+    }
+    let mut marker_vals = vec![min_value; vals.len()];
+    marker_vals[flat] = seed_value;
+    let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &marker_vals)?;
+    reconstruction_by_dilation(&marker_image, image, fully_connected)
+}
+
+/// `GrayscaleConnectedClosingImageFilter` (see module docs): the dual of
+/// [`grayscale_connected_opening`] — keep only the object touching `seed`,
+/// suppressing every other object to `image`'s global maximum.
+pub fn grayscale_connected_closing(
+    image: &Image,
+    seed: &[usize],
+    fully_connected: bool,
+) -> Result<Image> {
+    let flat = seed_flat_index(seed, image.size())?;
+    let (_, max_value) = crate::minimum_maximum(image)?;
+    let vals = image.to_f64_vec();
+    let seed_value = vals[flat];
+    if seed_value == max_value {
+        let out = vec![max_value; vals.len()];
+        return image_from_f64(image.pixel_id(), image.size(), image, &out);
+    }
+    let mut marker_vals = vec![max_value; vals.len()];
+    marker_vals[flat] = seed_value;
+    let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &marker_vals)?;
+    reconstruction_by_erosion(&marker_image, image, fully_connected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::FilterError;
 
     fn img_i32(size: &[usize], data: Vec<i32>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -238,6 +344,67 @@ mod tests {
         assert_eq!(
             opening_by_reconstruction(&image, &kernel, false, false).unwrap_err(),
             FilterError::InvalidReconstructionMarker { relation: "<=" }
+        );
+    }
+
+    // ---- grayscale_connected_opening / grayscale_connected_closing ----
+
+    /// Two isolated peaks; seeding the left one keeps it at its true height
+    /// and suppresses the unrelated right one to the global minimum.
+    #[test]
+    fn grayscale_connected_opening_keeps_only_the_seeded_object() {
+        let image = img_i32(&[9], vec![0, 0, 9, 0, 0, 0, 9, 0, 0]);
+        let out = grayscale_connected_opening(&image, &[2], false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<i32>().unwrap(),
+            &[0, 0, 9, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    /// Dual: two isolated valleys; seeding the left one keeps it at its true
+    /// depth and fills the unrelated right one up to the global maximum.
+    #[test]
+    fn grayscale_connected_closing_keeps_only_the_seeded_object() {
+        let image = img_i32(&[9], vec![9, 9, 0, 9, 9, 9, 0, 9, 9]);
+        let out = grayscale_connected_closing(&image, &[2], false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<i32>().unwrap(),
+            &[9, 9, 0, 9, 9, 9, 9, 9, 9]
+        );
+    }
+
+    /// A seed on the background (the global minimum) never touches any
+    /// object; `.hxx`'s degenerate branch fires and the whole output is
+    /// filled with the minimum, suppressing every object including the one
+    /// nearest the seed.
+    #[test]
+    fn grayscale_connected_opening_seed_outside_any_object_fills_the_minimum() {
+        let image = img_i32(&[9], vec![0, 0, 9, 0, 0, 0, 9, 0, 0]);
+        let out = grayscale_connected_opening(&image, &[4], false).unwrap();
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[0; 9]);
+    }
+
+    #[test]
+    fn grayscale_connected_opening_rejects_out_of_bounds_seed() {
+        let image = img_i32(&[3], vec![0, 5, 0]);
+        assert_eq!(
+            grayscale_connected_opening(&image, &[3], false).unwrap_err(),
+            FilterError::InvalidSeedIndex {
+                seed: vec![3],
+                size: vec![3],
+            }
+        );
+    }
+
+    #[test]
+    fn grayscale_connected_opening_rejects_wrong_length_seed() {
+        let image = img_i32(&[3], vec![0, 5, 0]);
+        assert_eq!(
+            grayscale_connected_opening(&image, &[1, 0, 0], false).unwrap_err(),
+            FilterError::DimensionLength {
+                expected: 1,
+                got: 3
+            }
         );
     }
 }

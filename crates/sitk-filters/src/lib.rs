@@ -144,7 +144,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, morphological_gradient,
     white_top_hat,
 };
-pub use morphology_reconstruction::{closing_by_reconstruction, opening_by_reconstruction};
+pub use morphology_reconstruction::{
+    closing_by_reconstruction, grayscale_connected_closing, grayscale_connected_opening,
+    opening_by_reconstruction,
+};
 pub use n4_bias_field::{
     N4BiasFieldCorrectionResult, N4BiasFieldCorrectionSettings, n4_bias_field_correction,
     n4_bias_field_correction_with_log_bias_field,
