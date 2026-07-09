@@ -25,6 +25,7 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
 pub mod binary_morphology;
 pub mod canny;
@@ -62,6 +63,7 @@ pub mod smoothing;
 pub mod threshold;
 pub mod watershed;
 
+pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
