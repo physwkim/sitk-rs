@@ -23,32 +23,32 @@ fn scratch_f64(img: &Image) -> Result<Image> {
 /// (`-max()`), not `-infinity`.
 fn nonpositive_min(target: PixelId) -> f64 {
     match target {
-        PixelId::UInt8 => u8::MIN as f64,
-        PixelId::Int8 => i8::MIN as f64,
-        PixelId::UInt16 => u16::MIN as f64,
-        PixelId::Int16 => i16::MIN as f64,
-        PixelId::UInt32 => u32::MIN as f64,
-        PixelId::Int32 => i32::MIN as f64,
-        PixelId::UInt64 => u64::MIN as f64,
-        PixelId::Int64 => i64::MIN as f64,
-        PixelId::Float32 => -(f32::MAX as f64),
-        PixelId::Float64 => -f64::MAX,
+        PixelId::UInt8 | PixelId::VectorUInt8 => u8::MIN as f64,
+        PixelId::Int8 | PixelId::VectorInt8 => i8::MIN as f64,
+        PixelId::UInt16 | PixelId::VectorUInt16 => u16::MIN as f64,
+        PixelId::Int16 | PixelId::VectorInt16 => i16::MIN as f64,
+        PixelId::UInt32 | PixelId::VectorUInt32 => u32::MIN as f64,
+        PixelId::Int32 | PixelId::VectorInt32 => i32::MIN as f64,
+        PixelId::UInt64 | PixelId::VectorUInt64 => u64::MIN as f64,
+        PixelId::Int64 | PixelId::VectorInt64 => i64::MIN as f64,
+        PixelId::Float32 | PixelId::VectorFloat32 => -(f32::MAX as f64),
+        PixelId::Float64 | PixelId::VectorFloat64 => -f64::MAX,
     }
 }
 
 /// `NumericTraits<T>::max()`.
 fn numeric_max(target: PixelId) -> f64 {
     match target {
-        PixelId::UInt8 => u8::MAX as f64,
-        PixelId::Int8 => i8::MAX as f64,
-        PixelId::UInt16 => u16::MAX as f64,
-        PixelId::Int16 => i16::MAX as f64,
-        PixelId::UInt32 => u32::MAX as f64,
-        PixelId::Int32 => i32::MAX as f64,
-        PixelId::UInt64 => u64::MAX as f64,
-        PixelId::Int64 => i64::MAX as f64,
-        PixelId::Float32 => f32::MAX as f64,
-        PixelId::Float64 => f64::MAX,
+        PixelId::UInt8 | PixelId::VectorUInt8 => u8::MAX as f64,
+        PixelId::Int8 | PixelId::VectorInt8 => i8::MAX as f64,
+        PixelId::UInt16 | PixelId::VectorUInt16 => u16::MAX as f64,
+        PixelId::Int16 | PixelId::VectorInt16 => i16::MAX as f64,
+        PixelId::UInt32 | PixelId::VectorUInt32 => u32::MAX as f64,
+        PixelId::Int32 | PixelId::VectorInt32 => i32::MAX as f64,
+        PixelId::UInt64 | PixelId::VectorUInt64 => u64::MAX as f64,
+        PixelId::Int64 | PixelId::VectorInt64 => i64::MAX as f64,
+        PixelId::Float32 | PixelId::VectorFloat32 => f32::MAX as f64,
+        PixelId::Float64 | PixelId::VectorFloat64 => f64::MAX,
     }
 }
 
@@ -63,15 +63,15 @@ fn numeric_max(target: PixelId) -> f64 {
 /// the documented wraparound.
 fn wrap_to_pixel_type(target: PixelId, v: f64) -> f64 {
     match target {
-        PixelId::UInt8 => (v.trunc() as i128 as u8) as f64,
-        PixelId::Int8 => (v.trunc() as i128 as i8) as f64,
-        PixelId::UInt16 => (v.trunc() as i128 as u16) as f64,
-        PixelId::Int16 => (v.trunc() as i128 as i16) as f64,
-        PixelId::UInt32 => (v.trunc() as i128 as u32) as f64,
-        PixelId::Int32 => (v.trunc() as i128 as i32) as f64,
-        PixelId::UInt64 => (v.trunc() as i128 as u64) as f64,
-        PixelId::Int64 => (v.trunc() as i128 as i64) as f64,
-        PixelId::Float32 | PixelId::Float64 => v,
+        PixelId::UInt8 | PixelId::VectorUInt8 => (v.trunc() as i128 as u8) as f64,
+        PixelId::Int8 | PixelId::VectorInt8 => (v.trunc() as i128 as i8) as f64,
+        PixelId::UInt16 | PixelId::VectorUInt16 => (v.trunc() as i128 as u16) as f64,
+        PixelId::Int16 | PixelId::VectorInt16 => (v.trunc() as i128 as i16) as f64,
+        PixelId::UInt32 | PixelId::VectorUInt32 => (v.trunc() as i128 as u32) as f64,
+        PixelId::Int32 | PixelId::VectorInt32 => (v.trunc() as i128 as i32) as f64,
+        PixelId::UInt64 | PixelId::VectorUInt64 => (v.trunc() as i128 as u64) as f64,
+        PixelId::Int64 | PixelId::VectorInt64 => (v.trunc() as i128 as i64) as f64,
+        PixelId::Float32 | PixelId::Float64 | PixelId::VectorFloat32 | PixelId::VectorFloat64 => v,
     }
 }
 

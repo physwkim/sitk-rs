@@ -320,10 +320,19 @@ pub(crate) fn image_from_f64(
 /// itk::NumericTraits<typename InputImageType::PixelType>::RealType` — among
 /// them `FastMarchingImageFilter` and `AntiAliasBinaryImageFilter` — resolve
 /// their output pixel type through this rule.
+/// A vector pixel type maps to the vector variant of its component's real type
+/// (`NumericTraits<VariableLengthVector<T>>::RealType` is
+/// `VariableLengthVector<NumericTraits<T>::RealType>`), so the projection never
+/// silently drops a pixel type's multi-component-ness.
 pub(crate) fn real_pixel_id(input: PixelId) -> PixelId {
-    match input {
+    let real = match input.component_id() {
         PixelId::Float32 => PixelId::Float32,
         _ => PixelId::Float64,
+    };
+    if input.is_vector() {
+        real.vector_id()
+    } else {
+        real
     }
 }
 

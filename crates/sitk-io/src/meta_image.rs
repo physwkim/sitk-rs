@@ -14,20 +14,22 @@ use sitk_core::{Image, PixelBuffer, PixelId};
 
 use crate::error::{IoError, Result};
 
-/// MetaIO `ElementType` string for each pixel id. 64-bit integers use the
-/// width-explicit `LONG_LONG` names so the file is unambiguous across platforms.
+/// MetaIO `ElementType` string for a pixel id's *component* type — MetaIO names
+/// the component type in `ElementType` and the count in
+/// `ElementNumberOfChannels`. 64-bit integers use the width-explicit
+/// `LONG_LONG` names so the file is unambiguous across platforms.
 fn element_type(id: PixelId) -> &'static str {
     match id {
-        PixelId::UInt8 => "MET_UCHAR",
-        PixelId::Int8 => "MET_CHAR",
-        PixelId::UInt16 => "MET_USHORT",
-        PixelId::Int16 => "MET_SHORT",
-        PixelId::UInt32 => "MET_UINT",
-        PixelId::Int32 => "MET_INT",
-        PixelId::UInt64 => "MET_ULONG_LONG",
-        PixelId::Int64 => "MET_LONG_LONG",
-        PixelId::Float32 => "MET_FLOAT",
-        PixelId::Float64 => "MET_DOUBLE",
+        PixelId::UInt8 | PixelId::VectorUInt8 => "MET_UCHAR",
+        PixelId::Int8 | PixelId::VectorInt8 => "MET_CHAR",
+        PixelId::UInt16 | PixelId::VectorUInt16 => "MET_USHORT",
+        PixelId::Int16 | PixelId::VectorInt16 => "MET_SHORT",
+        PixelId::UInt32 | PixelId::VectorUInt32 => "MET_UINT",
+        PixelId::Int32 | PixelId::VectorInt32 => "MET_INT",
+        PixelId::UInt64 | PixelId::VectorUInt64 => "MET_ULONG_LONG",
+        PixelId::Int64 | PixelId::VectorInt64 => "MET_LONG_LONG",
+        PixelId::Float32 | PixelId::VectorFloat32 => "MET_FLOAT",
+        PixelId::Float64 | PixelId::VectorFloat64 => "MET_DOUBLE",
     }
 }
 
@@ -94,16 +96,18 @@ fn buffer_from_bytes(id: PixelId, bytes: &[u8], big_endian: bool) -> Result<Pixe
         }};
     }
     Ok(match id {
-        PixelId::UInt8 => PixelBuffer::UInt8(bytes.to_vec()),
-        PixelId::Int8 => PixelBuffer::Int8(bytes.iter().map(|&b| b as i8).collect()),
-        PixelId::UInt16 => unpack!(u16, UInt16),
-        PixelId::Int16 => unpack!(i16, Int16),
-        PixelId::UInt32 => unpack!(u32, UInt32),
-        PixelId::Int32 => unpack!(i32, Int32),
-        PixelId::UInt64 => unpack!(u64, UInt64),
-        PixelId::Int64 => unpack!(i64, Int64),
-        PixelId::Float32 => unpack!(f32, Float32),
-        PixelId::Float64 => unpack!(f64, Float64),
+        PixelId::UInt8 | PixelId::VectorUInt8 => PixelBuffer::UInt8(bytes.to_vec()),
+        PixelId::Int8 | PixelId::VectorInt8 => {
+            PixelBuffer::Int8(bytes.iter().map(|&b| b as i8).collect())
+        }
+        PixelId::UInt16 | PixelId::VectorUInt16 => unpack!(u16, UInt16),
+        PixelId::Int16 | PixelId::VectorInt16 => unpack!(i16, Int16),
+        PixelId::UInt32 | PixelId::VectorUInt32 => unpack!(u32, UInt32),
+        PixelId::Int32 | PixelId::VectorInt32 => unpack!(i32, Int32),
+        PixelId::UInt64 | PixelId::VectorUInt64 => unpack!(u64, UInt64),
+        PixelId::Int64 | PixelId::VectorInt64 => unpack!(i64, Int64),
+        PixelId::Float32 | PixelId::VectorFloat32 => unpack!(f32, Float32),
+        PixelId::Float64 | PixelId::VectorFloat64 => unpack!(f64, Float64),
     })
 }
 
@@ -146,7 +150,15 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
 
 /// Write an image as MetaImage. `.mha` embeds the data (`ElementDataFile =
 /// LOCAL`); `.mhd` writes a sibling `.raw` file.
+///
+/// Vector images are rejected: [`build_header`] hard-codes
+/// `ElementNumberOfChannels = 1`, so the file would claim one component per
+/// pixel while carrying `number_of_components_per_pixel()` of them. This is the
+/// write-side counterpart of [`read`]'s `header.channels != 1` check.
 pub fn write(img: &Image, path: &Path) -> Result<()> {
+    if img.pixel_id().is_vector() {
+        return Err(IoError::Unsupported("multi-channel (vector) pixels".into()));
+    }
     let data = buffer_to_le_bytes(img.buffer());
     let is_mhd = path
         .extension()

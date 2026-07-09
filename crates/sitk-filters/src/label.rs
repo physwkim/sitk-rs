@@ -326,16 +326,16 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
 /// another output label.
 fn pixel_id_max_label(id: PixelId) -> u64 {
     match id {
-        PixelId::UInt8 => u8::MAX as u64,
-        PixelId::Int8 => i8::MAX as u64,
-        PixelId::UInt16 => u16::MAX as u64,
-        PixelId::Int16 => i16::MAX as u64,
-        PixelId::UInt32 => u32::MAX as u64,
-        PixelId::Int32 => i32::MAX as u64,
-        PixelId::UInt64 => u64::MAX,
-        PixelId::Int64 => i64::MAX as u64,
-        PixelId::Float32 => u64::MAX,
-        PixelId::Float64 => u64::MAX,
+        PixelId::UInt8 | PixelId::VectorUInt8 => u8::MAX as u64,
+        PixelId::Int8 | PixelId::VectorInt8 => i8::MAX as u64,
+        PixelId::UInt16 | PixelId::VectorUInt16 => u16::MAX as u64,
+        PixelId::Int16 | PixelId::VectorInt16 => i16::MAX as u64,
+        PixelId::UInt32 | PixelId::VectorUInt32 => u32::MAX as u64,
+        PixelId::Int32 | PixelId::VectorInt32 => i32::MAX as u64,
+        PixelId::UInt64 | PixelId::VectorUInt64 => u64::MAX,
+        PixelId::Int64 | PixelId::VectorInt64 => i64::MAX as u64,
+        PixelId::Float32 | PixelId::VectorFloat32 => u64::MAX,
+        PixelId::Float64 | PixelId::VectorFloat64 => u64::MAX,
     }
 }
 
