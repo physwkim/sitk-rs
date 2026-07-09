@@ -357,6 +357,66 @@ impl AntsNeighborhoodCorrelationMetric {
     /// other window voxels are valid.
     fn point_result(&self, transform: &dyn ParametricTransform, s: usize) -> Option<PointResult> {
         let dim = self.fixed.dim;
+        let (s_ff, s_mm, s_fm, fixed_mean, moving_mean) = self.window_stats(transform, s)?;
+
+        // The center voxel itself, evaluated again exactly as ITK's
+        // `ComputeInformationFromQueues` re-evaluates `oindex = scanIt.GetIndex()`.
+        // Sourced from `raster` (not `self.fixed`) so this always agrees with
+        // the window neighbours above, regardless of whether `fixed` is a
+        // sparse sample set.
+        let center_lin = self.sample_linear_index(s);
+        let fp_center = &self.raster.points[center_lin * dim..(center_lin + 1) * dim];
+        let fv_center = self.raster.values[center_lin];
+        let mp_center = transform.transform_point(fp_center);
+        let (mv_center, grad_phys) = self.moving.value_and_physical_gradient(&mp_center)?;
+
+        let fixed_i = fv_center - fixed_mean;
+        let moving_i = mv_center - moving_mean;
+
+        let eps = f64::EPSILON;
+        let denom = s_ff * s_mm;
+
+        let deriv_wrt_image = if s_ff > eps && s_mm > eps {
+            let factor = 2.0 * s_fm / denom * (fixed_i - s_fm / s_mm * moving_i);
+            Some(grad_phys.iter().map(|&g| factor * g).collect())
+        } else {
+            None
+        };
+
+        Some(PointResult {
+            local_cc: local_cc(s_ff, s_mm, s_fm),
+            deriv_wrt_image,
+            center_point: fp_center.to_vec(),
+        })
+    }
+
+    /// The local correlation at sample `s` alone — [`point_result`] without the
+    /// center voxel's moving gradient or the derivative factor. `None` on the
+    /// same two conditions: an empty window, or a center that does not map
+    /// inside the moving image.
+    ///
+    /// [`point_result`]: Self::point_result
+    fn point_local_cc(&self, transform: &dyn ParametricTransform, s: usize) -> Option<f64> {
+        let dim = self.fixed.dim;
+        let (s_ff, s_mm, s_fm, _, _) = self.window_stats(transform, s)?;
+
+        let center_lin = self.sample_linear_index(s);
+        let fp_center = &self.raster.points[center_lin * dim..(center_lin + 1) * dim];
+        let mp_center = transform.transform_point(fp_center);
+        self.moving.value_at(&mp_center)?;
+
+        Some(local_cc(s_ff, s_mm, s_fm))
+    }
+
+    /// `(sFF, sMM, sFM, fixedMean, movingMean)` over sample `s`'s window
+    /// (ITK's `UpdateQueuesAtBeginningOfLine` + `ComputeInformationFromQueues`).
+    /// `None` when no window voxel maps inside the moving image.
+    fn window_stats(
+        &self,
+        transform: &dyn ParametricTransform,
+        s: usize,
+    ) -> Option<(f64, f64, f64, f64, f64)> {
+        let dim = self.fixed.dim;
         let idx = &self.sample_index[s * dim..(s + 1) * dim];
 
         let mut sum_f = 0.0f64;
@@ -411,40 +471,25 @@ impl AntsNeighborhoodCorrelationMetric {
         let s_fm =
             sum_fm - moving_mean * sum_f - fixed_mean * sum_m + count * moving_mean * fixed_mean;
 
-        // The center voxel itself, evaluated again exactly as ITK's
-        // `ComputeInformationFromQueues` re-evaluates `oindex = scanIt.GetIndex()`.
-        // Sourced from `raster` (not `self.fixed`) so this always agrees with
-        // the window neighbours above, regardless of whether `fixed` is a
-        // sparse sample set.
-        let center_lin = self.sample_linear_index(s);
-        let fp_center = &self.raster.points[center_lin * dim..(center_lin + 1) * dim];
-        let fv_center = self.raster.values[center_lin];
-        let mp_center = transform.transform_point(fp_center);
-        let (mv_center, grad_phys) = self.moving.value_and_physical_gradient(&mp_center)?;
+        Some((s_ff, s_mm, s_fm, fixed_mean, moving_mean))
+    }
 
-        let fixed_i = fv_center - fixed_mean;
-        let moving_i = mv_center - moving_mean;
-
-        let eps = f64::EPSILON;
-        let denom = s_ff * s_mm;
-        let local_cc = if denom.abs() > eps {
-            s_fm * s_fm / denom
-        } else {
-            1.0
-        };
-
-        let deriv_wrt_image = if s_ff > eps && s_mm > eps {
-            let factor = 2.0 * s_fm / denom * (fixed_i - s_fm / s_mm * moving_i);
-            Some(grad_phys.iter().map(|&g| factor * g).collect())
-        } else {
-            None
-        };
-
-        Some(PointResult {
-            local_cc,
-            deriv_wrt_image,
-            center_point: fp_center.to_vec(),
-        })
+    /// The metric value alone at `transform`: `−(1/N)·Σ localCC`, with no
+    /// derivative accumulation and no center-voxel gradient.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
+        let mut value_sum = 0.0f64;
+        let mut valid = 0usize;
+        for s in 0..self.fixed.len() {
+            let Some(cc) = self.point_local_cc(transform, s) else {
+                continue;
+            };
+            value_sum -= cc;
+            valid += 1;
+        }
+        if valid == 0 {
+            return f64::MAX;
+        }
+        value_sum / valid as f64
     }
 
     /// Evaluate `value = −(1/N)·Σ localCC` and its parameter-derivative for
@@ -548,6 +593,18 @@ fn window_offsets(dim: usize, radius: usize) -> Vec<Vec<isize>> {
         }
     }
     offsets
+}
+
+/// ITK's `ComputeInformationFromQueues` local correlation `sFM² / (sFF·sMM)`,
+/// with its degenerate-window fallback of `1.0` (a perfectly correlated
+/// window, contributing `−1` to the value sum).
+fn local_cc(s_ff: f64, s_mm: f64, s_fm: f64) -> f64 {
+    let denom = s_ff * s_mm;
+    if denom.abs() > f64::EPSILON {
+        s_fm * s_fm / denom
+    } else {
+        1.0
+    }
 }
 
 #[cfg(test)]
@@ -901,5 +958,21 @@ mod tests {
             .map(|(l, g)| (l - g).abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-10, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate() {
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.5, 9.0, 4.0, 1.0);
+        let metric = AntsNeighborhoodCorrelationMetric::new(&fixed, &moving, 2).unwrap();
+        for t in [[0.0, 0.0], [1.3, -0.7], [-2.5, 2.5]] {
+            let transform = TranslationTransform::new(t.to_vec());
+            let full = metric.evaluate(&transform).value;
+            let value_only = metric.value(&transform);
+            assert!(
+                (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+                "at {t:?}: evaluate {full} vs value {value_only}"
+            );
+        }
     }
 }

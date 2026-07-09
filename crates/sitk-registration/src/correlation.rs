@@ -162,23 +162,65 @@ impl CorrelationMetric {
     /// [`DisplacementFieldTransform`](sitk_transform::DisplacementFieldTransform)).
     /// This metric is global-transform-only — see the
     /// [module docs](self#no-local-support-branch).
-    pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
+    /// The metric value alone at `transform`, for a caller that does not need
+    /// the derivative. Runs the same two passes as
+    /// [`evaluate`](Self::evaluate), but reads the moving image value-only and
+    /// never forms a transform Jacobian, so it costs no `O(nsamples · nparams)`
+    /// accumulation.
+    ///
+    /// # Panics
+    ///
+    /// As [`evaluate`](Self::evaluate): this metric is global-transform-only.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
         assert!(
             self.check_transform(transform).is_ok(),
             "CorrelationMetric is global-transform-only; call check_transform first"
         );
 
-        let dim = self.fixed.dim;
-        let nparams = transform.number_of_parameters();
-        let n = self.fixed.len();
+        let (avg_fix, avg_mov) = match self.means(transform) {
+            Some(m) => m,
+            None => return f64::MAX,
+        };
 
-        // Pass 1 (CorrelationImageToImageMetricv4HelperThreader): sample
-        // means over the valid point set. Only the moving *value* is needed
-        // here, so this reads through the value-only accessor.
+        let dim = self.fixed.dim;
+        let mut fm = 0.0f64;
+        let mut f2 = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut valid_points = 0usize;
+        for s in 0..self.fixed.len() {
+            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let mp = transform.transform_point(fp);
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
+                None => continue,
+            };
+            let f1 = self.fixed.values[s] - avg_fix;
+            let m1 = mv - avg_mov;
+            f2 += f1 * f1;
+            m2 += m1 * m1;
+            fm += f1 * m1;
+            valid_points += 1;
+        }
+
+        if valid_points == 0 {
+            return f64::MAX;
+        }
+        let m2f2 = m2 * f2;
+        if m2f2 <= f64::EPSILON {
+            return f64::MAX;
+        }
+        -fm * fm / m2f2
+    }
+
+    /// Pass 1 (`CorrelationImageToImageMetricv4HelperThreader`): the fixed and
+    /// moving sample means over the valid point set. `None` when no sample maps
+    /// inside the moving image.
+    fn means(&self, transform: &dyn ParametricTransform) -> Option<(f64, f64)> {
+        let dim = self.fixed.dim;
         let mut fix_sum = 0.0f64;
         let mut mov_sum = 0.0f64;
         let mut valid = 0usize;
-        for s in 0..n {
+        for s in 0..self.fixed.len() {
             let fp = &self.fixed.points[s * dim..(s + 1) * dim];
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
@@ -189,17 +231,32 @@ impl CorrelationMetric {
             mov_sum += mv;
             valid += 1;
         }
-
         if valid == 0 {
-            return MetricValue {
-                value: f64::MAX,
-                derivative: vec![0.0; nparams],
-                valid_points: 0,
-            };
+            return None;
         }
+        Some((fix_sum / valid as f64, mov_sum / valid as f64))
+    }
 
-        let avg_fix = fix_sum / valid as f64;
-        let avg_mov = mov_sum / valid as f64;
+    pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
+        assert!(
+            self.check_transform(transform).is_ok(),
+            "CorrelationMetric is global-transform-only; call check_transform first"
+        );
+
+        let dim = self.fixed.dim;
+        let nparams = transform.number_of_parameters();
+        let n = self.fixed.len();
+
+        let (avg_fix, avg_mov) = match self.means(transform) {
+            Some(m) => m,
+            None => {
+                return MetricValue {
+                    value: f64::MAX,
+                    derivative: vec![0.0; nparams],
+                    valid_points: 0,
+                };
+            }
+        };
 
         // Pass 2 (CorrelationImageToImageMetricv4GetValueAndDerivativeThreader):
         // sff/smm/sfm and the derivative accumulators fdm/mdm.
@@ -439,5 +496,21 @@ mod tests {
 
         let global = TranslationTransform::new(vec![0.0, 0.0]);
         assert!(metric.check_transform(&global).is_ok());
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate() {
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.5, 9.0, 4.0, 1.0);
+        let metric = CorrelationMetric::new(&fixed, &moving).unwrap();
+        for t in [[0.0, 0.0], [1.3, -0.7], [-2.5, 2.5]] {
+            let transform = TranslationTransform::new(t.to_vec());
+            let full = metric.evaluate(&transform).value;
+            let value_only = metric.value(&transform);
+            assert!(
+                (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+                "at {t:?}: evaluate {full} vs value {value_only}"
+            );
+        }
     }
 }

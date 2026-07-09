@@ -165,15 +165,23 @@ impl ActiveMetric {
         }
     }
 
-    /// Value alone at `transform`, for the gradient-free optimizers.
+    /// Value alone at `transform`, for the gradient-free optimizers and the
+    /// line searches' golden-section probes.
     ///
-    /// No metric in this crate has a value-only kernel, so this computes the
-    /// parameter-derivative and discards it. That is a wasted `O(nsamples ·
-    /// nparams)` accumulation per evaluation, not a wrong answer; adding a
-    /// value-only reduction means a new [`MetricBackend`] method, which a GPU
-    /// backend would want in any case.
+    /// Every metric has a value-only kernel: none of these builds a
+    /// parameter-derivative, and none reads the moving-image gradient except
+    /// where a validity predicate needs it. The value each returns is the one
+    /// [`evaluate`](Self::evaluate) would return, over the identical valid
+    /// sample set — pinned per metric by a `value_agrees_with_evaluate` test.
     fn value(&self, transform: &dyn ParametricTransform, backend: &dyn MetricBackend) -> f64 {
-        self.evaluate(transform, backend).value
+        match self {
+            ActiveMetric::MeanSquares(m) => m.value(transform, backend),
+            ActiveMetric::Mattes(m) => m.value(transform),
+            ActiveMetric::Correlation(m) => m.value(transform),
+            ActiveMetric::AntsNeighborhoodCorrelation(m) => m.value(transform),
+            ActiveMetric::JointHistogram(m) => m.value(transform),
+            ActiveMetric::Demons(m) => m.value(transform),
+        }
     }
 
     /// Physical-shift scale/learning-rate estimator over the fixed samples.

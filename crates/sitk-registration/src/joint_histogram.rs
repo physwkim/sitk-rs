@@ -664,6 +664,18 @@ impl JointHistogramMutualInformationMetric {
         -total / std::f64::consts::LN_2
     }
 
+    /// The metric value alone at `transform`: the first (value-only) pass of
+    /// [`evaluate`](Self::evaluate), stopping before the derivative pass. The
+    /// joint PDF already needs no gradients, so this is exactly `evaluate`'s
+    /// value with the second sample walk deleted.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
+        let (jp, fixed_marginal, moving_marginal, valid) = self.compute_joint_pdf(transform);
+        if valid == 0 {
+            return f64::MAX;
+        }
+        Self::compute_value(self.num_bins, &jp, &fixed_marginal, &moving_marginal)
+    }
+
     /// Evaluate `value = −MI` and its parameter-derivative for `transform`.
     ///
     /// Two passes over the fixed samples, exactly as ITK's two threaders: the
@@ -1232,5 +1244,27 @@ mod tests {
             "recovered dy {} (expected ~0.0)",
             result.parameters[1]
         );
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate() {
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.5, 9.0, 4.0, 1.0);
+        let metric = JointHistogramMutualInformationMetric::new(
+            &fixed,
+            &moving,
+            20,
+            JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+        )
+        .unwrap();
+        for t in [[0.0, 0.0], [1.3, -0.7], [-2.5, 2.5]] {
+            let transform = TranslationTransform::new(t.to_vec());
+            let full = metric.evaluate(&transform).value;
+            let value_only = metric.value(&transform);
+            assert!(
+                (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+                "at {t:?}: evaluate {full} vs value {value_only}"
+            );
+        }
     }
 }

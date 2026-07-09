@@ -555,6 +555,12 @@ pub struct MetricValue {
 
 /// Compute backend for the mean-squares metric: the isolated, parallelizable
 /// per-sample reduction. See the [module docs](self#gpu-seam) for the GPU seam.
+///
+/// Both reductions are required. A backend must not implement
+/// [`mean_squares_value`](Self::mean_squares_value) by discarding
+/// [`mean_squares`](Self::mean_squares)'s derivative: the gradient-free
+/// optimizers call it once per objective evaluation, and the derivative costs
+/// `O(nsamples · nparams)` to accumulate and is never read.
 pub trait MetricBackend {
     /// Accumulate the mean-squares value and its parameter-derivative over all
     /// fixed samples for the given transform.
@@ -564,6 +570,17 @@ pub trait MetricBackend {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> MetricValue;
+
+    /// Accumulate the mean-squares value alone, for a caller that does not need
+    /// the derivative (the gradient-free optimizers, and the line searches'
+    /// golden-section probes). `f64::MAX` when no sample is valid, matching
+    /// [`mean_squares`](Self::mean_squares)'s value in that case.
+    fn mean_squares_value(
+        &self,
+        fixed: &FixedSamples,
+        moving: &MovingImage,
+        transform: &dyn ParametricTransform,
+    ) -> f64;
 }
 
 /// Host (CPU) implementation of [`MetricBackend`].
@@ -642,6 +659,39 @@ impl MetricBackend for CpuBackend {
             valid_points: valid,
         }
     }
+
+    fn mean_squares_value(
+        &self,
+        fixed: &FixedSamples,
+        moving: &MovingImage,
+        transform: &dyn ParametricTransform,
+    ) -> f64 {
+        let dim = fixed.dim;
+        let n = fixed.values.len();
+
+        let mut value_sum = 0.0;
+        let mut valid = 0usize;
+
+        for s in 0..n {
+            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let mp = transform.transform_point(fp);
+            // No gradient, no Jacobian: `value_at` decides validity by exactly
+            // the same predicate `value_and_physical_gradient` does, so this
+            // walks the identical sample set as `mean_squares`.
+            let mv = match moving.value_at(&mp) {
+                Some(v) => v,
+                None => continue,
+            };
+            let diff = mv - fixed.values[s];
+            value_sum += diff * diff;
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return f64::MAX;
+        }
+        value_sum / valid as f64
+    }
 }
 
 /// The mean-squares image-to-image metric. Holds the precomputed fixed samples
@@ -705,6 +755,12 @@ impl MeanSquaresMetric {
         backend: &dyn MetricBackend,
     ) -> MetricValue {
         backend.mean_squares(&self.fixed, &self.moving, transform)
+    }
+
+    /// The metric value alone at `transform`, skipping the derivative
+    /// accumulation entirely (see [`MetricBackend::mean_squares_value`]).
+    pub fn value(&self, transform: &dyn ParametricTransform, backend: &dyn MetricBackend) -> f64 {
+        backend.mean_squares_value(&self.fixed, &self.moving, transform)
     }
 }
 
@@ -1040,5 +1096,24 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate() {
+        // `mean_squares_value` walks the samples with `value_at` where
+        // `mean_squares` uses `value_and_physical_gradient`. Both must accept
+        // the same samples and sum the same squares.
+        let fixed = ramp(9, 7, 3.0, 5.0);
+        let moving = ramp(9, 7, 3.0, 5.0);
+        let metric = MeanSquaresMetric::new(&fixed, &moving).unwrap();
+        for t in [[0.0, 0.0], [1.3, -0.7], [-2.5, 2.5]] {
+            let transform = TranslationTransform::new(t.to_vec());
+            let full = metric.evaluate(&transform, &CpuBackend).value;
+            let value_only = metric.value(&transform, &CpuBackend);
+            assert!(
+                (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+                "at {t:?}: evaluate {full} vs value {value_only}"
+            );
+        }
     }
 }

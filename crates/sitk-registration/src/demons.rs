@@ -284,6 +284,59 @@ impl DemonsMetric {
     /// `DemonsImageToImageMetricv4::Initialize`
     /// (`itkDemonsImageToImageMetricv4.hxx`), which throws for the identical
     /// condition once, at initialization, not on every per-point evaluation.
+    /// The metric value alone at `transform`: `mean((M − F)²)` over the samples
+    /// that are geometrically valid. Skips the force (derivative) arithmetic,
+    /// but still runs the two validity checks that decide which samples count —
+    /// the fixed-image gradient must exist at the fixed point, and a local
+    /// parameter block must govern it — so the sample set is identical to
+    /// [`evaluate`](Self::evaluate)'s.
+    ///
+    /// Neither of the two thresholds appears here: both gate the *force* only,
+    /// never the value or the valid-point count (see the module docs,
+    /// [Threshold semantics](self#threshold-semantics)).
+    ///
+    /// # Panics
+    ///
+    /// As [`evaluate`](Self::evaluate): this metric is local-support-only.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
+        assert!(
+            self.check_transform(transform).is_ok(),
+            "DemonsMetric requires a transform with local support; call check_transform first"
+        );
+
+        let dim = self.fixed.dim;
+        let n = self.fixed.len();
+        let mut value_sum = 0.0f64;
+        let mut valid = 0usize;
+
+        for s in 0..n {
+            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let mp = transform.transform_point(fp);
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
+                None => continue,
+            };
+            if self
+                .fixed_gradient
+                .value_and_physical_gradient(fp)
+                .is_none()
+            {
+                continue;
+            }
+            if local_support_block(transform, fp).is_none() {
+                continue;
+            }
+            let speed = mv - self.fixed.values[s];
+            value_sum += speed * speed;
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return f64::MAX;
+        }
+        value_sum / valid as f64
+    }
+
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
         assert!(
             self.check_transform(transform).is_ok(),
@@ -501,6 +554,15 @@ mod tests {
         let metric = DemonsMetric::new(&img, &img, 0.001).unwrap();
         let t = TranslationTransform::new(vec![0.0, 0.0]);
         let _ = metric.evaluate(&t);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a transform with local support")]
+    fn value_panics_on_global_transform() {
+        let img = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
+        let metric = DemonsMetric::new(&img, &img, 0.001).unwrap();
+        let t = TranslationTransform::new(vec![0.0, 0.0]);
+        let _ = metric.value(&t);
     }
 
     #[test]
@@ -750,5 +812,37 @@ mod tests {
         // Cross-axis components should stay small at each single-axis probe.
         assert!(px_dy.abs() < 0.3, "unexpected cross-axis dy {px_dy}");
         assert!(py_dx.abs() < 0.3, "unexpected cross-axis dx {py_dx}");
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate() {
+        // The two thresholds gate only the force, so `value` ignores them —
+        // it must still land on `evaluate`'s value, over the same sample set.
+        use sitk_transform::ParametricTransform;
+
+        let fixed = gaussian(16, 16, 8.0, 8.0, 4.0, 1.0);
+        let moving = gaussian(16, 16, 9.5, 7.0, 4.0, 1.0);
+        let metric = DemonsMetric::new(&fixed, &moving, 0.001).unwrap();
+
+        let mut field = zero_field(&fixed);
+        let full_at_identity = metric.evaluate(&field).value;
+        assert!(
+            (full_at_identity - metric.value(&field)).abs()
+                <= 1e-12 * full_at_identity.abs().max(1.0),
+            "at identity: evaluate {full_at_identity} vs value {}",
+            metric.value(&field)
+        );
+
+        let mut params = field.parameters();
+        for (i, p) in params.iter_mut().enumerate() {
+            *p = if i % 2 == 0 { 0.6 } else { -0.4 };
+        }
+        field.set_parameters(&params);
+        let full = metric.evaluate(&field).value;
+        let value_only = metric.value(&field);
+        assert!(
+            (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+            "at a nonzero field: evaluate {full} vs value {value_only}"
+        );
     }
 }

@@ -295,6 +295,108 @@ impl MattesMutualInformationMetric {
     ///
     /// [`BSplineTransform`]: sitk_transform::BSplineTransform
     /// [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
+    /// The unnormalized joint histogram, the unnormalized fixed marginal, and
+    /// the valid-sample count, from a **value-only** walk of the fixed samples
+    /// (no moving gradient, no transform Jacobian).
+    ///
+    /// This is the first pass of both [`value`](Self::value) and
+    /// `evaluate_sparse_support`. `evaluate_global_support` cannot use it: it
+    /// fuses the histogram and the `bins² × nparams` joint-PDF derivative into
+    /// one walk, and splitting them would cost it a second pass.
+    fn build_histogram(&self, transform: &dyn ParametricTransform) -> (Vec<f64>, Vec<f64>, usize) {
+        let dim = self.fixed.dim;
+        let bins = self.num_bins;
+        let n = self.fixed.len();
+
+        let mut joint_pdf = vec![0.0f64; bins * bins];
+        let mut fixed_marginal = vec![0.0f64; bins];
+        let mut valid = 0usize;
+
+        for s in 0..n {
+            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fv = self.fixed.values[s];
+
+            let mp = transform.transform_point(fp);
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
+                None => continue, // maps outside the moving buffer
+            };
+            if mv < self.moving_true_min || mv > self.moving_true_max {
+                continue;
+            }
+
+            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
+            let moving_index =
+                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
+            let fixed_index =
+                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+            fixed_marginal[fixed_index] += 1.0;
+
+            let mut pdf_moving_index = moving_index - 1;
+            let mut arg = pdf_moving_index as f64 - moving_term;
+            for _ in 0..4 {
+                joint_pdf[fixed_index * bins + pdf_moving_index] += cubic_bspline(arg);
+                arg += 1.0;
+                pdf_moving_index += 1;
+            }
+            valid += 1;
+        }
+
+        (joint_pdf, fixed_marginal, valid)
+    }
+
+    /// The metric value `−MI` alone at `transform`, for a caller that does not
+    /// need the derivative.
+    ///
+    /// One value-only pass over the samples, then the histogram walk. Neither
+    /// the `bins² × nparams` joint-PDF derivative array of the global path nor
+    /// the second sample walk of the sparse path is built, so this is the same
+    /// for either transform category — there is nothing left to dispatch on.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
+        let bins = self.num_bins;
+        let (mut joint_pdf, mut fixed_marginal, valid) = self.build_histogram(transform);
+        if valid == 0 {
+            return f64::MAX;
+        }
+        let joint_sum: f64 = joint_pdf.iter().sum();
+        if joint_sum < f64::EPSILON {
+            return f64::MAX;
+        }
+
+        let inv_sum = 1.0 / joint_sum;
+        for p in joint_pdf.iter_mut() {
+            *p *= inv_sum;
+        }
+        for p in fixed_marginal.iter_mut() {
+            *p *= inv_sum;
+        }
+
+        let mut moving_marginal = vec![0.0f64; bins];
+        for f in 0..bins {
+            for (m, mm) in moving_marginal.iter_mut().enumerate() {
+                *mm += joint_pdf[f * bins + m];
+            }
+        }
+
+        let close_to_zero = f64::EPSILON;
+        let mut sum = 0.0f64;
+        for f in 0..bins {
+            let fm = fixed_marginal[f];
+            if fm <= close_to_zero {
+                continue;
+            }
+            let log_fm = fm.ln();
+            for m in 0..bins {
+                let mm = moving_marginal[m];
+                let jp = joint_pdf[f * bins + m];
+                if mm > close_to_zero && jp > close_to_zero {
+                    sum += jp * ((jp / mm).ln() - log_fm);
+                }
+            }
+        }
+        -sum
+    }
+
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
         let dim = self.fixed.dim;
         let sparse_capable = match self.fixed.points.get(..dim) {
@@ -515,42 +617,8 @@ impl MattesMutualInformationMetric {
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
 
-        let mut joint_pdf = vec![0.0f64; bins * bins];
-        let mut fixed_marginal = vec![0.0f64; bins];
-        let mut valid = 0usize;
-
-        // Pass 1: joint histogram + fixed marginal only. Value-only sampling
-        // (no gradient, no per-sample Jacobian) — this pass does not need
-        // either.
-        for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
-            let fv = self.fixed.values[s];
-
-            let mp = transform.transform_point(fp);
-            let mv = match self.moving.value_at(&mp) {
-                Some(v) => v,
-                None => continue, // maps outside the moving buffer
-            };
-            if mv < self.moving_true_min || mv > self.moving_true_max {
-                continue;
-            }
-
-            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
-            let moving_index =
-                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
-            let fixed_index =
-                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
-            fixed_marginal[fixed_index] += 1.0;
-
-            let mut pdf_moving_index = moving_index - 1;
-            let mut arg = pdf_moving_index as f64 - moving_term;
-            for _ in 0..4 {
-                joint_pdf[fixed_index * bins + pdf_moving_index] += cubic_bspline(arg);
-                arg += 1.0;
-                pdf_moving_index += 1;
-            }
-            valid += 1;
-        }
+        // Pass 1: joint histogram + fixed marginal only.
+        let (mut joint_pdf, mut fixed_marginal, valid) = self.build_histogram(transform);
 
         if valid == 0 {
             return MetricValue {
@@ -1056,6 +1124,45 @@ mod tests {
         assert!(
             checked > 5,
             "expected several non-trivial params, got {checked}"
+        );
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate_on_the_global_support_path() {
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.5, 9.0, 4.0, 1.0);
+        let metric = MattesMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+        for t in [[0.0, 0.0], [1.3, -0.7], [-2.5, 2.5]] {
+            let transform = TranslationTransform::new(t.to_vec());
+            let full = metric.evaluate(&transform).value;
+            let value_only = metric.value(&transform);
+            assert!(
+                (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+                "at {t:?}: evaluate {full} vs value {value_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn value_agrees_with_evaluate_on_the_sparse_support_path() {
+        // `value` has no sparse/global dispatch — it never builds a derivative,
+        // so there is nothing to dispatch on. It must still reproduce the value
+        // `evaluate_sparse_support` computes for a displacement field.
+        use sitk_transform::ParametricTransform;
+
+        let (metric, mut field) = displacement_field_case();
+        assert!(field.has_local_support());
+        let mut params = field.parameters();
+        for (i, p) in params.iter_mut().enumerate() {
+            *p = if i % 2 == 0 { 0.4 } else { -0.3 };
+        }
+        field.set_parameters(&params);
+
+        let full = metric.evaluate(&field).value;
+        let value_only = metric.value(&field);
+        assert!(
+            (full - value_only).abs() <= 1e-12 * full.abs().max(1.0),
+            "evaluate {full} vs value {value_only}"
         );
     }
 }
