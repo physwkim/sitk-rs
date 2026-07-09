@@ -54,6 +54,7 @@ pub mod min_max_curvature_flow;
 pub mod morphology;
 pub mod n4_bias_field;
 pub mod noise;
+pub mod noise_estimate;
 pub mod overlap;
 pub mod projection;
 mod random;
@@ -133,6 +134,7 @@ pub use n4_bias_field::{
     n4_bias_field_correction_with_log_bias_field,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use noise_estimate::noise;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
