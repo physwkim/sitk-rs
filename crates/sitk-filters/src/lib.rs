@@ -33,6 +33,7 @@ pub mod clamp;
 pub mod convolution;
 pub mod denoise;
 pub mod distance;
+pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
@@ -84,6 +85,7 @@ pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
     signed_danielsson_distance_map, signed_maurer_distance_map,
 };
+pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
