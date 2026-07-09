@@ -576,11 +576,16 @@ pub fn bilateral(
 /// one pixel — `(Σᵢ (Σⱼ≠ᵢ secderiv[j])·firstderiv[i]² − 2·Σᵢ<ⱼ
 /// firstderiv[i]·firstderiv[j]·crossderiv[i][j]) / Σᵢ firstderiv[i]²`, zero
 /// when the gradient magnitude squared is below `1e-9` (ITK's own
-/// threshold). `scale[d]` is `ComputeNeighborhoodScales`'s per-axis factor
-/// (`1/spacing[d]` when using image spacing, else `1`; `CurvatureFlowFunction`'s
-/// own radius is always `1`, so `ScaleCoefficients[d]/radius[d] ==
-/// ScaleCoefficients[d]` exactly).
-fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &[f64]) -> f64 {
+/// threshold). `scale[d]` is `ComputeNeighborhoodScales`'s per-axis factor,
+/// `ScaleCoefficients[d] / radius[d]` — `ScaleCoefficients[d]` is `1/spacing[d]`
+/// when using image spacing, else `1`, and `CurvatureFlowFunction`'s own radius
+/// is always `1`, so for [`curvature_flow`] it is exactly `ScaleCoefficients[d]`.
+/// `MinMaxCurvatureFlowFunction` widens the radius to its stencil radius `r`
+/// and therefore passes `ScaleCoefficients[d] / r` — see
+/// [`crate::min_max_curvature_flow`], which reuses this update unchanged.
+///
+/// `nb` may carry any radius `>= 1` per axis; only the `±1` offsets are read.
+pub(crate) fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &[f64]) -> f64 {
     let center = nb.center_value();
     let mut first = vec![0.0f64; dim];
     let mut second = vec![0.0f64; dim];
