@@ -29,6 +29,7 @@ pub mod distance;
 pub mod error;
 pub mod functor;
 pub mod label;
+pub mod morphology;
 pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
@@ -39,6 +40,11 @@ pub use distance::{
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
+pub use morphology::{
+    StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
+    binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
+    grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
+};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
