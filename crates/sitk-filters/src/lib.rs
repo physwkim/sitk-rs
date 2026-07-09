@@ -82,6 +82,7 @@ mod random;
 pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
+pub mod reinitialize_level_set;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
@@ -200,6 +201,7 @@ pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
     neighborhood_connected,
 };
+pub use reinitialize_level_set::reinitialize_level_set;
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
