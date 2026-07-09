@@ -125,7 +125,7 @@ fn ravel(index: &[usize], size: &[usize]) -> usize {
 /// The input, widened to `f64` so the boundary conditions and the accumulation
 /// share one pixel type (ITK casts to `InternalImageType` for the same reason,
 /// itkFFTConvolutionImageFilter.hxx:284-291).
-fn as_f64_image(img: &Image) -> Result<Image> {
+pub(crate) fn as_f64_image(img: &Image) -> Result<Image> {
     Ok(Image::from_vec(img.size(), img.to_f64_vec())?)
 }
 
@@ -134,7 +134,7 @@ fn as_f64_image(img: &Image) -> Result<Image> {
 /// `NormalizeToConstantImageFilter` divides by `GetSum() / Constant` with
 /// `Constant == 1` (itkNormalizeToConstantImageFilter.hxx:71-76); the sum comes
 /// from `StatisticsImageFilter` in `RealType`, i.e. `f64`.
-fn prepare_kernel(image: &Image, kernel: &Image, normalize: bool) -> Result<Vec<f64>> {
+pub(crate) fn prepare_kernel(image: &Image, kernel: &Image, normalize: bool) -> Result<Vec<f64>> {
     if kernel.dimension() != image.dimension() {
         return Err(FilterError::KernelDimensionMismatch {
             image: image.dimension(),
@@ -161,7 +161,7 @@ fn prepare_kernel(image: &Image, kernel: &Image, normalize: bool) -> Result<Vec<
 /// Per-axis `kernelSize[d] / 2` — ITK's kernel radius *and* its kernel origin
 /// (`GetKernelRadius`, itkConvolutionImageFilter.hxx:226-240;
 /// `FFTConvolutionImageFilter::GetKernelRadius`, itkFFTConvolutionImageFilter.hxx:490-502).
-fn kernel_radius(kernel_size: &[usize]) -> Vec<usize> {
+pub(crate) fn kernel_radius(kernel_size: &[usize]) -> Vec<usize> {
     kernel_size.iter().map(|&s| s / 2).collect()
 }
 
@@ -200,7 +200,7 @@ fn valid_region(image_size: &[usize], kernel_size: &[usize]) -> (Vec<usize>, Vec
     (index, size)
 }
 
-fn output_region(
+pub(crate) fn output_region(
     image_size: &[usize],
     kernel_size: &[usize],
     mode: OutputRegionMode,
@@ -362,37 +362,27 @@ pub fn convolution(
 
 // ---- FFT convolution ------------------------------------------------------
 
-/// `FFTConvolutionImageFilter`'s mini-pipeline, minus the transforms
-/// themselves (itkFFTConvolutionImageFilter.hxx:80-488).
-///
-/// `PadInput` reduces, for a whole-image request, to: take the output region
-/// grown by the kernel radius from the boundary-extended input (the
-/// `RegionOfInterest` at `outputIndex - radius`, size `outputSize + 2*radius`,
-/// ibid. 214-221), then hand *that* to `FFTPadImageFilter`, which grows each
-/// axis to a power of two with `padSize / 2` pixels on the low side and draws
-/// the new pixels from the boundary condition applied to the region of
-/// interest (itkFFTPadImageFilter.hxx:52-72).
-///
-/// `PrepareKernel` zero-pads the kernel on the *upper* side up to the padded
-/// extent, then cyclically shifts it by `-(kernelSize / 2)`
-/// (itkFFTConvolutionImageFilter.hxx:332-392, itkCyclicShiftImageFilter.hxx:65-84),
-/// putting the kernel origin at the padded array's index 0.
-///
-/// `CropOutput` extracts at `paddedIndex + fftPadSize / 2 + kernelRadius`
-/// (ibid. 462-470). Every tap the circular convolution reads for those output
-/// pixels lands inside the region of interest, so the FFT padding never
-/// contributes and the result equals [`convolve_spatial`] up to round-off.
-fn convolve_fft<B: BoundaryCondition<f64>>(
+/// What `FFTConvolutionImageFilter::PadInput` leaves behind
+/// (itkFFTConvolutionImageFilter.hxx:143-296): the boundary-extended array the
+/// forward transform consumes, plus the geometry [`crop_output`] needs to find
+/// the requested region inside it.
+pub(crate) struct PaddedInput {
+    /// The padded pixels, first-index-fastest, `size.iter().product()` of them.
+    pub(crate) values: Vec<f64>,
+    /// The padded extent: every component a power of two.
+    pub(crate) size: Vec<usize>,
+    /// How many of the FFT-pad pixels `FFTPadImageFilter` put on the low side
+    /// of each axis (`m_FFTPadSize[d] / 2`).
+    pub(crate) lower: Vec<usize>,
+}
+
+fn pad_input_with<B: BoundaryCondition<f64>>(
     img: &Image,
-    kernel_values: &[f64],
-    kernel_size: &[usize],
     radius: &[usize],
     out_index: &[usize],
     out_size: &[usize],
     boundary: &B,
-) -> Result<Vec<f64>> {
-    let dim = img.dimension();
-
+) -> Result<PaddedInput> {
     let roi_index: Vec<i64> = out_index
         .iter()
         .zip(radius)
@@ -408,29 +398,87 @@ fn convolve_fft<B: BoundaryCondition<f64>>(
         sample_region(img, &roi_index, &roi_size, boundary),
     )?;
 
-    let padded_size: Vec<usize> = roi_size.iter().map(|&s| fft::padded_length(s)).collect();
+    let size: Vec<usize> = roi_size.iter().map(|&s| fft::padded_length(s)).collect();
     // `FFTPadImageFilter` puts `padSize / 2` of the new pixels on the low side.
-    let lower: Vec<usize> = padded_size
+    let lower: Vec<usize> = size
         .iter()
         .zip(&roi_size)
         .map(|(&p, &s)| (p - s) / 2)
         .collect();
     let pad_index: Vec<i64> = lower.iter().map(|&l| -(l as i64)).collect();
+    let values = sample_region(&roi, &pad_index, &size, boundary);
 
+    Ok(PaddedInput {
+        values,
+        size,
+        lower,
+    })
+}
+
+/// `FFTConvolutionImageFilter::PadInput` (itkFFTConvolutionImageFilter.hxx:143-296).
+///
+/// For a whole-image request it reduces to: take the output region grown by the
+/// kernel radius from the boundary-extended input (the `RegionOfInterest` at
+/// `outputIndex - radius`, size `outputSize + 2*radius`, ibid. 214-221), then
+/// hand *that* to `FFTPadImageFilter`, which grows each axis to a power of two
+/// with `padSize / 2` pixels on the low side and draws the new pixels from the
+/// boundary condition applied to the region of interest
+/// (itkFFTPadImageFilter.hxx:52-72).
+///
+/// `img` must already be an `f64` image ([`as_f64_image`]), matching ITK's cast
+/// to `InternalImageType`.
+pub(crate) fn pad_input(
+    img: &Image,
+    radius: &[usize],
+    out_index: &[usize],
+    out_size: &[usize],
+    boundary_condition: ConvolutionBoundaryCondition,
+) -> Result<PaddedInput> {
+    match boundary_condition {
+        ConvolutionBoundaryCondition::ZeroPad => pad_input_with(
+            img,
+            radius,
+            out_index,
+            out_size,
+            &ConstantBoundaryCondition::new(0.0f64),
+        ),
+        ConvolutionBoundaryCondition::ZeroFluxNeumannPad => pad_input_with(
+            img,
+            radius,
+            out_index,
+            out_size,
+            &ZeroFluxNeumannBoundaryCondition,
+        ),
+        ConvolutionBoundaryCondition::PeriodicPad => {
+            pad_input_with(img, radius, out_index, out_size, &PeriodicBoundaryCondition)
+        }
+    }
+}
+
+/// `FFTConvolutionImageFilter::PrepareKernel`'s transfer function
+/// (itkFFTConvolutionImageFilter.hxx:322-422): zero-pad the kernel on the
+/// *upper* side up to `padded_size`, cyclically shift it by `-(kernelSize / 2)`
+/// (itkCyclicShiftImageFilter.hxx:65-84) so the kernel origin lands on the
+/// padded array's index 0, and transform.
+///
+/// `kernel_values` has already been through [`prepare_kernel`], so `Normalize`
+/// is folded in.
+pub(crate) fn kernel_spectrum(
+    kernel_values: &[f64],
+    kernel_size: &[usize],
+    radius: &[usize],
+    padded_size: &[usize],
+) -> Vec<Complex> {
+    let dim = padded_size.len();
     let total: usize = padded_size.iter().product();
-    let mut spectrum: Vec<Complex> = sample_region(&roi, &pad_index, &padded_size, boundary)
-        .into_iter()
-        .map(|v| Complex::new(v, 0.0))
-        .collect();
 
-    // Upper-zero-padded kernel, cyclically shifted by `-radius`:
     // `shifted[j] = padded[(j + radius) mod paddedSize]`.
-    let mut kernel_spectrum = vec![Complex::default(); total];
+    let mut spectrum = vec![Complex::default(); total];
     let mut m = vec![0usize; dim];
     let mut source = vec![0usize; dim];
-    for (j, slot) in kernel_spectrum.iter_mut().enumerate() {
-        unravel(j, &padded_size, &mut m);
-        for (((s, &mi), &r), &p) in source.iter_mut().zip(&m).zip(radius).zip(&padded_size) {
+    for (j, slot) in spectrum.iter_mut().enumerate() {
+        unravel(j, padded_size, &mut m);
+        for (((s, &mi), &r), &p) in source.iter_mut().zip(&m).zip(radius).zip(padded_size) {
             *s = (mi + r) % p;
         }
         // Outside the kernel's own extent the upper zero pad supplies a zero.
@@ -438,25 +486,73 @@ fn convolve_fft<B: BoundaryCondition<f64>>(
             *slot = Complex::new(kernel_values[ravel(&source, kernel_size)], 0.0);
         }
     }
+    fft::transform_nd(&mut spectrum, padded_size, false);
+    spectrum
+}
 
-    fft::transform_nd(&mut spectrum, &padded_size, false);
-    fft::transform_nd(&mut kernel_spectrum, &padded_size, false);
-    for (x, &k) in spectrum.iter_mut().zip(&kernel_spectrum) {
-        *x = *x * k;
-    }
-    fft::transform_nd(&mut spectrum, &padded_size, true);
-
+/// `FFTConvolutionImageFilter::CropOutput` (itkFFTConvolutionImageFilter.hxx:445-488):
+/// extract `out_size` pixels at `paddedIndex + fftPadSize / 2 + kernelRadius`.
+///
+/// Every tap the circular convolution reads for those pixels lands inside the
+/// region of interest, so the FFT padding never contributes.
+pub(crate) fn crop_output(
+    padded: &[f64],
+    padded_size: &[usize],
+    lower: &[usize],
+    radius: &[usize],
+    out_size: &[usize],
+) -> Vec<f64> {
+    let dim = padded_size.len();
     let count: usize = out_size.iter().product();
     let mut values = Vec::with_capacity(count);
+    let mut m = vec![0usize; dim];
     let mut index = vec![0usize; dim];
     for i in 0..count {
         unravel(i, out_size, &mut m);
-        for (((x, &l), &r), &o) in index.iter_mut().zip(&lower).zip(radius).zip(&m) {
+        for (((x, &l), &r), &o) in index.iter_mut().zip(lower).zip(radius).zip(&m) {
             *x = l + r + o;
         }
-        values.push(spectrum[ravel(&index, &padded_size)].re);
+        values.push(padded[ravel(&index, padded_size)]);
     }
-    Ok(values)
+    values
+}
+
+/// The Fourier half of `FFTConvolutionImageFilter::GenerateData`
+/// (itkFFTConvolutionImageFilter.hxx:80-112): transform the padded input and
+/// the kernel, multiply, invert, crop.
+///
+/// Agrees with [`convolve_spatial`] up to round-off.
+fn convolve_fft(
+    img: &Image,
+    kernel_values: &[f64],
+    kernel_size: &[usize],
+    radius: &[usize],
+    out_index: &[usize],
+    out_size: &[usize],
+    boundary_condition: ConvolutionBoundaryCondition,
+) -> Result<Vec<f64>> {
+    let padded = pad_input(img, radius, out_index, out_size, boundary_condition)?;
+    let transfer = kernel_spectrum(kernel_values, kernel_size, radius, &padded.size);
+
+    let mut spectrum: Vec<Complex> = padded
+        .values
+        .iter()
+        .map(|&v| Complex::new(v, 0.0))
+        .collect();
+    fft::transform_nd(&mut spectrum, &padded.size, false);
+    for (x, &k) in spectrum.iter_mut().zip(&transfer) {
+        *x = *x * k;
+    }
+    fft::transform_nd(&mut spectrum, &padded.size, true);
+
+    let real: Vec<f64> = spectrum.iter().map(|x| x.re).collect();
+    Ok(crop_output(
+        &real,
+        &padded.size,
+        &padded.lower,
+        radius,
+        out_size,
+    ))
 }
 
 /// `FFTConvolutionImageFilter`: the same convolution as [`convolution`],
@@ -485,35 +581,15 @@ pub fn fft_convolution(
     }
 
     let widened = as_f64_image(image)?;
-    let values = match boundary_condition {
-        ConvolutionBoundaryCondition::ZeroPad => convolve_fft(
-            &widened,
-            &kernel_values,
-            kernel_size,
-            &radius,
-            &out_index,
-            &out_size,
-            &ConstantBoundaryCondition::new(0.0f64),
-        ),
-        ConvolutionBoundaryCondition::ZeroFluxNeumannPad => convolve_fft(
-            &widened,
-            &kernel_values,
-            kernel_size,
-            &radius,
-            &out_index,
-            &out_size,
-            &ZeroFluxNeumannBoundaryCondition,
-        ),
-        ConvolutionBoundaryCondition::PeriodicPad => convolve_fft(
-            &widened,
-            &kernel_values,
-            kernel_size,
-            &radius,
-            &out_index,
-            &out_size,
-            &PeriodicBoundaryCondition,
-        ),
-    }?;
+    let values = convolve_fft(
+        &widened,
+        &kernel_values,
+        kernel_size,
+        &radius,
+        &out_index,
+        &out_size,
+        boundary_condition,
+    )?;
 
     image_from_f64(image.pixel_id(), &out_size, image, &values)
 }
