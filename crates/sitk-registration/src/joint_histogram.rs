@@ -593,8 +593,8 @@ impl JointHistogramMutualInformationMetric {
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);
-            let mv = match self.moving.value_and_physical_gradient(&mp) {
-                Some((v, _)) => v,
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
                 None => continue,
             };
             if mv < self.moving_true_min || mv > self.moving_true_max {

@@ -384,7 +384,7 @@ impl AntsNeighborhoodCorrelationMetric {
             let fv = self.raster.values[lin];
             let fp = &self.raster.points[lin * dim..(lin + 1) * dim];
             let mp = transform.transform_point(fp);
-            let Some((mv, _)) = self.moving.value_and_physical_gradient(&mp) else {
+            let Some(mv) = self.moving.value_at(&mp) else {
                 continue;
             };
 

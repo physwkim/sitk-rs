@@ -174,16 +174,15 @@ impl CorrelationMetric {
 
         // Pass 1 (CorrelationImageToImageMetricv4HelperThreader): sample
         // means over the valid point set. Only the moving *value* is needed
-        // here (no gradient) — this is the one line to rewire to a
-        // value-only accessor if/when one is added to `MovingImage`.
+        // here, so this reads through the value-only accessor.
         let mut fix_sum = 0.0f64;
         let mut mov_sum = 0.0f64;
         let mut valid = 0usize;
         for s in 0..n {
             let fp = &self.fixed.points[s * dim..(s + 1) * dim];
             let mp = transform.transform_point(fp);
-            let (mv, _) = match self.moving.value_and_physical_gradient(&mp) {
-                Some(vg) => vg,
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
                 None => continue, // maps outside the moving buffer
             };
             fix_sum += self.fixed.values[s];
