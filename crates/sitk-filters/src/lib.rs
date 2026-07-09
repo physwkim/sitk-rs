@@ -36,7 +36,9 @@ mod fft;
 pub mod functor;
 pub mod geometry;
 pub mod gradient;
+pub mod grid_utility;
 mod histogram;
+pub mod histogram_matching;
 pub mod intensity;
 pub mod label;
 pub mod level_set;
@@ -49,6 +51,7 @@ mod random;
 pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
+pub mod sharpening;
 pub mod shrink;
 pub mod smoothing;
 pub mod threshold;
@@ -75,6 +78,8 @@ pub use gradient::{
     derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
     laplacian_recursive_gaussian, sobel_edge_detection,
 };
+pub use grid_utility::{checker_board, paste, tile};
+pub use histogram_matching::histogram_matching;
 pub use intensity::{
     intensity_windowing, intensity_windowing_in_place, invert_intensity, invert_intensity_in_place,
     normalize, otsu_multiple_thresholds, otsu_threshold, sigmoid, sigmoid_in_place,
@@ -113,6 +118,7 @@ pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
     neighborhood_connected,
 };
+pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;
