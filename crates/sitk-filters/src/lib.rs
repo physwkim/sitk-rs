@@ -17,73 +17,85 @@
 //!   out-of-range float→int cast is undefined in C++, and we define it as
 //!   saturation.
 //!
+//! Both policies are the two faces of the [`functor`] module's pixel-functor
+//! seam (ITK's `UnaryFunctorImageFilter` / `BinaryFunctorImageFilter`), which
+//! `add`/`subtract`/`multiply`/`divide`, the `*_constant` ops, and `abs` are
+//! built on.
+//!
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
 pub mod error;
+pub mod functor;
 pub mod recursive_gaussian;
 pub mod shrink;
 pub mod smoothing;
 
 pub use error::{FilterError, Result};
+pub use functor::{BinaryFunctor, UnaryFunctor};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
+//
+// Add/Sub/Mul/Div are [`BinaryFunctor`] markers plugged into
+// [`functor::binary_functor!`] below: pixel-type-compute (the seam's policy
+// (b)), matching ITK's `itkArithmeticOpsFunctors.h` (`Add2`, `Sub2`, `Mult`,
+// `Div` all evaluate their operator in the pixel type, then
+// `static_cast<TOutput>`).
 
-/// The four binary arithmetic operations, matching ITK's arithmetic functors.
-#[derive(Clone, Copy)]
-enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-}
+/// Pixel-wise `a + b`; matches ITK's `Add2` functor.
+struct AddOp;
+/// Pixel-wise `a - b`; matches ITK's `Sub2` functor.
+struct SubOp;
+/// Pixel-wise `a * b`; matches ITK's `Mult` functor.
+struct MulOp;
+/// Pixel-wise `a / b`, or the type's max value when `b == 0`; matches ITK's
+/// `Div` functor (`NumericTraits<T>::max()` on division by zero).
+struct DivOp;
 
-/// Per-pixel-type arithmetic with ITK functor semantics. Integer ops wrap on
-/// overflow (2's complement), matching C++ `static_cast<T>(promoted A op B)`;
-/// float ops use IEEE arithmetic. Division by zero returns the type's largest
-/// finite value, as ITK's `Div` functor does (`NumericTraits<T>::max()`).
-trait Arith: Scalar {
-    fn apply(self, rhs: Self, op: ArithOp) -> Self;
-}
-
-macro_rules! impl_arith_int {
+macro_rules! impl_binary_functor_int {
     ($($t:ty),+ $(,)?) => {$(
-        impl Arith for $t {
-            #[inline]
-            fn apply(self, rhs: Self, op: ArithOp) -> Self {
-                match op {
-                    ArithOp::Add => self.wrapping_add(rhs),
-                    ArithOp::Sub => self.wrapping_sub(rhs),
-                    ArithOp::Mul => self.wrapping_mul(rhs),
-                    ArithOp::Div => if rhs == 0 { <$t>::MAX } else { self.wrapping_div(rhs) },
-                }
+        impl BinaryFunctor<$t> for AddOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a.wrapping_add(b) }
+        }
+        impl BinaryFunctor<$t> for SubOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a.wrapping_sub(b) }
+        }
+        impl BinaryFunctor<$t> for MulOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a.wrapping_mul(b) }
+        }
+        impl BinaryFunctor<$t> for DivOp {
+            fn apply(&self, a: $t, b: $t) -> $t {
+                if b == 0 { <$t>::MAX } else { a.wrapping_div(b) }
             }
         }
     )+};
 }
 
-macro_rules! impl_arith_float {
+macro_rules! impl_binary_functor_float {
     ($($t:ty),+ $(,)?) => {$(
-        impl Arith for $t {
-            #[inline]
-            fn apply(self, rhs: Self, op: ArithOp) -> Self {
-                match op {
-                    ArithOp::Add => self + rhs,
-                    ArithOp::Sub => self - rhs,
-                    ArithOp::Mul => self * rhs,
-                    ArithOp::Div => if rhs == 0.0 { <$t>::MAX } else { self / rhs },
-                }
+        impl BinaryFunctor<$t> for AddOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a + b }
+        }
+        impl BinaryFunctor<$t> for SubOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a - b }
+        }
+        impl BinaryFunctor<$t> for MulOp {
+            fn apply(&self, a: $t, b: $t) -> $t { a * b }
+        }
+        impl BinaryFunctor<$t> for DivOp {
+            fn apply(&self, a: $t, b: $t) -> $t {
+                if b == 0.0 { <$t>::MAX } else { a / b }
             }
         }
     )+};
 }
 
-impl_arith_int!(u8, i8, u16, i16, u32, i32, u64, i64);
-impl_arith_float!(f32, f64);
+impl_binary_functor_int!(u8, i8, u16, i16, u32, i32, u64, i64);
+impl_binary_functor_float!(f32, f64);
 
 // ---- shared helpers -------------------------------------------------------
 
@@ -132,81 +144,88 @@ pub fn cast(img: &Image, target: PixelId) -> Result<Image> {
 
 // ---- binary arithmetic (image ⊕ image) ------------------------------------
 
-fn binary_apply<T: Arith>(a: &Image, b: &Image, op: ArithOp) -> Result<Image> {
-    let sa = a.scalar_slice::<T>().expect("dispatch guarantees type");
-    let sb = b.scalar_slice::<T>().expect("dispatch guarantees type");
-    let out: Vec<T> = sa
-        .iter()
-        .zip(sb.iter())
-        .map(|(&x, &y)| x.apply(y, op))
-        .collect();
-    let mut img = Image::from_vec(a.size(), out)?;
-    img.copy_geometry_from(a);
-    Ok(img)
+functor::binary_functor! {
+    /// `AddImageFilter`: pixel-wise `a + b` (`static_cast<T>(a + b)`; integers wrap).
+    pub fn add, add_in_place = AddOp;
 }
 
-fn binary(a: &Image, b: &Image, op: ArithOp) -> Result<Image> {
-    require_same_shape(a, b)?;
-    dispatch_scalar!(a.pixel_id(), binary_apply, a, b, op)
+functor::binary_functor! {
+    /// `SubtractImageFilter`: pixel-wise `a - b` (integers wrap).
+    pub fn subtract, subtract_in_place = SubOp;
 }
 
-/// `AddImageFilter`: pixel-wise `a + b` (`static_cast<T>(a + b)`; integers wrap).
-pub fn add(a: &Image, b: &Image) -> Result<Image> {
-    binary(a, b, ArithOp::Add)
+functor::binary_functor! {
+    /// `MultiplyImageFilter`: pixel-wise `a * b` (integers wrap).
+    pub fn multiply, multiply_in_place = MulOp;
 }
 
-/// `SubtractImageFilter`: pixel-wise `a - b` (integers wrap).
-pub fn subtract(a: &Image, b: &Image) -> Result<Image> {
-    binary(a, b, ArithOp::Sub)
-}
-
-/// `MultiplyImageFilter`: pixel-wise `a * b` (integers wrap).
-pub fn multiply(a: &Image, b: &Image) -> Result<Image> {
-    binary(a, b, ArithOp::Mul)
-}
-
-/// `DivideImageFilter`: pixel-wise `a / b`; where `b == 0` yields the output
-/// type's largest finite value (`NumericTraits<T>::max()`), matching ITK's `Div`
-/// functor.
-pub fn divide(a: &Image, b: &Image) -> Result<Image> {
-    binary(a, b, ArithOp::Div)
+functor::binary_functor! {
+    /// `DivideImageFilter`: pixel-wise `a / b`; where `b == 0` yields the output
+    /// type's largest finite value (`NumericTraits<T>::max()`), matching ITK's `Div`
+    /// functor.
+    pub fn divide, divide_in_place = DivOp;
 }
 
 // ---- binary arithmetic (image ⊕ constant) ---------------------------------
-
-fn constant_apply<T: Scalar>(a: &Image, c: f64, op: fn(f64, f64) -> f64) -> Result<Image> {
-    let sa = a.scalar_slice::<T>().expect("dispatch guarantees type");
-    let out: Vec<T> = sa.iter().map(|&x| T::from_f64(op(x.as_f64(), c))).collect();
-    let mut img = Image::from_vec(a.size(), out)?;
-    img.copy_geometry_from(a);
-    Ok(img)
-}
-
-fn constant(a: &Image, c: f64, op: fn(f64, f64) -> f64) -> Result<Image> {
-    dispatch_scalar!(a.pixel_id(), constant_apply, a, c, op)
-}
+//
+// The constant is SimpleITK's `double`, so unlike the image ⊕ image ops
+// above, these accumulate in `f64` and narrow with a saturating cast: the
+// seam's policy (a), matching ITK's math functors (`itkAcosImageFilter.h`)
+// rather than its arithmetic functors. Each op is a [`UnaryFunctor`] closing
+// over the runtime constant, plugged into [`functor::unary_functor!`].
 
 /// `a + c` for a scalar constant.
-pub fn add_constant(a: &Image, c: f64) -> Result<Image> {
-    constant(a, c, |x, y| x + y)
+struct AddConstant(f64);
+impl UnaryFunctor for AddConstant {
+    fn apply(&self, x: f64) -> f64 {
+        x + self.0
+    }
 }
 
 /// `a - c` for a scalar constant.
-pub fn subtract_constant(a: &Image, c: f64) -> Result<Image> {
-    constant(a, c, |x, y| x - y)
+struct SubConstant(f64);
+impl UnaryFunctor for SubConstant {
+    fn apply(&self, x: f64) -> f64 {
+        x - self.0
+    }
 }
 
 /// `a * c` for a scalar constant.
-pub fn multiply_constant(a: &Image, c: f64) -> Result<Image> {
-    constant(a, c, |x, y| x * y)
+struct MulConstant(f64);
+impl UnaryFunctor for MulConstant {
+    fn apply(&self, x: f64) -> f64 {
+        x * self.0
+    }
+}
+
+functor::unary_functor! {
+    /// `a + c` for a scalar constant.
+    pub fn add_constant, add_constant_in_place(c: f64) = AddConstant(c);
+}
+
+functor::unary_functor! {
+    /// `a - c` for a scalar constant.
+    pub fn subtract_constant, subtract_constant_in_place(c: f64) = SubConstant(c);
+}
+
+functor::unary_functor! {
+    /// `a * c` for a scalar constant.
+    pub fn multiply_constant, multiply_constant_in_place(c: f64) = MulConstant(c);
 }
 
 // ---- unary ----------------------------------------------------------------
 
 /// `AbsImageFilter`: pixel-wise absolute value, output type follows input.
-pub fn abs(img: &Image) -> Result<Image> {
-    let vals: Vec<f64> = img.to_f64_vec().iter().map(|v| v.abs()).collect();
-    image_from_f64(img.pixel_id(), img.size(), img, &vals)
+struct Abs;
+impl UnaryFunctor for Abs {
+    fn apply(&self, x: f64) -> f64 {
+        x.abs()
+    }
+}
+
+functor::unary_functor! {
+    /// `AbsImageFilter`: pixel-wise absolute value, output type follows input.
+    pub fn abs, abs_in_place() = Abs;
 }
 
 // ---- threshold ------------------------------------------------------------
@@ -426,6 +445,39 @@ mod tests {
     fn abs_negative_values() {
         let a = Image::from_vec(&[3, 1], vec![-3i16, 0, 7]).unwrap();
         assert_eq!(abs(&a).unwrap().scalar_slice::<i16>().unwrap(), &[3, 0, 7]);
+    }
+
+    #[test]
+    fn add_constant_saturates_on_overflow_unlike_wrapping_add() {
+        // Seam policy (a) (f64-compute, `add_constant`): 250 + 10.0 = 260.0,
+        // which does not fit in u8, so `Scalar::from_f64` saturates to 255.
+        // Contrast seam policy (b) (pixel-type-compute, `add`): the same
+        // 250 + 10 wraps to 4 (see `add_wraps_on_u8_overflow_like_itk`).
+        let a = img_u8(&[1, 1], vec![250]);
+        assert_eq!(
+            add_constant(&a, 10.0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[255]
+        );
+    }
+
+    #[test]
+    fn add_in_place_matches_allocating() {
+        let a = img_u8(&[2, 2], vec![1, 2, 250, 4]);
+        let b = img_u8(&[2, 2], vec![10, 20, 10, 40]);
+        let allocated = add(&a, &b).unwrap();
+        let in_place = add_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn abs_in_place_matches_allocating() {
+        let a = Image::from_vec(&[3, 1], vec![-3i16, 0, 7]).unwrap();
+        let allocated = abs(&a).unwrap();
+        let in_place = abs_in_place(a).unwrap();
+        assert_eq!(allocated, in_place);
     }
 
     #[test]
