@@ -10,16 +10,14 @@
 //!   `RegionalMinimaImageFilter` → `ConnectedComponentImageFilter` →
 //!   `MorphologicalWatershedFromMarkersImageFilter`.
 //!
-//! The mini-pipeline's internal stages are ported here as module-private
-//! helpers rather than as public filters, because only the watershed needs
-//! them so far:
+//! The mini-pipeline's `HMinimaImageFilter` stage —
+//! [`crate::reconstruction::h_minima`], built on
+//! [`crate::reconstruction::reconstruction_by_erosion`]
+//! (`itkReconstructionImageFilter.hxx` with `TCompare = std::less`) — is a
+//! public filter in its own right, ported fully in [`crate::reconstruction`].
+//! Only [`regional_minima`] is ported here as a module-private helper,
+//! because only the watershed needs it so far:
 //!
-//! - [`reconstruction_by_erosion`] — `itkReconstructionImageFilter.hxx` with
-//!   `TCompare = std::less` (`itkReconstructionByErosionImageFilter.h`), i.e.
-//!   the raster / anti-raster / FIFO three-pass grayscale reconstruction.
-//! - [`h_minima`] — `itkHMinimaImageFilter.hxx`: reconstruct the image by
-//!   erosion under a marker of `input + height`, suppressing every regional
-//!   minimum shallower than `height`.
 //! - [`regional_minima`] — `itkValuedRegionalMinimaImageFilter.h` driving
 //!   `itkValuedRegionalExtremaImageFilter.hxx`, thresholded as
 //!   `itkRegionalMinimaImageFilter.hxx` does (`FlatIsMinima` defaults to
@@ -83,15 +81,17 @@
 //! visits its active offsets in ascending *neighborhood index* — the offset
 //! `o ∈ {-1,0,1}^dim` at index `Σ_d (o[d] + 1) · 3^d`, axis 0 fastest
 //! (`ConstShapedNeighborhoodIterator::ActivateIndex` keeps the active list
-//! sorted). [`neighbor_offsets`] reproduces that order, and
-//! `itkConnectedComponentAlgorithm.h`'s `setConnectivity` /
+//! sorted). `crate::reconstruction`'s private `neighbor_offsets` reproduces
+//! that order, and `itkConnectedComponentAlgorithm.h`'s `setConnectivity` /
 //! `setConnectivityPrevious` / `setConnectivityLater` become its three
-//! [`Half`] variants.
+//! [`crate::reconstruction::Half`] variants, reused here via
+//! [`crate::reconstruction::NeighborWalker`].
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::label::connected_component;
-use sitk_core::{Image, Scalar, dispatch_scalar};
+use crate::reconstruction::{Half, NeighborWalker};
+use sitk_core::Image;
 use std::collections::VecDeque;
 
 /// The marker image's background label and the output image's watershed-line
@@ -99,132 +99,6 @@ use std::collections::VecDeque;
 const BG_LABEL: i64 = 0;
 /// See [`BG_LABEL`]; named separately to mirror the `.hxx`'s `wsLabel`.
 const WS_LABEL: i64 = 0;
-
-// ---- N-D indexing and connectivity ---------------------------------------
-
-/// First-index-fastest strides for a size vector.
-fn strides(size: &[usize]) -> Vec<usize> {
-    let mut s = vec![1usize; size.len()];
-    for d in 1..size.len() {
-        s[d] = s[d - 1] * size[d - 1];
-    }
-    s
-}
-
-/// Decode a flat (first-index-fastest) offset into a multi-index.
-fn multi_index(flat: usize, size: &[usize], strides: &[usize], out: &mut Vec<usize>) {
-    out.clear();
-    out.extend((0..size.len()).map(|d| (flat / strides[d]) % size[d]));
-}
-
-/// Which side of the center a connectivity's offsets lie on, matching the
-/// three activation helpers in `itkConnectedComponentAlgorithm.h`.
-#[derive(Clone, Copy)]
-enum Half {
-    /// `setConnectivity`: every neighbor.
-    Full,
-    /// `setConnectivityPrevious`: neighbors earlier in raster order.
-    Previous,
-    /// `setConnectivityLater`: neighbors later in raster order.
-    Later,
-}
-
-/// The active offsets of a shaped neighborhood iterator, in ascending
-/// neighborhood index (see the module docs). `fully_connected = false` keeps
-/// only the axis-aligned unit steps (face connectivity); `true` keeps every
-/// nonzero offset in `{-1,0,1}^dim`.
-fn neighbor_offsets(dim: usize, fully_connected: bool, half: Half) -> Vec<Vec<i64>> {
-    let total = 3usize.pow(dim as u32);
-    let center = total / 2;
-    let mut offsets = Vec::new();
-    for code in 0..total {
-        let mut rem = code;
-        let mut offset = vec![0i64; dim];
-        let mut nonzero_axes = 0usize;
-        for d in offset.iter_mut() {
-            let digit = rem % 3;
-            rem /= 3;
-            *d = digit as i64 - 1; // 0,1,2 -> -1,0,1
-            if *d != 0 {
-                nonzero_axes += 1;
-            }
-        }
-        if nonzero_axes == 0 || (!fully_connected && nonzero_axes > 1) {
-            continue;
-        }
-        let keep = match half {
-            Half::Full => true,
-            Half::Previous => code < center,
-            Half::Later => code > center,
-        };
-        if keep {
-            offsets.push(offset);
-        }
-    }
-    offsets
-}
-
-/// A shaped neighborhood: the active offsets plus their flat-index deltas.
-struct Connectivity {
-    offsets: Vec<Vec<i64>>,
-    deltas: Vec<i64>,
-}
-
-impl Connectivity {
-    fn new(size: &[usize], fully_connected: bool, half: Half) -> Self {
-        let st = strides(size);
-        let offsets = neighbor_offsets(size.len(), fully_connected, half);
-        let deltas = offsets
-            .iter()
-            .map(|o| o.iter().zip(&st).map(|(&a, &s)| a * s as i64).sum())
-            .collect();
-        Connectivity { offsets, deltas }
-    }
-
-    /// Append the in-bounds neighbors of the pixel at `flat` (multi-index
-    /// `idx`) to `out`, in ascending neighborhood index. Out-of-bounds
-    /// neighbors are skipped — see the module docs on boundary handling.
-    fn collect(&self, idx: &[usize], flat: usize, size: &[usize], out: &mut Vec<usize>) {
-        out.clear();
-        'offset: for (offset, &delta) in self.offsets.iter().zip(&self.deltas) {
-            for (d, &o) in offset.iter().enumerate() {
-                let v = idx[d] as i64 + o;
-                if v < 0 || v as usize >= size[d] {
-                    continue 'offset;
-                }
-            }
-            out.push((flat as i64 + delta) as usize);
-        }
-    }
-}
-
-/// Walks the in-bounds neighbors of successive pixels, reusing one scratch
-/// buffer per role so the flooding loops allocate nothing per pixel.
-struct NeighborWalker {
-    conn: Connectivity,
-    idx: Vec<usize>,
-    neighbors: Vec<usize>,
-    strides: Vec<usize>,
-}
-
-impl NeighborWalker {
-    fn new(size: &[usize], fully_connected: bool, half: Half) -> Self {
-        NeighborWalker {
-            conn: Connectivity::new(size, fully_connected, half),
-            idx: Vec::with_capacity(size.len()),
-            neighbors: Vec::with_capacity(3usize.pow(size.len() as u32)),
-            strides: strides(size),
-        }
-    }
-
-    /// The in-bounds neighbors of `flat`, valid until the next call.
-    fn at(&mut self, flat: usize, size: &[usize]) -> &[usize] {
-        multi_index(flat, size, &self.strides, &mut self.idx);
-        self.conn
-            .collect(&self.idx, flat, size, &mut self.neighbors);
-        &self.neighbors
-    }
-}
 
 // ---- hierarchical queue keys ---------------------------------------------
 
@@ -428,105 +302,7 @@ fn flood_beucher(
     out
 }
 
-// ---- grayscale reconstruction / h-minima / regional minima ---------------
-
-/// `ReconstructionImageFilter` with `TCompare = std::less`, i.e.
-/// `ReconstructionByErosionImageFilter`: the largest image `<= marker` that is
-/// `>= mask` and has no regional minimum that `mask` does not have.
-///
-/// Three passes over `marker` (in place): a raster scan taking the minimum
-/// over the earlier neighbors then clamping up to `mask`; an anti-raster scan
-/// doing the same over the later neighbors and queueing every pixel that can
-/// still lower a later neighbor; and a FIFO propagation over the full
-/// neighborhood until the queue drains.
-///
-/// `marker[i] >= mask[i]` is the filter's stated precondition (the `.hxx`
-/// throws otherwise); [`h_minima`], its only caller, guarantees it by
-/// construction.
-fn reconstruction_by_erosion(
-    marker: &[f64],
-    mask: &[f64],
-    size: &[usize],
-    fully_connected: bool,
-) -> Vec<f64> {
-    let total = marker.len();
-    let mut out = marker.to_vec();
-    let mut previous = NeighborWalker::new(size, fully_connected, Half::Previous);
-    let mut later = NeighborWalker::new(size, fully_connected, Half::Later);
-    let mut full = NeighborWalker::new(size, fully_connected, Half::Full);
-
-    // Raster scan.
-    for f in 0..total {
-        let mut v = out[f];
-        for &g in previous.at(f, size) {
-            let vn = out[g];
-            if vn < v {
-                v = vn;
-            }
-        }
-        out[f] = if v < mask[f] { mask[f] } else { v };
-    }
-
-    // Anti-raster scan, collecting the seeds of the FIFO pass.
-    let mut fifo: VecDeque<usize> = VecDeque::new();
-    for f in (0..total).rev() {
-        let mut v = out[f];
-        for &g in later.at(f, size) {
-            let vn = out[g];
-            if vn < v {
-                v = vn;
-            }
-        }
-        if v < mask[f] {
-            v = mask[f];
-        }
-        out[f] = v;
-        // A later neighbor this pixel can still lower, but which the mask does
-        // not already hold down to that neighbor's own value.
-        if later
-            .at(f, size)
-            .iter()
-            .any(|&g| v < out[g] && mask[g] < out[g])
-        {
-            fifo.push_back(f);
-        }
-    }
-
-    // FIFO propagation over the full neighborhood.
-    while let Some(f) = fifo.pop_front() {
-        let v = out[f];
-        for &g in full.at(f, size) {
-            let vn = out[g];
-            let mask_n = mask[g];
-            if v < vn && mask_n != vn {
-                // `out >= mask` is invariant, so `mask_n != vn` means
-                // `mask_n < vn`: lowering `g` to `max(v, mask_n)` is always a
-                // strict decrease.
-                out[g] = if mask_n < v { v } else { mask_n };
-                fifo.push_back(g);
-            }
-        }
-    }
-    out
-}
-
-/// `HMinimaImageFilter`: suppress every regional minimum of `vals` whose
-/// depth is at most `height`, by reconstructing `vals` by erosion under the
-/// marker `vals + height`.
-///
-/// The marker is formed the way `ShiftScaleImageFilter` forms it — accumulate
-/// in a real type, then saturate into the pixel type — which is what
-/// [`crate::image_from_f64`] does via [`Scalar::from_f64`].
-fn h_minima(image: &Image, vals: &[f64], height: f64, fully_connected: bool) -> Result<Vec<f64>> {
-    let shifted: Vec<f64> = vals.iter().map(|&v| v + height).collect();
-    let marker = image_from_f64(image.pixel_id(), image.size(), image, &shifted)?.to_f64_vec();
-    Ok(reconstruction_by_erosion(
-        &marker,
-        vals,
-        image.size(),
-        fully_connected,
-    ))
-}
+// ---- regional minima -------------------------------------------------------
 
 /// `RegionalMinimaImageFilter` (via `ValuedRegionalMinimaImageFilter`): mark
 /// every pixel belonging to a regional minimum — a flat zone all of whose
@@ -582,13 +358,6 @@ fn regional_minima(vals: &[f64], size: &[usize], fully_connected: bool) -> Vec<b
 
 // ---- morphological_watershed ---------------------------------------------
 
-/// `static_cast<InputImagePixelType>(level)` — SimpleITK declares `Level` as a
-/// `double` with `pixeltype: Input`, and the `.hxx` compares it against
-/// `InputImagePixelType{}` to decide whether to insert the h-minima stage.
-fn quantize_to_pixel_type<T: Scalar>(v: f64) -> f64 {
-    T::from_f64(v).as_f64()
-}
-
 /// `MorphologicalWatershedImageFilter`: segment `image` into the catchment
 /// basins of its regional minima.
 ///
@@ -608,7 +377,7 @@ pub fn morphological_watershed(
     mark_watershed_line: bool,
     fully_connected: bool,
 ) -> Result<Image> {
-    let height = dispatch_scalar!(image.pixel_id(), quantize_to_pixel_type, level);
+    let height = crate::quantize_to_pixel_type(image.pixel_id(), level);
     if height < 0.0 {
         return Err(FilterError::InvalidWatershedLevel(level));
     }
@@ -616,7 +385,7 @@ pub fn morphological_watershed(
     let size = image.size();
     let vals = image.to_f64_vec();
     let minima_source = if height != 0.0 {
-        h_minima(image, &vals, height, fully_connected)?
+        crate::reconstruction::h_minima(image, height, fully_connected)?.to_f64_vec()
     } else {
         vals
     };
@@ -850,7 +619,7 @@ mod tests {
         ));
     }
 
-    // ---- regional_minima / reconstruction_by_erosion ----
+    // ---- regional_minima ----
 
     #[test]
     fn regional_minima_flood_covers_whole_plateau() {
@@ -866,52 +635,6 @@ mod tests {
     #[test]
     fn regional_minima_of_a_flat_image_is_everything() {
         assert_eq!(regional_minima(&[4.0; 4], &[4, 1], false), vec![true; 4]);
-    }
-
-    #[test]
-    fn reconstruction_by_erosion_fills_a_shallow_minimum() {
-        // mask [0,3,1,3,0], marker = mask + 2 -> the depth-2 middle minimum is
-        // erased, the two depth-3 end minima survive.
-        let mask = [0.0, 3.0, 1.0, 3.0, 0.0];
-        let marker: Vec<f64> = mask.iter().map(|v| v + 2.0).collect();
-        assert_eq!(
-            reconstruction_by_erosion(&marker, &mask, &[5, 1], false),
-            vec![2.0, 3.0, 3.0, 3.0, 2.0]
-        );
-
-        // At height 1 the middle minimum is only flattened to its own depth,
-        // and still reads as a regional minimum.
-        let marker: Vec<f64> = mask.iter().map(|v| v + 1.0).collect();
-        assert_eq!(
-            reconstruction_by_erosion(&marker, &mask, &[5, 1], false),
-            vec![1.0, 3.0, 2.0, 3.0, 1.0]
-        );
-    }
-
-    // ---- connectivity helpers ----
-
-    #[test]
-    fn neighbor_offsets_are_in_ascending_neighborhood_index() {
-        // 2-D face connectivity, ascending index: (0,-1), (-1,0), (1,0), (0,1).
-        assert_eq!(
-            neighbor_offsets(2, false, Half::Full),
-            vec![vec![0, -1], vec![-1, 0], vec![1, 0], vec![0, 1]]
-        );
-        // Previous / later split the same list at the center.
-        assert_eq!(
-            neighbor_offsets(2, false, Half::Previous),
-            vec![vec![0, -1], vec![-1, 0]]
-        );
-        assert_eq!(
-            neighbor_offsets(2, false, Half::Later),
-            vec![vec![1, 0], vec![0, 1]]
-        );
-        // Full connectivity keeps all 8, still ascending.
-        assert_eq!(neighbor_offsets(2, true, Half::Full).len(), 8);
-        assert_eq!(neighbor_offsets(2, true, Half::Previous).len(), 4);
-        assert_eq!(neighbor_offsets(2, true, Half::Later).len(), 4);
-        assert_eq!(neighbor_offsets(3, true, Half::Full).len(), 26);
-        assert_eq!(neighbor_offsets(3, false, Half::Full).len(), 6);
     }
 
     #[test]
