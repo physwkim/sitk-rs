@@ -69,6 +69,7 @@ pub mod shrink;
 pub mod slic;
 pub mod slice;
 pub mod smoothing;
+pub mod sources;
 pub mod threshold;
 pub mod watershed;
 
@@ -165,6 +166,7 @@ use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
 pub use smoothing::smooth_gaussian;
+pub use sources::{GaussianSourceSettings, SourceGeometry, gaussian_source};
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
     li_threshold, maximum_entropy_threshold, moments_threshold, renyi_entropy_threshold,
