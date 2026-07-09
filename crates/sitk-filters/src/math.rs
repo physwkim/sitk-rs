@@ -32,9 +32,45 @@
 //! `to_f64_vec`/`image_from_f64`, the same way `rescale_intensity` and
 //! `statistics` in `lib.rs` handle multi-image or reduction f64 math that
 //! falls outside the functor seam.
+//!
+//! [`nary_add`]/[`nary_maximum`] (`N` images,
+//! `Modules/Filtering/ImageIntensity/include/itkNaryFunctorImageFilter.h`'s
+//! `TFunction::operator()(const std::vector<TInput>&)`, specialised by
+//! `itkNaryAddImageFilter.h`'s `Add1` and `itkNaryMaximumImageFilter.h`'s
+//! `Maximum1`) and [`ternary_add`]/[`ternary_magnitude`]/
+//! [`ternary_magnitude_squared`] (fixed 3 images, `itkArithmeticOpsFunctors.h`'s
+//! `Add3`, `itkTernaryMagnitudeImageFilter.h`'s `Modulus3`,
+//! `itkTernaryMagnitudeSquaredImageFilter.h`'s `ModulusSquare3`) all reduce
+//! uniformly in `f64` here, narrowing once at the end -- consistent with
+//! this whole module's f64-compute policy and with the crate's established
+//! precedent for multi-image/multi-pixel reductions elsewhere (e.g.
+//! `projection::maximum_projection`/`minimum_projection`'s
+//! `fold(f64::NEG_INFINITY, f64::max)` over pixel lines). This is a
+//! deliberate, and not uniform, divergence from the raw C++, which computes
+//! each of these five functors differently:
+//! - `Add1` (nary) accumulates in `NumericTraits<TInput>::AccumulateType`, a
+//!   *wider* integer type than `TInput`, narrowing only once at the end (the
+//!   header's own doc: "No numeric overflow checking is performed").
+//! - `Maximum1` (nary) folds natively in `TOutput` with no promotion at all.
+//! - `Add3` (ternary) computes natively in the shared input pixel type with
+//!   no promotion either (`static_cast<TOutput>(A + B + C)`), so unlike
+//!   `Add1`, an intermediate `A + B` can itself overflow/wrap for a narrow
+//!   integer type before `+ C` is even applied.
+//! - `Modulus3` (ternary) already computes in `double`
+//!   (`static_cast<TOutput>(std::sqrt(static_cast<double>(A*A + B*B +
+//!   C*C)))`), matching this port exactly.
+//! - `ModulusSquare3` (ternary) computes natively in the shared input pixel
+//!   type (`static_cast<TOutput>(A*A + B*B + C*C)`, no `double` at all),
+//!   unlike its sibling `Modulus3` immediately above it in the same header
+//!   family.
+//!
+//! Folding every one of these in `f64` instead can misorder/round results
+//! that depend on exact integer overflow or on `u64`/`i64` magnitudes beyond
+//! `f64`'s 53-bit exact range; see each function's own doc for the precise
+//! divergence.
 
 use crate::functor::{self, UnaryFunctor};
-use crate::{Result, image_from_f64, require_same_shape};
+use crate::{FilterError, Result, image_from_f64, require_same_shape};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
 // ---- abs --------------------------------------------------------------
@@ -402,6 +438,151 @@ pub fn divide_real(a: &Image, b: &Image) -> Result<Image> {
     two_image_f64_with_output(a, b, output_id, |x, y| x / y)
 }
 
+// ---- nary reductions (N images, f64-compute) -------------------------------
+
+/// Every nary filter below needs at least one input image; when there is
+/// more than one, every image must share the first's pixel type and size
+/// (`itkNaryFunctorImageFilter.h` is one ITK template instantiation over a
+/// single pixel type, so ITK enforces this at compile time; here it's a
+/// runtime check). Mirrors `label_fusion::require_inputs`, duplicated here
+/// since that helper is private to its own module.
+fn require_inputs(images: &[&Image]) -> Result<()> {
+    let Some((first, rest)) = images.split_first() else {
+        return Err(FilterError::EmptyImageList);
+    };
+    for img in rest {
+        require_same_shape(first, img)?;
+    }
+    Ok(())
+}
+
+/// Shared by [`nary_add`]/[`nary_maximum`]: fold every input image's pixel
+/// values through `f`, seeded with `init`. Output pixel type is the first
+/// input's.
+fn nary_reduce_f64(images: &[&Image], init: f64, f: impl Fn(f64, f64) -> f64) -> Result<Image> {
+    require_inputs(images)?;
+    let first = images[0];
+    let mut out = vec![init; first.size().iter().product()];
+    for img in images {
+        for (o, x) in out.iter_mut().zip(img.to_f64_vec()) {
+            *o = f(*o, x);
+        }
+    }
+    image_from_f64(first.pixel_id(), first.size(), first, &out)
+}
+
+/// `NaryAddImageFilter` (`itkNaryAddImageFilter.h`'s `Add1` functor):
+/// pixel-wise sum of every input image. See the module docs for how this
+/// diverges from `Add1`'s wide-accumulator-then-narrow-once C++.
+pub fn nary_add(images: &[&Image]) -> Result<Image> {
+    nary_reduce_f64(images, 0.0, |acc, x| acc + x)
+}
+
+/// `NaryMaximumImageFilter` (`itkNaryMaximumImageFilter.h`'s `Maximum1`
+/// functor): pixel-wise maximum across every input image. See the module
+/// docs for how this diverges from `Maximum1`'s native-`TOutput` fold.
+pub fn nary_maximum(images: &[&Image]) -> Result<Image> {
+    nary_reduce_f64(images, f64::NEG_INFINITY, f64::max)
+}
+
+// ---- ternary ops (three images, f64-compute) -------------------------------
+
+fn three_image_f64(
+    a: &Image,
+    b: &Image,
+    c: &Image,
+    f: impl Fn(f64, f64, f64) -> f64,
+) -> Result<Image> {
+    require_same_shape(a, b)?;
+    require_same_shape(a, c)?;
+    let va = a.to_f64_vec();
+    let vb = b.to_f64_vec();
+    let vc = c.to_f64_vec();
+    let out: Vec<f64> = va
+        .iter()
+        .zip(&vb)
+        .zip(&vc)
+        .map(|((&x, &y), &z)| f(x, y, z))
+        .collect();
+    image_from_f64(a.pixel_id(), a.size(), a, &out)
+}
+
+fn three_image_f64_typed_in_place<T: Scalar>(
+    img: &mut Image,
+    other_b: &[f64],
+    other_c: &[f64],
+    f: &dyn Fn(f64, f64, f64) -> f64,
+) -> Result<()> {
+    let v = img.scalar_vec_mut::<T>()?;
+    for ((x, &y), &z) in v.iter_mut().zip(other_b).zip(other_c) {
+        *x = T::from_f64(f(x.as_f64(), y, z));
+    }
+    Ok(())
+}
+
+fn three_image_f64_in_place(
+    mut a: Image,
+    b: &Image,
+    c: &Image,
+    f: &dyn Fn(f64, f64, f64) -> f64,
+) -> Result<Image> {
+    require_same_shape(&a, b)?;
+    require_same_shape(&a, c)?;
+    let vb = b.to_f64_vec();
+    let vc = c.to_f64_vec();
+    dispatch_scalar!(
+        a.pixel_id(),
+        three_image_f64_typed_in_place,
+        &mut a,
+        &vb,
+        &vc,
+        f
+    )?;
+    Ok(a)
+}
+
+/// `TernaryAddImageFilter` (`itkArithmeticOpsFunctors.h`'s `Add3` functor):
+/// pixel-wise `a + b + c`. See the module docs for how this diverges from
+/// `Add3`'s native-pixel-type C++ (and from its own `nary_add` sibling,
+/// which upstream uses a wide accumulator that `Add3` does not).
+pub fn ternary_add(a: &Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64(a, b, c, |x, y, z| x + y + z)
+}
+
+/// In-place variant of [`ternary_add`]: reuses `a`'s buffer.
+pub fn ternary_add_in_place(a: Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64_in_place(a, b, c, &|x, y, z| x + y + z)
+}
+
+/// `TernaryMagnitudeImageFilter` (`itkTernaryMagnitudeImageFilter.h`'s
+/// `Modulus3` functor): pixel-wise `sqrt(a^2 + b^2 + c^2)`. ITK's raw
+/// `Modulus3` already computes this in `double`
+/// (`static_cast<TOutput>(std::sqrt(static_cast<double>(A*A + B*B +
+/// C*C)))`), so this port matches it exactly -- no divergence to document.
+pub fn ternary_magnitude(a: &Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64(a, b, c, |x, y, z| (x * x + y * y + z * z).sqrt())
+}
+
+/// In-place variant of [`ternary_magnitude`]: reuses `a`'s buffer.
+pub fn ternary_magnitude_in_place(a: Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64_in_place(a, b, c, &|x, y, z| (x * x + y * y + z * z).sqrt())
+}
+
+/// `TernaryMagnitudeSquaredImageFilter`
+/// (`itkTernaryMagnitudeSquaredImageFilter.h`'s `ModulusSquare3` functor):
+/// pixel-wise `a^2 + b^2 + c^2`. See the module docs for how this diverges
+/// from `ModulusSquare3`'s native-pixel-type C++ (and from its own
+/// `ternary_magnitude` sibling, which upstream *does* compute in `double`
+/// despite living in the same functor header family).
+pub fn ternary_magnitude_squared(a: &Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64(a, b, c, |x, y, z| x * x + y * y + z * z)
+}
+
+/// In-place variant of [`ternary_magnitude_squared`]: reuses `a`'s buffer.
+pub fn ternary_magnitude_squared_in_place(a: Image, b: &Image, c: &Image) -> Result<Image> {
+    three_image_f64_in_place(a, b, c, &|x, y, z| x * x + y * y + z * z)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +912,205 @@ mod tests {
         assert_eq!(vals[0], f64::INFINITY);
         assert!(vals[1].is_nan());
         assert_eq!(vals[2], 0.0);
+    }
+
+    // ---- nary_add ----
+
+    #[test]
+    fn nary_add_empty_list_is_error() {
+        assert_eq!(nary_add(&[]), Err(crate::FilterError::EmptyImageList));
+    }
+
+    #[test]
+    fn nary_add_single_image_is_identity() {
+        let a = img_u8(&[3, 1], vec![1, 2, 3]);
+        assert_eq!(
+            nary_add(&[&a]).unwrap().scalar_slice::<u8>().unwrap(),
+            &[1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn nary_add_sums_across_all_images() {
+        let a = img_u8(&[3, 1], vec![1, 2, 3]);
+        let b = img_u8(&[3, 1], vec![10, 20, 30]);
+        let c = img_u8(&[3, 1], vec![100, 100, 100]);
+        assert_eq!(
+            nary_add(&[&a, &b, &c])
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[111, 122, 133]
+        );
+    }
+
+    #[test]
+    fn nary_add_mismatched_pixel_type_is_error() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        assert!(matches!(
+            nary_add(&[&a, &b]),
+            Err(crate::FilterError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn nary_add_mismatched_size_is_error() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = img_u8(&[3, 1], vec![1, 2, 3]);
+        assert!(matches!(
+            nary_add(&[&a, &b]),
+            Err(crate::FilterError::SizeMismatch { .. })
+        ));
+    }
+
+    // ---- nary_maximum ----
+
+    #[test]
+    fn nary_maximum_empty_list_is_error() {
+        assert_eq!(nary_maximum(&[]), Err(crate::FilterError::EmptyImageList));
+    }
+
+    #[test]
+    fn nary_maximum_single_image_is_identity() {
+        let a = img_u8(&[3, 1], vec![1, 2, 3]);
+        assert_eq!(
+            nary_maximum(&[&a]).unwrap().scalar_slice::<u8>().unwrap(),
+            &[1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn nary_maximum_picks_pixelwise_max_across_all_images() {
+        let a = img_u8(&[3, 1], vec![5, 200, 0]);
+        let b = img_u8(&[3, 1], vec![10, 100, 255]);
+        let c = img_u8(&[3, 1], vec![7, 150, 128]);
+        assert_eq!(
+            nary_maximum(&[&a, &b, &c])
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[10, 200, 255]
+        );
+    }
+
+    // ---- ternary_add ----
+
+    #[test]
+    fn ternary_add_basic() {
+        let a = img_u8(&[3, 1], vec![1, 2, 3]);
+        let b = img_u8(&[3, 1], vec![10, 20, 30]);
+        let c = img_u8(&[3, 1], vec![100, 100, 100]);
+        assert_eq!(
+            ternary_add(&a, &b, &c)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[111, 122, 133]
+        );
+    }
+
+    #[test]
+    fn ternary_add_in_place_matches_allocating() {
+        let a = img_u8(&[3, 1], vec![1, 2, 3]);
+        let b = img_u8(&[3, 1], vec![10, 20, 30]);
+        let c = img_u8(&[3, 1], vec![100, 100, 100]);
+        let allocated = ternary_add(&a, &b, &c).unwrap();
+        let in_place = ternary_add_in_place(a, &b, &c).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn ternary_add_mismatched_second_input_is_error() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        let c = img_u8(&[2, 1], vec![1, 2]);
+        assert!(matches!(
+            ternary_add(&a, &b, &c),
+            Err(crate::FilterError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn ternary_add_mismatched_third_input_is_error() {
+        let a = img_u8(&[2, 1], vec![1, 2]);
+        let b = img_u8(&[2, 1], vec![1, 2]);
+        let c = img_u8(&[3, 1], vec![1, 2, 3]);
+        assert!(matches!(
+            ternary_add(&a, &b, &c),
+            Err(crate::FilterError::SizeMismatch { .. })
+        ));
+    }
+
+    // ---- ternary_magnitude ----
+
+    #[test]
+    fn ternary_magnitude_2_3_6_is_7() {
+        let a = img_u8(&[1, 1], vec![2]);
+        let b = img_u8(&[1, 1], vec![3]);
+        let c = img_u8(&[1, 1], vec![6]);
+        // sqrt(2^2 + 3^2 + 6^2) = sqrt(49) = 7, an exact integer result.
+        assert_eq!(
+            ternary_magnitude(&a, &b, &c)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[7]
+        );
+    }
+
+    #[test]
+    fn ternary_magnitude_in_place_matches_allocating() {
+        let a = img_u8(&[1, 1], vec![2]);
+        let b = img_u8(&[1, 1], vec![3]);
+        let c = img_u8(&[1, 1], vec![6]);
+        let allocated = ternary_magnitude(&a, &b, &c).unwrap();
+        let in_place = ternary_magnitude_in_place(a, &b, &c).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- ternary_magnitude_squared ----
+
+    #[test]
+    fn ternary_magnitude_squared_2_3_6_is_49() {
+        let a = img_u8(&[1, 1], vec![2]);
+        let b = img_u8(&[1, 1], vec![3]);
+        let c = img_u8(&[1, 1], vec![6]);
+        // 2^2 + 3^2 + 6^2 = 4 + 9 + 36 = 49, fits in u8 with no saturation.
+        assert_eq!(
+            ternary_magnitude_squared(&a, &b, &c)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[49]
+        );
+    }
+
+    #[test]
+    fn ternary_magnitude_squared_saturates_instead_of_wrapping_on_u8() {
+        // 200^2 + 200^2 + 200^2 = 120000, which does not fit in u8.
+        // Scalar::from_f64 saturates to 255; the raw C++ ModulusSquare3
+        // computes natively in u8 and would instead wrap the intermediate
+        // squared terms (200u8 * 200u8 overflows before the sum is taken).
+        let a = img_u8(&[1, 1], vec![200]);
+        let b = img_u8(&[1, 1], vec![200]);
+        let c = img_u8(&[1, 1], vec![200]);
+        assert_eq!(
+            ternary_magnitude_squared(&a, &b, &c)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[255]
+        );
+    }
+
+    #[test]
+    fn ternary_magnitude_squared_in_place_matches_allocating() {
+        let a = img_u8(&[1, 1], vec![2]);
+        let b = img_u8(&[1, 1], vec![3]);
+        let c = img_u8(&[1, 1], vec![6]);
+        let allocated = ternary_magnitude_squared(&a, &b, &c).unwrap();
+        let in_place = ternary_magnitude_squared_in_place(a, &b, &c).unwrap();
+        assert_eq!(allocated, in_place);
     }
 }
