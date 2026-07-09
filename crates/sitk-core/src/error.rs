@@ -28,6 +28,10 @@ pub enum Error {
     /// The direction cosine matrix could not be inverted.
     #[error("direction matrix is singular and cannot be inverted")]
     SingularDirection,
+
+    /// A neighborhood radius did not have one entry per image dimension.
+    #[error("radius length does not match image dimension {dimension}")]
+    RadiusMismatch { dimension: usize },
 }
 
 /// Convenience alias for core results.
