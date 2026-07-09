@@ -1,6 +1,7 @@
 //! Segmentation level-set filters: `GeodesicActiveContourLevelSetImageFilter`,
-//! `ShapeDetectionLevelSetImageFilter` and
-//! `ThresholdSegmentationLevelSetImageFilter`.
+//! `ShapeDetectionLevelSetImageFilter`,
+//! `ThresholdSegmentationLevelSetImageFilter` and
+//! `LaplacianSegmentationLevelSetImageFilter`.
 //!
 //! Ported from ITK's `Modules/Segmentation/LevelSets` and
 //! `Modules/Core/FiniteDifference`:
@@ -27,22 +28,24 @@
 //! ([`bounded_reciprocal`](crate::bounded_reciprocal) of
 //! [`gradient_magnitude_recursive_gaussian`](crate::gradient_magnitude_recursive_gaussian)),
 //! and the speed image is a verbatim copy of it. For
-//! [`threshold_segmentation_level_set`] the feature image is the raw image to
+//! [`threshold_segmentation_level_set`] and
+//! [`laplacian_segmentation_level_set`] the feature image is the raw image to
 //! segment.
 //!
-//! SimpleITK's yamls declare all three for `RealPixelIDTypeList`; ITK's
+//! SimpleITK's yamls declare all four for `RealPixelIDTypeList`; ITK's
 //! `TOutputPixelType` template parameter defaults to `float`, so the output is
 //! always [`PixelId::Float32`] regardless of input type. `IsoSurfaceValue` is
 //! fixed at `0` by `SegmentationLevelSetImageFilter`'s constructor and none of
-//! these three SimpleITK filters exposes it, so the shifted image equals the
+//! these four SimpleITK filters exposes it, so the shifted image equals the
 //! initial level set.
 //!
 //! ## Upstream behaviour reproduced here
 //!
 //! * **The functions' `Initialize` weights never survive.** Each
 //!   `SegmentationLevelSetFunction` subclass's `Initialize(radius)` installs its
-//!   own default weights — `ThresholdSegmentationLevelSetFunction` sets the
-//!   propagation weight to `-1` and the curvature weight to `+1`. But
+//!   own default weights — `ThresholdSegmentationLevelSetFunction` and
+//!   `LaplacianSegmentationLevelSetFunction` both set the propagation weight to
+//!   `-1` and the curvature weight to `+1`. But
 //!   `Initialize` runs from `SetSegmentationFunction`, i.e. in the filter's
 //!   constructor (itkSegmentationLevelSetImageFilter.h:457-467), and SimpleITK's
 //!   generated `Execute` then calls `SetPropagationScaling`/`SetCurvatureScaling`
@@ -51,9 +54,9 @@
 //!
 //! * **`CurvatureSpeed` differs between the filters.** Only the geodesic active
 //!   contour and shape detection functions override it to return
-//!   `PropagationSpeed`; `ThresholdSegmentationLevelSetFunction` inherits
-//!   `LevelSetFunction::CurvatureSpeed`'s constant `1`, so its curvature term is
-//!   not damped by the speed image.
+//!   `PropagationSpeed`; the threshold and Laplacian functions inherit
+//!   `LevelSetFunction::CurvatureSpeed`'s constant `1`, so their curvature term
+//!   is not damped by the speed image.
 //!
 //! * **`ThresholdSegmentationLevelSetFunction`'s `EdgeWeight` branch is dead.**
 //!   `CalculateSpeedImage` adds `m_EdgeWeight * Laplacian(GradientAnisotropicDiffusion(feature))`
@@ -69,6 +72,7 @@ mod sparse_field;
 
 use crate::canny::zero_crossing_values;
 use crate::error::{FilterError, Result};
+use crate::gradient::laplacian;
 use crate::image_from_f64;
 use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
 use function::{CurvatureSpeed, LevelSetFunction};
@@ -268,6 +272,59 @@ pub fn threshold_segmentation_level_set(
     )
 }
 
+/// `LaplacianSegmentationLevelSetImageFilter`: the speed is the Laplacian of
+/// the feature image, so the front locks onto the feature image's
+/// second-derivative zero crossings — its edges.
+///
+/// `LaplacianSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:28-47)
+/// runs `LaplacianImageFilter` on the feature image cast to the level-set's
+/// real pixel type; the filter's `UseImageSpacing` is left at its `true`
+/// default, so the speed is `sum_d (g(x+e_d) + g(x-e_d) - 2 g(x)) /
+/// spacing[d]^2` under a `ZeroFluxNeumannBoundaryCondition`.
+///
+/// There is no advection term: `LaplacianSegmentationLevelSetFunction::
+/// SetAdvectionWeight` (h:81-88) silently ignores any non-zero value, and
+/// SimpleITK's yaml exposes no `AdvectionScaling`. The curvature term is not
+/// modulated by the speed (`CurvatureSpeed` is the base constant `1`).
+///
+/// Because the speed changes sign across an edge rather than vanishing on it,
+/// ITK's header warns that the initial level set must already be close to the
+/// edge to be captured; a coarse segmentation is the intended input.
+///
+/// Argument order follows SimpleITK's
+/// `LaplacianSegmentationLevelSetImageFilter.yaml`; its defaults are
+/// `maximum_rms_error = 0.02`, both scalings `1.0`,
+/// `number_of_iterations = 1000`, `reverse_expansion_direction = false`.
+///
+/// Errors if the two images differ in size.
+pub fn laplacian_segmentation_level_set(
+    initial_level_set: &Image,
+    feature_image: &Image,
+    maximum_rms_error: f64,
+    propagation_scaling: f64,
+    curvature_scaling: f64,
+    number_of_iterations: u32,
+    reverse_expansion_direction: bool,
+) -> Result<LevelSetResult> {
+    check_same_size(initial_level_set, feature_image)?;
+    solve(
+        initial_level_set,
+        Solve {
+            speed: laplacian_speed(feature_image)?,
+            advection: Vec::new(),
+            curvature_speed: CurvatureSpeed::Unit,
+            weights: Weights {
+                propagation: propagation_scaling,
+                curvature: curvature_scaling,
+                advection: 0.0,
+            },
+            maximum_rms_error,
+            number_of_iterations,
+            reverse_expansion_direction,
+        },
+    )
+}
+
 /// The three term weights, before `ReverseExpansionDirection` is applied.
 struct Weights {
     propagation: f64,
@@ -407,6 +464,12 @@ fn threshold_speed(feature_image: &Image, lower_threshold: f64, upper_threshold:
             }
         })
         .collect()
+}
+
+/// `LaplacianSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:28-47):
+/// `LaplacianImageFilter` on the cast feature image, `UseImageSpacing` on.
+fn laplacian_speed(feature_image: &Image) -> Result<Vec<f64>> {
+    Ok(laplacian(&scratch_f64(feature_image)?, true)?.to_f64_vec())
 }
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry.
@@ -986,6 +1049,141 @@ mod tests {
                 &feature,
                 0.0,
                 255.0,
+                0.02,
+                1.0,
+                1.0,
+                10,
+                false
+            ),
+            Err(FilterError::SizeMismatch {
+                a: vec![N, N],
+                b: vec![8, 8],
+            })
+        );
+    }
+
+    // ======================================================================
+    // LaplacianSegmentationLevelSetImageFilter
+    // ======================================================================
+
+    /// The 3x3 discrete Laplacian of a unit impulse, under
+    /// `ZeroFluxNeumannBoundaryCondition` and unit spacing. Center:
+    /// `(0 + 0 - 2) + (0 + 0 - 2) == -4`. Edge midpoint `(1, 0)`: the `x` axis
+    /// contributes `0 + 0 - 0 == 0`, the `y` axis `1 + 0 - 0 == 1` because the
+    /// out-of-image neighbor clamps back onto `(1, 0)` itself. Corners: `0`.
+    #[test]
+    fn laplacian_speed_is_the_discrete_laplacian_of_the_feature_image() {
+        #[rustfmt::skip]
+        let feature = Image::from_vec(&[3, 3], vec![
+            0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0,
+        ]).unwrap();
+
+        #[rustfmt::skip]
+        let expected = vec![
+            0.0,  1.0, 0.0,
+            1.0, -4.0, 1.0,
+            0.0,  1.0, 0.0,
+        ];
+        assert_eq!(laplacian_speed(&feature).unwrap(), expected);
+    }
+
+    /// `LaplacianImageFilter`'s `UseImageSpacing` is on, so each axis's second
+    /// difference is divided by that axis's squared spacing. Halving the `x`
+    /// spacing quadruples the `x` contribution: the impulse's center becomes
+    /// `-2/0.25 - 2 == -10`.
+    #[test]
+    fn laplacian_speed_divides_each_axis_by_its_squared_spacing() {
+        let mut feature = Image::from_vec(&[3, 3], {
+            let mut v = vec![0.0; 9];
+            v[4] = 1.0;
+            v
+        })
+        .unwrap();
+        feature.set_spacing(&[0.5, 1.0]).unwrap();
+        assert_eq!(laplacian_speed(&feature).unwrap()[4], -10.0);
+    }
+
+    /// The Laplacian of a locally flat feature image is zero, so every active
+    /// pixel's propagation term vanishes. With the curvature weight also zero
+    /// the update is identically zero, the first iteration's RMS change is `0`,
+    /// and `Halt()` fires on the second pass — the front never moves. This is
+    /// the failure mode ITK's header warns about: the Laplacian speed carries no
+    /// information away from an edge.
+    #[test]
+    fn laplacian_front_does_not_move_inside_a_flat_region() {
+        let result = laplacian_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(20.0),
+            0.02,
+            1.0,
+            0.0,
+            50,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.elapsed_iterations, 1);
+        assert_eq!(result.rms_change, 0.0);
+        assert!((enclosed_radius(&result.image) - 4.0).abs() < 0.5);
+    }
+
+    /// `ReverseExpansionDirection` negates the propagation weight; there is no
+    /// advection weight (the Laplacian function refuses any non-zero value), so
+    /// it is exactly equivalent to negating `propagation_scaling`.
+    #[test]
+    fn laplacian_reverse_expansion_direction_negates_the_propagation_weight() {
+        let feature = plateau(12.0);
+        let reversed = laplacian_segmentation_level_set(
+            &circle_level_set(11.0),
+            &feature,
+            0.0,
+            1.0,
+            0.0,
+            10,
+            true,
+        )
+        .unwrap();
+        let negated = laplacian_segmentation_level_set(
+            &circle_level_set(11.0),
+            &feature,
+            0.0,
+            -1.0,
+            0.0,
+            10,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+    }
+
+    #[test]
+    fn laplacian_zero_iterations_leaves_the_contour_where_it_started() {
+        let result = laplacian_segmentation_level_set(
+            &circle_level_set(8.0),
+            &plateau(12.0),
+            0.02,
+            1.0,
+            1.0,
+            0,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.elapsed_iterations, 0);
+        assert_eq!(result.rms_change, 0.0);
+        assert!((enclosed_radius(&result.image) - 8.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn laplacian_rejects_mismatched_input_sizes() {
+        let feature = Image::from_vec(&[8, 8], vec![1.0; 64]).unwrap();
+        assert_eq!(
+            laplacian_segmentation_level_set(
+                &circle_level_set(8.0),
+                &feature,
                 0.02,
                 1.0,
                 1.0,

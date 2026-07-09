@@ -124,8 +124,8 @@ pub use label_shape::{
     label_shape_statistics,
 };
 pub use level_set::{
-    LevelSetResult, geodesic_active_contour_level_set, shape_detection_level_set,
-    threshold_segmentation_level_set,
+    LevelSetResult, geodesic_active_contour_level_set, laplacian_segmentation_level_set,
+    shape_detection_level_set, threshold_segmentation_level_set,
 };
 pub use logic::{
     and, and_in_place, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
