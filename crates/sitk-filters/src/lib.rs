@@ -45,6 +45,7 @@ pub mod binary_morphology;
 pub mod canny;
 pub mod change_label;
 pub mod clamp;
+pub mod colliding_fronts;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
@@ -111,6 +112,7 @@ pub use binary_morphology::{
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use change_label::change_label;
 pub use clamp::clamp;
+pub use colliding_fronts::colliding_fronts;
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{

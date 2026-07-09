@@ -59,6 +59,7 @@
 //! ITK's fourth mode, `AllTargets`, is unreachable from this API — the clamp
 //! makes `SomeTargets` with `n >= target_points.len()` behave identically
 //! anyway, since each in-bounds target is accepted at most once.
+//! [`crate::colliding_fronts`] drives `AllTargets` through the internal seam.
 //!
 //! Every mode but `NoTargets` requires at least one target point
 //! (`VerifyTargetReachedModeConditions`); an empty list is

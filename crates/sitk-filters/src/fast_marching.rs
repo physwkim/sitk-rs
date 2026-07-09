@@ -254,13 +254,13 @@ pub(crate) struct MarchInput<'a> {
     pub(crate) upwind: Option<UpwindInput<'a>>,
 }
 
-/// `FastMarchingUpwindGradientImageFilterEnums::TargetCondition`, minus
-/// `AllTargets`, which no caller can select yet.
+/// `FastMarchingUpwindGradientImageFilterEnums::TargetCondition`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TargetCondition {
     NoTargets,
     OneTarget,
     SomeTargets,
+    AllTargets,
 }
 
 /// The subclass state `FastMarchingUpwindGradientImageFilter::UpdateNeighbors`
@@ -533,7 +533,7 @@ impl FastMarching {
     /// - With no targets, `m_TargetValue` is overwritten at *every* accepted
     ///   point, so it ends as the last (largest) Eikonal value — which is what
     ///   `GetTargetValue`'s doc promises.
-    /// - Under `SomeTargets` the count test sits outside the
+    /// - Under `SomeTargets`/`AllTargets` the count test sits outside the
     ///   target lookup, so once the count is met every subsequent accepted
     ///   point — target or not — re-triggers `targetReached` and moves
     ///   `m_TargetValue` forward. Only the *stopping value* is latched, since
@@ -558,6 +558,7 @@ impl FastMarching {
         let target_reached = match upwind.mode {
             TargetCondition::OneTarget => matched,
             TargetCondition::SomeTargets => upwind.reached == upwind.number_of_targets,
+            TargetCondition::AllTargets => upwind.reached == upwind.targets.len(),
             TargetCondition::NoTargets => unreachable!("returned above"),
         };
 
