@@ -6,13 +6,20 @@
 //! provides the [`dispatch_scalar!`] macro that lets the filter and transform
 //! crates recover static typing over a runtime pixel type.
 
+pub mod boundary;
 pub mod error;
 pub mod image;
 pub mod matrix;
+pub mod neighborhood;
 pub mod pixel;
 
+pub use boundary::{
+    BoundaryCondition, ConstantBoundaryCondition, PeriodicBoundaryCondition,
+    ZeroFluxNeumannBoundaryCondition,
+};
 pub use error::{Error, Result};
 pub use image::{Image, PixelBuffer};
+pub use neighborhood::{Neighborhood, NeighborhoodIterator};
 pub use pixel::{PixelId, Scalar};
 
 #[cfg(test)]
