@@ -40,8 +40,10 @@
 
 pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
+pub mod attribute_morphology;
 pub mod binary_morphology;
 pub mod canny;
+pub mod change_label;
 pub mod clamp;
 pub mod contour;
 pub mod contour_extractor_2d;
@@ -83,6 +85,8 @@ pub mod rank;
 pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
+pub mod regional_extrema;
+pub mod scalar_connected_component;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
@@ -97,11 +101,13 @@ pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
 };
+pub use attribute_morphology::{area_closing, area_opening};
 pub use binary_morphology::{
     binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
     voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use change_label::change_label;
 pub use clamp::clamp;
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
@@ -202,6 +208,10 @@ pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
     neighborhood_connected,
 };
+pub use regional_extrema::{
+    ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
+};
+pub use scalar_connected_component::scalar_connected_component;
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::{bin_shrink, shrink};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
