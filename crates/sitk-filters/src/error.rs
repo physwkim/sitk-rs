@@ -198,6 +198,24 @@ pub enum FilterError {
     #[error("discriminant of the fast marching quadratic equation is negative")]
     NegativeDiscriminant,
 
+    /// `IsoContourDistanceImageFilter::ComputeValue` throws
+    /// `itkGenericExceptionMacro("diff " << diff << " < NumericTraits<
+    /// PixelRealType >::min()")` when the two endpoints of a level-set
+    /// crossing are separated by less than the real type's smallest positive
+    /// normal value (here `f64::MIN_POSITIVE`), which would make the
+    /// `1 / diff` in the distance estimate blow up.
+    #[error(
+        "iso-contour level-set crossing has a degenerate value difference {0} (< f64::MIN_POSITIVE)"
+    )]
+    IsoContourDegenerateDifference(f64),
+
+    /// `IsoContourDistanceImageFilter::ComputeValue` throws
+    /// `itkExceptionStringMacro("Gradient norm is lower than pixel
+    /// precision")` when the interpolated gradient at a level-set crossing has
+    /// no magnitude, leaving the crossing's normal direction undefined.
+    #[error("iso-contour gradient norm is lower than pixel precision")]
+    IsoContourZeroGradient,
+
     /// A convolution filter was given a kernel of a different dimension than
     /// the image. ITK expresses this as a template parameter shared by both
     /// inputs (`itk::ConvolutionImageFilter<TInputImage, TKernelImage, ...>`,

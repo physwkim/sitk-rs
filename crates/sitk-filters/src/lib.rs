@@ -71,7 +71,8 @@ pub use convolution::{
 };
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
 pub use distance::{
-    danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
+    approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
+    signed_danielsson_distance_map, signed_maurer_distance_map,
 };
 pub use error::{FilterError, Result};
 pub use fast_marching::fast_marching;
