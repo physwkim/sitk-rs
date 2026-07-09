@@ -264,6 +264,14 @@ pub enum FilterError {
     #[error("binary_thinning only supports 2-D images, got {0}-D")]
     UnsupportedThinningDimension(usize),
 
+    /// `ShapeLabelMapFilter::PerimeterFromInterceptCount` has hand-tuned
+    /// direction-weight overloads for 2-D and 3-D only
+    /// (`itkShapeLabelMapFilter.hxx`'s `MapIntercept2Type` /
+    /// `MapIntercept3Type` specializations), and SimpleITK only instantiates
+    /// `LabelShapeStatisticsImageFilter` for those two dimensions.
+    #[error("label_shape_statistics only supports 2-D and 3-D images, got {0}-D")]
+    UnsupportedShapeDimension(usize),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
