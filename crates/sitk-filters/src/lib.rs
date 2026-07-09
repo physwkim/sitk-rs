@@ -108,8 +108,8 @@ pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
 pub use denoise::{
-    bilateral, binomial_blur, curvature_flow, discrete_gaussian, discrete_gaussian_derivative,
-    mean, median,
+    bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
+    discrete_gaussian_derivative, mean, median,
 };
 pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
