@@ -31,10 +31,14 @@ use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
 
+use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
+use crate::correlation::CorrelationMetric;
+use crate::demons::DemonsMetric;
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
 };
+use crate::joint_histogram::JointHistogramMutualInformationMetric;
 use crate::lbfgs2::LBFGS2Optimizer;
 use crate::lbfgsb::LBFGSBOptimizer;
 use crate::mattes::MattesMutualInformationMetric;
@@ -84,9 +88,8 @@ enum LearningRateMode {
     Estimate(EstimateLearningRate),
 }
 
-/// Which similarity metric the method optimizes. Selected via
-/// [`ImageRegistrationMethod::set_metric_as_mean_squares`] /
-/// [`ImageRegistrationMethod::set_metric_as_mattes_mutual_information`].
+/// Which similarity metric the method optimizes. Selected via one of the
+/// `set_metric_as_*` methods on [`ImageRegistrationMethod`].
 enum MetricKind {
     /// Mean squares (`itk::MeanSquaresImageToImageMetricv4`) — the default,
     /// suited to same-modality images with a linear intensity relationship.
@@ -95,6 +98,22 @@ enum MetricKind {
     /// (`itk::MattesMutualInformationImageToImageMetricv4`) with the given
     /// number of joint-histogram bins — suited to multi-modality registration.
     MattesMutualInformation { number_of_histogram_bins: usize },
+    /// Global normalized cross-correlation
+    /// (`itk::CorrelationImageToImageMetricv4`). Global-support transforms only.
+    Correlation,
+    /// ANTS local neighborhood cross-correlation
+    /// (`itk::ANTSNeighborhoodCorrelationImageToImageMetricv4`) over a window of
+    /// diameter `2·radius + 1`.
+    AntsNeighborhoodCorrelation { radius: usize },
+    /// Joint-histogram mutual information
+    /// (`itk::JointHistogramMutualInformationImageToImageMetricv4`).
+    JointHistogramMutualInformation {
+        number_of_histogram_bins: usize,
+        variance_for_joint_pdf_smoothing: f64,
+    },
+    /// Demons (`itk::DemonsImageToImageMetricv4`). Local-support (displacement
+    /// field) transforms only.
+    Demons { intensity_difference_threshold: f64 },
 }
 
 /// A constructed metric for one resolution level, dispatching
@@ -106,6 +125,10 @@ enum MetricKind {
 enum ActiveMetric {
     MeanSquares(MeanSquaresMetric),
     Mattes(MattesMutualInformationMetric),
+    Correlation(CorrelationMetric),
+    AntsNeighborhoodCorrelation(AntsNeighborhoodCorrelationMetric),
+    JointHistogram(JointHistogramMutualInformationMetric),
+    Demons(DemonsMetric),
 }
 
 impl ActiveMetric {
@@ -120,6 +143,25 @@ impl ActiveMetric {
         match self {
             ActiveMetric::MeanSquares(m) => m.evaluate(transform, backend),
             ActiveMetric::Mattes(m) => m.evaluate(transform),
+            ActiveMetric::Correlation(m) => m.evaluate(transform),
+            ActiveMetric::AntsNeighborhoodCorrelation(m) => m.evaluate(transform),
+            ActiveMetric::JointHistogram(m) => m.evaluate(transform),
+            ActiveMetric::Demons(m) => m.evaluate(transform),
+        }
+    }
+
+    /// Reject a transform whose support category this metric cannot handle,
+    /// *before* any `evaluate` call can hit that metric's own debug assertion.
+    /// [`CorrelationMetric`] is global-support only and [`DemonsMetric`] is
+    /// local-support only; the rest accept both.
+    fn check_transform(&self, transform: &dyn ParametricTransform) -> Result<()> {
+        match self {
+            ActiveMetric::Correlation(m) => m.check_transform(transform),
+            ActiveMetric::Demons(m) => m.check_transform(transform),
+            ActiveMetric::MeanSquares(_)
+            | ActiveMetric::Mattes(_)
+            | ActiveMetric::AntsNeighborhoodCorrelation(_)
+            | ActiveMetric::JointHistogram(_) => Ok(()),
         }
     }
 
@@ -139,6 +181,10 @@ impl ActiveMetric {
         match self {
             ActiveMetric::MeanSquares(m) => m.physical_shift_scales(transform),
             ActiveMetric::Mattes(m) => m.physical_shift_scales(transform),
+            ActiveMetric::Correlation(m) => m.physical_shift_scales(transform),
+            ActiveMetric::AntsNeighborhoodCorrelation(m) => m.physical_shift_scales(transform),
+            ActiveMetric::JointHistogram(m) => m.physical_shift_scales(transform),
+            ActiveMetric::Demons(m) => m.physical_shift_scales(transform),
         }
     }
 }
@@ -757,6 +803,77 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Use the **normalized cross-correlation** metric
+    /// (`itk::CorrelationImageToImageMetricv4`), a global reduction over every
+    /// sample. Suited to same-modality images related by an *affine* intensity
+    /// map (mean squares assumes the identity map). SimpleITK
+    /// `SetMetricAsCorrelation`.
+    ///
+    /// [`execute`](Self::execute) returns
+    /// [`RegistrationError::RequiresGlobalTransform`] for a displacement-field
+    /// transform, matching ITK, whose constructor throws for one.
+    pub fn set_metric_as_correlation(&mut self) -> &mut Self {
+        self.metric_kind = MetricKind::Correlation;
+        self
+    }
+
+    /// Use the **ANTS neighborhood cross-correlation** metric
+    /// (`itk::ANTSNeighborhoodCorrelationImageToImageMetricv4`): normalized
+    /// cross-correlation computed inside a window of diameter `2·radius + 1`
+    /// around each sample and summed. SimpleITK
+    /// `SetMetricAsANTSNeighborhoodCorrelation` (default radius 5).
+    ///
+    /// Unlike [`set_metric_as_correlation`](Self::set_metric_as_correlation) it
+    /// accepts both global and displacement-field transforms. Errors at
+    /// [`execute`](Self::execute) if the window does not fit inside the fixed
+    /// image along some axis.
+    pub fn set_metric_as_ants_neighborhood_correlation(&mut self, radius: usize) -> &mut Self {
+        self.metric_kind = MetricKind::AntsNeighborhoodCorrelation { radius };
+        self
+    }
+
+    /// Use the **joint-histogram mutual-information** metric
+    /// (`itk::JointHistogramMutualInformationImageToImageMetricv4`) with
+    /// `number_of_histogram_bins` bins (SimpleITK's default is 20) and
+    /// `variance_for_joint_pdf_smoothing` (default `1.5`) as the variance, in
+    /// bins², of the discrete Gaussian smoothed over each histogram axis.
+    /// SimpleITK `SetMetricAsJointHistogramMutualInformation`.
+    ///
+    /// A second multi-modality metric alongside
+    /// [`set_metric_as_mattes_mutual_information`](Self::set_metric_as_mattes_mutual_information);
+    /// it estimates the joint density by Gaussian-smoothing a hard-binned
+    /// histogram rather than by a cubic B-spline Parzen window. Errors at
+    /// [`execute`](Self::execute) if fewer than six bins are requested or an
+    /// image is constant.
+    pub fn set_metric_as_joint_histogram_mutual_information(
+        &mut self,
+        number_of_histogram_bins: usize,
+        variance_for_joint_pdf_smoothing: f64,
+    ) -> &mut Self {
+        self.metric_kind = MetricKind::JointHistogramMutualInformation {
+            number_of_histogram_bins,
+            variance_for_joint_pdf_smoothing,
+        };
+        self
+    }
+
+    /// Use the **Demons** metric (`itk::DemonsImageToImageMetricv4`), the
+    /// optical-flow force `(f − m)·∇f / (‖∇f‖² + (f − m)²/normalizer)` written
+    /// straight into each pixel's own parameter block. SimpleITK
+    /// `SetMetricAsDemons` (default `intensityDifferenceThreshold` `0.001`): a
+    /// sample whose `|f − m|` falls below the threshold contributes no force.
+    ///
+    /// [`execute`](Self::execute) returns
+    /// [`RegistrationError::RequiresLocalSupportTransform`] for anything but a
+    /// [`DisplacementFieldTransform`](sitk_transform::DisplacementFieldTransform),
+    /// matching `itk::DemonsImageToImageMetricv4::Initialize`.
+    pub fn set_metric_as_demons(&mut self, intensity_difference_threshold: f64) -> &mut Self {
+        self.metric_kind = MetricKind::Demons {
+            intensity_difference_threshold,
+        };
+        self
+    }
+
     /// Replace the metric compute backend (the GPU seam). Defaults to
     /// [`CpuBackend`]; a CUDA/`wgpu` backend implements the same
     /// [`MetricBackend`] trait.
@@ -896,6 +1013,42 @@ impl ImageRegistrationMethod {
                     *number_of_histogram_bins,
                 )?,
             )),
+            MetricKind::Correlation => Ok(ActiveMetric::Correlation(
+                CorrelationMetric::from_samples(samples, moving_image)?,
+            )),
+            // ANTS and Demons read the level's fixed image directly — the former
+            // to raster its neighborhood windows, the latter for its fixed
+            // gradient and spacing normalizer — so both take `fixed` alongside
+            // the (possibly sparse) sample set.
+            MetricKind::AntsNeighborhoodCorrelation { radius } => {
+                Ok(ActiveMetric::AntsNeighborhoodCorrelation(
+                    AntsNeighborhoodCorrelationMetric::from_samples(
+                        fixed,
+                        samples,
+                        moving_image,
+                        *radius,
+                    )?,
+                ))
+            }
+            MetricKind::JointHistogramMutualInformation {
+                number_of_histogram_bins,
+                variance_for_joint_pdf_smoothing,
+            } => Ok(ActiveMetric::JointHistogram(
+                JointHistogramMutualInformationMetric::from_samples(
+                    samples,
+                    moving_image,
+                    *number_of_histogram_bins,
+                    *variance_for_joint_pdf_smoothing,
+                )?,
+            )),
+            MetricKind::Demons {
+                intensity_difference_threshold,
+            } => Ok(ActiveMetric::Demons(DemonsMetric::from_samples(
+                fixed,
+                samples,
+                moving_image,
+                *intensity_difference_threshold,
+            )?)),
         }
     }
 
@@ -1118,6 +1271,7 @@ impl ImageRegistrationMethod {
         initial: T,
     ) -> Result<RegistrationResult<T>> {
         let metric = self.build_metric(fixed, moving, fixed_mask, level)?;
+        metric.check_transform(&initial)?;
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
@@ -2889,5 +3043,256 @@ mod tests {
                 sigma: 2
             }
         ));
+    }
+
+    // ---- metrics: Correlation / ANTS NCC / joint-histogram MI / Demons ----
+
+    /// `moving(p) = a·fixed(p − t) + b` — an *affine* intensity map. Mean
+    /// squares wants `M ≈ F` and is defeated by it; correlation is invariant to
+    /// it by construction (it subtracts the means and divides by the standard
+    /// deviations).
+    fn affinely_remapped_shifted_blob() -> (Image, Image, f64, f64) {
+        let (w, h) = (48usize, 48usize);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 24.0, 24.0, 6.0, 1.0);
+        let shifted = gaussian(w, h, 24.0 + tx, 24.0 + ty, 6.0, 1.0);
+        let moving = Image::from_vec(
+            &[w, h],
+            shifted.to_f64_vec().iter().map(|v| 2.1 * v + 0.4).collect(),
+        )
+        .unwrap();
+        (fixed, moving, tx, ty)
+    }
+
+    #[test]
+    fn correlation_recovers_a_translation_under_an_affine_intensity_map() {
+        let (fixed, moving, tx, ty) = affinely_remapped_shifted_blob();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_correlation()
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-3,
+                200,
+                1e-7,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 0.1 && (p[1] - ty).abs() < 0.1,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+    }
+
+    #[test]
+    fn correlation_rejects_a_displacement_field_transform() {
+        // itk::CorrelationImageToImageMetricv4's constructor throws for a
+        // displacement field; the driver must surface that as an error, not
+        // trip the metric's own debug assertion.
+        use sitk_transform::DisplacementFieldTransform;
+
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 9.0, 8.0, 3.0, 1.0);
+        let field = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_correlation()
+            .set_optimizer_as_gradient_descent(1e-3, 1);
+        let Err(err) = reg.execute(&fixed, &moving, field) else {
+            panic!("a displacement field must be rejected by the correlation metric");
+        };
+        assert!(
+            matches!(
+                err,
+                RegistrationError::RequiresGlobalTransform {
+                    metric: "Correlation"
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn ants_neighborhood_correlation_recovers_a_translation() {
+        // The local (windowed) counterpart of the global correlation metric: the
+        // same affine intensity map, recovered from per-window normalization.
+        let (fixed, moving, tx, ty) = affinely_remapped_shifted_blob();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_ants_neighborhood_correlation(3)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-3,
+                200,
+                1e-7,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 0.2 && (p[1] - ty).abs() < 0.2,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+    }
+
+    #[test]
+    fn ants_neighborhood_radius_wider_than_the_fixed_image_is_rejected() {
+        let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
+        let moving = gaussian(8, 8, 5.0, 4.0, 2.0, 1.0);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_ants_neighborhood_correlation(5)
+            .set_optimizer_as_gradient_descent(1e-3, 1);
+        let Err(err) = reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+        else {
+            panic!("a window of diameter 11 must not be accepted on an 8-wide image");
+        };
+        assert!(
+            matches!(
+                err,
+                RegistrationError::NeighborhoodRadiusExceedsImage {
+                    radius: 5,
+                    window: 11,
+                    size: 8,
+                    axis: 0
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn joint_histogram_mi_recovers_a_translation_under_contrast_inversion() {
+        // Same multi-modality setup as the Mattes test, driven by the other
+        // mutual-information metric: a Gaussian-smoothed hard-binned histogram
+        // instead of a cubic B-spline Parzen window.
+        let (w, h, sigma, amp) = (48usize, 48usize, 6.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 24.0, 24.0, sigma, amp);
+        let bright = gaussian(w, h, 24.0 + tx, 24.0 + ty, sigma, amp);
+        let moving = Image::from_vec(
+            &[w, h],
+            bright.to_f64_vec().iter().map(|v| amp - v).collect(),
+        )
+        .unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_joint_histogram_mutual_information(20, 1.5)
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                0.01,
+                200,
+                1e-6,
+                EstimateLearningRate::Once,
+            );
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 0.5 && (p[1] - ty).abs() < 0.5,
+            "recovered {p:?}, expected [{tx}, {ty}], metric {}, iters {}",
+            result.metric_value,
+            result.iterations
+        );
+    }
+
+    #[test]
+    fn joint_histogram_mi_smoothing_variance_reaches_the_metric() {
+        // The variance is a real knob, not a stored-and-ignored field: a wider
+        // joint-PDF smoothing blurs the density and changes the metric value at
+        // the same (identity) transform.
+        let (fixed, moving, _, _) = shifted_blob_pair();
+        let value_at_identity = |variance: f64| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_metric_as_joint_histogram_mutual_information(20, variance)
+                .set_optimizer_as_gradient_descent(0.0, 1);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .metric_value
+        };
+        let tight = value_at_identity(0.5);
+        let wide = value_at_identity(4.0);
+        assert!(
+            (tight - wide).abs() > 1e-6,
+            "smoothing variance did not change the metric: {tight} vs {wide}"
+        );
+    }
+
+    #[test]
+    fn demons_recovers_a_translation_with_a_displacement_field() {
+        use sitk_transform::{DisplacementFieldTransform, Transform};
+
+        let (w, h, sigma, amp) = (20usize, 20usize, 4.0, 1.0);
+        let (cx, cy) = (10.0f64, 10.0f64);
+        let (tx, ty) = (2.0f64, -1.0f64);
+        let fixed = gaussian(w, h, cx, cy, sigma, amp);
+        let moving = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
+
+        let identity = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let baseline = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(&identity, &CpuBackend)
+            .value;
+
+        let field = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let mut reg = ImageRegistrationMethod::new();
+        // Every pixel's force is divided by the metric-wide valid-point count
+        // (see the `demons` module docs), so an individually Newton-sized step
+        // needs a learning rate scaled up by roughly that count. Demons has no
+        // line search and no step cap, so an over-large rate (or too many
+        // iterations at a large one) oscillates instead of converging: on this
+        // fixture `(5.0, 300)` reaches 0.09×baseline, `(20.0, 1000)` diverges
+        // back above it.
+        reg.set_metric_as_demons(0.001)
+            .set_optimizer_as_gradient_descent(5.0, 300);
+        let result = reg.execute(&fixed, &moving, field).unwrap();
+
+        // Demons drives each pixel's own displacement; alignment shows up as a
+        // mean-squares residual far below the identity baseline.
+        let aligned = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(&result.transform, &CpuBackend)
+            .value;
+        assert!(
+            aligned < 0.3 * baseline,
+            "mean squares after Demons {aligned} not below 0.3×baseline {baseline}"
+        );
+        // On the blob's flank the recovered x-displacement approaches the shift.
+        let flank = [cx + sigma, cy];
+        let mapped = result.transform.transform_point(&flank);
+        assert!(
+            (mapped[0] - (flank[0] + tx)).abs() < 0.7,
+            "flank mapped to {mapped:?}, expected x≈{}",
+            flank[0] + tx
+        );
+    }
+
+    #[test]
+    fn demons_rejects_a_global_transform() {
+        // itk::DemonsImageToImageMetricv4::Initialize throws unless the moving
+        // transform is a displacement field.
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 9.0, 8.0, 3.0, 1.0);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_demons(0.001)
+            .set_optimizer_as_gradient_descent(1e-3, 1);
+        let Err(err) = reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+        else {
+            panic!("a translation transform must be rejected by the Demons metric");
+        };
+        assert!(
+            matches!(
+                err,
+                RegistrationError::RequiresLocalSupportTransform { metric: "Demons" }
+            ),
+            "unexpected error {err:?}"
+        );
     }
 }
