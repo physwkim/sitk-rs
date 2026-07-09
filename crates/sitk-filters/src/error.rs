@@ -36,6 +36,22 @@ pub enum FilterError {
     #[error("smoothing sigmas must be >= 0, got {0:?}")]
     InvalidSigma(Vec<f64>),
 
+    /// `DiscreteGaussianImageFilter`'s per-axis `Variance` was negative.
+    #[error("discrete Gaussian variances must be >= 0, got {0:?}")]
+    InvalidVariance(Vec<f64>),
+
+    /// `GaussianOperator::SetMaximumError`: every value must lie in the open
+    /// interval `(0.0, 1.0)`.
+    #[error("maximum_error values must be in the open interval (0.0, 1.0), got {0:?}")]
+    InvalidMaximumError(Vec<f64>),
+
+    /// `CurvatureFlowImageFilter`'s `TimeStep` violates the explicit-scheme
+    /// stability bound derived for the finite-difference curvature update
+    /// (see `curvature_flow`'s doc comment): the caller must pick a
+    /// `time_step` in `[0, max_stable]`.
+    #[error("time_step {time_step} is outside the stable range [0, {max_stable}]")]
+    UnstableTimeStep { time_step: f64, max_stable: f64 },
+
     /// The recursive Gaussian was asked to filter an axis shorter than the
     /// four pixels its fourth-order recursion needs (matching ITK's
     /// `RecursiveSeparableImageFilter` requirement).
