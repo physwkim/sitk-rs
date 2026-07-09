@@ -332,12 +332,10 @@ impl MattesMutualInformationMetric {
                 self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
             fixed_marginal[fixed_index] += 1.0;
 
-            let mut pdf_moving_index = moving_index - 1;
-            let mut arg = pdf_moving_index as f64 - moving_term;
-            for _ in 0..4 {
+            let pdf_moving_start = moving_index - 1;
+            for pdf_moving_index in pdf_moving_start..pdf_moving_start + 4 {
+                let arg = pdf_moving_index as f64 - moving_term;
                 joint_pdf[fixed_index * bins + pdf_moving_index] += cubic_bspline(arg);
-                arg += 1.0;
-                pdf_moving_index += 1;
             }
             valid += 1;
         }
@@ -457,9 +455,9 @@ impl MattesMutualInformationMetric {
 
             // Cubic window covers the four bins [moving_index − 1 .. + 2].
             let jac = transform.jacobian_wrt_parameters(fp);
-            let mut pdf_moving_index = moving_index - 1;
-            let mut arg = pdf_moving_index as f64 - moving_term;
-            for _ in 0..4 {
+            let pdf_moving_start = moving_index - 1;
+            for pdf_moving_index in pdf_moving_start..pdf_moving_start + 4 {
+                let arg = pdf_moving_index as f64 - moving_term;
                 let val = cubic_bspline(arg);
                 joint_pdf[fixed_index * bins + pdf_moving_index] += val;
 
@@ -473,9 +471,6 @@ impl MattesMutualInformationMetric {
                     }
                     joint_pdf_derivatives[base + k] += inner * deriv_weight;
                 }
-
-                arg += 1.0;
-                pdf_moving_index += 1;
             }
 
             valid += 1;
@@ -705,14 +700,11 @@ impl MattesMutualInformationMetric {
             for (idx, col) in &entries {
                 let inner: f64 = col.iter().zip(grad_phys.iter()).map(|(&c, &g)| c * g).sum();
 
-                let mut pdf_moving_index = moving_start;
-                let mut arg = pdf_moving_index as f64 - moving_term;
                 let mut acc = 0.0;
-                for _ in 0..4 {
+                for pdf_moving_index in moving_start..moving_start + 4 {
+                    let arg = pdf_moving_index as f64 - moving_term;
                     let deriv_weight = cubic_bspline_derivative(arg);
                     acc += deriv_weight * pratio[fixed_index * bins + pdf_moving_index];
-                    arg += 1.0;
-                    pdf_moving_index += 1;
                 }
                 derivative[*idx] += inner * acc;
             }
