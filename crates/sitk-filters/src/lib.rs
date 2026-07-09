@@ -70,6 +70,7 @@ pub mod grid_utility;
 mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
+pub mod join_series;
 pub mod kmeans;
 pub mod label;
 pub mod label_fusion;
