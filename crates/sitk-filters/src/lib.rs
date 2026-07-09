@@ -41,6 +41,7 @@ pub mod math;
 pub mod morphology;
 pub mod noise;
 mod random;
+pub mod reconstruction;
 pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod shrink;
@@ -87,6 +88,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use reconstruction::{
+    grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima, h_minima,
+    reconstruction_by_dilation, reconstruction_by_erosion,
+};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
     IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
@@ -179,6 +184,21 @@ pub(crate) fn image_from_f64(
     vals: &[f64],
 ) -> Result<Image> {
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
+}
+
+fn quantize_to_pixel_type_impl<T: Scalar>(v: f64) -> f64 {
+    T::from_f64(v).as_f64()
+}
+
+/// `static_cast<PixelType>(v)` narrowed back to `f64`: SimpleITK's `pixeltype:
+/// Input` YAML members — `MorphologicalWatershedImageFilter::Level`,
+/// `HMinimaImageFilter`/`HMaximaImageFilter`/`HConvexImageFilter`/
+/// `HConcaveImageFilter::Height` — are all `InputImagePixelType`-typed at the
+/// ITK level (each is set via `itkSetMacro(Level`/`Height, InputImagePixelType)`),
+/// so the `double` SimpleITK exposes to callers is cast to the pixel type
+/// before the underlying filter ever sees it.
+pub(crate) fn quantize_to_pixel_type(target: PixelId, v: f64) -> f64 {
+    dispatch_scalar!(target, quantize_to_pixel_type_impl, v)
 }
 
 fn require_same_shape(a: &Image, b: &Image) -> Result<()> {

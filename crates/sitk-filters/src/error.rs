@@ -157,6 +157,14 @@ pub enum FilterError {
     #[error("watershed level must be >= 0, got {0}")]
     InvalidWatershedLevel(f64),
 
+    /// `ReconstructionByErosionImageFilter`/`ReconstructionByDilationImageFilter`,
+    /// via `itkReconstructionImageFilter.hxx`'s per-pixel precondition check
+    /// ("be sure that the pixels in the images follow the preconditions"):
+    /// reconstruction by erosion requires the marker image to be pixelwise
+    /// `>=` the mask image; by dilation, `<=`.
+    #[error("reconstruction marker image must be pixelwise {relation} the mask image")]
+    InvalidReconstructionMarker { relation: &'static str },
+
     /// `FastMarchingImageFilter::GenerateData` throws "Normalization Factor
     /// is null or negative" when `m_NormalizationFactor < itk::Math::eps`
     /// (`f64::EPSILON`).
