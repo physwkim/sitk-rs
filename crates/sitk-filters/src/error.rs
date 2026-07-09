@@ -246,6 +246,15 @@ pub enum FilterError {
     #[error("binary_thinning only supports 2-D images, got {0}-D")]
     UnsupportedThinningDimension(usize),
 
+    /// `DirectedHausdorffDistanceImageFilter::AfterThreadedGenerateData`
+    /// throws `"pixelcount is equal to 0"` via `itkGenericExceptionMacro`
+    /// when the first input image has no non-zero pixels (the "from" set
+    /// is empty, so no minimum distance can be measured from it).
+    #[error(
+        "directed Hausdorff distance requires at least one non-zero pixel in the first input image"
+    )]
+    EmptyHausdorffForegroundSet,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
