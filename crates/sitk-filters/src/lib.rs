@@ -25,6 +25,7 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+pub mod binary_morphology;
 pub mod canny;
 pub mod convolution;
 pub mod denoise;
@@ -52,6 +53,10 @@ pub mod smoothing;
 pub mod threshold;
 pub mod watershed;
 
+pub use binary_morphology::{
+    binary_fillhole, binary_grind_peak, binary_thinning, voting_binary,
+    voting_binary_iterative_hole_filling,
+};
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,

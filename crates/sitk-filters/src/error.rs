@@ -200,6 +200,15 @@ pub enum FilterError {
     #[error("normalize requires a convolution kernel whose pixels sum to a non-zero value")]
     ZeroKernelSum,
 
+    /// `BinaryThinningImageFilter::ComputeThinImage` hardcodes 2-D 8-neighbor
+    /// offsets (`itkBinaryThinningImageFilter.hxx`'s `o2`..`o9`, each a
+    /// 2-element `OffsetType`), so ITK only wraps/instantiates this filter
+    /// for 2-D images (`itkBinaryThinningImageFilter.wrap`'s
+    /// `itk_wrap_image_filter(..., 2, 2)`); a higher-dimensional
+    /// instantiation would not even compile in C++.
+    #[error("binary_thinning only supports 2-D images, got {0}-D")]
+    UnsupportedThinningDimension(usize),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
