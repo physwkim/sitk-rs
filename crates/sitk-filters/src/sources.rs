@@ -1,8 +1,14 @@
-//! Image-source generators: filters with no input image. Ported so far:
-//! `GaussianImageSource` (`itkGaussianImageSource.h`/`.hxx`,
-//! `Modules/Filtering/ImageSources/include`; [`gaussian_source`]) and
-//! `GaborImageSource` (`itkGaborImageSource.h`/`.hxx`, same directory;
-//! [`gabor_source`]).
+//! Image-source generators: filters with no input image, ported from
+//! `Modules/Filtering/ImageSources/include/itkGaussianImageSource.h`/`.hxx`
+//! ([`gaussian_source`]), `itkGaborImageSource.h`/`.hxx` ([`gabor_source`]),
+//! and `itkGridImageSource.h`/`.hxx` ([`grid_source`]).
+//!
+//! `PhysicalPointImageSource` (`PhysicalPointImageSource.yaml`) is **not**
+//! ported: its `pixel_types` is `VectorPixelIDTypeList` and its default
+//! output pixel type is `sitkVectorFloat32` — it produces a vector image with
+//! one component per dimension. This crate's [`Image`]/`PixelBuffer` model is
+//! scalar-only (ten scalar variants, see `sitk_core::pixel::PixelId`), so
+//! there is no representation for a multi-component pixel to port it onto.
 //!
 //! Every source in this module shares the same physical-space placement
 //! surface ([`SourceGeometry`]): `size` fixes the output dimension and pixel
@@ -284,6 +290,155 @@ pub fn gabor_source(
     Ok(out)
 }
 
+// ---- grid_source --------------------------------------------------------
+
+/// `GridImageSource`'s own parameters (everything but geometry and output
+/// pixel type). The kernel is fixed to `GaussianKernelFunction<double>`
+/// (`itkGridImageSource.hxx`'s constructor — not the B-spline kernel — see
+/// [`grid_source`]'s doc for why the choice is numerically irrelevant here).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridSourceSettings {
+    /// Standard deviation of the per-axis Gaussian pulses. One entry per
+    /// dimension.
+    pub sigma: Vec<f64>,
+    /// Spacing between grid lines along each axis. One entry per dimension.
+    pub grid_spacing: Vec<f64>,
+    /// Offset of the first grid line along each axis (clamped to at most
+    /// `grid_spacing[d]`, matching `BeforeThreadedGenerateData`'s
+    /// `std::min(GridOffset, GridSpacing)`). One entry per dimension.
+    pub grid_offset: Vec<f64>,
+    /// Which axes are gridded; an axis with `false` is left constant (a
+    /// factor of `1`) rather than pulsed. One entry per dimension.
+    pub which_dimensions: Vec<bool>,
+    /// Scale factor multiplying the grid value.
+    pub scale: f64,
+}
+
+impl Default for GridSourceSettings {
+    /// SimpleITK's yaml defaults, sized for a 3-D image:
+    /// `Sigma = [0.5,0.5,0.5]`, `GridSpacing = [4,4,4]`,
+    /// `GridOffset = [0,0,0]`, `WhichDimensions = [true,true,true]`,
+    /// `Scale = 255`.
+    fn default() -> Self {
+        Self {
+            sigma: vec![0.5; 3],
+            grid_spacing: vec![4.0; 3],
+            grid_offset: vec![0.0; 3],
+            which_dimensions: vec![true; 3],
+            scale: 255.0,
+        }
+    }
+}
+
+/// `GaussianKernelFunction<double>::Evaluate` (`itkGaussianKernelFunction.h`):
+/// the standard normal density, `exp(-0.5*x^2) / sqrt(2*pi)`.
+fn gaussian_kernel(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+/// `GridImageSource`: a separable grid of pulses, one per gridded axis,
+/// multiplied together (`itkGridImageSource.hxx`).
+///
+/// For each gridded axis `i` (`which_dimensions[i]`), `BeforeThreadedGenerateData`
+/// builds a 1-D response by summing shifted Gaussian-kernel pulses spaced
+/// `grid_spacing[i]` apart and inverting it so grid lines read as troughs
+/// (`pixels = 1 - pixels/pixels.max()`); a non-gridded axis is left at a
+/// constant `1`. The final pixel is `scale` times the product of each axis's
+/// 1-D response at that pixel's own index along the axis.
+///
+/// Two upstream quirks are reproduced exactly here, both consequences of
+/// `BeforeThreadedGenerateData` computing each axis's response along a
+/// single `ImageLinearIteratorWithIndex` line with every *other* index held
+/// at the region's start index (always `0` in this crate's `Image` model):
+///
+/// - **`Origin` does not affect the grid pattern.** The `.hxx` computes
+///   `point[i] - origin[i] - ...`, and `point[i]` (from
+///   `TransformIndexToPhysicalPoint` with every other index at `0`) is itself
+///   `origin[i] + direction[i][i]*spacing[i]*index[i]` — so `origin[i]`
+///   cancels algebraically. This port computes the already-cancelled form
+///   (`direction[i][i]*spacing[i]*index[i] - ...`) rather than transcribing
+///   the literal subtraction, avoiding needless floating-point cancellation
+///   error for a large `origin`; the two are mathematically identical.
+///   `origin` still becomes the output image's own origin metadata, it just
+///   never influences *where the grid lines fall*.
+/// - **Only `direction`'s diagonal feeds the pattern**, not its full row:
+///   with every other index at `0`, `TransformIndexToPhysicalPoint`'s
+///   `sum_k direction[i][k]*spacing[k]*index[k]` reduces to its `k == i`
+///   term. An off-diagonal direction entry is faithfully inert here — again
+///   because `BeforeThreadedGenerateData` itself only ever walks that one
+///   line, not because this port dropped a term it should have used.
+///
+/// The kernel is always `GaussianKernelFunction`, matching the constructor's
+/// hardcoded choice (`itkGridImageSource.hxx`; the class documents itself as
+/// pluggable via `SetKernelFunction`, but SimpleITK's yaml never exposes that
+/// setter). Its `1/sqrt(2*pi)` normalization constant cancels out of
+/// `pixels/pixels.max()` regardless, so it is carried here for fidelity to
+/// the ported formula rather than because it changes the result.
+///
+/// Errors if `sigma`/`grid_spacing`/`grid_offset`/`which_dimensions`/
+/// `geometry.origin`/`geometry.spacing` don't have one entry per dimension
+/// of `size`, or `geometry.direction` is non-empty and not exactly `dim*dim`.
+pub fn grid_source(
+    pixel_id: PixelId,
+    size: &[usize],
+    settings: &GridSourceSettings,
+    geometry: &SourceGeometry,
+) -> Result<Image> {
+    let dim = size.len();
+    require_dim(settings.sigma.len(), dim)?;
+    require_dim(settings.grid_spacing.len(), dim)?;
+    require_dim(settings.grid_offset.len(), dim)?;
+    require_dim(settings.which_dimensions.len(), dim)?;
+
+    let geo = geometry_image(size, geometry)?;
+    let spacing = geo.spacing().to_vec();
+    let direction = geo.direction().to_vec();
+
+    let mut axis_pixels: Vec<Vec<f64>> = Vec::with_capacity(dim);
+    for i in 0..dim {
+        if !settings.which_dimensions[i] {
+            axis_pixels.push(vec![1.0; size[i]]);
+            continue;
+        }
+        let offset = settings.grid_offset[i].min(settings.grid_spacing[i]);
+        let number_of_gaussians =
+            (size[i] as f64 * spacing[i] / settings.grid_spacing[i]).ceil() as u32 + 4;
+        let direction_diag = direction[i * dim + i];
+
+        let mut pixels = vec![0.0f64; size[i]];
+        for (idx, slot) in pixels.iter_mut().enumerate() {
+            let point_i = direction_diag * spacing[i] * idx as f64;
+            let mut val = 0.0;
+            for j in 0..number_of_gaussians {
+                let num = point_i - (j as f64 - 2.0) * settings.grid_spacing[i] - offset;
+                val += gaussian_kernel(num / settings.sigma[i]);
+            }
+            *slot = val;
+        }
+        let max_val = pixels.iter().cloned().fold(f64::MIN, f64::max);
+        for p in pixels.iter_mut() {
+            *p = 1.0 - *p / max_val;
+        }
+        axis_pixels.push(pixels);
+    }
+
+    let axis_strides = strides(size);
+    let count: usize = size.iter().product();
+    let mut vals = vec![0.0f64; count];
+    for (o, slot) in vals.iter_mut().enumerate() {
+        let mut val = 1.0;
+        for (i, axis) in axis_pixels.iter().enumerate() {
+            let ii = (o / axis_strides[i]) % size[i];
+            val *= axis[ii];
+        }
+        *slot = settings.scale * val;
+    }
+
+    let mut out = dispatch_scalar!(pixel_id, build_typed_image, size, &vals)?;
+    out.copy_geometry_from(&geo);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +704,202 @@ mod tests {
         };
         assert_eq!(
             gabor_source(PixelId::Float64, &[2, 2], &settings, &identity_geometry(2)),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        );
+    }
+
+    // ---- grid_source ----
+
+    fn grid_1d_settings(grid_offset: f64) -> GridSourceSettings {
+        GridSourceSettings {
+            sigma: vec![0.5],
+            grid_spacing: vec![4.0],
+            grid_offset: vec![grid_offset],
+            which_dimensions: vec![true],
+            scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn grid_hand_derived_troughs_and_off_peak_1d() {
+        let settings = grid_1d_settings(0.0);
+        let img = grid_source(PixelId::Float64, &[8], &settings, &identity_geometry(1)).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+        // Grid lines (troughs) at multiples of grid_spacing == 0, 4.
+        assert!(v[0].abs() < 1e-9, "trough at 0: {}", v[0]);
+        assert!(v[4].abs() < 1e-9, "trough at 4: {}", v[4]);
+        // Hand-derived off-peak value at index 2 (midway between grid
+        // lines): the two dominant kernel terms are at |num/sigma| == 4,
+        // giving kernel sum ~= 2 * exp(-8)/sqrt(2*pi) against a peak kernel
+        // value of 1/sqrt(2*pi), so 1 - sum/peak ~= 1 - 2*exp(-8) =~ 0.9993276.
+        let expected_off_peak = 1.0 - 2.0 * (-8.0f64).exp();
+        assert!(
+            (v[2] - expected_off_peak).abs() < 1e-4,
+            "off-peak value {} vs expected {expected_off_peak}",
+            v[2]
+        );
+        // idx 6 is symmetric to idx 2 around the trough at idx 4.
+        assert!((v[6] - v[2]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_offset_shifts_trough_positions() {
+        let settings = grid_1d_settings(2.0);
+        let img = grid_source(PixelId::Float64, &[8], &settings, &identity_geometry(1)).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+        // Troughs move from {0, 4} to {2, 6}.
+        assert!(v[2].abs() < 1e-9, "trough at 2: {}", v[2]);
+        assert!(v[6].abs() < 1e-9, "trough at 6: {}", v[6]);
+        // 0 and 4, no longer trough positions, land back on the same
+        // off-peak value hand-derived above.
+        let expected_off_peak = 1.0 - 2.0 * (-8.0f64).exp();
+        assert!((v[0] - expected_off_peak).abs() < 1e-4);
+        assert!((v[4] - expected_off_peak).abs() < 1e-4);
+    }
+
+    #[test]
+    fn grid_which_dimensions_masks_axis_constant() {
+        let settings = GridSourceSettings {
+            sigma: vec![0.5, 0.5],
+            grid_spacing: vec![4.0, 4.0],
+            grid_offset: vec![0.0, 0.0],
+            which_dimensions: vec![true, false],
+            scale: 1.0,
+        };
+        let img = grid_source(PixelId::Float64, &[6, 8], &settings, &identity_geometry(2)).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+        // axis 1 is masked off: fixing x, every y must give the same value.
+        for x in 0..6 {
+            let base = v[img.linear_index(&[x, 0])];
+            for y in 1..8 {
+                let val = v[img.linear_index(&[x, y])];
+                assert!(
+                    (val - base).abs() < 1e-12,
+                    "axis 1 should be constant at x={x}: y=0 -> {base}, y={y} -> {val}"
+                );
+            }
+        }
+        // axis 0 is still gridded: it must actually vary.
+        let x0 = v[img.linear_index(&[0, 0])];
+        let x2 = v[img.linear_index(&[2, 0])];
+        assert!((x0 - x2).abs() > 1e-6);
+    }
+
+    #[test]
+    fn grid_scale_factor_is_linear() {
+        let base = GridSourceSettings {
+            scale: 1.0,
+            ..grid_1d_settings(0.0)
+        };
+        let scaled = GridSourceSettings {
+            scale: 7.5,
+            ..grid_1d_settings(0.0)
+        };
+        let a = grid_source(PixelId::Float64, &[8], &base, &identity_geometry(1)).unwrap();
+        let b = grid_source(PixelId::Float64, &[8], &scaled, &identity_geometry(1)).unwrap();
+        let av = a.scalar_slice::<f64>().unwrap();
+        let bv = b.scalar_slice::<f64>().unwrap();
+        for (x, y) in av.iter().zip(bv.iter()) {
+            assert!((y - 7.5 * x).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn grid_origin_does_not_affect_pattern_only_metadata() {
+        let settings = grid_1d_settings(0.0);
+        let near_origin = SourceGeometry {
+            origin: vec![0.0],
+            spacing: vec![1.0],
+            direction: vec![1.0],
+        };
+        let far_origin = SourceGeometry {
+            origin: vec![500.0],
+            spacing: vec![1.0],
+            direction: vec![1.0],
+        };
+        let a = grid_source(PixelId::Float64, &[8], &settings, &near_origin).unwrap();
+        let b = grid_source(PixelId::Float64, &[8], &settings, &far_origin).unwrap();
+        // Bit-for-bit identical pixel pattern...
+        assert_eq!(
+            a.scalar_slice::<f64>().unwrap(),
+            b.scalar_slice::<f64>().unwrap()
+        );
+        // ...even though the requested origin still lands in the metadata.
+        assert_eq!(a.origin(), &[0.0]);
+        assert_eq!(b.origin(), &[500.0]);
+    }
+
+    #[test]
+    fn grid_direction_only_diagonal_feeds_the_pattern() {
+        let settings = GridSourceSettings {
+            sigma: vec![0.5, 0.5],
+            grid_spacing: vec![4.0, 4.0],
+            grid_offset: vec![0.0, 0.0],
+            which_dimensions: vec![true, true],
+            scale: 1.0,
+        };
+        let identity = identity_geometry(2);
+        // Off-diagonal-only shear: diagonal entries unchanged (1, 1), only
+        // the off-diagonal term differs from identity.
+        let sheared = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![1.0, 0.5, 0.0, 1.0],
+        };
+        let a = grid_source(PixelId::Float64, &[8, 8], &settings, &identity).unwrap();
+        let b = grid_source(PixelId::Float64, &[8, 8], &settings, &sheared).unwrap();
+        assert_eq!(
+            a.scalar_slice::<f64>().unwrap(),
+            b.scalar_slice::<f64>().unwrap()
+        );
+
+        // Changing the diagonal itself, by contrast, does change the
+        // pattern: doubling axis 0's diagonal entry doubles its effective
+        // position, so index 2 (previously off-peak) becomes a trough.
+        let doubled_diag = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![2.0, 0.0, 0.0, 1.0],
+        };
+        let c = grid_source(PixelId::Float64, &[8, 8], &settings, &doubled_diag).unwrap();
+        let cv = c.scalar_slice::<f64>().unwrap();
+        assert!(cv[c.linear_index(&[2, 0])].abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_propagates_geometry() {
+        let geometry = SourceGeometry {
+            origin: vec![3.0, -1.0],
+            spacing: vec![2.0, 0.5],
+            direction: vec![0.0, 1.0, -1.0, 0.0],
+        };
+        let settings = GridSourceSettings {
+            sigma: vec![0.5, 0.5],
+            grid_spacing: vec![4.0, 4.0],
+            grid_offset: vec![0.0, 0.0],
+            which_dimensions: vec![true, true],
+            scale: 255.0,
+        };
+        let img = grid_source(PixelId::Float32, &[6, 6], &settings, &geometry).unwrap();
+        assert_eq!(img.origin(), geometry.origin.as_slice());
+        assert_eq!(img.spacing(), geometry.spacing.as_slice());
+        assert_eq!(img.direction(), geometry.direction.as_slice());
+    }
+
+    #[test]
+    fn grid_dimension_mismatch_errors() {
+        let settings = GridSourceSettings {
+            sigma: vec![0.5],
+            grid_spacing: vec![4.0, 4.0],
+            grid_offset: vec![0.0, 0.0],
+            which_dimensions: vec![true, true],
+            scale: 255.0,
+        };
+        assert_eq!(
+            grid_source(PixelId::Float64, &[4, 4], &settings, &identity_geometry(2)),
             Err(FilterError::DimensionLength {
                 expected: 2,
                 got: 1

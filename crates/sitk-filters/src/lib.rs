@@ -167,7 +167,8 @@ pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
 pub use smoothing::smooth_gaussian;
 pub use sources::{
-    GaborSourceSettings, GaussianSourceSettings, SourceGeometry, gabor_source, gaussian_source,
+    GaborSourceSettings, GaussianSourceSettings, GridSourceSettings, SourceGeometry, gabor_source,
+    gaussian_source, grid_source,
 };
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
