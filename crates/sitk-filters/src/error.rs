@@ -180,6 +180,26 @@ pub enum FilterError {
     #[error("discriminant of the fast marching quadratic equation is negative")]
     NegativeDiscriminant,
 
+    /// A convolution filter was given a kernel of a different dimension than
+    /// the image. ITK expresses this as a template parameter shared by both
+    /// inputs (`itk::ConvolutionImageFilter<TInputImage, TKernelImage, ...>`,
+    /// all of `ImageDimension`), so the mismatch cannot be built in C++.
+    #[error("kernel dimension {kernel} does not match image dimension {image}")]
+    KernelDimensionMismatch { image: usize, kernel: usize },
+
+    /// A convolution filter was given a kernel with a zero-length axis, for
+    /// which `GetKernelPadSize` would pad an all-zero operator into existence
+    /// and `GetKernelRadius` would report radius 0.
+    #[error("convolution kernel must have at least one pixel along every axis, got {0:?}")]
+    EmptyKernel(Vec<usize>),
+
+    /// `Normalize` was requested for a kernel whose pixels sum to zero.
+    /// `NormalizeToConstantImageFilter` divides by `GetSum() / Constant`
+    /// (itkNormalizeToConstantImageFilter.hxx:71-73), so ITK's `Div` functor
+    /// would replace every coefficient with `NumericTraits<RealType>::max()`.
+    #[error("normalize requires a convolution kernel whose pixels sum to a non-zero value")]
+    ZeroKernelSum,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

@@ -26,10 +26,12 @@
 //! yaml codegen in a later phase.
 
 pub mod canny;
+pub mod convolution;
 pub mod denoise;
 pub mod distance;
 pub mod error;
 pub mod fast_marching;
+mod fft;
 pub mod functor;
 pub mod geometry;
 pub mod gradient;
@@ -51,6 +53,9 @@ pub mod threshold;
 pub mod watershed;
 
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use convolution::{
+    ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
+};
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
 pub use distance::{
     danielsson_distance_map, signed_danielsson_distance_map, signed_maurer_distance_map,
