@@ -53,6 +53,20 @@ pub enum FilterError {
     #[error("relabel needs more than {max} object labels, exceeding the output pixel type's range")]
     TooManyObjects { max: u64 },
 
+    /// A histogram-driven threshold calculator (Otsu, Triangle, ...) was
+    /// asked for fewer than one histogram bin.
+    #[error("number of histogram bins must be >= 1, got {0}")]
+    InvalidHistogramBins(u32),
+
+    /// Otsu's multi-threshold search needs strictly more histogram bins than
+    /// requested thresholds (`itkOtsuMultipleThresholdsCalculator.hxx`'s
+    /// `IncrementThresholds` indexes off `numberOfHistogramBins - 2 - ...`,
+    /// which requires this to hold).
+    #[error(
+        "otsu threshold search needs number_of_histogram_bins ({bins}) > number_of_thresholds ({thresholds})"
+    )]
+    InvalidThresholdCount { bins: u32, thresholds: u32 },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
