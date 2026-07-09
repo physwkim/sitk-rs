@@ -150,6 +150,18 @@ pub enum FilterError {
     #[error("bitwise/logic filters require an integer pixel type, got {0:?}")]
     RequiresIntegerPixelType(PixelId),
 
+    /// A filter whose SimpleITK yaml restricts it to the unsigned integer
+    /// pixel types (`LabelVotingImageFilter`,
+    /// `MultiLabelSTAPLEImageFilter`), whose label values index a vote or
+    /// confusion-matrix row directly.
+    #[error("this filter requires an unsigned integer pixel type, got {0:?}")]
+    RequiresUnsignedIntegerPixelType(PixelId),
+
+    /// `MultiLabelSTAPLEImageFilter::InitializePriorProbabilities` throws when
+    /// the caller-supplied prior array is shorter than the number of labels.
+    #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
+    InvalidPriorProbabilities { got: usize, expected: usize },
+
     /// A filter whose SimpleITK yaml declares `pixel_types: RealPixelIDTypeList`
     /// (`GradientAnisotropicDiffusionImageFilter`,
     /// `CurvatureAnisotropicDiffusionImageFilter`) was given a non-floating-point
@@ -264,8 +276,10 @@ pub enum FilterError {
     )]
     InvalidCheckerPattern { pattern: Vec<u32>, size: Vec<usize> },
 
-    /// `TileImageFilter` was given zero input images to lay out.
-    #[error("tile requires at least one input image")]
+    /// A multi-input filter (`TileImageFilter`, `STAPLEImageFilter`,
+    /// `LabelVotingImageFilter`, `MultiLabelSTAPLEImageFilter`) was given zero
+    /// input images.
+    #[error("this filter requires at least one input image")]
     EmptyImageList,
 
     /// `UnsharpMaskImageFilter::VerifyPreconditions` throws "Threshold must
