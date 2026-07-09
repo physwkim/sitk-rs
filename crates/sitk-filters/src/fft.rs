@@ -33,6 +33,29 @@ impl Complex {
     pub(crate) const fn new(re: f64, im: f64) -> Self {
         Self { re, im }
     }
+
+    /// `std::conj`.
+    pub(crate) const fn conj(self) -> Self {
+        Self::new(self.re, -self.im)
+    }
+
+    /// `std::norm`: the *squared* magnitude, as the deconvolution functors use
+    /// it (`itkTikhonovDeconvolutionImageFilter.h:142`).
+    pub(crate) fn norm(self) -> f64 {
+        self.re * self.re + self.im * self.im
+    }
+
+    /// `itk::Math::Absolute` of a complex value, i.e. `std::abs` — the
+    /// magnitude (`itkInverseDeconvolutionImageFilter.h:145`).
+    pub(crate) fn abs(self) -> f64 {
+        self.re.hypot(self.im)
+    }
+
+    /// Multiplication by a real scalar, the shape every deconvolution functor
+    /// mixes a `double` parameter into a complex spectrum with.
+    pub(crate) fn scale(self, s: f64) -> Self {
+        Self::new(self.re * s, self.im * s)
+    }
 }
 
 impl Add for Complex {

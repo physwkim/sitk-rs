@@ -32,6 +32,7 @@ pub mod canny;
 pub mod clamp;
 pub mod contour;
 pub mod convolution;
+pub mod deconvolution;
 pub mod denoise;
 pub mod distance;
 pub mod edge;
