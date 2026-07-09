@@ -46,6 +46,7 @@ pub mod label_shape;
 pub mod level_set;
 pub mod logic;
 pub mod math;
+pub mod min_max_curvature_flow;
 pub mod morphology;
 pub mod noise;
 pub mod overlap;
@@ -111,6 +112,7 @@ pub use math::{
     sin_in_place, sqrt, sqrt_in_place, square, square_in_place, squared_difference,
     squared_difference_in_place, tan, tan_in_place,
 };
+pub use min_max_curvature_flow::{binary_min_max_curvature_flow, min_max_curvature_flow};
 pub use morphology::{
     StructuringElement, binary_dilate, binary_erode, binary_morphological_closing,
     binary_morphological_opening, black_top_hat, grayscale_dilate, grayscale_erode,
