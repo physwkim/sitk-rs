@@ -1,6 +1,8 @@
 //! Image-source generators: filters with no input image. Ported so far:
 //! `GaussianImageSource` (`itkGaussianImageSource.h`/`.hxx`,
-//! `Modules/Filtering/ImageSources/include`; [`gaussian_source`]).
+//! `Modules/Filtering/ImageSources/include`; [`gaussian_source`]) and
+//! `GaborImageSource` (`itkGaborImageSource.h`/`.hxx`, same directory;
+//! [`gabor_source`]).
 //!
 //! Every source in this module shares the same physical-space placement
 //! surface ([`SourceGeometry`]): `size` fixes the output dimension and pixel
@@ -182,6 +184,106 @@ pub fn gaussian_source(
     Ok(out)
 }
 
+// ---- gabor_source -------------------------------------------------------
+
+/// `GaborImageSource`'s own parameters (everything but geometry and output
+/// pixel type). `PhaseOffset` is deliberately absent: SimpleITK's yaml never
+/// exposes it (`GaborImageSource.yaml` has no `PhaseOffset` member), so the
+/// underlying `GaborKernelFunction`'s phase offset stays at its own default
+/// of `0.0` in every call this port can make.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GaborSourceSettings {
+    /// Standard deviation in each direction; `sigma[0]` is also the Gabor
+    /// kernel's own envelope width along axis 0. One entry per dimension.
+    pub sigma: Vec<f64>,
+    /// Mean (center) in each direction. One entry per dimension.
+    pub mean: Vec<f64>,
+    /// Modulation frequency of the sine/cosine component along axis 0.
+    pub frequency: f64,
+    /// `false` evaluates the cosine (real/symmetric) part, `true` the sine
+    /// (imaginary/antisymmetric) part.
+    pub calculate_imaginary_part: bool,
+}
+
+impl Default for GaborSourceSettings {
+    /// SimpleITK's yaml defaults, sized for a 3-D image: `Sigma = [16,16,16]`,
+    /// `Mean = [32,32,32]`, `Frequency = 0.4`,
+    /// `CalculateImaginaryPart = false`.
+    fn default() -> Self {
+        Self {
+            sigma: vec![16.0; 3],
+            mean: vec![32.0; 3],
+            frequency: 0.4,
+            calculate_imaginary_part: false,
+        }
+    }
+}
+
+/// `GaborImageSource`: a Gabor filter oriented along axis 0 — a
+/// `GaborKernelFunction` sinusoid-in-Gaussian-envelope along axis 0,
+/// multiplied by a non-normalized 1-D Gaussian envelope along every other
+/// axis (`itkGaborImageSource.hxx::GenerateData`):
+///
+/// `value(p) = exp(-0.5 * sum_{d=1..} ((p[d]-mean[d])/sigma[d])^2) * kernel(p[0]-mean[0])`
+///
+/// where, with `u = p[0]-mean[0]`
+/// (`itkGaborKernelFunction.h::Evaluate`, `PhaseOffset` fixed at `0`):
+///
+/// `kernel(u) = exp(-0.5*(u/sigma[0])^2) * cos_or_sin(2*pi*frequency*u)`
+///
+/// (`cos` unless `calculate_imaginary_part`, then `sin`). The result is
+/// narrowed to the output pixel type with truncating semantics
+/// ([`Scalar::from_f64`]), matching the `.hxx`'s `static_cast<PixelType>`.
+///
+/// Errors under the same conditions as [`gaussian_source`].
+pub fn gabor_source(
+    pixel_id: PixelId,
+    size: &[usize],
+    settings: &GaborSourceSettings,
+    geometry: &SourceGeometry,
+) -> Result<Image> {
+    let dim = size.len();
+    require_dim(settings.sigma.len(), dim)?;
+    require_dim(settings.mean.len(), dim)?;
+    let sigma = &settings.sigma;
+    let mean = &settings.mean;
+
+    let geo = geometry_image(size, geometry)?;
+
+    let axis_strides = strides(size);
+    let count: usize = size.iter().product();
+    let mut vals = vec![0.0f64; count];
+    for (o, slot) in vals.iter_mut().enumerate() {
+        let idx_f: Vec<f64> = (0..dim)
+            .map(|d| ((o / axis_strides[d]) % size[d]) as f64)
+            .collect();
+        let point = geo.continuous_index_to_physical_point(&idx_f);
+
+        let envelope_rest: f64 = (1..dim)
+            .map(|d| {
+                let z = (point[d] - mean[d]) / sigma[d];
+                z * z
+            })
+            .sum();
+        let gaussian_rest = (-0.5 * envelope_rest).exp();
+
+        let u = point[0] - mean[0];
+        let envelope0 = (-0.5 * (u / sigma[0]).powi(2)).exp();
+        let phase = 2.0 * std::f64::consts::PI * settings.frequency * u;
+        let trig = if settings.calculate_imaginary_part {
+            phase.sin()
+        } else {
+            phase.cos()
+        };
+
+        *slot = gaussian_rest * envelope0 * trig;
+    }
+
+    let mut out = dispatch_scalar!(pixel_id, build_typed_image, size, &vals)?;
+    out.copy_geometry_from(&geo);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +443,116 @@ mod tests {
             gaussian_source(PixelId::Float64, &[2, 2], &settings, &geometry),
             Err(FilterError::Core(_))
         ));
+    }
+
+    // ---- gabor_source ----
+
+    #[test]
+    fn gabor_real_and_imaginary_parts_at_dc() {
+        let base = GaborSourceSettings {
+            sigma: vec![2.0],
+            mean: vec![4.0],
+            frequency: 0.2,
+            calculate_imaginary_part: false,
+        };
+        let real = gabor_source(PixelId::Float64, &[9], &base, &identity_geometry(1)).unwrap();
+        // u == 0 at the mean: envelope(1) * cos(0) == 1.
+        assert!((real.scalar_slice::<f64>().unwrap()[4] - 1.0).abs() < 1e-12);
+
+        let imaginary = GaborSourceSettings {
+            calculate_imaginary_part: true,
+            ..base
+        };
+        let img = gabor_source(PixelId::Float64, &[9], &imaginary, &identity_geometry(1)).unwrap();
+        // u == 0 at the mean: envelope(1) * sin(0) == 0.
+        assert!(img.scalar_slice::<f64>().unwrap()[4].abs() < 1e-12);
+    }
+
+    #[test]
+    fn gabor_real_part_is_even_and_imaginary_part_is_odd_about_mean() {
+        let real_settings = GaborSourceSettings {
+            sigma: vec![5.0],
+            mean: vec![4.0],
+            frequency: 0.2,
+            calculate_imaginary_part: false,
+        };
+        let real = gabor_source(
+            PixelId::Float64,
+            &[9],
+            &real_settings,
+            &identity_geometry(1),
+        )
+        .unwrap();
+        let rv = real.scalar_slice::<f64>().unwrap();
+        for d in 1..=4usize {
+            assert!(
+                (rv[4 - d] - rv[4 + d]).abs() < 1e-12,
+                "real part not even at offset {d}"
+            );
+        }
+
+        let imaginary_settings = GaborSourceSettings {
+            calculate_imaginary_part: true,
+            ..real_settings
+        };
+        let imaginary = gabor_source(
+            PixelId::Float64,
+            &[9],
+            &imaginary_settings,
+            &identity_geometry(1),
+        )
+        .unwrap();
+        let iv = imaginary.scalar_slice::<f64>().unwrap();
+        for d in 1..=4usize {
+            assert!(
+                (iv[4 - d] + iv[4 + d]).abs() < 1e-12,
+                "imaginary part not odd at offset {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn gabor_frequency_pins_zero_crossing_spacing() {
+        // frequency = 0.25 => period 4, so cos(2*pi*0.25*u) == cos(pi/2 * u)
+        // crosses zero at odd u and alternates sign at even u. sigma is huge
+        // so the envelope is ~constant over this small domain and does not
+        // mask the sign pattern.
+        let settings = GaborSourceSettings {
+            sigma: vec![100.0],
+            mean: vec![4.0],
+            frequency: 0.25,
+            calculate_imaginary_part: false,
+        };
+        let img = gabor_source(PixelId::Float64, &[9], &settings, &identity_geometry(1)).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+        for &idx in &[1usize, 3, 5, 7] {
+            assert!(
+                v[idx].abs() < 1e-9,
+                "expected zero crossing at {idx}: {}",
+                v[idx]
+            );
+        }
+        let signs: Vec<f64> = [0usize, 2, 4, 6, 8]
+            .iter()
+            .map(|&i| v[i].signum())
+            .collect();
+        assert_eq!(signs, vec![1.0, -1.0, 1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn gabor_dimension_mismatch_errors() {
+        let settings = GaborSourceSettings {
+            sigma: vec![1.0],
+            mean: vec![0.0, 0.0],
+            frequency: 0.4,
+            calculate_imaginary_part: false,
+        };
+        assert_eq!(
+            gabor_source(PixelId::Float64, &[2, 2], &settings, &identity_geometry(2)),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        );
     }
 }
