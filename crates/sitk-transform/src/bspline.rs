@@ -49,11 +49,27 @@
 //! `∂T_d / ∂(coefficient for dimension d' at control point j)` is the B-spline
 //! weight of control point `j` when `d == d'`, and zero otherwise. So the
 //! Jacobian is sparse: only the `4^dimension` in-support control points (times
-//! the matching output dimension) are non-zero. This implementation returns it
-//! through the dense [`ParametricTransform::jacobian_wrt_parameters`] contract (a
-//! `dimension × numberOfParameters` row-major matrix that is mostly zero), so the
-//! transform drops into the existing metric/optimizer unchanged. A sparse-Jacobian
-//! fast path (and ITK's `HasLocalSupport` metric branch) is a later optimization.
+//! the matching output dimension) are non-zero. The dense
+//! [`ParametricTransform::jacobian_wrt_parameters`] contract (a `dimension ×
+//! numberOfParameters` row-major matrix that is mostly zero) is still
+//! available, so the transform drops into any metric/optimizer unchanged; it
+//! is implemented in terms of the sparse form below.
+//!
+//! [`ParametricTransform::sparse_jacobian_wrt_parameters`] returns exactly
+//! those non-zero entries — `(order+1)^dimension · dimension` `(parameter
+//! index, column)` pairs — without ever allocating the dense array. This is
+//! **not** ITK's `HasLocalSupport` metric branch: per
+//! `itk::BSplineBaseTransform::GetTransformCategory`
+//! (`itkBSplineBaseTransform.h`), a B-spline transform's category is
+//! `TransformCategoryEnum::BSpline`, not `DisplacementField`, so
+//! `itk::ObjectToObjectMetric::HasLocalSupport()` — which checks exactly
+//! `GetTransformCategory() == DisplacementField` — is `false` for it, and
+//! ITK's own metric threader (`ImageToImageMetricv4GetValueAndDerivativeThreaderBase
+//! ::StorePointDerivativeResult`) accumulates a B-spline's derivative through
+//! the *dense*, global-support branch. This crate's sparse accessor is a
+//! separate, purely internal performance device — see
+//! [`ParametricTransform::sparse_jacobian_wrt_parameters`] for how it stays
+//! decoupled from `HasLocalSupport` parity.
 
 use sitk_core::{Image, matrix};
 
@@ -454,14 +470,27 @@ impl ParametricTransform for BSplineTransform {
         let dim = self.dim;
         let nparams = self.number_of_parameters();
         let mut jac = vec![0.0f64; dim * nparams];
+        if let Some(entries) = self.sparse_jacobian_wrt_parameters(point) {
+            for (idx, col) in entries {
+                for (d, &w) in col.iter().enumerate() {
+                    jac[d * nparams + idx] = w;
+                }
+            }
+        }
+        jac
+    }
+
+    fn sparse_jacobian_wrt_parameters(&self, point: &[f64]) -> Option<Vec<(usize, Vec<f64>)>> {
+        let dim = self.dim;
 
         let mut index = self.continuous_index(point);
         if !self.inside_valid_region(&mut index) {
-            return jac; // outside grid ⇒ zero Jacobian
+            return Some(Vec::new()); // outside grid ⇒ zero Jacobian, no affected params
         }
 
         let (weights, start) = self.evaluate_weights(&index);
         let taps = SPLINE_ORDER + 1;
+        let mut entries = Vec::with_capacity(weights.len() * dim);
         for (k, &w) in weights.iter().enumerate() {
             let mut rem = k;
             let mut flat = 0usize;
@@ -472,10 +501,12 @@ impl ParametricTransform for BSplineTransform {
             }
             // ∂T_d/∂(coeff d at control point flat) = weight; other outputs 0.
             for d in 0..dim {
-                jac[d * nparams + d * self.num_per_dim + flat] = w;
+                let mut col = vec![0.0f64; dim];
+                col[d] = w;
+                entries.push((d * self.num_per_dim + flat, col));
             }
         }
-        jac
+        Some(entries)
     }
 }
 
@@ -613,6 +644,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sparse_jacobian_reproduces_the_dense_jacobians_nonzero_entries() {
+        // At several off-lattice points — including ones near the domain
+        // border where the support region is clipped by `inside_valid_region`
+        // — the sparse accessor's (index, column) entries must reproduce
+        // exactly the non-zero entries of the dense Jacobian, and nothing
+        // else.
+        let t = BSplineTransform::new(2, &[0.0, 0.0], &[10.0, 10.0], &matrix::identity(2), &[4, 4])
+            .unwrap();
+        let n = t.number_of_parameters();
+        // grid_spacing = 2.5, grid_origin = −2.5 ⇒ continuous index (p+2.5)/2.5;
+        // the valid interval [1, 5) per axis corresponds to physical p ∈ [0, 10) —
+        // exactly the transform domain. Points near p = 0 and p = 10 sit close
+        // to that clipped border but remain (just) inside it.
+        for point in &[[4.3, 5.7], [0.05, 0.05], [9.95, 9.95], [0.05, 9.95]] {
+            let dense = t.jacobian_wrt_parameters(point);
+            let entries = t.sparse_jacobian_wrt_parameters(point).unwrap();
+
+            // Every sparse entry matches the dense matrix at that column.
+            for (idx, col) in &entries {
+                for d in 0..2 {
+                    assert_eq!(
+                        dense[d * n + idx],
+                        col[d],
+                        "point {point:?}, param {idx}, dim {d}"
+                    );
+                }
+            }
+            // Every non-zero dense entry is covered by some sparse entry.
+            let sparse_cols: std::collections::HashSet<usize> =
+                entries.iter().map(|(idx, _)| *idx).collect();
+            for (k, &v) in dense.iter().enumerate() {
+                if v != 0.0 {
+                    let col = k % n;
+                    assert!(
+                        sparse_cols.contains(&col),
+                        "point {point:?}: dense non-zero at param {col} missing from sparse entries"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_jacobian_affects_exactly_order_plus_one_pow_dim_times_dim_params() {
+        // An interior point (well away from the border) affects exactly
+        // (order+1)^dim control points, each contributing one entry per
+        // output dimension.
+        let t = BSplineTransform::new(2, &[0.0, 0.0], &[10.0, 10.0], &matrix::identity(2), &[4, 4])
+            .unwrap();
+        let entries = t.sparse_jacobian_wrt_parameters(&[5.0, 5.0]).unwrap();
+        assert_eq!(entries.len(), 4usize.pow(2) * 2);
+
+        let t3 = BSplineTransform::new(
+            3,
+            &[0.0, 0.0, 0.0],
+            &[10.0, 10.0, 10.0],
+            &matrix::identity(3),
+            &[4, 4, 4],
+        )
+        .unwrap();
+        let entries3 = t3.sparse_jacobian_wrt_parameters(&[5.0, 5.0, 5.0]).unwrap();
+        assert_eq!(entries3.len(), 4usize.pow(3) * 3);
+    }
+
+    #[test]
+    fn sparse_jacobian_is_empty_outside_the_valid_region() {
+        // Far outside the grid the dense Jacobian is all-zero; the sparse
+        // accessor reports that as `Some(empty)`, not `None` — the transform
+        // does support a sparse representation, this point just contributes
+        // nothing to it.
+        let t = BSplineTransform::new(2, &[0.0, 0.0], &[10.0, 10.0], &matrix::identity(2), &[5, 5])
+            .unwrap();
+        assert_eq!(
+            t.sparse_jacobian_wrt_parameters(&[-50.0, -50.0]),
+            Some(Vec::new())
+        );
     }
 
     #[test]

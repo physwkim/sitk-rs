@@ -120,21 +120,47 @@ pub trait ParametricTransform: Transform {
         self.number_of_parameters()
     }
 
-    /// For a [local-support] transform, the `(offset, local_jacobian)` of the
-    /// region containing `point`: `offset` is the start index of that region's
-    /// parameter block in the flat parameter vector, and `local_jacobian` is the
-    /// row-major `dimension × number_of_local_parameters` Jacobian of the mapped
-    /// point with respect to *only* that block. Returns `None` when `point` lies
-    /// outside the region the transform can influence, or for a global transform
-    /// (the default).
+    /// A sparse representation of [`jacobian_wrt_parameters`] at `point`: the
+    /// list of `(parameter_index, column)` entries whose column — length
+    /// [`dimension`], `∂Tᵢ/∂param[parameter_index]` — may be non-zero. Every
+    /// *other* entry of the dense Jacobian at `point` is exactly zero, so a
+    /// metric can accumulate the derivative by touching only these entries
+    /// instead of allocating the full `dimension × number_of_parameters`
+    /// array.
     ///
-    /// This is the crate's analogue of pairing ITK's
-    /// `ComputeParameterOffsetFromVirtualIndex` with the local
-    /// `ComputeJacobianWithRespectToParameters`; it lets a metric read one
-    /// region's contribution without ever building the dense Jacobian.
+    /// A transform that implements this **always** returns `Some`, even when
+    /// `point` contributes nothing (an empty `Vec` — e.g. outside a
+    /// B-spline's valid region or a displacement field's buffer, where the
+    /// dense Jacobian is all-zero too, not absent). `None` means this
+    /// transform has no sparse representation at all; a metric reads that
+    /// *once per transform*, not per point, as the signal to fall back to
+    /// the dense [`jacobian_wrt_parameters`] contract for every sample. The
+    /// default returns `None` — every transform whose Jacobian is already
+    /// dense and small (translation, affine, similarity, Euler, versor)
+    /// keeps it. [`BSplineTransform`] and [`DisplacementFieldTransform`]
+    /// override it: both have a Jacobian that is structurally almost
+    /// entirely zero at any point, just with a different affected-parameter
+    /// *shape* — a scattered set of control points for a B-spline, one
+    /// contiguous pixel block for a displacement field — which is exactly
+    /// what this entry list abstracts over.
     ///
-    /// [local-support]: ParametricTransform::has_local_support
-    fn local_support_jacobian(&self, _point: &[f64]) -> Option<(usize, Vec<f64>)> {
+    /// This is independent of [`has_local_support`]: that flag mirrors
+    /// ITK's `Transform::GetTransformCategory() == DisplacementField` /
+    /// `ObjectToObjectMetric::HasLocalSupport()` exactly, and stays `false`
+    /// for a B-spline transform (`BSplineBaseTransform::GetTransformCategory`
+    /// returns `TransformCategoryEnum::BSpline`, not `DisplacementField` —
+    /// see the [`BSplineTransform`] module docs). This accessor is a
+    /// separate, crate-internal performance signal: it lets a metric skip
+    /// the dense Jacobian without touching `has_local_support`'s
+    /// ITK-faithful semantics, which stay available for whatever else keys
+    /// on them (e.g. a future displacement-field scales path).
+    ///
+    /// [`jacobian_wrt_parameters`]: ParametricTransform::jacobian_wrt_parameters
+    /// [`dimension`]: Transform::dimension
+    /// [`has_local_support`]: ParametricTransform::has_local_support
+    /// [`BSplineTransform`]: crate::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    fn sparse_jacobian_wrt_parameters(&self, _point: &[f64]) -> Option<Vec<(usize, Vec<f64>)>> {
         None
     }
 }

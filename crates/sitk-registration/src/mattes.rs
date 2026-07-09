@@ -40,26 +40,41 @@
 //!   deliberate deviation the mean-squares metric documents: ITK defaults to a
 //!   separately-computed (Gaussian-smoothed or central-difference) gradient
 //!   image that is not consistent with the interpolated value.
-//! * **Global-support derivative path (covers BSpline).** The dense
-//!   `jointPDFDerivatives` accumulation is ported. In ITK v4 this is the path
-//!   taken by every transform whose `HasLocalSupport()` is false — which, per
-//!   `itk::ObjectToObjectMetric::HasLocalSupport`, means every category *except*
-//!   `DisplacementField`. A [`BSplineTransform`] reports
-//!   `GetTransformCategory() == BSpline`, so it is **not** local-support and is
-//!   handled here exactly as ITK handles it: the (sparse) transform Jacobian is
-//!   folded densely over all parameters. This makes **deformable, multi-modality
-//!   registration** (BSpline + mutual information) work; it is finite-difference
-//!   verified against the value in the tests.
-//! * **Displacement-field local-support branch.** ITK's genuine local-support
-//!   path fires only for a [`DisplacementFieldTransform`]
-//!   (`HasLocalSupport() == true`), where each pixel's displacement is governed
-//!   by its own parameter block. It is ported: `evaluate` dispatches on
-//!   [`ParametricTransform::has_local_support`] to a per-pixel accumulation that
-//!   keeps only ITK's compact `m_LocalDerivativeByParzenBin` (`4 × params`),
-//!   `m_JointPdfIndex1DArray` (`params`), and `m_PRatioArray` (`bins²`) instead
-//!   of the dense `bins² × params` array — the same result, memory linear rather
-//!   than quadratic in the parameters. A test asserts it reproduces the global
-//!   path's derivative for the same field.
+//! * **Global-support derivative path.** The dense `jointPDFDerivatives`
+//!   accumulation is ported, taken by every transform whose Jacobian is
+//!   already dense and small (translation, affine, similarity, Euler,
+//!   versor) — ITK's `!HasLocalSupport` branch, i.e. every category *except*
+//!   `DisplacementField` per `itk::ObjectToObjectMetric::HasLocalSupport`.
+//! * **Sparse-support derivative path (covers BSpline and displacement
+//!   fields).** A [`BSplineTransform`] reports `GetTransformCategory() ==
+//!   BSpline` (`itk::BSplineBaseTransform::GetTransformCategory`,
+//!   `itkBSplineBaseTransform.h`), so per ITK's `HasLocalSupport()` — which
+//!   checks exactly `GetTransformCategory() == DisplacementField` — it is
+//!   **not** local-support, and ITK's own metric threader
+//!   (`ImageToImageMetricv4GetValueAndDerivativeThreaderBase::
+//!   StorePointDerivativeResult`) folds its Jacobian densely over every
+//!   parameter, the same as any other global transform. This crate produces
+//!   the identical result — finite-difference verified, and cross-checked
+//!   against the dense path to `1e-12` on a shared B-spline problem — through
+//!   a different, purely internal computation:
+//!   [`evaluate`](Self::evaluate) dispatches to
+//!   [`evaluate_sparse_support`](Self::evaluate_sparse_support) for any
+//!   transform implementing
+//!   [`ParametricTransform::sparse_jacobian_wrt_parameters`] — currently
+//!   [`BSplineTransform`] and [`DisplacementFieldTransform`] — which
+//!   accumulates the derivative by touching only each sample's affected
+//!   parameters, never materializing the `bins² × numberOfParameters` array.
+//!   This is a genuinely different algorithm from ITK's `HasLocalSupport`
+//!   branch (which fires only for a displacement field, one contiguous
+//!   parameter block per sample): a B-spline control point is shared by every
+//!   sample whose support region overlaps it, unlike a displacement-field
+//!   pixel touched by at most one sample, so the accumulation re-walks the
+//!   samples in a second pass once the joint histogram is known, rather than
+//!   caching one contributing sample per parameter — see
+//!   [`evaluate_sparse_support`](Self::evaluate_sparse_support) for why that
+//!   is necessary, not just a rewrite. A test proves it still reproduces the
+//!   (unchanged) dense path's derivative for a displacement field, exactly as
+//!   the branch it replaces did.
 //!
 //! [`BSplineTransform`]: sitk_transform::BSplineTransform
 //! [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
@@ -264,16 +279,30 @@ impl MattesMutualInformationMetric {
     /// Evaluate `value = −MI` and its parameter-derivative for `transform`.
     ///
     /// The value is identical for every transform; only how the derivative is
-    /// accumulated differs by transform category, exactly as ITK keys on
-    /// `HasLocalSupport()`. A global transform (translation, affine, versor,
-    /// B-spline — everything except a displacement field) takes the dense
-    /// `evaluate_global_support` path; a
-    /// [local-support](ParametricTransform::has_local_support) displacement field
-    /// takes the per-pixel `evaluate_local_support` path, which never
-    /// materializes the `bins² × numberOfParameters` derivative array.
+    /// accumulated differs. This probes
+    /// [`sparse_jacobian_wrt_parameters`](ParametricTransform::sparse_jacobian_wrt_parameters)
+    /// on the first fixed sample: if `transform` answers (currently
+    /// [`BSplineTransform`] and [`DisplacementFieldTransform`]), every sample
+    /// answers, and `evaluate_sparse_support` never materializes the `bins² ×
+    /// numberOfParameters` derivative array; otherwise `evaluate_global_support`
+    /// folds the dense Jacobian, exactly as ITK's `!HasLocalSupport` branch does.
+    /// This is deliberately *not* keyed on
+    /// [`has_local_support`](ParametricTransform::has_local_support) — that flag
+    /// mirrors ITK's `HasLocalSupport()` (`DisplacementField` category only) and
+    /// must keep its ITK-parity meaning for other consumers (e.g. derivative
+    /// normalization); the sparse-Jacobian probe is a separate, purely internal
+    /// capability signal.
+    ///
+    /// [`BSplineTransform`]: sitk_transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        if transform.has_local_support() {
-            self.evaluate_local_support(transform)
+        let dim = self.fixed.dim;
+        let sparse_capable = match self.fixed.points.get(..dim) {
+            Some(p0) => transform.sparse_jacobian_wrt_parameters(p0).is_some(),
+            None => false,
+        };
+        if sparse_capable {
+            self.evaluate_sparse_support(transform)
         } else {
             self.evaluate_global_support(transform)
         }
@@ -436,97 +465,90 @@ impl MattesMutualInformationMetric {
         }
     }
 
-    /// Local-support derivative accumulation (ITK's `HasLocalSupport` branch,
-    /// fired only for a displacement field).
+    /// Sparse-support derivative accumulation, taken when `transform`
+    /// implements [`sparse_jacobian_wrt_parameters`] (currently
+    /// [`BSplineTransform`] and [`DisplacementFieldTransform`]).
     ///
-    /// A local-support transform governs each point by its own small parameter
-    /// block ([`local_support_jacobian`]), so a sample's four cubic-window taps
-    /// only ever touch *that* block. Instead of the dense `bins² ×
-    /// numberOfParameters` derivative array, this keeps ITK's compact trio:
-    /// `local_deriv_by_bin` (`4 × numberOfParameters`, the per-parzen-bin
-    /// projected gradient — `m_LocalDerivativeByParzenBin`), `jointpdf_index_1d`
-    /// (the 1-D joint-PDF index each parameter's sample lands in —
-    /// `m_JointPdfIndex1DArray`), and `pratio` (`bins²`, the per-bin `pRatio`
-    /// scaled by `n_factor` — `m_PRatioArray`). The result is *identical* to the
-    /// global path — each parameter's contribution is exactly its owning
-    /// sample's — but the memory is linear in the parameters, not quadratic in
-    /// the histogram times the parameters.
+    /// This makes **two passes** over the fixed samples, unlike the
+    /// single-pass `evaluate_global_support`:
     ///
-    /// [`local_support_jacobian`]: ParametricTransform::local_support_jacobian
-    fn evaluate_local_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
+    /// 1. Build the joint histogram and fixed marginal exactly as the dense
+    ///    path does, using [`MovingImage::value_at`] — a value-only sample
+    ///    that skips the gradient this pass does not need.
+    /// 2. Once the histogram is final (so every bin's `pRatio` is known),
+    ///    re-walk the samples: for each one, pull its sparse Jacobian entries
+    ///    — `(parameter_index, column)` pairs, at most `(order+1)^dim` of them
+    ///    for a B-spline, exactly `dim` for a displacement-field pixel — and
+    ///    scatter-add `∂value/∂p_k` directly into `derivative[k]`.
+    ///
+    /// A second pass is *necessary*, not just a simpler rewrite of the old
+    /// single-pass local-support branch this replaces. That branch exploited
+    /// a displacement field's specific geometry: under a grid-aligned virtual
+    /// domain, each pixel — and so each sample — owns a disjoint parameter
+    /// block, so a parameter's bin location could be cached once per sample
+    /// and applied after the histogram finished (`m_JointPdfIndex1DArray` /
+    /// `m_LocalDerivativeByParzenBin`). A B-spline control point has no such
+    /// owning sample: it is shared by every sample whose `(order+1)^dim`
+    /// support region covers it, so a single per-parameter cache slot cannot
+    /// hold contributions from multiple overlapping samples. Recomputing each
+    /// sample's Jacobian and gradient in a second pass — reading, not
+    /// caching, the finished `pRatio` table — handles overlap correctly by
+    /// construction: every sample sharing a parameter adds its own
+    /// contribution via `derivative[idx] +=`.
+    ///
+    /// Every sample counts toward the *value* and joint histogram regardless
+    /// of whether it lands inside any parameter's support — a B-spline sample
+    /// outside the valid region (see
+    /// [`BSplineTransform::sparse_jacobian_wrt_parameters`]) still maps
+    /// through the transform (as identity there) and still has a moving
+    /// intensity; it simply contributes zero derivative, an empty entry list.
+    /// Only a sample landing outside the *moving buffer* is skipped from the
+    /// value entirely, exactly as in `evaluate_global_support`.
+    ///
+    /// [`sparse_jacobian_wrt_parameters`]: ParametricTransform::sparse_jacobian_wrt_parameters
+    /// [`BSplineTransform`]: sitk_transform::BSplineTransform
+    /// [`BSplineTransform::sparse_jacobian_wrt_parameters`]: sitk_transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
+    fn evaluate_sparse_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
         let dim = self.fixed.dim;
         let bins = self.num_bins;
         let nparams = transform.number_of_parameters();
-        let num_local = transform.number_of_local_parameters();
         let n = self.fixed.len();
 
         let mut joint_pdf = vec![0.0f64; bins * bins];
         let mut fixed_marginal = vec![0.0f64; bins];
-        // ITK m_LocalDerivativeByParzenBin[bin][param] and m_JointPdfIndex1DArray.
-        let mut local_deriv_by_bin = vec![0.0f64; 4 * nparams];
-        let mut jointpdf_index_1d = vec![0usize; nparams];
         let mut valid = 0usize;
 
+        // Pass 1: joint histogram + fixed marginal only. Value-only sampling
+        // (no gradient, no per-sample Jacobian) — this pass does not need
+        // either.
         for s in 0..n {
             let fp = &self.fixed.points[s * dim..(s + 1) * dim];
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);
-            let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
-                Some(vg) => vg,
+            let mv = match self.moving.value_at(&mp) {
+                Some(v) => v,
                 None => continue, // maps outside the moving buffer
             };
             if mv < self.moving_true_min || mv > self.moving_true_max {
                 continue;
             }
-            // The parameter block + local Jacobian of the region owning this
-            // sample; skip if the sample falls outside every region.
-            let (offset, local_jac) = match transform.local_support_jacobian(fp) {
-                Some(oj) => oj,
-                None => continue,
-            };
 
             let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
             let moving_index =
                 self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
             let fixed_index =
                 self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
-
             fixed_marginal[fixed_index] += 1.0;
 
-            // inner[mu] = ∇M · (column mu of the LOCAL Jacobian). It does not
-            // depend on the parzen bin, so compute it once per sample.
-            let mut inner = vec![0.0f64; num_local];
-            for (mu, im) in inner.iter_mut().enumerate() {
-                let mut acc = 0.0;
-                for (j, &g) in grad_phys.iter().enumerate() {
-                    acc += local_jac[j * num_local + mu] * g;
-                }
-                *im = acc;
-            }
-
-            // Every parameter of this block lands in the same joint-PDF row/first
-            // tap: index (fixed_index, moving_index − 1).
-            let moving_start = moving_index - 1;
-            let jpi1d = fixed_index * bins + moving_start;
-            for mu in 0..num_local {
-                jointpdf_index_1d[offset + mu] = jpi1d;
-            }
-
-            // Cubic window covers the four bins [moving_index − 1 .. + 2].
-            let mut pdf_moving_index = moving_start;
+            let mut pdf_moving_index = moving_index - 1;
             let mut arg = pdf_moving_index as f64 - moving_term;
-            for (b, chunk) in local_deriv_by_bin.chunks_exact_mut(nparams).enumerate() {
-                debug_assert!(b < 4);
+            for _ in 0..4 {
                 joint_pdf[fixed_index * bins + pdf_moving_index] += cubic_bspline(arg);
-                let deriv_weight = cubic_bspline_derivative(arg);
-                for (mu, &im) in inner.iter().enumerate() {
-                    chunk[offset + mu] += im * deriv_weight;
-                }
                 arg += 1.0;
                 pdf_moving_index += 1;
             }
-
             valid += 1;
         }
 
@@ -562,9 +584,9 @@ impl MattesMutualInformationMetric {
             }
         }
 
-        // Value pass. Identical to the global path, but instead of folding the
-        // dense derivatives it records pRatio·n_factor per bin (m_PRatioArray),
-        // to be applied to the compact per-bin local derivatives below.
+        // Value pass, identical in form to `evaluate_global_support`, but
+        // recording pRatio·n_factor per bin for pass 2 below instead of
+        // folding it into a dense derivative array immediately.
         let close_to_zero = f64::EPSILON;
         let mut sum = 0.0f64;
         let mut pratio = vec![0.0f64; bins * bins];
@@ -585,17 +607,47 @@ impl MattesMutualInformationMetric {
             }
         }
 
-        // Apply the per-bin pRatio to each parameter's owning sample. The sign is
-        // + to match this crate's global path (see the `n_factor` sign note in
-        // `evaluate_global_support`); ITK subtracts under its opposite convention.
+        // Pass 2: re-walk the samples, scatter-adding each one's sparse
+        // Jacobian contribution weighted by the now-finished per-bin pRatio.
         let mut derivative = vec![0.0f64; nparams];
-        for (i, di) in derivative.iter_mut().enumerate() {
-            let base = jointpdf_index_1d[i];
-            let mut acc = 0.0;
-            for b in 0..4 {
-                acc += local_deriv_by_bin[b * nparams + i] * pratio[base + b];
+        for s in 0..n {
+            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fv = self.fixed.values[s];
+
+            let mp = transform.transform_point(fp);
+            let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
+                Some(vg) => vg,
+                None => continue,
+            };
+            if mv < self.moving_true_min || mv > self.moving_true_max {
+                continue;
             }
-            *di = acc;
+            let entries = match transform.sparse_jacobian_wrt_parameters(fp) {
+                Some(e) if !e.is_empty() => e,
+                _ => continue, // outside every parameter's support: zero derivative
+            };
+
+            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
+            let moving_index =
+                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
+            let fixed_index =
+                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+            let moving_start = moving_index - 1;
+
+            for (idx, col) in &entries {
+                let inner: f64 = col.iter().zip(grad_phys.iter()).map(|(&c, &g)| c * g).sum();
+
+                let mut pdf_moving_index = moving_start;
+                let mut arg = pdf_moving_index as f64 - moving_term;
+                let mut acc = 0.0;
+                for _ in 0..4 {
+                    let deriv_weight = cubic_bspline_derivative(arg);
+                    acc += deriv_weight * pratio[fixed_index * bins + pdf_moving_index];
+                    arg += 1.0;
+                    pdf_moving_index += 1;
+                }
+                derivative[*idx] += inner * acc;
+            }
         }
 
         MetricValue {
@@ -703,12 +755,13 @@ mod tests {
 
     #[test]
     fn bspline_derivative_matches_finite_difference() {
-        // The existing dense/global-support path produces a correct Mattes
-        // derivative for a BSpline transform, which is !HasLocalSupport in ITK
-        // (GetTransformCategory() == BSpline, and HasLocalSupport() is true only
-        // for a displacement field) and so takes exactly this global path. The
-        // (sparse) BSpline Jacobian is folded densely over all parameters;
-        // compare the analytic MI derivative to a central finite difference.
+        // `evaluate` routes a BSpline transform through `evaluate_sparse_support`
+        // (it implements `sparse_jacobian_wrt_parameters`), which must produce
+        // the same MI derivative ITK's dense `!HasLocalSupport` path would —
+        // BSpline is `GetTransformCategory() == BSpline`, not `DisplacementField`,
+        // so `HasLocalSupport()` is still false for it in the ITK-parity sense;
+        // only this crate's *internal* accumulation is sparse. Compare the
+        // analytic MI derivative to a central finite difference.
         use sitk_transform::{BSplineTransform, ParametricTransform};
 
         let (w, h, sigma) = (32usize, 32usize, 6.0);
@@ -824,29 +877,144 @@ mod tests {
     }
 
     #[test]
-    fn local_support_reproduces_the_global_support_derivative() {
-        // The per-pixel local-support accumulation is an exact reorganization of
-        // the dense global path: each displacement parameter's contribution is
-        // precisely its owning pixel's sample. So for a displacement field the
-        // two branches must agree in value AND derivative — the compact memory
-        // trio costs nothing in accuracy.
+    fn sparse_support_reproduces_the_global_support_derivative_for_a_displacement_field() {
+        // The sparse-support accumulation must exactly reproduce the dense
+        // global path for a displacement field: each pixel's parameter block is
+        // touched by exactly that pixel's sample, so the two-pass recomputation
+        // and the single-pass dense fold must agree in value AND derivative.
         let (metric, field) = displacement_field_case();
-        let local = metric.evaluate_local_support(&field);
+        let sparse = metric.evaluate_sparse_support(&field);
         let global = metric.evaluate_global_support(&field);
 
-        assert_eq!(local.valid_points, global.valid_points);
+        assert_eq!(sparse.valid_points, global.valid_points);
         assert!(
-            (local.value - global.value).abs() < 1e-12,
-            "value: local {} vs global {}",
-            local.value,
+            (sparse.value - global.value).abs() < 1e-12,
+            "value: sparse {} vs global {}",
+            sparse.value,
             global.value
         );
-        assert_eq!(local.derivative.len(), global.derivative.len());
-        let max_diff = local
+        assert_eq!(sparse.derivative.len(), global.derivative.len());
+        let max_diff = sparse
             .derivative
             .iter()
             .zip(&global.derivative)
             .map(|(l, g)| (l - g).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn bspline_sparse_support_matches_the_dense_reference() {
+        // Same property as above, for a BSpline transform: even though every
+        // control point is shared by many overlapping samples (unlike a
+        // displacement field's disjoint per-pixel blocks), the two-pass
+        // sparse accumulation must still exactly reproduce the dense fold.
+        use sitk_transform::{BSplineTransform, ParametricTransform};
+
+        let (w, h, sigma) = (32usize, 32usize, 6.0);
+        let fixed = gaussian(w, h, 16.0, 16.0, sigma, 1.0);
+        let s2 = 2.0 * sigma * sigma;
+        let mut mv = vec![0.0f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 - 16.0, y as f64 - 16.0);
+                mv[y * w + x] = 1.0 - (-(dx * dx + dy * dy) / s2).exp();
+            }
+        }
+        let moving = Image::from_vec(&[w, h], mv).unwrap();
+        let metric = MattesMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+
+        let mut t = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        let n = t.number_of_parameters();
+        let params: Vec<f64> = (0..n)
+            .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.05)
+            .collect();
+        t.set_parameters(&params);
+
+        let sparse = metric.evaluate_sparse_support(&t);
+        let dense = metric.evaluate_global_support(&t);
+
+        assert_eq!(sparse.valid_points, dense.valid_points);
+        assert!(
+            (sparse.value - dense.value).abs() < 1e-12,
+            "value: sparse {} vs dense {}",
+            sparse.value,
+            dense.value
+        );
+        let max_diff = sparse
+            .derivative
+            .iter()
+            .zip(&dense.derivative)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn bspline_sparse_support_counts_samples_outside_its_valid_region() {
+        // A BSpline domain narrower than the fixed image leaves some fixed
+        // samples outside the transform's valid region — there
+        // `sparse_jacobian_wrt_parameters` returns `Some(empty)`, contributing
+        // zero derivative, but the sample must still count toward the value and
+        // joint histogram exactly as the dense path counts it (it still maps
+        // through the transform, as identity there, and still has a moving
+        // intensity). This is the case the old cache-based local-support branch
+        // got wrong for a non-displacement-field transform: it treated "no
+        // owning parameter block" as "drop the sample" instead of "drop only
+        // its derivative contribution".
+        use sitk_transform::{BSplineTransform, ParametricTransform, Transform};
+
+        let (w, h, sigma) = (32usize, 32usize, 5.0);
+        let fixed = gaussian(w, h, 16.0, 16.0, sigma, 1.0);
+        let moving = gaussian(w, h, 16.0, 16.0, sigma, 1.0);
+        let metric = MattesMutualInformationMetric::new(&fixed, &moving, 32).unwrap();
+
+        // Domain covers only [8, 24) of the 32-pixel image.
+        let mut t = BSplineTransform::new(
+            2,
+            &[8.0, 8.0],
+            &[16.0, 16.0],
+            &[1.0, 0.0, 0.0, 1.0],
+            &[4, 4],
+        )
+        .unwrap();
+        let n = t.number_of_parameters();
+        let params: Vec<f64> = (0..n)
+            .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.02)
+            .collect();
+        t.set_parameters(&params);
+
+        // Sanity-check the setup actually exercises the out-of-region path.
+        assert_eq!(
+            t.transform_point(&[0.0, 0.0]),
+            vec![0.0, 0.0],
+            "corner should be outside the domain (identity)"
+        );
+        assert_ne!(
+            t.transform_point(&[16.0, 16.0]),
+            vec![16.0, 16.0],
+            "center should be inside the domain (deformed)"
+        );
+
+        let sparse = metric.evaluate_sparse_support(&t);
+        let dense = metric.evaluate_global_support(&t);
+
+        assert_eq!(
+            sparse.valid_points, dense.valid_points,
+            "sparse path must count every sample the dense path counts, \
+             even outside the BSpline's valid region"
+        );
+        assert!(
+            (sparse.value - dense.value).abs() < 1e-12,
+            "value: sparse {} vs dense {}",
+            sparse.value,
+            dense.value
+        );
+        let max_diff = sparse
+            .derivative
+            .iter()
+            .zip(&dense.derivative)
+            .map(|(a, b)| (a - b).abs())
             .fold(0.0f64, f64::max);
         assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
     }

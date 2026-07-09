@@ -48,8 +48,8 @@ use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
     bspline_coefficients, bspline_value_and_gradient, gaussian_value_and_gradient,
-    index_to_physical_matrix, linear_value_and_gradient, nearest_value_and_gradient,
-    physical_to_index_matrix, strides,
+    index_to_physical_matrix, linear_at, linear_value_and_gradient, nearest_at,
+    nearest_value_and_gradient, physical_to_index_matrix, strides,
 };
 
 use crate::error::{RegistrationError, Result};
@@ -180,7 +180,7 @@ impl FixedSamples {
     /// `percentage` and `seed` are used by [`SamplingStrategy::Regular`]
     /// (stride `= ceil(1/percentage)`) and [`SamplingStrategy::Random`]
     /// (`floor(N * percentage)` draws, uniform with replacement, seeded via a
-    /// small deterministic PRNG — see the private `SplitMix64`); both are ignored for
+    /// small deterministic PRNG — see [`SplitMix64`]); both are ignored for
     /// [`SamplingStrategy::None`]. `mask` is a binary image on the same grid
     /// as `fixed` (any nonzero value is "inside"): a candidate sample whose
     /// voxel is zero in the mask is dropped, exactly as ITK's
@@ -379,7 +379,8 @@ impl MovingImage {
     /// Restrict this moving image to a binary mask on its own grid (ITK
     /// `ImageToImageMetricv4::SetMovingImageMask`): any nonzero mask voxel is
     /// "inside". A physical point that maps to a zero-mask voxel makes
-    /// `value_and_physical_gradient` return `None`, exactly as if it fell outside the buffer. Fails if
+    /// [`value_and_physical_gradient`](Self::value_and_physical_gradient)
+    /// return `None`, exactly as if it fell outside the buffer. Fails if
     /// `mask` does not share this image's size.
     pub fn with_moving_mask(mut self, mask: &Image) -> Result<Self> {
         if mask.size() != self.size.as_slice() {
@@ -483,6 +484,47 @@ impl MovingImage {
         Some((value, grad_phys))
     }
 
+    /// Sample of physical point `p` under this image's interpolator, or
+    /// `None` if `p` maps outside the buffer or onto a zero moving-mask
+    /// voxel — a value-only sibling of
+    /// [`value_and_physical_gradient`](Self::value_and_physical_gradient)
+    /// for a pass that does not need the gradient (e.g. the histogram-only
+    /// first pass of a two-pass metric such as Mattes' sparse-support path,
+    /// Correlation, or ANTS neighborhood correlation, which would otherwise
+    /// pay for a gradient it immediately discards).
+    ///
+    /// For the nearest-neighbor and linear interpolators this skips the
+    /// gradient *computation* itself, not just the return value ([`nearest_at`]
+    /// / [`linear_at`] are genuinely value-only primitives). The cubic
+    /// B-spline and Gaussian interpolators currently expose only a combined
+    /// value-and-gradient primitive, so for those this still computes the
+    /// gradient and discards it.
+    pub(crate) fn value_at(&self, p: &[f64]) -> Option<f64> {
+        let cidx = self.continuous_index(p);
+        if !self.mask_allows(&cidx) {
+            return None;
+        }
+        match self.interpolator {
+            Interpolator::NearestNeighbor => {
+                nearest_at(&self.buf, &self.size, &self.strides, &cidx)
+            }
+            Interpolator::Linear => linear_at(&self.buf, &self.size, &self.strides, &cidx),
+            Interpolator::BSpline => bspline_value_and_gradient(
+                self.bspline_coeffs
+                    .as_deref()
+                    .expect("bspline_coeffs is Some whenever interpolator == BSpline"),
+                &self.size,
+                &self.strides,
+                &cidx,
+            )
+            .map(|(v, _)| v),
+            Interpolator::Gaussian => {
+                gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, &cidx)
+                    .map(|(v, _)| v)
+            }
+        }
+    }
+
     /// The `(min, max)` of the moving-image buffer. `(0, 0)` when empty. The
     /// Mattes MI metric uses this to size the joint-histogram moving axis.
     pub(crate) fn value_range(&self) -> (f64, f64) {
@@ -556,14 +598,31 @@ impl MetricBackend for CpuBackend {
             let diff = mv - fv;
             value_sum += diff * diff;
 
-            // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k].
-            let jac = transform.jacobian_wrt_parameters(fp);
-            for (k, dk) in deriv.iter_mut().enumerate() {
-                let mut g = 0.0;
-                for (d, &gp) in grad_phys.iter().enumerate() {
-                    g += gp * jac[d * nparams + k];
+            // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k]. A transform with
+            // a sparse Jacobian (BSpline, DisplacementField) touches only its
+            // affected parameters; every other transform falls back to the
+            // dense Jacobian, unchanged from before.
+            match transform.sparse_jacobian_wrt_parameters(fp) {
+                Some(entries) => {
+                    for (idx, col) in &entries {
+                        let g: f64 = col
+                            .iter()
+                            .zip(grad_phys.iter())
+                            .map(|(&c, &gp)| c * gp)
+                            .sum();
+                        deriv[*idx] += 2.0 * diff * g;
+                    }
                 }
-                *dk += 2.0 * diff * g;
+                None => {
+                    let jac = transform.jacobian_wrt_parameters(fp);
+                    for (k, dk) in deriv.iter_mut().enumerate() {
+                        let mut g = 0.0;
+                        for (d, &gp) in grad_phys.iter().enumerate() {
+                            g += gp * jac[d * nparams + k];
+                        }
+                        *dk += 2.0 * diff * g;
+                    }
+                }
             }
 
             valid += 1;
@@ -647,6 +706,54 @@ impl MeanSquaresMetric {
     ) -> MetricValue {
         backend.mean_squares(&self.fixed, &self.moving, transform)
     }
+}
+
+/// The one contiguous parameter block a [local-support] transform's Jacobian
+/// touches at `point`, as `(block offset, dim × numberOfLocalParameters
+/// row-major block)`.
+///
+/// A local-support transform is a displacement field (that is exactly what
+/// ITK's `DisplacementField` transform category means), so its sparse Jacobian
+/// at a sample is its own pixel's `numberOfLocalParameters` *consecutive*
+/// parameters: entry `i` is `(offset + i, column i)`. This transposes that
+/// entry list back into the dense block, which is the shape every consumer of
+/// the local path wants.
+///
+/// Returns `None` when the sample falls outside the field — the sparse accessor
+/// answers with an empty entry list there, meaning "zero Jacobian, no affected
+/// parameters", so the sample contributes no shift and every caller drops it.
+///
+/// # Panics
+///
+/// Panics if `transform` has no sparse Jacobian at all. Call only when
+/// [`ParametricTransform::has_local_support`] is `true`; every such transform
+/// implements [`ParametricTransform::sparse_jacobian_wrt_parameters`].
+///
+/// [local-support]: ParametricTransform::has_local_support
+pub(crate) fn local_support_block(
+    transform: &dyn ParametricTransform,
+    point: &[f64],
+) -> Option<(usize, Vec<f64>)> {
+    debug_assert!(transform.has_local_support());
+    let dim = transform.dimension();
+    let num_local = transform.number_of_local_parameters();
+    let entries = transform
+        .sparse_jacobian_wrt_parameters(point)
+        .expect("a local-support transform always has a sparse Jacobian");
+    if entries.is_empty() {
+        return None;
+    }
+    debug_assert_eq!(entries.len(), num_local);
+
+    let offset = entries[0].0;
+    let mut block = vec![0.0; dim * num_local];
+    for (i, (index, column)) in entries.iter().enumerate() {
+        debug_assert_eq!(*index, offset + i);
+        for (r, &c) in column.iter().enumerate() {
+            block[r * num_local + i] = c;
+        }
+    }
+    Some((offset, block))
 }
 
 /// Increment a multi-index in place (first index fastest).
@@ -817,5 +924,121 @@ mod tests {
             after < before,
             "moving mask should drop previously-valid points: after {after} vs before {before}"
         );
+    }
+
+    /// The pre-fast-path mean-squares reduction: always uses the dense
+    /// `jacobian_wrt_parameters` contract, never the sparse accessor. Kept
+    /// here only as an independent reference to verify `CpuBackend`'s sparse
+    /// fast path (which takes the sparse branch automatically for any
+    /// transform that implements it) computes the identical result.
+    fn mean_squares_dense_reference(
+        fixed: &FixedSamples,
+        moving: &MovingImage,
+        transform: &dyn ParametricTransform,
+    ) -> MetricValue {
+        let dim = fixed.dim;
+        let nparams = transform.number_of_parameters();
+        let n = fixed.values.len();
+
+        let mut value_sum = 0.0;
+        let mut deriv = vec![0.0; nparams];
+        let mut valid = 0usize;
+
+        for s in 0..n {
+            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let fv = fixed.values[s];
+
+            let mp = transform.transform_point(fp);
+            let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
+                Some(vg) => vg,
+                None => continue,
+            };
+
+            let diff = mv - fv;
+            value_sum += diff * diff;
+
+            let jac = transform.jacobian_wrt_parameters(fp);
+            for (k, dk) in deriv.iter_mut().enumerate() {
+                let mut g = 0.0;
+                for (d, &gp) in grad_phys.iter().enumerate() {
+                    g += gp * jac[d * nparams + k];
+                }
+                *dk += 2.0 * diff * g;
+            }
+
+            valid += 1;
+        }
+
+        if valid == 0 {
+            return MetricValue {
+                value: f64::MAX,
+                derivative: vec![0.0; nparams],
+                valid_points: 0,
+            };
+        }
+        let inv = 1.0 / valid as f64;
+        MetricValue {
+            value: value_sum * inv,
+            derivative: deriv.iter().map(|d| d * inv).collect(),
+            valid_points: valid,
+        }
+    }
+
+    #[test]
+    fn bspline_sparse_derivative_matches_dense_reference() {
+        use sitk_transform::BSplineTransform;
+
+        let fixed = ramp(16, 16, 3.0, 5.0);
+        let moving = ramp(16, 16, 3.0, 5.0);
+        let fixed_samples = FixedSamples::from_image(&fixed);
+        let moving_image = MovingImage::from_image(&moving).unwrap();
+
+        let mut t = BSplineTransform::from_image_domain(&fixed, &[4, 4]).unwrap();
+        let n = t.number_of_parameters();
+        let params: Vec<f64> = (0..n)
+            .map(|i| ((i * 37 % 11) as f64 - 5.0) * 0.05)
+            .collect();
+        t.set_parameters(&params);
+
+        let sparse = CpuBackend.mean_squares(&fixed_samples, &moving_image, &t);
+        let dense = mean_squares_dense_reference(&fixed_samples, &moving_image, &t);
+
+        assert_eq!(sparse.valid_points, dense.valid_points);
+        assert!((sparse.value - dense.value).abs() < 1e-12);
+        assert_eq!(sparse.derivative.len(), dense.derivative.len());
+        let max_diff = sparse
+            .derivative
+            .iter()
+            .zip(&dense.derivative)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
+    }
+
+    #[test]
+    fn displacement_field_sparse_derivative_matches_dense_reference() {
+        use sitk_transform::DisplacementFieldTransform;
+
+        let img = ramp(8, 8, 3.0, 5.0);
+        let fixed_samples = FixedSamples::from_image(&img);
+        let moving_image = MovingImage::from_image(&img).unwrap();
+
+        let mut t = DisplacementFieldTransform::from_image_domain(&img).unwrap();
+        let n = t.number_of_parameters();
+        let params: Vec<f64> = (0..n).map(|i| ((i * 13 % 7) as f64 - 3.0) * 0.05).collect();
+        t.set_parameters(&params);
+
+        let sparse = CpuBackend.mean_squares(&fixed_samples, &moving_image, &t);
+        let dense = mean_squares_dense_reference(&fixed_samples, &moving_image, &t);
+
+        assert_eq!(sparse.valid_points, dense.valid_points);
+        assert!((sparse.value - dense.value).abs() < 1e-12);
+        let max_diff = sparse
+            .derivative
+            .iter()
+            .zip(&dense.derivative)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(max_diff < 1e-12, "max derivative diff {max_diff}");
     }
 }

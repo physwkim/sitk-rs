@@ -48,7 +48,7 @@
 //!   (lines 54–86) instead of every one of the `nparams` parameters. For
 //!   [`DisplacementFieldTransform`](sitk_transform::DisplacementFieldTransform)
 //!   the local Jacobian at a grid-aligned sample is always the `dim × dim`
-//!   identity (`local_support_jacobian` in `sitk-transform/src/displacement.rs`
+//!   identity (`sparse_jacobian_wrt_parameters` in `sitk-transform/src/displacement.rs`
 //!   — the interpolation weight of a pixel at its own grid index is exactly 1,
 //!   every other weight 0), so every probe shifts by exactly `δ` and the
 //!   ITK formula (lines 102–116: `scaleᵢ = maxShiftᵢ² / δ²`) reduces to
@@ -83,6 +83,8 @@
 //! [`ParametricTransform::has_local_support`]: sitk_transform::ParametricTransform::has_local_support
 
 use sitk_transform::ParametricTransform;
+
+use crate::metric::local_support_block;
 
 /// ITK's `m_SmallParameterVariation` default.
 const SMALL_PARAMETER_VARIATION: f64 = 0.01;
@@ -149,7 +151,7 @@ impl PhysicalShiftScales {
             let mut blocks = Vec::new();
             for s in 0..n {
                 let p = &sample_points[s * dim..(s + 1) * dim];
-                if let Some(block) = transform.local_support_jacobian(p) {
+                if let Some(block) = local_support_block(transform, p) {
                     blocks.push(block);
                 }
             }
