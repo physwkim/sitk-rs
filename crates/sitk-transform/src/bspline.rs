@@ -595,6 +595,111 @@ mod tests {
         }
     }
 
+    /// The reference grid used by the single-coefficient tests: domain
+    /// `[0, 10]²`, mesh 5 ⇒ `gridSpacing = 2`, `gridSize = 8`, `gridOrigin = −2`.
+    /// Continuous grid index of physical `p` is `(p + 2) / 2`, so grid index
+    /// `g` sits at physical `2g − 2`, and the valid region `[1, 6)` in index
+    /// space is physical `[0, 10)`.
+    fn mesh5_grid() -> BSplineTransform {
+        BSplineTransform::new(2, &[0.0, 0.0], &[10.0, 10.0], &matrix::identity(2), &[5, 5]).unwrap()
+    }
+
+    /// Set exactly one control-point coefficient: grid point `(gx, gy)` of
+    /// output dimension `d`.
+    fn one_coefficient(t: &mut BSplineTransform, d: usize, gx: usize, gy: usize, value: f64) {
+        let per = t.number_of_parameters_per_dimension();
+        let mut params = vec![0.0; t.number_of_parameters()];
+        params[d * per + gy * t.grid_size()[0] + gx] = value;
+        t.set_parameters(&params);
+    }
+
+    #[test]
+    fn a_single_coefficient_displaces_by_the_hand_derived_weight() {
+        // Coefficient 1.0 at control point (2, 2), dimension 0. At an integer
+        // grid index g the support is [g−1, g+2] with 1-D weights
+        // B₃(1), B₃(0), B₃(−1), B₃(−2) = 1/6, 2/3, 1/6, 0; at a half index the
+        // taps are 1/48, 23/48, 23/48, 1/48. Displacement is the tensor product
+        // of the two axes' weights on control point (2, 2).
+        let mut t = mesh5_grid();
+        one_coefficient(&mut t, 0, 2, 2, 1.0);
+
+        // (physical point, expected x-displacement)
+        let cases: [([f64; 2], f64); 4] = [
+            // grid index (2, 2): control point 2 sits at support offset 1 ⇒ 2/3 per axis.
+            ([2.0, 2.0], (2.0 / 3.0) * (2.0 / 3.0)),
+            // grid index (3, 3): support [2, 5], control point 2 at offset 0 ⇒ 1/6 per axis.
+            ([4.0, 4.0], (1.0 / 6.0) * (1.0 / 6.0)),
+            // grid index (2.5, 2): x taps 1/48, 23/48, 23/48, 1/48 over [1, 4] ⇒
+            // control point 2 gets 23/48; y weight is 2/3.
+            ([3.0, 2.0], (23.0 / 48.0) * (2.0 / 3.0)),
+            // grid index (1, 1): support [0, 3], control point 2 at offset 2 ⇒ 1/6 per axis.
+            ([0.0, 0.0], (1.0 / 6.0) * (1.0 / 6.0)),
+        ];
+        for (p, want_dx) in cases {
+            let out = t.transform_point(&p);
+            assert!(
+                (out[0] - (p[0] + want_dx)).abs() < 1e-12,
+                "{p:?}: dx {} vs {want_dx}",
+                out[0] - p[0]
+            );
+            assert!(
+                (out[1] - p[1]).abs() < 1e-12,
+                "{p:?}: dimension-0 coefficient leaked into y ({})",
+                out[1] - p[1]
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_coefficient_leaves_points_outside_its_support_untouched() {
+        // The cubic support of control point (2, 2) is grid index (0, 4)² —
+        // open at 4 since B₃(±2) = 0. Points whose support region excludes
+        // control point 2 on either axis get exactly zero displacement, even
+        // though they are well inside the valid region.
+        let mut t = mesh5_grid();
+        one_coefficient(&mut t, 0, 2, 2, 5.0);
+        // grid index (4, 4) → physical (6, 6); grid index (2, 4) → (2, 6);
+        // grid index (4, 2) → (6, 2); grid index (5, 5) → (8, 8).
+        for p in &[[6.0, 6.0], [2.0, 6.0], [6.0, 2.0], [8.0, 8.0]] {
+            let out = t.transform_point(p);
+            assert_eq!(out, p.to_vec(), "point {p:?} outside the support moved");
+        }
+    }
+
+    #[test]
+    fn a_dimension_one_coefficient_displaces_only_y() {
+        // Parameter ordering is all-X then all-Y: the same flat grid offset in
+        // the second half of the vector must drive the y displacement and
+        // nothing else, with the identical weight.
+        let mut t = mesh5_grid();
+        one_coefficient(&mut t, 1, 2, 2, 1.0);
+        let out = t.transform_point(&[2.0, 2.0]);
+        let want_dy = (2.0 / 3.0) * (2.0 / 3.0);
+        assert!((out[0] - 2.0).abs() < 1e-12, "x moved: {}", out[0]);
+        assert!(
+            (out[1] - (2.0 + want_dy)).abs() < 1e-12,
+            "dy {} vs {want_dy}",
+            out[1] - 2.0
+        );
+    }
+
+    #[test]
+    fn parameters_round_trip_in_itk_ordering() {
+        // `parameters()` must return exactly what `set_parameters` was given —
+        // the `dim` coefficient grids concatenated, each in first-axis-fastest
+        // raster order (`itk::BSplineBaseTransform::WrapAsImages`). A transposed
+        // or interleaved layout would survive a length check but not this one.
+        let mut t = mesh5_grid();
+        let n = t.number_of_parameters();
+        assert_eq!(n, 2 * 8 * 8);
+        assert_eq!(t.number_of_parameters_per_dimension(), 64);
+        assert!(t.parameters().iter().all(|&v| v == 0.0));
+
+        let params: Vec<f64> = (0..n).map(|i| i as f64 * 0.5 - 3.0).collect();
+        t.set_parameters(&params);
+        assert_eq!(t.parameters(), params);
+    }
+
     #[test]
     fn points_outside_the_valid_region_are_unmapped() {
         // A far-outside point gets zero displacement even with non-zero
