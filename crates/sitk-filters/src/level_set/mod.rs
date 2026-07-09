@@ -1,7 +1,8 @@
 //! Segmentation level-set filters: `GeodesicActiveContourLevelSetImageFilter`,
 //! `ShapeDetectionLevelSetImageFilter`,
-//! `ThresholdSegmentationLevelSetImageFilter` and
-//! `LaplacianSegmentationLevelSetImageFilter`.
+//! `ThresholdSegmentationLevelSetImageFilter`,
+//! `LaplacianSegmentationLevelSetImageFilter` and
+//! `CannySegmentationLevelSetImageFilter`.
 //!
 //! Ported from ITK's `Modules/Segmentation/LevelSets` and
 //! `Modules/Core/FiniteDifference`:
@@ -11,13 +12,13 @@
 //! | [`grid`] | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
 //! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx` |
 //! | [`sparse_field`] | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
-//! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx` plus each filter's `itk*LevelSetFunction.h/.hxx` + `itk*LevelSetImageFilter.h/.hxx` pair |
+//! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx` plus the five `itk*LevelSetFunction.h/.hxx` + `itk*LevelSetImageFilter.h/.hxx` pairs |
 //!
-//! Every filter takes an **initial level set** — a real image whose zero
-//! crossing is the starting front, negative inside — and a **feature image**,
-//! from which that filter's `CalculateSpeedImage` derives the speed. The output
-//! is the evolved level set: negative inside the segmented region, positive
-//! outside, with the zero crossing on the front. (ITK's own
+//! Every filter takes an **initial level set** — a real image whose
+//! `iso_surface_value` contour is the starting front, negative inside — and a
+//! **feature image**, from which that filter's `CalculateSpeedImage` derives the
+//! speed. The output is the evolved level set: negative inside the segmented
+//! region, positive outside, with the zero crossing on the front. (ITK's own
 //! `ThresholdSegmentationLevelSetImageFilter` header, copied into SimpleITK's
 //! yaml, states the opposite sign convention; the code follows the convention
 //! stated here, so the doc is simply wrong.)
@@ -27,34 +28,30 @@
 //! inside homogeneous regions), typically `1 / (1 + |grad(G * I)|)`
 //! ([`bounded_reciprocal`](crate::bounded_reciprocal) of
 //! [`gradient_magnitude_recursive_gaussian`](crate::gradient_magnitude_recursive_gaussian)),
-//! and the speed image is a verbatim copy of it. For
-//! [`threshold_segmentation_level_set`] and
-//! [`laplacian_segmentation_level_set`] the feature image is the raw image to
-//! segment.
+//! and the speed image is a verbatim copy of it. For the other three the feature
+//! image is the raw image to segment.
 //!
-//! SimpleITK's yamls declare all four for `RealPixelIDTypeList`; ITK's
+//! SimpleITK's yamls declare all five for `RealPixelIDTypeList`; ITK's
 //! `TOutputPixelType` template parameter defaults to `float`, so the output is
-//! always [`PixelId::Float32`] regardless of input type. `IsoSurfaceValue` is
-//! fixed at `0` by `SegmentationLevelSetImageFilter`'s constructor and none of
-//! these four SimpleITK filters exposes it, so the shifted image equals the
-//! initial level set.
+//! always [`PixelId::Float32`] regardless of input type.
 //!
 //! ## Upstream behaviour reproduced here
 //!
 //! * **The functions' `Initialize` weights never survive.** Each
 //!   `SegmentationLevelSetFunction` subclass's `Initialize(radius)` installs its
 //!   own default weights — `ThresholdSegmentationLevelSetFunction` and
-//!   `LaplacianSegmentationLevelSetFunction` both set the propagation weight to
-//!   `-1` and the curvature weight to `+1`. But
-//!   `Initialize` runs from `SetSegmentationFunction`, i.e. in the filter's
-//!   constructor (itkSegmentationLevelSetImageFilter.h:457-467), and SimpleITK's
-//!   generated `Execute` then calls `SetPropagationScaling`/`SetCurvatureScaling`
-//!   unconditionally. So the exposed scalings *are* the weights, and these ports
-//!   take them directly.
+//!   `LaplacianSegmentationLevelSetFunction` set the propagation weight to
+//!   `-1`, `CannySegmentationLevelSetFunction` sets both the propagation and
+//!   advection weights to `-1`. But `Initialize` runs from
+//!   `SetSegmentationFunction`, i.e. in the filter's constructor
+//!   (itkSegmentationLevelSetImageFilter.h:457-467), and SimpleITK's generated
+//!   `Execute` then calls `SetPropagationScaling`/`SetCurvatureScaling`/
+//!   `SetAdvectionScaling` unconditionally. So the exposed scalings *are* the
+//!   weights, and these ports take them directly.
 //!
 //! * **`CurvatureSpeed` differs between the filters.** Only the geodesic active
 //!   contour and shape detection functions override it to return
-//!   `PropagationSpeed`; the threshold and Laplacian functions inherit
+//!   `PropagationSpeed`; the threshold, Laplacian and Canny functions inherit
 //!   `LevelSetFunction::CurvatureSpeed`'s constant `1`, so their curvature term
 //!   is not damped by the speed image.
 //!
@@ -65,17 +62,30 @@
 //!   `ThresholdSegmentationLevelSetImageFilter.yaml` exposes none of the four,
 //!   and ITK's constructor sets `m_EdgeWeight = 0`, so the branch is
 //!   unreachable through the SimpleITK API and is not ported.
+//!
+//! ## Where this port is deliberately better defined than ITK
+//!
+//! ITK generates the speed image only when the propagation weight is non-zero
+//! (`SegmentationLevelSetImageFilter::GenerateData`). For
+//! `CannySegmentationLevelSetImageFilter` with `propagation_scaling == 0` and
+//! `advection_scaling != 0` that leaves `CalculateAdvectionImage` computing its
+//! distance map into the *unallocated* speed image's requested region
+//! (itkCannySegmentationLevelSetFunction.hxx:95), producing an empty advection
+//! field. This port always builds the speed image first, so the advection field
+//! is well defined at `propagation_scaling == 0`.
 
 mod function;
 mod grid;
 mod sparse_field;
 
-use crate::canny::zero_crossing_values;
+use crate::canny::{canny_edge_detection, zero_crossing_values};
+use crate::distance::danielsson_distance_map;
 use crate::error::{FilterError, Result};
 use crate::gradient::laplacian;
 use crate::image_from_f64;
 use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
 use function::{CurvatureSpeed, LevelSetFunction};
+use grid::Grid;
 use sitk_core::{Image, PixelId};
 use sparse_field::SparseFieldSolver;
 
@@ -84,6 +94,15 @@ use sparse_field::SparseFieldSolver;
 /// and SimpleITK does not expose `SetDerivativeSigma`, so it is a constant
 /// here.
 const DERIVATIVE_SIGMA: f64 = 1.0;
+
+/// `CannySegmentationLevelSetFunction::CalculateDistanceImage` (hxx:93) sets
+/// the Canny detector's `MaximumError` to this on every axis; SimpleITK exposes
+/// only `Threshold` and `Variance`.
+const CANNY_MAXIMUM_ERROR: f64 = 0.01;
+
+/// `CannyEdgeDetectionImageFilter`'s constructor leaves `m_LowerThreshold` at
+/// zero and the Canny level-set function never sets it.
+const CANNY_LOWER_THRESHOLD: f64 = 0.0;
 
 /// The evolved level set together with the two measurements SimpleITK reports:
 /// `GetElapsedIterations()` and `GetRMSChange()`.
@@ -155,6 +174,7 @@ pub fn geodesic_active_contour_level_set(
                 curvature: curvature_scaling,
                 advection: advection_scaling,
             },
+            iso_surface_value: 0.0,
             maximum_rms_error,
             number_of_iterations,
             reverse_expansion_direction,
@@ -204,6 +224,7 @@ pub fn shape_detection_level_set(
                 curvature: curvature_scaling,
                 advection: 0.0,
             },
+            iso_surface_value: 0.0,
             maximum_rms_error,
             number_of_iterations,
             reverse_expansion_direction,
@@ -265,6 +286,7 @@ pub fn threshold_segmentation_level_set(
                 curvature: curvature_scaling,
                 advection: 0.0,
             },
+            iso_surface_value: 0.0,
             maximum_rms_error,
             number_of_iterations,
             reverse_expansion_direction,
@@ -318,11 +340,110 @@ pub fn laplacian_segmentation_level_set(
                 curvature: curvature_scaling,
                 advection: 0.0,
             },
+            iso_surface_value: 0.0,
             maximum_rms_error,
             number_of_iterations,
             reverse_expansion_direction,
         },
     )
+}
+
+/// The evolved level set of [`canny_segmentation_level_set`], which reports one
+/// extra measurement beyond [`LevelSetResult`]: `GetCannyImage()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CannyLevelSetResult {
+    /// The output level set, [`PixelId::Float32`]. Negative inside the
+    /// segmented region, positive outside.
+    pub image: Image,
+    /// Number of iterations actually run before `Halt()` returned true.
+    pub elapsed_iterations: u32,
+    /// The RMS change of the final iteration.
+    pub rms_change: f64,
+    /// `GetCannyImage()`: the Canny edge map the speed and advection images
+    /// were built from, [`PixelId::Float32`], `1` on edges and `0` elsewhere.
+    pub canny_image: Image,
+}
+
+/// `CannySegmentationLevelSetImageFilter`: the speed is the distance to the
+/// feature image's Canny edges and the advection field is that distance times
+/// its own gradient, so the front is drawn onto the edges and pinned there.
+///
+/// `CannySegmentationLevelSetFunction::CalculateDistanceImage` (hxx:71-97) runs
+/// `CannyEdgeDetectionImageFilter` with `UpperThreshold = threshold`,
+/// `Variance = variance` and `MaximumError = 0.01` (its `LowerThreshold` is
+/// left at the constructor's `0`), then a `DanielssonDistanceMapImageFilter` at
+/// its defaults (unsquared distance, `UseImageSpacing` on). `CalculateSpeedImage`
+/// grafts that distance map in; `CalculateAdvectionImage` (hxx:40-68) multiplies
+/// `GradientImageFilter`'s central-difference gradient of the distance map by
+/// the distance map itself.
+///
+/// The curvature term is not modulated by the speed (`CurvatureSpeed` is the
+/// base constant `1`). `iso_surface_value` selects which isocontour of the
+/// initial image seeds the front: `SparseFieldLevelSetImageFilter::
+/// CopyInputToOutput` subtracts it from the input before taking zero crossings.
+///
+/// Argument order follows SimpleITK's
+/// `CannySegmentationLevelSetImageFilter.yaml`; its defaults are
+/// `threshold = 0.0`, `variance = 0.0`, `maximum_rms_error = 0.02`, all three
+/// scalings `1.0`, `number_of_iterations = 1000`,
+/// `reverse_expansion_direction = false`, `iso_surface_value = 0.0`.
+///
+/// Errors if the two images differ in size, or if `variance` is negative
+/// (`GaussianOperator`'s constraint, surfaced by
+/// [`canny_edge_detection`](crate::canny_edge_detection)).
+#[allow(clippy::too_many_arguments)]
+pub fn canny_segmentation_level_set(
+    initial_level_set: &Image,
+    feature_image: &Image,
+    threshold: f64,
+    variance: f64,
+    maximum_rms_error: f64,
+    propagation_scaling: f64,
+    curvature_scaling: f64,
+    advection_scaling: f64,
+    number_of_iterations: u32,
+    reverse_expansion_direction: bool,
+    iso_surface_value: f64,
+) -> Result<CannyLevelSetResult> {
+    check_same_size(initial_level_set, feature_image)?;
+
+    let (canny_image, distance) = canny_distance_image(feature_image, threshold, variance)?;
+    let speed = distance.to_f64_vec();
+    let advection = if advection_scaling == 0.0 {
+        Vec::new()
+    } else {
+        canny_advection_field(&distance, &speed)
+    };
+
+    let result = solve(
+        initial_level_set,
+        Solve {
+            speed,
+            advection,
+            curvature_speed: CurvatureSpeed::Unit,
+            weights: Weights {
+                propagation: propagation_scaling,
+                curvature: curvature_scaling,
+                advection: advection_scaling,
+            },
+            iso_surface_value,
+            maximum_rms_error,
+            number_of_iterations,
+            reverse_expansion_direction,
+        },
+    )?;
+
+    Ok(CannyLevelSetResult {
+        image: result.image,
+        elapsed_iterations: result.elapsed_iterations,
+        rms_change: result.rms_change,
+        canny_image: image_from_f64(
+            PixelId::Float32,
+            canny_image.size(),
+            &canny_image,
+            &canny_image.to_f64_vec(),
+        )?,
+    })
 }
 
 /// The three term weights, before `ReverseExpansionDirection` is applied.
@@ -344,6 +465,8 @@ struct Solve {
     advection: Vec<Vec<f64>>,
     curvature_speed: CurvatureSpeed,
     weights: Weights,
+    /// `SparseFieldLevelSetImageFilter::m_IsoSurfaceValue`.
+    iso_surface_value: f64,
     maximum_rms_error: f64,
     number_of_iterations: u32,
     reverse_expansion_direction: bool,
@@ -380,10 +503,17 @@ fn solve(initial_level_set: &Image, s: Solve) -> Result<LevelSetResult> {
         &spacing,
     );
 
-    // `CopyInputToOutput`: shift by the iso-surface value (zero), then graft the
-    // zero-crossing map onto the output as the seed of the active layer.
-    let shifted = initial_level_set.to_f64_vec();
-    let zero_crossings = zero_crossing_values(&scratch_f64(initial_level_set)?, 0.0, 1.0)?;
+    // `CopyInputToOutput`: shift the input by the iso-surface value, then graft
+    // the shifted image's zero-crossing map onto the output as the seed of the
+    // active layer.
+    let shifted: Vec<f64> = initial_level_set
+        .to_f64_vec()
+        .into_iter()
+        .map(|v| v - s.iso_surface_value)
+        .collect();
+    let mut shifted_image = Image::from_vec(initial_level_set.size(), shifted.clone())?;
+    shifted_image.copy_geometry_from(initial_level_set);
+    let zero_crossings = zero_crossing_values(&shifted_image, 0.0, 1.0)?;
 
     let solver = SparseFieldSolver::new(
         initial_level_set.size(),
@@ -470,6 +600,59 @@ fn threshold_speed(feature_image: &Image, lower_threshold: f64, upper_threshold:
 /// `LaplacianImageFilter` on the cast feature image, `UseImageSpacing` on.
 fn laplacian_speed(feature_image: &Image) -> Result<Vec<f64>> {
     Ok(laplacian(&scratch_f64(feature_image)?, true)?.to_f64_vec())
+}
+
+/// `CannySegmentationLevelSetFunction::CalculateDistanceImage` (hxx:71-97):
+/// the Canny edge map of the feature image, and the unsigned distance transform
+/// to it. Returned as `(canny, distance)`.
+fn canny_distance_image(
+    feature_image: &Image,
+    threshold: f64,
+    variance: f64,
+) -> Result<(Image, Image)> {
+    let dim = feature_image.dimension();
+    let canny = canny_edge_detection(
+        &scratch_f64(feature_image)?,
+        &vec![variance; dim],
+        &vec![CANNY_MAXIMUM_ERROR; dim],
+        threshold,
+        CANNY_LOWER_THRESHOLD,
+    )?;
+    // `DanielssonDistanceMapImageFilter` at its defaults: `SquaredDistance` off,
+    // `UseImageSpacing` on (itkDanielssonDistanceMapImageFilter.h:209).
+    let distance = danielsson_distance_map(&canny, false, true)?;
+    Ok((canny, distance))
+}
+
+/// `CannySegmentationLevelSetFunction::CalculateAdvectionImage` (hxx:40-68):
+/// `GradientImageFilter`'s gradient of the distance map, multiplied pixelwise
+/// by the distance map. Stored as one `f64` buffer per axis.
+///
+/// `GradientImageFilter` (hxx:105-125) applies a first-order `DerivativeOperator`
+/// scaled by `1 / spacing[d]`, i.e. the central difference
+/// `(f(x+e_d) - f(x-e_d)) / (2 spacing[d])`, under a
+/// `ZeroFluxNeumannBoundaryCondition`. Its `m_UseImageDirection` reorientation
+/// is not applied, matching the rest of this crate's gradient filters, which
+/// assume identity direction cosines.
+fn canny_advection_field(distance: &Image, values: &[f64]) -> Vec<Vec<f64>> {
+    let grid = Grid::new(distance.size());
+    let dim = grid.dim();
+    let spacing = distance.spacing();
+
+    let mut fields = vec![vec![0.0; values.len()]; dim];
+    let mut coord = vec![0i64; dim];
+    for (p, &center) in values.iter().enumerate() {
+        coord.copy_from_slice(&grid.coord(p));
+        for (d, field) in fields.iter_mut().enumerate() {
+            coord[d] += 1;
+            let forward = values[grid.clamped_index(&coord)];
+            coord[d] -= 2;
+            let backward = values[grid.clamped_index(&coord)];
+            coord[d] += 1;
+            field[p] = (forward - backward) / (2.0 * spacing[d]) * center;
+        }
+    }
+    fields
 }
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry.
@@ -1194,6 +1377,379 @@ mod tests {
                 a: vec![N, N],
                 b: vec![8, 8],
             })
+        );
+    }
+
+    // ======================================================================
+    // CannySegmentationLevelSetImageFilter
+    // ======================================================================
+
+    /// A `9 x 7` step edge: `0` for `x < 4`, `100` for `x >= 4`.
+    fn step_edge() -> Image {
+        let mut values = vec![0.0; 9 * 7];
+        for y in 0..7 {
+            for x in 4..9 {
+                values[x + 9 * y] = 100.0;
+            }
+        }
+        Image::from_vec(&[9, 7], values).unwrap()
+    }
+
+    /// The speed image is the unsigned distance to the Canny edges. At
+    /// `threshold = 10`, `variance = 0` the detector marks columns `2` and `3`
+    /// on every row, so the distance along a row is `min(|x - 2|, |x - 3|)`.
+    #[test]
+    fn canny_speed_is_the_distance_to_the_canny_edges() {
+        let (canny, distance) = canny_distance_image(&step_edge(), 10.0, 0.0).unwrap();
+
+        let edges = canny.to_f64_vec();
+        let expected_edges: Vec<f64> = (0..9)
+            .map(|x| f64::from(u8::from(x == 2 || x == 3)))
+            .collect();
+        for y in 0..7 {
+            assert_eq!(&edges[9 * y..9 * (y + 1)], &expected_edges[..], "row {y}");
+        }
+
+        let expected: Vec<f64> = (0..9)
+            .map(|x: i32| f64::from((x - 2).abs().min((x - 3).abs())))
+            .collect();
+        let d = distance.to_f64_vec();
+        for y in 0..7 {
+            assert_eq!(&d[9 * y..9 * (y + 1)], &expected[..], "row {y}");
+        }
+    }
+
+    /// The advection field is `d * grad(d)` with `grad` the central difference
+    /// `(d(x+1) - d(x-1)) / (2 * spacing)` under a zero-flux boundary. Along a
+    /// row `d = [2, 1, 0, 0, 1, 2, 3, 4, 5]` that is
+    /// `[-1, -1, 0, 0, 1, 2, 3, 4, 2.5]`, and the `y` component is zero because
+    /// `d` is constant down every column.
+    #[test]
+    fn canny_advection_field_is_the_distance_times_its_own_gradient() {
+        let (_, distance) = canny_distance_image(&step_edge(), 10.0, 0.0).unwrap();
+        let values = distance.to_f64_vec();
+        let field = canny_advection_field(&distance, &values);
+
+        let expected_x = [-1.0, -1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 2.5];
+        for y in 0..7 {
+            assert_eq!(&field[0][9 * y..9 * (y + 1)], &expected_x[..], "row {y}");
+            assert_eq!(&field[1][9 * y..9 * (y + 1)], &[0.0; 9][..], "row {y}");
+        }
+    }
+
+    /// `advection_scaling == 0` leaves the advection buffer unallocated, exactly
+    /// as `SegmentationLevelSetImageFilter::GenerateData` skips
+    /// `GenerateAdvectionImage`.
+    #[test]
+    fn canny_zero_advection_scaling_runs_without_an_advection_field() {
+        let result = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &disk_indicator(12.0),
+            0.1,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            5,
+            false,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(result.elapsed_iterations, 5);
+    }
+
+    /// End to end, at SimpleITK's own `cthead` regression settings
+    /// (`Threshold = 5`, `Variance = 1`, `PropagationScaling = 1`,
+    /// `CurvatureScaling = 0`, `AdvectionScaling = 0.1`): a seed circle of
+    /// radius `4` inside a bright disk of radius `12` grows under the
+    /// distance-to-edge speed and freezes on the disk's Canny edge ring, where
+    /// the distance — hence both the propagation speed and the advection field
+    /// `d grad(d)` — is exactly zero. The update over the whole active layer
+    /// then vanishes, `rms_change` is exactly `0`, and `Halt()` fires far short
+    /// of the iteration cap.
+    #[test]
+    fn canny_grows_a_seed_onto_the_disk_edge_and_freezes_there() {
+        let result = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(12.0),
+            5.0,
+            1.0,
+            0.02,
+            1.0,
+            0.0,
+            0.1,
+            400,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        // The Canny ring the front is chasing.
+        let edges = result.canny_image.to_f64_vec();
+        let inner_edge = (0..N)
+            .flat_map(|y| (0..N).map(move |x| (x, y)))
+            .filter(|&(x, y)| edges[x + N * y] == 1.0)
+            .map(|(x, y)| radius_from(x, y))
+            .fold(f64::MAX, f64::min);
+        assert!(
+            inner_edge > 11.0 && inner_edge < 12.1,
+            "ring at {inner_edge}"
+        );
+
+        let radius = enclosed_radius(&result.image);
+        assert!(
+            (radius - inner_edge).abs() < 0.5,
+            "front settled at radius {radius}, Canny ring starts at {inner_edge}"
+        );
+        assert_eq!(result.rms_change, 0.0);
+        assert!(result.elapsed_iterations < 400);
+    }
+
+    /// The front is stationary once it reaches the ring: iteration 100 and
+    /// iteration 200 give bit-identical level sets. Run with
+    /// `maximum_rms_error == 0` so `Halt()` cannot end either run early.
+    #[test]
+    fn canny_front_does_not_drift_after_reaching_the_edge() {
+        let early = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(12.0),
+            5.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            0.1,
+            100,
+            false,
+            0.0,
+        )
+        .unwrap();
+        let late = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(12.0),
+            5.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            0.1,
+            200,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(early.elapsed_iterations, 100);
+        assert_eq!(late.elapsed_iterations, 200);
+        assert_eq!(early.image.to_f64_vec(), late.image.to_f64_vec());
+    }
+
+    /// The advection field `d grad(d)` points *away* from the Canny edges (it
+    /// is `d` times the ascent direction of the distance map), so with a
+    /// positive advection weight it opposes the outward propagation rather than
+    /// reinforcing it. At SimpleITK's default `advection_scaling = 1.0` — equal
+    /// to the propagation scaling — advection wins on this phantom and the seed
+    /// collapses to nothing.
+    ///
+    /// This is upstream behaviour, not a port artefact:
+    /// `CannySegmentationLevelSetFunction::Initialize` sets the propagation and
+    /// advection weights to `-1`, but SimpleITK's generated `Execute`
+    /// overwrites both with the exposed scalings, whose defaults are `+1`. ITK's
+    /// own regression test picks `propagation = 0.5`, `advection = 1.0` on a
+    /// binary seed at `iso_surface_value = 0.5`; the balance is
+    /// application-specific.
+    #[test]
+    fn canny_default_advection_scaling_opposes_the_propagation_term() {
+        let collapsed = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &plateau(12.0),
+            5.0,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            200,
+            false,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(enclosed_radius(&collapsed.image), 0.0);
+    }
+
+    /// `ReverseExpansionDirection` negates *both* the propagation and advection
+    /// weights, so it equals negating both scalings.
+    #[test]
+    fn canny_reverse_expansion_direction_negates_propagation_and_advection() {
+        let feature = disk_indicator(12.0);
+        let reversed = canny_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            0.1,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            15,
+            true,
+            0.0,
+        )
+        .unwrap();
+        let negated = canny_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            0.1,
+            1.0,
+            0.0,
+            -1.0,
+            1.0,
+            -1.0,
+            15,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+    }
+
+    /// `iso_surface_value` selects which isocontour of the initial image seeds
+    /// the front: `CopyInputToOutput` subtracts it before taking zero crossings.
+    /// Seeding the `-4` contour of a signed distance to a circle of radius `8`
+    /// is the same as seeding the zero contour of a circle of radius `4`.
+    #[test]
+    fn canny_iso_surface_value_shifts_the_initial_contour() {
+        let feature = disk_indicator(12.0);
+        let shifted = canny_segmentation_level_set(
+            &circle_level_set(8.0),
+            &feature,
+            0.1,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            10,
+            false,
+            -4.0,
+        )
+        .unwrap();
+        let seeded_directly = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &feature,
+            0.1,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            10,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shifted.image.to_f64_vec(),
+            seeded_directly.image.to_f64_vec()
+        );
+    }
+
+    /// `GetCannyImage()` is reported as a measurement, `Float32`, `1` on edges.
+    #[test]
+    fn canny_reports_the_edge_map_it_used() {
+        let result = canny_segmentation_level_set(
+            &circle_level_set(4.0),
+            &disk_indicator(12.0),
+            0.1,
+            1.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            1,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(result.canny_image.pixel_id(), PixelId::Float32);
+        assert_eq!(result.canny_image.size(), &[N, N]);
+        let edges = result.canny_image.to_f64_vec();
+        assert!(edges.iter().all(|&v| v == 0.0 || v == 1.0));
+        let on = edges.iter().filter(|&&v| v == 1.0).count();
+        assert!(on > 0, "the disk's boundary produced no Canny edges");
+    }
+
+    #[test]
+    fn canny_zero_iterations_leaves_the_contour_where_it_started() {
+        let result = canny_segmentation_level_set(
+            &circle_level_set(8.0),
+            &disk_indicator(12.0),
+            0.1,
+            1.0,
+            0.02,
+            1.0,
+            1.0,
+            1.0,
+            0,
+            false,
+            0.0,
+        )
+        .unwrap();
+
+        assert_eq!(result.elapsed_iterations, 0);
+        assert_eq!(result.rms_change, 0.0);
+        assert!((enclosed_radius(&result.image) - 8.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn canny_rejects_mismatched_input_sizes() {
+        let feature = Image::from_vec(&[8, 8], vec![1.0; 64]).unwrap();
+        assert_eq!(
+            canny_segmentation_level_set(
+                &circle_level_set(8.0),
+                &feature,
+                0.0,
+                0.0,
+                0.02,
+                1.0,
+                1.0,
+                1.0,
+                10,
+                false,
+                0.0
+            )
+            .unwrap_err(),
+            FilterError::SizeMismatch {
+                a: vec![N, N],
+                b: vec![8, 8],
+            }
+        );
+    }
+
+    /// A negative `variance` is `GaussianOperator`'s error, surfaced through
+    /// `canny_edge_detection`.
+    #[test]
+    fn canny_rejects_a_negative_variance() {
+        assert_eq!(
+            canny_segmentation_level_set(
+                &circle_level_set(8.0),
+                &disk_indicator(12.0),
+                0.0,
+                -1.0,
+                0.02,
+                1.0,
+                1.0,
+                1.0,
+                10,
+                false,
+                0.0
+            )
+            .unwrap_err(),
+            FilterError::InvalidVariance(vec![-1.0, -1.0])
         );
     }
 }
