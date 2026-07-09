@@ -40,6 +40,7 @@ pub mod logic;
 pub mod math;
 pub mod morphology;
 pub mod noise;
+pub mod projection;
 mod random;
 pub mod reconstruction;
 pub mod recursive_gaussian;
@@ -88,6 +89,10 @@ pub use morphology::{
     grayscale_morphological_closing, grayscale_morphological_opening, white_top_hat,
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
+pub use projection::{
+    binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
+    standard_deviation_projection, sum_projection,
+};
 pub use reconstruction::{
     grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima, h_minima,
     reconstruction_by_dilation, reconstruction_by_erosion,
