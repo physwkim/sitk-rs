@@ -32,6 +32,7 @@ pub mod error;
 pub mod functor;
 pub mod geometry;
 pub mod gradient;
+mod histogram;
 pub mod intensity;
 pub mod label;
 pub mod logic;
@@ -41,6 +42,7 @@ pub mod recursive_gaussian;
 pub mod region_growing;
 pub mod shrink;
 pub mod smoothing;
+pub mod threshold;
 
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use denoise::{bilateral, binomial_blur, curvature_flow, discrete_gaussian, mean, median};
@@ -87,6 +89,11 @@ pub use region_growing::{
 pub use shrink::shrink;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 pub use smoothing::smooth_gaussian;
+pub use threshold::{
+    huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
+    li_threshold, maximum_entropy_threshold, moments_threshold, renyi_entropy_threshold,
+    shanbhag_threshold, threshold, yen_threshold,
+};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //
