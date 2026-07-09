@@ -43,6 +43,43 @@ pub enum FilterError {
     #[error("relabel needs more than {max} object labels, exceeding the output pixel type's range")]
     TooManyObjects { max: u64 },
 
+    /// `RegionOfInterestImageFilter`'s requested region does not fit inside
+    /// the input's `LargestPossibleRegion`.
+    #[error(
+        "region [index={index:?}, size={size:?}] does not fit inside input of size {input_size:?}"
+    )]
+    RegionOutOfBounds {
+        index: Vec<usize>,
+        size: Vec<usize>,
+        input_size: Vec<usize>,
+    },
+
+    /// `CropImageFilter::VerifyInputInformation`: the requested crop bounds
+    /// exceed the input's size along some axis.
+    #[error("axis {axis} crop bounds (lower={lower}, upper={upper}) exceed input size {size}")]
+    InvalidCropBounds {
+        axis: usize,
+        lower: usize,
+        upper: usize,
+        size: usize,
+    },
+
+    /// `ExtractImageFilter::SetExtractionRegion`: every size component was
+    /// zero, leaving no output dimensions.
+    #[error("extraction size collapses every axis; at least one axis must be non-zero")]
+    ExtractCollapsedAllAxes,
+
+    /// `ExtractImageFilter::GenerateOutputInformation`
+    /// (`DIRECTIONCOLLAPSETOSUBMATRIX`): the submatrix of retained direction
+    /// cosines is singular.
+    #[error("collapsed direction submatrix is singular")]
+    SingularCollapsedDirection,
+
+    /// `PermuteAxesImageFilter::SetOrder`: `order` is not a rearrangement of
+    /// `0..dim`.
+    #[error("order {0:?} is not a permutation of 0..{1}")]
+    InvalidPermutation(Vec<usize>, usize),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

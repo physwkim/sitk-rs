@@ -28,6 +28,7 @@
 pub mod distance;
 pub mod error;
 pub mod functor;
+pub mod geometry;
 pub mod label;
 pub mod recursive_gaussian;
 pub mod shrink;
@@ -38,6 +39,9 @@ pub use distance::{
 };
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use geometry::{
+    constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
+};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use shrink::shrink;
