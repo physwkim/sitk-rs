@@ -136,6 +136,18 @@ pub enum FilterError {
     #[error("{which} must be non-empty")]
     EmptySeeds { which: &'static str },
 
+    /// `FastMarchingImageFilter::GenerateData` throws "Normalization Factor
+    /// is null or negative" when `m_NormalizationFactor < itk::Math::eps`
+    /// (`f64::EPSILON`).
+    #[error("normalization_factor must be >= f64::EPSILON, got {0}")]
+    InvalidNormalizationFactor(f64),
+
+    /// `FastMarchingImageFilter::UpdateValue` throws "Discriminant of
+    /// quadratic equation is negative" rather than picking a root, when the
+    /// upwind quadratic `bb^2 - aa*cc` comes out below zero.
+    #[error("discriminant of the fast marching quadratic equation is negative")]
+    NegativeDiscriminant,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
