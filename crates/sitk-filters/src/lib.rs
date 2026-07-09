@@ -28,6 +28,7 @@
 pub mod distance;
 pub mod error;
 pub mod functor;
+pub mod geometry;
 pub mod gradient;
 pub mod intensity;
 pub mod label;
@@ -41,6 +42,9 @@ pub use distance::{
 };
 pub use error::{FilterError, Result};
 pub use functor::{BinaryFunctor, UnaryFunctor};
+pub use geometry::{
+    constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
+};
 pub use gradient::{
     derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
     laplacian_recursive_gaussian, sobel_edge_detection,

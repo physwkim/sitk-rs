@@ -100,6 +100,36 @@ impl<T: Scalar> BoundaryCondition<T> for PeriodicBoundaryCondition {
     }
 }
 
+/// Reflects out-of-bounds indices back into the image, repeating the edge
+/// pixel: period `2 * size`, tiling `[0, size)` direct then `[size, 2*size)`
+/// reversed (so index `-1` reads the same pixel as index `0`, index `-2` the
+/// same as index `1`, etc).
+///
+/// `MirrorPadImageFilter` has no standalone `itk::ImageBoundaryCondition`
+/// class to port from; it implements this index mapping directly in
+/// `RegionIsOdd`/`ConvertOutputIndexToInputIndex`
+/// (itkMirrorPadImageFilter.hxx). The closed form here is verified against
+/// that filter's own ground-truth test (`itkMirrorPadImageTest.cxx`'s
+/// `VerifyPixel`, sizes 8 and 12: index `-1` maps to `0`, index `size` maps
+/// to `size - 1`, etc).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MirrorBoundaryCondition;
+
+impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
+    fn get_pixel(&self, index: &[i64], image: &Image) -> T {
+        let mapped: Vec<usize> = index
+            .iter()
+            .zip(image.size())
+            .map(|(&i, &size)| {
+                let period = 2 * size as i64;
+                let m = i.rem_euclid(period);
+                (if m < size as i64 { m } else { period - 1 - m }) as usize
+            })
+            .collect();
+        pixel_at(image, &mapped)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +178,60 @@ mod tests {
         assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[11], &img), 1);
     }
 
+    #[test]
+    fn mirror_reflects_1d_left_and_right_corners() {
+        let img = image_1d();
+        let bc = MirrorBoundaryCondition;
+        // Edge pixel repeats: index -1 and index 0 both read pixel 0.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1], &img), 0);
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-2], &img), 1);
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-5], &img), 4);
+        // Symmetric on the right: index `size` repeats the last pixel.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[5], &img), 4);
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[6], &img), 3);
+        // Second period (itkMirrorPadImageTest.cxx ground truth: index -9 on
+        // an 8-pixel axis reads pixel 7, i.e. a direct, unflipped copy one
+        // full period back). Mirrored here at size 5: period = 10.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-6], &img), 4);
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-10], &img), 0);
+    }
+
+    #[test]
+    fn mirror_single_pixel_axis_always_reads_zero() {
+        let img = Image::from_vec(&[1], vec![7u32]).unwrap();
+        let bc = MirrorBoundaryCondition;
+        for i in [-3, -2, -1, 0, 1, 2, 3] {
+            assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[i], &img), 7);
+        }
+    }
+
+    #[test]
+    fn mirror_matches_itk_ground_truth_size_8() {
+        // itkMirrorPadImageTest.cxx's `VerifyPixel`: an 8-pixel axis, index
+        // `row` maps to `rowVal` via reflect-with-edge-repeat, period 16.
+        let img = Image::from_vec(&[8], (0..8).collect::<Vec<u32>>()).unwrap();
+        let bc = MirrorBoundaryCondition;
+        let cases: [(i64, u32); 10] = [
+            (-1, 0),
+            (-2, 1),
+            (-8, 7),
+            (-9, 7),
+            (-10, 6),
+            (-16, 0),
+            (0, 0),
+            (7, 7),
+            (8, 7),
+            (15, 0),
+        ];
+        for (index, expected) in cases {
+            assert_eq!(
+                BoundaryCondition::<u32>::get_pixel(&bc, &[index], &img),
+                expected,
+                "index {index}"
+            );
+        }
+    }
+
     // 2-D: value(x, y) = x + 10*y.
     fn image_2d() -> Image {
         let (w, h) = (4usize, 3usize);
@@ -194,6 +278,20 @@ mod tests {
         assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &img), 21);
         // (4, 0) wraps x only -> (0, 0) = 0.
         assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &img), 0);
+    }
+
+    #[test]
+    fn mirror_2d_reflects_each_axis_independently() {
+        let img = image_2d();
+        let bc = MirrorBoundaryCondition;
+        // (-1, -1) repeats the (0, 0) corner = 0.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1], &img), 0);
+        // (-1, 0) repeats x only -> (0, 0) = 0.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[-1, 0], &img), 0);
+        // (1, -1) repeats y only -> (1, 0) = 1.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1], &img), 1);
+        // (4, 0) (one past the right edge, w=4) repeats x -> (3, 0) = 3.
+        assert_eq!(BoundaryCondition::<u32>::get_pixel(&bc, &[4, 0], &img), 3);
     }
 
     // 3-D: value(x, y, z) = x + 10*y + 100*z.
@@ -254,6 +352,22 @@ mod tests {
         assert_eq!(
             BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &img),
             221
+        );
+    }
+
+    #[test]
+    fn mirror_3d_reflects_each_axis_independently() {
+        let img = image_3d();
+        let bc = MirrorBoundaryCondition;
+        // (-1,-1,-1) repeats the (0,0,0) corner = 0.
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[-1, -1, -1], &img),
+            0
+        );
+        // (1,-1,-1): x in-bounds, y and z repeat -> (1,0,0) = 1.
+        assert_eq!(
+            BoundaryCondition::<u32>::get_pixel(&bc, &[1, -1, -1], &img),
+            1
         );
     }
 }

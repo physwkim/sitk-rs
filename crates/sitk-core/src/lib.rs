@@ -14,8 +14,8 @@ pub mod neighborhood;
 pub mod pixel;
 
 pub use boundary::{
-    BoundaryCondition, ConstantBoundaryCondition, PeriodicBoundaryCondition,
-    ZeroFluxNeumannBoundaryCondition,
+    BoundaryCondition, ConstantBoundaryCondition, MirrorBoundaryCondition,
+    PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
 };
 pub use error::{Error, Result};
 pub use image::{Image, PixelBuffer};
