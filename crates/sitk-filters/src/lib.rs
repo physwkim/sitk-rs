@@ -101,6 +101,7 @@ pub mod slic;
 pub mod slice;
 pub mod smoothing;
 pub mod sources;
+pub mod stochastic_fractal_dimension;
 pub mod threshold;
 pub mod threshold_maximum_connected_components;
 pub mod watershed;
