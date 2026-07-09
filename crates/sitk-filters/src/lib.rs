@@ -26,6 +26,7 @@
 //! yaml codegen in a later phase.
 
 pub mod anisotropic_diffusion;
+pub mod binary_morphology;
 pub mod canny;
 pub mod convolution;
 pub mod denoise;
@@ -59,6 +60,10 @@ pub mod watershed;
 
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
+};
+pub use binary_morphology::{
+    binary_fillhole, binary_grind_peak, binary_thinning, voting_binary,
+    voting_binary_iterative_hole_filling,
 };
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use convolution::{
