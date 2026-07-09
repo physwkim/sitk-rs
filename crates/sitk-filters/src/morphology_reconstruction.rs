@@ -17,9 +17,9 @@
 //!   `itkBinaryReconstructionLabelMapFilter`, `itkAttributeOpeningLabelMapFilter`,
 //!   `itkLabelMapToBinaryImageFilter`, `itkLabelMapMaskImageFilter`,
 //!   `itkBinaryNotImageFilter`).
-//!
-//! (`BinaryOpeningByReconstruction`/`BinaryClosingByReconstruction` land in
-//! this module in a later commit.)
+//! - [`binary_opening_by_reconstruction`] / [`binary_closing_by_reconstruction`] —
+//!   `itkBinaryOpeningByReconstructionImageFilter.h` / `.hxx`,
+//!   `itkBinaryClosingByReconstructionImageFilter.h` / `.hxx`.
 //!
 //! ## Reconstruction engine reuse
 //!
@@ -31,11 +31,11 @@
 //! module docs prove that algorithm is behaviorally identical (for
 //! `fully_connected = false`; see that module for the `fully_connected =
 //! true` caveat) to running elementary-kernel geodesic dilation/erosion to
-//! convergence. `OpeningByReconstructionImageFilter`/
-//! `ClosingByReconstructionImageFilter` (and, in later commits, the other
-//! filters in this module) are thin `.hxx` wrappers that build a marker
-//! image and hand it straight to `ReconstructionByDilationImageFilter` /
-//! `ReconstructionByErosionImageFilter` with no logic of their own beyond
+//! convergence. Every grayscale filter below (`OpeningByReconstruction`,
+//! `ClosingByReconstruction`, `GrayscaleConnectedOpening`,
+//! `GrayscaleConnectedClosing`) is a thin `.hxx` wrapper that builds a marker
+//! image and hands it straight to `ReconstructionByDilationImageFilter` /
+//! `ReconstructionByErosionImageFilter` with no logic of its own beyond
 //! that — so this port builds each one directly on `reconstruction_by_dilation`
 //! / `reconstruction_by_erosion` rather than re-deriving the three-pass
 //! algorithm, relying on the same equivalence [`crate::geodesic_morphology`]
@@ -165,10 +165,27 @@
 //! `.hxx` files actually specify, so this port implements it at that level
 //! per the task's instruction rather than calling through the grayscale
 //! engine.
+//!
+//! ## Binary opening/closing by reconstruction
+//!
+//! `BinaryOpeningByReconstructionImageFilter::GenerateData`: binary-erode
+//! ([`crate::morphology::binary_erode`]) then
+//! [`binary_reconstruction_by_dilation`], both with the caller's own
+//! `foreground_value`/`background_value` passed straight through unchanged,
+//! and no `SafeBorder` padding. `BinaryClosingByReconstructionImageFilter` is
+//! the dual — binary-dilate then [`binary_reconstruction_by_erosion`],
+//! likewise unpadded — except its internal erode/dilate `background_value`
+//! is chosen exactly the way
+//! [`crate::morphology::binary_morphological_closing`] chooses its own (`0`
+//! unless `foreground_value == 0`, in which case
+//! `NumericTraits<T>::max()`): the `.hxx` has no user-facing
+//! `BackgroundValue` member at all.
 
 use crate::error::{FilterError, Result};
 use crate::label::connected_component;
-use crate::morphology::{StructuringElement, bounds_for, grayscale_dilate, grayscale_erode};
+use crate::morphology::{
+    StructuringElement, binary_dilate, binary_erode, bounds_for, grayscale_dilate, grayscale_erode,
+};
 use crate::reconstruction::{reconstruction_by_dilation, reconstruction_by_erosion};
 use crate::{image_from_f64, require_same_shape};
 use sitk_core::Image;
@@ -469,6 +486,64 @@ pub fn binary_reconstruction_by_erosion(
     image_from_f64(mask_image.pixel_id(), mask_image.size(), mask_image, &out)
 }
 
+// ---- binary opening / closing by reconstruction -----------------------
+
+/// `BinaryOpeningByReconstructionImageFilter` (see module docs):
+/// binary-erode `image` by `kernel`, then keep only the mask-foreground
+/// connected components erosion left touched anywhere
+/// ([`binary_reconstruction_by_dilation`]). `foreground_value`/
+/// `background_value` are passed through to both stages unchanged; the
+/// erode step keeps its own class default `boundary_to_foreground = true`.
+pub fn binary_opening_by_reconstruction(
+    image: &Image,
+    kernel: &StructuringElement,
+    foreground_value: f64,
+    background_value: f64,
+    fully_connected: bool,
+) -> Result<Image> {
+    let eroded = binary_erode(image, kernel, foreground_value, background_value, true)?;
+    binary_reconstruction_by_dilation(
+        &eroded,
+        image,
+        foreground_value,
+        background_value,
+        fully_connected,
+    )
+}
+
+/// `BinaryClosingByReconstructionImageFilter` (see module docs):
+/// binary-dilate `image` by `kernel` (own class default
+/// `boundary_to_foreground = false`), then
+/// [`binary_reconstruction_by_erosion`] under `image` as the mask. The
+/// internal erode/dilate `background_value` is chosen the same way
+/// [`crate::morphology::binary_morphological_closing`] chooses its own — `0`
+/// unless `foreground_value == 0`, in which case
+/// `NumericTraits<T>::max()` — since the `.hxx` has no user-facing
+/// `BackgroundValue` member; unlike grayscale closing, there is no
+/// `SafeBorder` padding here (`BinaryReconstructionByErosionImageFilter` has
+/// no boundary condition to pad against).
+pub fn binary_closing_by_reconstruction(
+    image: &Image,
+    kernel: &StructuringElement,
+    foreground_value: f64,
+    fully_connected: bool,
+) -> Result<Image> {
+    let (max_value, _) = bounds_for(image.pixel_id());
+    let background_value = if foreground_value == 0.0 {
+        max_value
+    } else {
+        0.0
+    };
+    let dilated = binary_dilate(image, kernel, foreground_value, background_value, false)?;
+    binary_reconstruction_by_erosion(
+        &dilated,
+        image,
+        foreground_value,
+        background_value,
+        fully_connected,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +806,75 @@ mod tests {
         assert_eq!(
             out.scalar_slice::<i32>().unwrap(),
             &[1, 1, 1, 3, 3, 1, 1, 1, 1, 0]
+        );
+    }
+
+    // ---- binary_opening_by_reconstruction / binary_closing_by_reconstruction ----
+
+    /// The same dumbbell as [`opening_by_reconstruction_restores_a_bridge_a_plain_open_would_lose`],
+    /// exercised through the binary entry point end to end (erode + label
+    /// reconstruction) instead of the grayscale engine, contrasted against
+    /// the existing [`crate::morphology::binary_morphological_opening`].
+    #[test]
+    fn binary_opening_by_reconstruction_restores_a_bridge_a_plain_open_would_lose() {
+        #[rustfmt::skip]
+        let image = img_u8(&[7, 3], vec![
+            1, 1, 1, 0, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 0, 1, 1, 1,
+        ]);
+        let kernel = StructuringElement::box_(&[1, 1]);
+
+        let opened = binary_opening_by_reconstruction(&image, &kernel, 1.0, 0.0, false).unwrap();
+        assert_eq!(
+            opened.scalar_slice::<u8>().unwrap(),
+            image.scalar_slice::<u8>().unwrap()
+        );
+
+        let naive =
+            crate::morphology::binary_morphological_opening(&image, &kernel, 1.0, 0.0).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(naive.scalar_slice::<u8>().unwrap(), &[
+            1, 1, 1, 0, 1, 1, 1,
+            1, 1, 1, 0, 1, 1, 1,
+            1, 1, 1, 0, 1, 1, 1,
+        ]);
+        assert_ne!(
+            opened.scalar_slice::<u8>().unwrap(),
+            naive.scalar_slice::<u8>().unwrap()
+        );
+    }
+
+    /// A gap of one background pixel (index 4) between two foreground runs,
+    /// comfortably clear of the image border so no boundary condition
+    /// participates: dilating by radius 1 bridges the gap, and since the
+    /// bridging marker pixel is non-foreground nowhere the gap's own
+    /// not-mask component is left untouched, the reconstruction-by-erosion
+    /// stage fills the gap in the final output.
+    #[test]
+    fn binary_closing_by_reconstruction_fills_a_gap_narrower_than_the_kernel() {
+        let image = img_u8(&[9], vec![0, 0, 9, 9, 0, 9, 9, 0, 0]);
+        let kernel = StructuringElement::box_(&[1]);
+        let out = binary_closing_by_reconstruction(&image, &kernel, 9.0, false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u8>().unwrap(),
+            &[0, 0, 9, 9, 9, 9, 9, 0, 0]
+        );
+    }
+
+    /// `foreground_value == 0.0` forces the internal `background_value` to
+    /// `NumericTraits<T>::max()` instead of `0.0` (see the module docs); an
+    /// already-closed run (no internal gap narrower than the kernel) must
+    /// come back unchanged, confirming that branch computes correctly rather
+    /// than colliding `0` with itself.
+    #[test]
+    fn binary_closing_by_reconstruction_foreground_zero_uses_max_as_internal_background() {
+        let image = img_u8(&[7], vec![200, 200, 0, 0, 0, 200, 200]);
+        let kernel = StructuringElement::box_(&[1]);
+        let out = binary_closing_by_reconstruction(&image, &kernel, 0.0, false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u8>().unwrap(),
+            image.scalar_slice::<u8>().unwrap()
         );
     }
 }
