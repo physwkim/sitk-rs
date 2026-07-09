@@ -186,7 +186,7 @@ pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, spec
 pub use noise_estimate::noise;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
-    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
+    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
 };
 pub use projection::{
     binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
