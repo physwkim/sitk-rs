@@ -46,6 +46,7 @@ pub mod bspline_decomposition;
 pub mod canny;
 pub mod change_label;
 pub mod clamp;
+pub mod coherence_enhancing_diffusion;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
@@ -71,6 +72,7 @@ pub mod label;
 pub mod label_fusion;
 pub mod label_shape;
 pub mod level_set;
+mod linalg;
 pub mod logic;
 pub mod math;
 pub mod min_max_curvature_flow;
@@ -112,6 +114,9 @@ pub use bspline_decomposition::{bspline_decomposition, bspline_spline_poles};
 pub use canny::{canny_edge_detection, zero_crossing};
 pub use change_label::change_label;
 pub use clamp::clamp;
+pub use coherence_enhancing_diffusion::{
+    CoherenceEnhancingDiffusionSettings, Enhancement, coherence_enhancing_diffusion,
+};
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{

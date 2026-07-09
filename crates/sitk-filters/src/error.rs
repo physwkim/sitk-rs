@@ -428,6 +428,26 @@ pub enum FilterError {
     #[error("spline order must be between 0 and 5, got {0}")]
     UnsupportedSplineOrder(u32),
 
+    /// `LinearAnisotropicDiffusionLBRImageFilter::StencilFunctor::Stencil` is
+    /// overloaded only on `Dispatch<2>` and `Dispatch<3>`, so the lattice-basis
+    /// -reduction stencil exists in 2-D and 3-D only. In C++ any other
+    /// dimension fails to compile; this port rejects it at run time.
+    #[error("lattice-basis-reduction diffusion supports 2-D and 3-D images only, got {0}-D")]
+    UnsupportedLbrDimension(usize),
+
+    /// `LinearAnisotropicDiffusionLBRImageFilter::SetRatioToMaxStableTimeStep`
+    /// throws "Ratio to max time step ... should be within ]0,1]".
+    #[error("ratio to the maximum stable time step must lie in (0, 1], got {0}")]
+    InvalidTimeStepRatio(f64),
+
+    /// `LinearAnisotropicDiffusionLBRImageFilter::SetMaxNumberOfTimeSteps`
+    /// throws "Max number of time steps must be positive". Reachable from
+    /// SimpleITK because `MaxTimeStepsBetweenTensorUpdates` is a `uint8_t`
+    /// that `AnisotropicDiffusionLBRImageFilter` stores unvalidated and only
+    /// forwards at `Update` time.
+    #[error("max time steps between tensor updates must be >= 1, got 0")]
+    ZeroMaxTimeSteps,
+
     /// `BSplineScatteredDataPointSetToImageFilter::GenerateData` throws "The
     /// number of control points must be greater than the spline order" when
     /// `m_NumberOfControlPoints[i] < m_SplineOrder[i] + 1` — a lattice that
