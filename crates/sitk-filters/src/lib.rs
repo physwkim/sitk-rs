@@ -139,9 +139,10 @@ pub use label_shape::{
 pub use level_set::{LevelSetResult, geodesic_active_contour_level_set, shape_detection_level_set};
 pub use logic::{
     and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place,
-    greater_equal, less_equal, mask, mask_in_place, mask_negated, mask_negated_in_place, maximum,
-    maximum_in_place, minimum, minimum_in_place, not, not_equal, not_in_place, or, or_in_place,
-    xor, xor_in_place,
+    greater_equal, less_equal, mask, mask_in_place, mask_negated, mask_negated_in_place,
+    masked_assign, masked_assign_constant, masked_assign_constant_in_place, masked_assign_in_place,
+    maximum, maximum_in_place, minimum, minimum_in_place, not, not_equal, not_in_place, or,
+    or_in_place, xor, xor_in_place,
 };
 pub use math::{
     abs, abs_in_place, absolute_value_difference, absolute_value_difference_in_place, acos,

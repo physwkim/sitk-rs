@@ -312,6 +312,18 @@ pub enum FilterError {
     #[error("this filter requires at least one input image")]
     EmptyImageList,
 
+    /// `MaskedAssignImageFilter.yaml`'s `filter_type` fixes the mask image's
+    /// ITK template parameter to `itk::Image<std::uint8_t, ...>`, with no
+    /// fallback casting path the way `MaskImageFilter.yaml`'s `MaskImage`
+    /// input has (that filter's generated wrapper re-derives a `UInt8` mask
+    /// via `NotEqual`, with a deprecation warning, when given another
+    /// integer pixel type). This filter's generated wrapper has no such
+    /// `custom_itk_cast`, so SimpleITK's default `CastImageToITK` -- a
+    /// `dynamic_cast`, not a value cast -- throws outright on any other
+    /// pixel type; this port reproduces that as a hard runtime error.
+    #[error("mask image must be UInt8, got {0:?}")]
+    RequiresUInt8MaskPixelType(PixelId),
+
     /// `UnsharpMaskImageFilter::VerifyPreconditions` throws "Threshold must
     /// be non-negative!" when `Threshold < 0`.
     #[error("unsharp_mask threshold must be >= 0, got {0}")]

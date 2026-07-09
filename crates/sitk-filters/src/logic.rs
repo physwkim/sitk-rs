@@ -71,10 +71,26 @@
 //! requires both operands to share one pixel type (the same constraint
 //! `add`/`subtract`/... already have in `lib.rs`), so the mask image must be
 //! cast to the main image's pixel type first.
+//!
+//! [`masked_assign`]/[`masked_assign_constant`] (`itkMaskedAssignImageFilter.h`/
+//! `.hxx`, `MaskedAssignImageFilter.yaml`): pixel-wise `mask != 0 ? assign :
+//! image`, a `TernaryGeneratorImageFilter` with no numeric computation at
+//! all, just a per-pixel selection. Unlike `mask`/`mask_negated` immediately
+//! above, the mask's pixel type here is not cast to the main image's type --
+//! `MaskedAssignImageFilter.yaml`'s `filter_type` fixes the ITK mask template
+//! parameter to `itk::Image<std::uint8_t, ...>` outright, with no fallback
+//! casting path the way `MaskImageFilter.yaml` has (see
+//! [`FilterError::RequiresUInt8MaskPixelType`]'s doc for the distinction).
+//! `assign` (an `&Image`) must share `image`'s pixel type and size exactly,
+//! since ITK's `AssignImageType` defaults to `OutputImageType`, which
+//! defaults to `InputImageType`, with no cast path for a mismatch either.
+//! [`masked_assign_constant`] is `SetAssignConstant`: a `double` narrowed to
+//! `image`'s pixel type via `Scalar::from_f64`, used pixel-wise in place of
+//! an `AssignImage`.
 
 use crate::functor::{self, BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
-use crate::{FilterError, Result};
-use sitk_core::{Image, Scalar};
+use crate::{FilterError, Result, require_same_shape};
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
 pub(crate) fn require_integer_pixel_type(img: &Image) -> Result<()> {
     if img.pixel_id().is_floating_point() {
@@ -493,6 +509,170 @@ functor::binary_functor! {
     pub fn minimum, minimum_in_place = MinOp;
 }
 
+// ---- masked_assign (image, UInt8 mask, assign image or constant) ----------
+
+/// Checked by every `masked_assign*` function: `mask` must be `UInt8`. See
+/// the module docs and [`FilterError::RequiresUInt8MaskPixelType`]'s doc for
+/// why this is a hard error rather than an implicit cast.
+fn require_uint8_mask(mask: &Image) -> Result<()> {
+    if mask.pixel_id() != PixelId::UInt8 {
+        return Err(FilterError::RequiresUInt8MaskPixelType(mask.pixel_id()));
+    }
+    Ok(())
+}
+
+/// Size-only shape check between `image` and `mask`: `mask`'s pixel type is
+/// independently pinned to `UInt8` by [`require_uint8_mask`], so
+/// [`require_same_shape`] (which also checks pixel type) would reject a
+/// valid call.
+fn require_same_size(a: &Image, b: &Image) -> Result<()> {
+    if a.size() != b.size() {
+        return Err(FilterError::SizeMismatch {
+            a: a.size().to_vec(),
+            b: b.size().to_vec(),
+        });
+    }
+    Ok(())
+}
+
+fn masked_assign_typed<T: Scalar>(image: &Image, mask: &[u8], assign: &Image) -> Result<Image> {
+    let s = image.scalar_slice::<T>().expect("dispatch guarantees type");
+    let a = assign
+        .scalar_slice::<T>()
+        .expect("require_same_shape guarantees type");
+    let out: Vec<T> = s
+        .iter()
+        .zip(mask)
+        .zip(a)
+        .map(|((&px, &m), &av)| if m != 0 { av } else { px })
+        .collect();
+    let mut out_img = Image::from_vec(image.size(), out)?;
+    out_img.copy_geometry_from(image);
+    Ok(out_img)
+}
+
+fn masked_assign_typed_in_place<T: Scalar>(
+    mut image: Image,
+    mask: &[u8],
+    assign: &Image,
+) -> Result<Image> {
+    let a = assign
+        .scalar_slice::<T>()
+        .expect("require_same_shape guarantees type");
+    let v = image
+        .scalar_vec_mut::<T>()
+        .expect("dispatch guarantees type");
+    for ((x, &m), &av) in v.iter_mut().zip(mask).zip(a) {
+        if m != 0 {
+            *x = av;
+        }
+    }
+    Ok(image)
+}
+
+/// `MaskedAssignImageFilter`: pixel-wise `mask != 0 ? assign : image` (see
+/// the module docs). `mask` must be `UInt8` and share `image`'s size;
+/// `assign` must share `image`'s pixel type and size.
+pub fn masked_assign(image: &Image, mask: &Image, assign: &Image) -> Result<Image> {
+    require_uint8_mask(mask)?;
+    require_same_size(image, mask)?;
+    require_same_shape(image, assign)?;
+    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    dispatch_scalar!(
+        image.pixel_id(),
+        masked_assign_typed,
+        image,
+        mask_bytes,
+        assign
+    )
+}
+
+/// In-place variant of [`masked_assign`]: reuses `image`'s buffer.
+pub fn masked_assign_in_place(image: Image, mask: &Image, assign: &Image) -> Result<Image> {
+    require_uint8_mask(mask)?;
+    require_same_size(&image, mask)?;
+    require_same_shape(&image, assign)?;
+    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    dispatch_scalar!(
+        image.pixel_id(),
+        masked_assign_typed_in_place,
+        image,
+        mask_bytes,
+        assign
+    )
+}
+
+fn masked_assign_constant_typed<T: Scalar>(
+    image: &Image,
+    mask: &[u8],
+    assign_constant: f64,
+) -> Result<Image> {
+    let s = image.scalar_slice::<T>().expect("dispatch guarantees type");
+    let av = T::from_f64(assign_constant);
+    let out: Vec<T> = s
+        .iter()
+        .zip(mask)
+        .map(|(&px, &m)| if m != 0 { av } else { px })
+        .collect();
+    let mut out_img = Image::from_vec(image.size(), out)?;
+    out_img.copy_geometry_from(image);
+    Ok(out_img)
+}
+
+fn masked_assign_constant_typed_in_place<T: Scalar>(
+    mut image: Image,
+    mask: &[u8],
+    assign_constant: f64,
+) -> Result<Image> {
+    let av = T::from_f64(assign_constant);
+    let v = image
+        .scalar_vec_mut::<T>()
+        .expect("dispatch guarantees type");
+    for (x, &m) in v.iter_mut().zip(mask) {
+        if m != 0 {
+            *x = av;
+        }
+    }
+    Ok(image)
+}
+
+/// `MaskedAssignImageFilter` with a constant `assign` value in place of an
+/// `AssignImage` (`SetAssignConstant`, `AssignConstant` in
+/// `MaskedAssignImageFilter.yaml`): pixel-wise `mask != 0 ? assign_constant :
+/// image`. `assign_constant` is narrowed to `image`'s pixel type via
+/// `Scalar::from_f64` before use (see the module docs). `mask` must be
+/// `UInt8` and share `image`'s size.
+pub fn masked_assign_constant(image: &Image, mask: &Image, assign_constant: f64) -> Result<Image> {
+    require_uint8_mask(mask)?;
+    require_same_size(image, mask)?;
+    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    dispatch_scalar!(
+        image.pixel_id(),
+        masked_assign_constant_typed,
+        image,
+        mask_bytes,
+        assign_constant
+    )
+}
+
+/// In-place variant of [`masked_assign_constant`]: reuses `image`'s buffer.
+pub fn masked_assign_constant_in_place(
+    image: Image,
+    mask: &Image,
+    assign_constant: f64,
+) -> Result<Image> {
+    require_uint8_mask(mask)?;
+    require_same_size(&image, mask)?;
+    let mask_bytes = mask.scalar_slice::<u8>().expect("checked UInt8 above");
+    dispatch_scalar!(
+        image.pixel_id(),
+        masked_assign_constant_typed_in_place,
+        image,
+        mask_bytes,
+        assign_constant
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +1001,146 @@ mod tests {
         let allocated = maximum(&a, &b).unwrap();
         let in_place = maximum_in_place(a, &b).unwrap();
         assert_eq!(allocated, in_place);
+    }
+
+    // ---- masked_assign: mask zero vs nonzero boundaries and error paths ----
+
+    #[test]
+    fn masked_assign_selects_by_mask() {
+        let image = img_u8(&[3, 1], vec![10, 20, 30]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 0]);
+        let assign = img_u8(&[3, 1], vec![100, 200, 250]);
+        assert_eq!(
+            masked_assign(&image, &mask, &assign)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[10, 200, 30]
+        );
+    }
+
+    #[test]
+    fn masked_assign_in_place_matches_allocating() {
+        let image = img_u8(&[3, 1], vec![10, 20, 30]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 0]);
+        let assign = img_u8(&[3, 1], vec![100, 200, 250]);
+        let allocated = masked_assign(&image, &mask, &assign).unwrap();
+        let in_place = masked_assign_in_place(image, &mask, &assign).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn masked_assign_rejects_non_uint8_mask() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = Image::from_vec(&[2, 1], vec![0i32, 1]).unwrap();
+        let assign = img_u8(&[2, 1], vec![100, 200]);
+        assert_eq!(
+            masked_assign(&image, &mask, &assign),
+            Err(FilterError::RequiresUInt8MaskPixelType(mask.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn masked_assign_rejects_mismatched_mask_size() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 0]);
+        let assign = img_u8(&[2, 1], vec![100, 200]);
+        assert_eq!(
+            masked_assign(&image, &mask, &assign),
+            Err(FilterError::SizeMismatch {
+                a: image.size().to_vec(),
+                b: mask.size().to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn masked_assign_rejects_mismatched_assign_pixel_type() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = img_u8(&[2, 1], vec![0, 1]);
+        let assign = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            masked_assign(&image, &mask, &assign),
+            Err(FilterError::TypeMismatch {
+                a: image.pixel_id(),
+                b: assign.pixel_id(),
+            })
+        );
+    }
+
+    #[test]
+    fn masked_assign_rejects_mismatched_assign_size() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = img_u8(&[2, 1], vec![0, 1]);
+        let assign = img_u8(&[3, 1], vec![100, 200, 250]);
+        assert_eq!(
+            masked_assign(&image, &mask, &assign),
+            Err(FilterError::SizeMismatch {
+                a: image.size().to_vec(),
+                b: assign.size().to_vec(),
+            })
+        );
+    }
+
+    // ---- masked_assign_constant ----
+
+    #[test]
+    fn masked_assign_constant_selects_by_mask() {
+        let image = img_u8(&[3, 1], vec![10, 20, 30]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 1]);
+        assert_eq!(
+            masked_assign_constant(&image, &mask, 99.0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[10, 99, 99]
+        );
+    }
+
+    #[test]
+    fn masked_assign_constant_saturates_out_of_range_value() {
+        // 300.0 does not fit in u8; Scalar::from_f64 saturates to 255,
+        // matching ToPixelType's narrowing in MaskedAssignImageFilter.yaml.
+        let image = img_u8(&[1, 1], vec![10]);
+        let mask = img_u8(&[1, 1], vec![1]);
+        assert_eq!(
+            masked_assign_constant(&image, &mask, 300.0)
+                .unwrap()
+                .scalar_slice::<u8>()
+                .unwrap(),
+            &[255]
+        );
+    }
+
+    #[test]
+    fn masked_assign_constant_in_place_matches_allocating() {
+        let image = img_u8(&[3, 1], vec![10, 20, 30]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 1]);
+        let allocated = masked_assign_constant(&image, &mask, 99.0).unwrap();
+        let in_place = masked_assign_constant_in_place(image, &mask, 99.0).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn masked_assign_constant_rejects_non_uint8_mask() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = Image::from_vec(&[2, 1], vec![0i32, 1]).unwrap();
+        assert_eq!(
+            masked_assign_constant(&image, &mask, 0.0),
+            Err(FilterError::RequiresUInt8MaskPixelType(mask.pixel_id()))
+        );
+    }
+
+    #[test]
+    fn masked_assign_constant_rejects_mismatched_mask_size() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let mask = img_u8(&[3, 1], vec![0, 1, 0]);
+        assert_eq!(
+            masked_assign_constant(&image, &mask, 0.0),
+            Err(FilterError::SizeMismatch {
+                a: image.size().to_vec(),
+                b: mask.size().to_vec(),
+            })
+        );
     }
 }
