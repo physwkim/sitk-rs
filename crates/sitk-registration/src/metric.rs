@@ -180,7 +180,7 @@ impl FixedSamples {
     /// `percentage` and `seed` are used by [`SamplingStrategy::Regular`]
     /// (stride `= ceil(1/percentage)`) and [`SamplingStrategy::Random`]
     /// (`floor(N * percentage)` draws, uniform with replacement, seeded via a
-    /// small deterministic PRNG — see [`SplitMix64`]); both are ignored for
+    /// small deterministic PRNG — see the private `SplitMix64`); both are ignored for
     /// [`SamplingStrategy::None`]. `mask` is a binary image on the same grid
     /// as `fixed` (any nonzero value is "inside"): a candidate sample whose
     /// voxel is zero in the mask is dropped, exactly as ITK's
@@ -379,8 +379,7 @@ impl MovingImage {
     /// Restrict this moving image to a binary mask on its own grid (ITK
     /// `ImageToImageMetricv4::SetMovingImageMask`): any nonzero mask voxel is
     /// "inside". A physical point that maps to a zero-mask voxel makes
-    /// [`value_and_physical_gradient`](Self::value_and_physical_gradient)
-    /// return `None`, exactly as if it fell outside the buffer. Fails if
+    /// `value_and_physical_gradient` return `None`, exactly as if it fell outside the buffer. Fails if
     /// `mask` does not share this image's size.
     pub fn with_moving_mask(mut self, mask: &Image) -> Result<Self> {
         if mask.size() != self.size.as_slice() {

@@ -18,8 +18,8 @@
 //!
 //! The forward/backward recursion itself
 //! (`RecursiveSeparableImageFilter::FilterDataArray`, ported here as
-//! [`filter_line`]/[`filter_axis`]) does not depend on the order at all —
-//! only the coefficients [`Coefficients::new`] builds do, so all three
+//! the private `filter_line`/`filter_axis`) does not depend on the order at
+//! all — only the coefficients `Coefficients::new` builds do, so all three
 //! orders share the same recursion code:
 //! - **Normalization.** `ZeroOrder` scales its numerator for unity DC gain
 //!   (`alpha0`); `FirstOrder`/`SecondOrder` instead scale so the filter's

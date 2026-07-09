@@ -559,7 +559,7 @@ impl ImageRegistrationMethod {
     /// The remaining line-search knobs keep SimpleITK's defaults
     /// (`MoreThuente`, Wolfe coefficient `0.9`, gradient accuracy `0.9`,
     /// machine-precision tolerance `1e-16`); reach for
-    /// [`LBFGS2Optimizer`](crate::LBFGS2Optimizer) directly to change them.
+    /// [`LBFGS2Optimizer`] directly to change them.
     ///
     /// [`set_optimizer_as_lbfgsb`]: Self::set_optimizer_as_lbfgsb
     #[allow(clippy::too_many_arguments)]

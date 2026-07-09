@@ -24,8 +24,8 @@
 //! routines (`Modules/ThirdParty/libLBFGS/src/itklbfgs/lib/lbfgs.c` in the
 //! ITK tree), restructured so the driver calls the caller's `eval` closure
 //! inline wherever the C code calls `cd->proc_evaluate`. Function names below
-//! mirror the C source: [`update_trial_interval`], [`cubic_minimizer`],
-//! [`cubic_minimizer2`], [`quad_minimizer`], [`quad_minimizer2`].
+//! mirror the C source: `update_trial_interval`, `cubic_minimizer`,
+//! `cubic_minimizer2`, `quad_minimizer`, `quad_minimizer2`.
 //!
 //! **Not ported**: the Orthant-Wise Limited-memory Quasi-Newton (OWL-QN) L1
 //! extension (`orthantwise_c`/`orthantwise_start`/`orthantwise_end`,
@@ -61,7 +61,7 @@
 //!   collapsed below machine precision, or a direction that is not a descent
 //!   direction) → [`StopReason::LineSearchFailed`]. The crate's `StopReason`
 //!   has no finer-grained line-search variants, so every libLBFGS `LBFGSERR_*`
-//!   line-search code collapses to this one (see [`LineSearchError`]).
+//!   line-search code collapses to this one (see its private `LineSearchError`).
 //!
 //! On a line-search failure the previous iterate is restored before
 //! returning — mirroring the C driver's `veccpy(x, xp, n); veccpy(g, gp, n);`

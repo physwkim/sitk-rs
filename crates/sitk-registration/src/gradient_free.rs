@@ -31,7 +31,7 @@
 //! from scratch below as a private `NormalVariateGenerator`, including the
 //! 32-bit two's-complement integer arithmetic the original assumes; its
 //! `goto`-based `FastNorm` is restructured into equivalent straight-line
-//! control flow (see the doc comment on [`NormalVariateGenerator::fast_norm`]).
+//! control flow (see the doc comment on its private `fast_norm`).
 
 use crate::optimizer::{OptimizerResult, StopReason};
 
