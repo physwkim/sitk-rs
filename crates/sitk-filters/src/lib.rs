@@ -102,7 +102,9 @@ pub mod smoothing;
 pub mod sources;
 pub mod threshold;
 pub mod threshold_maximum_connected_components;
+pub mod toboggan;
 pub mod watershed;
+pub mod watershed_classic;
 
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
@@ -209,7 +211,7 @@ pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, spec
 pub use noise_estimate::noise;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
-    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
+    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
 };
 pub use projection::{
     binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
@@ -249,7 +251,12 @@ pub use threshold::{
 pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
+pub use toboggan::toboggan;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
+pub use watershed_classic::{
+    IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
+    watershed,
+};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //

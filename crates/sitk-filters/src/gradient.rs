@@ -54,6 +54,22 @@ fn scratch_f64(img: &Image) -> Result<Image> {
 /// `scale_d = 1`. Output is always [`PixelId::Float32`] (SimpleITK's
 /// `output_pixel_type: float`).
 pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image> {
+    let out = gradient_magnitude_values(img, use_image_spacing)?;
+    image_from_f64(PixelId::Float32, img.size(), img, &out)
+}
+
+/// The raw `f64` gradient-magnitude values, before [`gradient_magnitude`]
+/// narrows them to `PixelId::Float32`.
+///
+/// `pub(crate)`: [`crate::watershed_classic::isolated_watershed`] needs them
+/// at full `RealType` precision. ITK instantiates the gradient magnitude as
+/// `GradientMagnitudeImageFilter<InputImageType, RealImageType>`, whose output
+/// pixel type is `NumericTraits<InputPixelType>::RealType` — `double` for
+/// every integer input — whereas SimpleITK's standalone
+/// `GradientMagnitudeImageFilter.yaml` fixes the output at `float`. Going
+/// through [`gradient_magnitude`] would quantize the watershed's height
+/// function to `f32` for `u8`/`u16`/... inputs, which ITK does not do.
+pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) -> Result<Vec<f64>> {
     let dim = img.dimension();
     let scales: Vec<f64> = (0..dim)
         .map(|d| {
@@ -86,7 +102,7 @@ pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image>
         })
         .collect();
 
-    image_from_f64(PixelId::Float32, img.size(), img, &out)
+    Ok(out)
 }
 
 // ---- derivative -------------------------------------------------------------
