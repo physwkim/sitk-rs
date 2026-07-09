@@ -143,7 +143,7 @@ pub use label_shape::{
     label_shape_statistics,
 };
 pub use level_set::{
-    CannyLevelSetResult, LevelSetResult, canny_segmentation_level_set,
+    CannyLevelSetResult, LevelSetResult, anti_alias_binary, canny_segmentation_level_set,
     geodesic_active_contour_level_set, laplacian_segmentation_level_set, shape_detection_level_set,
     threshold_segmentation_level_set,
 };
@@ -297,6 +297,20 @@ pub(crate) fn image_from_f64(
     vals: &[f64],
 ) -> Result<Image> {
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
+}
+
+/// `itk::NumericTraits<PixelType>::RealType` (itkNumericTraits.h): `float` for
+/// a `float` pixel, `double` for every integer pixel and for `double` itself.
+///
+/// SimpleITK yamls that declare `output_pixel_type: typename
+/// itk::NumericTraits<typename InputImageType::PixelType>::RealType` — among
+/// them `FastMarchingImageFilter` and `AntiAliasBinaryImageFilter` — resolve
+/// their output pixel type through this rule.
+pub(crate) fn real_pixel_id(input: PixelId) -> PixelId {
+    match input {
+        PixelId::Float32 => PixelId::Float32,
+        _ => PixelId::Float64,
+    }
 }
 
 fn quantize_to_pixel_type_impl<T: Scalar>(v: f64) -> f64 {

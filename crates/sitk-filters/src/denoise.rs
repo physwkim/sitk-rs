@@ -898,18 +898,34 @@ pub fn bilateral(
 ///
 /// `nb` may carry any radius `>= 1` per axis; only the `±1` offsets are read.
 pub(crate) fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &[f64]) -> f64 {
-    let center = nb.center_value();
+    curvature_flow_update_at(dim, scale, |offset| nb.get(offset))
+}
+
+/// [`curvature_flow_update`] against an arbitrary stencil accessor: `at(offset)`
+/// returns the pixel at `offset` from the center, `offset` running over the
+/// `±1` city-block and diagonal positions (and the all-zero center).
+///
+/// The sparse-field level-set solver evolves a bare `f64` buffer rather than an
+/// `Image`, so it cannot hand over a [`Neighborhood`]; it reaches the same
+/// `CurvatureFlowFunction::ComputeUpdate` through this seam.
+pub(crate) fn curvature_flow_update_at(
+    dim: usize,
+    scale: &[f64],
+    mut at: impl FnMut(&[i64]) -> f64,
+) -> f64 {
+    let mut off = vec![0i64; dim];
+    let center = at(&off);
+
     let mut first = vec![0.0f64; dim];
     let mut second = vec![0.0f64; dim];
     let mut cross = vec![vec![0.0f64; dim]; dim];
     let mut magnitude_sqr = 0.0f64;
-    let mut off = vec![0i64; dim];
 
     for i in 0..dim {
         off[i] = 1;
-        let plus = nb.get(&off);
+        let plus = at(&off);
         off[i] = -1;
-        let minus = nb.get(&off);
+        let minus = at(&off);
         off[i] = 0;
 
         first[i] = 0.5 * (plus - minus) * scale[i];
@@ -919,13 +935,13 @@ pub(crate) fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &
         for j in (i + 1)..dim {
             off[i] = -1;
             off[j] = -1;
-            let mm = nb.get(&off);
+            let mm = at(&off);
             off[j] = 1;
-            let mp = nb.get(&off);
+            let mp = at(&off);
             off[i] = 1;
-            let pp = nb.get(&off);
+            let pp = at(&off);
             off[j] = -1;
-            let pm = nb.get(&off);
+            let pm = at(&off);
             off[i] = 0;
             off[j] = 0;
             cross[i][j] = 0.25 * (mm - mp - pm + pp) * scale[i] * scale[j];

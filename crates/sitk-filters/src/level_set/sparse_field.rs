@@ -48,7 +48,7 @@
 
 use std::collections::VecDeque;
 
-use super::function::{GlobalData, LevelSetFunction};
+use super::function::{DifferenceFunction, GlobalData};
 use super::grid::{Grid, city_block_neighbors};
 
 /// `SparseFieldLevelSetImageFilter::m_StatusNull`:
@@ -64,29 +64,91 @@ const STATUS_ACTIVE_CHANGING_DOWN: i32 = -3;
 /// The one-pixel rim of the image.
 const STATUS_BOUNDARY_PIXEL: i32 = -4;
 
+/// `SparseFieldLevelSetImageFilter::CalculateUpdateValue`
+/// (itkSparseFieldLevelSetImageFilter.h:346-353) and the one override of it
+/// among the ported subclasses. It is the sole hook between
+/// `UpdateActiveLayerValues`' finite-difference step and the new active-layer
+/// value.
+pub(super) enum UpdateRule {
+    /// The base implementation: `value + dt * change`, with no constraint.
+    Unconstrained,
+    /// `AntiAliasBinaryImageFilter::CalculateUpdateValue`
+    /// (itkAntiAliasBinaryImageFilter.hxx:59-75): the surface may flow under
+    /// curvature but never across the interface of the original binary image,
+    /// so a pixel whose binary value is the input's maximum is floored at zero
+    /// and every other pixel is capped at zero.
+    BinaryConstrained {
+        /// `m_InputImage`: the *unshifted* binary input, sampled at the
+        /// active-layer index.
+        input: Vec<f64>,
+        /// `m_UpperBinaryValue`, the input's maximum. ITK's test is
+        /// `Math::ExactlyEquals`, so a pixel matching neither binary value
+        /// takes the `min(.., 0)` branch alongside the lower one.
+        upper_binary_value: f64,
+    },
+}
+
+impl UpdateRule {
+    fn calculate_update_value(&self, index: usize, dt: f64, value: f64, change: f64) -> f64 {
+        let new_value = value + dt * change;
+        match self {
+            UpdateRule::Unconstrained => new_value,
+            UpdateRule::BinaryConstrained {
+                input,
+                upper_binary_value,
+            } => {
+                if input[index] == *upper_binary_value {
+                    new_value.max(0.0)
+                } else {
+                    new_value.min(0.0)
+                }
+            }
+        }
+    }
+}
+
+/// Everything the concrete `SparseFieldLevelSetImageFilter` subclass fixes
+/// before `GenerateData` runs.
+pub(super) struct SolverSetup {
+    /// `m_ShiftedImage`: the input level set minus `m_IsoSurfaceValue`.
+    pub(super) shifted: Vec<f64>,
+    /// The `ZeroCrossingImageFilter` map of `shifted`, foreground `0` and
+    /// background `1`, which `CopyInputToOutput` grafts onto the output.
+    pub(super) zero_crossings: Vec<f64>,
+    pub(super) func: DifferenceFunction,
+    /// `m_NumberOfLayers`: layers on *one* side of the active layer.
+    pub(super) number_of_layers: usize,
+    /// `FiniteDifferenceImageFilter::m_UseImageSpacing`, which drives both
+    /// `m_ConstantGradientValue` and `InitializeActiveLayerValues`' `MIN_NORM`.
+    /// The `SegmentationLevelSetImageFilter`s leave it at its `true` default;
+    /// `AntiAliasBinaryImageFilter`'s constructor turns it off.
+    pub(super) use_image_spacing: bool,
+    pub(super) update_rule: UpdateRule,
+}
+
 /// The solver's inputs and evolving state.
 pub(super) struct SparseFieldSolver {
     grid: Grid,
-    func: LevelSetFunction,
+    func: DifferenceFunction,
+    update_rule: UpdateRule,
     /// The level-set image being evolved; also the filter's output.
     output: Vec<f64>,
-    /// `m_ShiftedImage`: the input level set minus `m_IsoSurfaceValue`. Both
-    /// ported filters leave the iso-surface value at zero, so this is the
-    /// initial level set itself. Read by `ConstructActiveLayer`,
-    /// `InitializeActiveLayerValues` and `InitializeBackgroundPixels`.
+    /// `m_ShiftedImage`: the input level set minus `m_IsoSurfaceValue`. Read by
+    /// `ConstructActiveLayer`, `InitializeActiveLayerValues` and
+    /// `InitializeBackgroundPixels`.
     shifted: Vec<f64>,
     status: Vec<i32>,
     layers: Vec<VecDeque<usize>>,
     update_buffer: Vec<f64>,
     /// `m_NumberOfLayers`: layers on *one* side of the active layer.
-    /// `SegmentationLevelSetImageFilter`'s constructor sets it to the image
-    /// dimension.
     number_of_layers: usize,
-    /// `m_ConstantGradientValue`: with `UseImageSpacing` on (the ITK default)
-    /// this is the minimum spacing. It is the assumed `|grad(phi)|` used to
-    /// space the layers one unit of distance apart.
+    /// `m_ConstantGradientValue`: with `UseImageSpacing` on this is the minimum
+    /// spacing, otherwise `1.0`. It is the assumed `|grad(phi)|` used to space
+    /// the layers one unit of distance apart.
     constant_gradient_value: f64,
-    min_spacing: f64,
+    /// `InitializeActiveLayerValues`' `MIN_NORM`: `1.0e-6`, multiplied by the
+    /// minimum spacing only when `UseImageSpacing` is on.
+    min_norm: f64,
     neighbors: Vec<(usize, i64)>,
     rms_change: f64,
     elapsed_iterations: u32,
@@ -102,38 +164,36 @@ pub(super) struct SolverOutput {
 }
 
 impl SparseFieldSolver {
-    /// `initial` is the input level set (negative inside); `zero_crossings` is
-    /// its `ZeroCrossingImageFilter` map with foreground `0` and background
-    /// `1`, which `CopyInputToOutput` grafts onto the output before
-    /// `Initialize` reads it.
-    pub(super) fn new(
-        size: &[usize],
-        spacing: &[f64],
-        initial: Vec<f64>,
-        zero_crossings: Vec<f64>,
-        func: LevelSetFunction,
-    ) -> Self {
+    pub(super) fn new(size: &[usize], spacing: &[f64], setup: SolverSetup) -> Self {
         let grid = Grid::new(size);
         let dim = grid.dim();
         let min_spacing = spacing.iter().copied().fold(f64::INFINITY, f64::min);
+        let layers = 2 * setup.number_of_layers + 1;
+
+        // `Initialize()`: `m_ConstantGradientValue = minSpacing` under
+        // `GetUseImageSpacing()`, else `1.0`. `InitializeActiveLayerValues()`
+        // scales `MIN_NORM` by the same minimum spacing under the same flag.
+        let (constant_gradient_value, min_norm) = if setup.use_image_spacing {
+            (min_spacing, 1.0e-6 * min_spacing)
+        } else {
+            (1.0, 1.0e-6)
+        };
 
         let mut solver = SparseFieldSolver {
-            output: zero_crossings,
-            shifted: initial,
+            output: setup.zero_crossings,
+            shifted: setup.shifted,
             status: vec![STATUS_NULL; grid.number_of_pixels()],
-            layers: (0..2 * dim + 1).map(|_| VecDeque::new()).collect(),
+            layers: (0..layers).map(|_| VecDeque::new()).collect(),
             update_buffer: Vec::new(),
-            number_of_layers: dim,
-            // `Initialize()`: `m_ConstantGradientValue = minSpacing` under
-            // `GetUseImageSpacing()`, which `FiniteDifferenceImageFilter`
-            // defaults to true.
-            constant_gradient_value: min_spacing,
-            min_spacing,
+            number_of_layers: setup.number_of_layers,
+            constant_gradient_value,
+            min_norm,
             neighbors: city_block_neighbors(dim),
             rms_change: 0.0,
             elapsed_iterations: 0,
             grid,
-            func,
+            func: setup.func,
+            update_rule: setup.update_rule,
         };
         solver.initialize();
         solver
@@ -269,8 +329,8 @@ impl SparseFieldSolver {
     fn initialize_active_layer_values(&mut self) {
         let dim = self.grid.dim();
         let change_factor = self.constant_gradient_value / 2.0;
-        let min_norm = 1.0e-6 * self.min_spacing;
-        let scales = self.func.neighborhood_scales.clone();
+        let min_norm = self.min_norm;
+        let scales = self.func.neighborhood_scales().to_vec();
 
         let active = std::mem::take(&mut self.layers[0]);
         for &index in &active {
@@ -426,8 +486,9 @@ impl SparseFieldSolver {
 
         for (n, &index) in active.iter().enumerate() {
             let center = self.output[index];
-            // `CalculateUpdateValue`: the plain finite-difference step.
-            let new_value = center + dt * self.update_buffer[n];
+            let new_value =
+                self.update_rule
+                    .calculate_update_value(index, dt, center, self.update_buffer[n]);
             let mut coord = self.grid.coord(index);
 
             if new_value >= upper_active_threshold {

@@ -1,18 +1,25 @@
-//! Segmentation level-set filters: `GeodesicActiveContourLevelSetImageFilter`,
+//! The `SparseFieldLevelSetImageFilter` family: the five segmentation filters
+//! `GeodesicActiveContourLevelSetImageFilter`,
 //! `ShapeDetectionLevelSetImageFilter`,
 //! `ThresholdSegmentationLevelSetImageFilter`,
 //! `LaplacianSegmentationLevelSetImageFilter` and
-//! `CannySegmentationLevelSetImageFilter`.
+//! `CannySegmentationLevelSetImageFilter`, plus
+//! [`AntiAliasBinaryImageFilter`](anti_alias_binary), which drives the same
+//! solver with a curvature-flow function and a per-pixel constraint.
 //!
-//! Ported from ITK's `Modules/Segmentation/LevelSets` and
-//! `Modules/Core/FiniteDifference`:
+//! Ported from ITK's `Modules/Segmentation/LevelSets`,
+//! `Modules/Filtering/AntiAlias` and `Modules/Core/FiniteDifference`:
 //!
 //! | Layer | ITK source |
 //! |---|---|
 //! | [`grid`] | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
-//! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx` |
+//! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx`, `itkCurvatureFlowFunction.h/.hxx` |
 //! | [`sparse_field`] | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
+//! | [`anti_alias`] | `itkAntiAliasBinaryImageFilter.h/.hxx` |
 //! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx` plus the five `itk*LevelSetFunction.h/.hxx` + `itk*LevelSetImageFilter.h/.hxx` pairs |
+//!
+//! The rest of this doc describes the five *segmentation* filters;
+//! [`anti_alias_binary`] documents its own inputs and sign convention.
 //!
 //! Every filter takes an **initial level set** — a real image whose
 //! `iso_surface_value` contour is the starting front, negative inside — and a
@@ -74,9 +81,12 @@
 //! field. This port always builds the speed image first, so the advection field
 //! is well defined at `propagation_scaling == 0`.
 
+mod anti_alias;
 mod function;
 mod grid;
 mod sparse_field;
+
+pub use anti_alias::anti_alias_binary;
 
 use crate::canny::{canny_edge_detection, zero_crossing_values};
 use crate::distance::danielsson_distance_map;
@@ -84,10 +94,10 @@ use crate::error::{FilterError, Result};
 use crate::gradient::laplacian;
 use crate::image_from_f64;
 use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
-use function::{CurvatureSpeed, LevelSetFunction};
+use function::{CurvatureSpeed, DifferenceFunction, LevelSetFunction};
 use grid::Grid;
 use sitk_core::{Image, PixelId};
-use sparse_field::SparseFieldSolver;
+use sparse_field::{SolverSetup, SparseFieldSolver, UpdateRule};
 
 /// `GeodesicActiveContourLevelSetFunction::m_DerivativeSigma`, the sigma of the
 /// Gaussian whose gradient forms the advection field. ITK's default is `1.0`
@@ -108,8 +118,10 @@ const CANNY_LOWER_THRESHOLD: f64 = 0.0;
 /// `GetElapsedIterations()` and `GetRMSChange()`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelSetResult {
-    /// The output level set, [`PixelId::Float32`]. Negative inside the
-    /// segmented region, positive outside.
+    /// The output level set. The five segmentation filters produce a
+    /// [`PixelId::Float32`] image, negative inside the segmented region;
+    /// [`anti_alias_binary`] produces the input's real type with the opposite
+    /// sign convention.
     pub image: Image,
     /// Number of iterations actually run before `Halt()` returned true.
     pub elapsed_iterations: u32,
@@ -518,9 +530,16 @@ fn solve(initial_level_set: &Image, s: Solve) -> Result<LevelSetResult> {
     let solver = SparseFieldSolver::new(
         initial_level_set.size(),
         &spacing,
-        shifted,
-        zero_crossings,
-        func,
+        SolverSetup {
+            shifted,
+            zero_crossings,
+            func: DifferenceFunction::LevelSet(func),
+            // `SegmentationLevelSetImageFilter`'s constructor:
+            // `this->SetNumberOfLayers(TInputImage::ImageDimension)`.
+            number_of_layers: spacing.len(),
+            use_image_spacing: true,
+            update_rule: UpdateRule::Unconstrained,
+        },
     );
     let out = solver.run(s.maximum_rms_error, s.number_of_iterations);
 
