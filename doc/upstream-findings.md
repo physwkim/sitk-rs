@@ -481,11 +481,13 @@ What actually remains unported:
 - **Registration/Transform**: the erased `Transform` value type landed
   wave-18 (§5.10 option (a) executed — `sitk-transform::erased`, sixteen
   concrete types, §4.46/§4.48/§4.49) with `read_transform`/`write_transform`
-  for `.tfm`/`.txt` (`.h5`/`.mat`/`.xfm` stay gated on §5.8). Still missing:
-  the initial-transform model
-  (`SetInitialTransform`(+in-place)/`SetMovingInitialTransform`/
-  `SetFixedInitialTransform`/`SetInitialTransformAsBSpline`,
-  `SetVirtualDomain{,FromImage}`, `MetricEvaluate`); the observer/introspection
+  for `.tfm`/`.txt`, since joined by `.h5`/`.hdf5` (wave-21; `.mat`/`.xfm`
+  stay gated on §5.8). The initial-transform model landed wave-19
+  (`set_initial_transform`(+in-place)/`set_moving_initial_transform`/
+  `set_fixed_initial_transform`, `set_virtual_domain{,_from_image}`,
+  `metric_evaluate` — §3.33-3.36, §4.64-4.67). Still missing:
+  `SetInitialTransformAsBSpline` (the multi-level BSpline overload with
+  per-level scale factors); the observer/introspection
   surface (`GetOptimizerIteration`/`GetMetricValue`/…/`StopRegistration`,
   upstream `sitkCommand.h`/`sitkEvent.h`);
   and `SetMetricUse{Fixed,Moving}ImageGradientFilter`, which this port
