@@ -16,9 +16,9 @@
 //!
 //! Only the `double` precision variant exists here, matching SimpleITK, which
 //! instantiates `TransformFileReader`/`Writer` on `double` alone. `.h5` /
-//! `.hdf5` live in [`crate::transform_hdf5`], which [`read_transform`] and
-//! [`write_transform`] dispatch to; the MATLAB `.mat` format is out of scope
-//! (ledger §5.8).
+//! `.hdf5` live in [`crate::transform_hdf5`] and MATLAB `.mat` in
+//! [`crate::transform_matlab`]; [`read_transform`] and [`write_transform`]
+//! dispatch to both.
 //!
 //! # Fidelity notes
 //!
@@ -46,6 +46,7 @@ use sitk_transform::{
 
 use crate::error::{IoError, Result};
 use crate::transform_hdf5;
+use crate::transform_matlab;
 
 /// How deep `ComponentTransformFile:` references may nest before the reader
 /// gives up. ITK has no such limit and recurses until the C++ stack is
@@ -453,15 +454,17 @@ fn read_component_file(master: &Path, value: &str, depth: usize) -> Result<Trans
 /// is returned.
 ///
 /// `TransformIOFactory::CreateTransformIO` polls every registered IO's
-/// `CanReadFile` in registration order. Only two are ported: the Insight legacy
-/// text IO, which looks at the extension alone, and
+/// `CanReadFile` in registration order. Three are ported: the Insight legacy
+/// text IO and [`crate::transform_matlab`], both extension-based, and
 /// [`crate::transform_hdf5`], which looks at the *content* alone. This port
-/// asks the text IO first, so an HDF5 file misnamed `.tfm` is parsed as text
-/// and fails, where ITK's answer depends on its factory registration order
-/// (ledger §4.80).
+/// asks the text IO first, then Matlab, then HDF5, so an HDF5 file misnamed
+/// `.tfm` is parsed as text and fails, where ITK's answer depends on its
+/// factory registration order (ledger §4.80).
 fn read_and_fold(path: &Path, depth: usize) -> Result<Vec<Transform>> {
     let list = if can_handle(path) {
         read_transform_list(path, depth)?
+    } else if transform_matlab::can_read_file(path) {
+        transform_matlab::read_transform_list(path)?
     } else if transform_hdf5::can_read_file(path) {
         transform_hdf5::read_transform_list(path)?
     } else {
@@ -491,9 +494,10 @@ fn can_handle(path: &Path) -> bool {
     )
 }
 
-/// Read a transform from an Insight legacy transform file (`.tfm` / `.txt`) or
+/// Read a transform from an Insight legacy transform file (`.tfm` / `.txt`),
 /// an HDF5 one (any file holding a `/TransformGroup`, conventionally `.h5` /
-/// `.hdf5`) — `itk::simple::ReadTransform` (`sitkTransform.cxx:668-723`).
+/// `.hdf5`), or a MATLAB one (`.mat`) — `itk::simple::ReadTransform`
+/// (`sitkTransform.cxx:668-723`).
 ///
 /// A file may hold several transforms; as upstream, only the first is returned
 /// (SimpleITK prints a warning here, which this port has no channel for —
@@ -539,8 +543,9 @@ fn print_vector(out: &mut String, values: &[f64]) {
 
 /// Write a transform to an Insight legacy transform file (`.tfm` / `.txt`) —
 /// `itk::simple::WriteTransform` (`sitkTransform.cxx:731-737`) over
-/// `TxtTransformIOTemplate::Write` (`itkTxtTransformIO.cxx:242-296`) — or to an
-/// HDF5 one, for the eight extensions [`crate::transform_hdf5`] claims.
+/// `TxtTransformIOTemplate::Write` (`itkTxtTransformIO.cxx:242-296`) — to a
+/// MATLAB one (`.mat`, see [`crate::transform_matlab`]), or to an HDF5 one,
+/// for the eight extensions [`crate::transform_hdf5`] claims.
 ///
 /// A [`CompositeTransform`] is written as a `CompositeTransform` line with no
 /// parameters, followed by each of its sub-transforms in queue order — the
@@ -560,6 +565,8 @@ pub fn write_transform<P: AsRef<Path>>(transform: &Transform, path: P) -> Result
     if can_handle(path) {
         std::fs::write(path, serialize(transform)?)?;
         Ok(())
+    } else if transform_matlab::can_write_file(path) {
+        transform_matlab::write_transform(transform, path)
     } else if transform_hdf5::can_write_file(path) {
         transform_hdf5::write_transform(transform, path)
     } else {
@@ -894,18 +901,18 @@ mod tests {
         assert!(matches!(result, Err(IoError::MalformedTransformFile(_))));
     }
 
-    /// `.mat` is `MatlabTransformIO`'s, which this crate does not port; no other
-    /// IO claims it, so both directions fail as `TransformFileReader` /
-    /// `Writer` do when `CreateTransformIO` returns null.
+    /// `.xfm` (MINC) is not ported by any IO here, so both directions fail as
+    /// `TransformFileReader` / `Writer` do when `CreateTransformIO` returns
+    /// null.
     #[test]
     fn an_unknown_extension_is_rejected() {
         let transform: Transform = TranslationTransform::new(vec![1.0, 2.0]).into();
         assert!(matches!(
-            write_transform(&transform, tmp_path("bad.mat")),
+            write_transform(&transform, tmp_path("bad.xfm")),
             Err(IoError::NoTransformWriterFound(_))
         ));
         assert!(matches!(
-            read_transform(tmp_path("bad.mat")),
+            read_transform(tmp_path("bad.xfm")),
             Err(IoError::NoTransformReaderFound(_))
         ));
     }

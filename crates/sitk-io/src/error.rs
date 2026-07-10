@@ -299,6 +299,16 @@ pub enum IoError {
     #[error("unable to read a transform of dimension {0}: only 2D and 3D are supported")]
     UnsupportedTransformDimension(usize),
 
+    /// A `.mat` transform record this port refuses rather than reproduces —
+    /// a complex-valued (`imag != 0`) record. Upstream's `ReadMat`
+    /// (`itkMatlabTransformIO.cxx:50-73`) ignores `vnl_matlab_readhdr::
+    /// read_data`'s `bool` return, so a complex header leaves the stream
+    /// desynchronized rather than raising an error; that has no stable,
+    /// reproducible semantics to match. See [`crate::transform_matlab`] and
+    /// ledger §4.104.
+    #[error("unsupported MATLAB transform feature: {0}")]
+    UnsupportedMatlabTransformFeature(String),
+
     /// A JPEG feature this port does not implement, or that SimpleITK's
     /// wrapping layer cannot represent: a >8-bit-precision (12-bit lossless)
     /// JPEG, which `itk::JPEGImageIO` cannot read either since its own
