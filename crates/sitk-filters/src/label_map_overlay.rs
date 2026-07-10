@@ -19,7 +19,12 @@
 //!   component type from the **feature** image
 //!   (`output_image_type: itk::VectorImage< typename InputImageType2::PixelType,
 //!   ... >`), so the palette is rescaled to that type's `max()` exactly as in
-//!   [`crate::label_to_rgb::label_overlay`].
+//!   [`crate::label_to_rgb::label_overlay`]. For every **integer** feature this
+//!   is reproduced faithfully; a **floating-point** feature would scale into
+//!   `[0, f64::MAX]` and swamp the feature pixel in the blend, so this port
+//!   rejects it with [`FilterError::FloatingPointFeatureLabelMapOverlay`]
+//!   rather than emitting the swamped garbage — the same honor-or-reject
+//!   resolution as §2.54, tracked as ledger §2.151.
 //!
 //! All three write three components per pixel (`GenerateOutputInformation`
 //! forces `SetNumberOfComponentsPerPixel(3)`:
@@ -231,6 +236,8 @@ pub fn label_map_to_rgb(map: &LabelMap, colormap: &[u8]) -> Result<Image> {
 
 /// The palette, rescaled to `feature_id`'s `NumericTraits<ValueType>::max()` and
 /// narrowed to it once, as `AddColor` does (`itkLabelToRGBFunctor.h:104-118`).
+/// `feature_id` is always an integer type here: `overlay_onto` rejects a
+/// floating-point feature before reaching this helper (§2.151).
 fn scaled_colors(colors: &[[u8; 3]], feature_id: PixelId) -> Vec<[f64; 3]> {
     let value_max = numeric_traits_max(feature_id);
     colors
@@ -268,6 +275,18 @@ fn overlay_onto(
     colormap: &[u8],
 ) -> Result<Image> {
     let feature_id = feature.pixel_id();
+    // §2.151: the palette is scaled by the feature image's own
+    // NumericTraits<ValueType>::max() (the output is RGBPixel<feature type>).
+    // For a scalar floating-point feature that is f32/f64 MAX, which swamps the
+    // feature pixel in the blend and produces a meaningless overlay. Refuse
+    // rather than emit the swamped garbage; any float scaling rule would be
+    // invented semantics with no unique answer. This single owner covers both
+    // `label_map_overlay` and `label_map_contour_overlay`. A complex or vector
+    // feature falls through to the scalar-required error below (its component
+    // being float is a distinct concern), so this matches scalar float only.
+    if matches!(feature_id, PixelId::Float32 | PixelId::Float64) {
+        return Err(FilterError::FloatingPointFeatureLabelMapOverlay(feature_id));
+    }
     let base = feature.to_f64_vec()?;
 
     let colors = build_color_table(colormap);
@@ -547,13 +566,6 @@ mod tests {
         [s[off], s[off + 1], s[off + 2]]
     }
 
-    fn f64_at(img: &Image, x: usize, y: usize) -> [f64; 3] {
-        let w = img.size()[0];
-        let s = img.components_to_f64_vec();
-        let off = (y * w + x) * 3;
-        [s[off], s[off + 1], s[off + 2]]
-    }
-
     #[test]
     fn label_map_to_rgb_paints_the_palette_and_a_black_background() {
         let map = map_of(&[3, 1], &[(1, &[([0, 0], 1)]), (2, &[([2, 0], 1)])]);
@@ -668,13 +680,38 @@ mod tests {
 
     #[test]
     fn label_map_overlay_rescales_the_palette_to_the_feature_types_max() {
+        // Feature type UInt16: NumericTraits<uint16_t>::max() == 65535, not 255,
+        // so palette color 1's green 205 scales to 205/255*65535 == 52685 --
+        // proof the rescale uses the feature type's max, not a fixed 255. Feature
+        // value 0, opacity 1.0, so the blend is the scaled color itself. Integer
+        // feature: byte-identical to upstream.
         let map = map_of(&[1, 1], &[(1, &[([0, 0], 1)])]);
-        let feature = Image::from_vec(&[1, 1], vec![0.0f64]).unwrap();
+        let feature = Image::from_vec(&[1, 1], vec![0u16]).unwrap();
         let out = label_map_overlay(&map, &feature, 1.0, &[]).unwrap();
-        let got = f64_at(&out, 0, 0);
-        assert_eq!(got[0], 0.0);
-        assert_eq!(got[1], 205.0 / 255.0 * f64::MAX);
-        assert_eq!(got[2], 0.0);
+        assert_eq!(out.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(out.component_slice::<u16>().unwrap(), &[0, 52685, 0]);
+    }
+
+    #[test]
+    fn label_map_overlay_rejects_a_floating_point_feature_image() {
+        // §2.151: the palette is scaled by the feature's NumericTraits::max(),
+        // which is f32/f64 MAX for a floating-point feature -- meaningless in
+        // the blend. Both float features are refused with the dedicated typed
+        // error. The guard lives in the shared `overlay_onto`, so both
+        // `label_map_overlay` and `label_map_contour_overlay` are covered.
+        let map = map_of(&[1, 1], &[(1, &[([0, 0], 1)])]);
+
+        let f32_feature = Image::from_vec(&[1, 1], vec![0.0f32]).unwrap();
+        assert_eq!(
+            label_map_overlay(&map, &f32_feature, 0.5, &[]).unwrap_err(),
+            FilterError::FloatingPointFeatureLabelMapOverlay(PixelId::Float32)
+        );
+
+        let f64_feature = Image::from_vec(&[1, 1], vec![0.0f64]).unwrap();
+        assert_eq!(
+            label_map_overlay(&map, &f64_feature, 0.5, &[]).unwrap_err(),
+            FilterError::FloatingPointFeatureLabelMapOverlay(PixelId::Float64)
+        );
     }
 
     #[test]
