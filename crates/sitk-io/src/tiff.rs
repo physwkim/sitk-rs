@@ -181,7 +181,7 @@
 //!
 //! A file carrying `RESOLUTIONUNIT = 2` but **no** `XRESOLUTION` therefore
 //! reports a spacing of `25.4 / 1 == 25.4` mm rather than `1.0`: the guard
-//! `m_XResolution > 0` passes on `Clean()`'s seed. Ledger §2.141.
+//! `m_XResolution > 0` passes on `Clean()`'s seed. Ledger §2.142.
 //!
 //! # 16-bit endianness needs no hand-swapping
 //!
@@ -1559,7 +1559,7 @@ mod tests {
     /// `Clean()` seeds `m_XResolution = 1`, and `ReadImageInformation`'s guard
     /// is `m_XResolution > 0` — which that seed passes. A page with
     /// `RESOLUTIONUNIT = 2` and no `XRESOLUTION` therefore reports a spacing of
-    /// `25.4 / 1`, not `1.0`. Ledger §2.141.
+    /// `25.4 / 1`, not `1.0`. Ledger §2.142.
     #[test]
     fn resolution_unit_without_a_resolution_tag_yields_a_spacing_of_25_4() {
         let mut entries = base_entries(2, 1, 8, 1, 1);
