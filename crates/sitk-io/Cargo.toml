@@ -23,3 +23,11 @@ rust-hdf5 = "0.3"
 # `miniz_oxide` (via `flate2`) for the read side — no `*-sys` crate enters the
 # tree (verified with `cargo tree`) — ledger §5.8.
 png = "0.18"
+# Pure-Rust JPEG decoding/encoding, used by the `jpeg` module for `.jpg`
+# image IO. Both crates are `#![forbid(unsafe_code)]`/`#![deny(unsafe_code)]`
+# safe Rust with no `*-sys` crate in the tree (verified with `cargo tree`) —
+# ledger §5.8/§5.26. `jpeg-decoder`'s default `rayon` feature (multithreaded
+# decode) is dropped — this crate has no use for it and it is the one feature
+# that would otherwise pull in a large extra dependency graph.
+jpeg-encoder = "0.6.1"
+jpeg-decoder = { version = "0.3.2", default-features = false }
