@@ -15,8 +15,13 @@
 //! pixel type this crate supports has a total order) and no in-place variant
 //! (matching `divide_real`'s precedent in `math.rs`). ITK's own header also
 //! declares sibling `Greater`/`Less`/`Equal` functors
-//! (`GreaterImageFilter.yaml`/`LessImageFilter.yaml`/`EqualImageFilter.yaml`)
-//! that this port does not implement, as they were not in this port's scope.
+//! (`GreaterImageFilter.yaml`/`LessImageFilter.yaml`/`EqualImageFilter.yaml`),
+//! implemented below as [`equal`]/[`greater`]/[`less`] on the same
+//! `ComparisonFunctor` policy. `Equal`'s `Math::ExactlyEquals(A,
+//! static_cast<TInput1>(B))` (itkLogicOpsFunctors.h:130) is a
+//! compiler-warning-suppressing wrapper around `==`, not a different
+//! comparison, and the `static_cast<TInput1>(B)` is a no-op here since both
+//! operands share the crate's single generic `T`.
 //!
 //! [`and`]/[`or`]/[`xor`] are pixel-type-compute (`functor.rs`'s policy
 //! (b)): ITK's `Functor::AND`/`OR`/`XOR` evaluate `&`/`|`/`^` directly in the
@@ -369,6 +374,75 @@ functor::comparison_functor! {
     /// `NotEqualImageFilter`: pixel-wise `a != b ? foreground_value :
     /// background_value`. Output is always `UInt8`.
     pub fn not_equal(foreground_value: u8, background_value: u8) = NotEqualOp { foreground_value, background_value };
+}
+
+/// `Equal` functor (`itkLogicOpsFunctors.h`): `a == b ? foreground_value :
+/// background_value`, compared directly in the pixel type (no promotion; see
+/// the module docs).
+struct EqualOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for EqualOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a == b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+/// `Greater` functor (`itkLogicOpsFunctors.h`): `a > b ? foreground_value :
+/// background_value`, compared directly in the pixel type (no promotion; see
+/// the module docs).
+struct GreaterOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for GreaterOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a > b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+/// `Less` functor (`itkLogicOpsFunctors.h`): `a < b ? foreground_value :
+/// background_value`, compared directly in the pixel type (no promotion; see
+/// the module docs).
+struct LessOp {
+    foreground_value: u8,
+    background_value: u8,
+}
+impl<T: Scalar> ComparisonFunctor<T> for LessOp {
+    fn apply(&self, a: T, b: T) -> u8 {
+        if a < b {
+            self.foreground_value
+        } else {
+            self.background_value
+        }
+    }
+}
+
+functor::comparison_functor! {
+    /// `EqualImageFilter`: pixel-wise `a == b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn equal(foreground_value: u8, background_value: u8) = EqualOp { foreground_value, background_value };
+}
+
+functor::comparison_functor! {
+    /// `GreaterImageFilter`: pixel-wise `a > b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn greater(foreground_value: u8, background_value: u8) = GreaterOp { foreground_value, background_value };
+}
+
+functor::comparison_functor! {
+    /// `LessImageFilter`: pixel-wise `a < b ? foreground_value :
+    /// background_value`. Output is always `UInt8`.
+    pub fn less(foreground_value: u8, background_value: u8) = LessOp { foreground_value, background_value };
 }
 
 // ---- mask / mask_negated (all pixel types) ---------------------------------
@@ -915,6 +989,81 @@ mod tests {
                 b: b.pixel_id()
             })
         );
+    }
+
+    // ---- equal / greater / less: ==, >, < boundaries, defaults, guards ----
+
+    #[test]
+    fn equal_matching_and_differing_pixels() {
+        let a = Image::from_vec(&[3, 1], vec![1i32, 2, 2]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![1i32, 3, 2]).unwrap();
+        assert_eq!(
+            equal(&a, &b, 1, 0).unwrap().scalar_slice::<u8>().unwrap(),
+            &[1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn greater_above_equal_and_below_boundaries() {
+        let a = Image::from_vec(&[3, 1], vec![5i32, 3, 3]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 5]).unwrap();
+        assert_eq!(
+            greater(&a, &b, 1, 0).unwrap().scalar_slice::<u8>().unwrap(),
+            &[1, 0, 0]
+        );
+    }
+
+    #[test]
+    fn less_above_equal_and_below_boundaries() {
+        let a = Image::from_vec(&[3, 1], vec![5i32, 3, 3]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![3i32, 3, 5]).unwrap();
+        assert_eq!(
+            less(&a, &b, 1, 0).unwrap().scalar_slice::<u8>().unwrap(),
+            &[0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn equal_greater_less_use_yaml_default_foreground_1_background_0() {
+        // EqualImageFilter.yaml / GreaterImageFilter.yaml / LessImageFilter.yaml:
+        // ForegroundValue default 1u, BackgroundValue default 0u.
+        let a = Image::from_vec(&[2, 1], vec![5i32, 3]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![3i32, 5]).unwrap();
+        assert_eq!(
+            greater(&a, &b, 1, 0).unwrap().scalar_slice::<u8>().unwrap(),
+            &[1, 0]
+        );
+        assert_eq!(
+            less(&a, &b, 1, 0).unwrap().scalar_slice::<u8>().unwrap(),
+            &[0, 1]
+        );
+    }
+
+    #[test]
+    fn equal_greater_less_output_is_always_uint8_regardless_of_input_type() {
+        let a = Image::from_vec(&[2, 1], vec![5.0f32, 3.0]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![3.0f32, 5.0]).unwrap();
+        for out in [
+            greater(&a, &b, 1, 0).unwrap(),
+            less(&a, &b, 1, 0).unwrap(),
+            equal(&a, &b, 1, 0).unwrap(),
+        ] {
+            assert_eq!(out.pixel_id(), sitk_core::PixelId::UInt8);
+        }
+    }
+
+    #[test]
+    fn equal_greater_less_reject_a_complex_pixel_type() {
+        let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        let b = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        let expected = || {
+            Err(FilterError::Core(
+                sitk_core::Error::RequiresScalarPixelType(PixelId::ComplexFloat32),
+            ))
+        };
+        assert_eq!(equal(&a, &b, 1, 0), expected());
+        assert_eq!(greater(&a, &b, 1, 0), expected());
+        assert_eq!(less(&a, &b, 1, 0), expected());
     }
 
     // ---- mask: mask zero vs nonzero vs explicit masking_value ----
