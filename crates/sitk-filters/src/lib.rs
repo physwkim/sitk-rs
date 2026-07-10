@@ -144,8 +144,9 @@ pub use denoise::{
     discrete_gaussian_derivative, mean, median,
 };
 pub use displacement_field::{
-    InvertDisplacementFieldResult, InvertDisplacementFieldSettings, inverse_displacement_field,
-    invert_displacement_field,
+    InvertDisplacementFieldResult, InvertDisplacementFieldSettings,
+    IterativeInverseDisplacementFieldSettings, inverse_displacement_field,
+    invert_displacement_field, iterative_inverse_displacement_field,
 };
 pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,

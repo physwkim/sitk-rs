@@ -53,10 +53,14 @@ use crate::{FilterError, Result};
 
 mod inverse;
 mod invert;
+mod iterative_inverse;
 
 pub use inverse::inverse_displacement_field;
 pub use invert::{
     InvertDisplacementFieldResult, InvertDisplacementFieldSettings, invert_displacement_field,
+};
+pub use iterative_inverse::{
+    IterativeInverseDisplacementFieldSettings, iterative_inverse_displacement_field,
 };
 
 /// Check that `img` is what SimpleITK's `GetImageFromVectorImage` accepts as a
