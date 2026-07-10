@@ -15,6 +15,7 @@ use sitk_core::{Complex, Image, PixelBuffer, PixelId, matrix};
 
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, reader_for};
+use crate::reader::normalize_reader_geometry;
 
 /// `SimpleITK_MAX_DIMENSION` (CMake `SimpleITK_MAX_DIMENSION_DEFAULT`), the
 /// ceiling `ImageSeriesReader::Execute` enforces on the promoted dimension
@@ -290,8 +291,13 @@ impl ImageSeriesReader {
         let first_idx = if self.reverse_order { n - 1 } else { 0 };
         let last_idx = if self.reverse_order { 0 } else { n - 1 };
 
-        let first_info = io.read_information(&self.file_names[first_idx])?;
+        let mut first_info = io.read_information(&self.file_names[first_idx])?;
         check_pixel_type(&self.file_names[first_idx], &first_info, pixel_id)?;
+        // Upstream derives the first/last geometry through the same
+        // `ImageFileReader` that normalizes negative spacing to positive
+        // (itkImageSeriesReader.hxx:120-122); this port reads raw geometry via
+        // `read_information`, so it must normalize before deriving.
+        normalize_info_geometry(&mut first_info);
         let (first_size, first_spacing, first_origin, first_direction) =
             padded_info_geometry(&first_info, out_dim);
 
@@ -316,8 +322,9 @@ impl ImageSeriesReader {
             }
             moving_dim = moving;
 
-            let last_info = io.read_information(&self.file_names[last_idx])?;
+            let mut last_info = io.read_information(&self.file_names[last_idx])?;
             check_pixel_type(&self.file_names[last_idx], &last_info, pixel_id)?;
+            normalize_info_geometry(&mut last_info);
             let (_, _, last_padded_origin, _) = padded_info_geometry(&last_info, out_dim);
 
             let position1 = itk_image_origin_override(&first_info.metadata, out_dim)
@@ -387,7 +394,14 @@ impl ImageSeriesReader {
         for i in 0..n {
             let file_idx = if self.reverse_order { n - 1 - i } else { i };
             let path = self.file_names[file_idx].clone();
-            let slice_image = io.read(&path)?;
+            let mut slice_image = io.read(&path)?;
+            // Every slice goes through the same `ImageFileReader` normalization
+            // upstream applies per file (itkImageSeriesReader.hxx:106-109,327):
+            // negative spacing flips positive and the raw geometry is recorded
+            // under `ITK_original_*`, which the collected per-slice dictionaries
+            // then copy (itkImageFileReader.hxx:219-221,
+            // itkImageSeriesReader.hxx:468).
+            normalize_reader_geometry(&mut slice_image)?;
             if slice_image.pixel_id() != pixel_id {
                 return Err(IoError::SeriesPixelTypeMismatch {
                     file: path,
@@ -544,6 +558,17 @@ fn pad_axes(
         }
     }
     (padded_size, padded_spacing, padded_origin, padded_direction)
+}
+
+/// Apply `itk::ImageFileReader`'s positive-spacing normalization to the raw
+/// geometry `read_information` reports, so the series reader derives its
+/// inter-slice spacing/direction from the same normalized geometry upstream's
+/// per-file `ImageFileReader` produces (itkImageSeriesReader.hxx:120-122). Only
+/// the sign-flip half applies here — the `ITK_original_*` recording lives on
+/// the per-slice [`Image`] reads, which are what the collected dictionaries
+/// copy.
+fn normalize_info_geometry(info: &mut ImageInformation) {
+    crate::reader::flip_negative_spacing(info.dimension, &mut info.spacing, &mut info.direction);
 }
 
 fn padded_info_geometry(
@@ -811,6 +836,93 @@ mod tests {
         let mut bytes = header.into_bytes();
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    /// A 2-D MetaImage with an explicit (possibly negative) `ElementSpacing` —
+    /// `write_image` refuses a negative spacing (`Image::set_spacing` rejects
+    /// non-positive), but `Image::from_parts` (the reader's own path) accepts
+    /// it, so the header text is written directly.
+    fn mha_2d_with_spacing(
+        size: [usize; 2],
+        spacing: [f64; 2],
+        origin: [f64; 2],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let header = format!(
+            "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             BinaryDataByteOrderMSB = False\n\
+             CompressedData = False\n\
+             TransformMatrix = 1 0 0 1\n\
+             Offset = {} {}\n\
+             ElementSpacing = {} {}\n\
+             DimSize = {} {}\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LOCAL\n",
+            origin[0], origin[1], spacing[0], spacing[1], size[0], size[1],
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn series_reader_flips_negative_spacing_and_records_the_originals() {
+        // Two 2-D slices carrying a negative Y spacing — the sign a raw read
+        // preserves (dicom.rs) but that every read path must flip positive.
+        // The series reader is the one path that used to bypass
+        // `normalize_reader_geometry` (itkImageSeriesReader.hxx:120-122,468).
+        let dir = tmp_dir("negative_spacing_series");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        std::fs::write(
+            &p0,
+            mha_2d_with_spacing([2, 2], [2.0, -3.0], [0.0, 0.0], &[0, 1, 2, 3]),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            mha_2d_with_spacing([2, 2], [2.0, -3.0], [0.0, 0.0], &[10, 11, 12, 13]),
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader
+            .set_file_names(&[&p0, &p1])
+            .set_meta_data_dictionary_array_update(true);
+        let image = reader.execute().unwrap();
+
+        // The derived volume geometry is flipped positive: the negative Y
+        // spacing becomes positive and the Y direction *column* is negated.
+        assert_eq!(image.dimension(), 3);
+        assert_eq!(image.spacing(), &[2.0, 3.0, 1.0]);
+        assert_eq!(
+            image.direction(),
+            &[1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        // Pixels are untouched by the sign flip.
+        assert_eq!(
+            image.scalar_slice::<u8>().unwrap(),
+            &[0, 1, 2, 3, 10, 11, 12, 13]
+        );
+
+        // Every collected per-slice dictionary carries the raw geometry under
+        // `ITK_original_*`, exactly as upstream's per-file `ImageFileReader`
+        // records and the series reader copies.
+        for slice in 0..2 {
+            assert_eq!(
+                reader.meta_data(slice, "ITK_original_spacing").unwrap(),
+                Some("2 -3"),
+                "slice {slice} ITK_original_spacing"
+            );
+            assert_eq!(
+                reader.meta_data(slice, "ITK_original_direction").unwrap(),
+                Some("1 0 0 1"),
+                "slice {slice} ITK_original_direction"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

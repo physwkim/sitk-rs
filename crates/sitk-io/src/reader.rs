@@ -347,18 +347,35 @@ pub(crate) fn normalize_reader_geometry(image: &mut Image) -> Result<()> {
     if image.spacing().iter().any(|&s| s < 0.0) {
         let mut spacing = image.spacing().to_vec();
         let mut direction = image.direction().to_vec();
-        for i in 0..dim {
-            if spacing[i] < 0.0 {
-                spacing[i] = -spacing[i];
-                for j in 0..dim {
-                    direction[j * dim + i] = -direction[j * dim + i];
-                }
-            }
-        }
+        flip_negative_spacing(dim, &mut spacing, &mut direction);
         image.set_spacing(&spacing)?;
         image.set_direction(&direction)?;
     }
     Ok(())
+}
+
+/// Step 2 of `itk::ImageFileReader`'s geometry normalization
+/// (itkImageFileReader.hxx:226-236), factored out so every read path can carry
+/// the same positive-spacing invariant by construction. For each axis whose
+/// spacing is negative, make it positive and negate the matching **column** of
+/// the direction cosine matrix (cosines are stored as columns), leaving the
+/// physical geometry unchanged.
+///
+/// [`normalize_reader_geometry`] applies this to a full [`Image`]; the series
+/// reader ([`crate::ImageSeriesReader`]) applies it to the raw
+/// [`ImageInformation`](crate::image_io::ImageInformation) geometry it derives
+/// its inter-slice spacing/direction from, which upstream reads through the
+/// same `ImageFileReader` and so sees already-normalized
+/// (itkImageSeriesReader.hxx:120-122).
+pub(crate) fn flip_negative_spacing(dim: usize, spacing: &mut [f64], direction: &mut [f64]) {
+    for i in 0..dim {
+        if spacing[i] < 0.0 {
+            spacing[i] = -spacing[i];
+            for j in 0..dim {
+                direction[j * dim + i] = -direction[j * dim + i];
+            }
+        }
+    }
 }
 
 /// Space-separated shortest-round-trip decimals, the string form the reader
