@@ -17,13 +17,19 @@
 //! constructor sets the default quality to 95 (itkJPEGImageIO.cxx:300).
 //! Ledger §3.49.
 //!
+//! Because that ITK alias is a *single* field, this port has nothing to
+//! disambiguate: it exposes one knob, [`WriteOptions::compression_level`],
+//! which [`resolved_quality`] interprets as the JPEG quality. There is no
+//! separate `Quality` option, so the alias collapses to one field with one
+//! meaning — verified 2026-07-11, no code change (ledger §3.49).
+//!
 //! `m_UseCompression = false` is set in the same constructor (`:299`) and
 //! never referenced again anywhere in `itkJPEGImageIO.cxx` — dead code.
 //! `Write` calls `jpeg_set_quality` unconditionally; there is no branch that
 //! skips it. [`write`] reproduces this: [`resolved_quality`] never consults
 //! [`WriteOptions::use_compression`]. Ledger §2.138.
 //!
-//! # `Progressive` and `CMYKtoRGB` are always on, and SimpleITK can't change either
+//! # `Progressive` and `CMYKtoRGB` are always on upstream — configurable here
 //!
 //! Both are in-class initializers on `JPEGImageIO` itself — `m_Progressive{
 //! true }`, `m_CMYKtoRGB{ true }` (itkJPEGImageIO.h:125,127) — and the
@@ -32,10 +38,29 @@
 //! generic `SetUseCompression`/`SetCompressionLevel`/`SetCompressor`; neither
 //! `SetProgressive` nor `SetCMYKtoRGB` is wrapped anywhere in
 //! `Code/IO/include/sitkImageFileWriter.h` or `sitkImageSeriesWriter.h`.
-//! Through this crate's public surface a JPEG is therefore always written
-//! progressive and a CMYK source is always converted to RGB on read. Ledger
-//! §3.50. [`write`] calls `encoder.set_progressive(true)` unconditionally;
-//! [`read`] always applies [`cmyk_to_rgb`] to a 4-component source.
+//! Through *SimpleITK's* public surface a JPEG is therefore always written
+//! progressive and a CMYK source is always converted to RGB on read (ledger
+//! §3.50; the chroma-subsampling factor is likewise fixed at 4:2:0, §5.27).
+//!
+//! This port keeps that as the default but exposes the capability upstream
+//! hides:
+//!
+//! * **Write** — the [`ImageIo`] trait and [`write`] use
+//!   [`JpegWriteOptions::default`] (progressive on, 4:2:0), byte-identical to
+//!   before; [`write_with_jpeg_options`] takes an explicit [`JpegWriteOptions`]
+//!   to pick the progressive flag and one of 4:4:4 / 4:2:2 / 4:2:0 chroma
+//!   subsampling.
+//! * **Read** — [`read`] flattens CMYK to RGB, upstream's only path;
+//!   [`read_preserving_cmyk`] keeps the raw four uninverted channels as a
+//!   4-component vector image. `jpeg_decoder` hands back
+//!   [`PixelFormat::CMYK32`] itself, so this is a genuine capability, not a
+//!   decoder work-around.
+//!
+//! These live on the `jpeg` module's own surface because this crate's shared
+//! [`WriteOptions`] carries no format-specific fields and `read` takes no
+//! options at all; a future shared `ReadOptions`/`WriteOptions` unification
+//! could lift progressive, chroma subsampling and CMYK-preservation into the
+//! generic writer/reader surface.
 //!
 //! # CMYK → RGB: fixed in this port (upstream is right for plain CMYK, wrong for YCCK)
 //!
@@ -196,6 +221,59 @@ const JPEG_MAX_DIMENSION: usize = 65500;
 /// hit first for a component count in `4..=10`, but a count above 10 hits
 /// this check, and only this one, exactly as upstream does.
 const MAX_COMPONENTS: usize = 10;
+
+/// The chroma-subsampling scheme applied to a 3-component (YCbCr) JPEG write.
+///
+/// SimpleITK exposes no way to choose this (ledger §3.50); `JPEGImageIO`
+/// always writes 4:2:0 via libjpeg's constant `jpeg_default_colorspace`
+/// (§5.27). This port keeps 4:2:0 as the default but lets a caller pick
+/// through [`JpegWriteOptions`] / [`write_with_jpeg_options`]. It has no
+/// effect on a 1-component grayscale write, which carries no chroma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JpegChromaSubsampling {
+    /// 4:4:4 — no chroma subsampling (`jpeg_encoder::SamplingFactor::F_1_1`).
+    None,
+    /// 4:2:2 — chroma halved horizontally (`SamplingFactor::F_2_1`).
+    Chroma422,
+    /// 4:2:0 — chroma halved on both axes (`SamplingFactor::F_2_2`). The
+    /// default, byte-identical to upstream's constant behaviour.
+    #[default]
+    Chroma420,
+}
+
+impl JpegChromaSubsampling {
+    /// The `jpeg_encoder` factor this scheme maps to.
+    fn sampling_factor(self) -> SamplingFactor {
+        match self {
+            JpegChromaSubsampling::None => SamplingFactor::F_1_1,
+            JpegChromaSubsampling::Chroma422 => SamplingFactor::F_2_1,
+            JpegChromaSubsampling::Chroma420 => SamplingFactor::F_2_2,
+        }
+    }
+}
+
+/// The two JPEG encode knobs `JPEGImageIO` hard-wires and SimpleITK cannot
+/// reach — `m_Progressive` and the chroma-subsampling factor (ledger §3.50,
+/// §5.27). [`write`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
+/// whose values reproduce upstream exactly (progressive on, 4:2:0);
+/// [`write_with_jpeg_options`] takes an explicit set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JpegWriteOptions {
+    /// `m_Progressive` — upstream's in-class `true` (itkJPEGImageIO.h:125).
+    pub progressive: bool,
+    /// The chroma-subsampling scheme for a 3-component write.
+    pub chroma_subsampling: JpegChromaSubsampling,
+}
+
+impl Default for JpegWriteOptions {
+    /// Byte-identical to today's fixed behaviour: progressive, 4:2:0.
+    fn default() -> Self {
+        Self {
+            progressive: true,
+            chroma_subsampling: JpegChromaSubsampling::Chroma420,
+        }
+    }
+}
 
 /// `GetQuality`/`SetQuality`'s clamp, `1..=100` (see module doc, ledger
 /// §3.49) — distinct from every other format's `1..=9`
@@ -393,23 +471,60 @@ fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
     rgb
 }
 
-/// Read a `.jpg` file.
+/// Read a `.jpg` file, converting a CMYK source to RGB — the only behaviour
+/// SimpleITK can reach, since `m_CMYKtoRGB` is hard-wired on (ledger §3.50).
 pub fn read(path: &Path) -> Result<Image> {
+    read_impl(path, false)
+}
+
+/// Read a `.jpg` file, keeping a CMYK source as its raw four uninverted
+/// channels instead of converting to RGB.
+///
+/// `JPEGImageIO::m_CMYKtoRGB` is an in-class `true` the constructor never
+/// touches, and SimpleITK wraps no `SetCMYKtoRGB`, so a CMYK JPEG is always
+/// flattened to RGB through the public surface (ledger §3.50). That is not a
+/// decoder limitation: `jpeg_decoder` reads the Adobe APP14 marker and hands
+/// back [`PixelFormat::CMYK32`] — four channels in the *uninverted* (`true`)
+/// CMYK convention regardless of a plain-CMYK or YCCK encoding (module doc's
+/// "CMYK → RGB" section). This crate-only reader exposes that: a CMYK source
+/// reads back as a four-component [`PixelId::VectorUInt8`] carrying the raw
+/// channels, and a non-CMYK source is identical to [`read`].
+pub fn read_preserving_cmyk(path: &Path) -> Result<Image> {
+    read_impl(path, true)
+}
+
+/// The body of [`read`] / [`read_preserving_cmyk`]: decode once, then either
+/// flatten a CMYK source to RGB (`preserve_cmyk == false`, upstream's only
+/// path) or keep its raw four channels (`preserve_cmyk == true`).
+fn read_impl(path: &Path, preserve_cmyk: bool) -> Result<Image> {
     let bytes = std::fs::read(path)?;
     let (mut decoder, header) = open_and_probe(&bytes)?;
     let raw = decoder.decode()?;
+
+    let size = vec![header.width, header.height];
+    let spacing = spacing_from_density(scan_jfif_density(&bytes)).to_vec();
+    let origin = vec![0.0, 0.0];
+    let direction = identity(2);
+
+    if header.is_cmyk && preserve_cmyk {
+        // The raw four uninverted CMYK channels, kept as a 4-component vector
+        // image rather than flattened to RGB.
+        return Ok(Image::from_parts_vector(
+            PixelBuffer::UInt8(raw),
+            4,
+            size,
+            spacing,
+            origin,
+            direction,
+        )?);
+    }
 
     let pixels = if header.is_cmyk {
         cmyk_to_rgb(&raw)
     } else {
         raw
     };
-
     let buffer = PixelBuffer::UInt8(pixels);
-    let size = vec![header.width, header.height];
-    let spacing = spacing_from_density(scan_jfif_density(&bytes)).to_vec();
-    let origin = vec![0.0, 0.0];
-    let direction = identity(2);
 
     Ok(if header.pixel_id.is_vector() {
         Image::from_parts_vector(
@@ -454,12 +569,25 @@ fn density_for_spacing(spacing_x: f64, spacing_y: f64) -> Density {
     }
 }
 
-/// Write a `.jpg` file.
+/// Write a `.jpg` file with the fixed encode settings SimpleITK reaches:
+/// progressive, 4:2:0 chroma subsampling ([`JpegWriteOptions::default`]).
 ///
 /// `WriteImageInformation` is a no-op upstream; the header and pixel data are
 /// both emitted by `Write`/`WriteSlice` here in one pass, as they are
 /// upstream.
 pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
+    write_with_jpeg_options(image, path, options, &JpegWriteOptions::default())
+}
+
+/// Write a `.jpg` file, choosing the progressive flag and chroma-subsampling
+/// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write`] is this with
+/// [`JpegWriteOptions::default`], which is byte-identical to upstream.
+pub fn write_with_jpeg_options(
+    image: &Image,
+    path: &Path,
+    options: &WriteOptions,
+    jpeg: &JpegWriteOptions,
+) -> Result<()> {
     if image.dimension() != 2 {
         return Err(IoError::JpegWriteRejected(format!(
             "JPEG Writer can only write 2-dimensional images (itkJPEGImageIO.cxx:459-463), \
@@ -511,14 +639,15 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
 
     let file = std::fs::File::create(path)?;
     let mut encoder = JpegEncoder::new(file, resolved_quality(options));
-    encoder.set_progressive(true);
+    encoder.set_progressive(jpeg.progressive);
     if num_comp == 3 {
         // `jpeg_default_colorspace` always applies 2x2/1x1/1x1 (4:2:0)
         // sampling for a JCS_YCbCr write, regardless of quality
         // (jcparam.c:374-382); `jpeg_encoder::Encoder::new` would otherwise
         // pick no subsampling at ITK's own default quality of 95 (>= 90).
-        // Ledger §5.27.
-        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        // The default `JpegWriteOptions` keeps upstream's constant 4:2:0
+        // (ledger §5.27); a caller may pick another factor here.
+        encoder.set_sampling_factor(jpeg.chroma_subsampling.sampling_factor());
     }
     let spacing = image.spacing();
     if spacing[0] > 0.0 && spacing[1] > 0.0 {
@@ -1036,6 +1165,176 @@ mod tests {
         assert_eq!(cmyk_pixels, ycck_pixels);
         for px in cmyk_pixels.chunks_exact(3) {
             assert_eq!(px, [245, 55, 205]);
+        }
+    }
+
+    // -- JPEG write options (§3.50 / §5.27) ---------------------------------
+
+    /// Walk the marker stream to the first SOF (baseline `0xC0` or progressive
+    /// `0xC2`) and return `(sof_marker_code, first_component_sampling_byte)`.
+    /// The sampling byte packs H in the high nibble and V in the low nibble,
+    /// so luma is `0x11` for 4:4:4, `0x21` for 4:2:2, `0x22` for 4:2:0.
+    fn first_sof(bytes: &[u8]) -> (u8, u8) {
+        assert_eq!(&bytes[0..2], &[0xFF, 0xD8], "not a JPEG stream");
+        let mut pos = 2;
+        loop {
+            assert_eq!(bytes[pos], 0xFF, "expected a marker at offset {pos}");
+            let marker = bytes[pos + 1];
+            if marker == 0xC0 || marker == 0xC2 {
+                // len(2), precision(1), height(2), width(2), ncomp(1), then
+                // component 0: id(1), sampling(1) — the sampling byte is
+                // `2 (0xFF+code) + 2 (len) + 1 + 2 + 2 + 1 + 1` past `pos`.
+                return (marker, bytes[pos + 11]);
+            }
+            let len = u16::from_be_bytes([bytes[pos + 2], bytes[pos + 3]]) as usize;
+            pos += 2 + len;
+        }
+    }
+
+    fn rgb_image() -> Image {
+        let data: Vec<u8> = (0..(20 * 10 * 3)).map(|i| ((i * 53) % 256) as u8).collect();
+        Image::from_vec_vector(&[20, 10], 3, data).unwrap()
+    }
+
+    /// `JpegWriteOptions::default` reproduces upstream's fixed behaviour —
+    /// progressive, 4:2:0 — and `write` is byte-identical to
+    /// `write_with_jpeg_options` with those defaults.
+    #[test]
+    fn jpeg_write_defaults_match_upstream_progressive_and_4_2_0() {
+        assert_eq!(
+            JpegWriteOptions::default(),
+            JpegWriteOptions {
+                progressive: true,
+                chroma_subsampling: JpegChromaSubsampling::Chroma420,
+            }
+        );
+
+        let image = rgb_image();
+        let via_write = temp_path("sitk_io_jpeg_default_write.jpg");
+        let via_options = temp_path("sitk_io_jpeg_default_options.jpg");
+        write(&image, &via_write, &WriteOptions::default()).unwrap();
+        write_with_jpeg_options(
+            &image,
+            &via_options,
+            &WriteOptions::default(),
+            &JpegWriteOptions::default(),
+        )
+        .unwrap();
+        let write_bytes = std::fs::read(&via_write).unwrap();
+        let options_bytes = std::fs::read(&via_options).unwrap();
+        std::fs::remove_file(&via_write).ok();
+        std::fs::remove_file(&via_options).ok();
+        assert_eq!(write_bytes, options_bytes, "default path is byte-identical");
+
+        let (sof, luma) = first_sof(&write_bytes);
+        assert_eq!(sof, 0xC2, "default write is progressive (SOF2)");
+        assert_eq!(luma, 0x22, "default write is 4:2:0");
+    }
+
+    /// `progressive = false` emits a baseline (SOF0) JPEG, and it still reads
+    /// back as a 3-component image.
+    #[test]
+    fn jpeg_progressive_false_produces_a_baseline_jpeg() {
+        let image = rgb_image();
+        let path = temp_path("sitk_io_jpeg_baseline.jpg");
+        write_with_jpeg_options(
+            &image,
+            &path,
+            &WriteOptions::default(),
+            &JpegWriteOptions {
+                progressive: false,
+                chroma_subsampling: JpegChromaSubsampling::Chroma420,
+            },
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let read_back = read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let (sof, _) = first_sof(&bytes);
+        assert_eq!(sof, 0xC0, "progressive=false is a baseline SOF0 JPEG");
+        assert_eq!(read_back.number_of_components_per_pixel(), 3);
+        assert_eq!(read_back.size(), &[20, 10]);
+    }
+
+    /// Each chroma-subsampling scheme sets the luma sampling factor it names,
+    /// and every one still round-trips.
+    #[test]
+    fn jpeg_chroma_subsampling_selects_the_sampling_factor() {
+        let image = rgb_image();
+        for (scheme, luma) in [
+            (JpegChromaSubsampling::None, 0x11u8),
+            (JpegChromaSubsampling::Chroma422, 0x21),
+            (JpegChromaSubsampling::Chroma420, 0x22),
+        ] {
+            let path = temp_path(&format!("sitk_io_jpeg_chroma_{luma:#x}.jpg"));
+            write_with_jpeg_options(
+                &image,
+                &path,
+                &WriteOptions::default(),
+                &JpegWriteOptions {
+                    progressive: true,
+                    chroma_subsampling: scheme,
+                },
+            )
+            .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let read_back = read(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+
+            let (_, got) = first_sof(&bytes);
+            assert_eq!(got, luma, "{scheme:?} luma sampling factor");
+            assert_eq!(
+                read_back.number_of_components_per_pixel(),
+                3,
+                "{scheme:?} round-trips"
+            );
+            assert_eq!(read_back.size(), &[20, 10]);
+        }
+    }
+
+    /// [`read_preserving_cmyk`] keeps the raw four uninverted CMYK channels as
+    /// a 4-component vector image, where [`read`] flattens the same source to
+    /// the Gimp-formula RGB (§3.50). Same CMYK fixture as
+    /// `cmyk_source_reads_back_as_the_inverted_gimp_formula_rgb`.
+    #[test]
+    fn read_preserving_cmyk_keeps_the_raw_four_uninverted_channels() {
+        let width = 16;
+        let height = 16;
+        let data: Vec<u8> = std::iter::repeat_n([10u8, 200, 50, 0], width * height)
+            .flatten()
+            .collect();
+
+        let path = temp_path("sitk_io_jpeg_cmyk_preserve.jpg");
+        let file = std::fs::File::create(&path).unwrap();
+        JpegEncoder::new(file, 100)
+            .encode(&data, width as u16, height as u16, ColorType::Cmyk)
+            .unwrap();
+
+        let preserved = read_preserving_cmyk(&path).unwrap();
+        let converted = read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Preserved: 4-component vector of the raw uninverted CMYK.
+        assert_eq!(preserved.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(preserved.number_of_components_per_pixel(), 4);
+        assert_eq!(preserved.size(), &[width, height]);
+        let preserved_px = match preserved.buffer() {
+            PixelBuffer::UInt8(v) => v.as_slice(),
+            other => panic!("expected UInt8, got {other:?}"),
+        };
+        for chunk in preserved_px.chunks_exact(4) {
+            assert_eq!(chunk, [10, 200, 50, 0]);
+        }
+
+        // `read` still flattens to RGB — upstream's only reachable path.
+        assert_eq!(converted.number_of_components_per_pixel(), 3);
+        let converted_px = match converted.buffer() {
+            PixelBuffer::UInt8(v) => v.as_slice(),
+            other => panic!("expected UInt8, got {other:?}"),
+        };
+        for chunk in converted_px.chunks_exact(3) {
+            assert_eq!(chunk, [245, 55, 205]);
         }
     }
 }
