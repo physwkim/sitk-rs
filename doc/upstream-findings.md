@@ -655,8 +655,15 @@ What actually remains unported:
   bites DICOM because GDCM's Z-spacing can be negative before that flip
   (`itkGDCMImageIO.cxx:703`) — were ported 2026-07-11 as
   `reader::normalize_reader_geometry`, applied crate-wide on the shared read
-  path (`execute`/`read_image`; `read_image_information` still reports raw
-  geometry, as SimpleITK does).
+  path (`execute`/`read_image`, and — as of 2026-07-11 — inside
+  `ImageSeriesReader::execute` too, on each per-slice read and on the
+  first/last derivation geometry, which was the one read path that had
+  bypassed the normalization; the sign-flip half is factored into
+  `reader::flip_negative_spacing` so the series reader can apply it to the raw
+  `ImageInformation` geometry it derives inter-slice spacing/direction from,
+  matching upstream reading every slice through the same `ImageFileReader`,
+  `itkImageSeriesReader.hxx:120-122,468`; `read_image_information` still
+  reports raw geometry, as SimpleITK does).
   Wave-25 landed **`ImageSeriesReader`/`ImageSeriesWriter`**
   (`sitk-io::image_series_reader`/`image_series_writer`, a port of
   `itk::simple::ImageSeriesReader`/`ImageSeriesWriter` wrapping

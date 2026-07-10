@@ -647,6 +647,25 @@ impl PixelFormat {
         self.high_bit = ba - 1;
     }
 
+    /// `PixelFormat::SetBitsStored` (gdcmPixelFormat.h:134-149): the same three
+    /// bit-mask spellings some scanners emit (FUJIFILM CR + MONO1) are read as
+    /// the value they meant, then guarded to `bs <= BitsAllocated && bs` before
+    /// Bits Stored / High Bit follow. `SetHighBit(bs - 1)` collapses to
+    /// `high_bit = bs - 1` here: the guard forces `1 <= bs <= BitsAllocated`, so
+    /// `bs - 1` never hits `SetHighBit`'s own bitmask remaps (:159-167).
+    fn set_bits_stored(&mut self, bs: u16) {
+        let bs = match bs {
+            0xffff => 16,
+            0x0fff => 12,
+            0x00ff => 8,
+            other => other,
+        };
+        if bs <= self.bits_allocated && bs != 0 {
+            self.bits_stored = bs;
+            self.high_bit = bs - 1;
+        }
+    }
+
     /// `PixelFormat::GetScalarType` (gdcmPixelFormat.cxx:130-199).
     ///
     /// Bits **Allocated** picks the width; Pixel Representation picks the sign
@@ -726,9 +745,7 @@ fn pixel_format_from_dataset(obj: &Obj) -> PixelFormat {
     };
     pf.set_bits_allocated(u16_value(obj, BITS_ALLOCATED).unwrap_or(0));
     if let Some(bs) = u16_value(obj, BITS_STORED) {
-        if bs != 0 {
-            pf.bits_stored = bs;
-        }
+        pf.set_bits_stored(bs);
     }
     if let Some(hb) = u16_value(obj, HIGH_BIT) {
         pf.high_bit = hb;
@@ -788,7 +805,12 @@ fn compute_intercept_slope_pixel_type(pf: PixelFormat, intercept: f64, slope: f6
     if pf.scalar_type() == ScalarType::SingleBit {
         return ScalarType::SingleBit;
     }
-    if slope != slope.trunc() || intercept != intercept.trunc() {
+    // `Slope != (int)Slope || Intercept != (int)Intercept` (gdcmRescaler.cxx:206):
+    // the integrality test is a 32-bit `(int)` cast, not a full-range truncation,
+    // so an integral magnitude beyond `i32` range fails it and short-circuits to
+    // `Float64` (Rust's saturating `as i32` reproduces the practical result of
+    // C++'s out-of-range float→int cast).
+    if slope != f64::from(slope as i32) || intercept != f64::from(intercept as i32) {
         return ScalarType::Float64;
     }
     compute_best_fit(pf, intercept, slope)
@@ -2489,6 +2511,44 @@ mod tests {
     }
 
     #[test]
+    fn set_bits_stored_remaps_fujifilm_bitmask_and_guards() {
+        // FUJIFILM CR + MONO1 emit BitsStored as a bitmask; GDCM reads the value
+        // they meant (gdcmPixelFormat.h:134-149). Without the remap, min()/max()
+        // compute `1u64 << 0xffff` (dicom.rs:691,699,700) — a debug panic /
+        // release garbage that mis-drives pixel-type promotion.
+        let mut pf = PixelFormat {
+            samples_per_pixel: 1,
+            bits_allocated: 0,
+            bits_stored: 0,
+            high_bit: 0,
+            pixel_representation: 0,
+        };
+        pf.set_bits_allocated(0xffff); // -> 16
+        pf.set_bits_stored(0xffff); // -> 16, guarded by BitsAllocated
+        assert_eq!(pf.bits_stored, 16);
+        assert_eq!(pf.high_bit, 15);
+        assert_eq!(pf.max(), (1i64 << 16) - 1);
+        assert_eq!(pf.min(), 0);
+
+        // Guard: a BitsStored exceeding BitsAllocated is dropped outright.
+        let mut pf2 = PixelFormat {
+            samples_per_pixel: 1,
+            bits_allocated: 8,
+            bits_stored: 8,
+            high_bit: 7,
+            pixel_representation: 0,
+        };
+        pf2.set_bits_stored(16);
+        assert_eq!(pf2.bits_stored, 8, "bs > BitsAllocated is rejected");
+        assert_eq!(pf2.high_bit, 7);
+
+        // Zero is dropped (unknown / absent).
+        let mut pf3 = pf2;
+        pf3.set_bits_stored(0);
+        assert_eq!(pf3.bits_stored, 8);
+    }
+
+    #[test]
     fn read_information_ct_slice_is_three_dimensional() {
         let bytes = dicom_file(EVR_LE, CT, &ct_dataset(4, 2, &[0; 8]));
         let path = write_temp(&bytes, "ct_info.dcm");
@@ -2971,5 +3031,54 @@ mod tests {
         let mut buf = vec![128u8, 128, 128];
         ycbcr_to_rgb(&mut buf).unwrap();
         assert_eq!(buf, vec![128, 128, 128]);
+    }
+
+    #[test]
+    fn read_image_flips_a_negative_z_spacing_dicom_and_records_the_originals() {
+        // A CT slice whose Spacing Between Slices (0018,0088) is negative. GDCM
+        // preserves that sign at the IO layer ("Spacing may be negative at this
+        // point, will be fixed below", itkGDCMImageIO.cxx:703-704), leaving the
+        // reader's `normalize_reader_geometry` to flip it. This is the
+        // end-to-end pin: a real DICOM negative Z-spacing must survive through
+        // `read_image` to a positive spacing with the Z direction column
+        // negated and the raw values recorded under `ITK_original_*`. Reverting
+        // the IO-layer sign preservation (the negative `z` kept in
+        // `read_header`) makes this fail.
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0008, 0x0060, b"CS", b"CT"));
+        d.extend(elem(0x0018, 0x0088, b"DS", b"-2.5")); // negative Spacing Between Slices
+        d.extend(elem(0x0020, 0x0032, b"DS", b"1\\2\\3"));
+        d.extend(elem(0x0020, 0x0037, b"DS", b"1\\0\\0\\0\\1\\0"));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(2))); // rows
+        d.extend(elem(0x0028, 0x0011, b"US", &us(4))); // cols
+        d.extend(elem(0x0028, 0x0030, b"DS", b"0.5\\0.75"));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(15)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &[0u8; 16])); // 4×2 × 2 bytes
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "negative_z_spacing.dcm");
+
+        let image = crate::read_image(&path).unwrap();
+
+        // Flipped positive: |−2.5| with the Z direction *column* negated.
+        assert_eq!(image.spacing(), &[0.75, 0.5, 2.5]);
+        assert_eq!(
+            image.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0]
+        );
+        // The raw negative sign is preserved in the recorded originals.
+        assert_eq!(
+            image.meta_data("ITK_original_spacing"),
+            Some("0.75 0.5 -2.5")
+        );
+        assert_eq!(
+            image.meta_data("ITK_original_direction"),
+            Some("1 0 0 0 1 0 0 0 1")
+        );
     }
 }
