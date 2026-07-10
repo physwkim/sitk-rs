@@ -22,7 +22,7 @@ pub use error::{Error, Result};
 pub use image::{Image, PixelBuffer, ScalarView};
 pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
 pub use neighborhood::{Neighborhood, NeighborhoodIterator};
-pub use pixel::{PixelId, Scalar};
+pub use pixel::{Complex, PixelId, Real, Scalar};
 
 #[cfg(test)]
 mod tests {
@@ -117,6 +117,83 @@ mod tests {
 
     // ---- vector pixel types -----------------------------------------------
 
+    /// Every `PixelId`, in discriminant order. A compile-time exhaustive match
+    /// would be better still, but this at least fails loudly when a variant is
+    /// added without extending the partition test below.
+    const ALL_PIXEL_IDS: [PixelId; 22] = [
+        PixelId::UInt8,
+        PixelId::Int8,
+        PixelId::UInt16,
+        PixelId::Int16,
+        PixelId::UInt32,
+        PixelId::Int32,
+        PixelId::UInt64,
+        PixelId::Int64,
+        PixelId::Float32,
+        PixelId::Float64,
+        PixelId::ComplexFloat32,
+        PixelId::ComplexFloat64,
+        PixelId::VectorUInt8,
+        PixelId::VectorInt8,
+        PixelId::VectorUInt16,
+        PixelId::VectorInt16,
+        PixelId::VectorUInt32,
+        PixelId::VectorInt32,
+        PixelId::VectorUInt64,
+        PixelId::VectorInt64,
+        PixelId::VectorFloat32,
+        PixelId::VectorFloat64,
+    ];
+
+    #[test]
+    fn pixel_id_discriminants_match_simpleitk() {
+        // sitkPixelIDValues.h:103-131 — scalars 0..=9, complex 10..=11,
+        // vectors 12..=21. Label ids 22..=25 are not modelled here.
+        for (i, id) in ALL_PIXEL_IDS.iter().enumerate() {
+            assert_eq!(*id as i8, i as i8, "{id:?}");
+        }
+        assert_eq!(PixelId::ComplexFloat32 as i8, 10);
+        assert_eq!(PixelId::ComplexFloat64 as i8, 11);
+        assert_eq!(PixelId::VectorUInt8 as i8, 12);
+        assert_eq!(PixelId::VectorFloat64 as i8, 21);
+    }
+
+    #[test]
+    fn pixel_id_predicates_partition_the_enum() {
+        // `is_scalar`/`is_complex`/`is_vector` are mutually exclusive and total.
+        // Every category test in this workspace is a whitelist over them, so a
+        // new variant that satisfied none would be rejected everywhere rather
+        // than admitted by some `else`.
+        for id in ALL_PIXEL_IDS {
+            let hits = [id.is_scalar(), id.is_complex(), id.is_vector()]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            assert_eq!(hits, 1, "{id:?} belongs to {hits} categories");
+        }
+        assert_eq!(ALL_PIXEL_IDS.iter().filter(|i| i.is_scalar()).count(), 10);
+        assert_eq!(ALL_PIXEL_IDS.iter().filter(|i| i.is_complex()).count(), 2);
+        assert_eq!(ALL_PIXEL_IDS.iter().filter(|i| i.is_vector()).count(), 10);
+    }
+
+    #[test]
+    fn complex_pixel_id_projections() {
+        for (complex, component) in [
+            (PixelId::ComplexFloat32, PixelId::Float32),
+            (PixelId::ComplexFloat64, PixelId::Float64),
+        ] {
+            assert_eq!(complex.component_id(), component);
+            // GetSizeOfPixelComponent: per component, not per pixel.
+            assert_eq!(complex.size_in_bytes(), component.size_in_bytes());
+            assert!(complex.is_floating_point());
+            assert!(complex.is_signed());
+            assert!(!complex.is_scalar());
+            assert!(!complex.is_vector());
+        }
+        assert_eq!(<f32 as Real>::COMPLEX_ID, PixelId::ComplexFloat32);
+        assert_eq!(<f64 as Real>::COMPLEX_ID, PixelId::ComplexFloat64);
+    }
+
     #[test]
     fn pixel_id_component_and_vector_projections_are_total() {
         const SCALARS: [PixelId; 10] = [
@@ -132,6 +209,7 @@ mod tests {
             PixelId::Float64,
         ];
         for id in SCALARS {
+            assert!(id.is_scalar());
             assert!(!id.is_vector());
             assert!(id.vector_id().is_vector());
             assert_eq!(id.vector_id().component_id(), id);
@@ -423,5 +501,206 @@ mod tests {
         assert_eq!(dispatch_scalar!(img.pixel_id(), pixel_size), 8);
         let img = Image::new(&[2, 2], PixelId::VectorInt16);
         assert_eq!(dispatch_scalar!(img.pixel_id(), pixel_size), 2);
+    }
+
+    // ---- complex pixel types ----------------------------------------------
+
+    #[test]
+    fn new_complex_image_has_stride_two_and_one_component_per_pixel() {
+        let img = Image::new(&[4, 3], PixelId::ComplexFloat32);
+        // sitkPimpleImageBase.hxx:202-209 — `1` for a basic pixel type.
+        assert_eq!(img.number_of_components_per_pixel(), 1);
+        assert_eq!(img.buffer_stride(), 2);
+        assert_eq!(img.number_of_pixels(), 12);
+        assert_eq!(img.buffer().len(), 24);
+        assert_eq!(img.buffer().component_id(), PixelId::Float32);
+        // ...unlike `Image::new` on a vector id, which takes `size.len()`.
+        assert_eq!(
+            Image::new(&[4, 3], PixelId::VectorFloat32).buffer_stride(),
+            2
+        );
+        assert_eq!(
+            Image::new(&[4, 3], PixelId::VectorFloat32).number_of_components_per_pixel(),
+            2
+        );
+    }
+
+    #[test]
+    fn new_vector_rejects_a_complex_component_count_other_than_one() {
+        // AllocateInternal's basic-pixel-type branch (sitkImage.hxx:63-67)
+        // accepts only 1 (or the 0 that `Image::new` substitutes away).
+        assert!(Image::new_vector(&[2, 2], PixelId::ComplexFloat64, 1).is_ok());
+        for bad in [0usize, 2, 3] {
+            assert_eq!(
+                Image::new_vector(&[2, 2], PixelId::ComplexFloat64, bad),
+                Err(Error::InvalidComponentCount {
+                    pixel_id: PixelId::ComplexFloat64,
+                    components_per_pixel: bad,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn from_vec_complex_interleaves_re_im() {
+        let data = vec![
+            Complex::new(1.0f32, 2.0),
+            Complex::new(3.0, 4.0),
+            Complex::new(5.0, 6.0),
+            Complex::new(7.0, 8.0),
+        ];
+        let img = Image::from_vec_complex(&[2, 2], data).unwrap();
+        assert_eq!(img.pixel_id(), PixelId::ComplexFloat32);
+        // The exact layout `GetBufferAsFloat()` reinterpret-casts to.
+        assert_eq!(
+            img.complex_components::<f32>().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(img.component_slice::<f32>().unwrap().len(), 8);
+        assert_eq!(img.components_to_f64_vec().len(), 8);
+    }
+
+    #[test]
+    fn from_vec_complex_length_is_counted_in_pixels() {
+        assert_eq!(
+            Image::from_vec_complex(&[2, 2], vec![Complex::new(0.0f64, 0.0); 3]),
+            Err(Error::BufferSizeMismatch {
+                expected: 4,
+                actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn get_and_set_complex_roundtrip() {
+        let mut img = Image::new(&[3, 2], PixelId::ComplexFloat64);
+        assert_eq!(
+            img.get_complex::<f64>(&[1, 1]).unwrap(),
+            Complex::new(0.0, 0.0)
+        );
+
+        img.set_complex::<f64>(&[1, 1], Complex::new(-1.5, 2.25))
+            .unwrap();
+        assert_eq!(
+            img.get_complex::<f64>(&[1, 1]).unwrap(),
+            Complex::new(-1.5, 2.25)
+        );
+        // Neighbouring pixels untouched, and the write landed at 2*linear_index.
+        assert_eq!(
+            img.get_complex::<f64>(&[0, 1]).unwrap(),
+            Complex::new(0.0, 0.0)
+        );
+        assert_eq!(
+            img.get_complex::<f64>(&[2, 1]).unwrap(),
+            Complex::new(0.0, 0.0)
+        );
+        let flat = img.complex_components::<f64>().unwrap();
+        assert_eq!(flat[2 * img.linear_index(&[1, 1])], -1.5);
+        assert_eq!(flat[2 * img.linear_index(&[1, 1]) + 1], 2.25);
+    }
+
+    #[test]
+    fn set_complex_preserves_negative_zero() {
+        // -0.0 is a distinct bit pattern that atan2 and the sign of a real part
+        // both observe; the buffer must not normalize it away.
+        let mut img = Image::new(&[1], PixelId::ComplexFloat32);
+        img.set_complex::<f32>(&[0], Complex::new(-0.0f32, -0.0))
+            .unwrap();
+        let v = img.get_complex::<f32>(&[0]).unwrap();
+        assert!(v.re.is_sign_negative() && v.im.is_sign_negative());
+        assert_eq!(v, Complex::new(0.0, 0.0)); // -0.0 == 0.0 by IEEE
+    }
+
+    #[test]
+    fn complex_component_index_and_get_vector_use_the_stride() {
+        let img = Image::from_vec_complex(&[2, 2], vec![Complex::new(1.0f32, 2.0); 4]).unwrap();
+        assert_eq!(img.component_index(&[0, 0], 0), 0);
+        assert_eq!(img.component_index(&[0, 0], 1), 1);
+        assert_eq!(img.component_index(&[1, 0], 0), 2);
+        assert_eq!(img.component_index(&[1, 1], 1), 7);
+        // get_vector hands back the whole pixel: [re, im].
+        assert_eq!(img.get_vector::<f32>(&[1, 1]).unwrap(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn scalar_accessors_reject_complex_images() {
+        // The whitelist guard: `!is_vector()` would have admitted these and
+        // handed a 2N-long slice to a consumer that indexes it per pixel.
+        let mut img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        let expected = || Error::RequiresScalarPixelType(PixelId::ComplexFloat32);
+        assert_eq!(img.scalar_slice::<f32>(), Err(expected()));
+        assert_eq!(img.scalar_view::<f32>().err(), Some(expected()));
+        assert_eq!(img.scalar_vec_mut::<f32>().err(), Some(expected()));
+        assert_eq!(img.to_f64_vec(), Err(expected()));
+    }
+
+    #[test]
+    fn complex_accessors_reject_scalar_and_vector_images() {
+        let mut scalar = Image::from_vec(&[2, 2], vec![0.0f32; 4]).unwrap();
+        assert_eq!(
+            scalar.get_complex::<f32>(&[0, 0]),
+            Err(Error::RequiresComplexPixelType(PixelId::Float32))
+        );
+        assert_eq!(
+            scalar.set_complex::<f32>(&[0, 0], Complex::new(1.0, 1.0)),
+            Err(Error::RequiresComplexPixelType(PixelId::Float32))
+        );
+        assert_eq!(
+            scalar.complex_components::<f32>(),
+            Err(Error::RequiresComplexPixelType(PixelId::Float32))
+        );
+        assert_eq!(
+            scalar.complex_components_mut::<f32>().err(),
+            Some(Error::RequiresComplexPixelType(PixelId::Float32))
+        );
+
+        let vector = Image::from_vec_vector(&[2, 2], 2, vec![0.0f32; 8]).unwrap();
+        assert_eq!(
+            vector.complex_components::<f32>(),
+            Err(Error::RequiresComplexPixelType(PixelId::VectorFloat32))
+        );
+    }
+
+    #[test]
+    fn complex_accessors_reject_the_wrong_component_type() {
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(
+            img.complex_components::<f64>(),
+            Err(Error::PixelTypeMismatch {
+                expected: PixelId::Float32,
+                requested: PixelId::Float64,
+            })
+        );
+    }
+
+    #[test]
+    fn compose_rejects_a_complex_input() {
+        let c = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(
+            Image::from_component_images(&[&c]),
+            Err(Error::RequiresScalarPixelType(PixelId::ComplexFloat32))
+        );
+    }
+
+    #[test]
+    fn extract_component_rejects_a_complex_input() {
+        // Complex is not a vector, so `VectorIndexSelectionCast` refuses it —
+        // `complex_components` / `ComplexToReal` are the way to its halves.
+        let c = Image::new(&[2, 2], PixelId::ComplexFloat64);
+        assert_eq!(
+            c.extract_component(0),
+            Err(Error::RequiresVectorPixelType(PixelId::ComplexFloat64))
+        );
+    }
+
+    #[test]
+    fn dispatch_scalar_on_a_complex_id_selects_the_component_type() {
+        fn pixel_size<T: Scalar>() -> usize {
+            std::mem::size_of::<T>()
+        }
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(dispatch_scalar!(img.pixel_id(), pixel_size), 4);
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat64);
+        assert_eq!(dispatch_scalar!(img.pixel_id(), pixel_size), 8);
     }
 }

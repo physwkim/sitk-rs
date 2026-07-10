@@ -369,9 +369,12 @@ fn distinct_value_count(pixel_id: PixelId) -> Option<u128> {
         PixelId::UInt64 | PixelId::Int64 | PixelId::VectorUInt64 | PixelId::VectorInt64 => {
             Some(1 << 64)
         }
-        PixelId::Float32 | PixelId::Float64 | PixelId::VectorFloat32 | PixelId::VectorFloat64 => {
-            None
-        }
+        PixelId::Float32
+        | PixelId::ComplexFloat32
+        | PixelId::VectorFloat32
+        | PixelId::Float64
+        | PixelId::ComplexFloat64
+        | PixelId::VectorFloat64 => None,
     }
 }
 

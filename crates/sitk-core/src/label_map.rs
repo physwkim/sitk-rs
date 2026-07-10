@@ -904,6 +904,23 @@ mod tests {
     }
 
     #[test]
+    fn new_rejects_a_complex_pixel_id() {
+        assert_eq!(
+            LabelMap::new(&[2, 2], PixelId::ComplexFloat32, 0),
+            Err(Error::RequiresIntegerPixelType(PixelId::ComplexFloat32))
+        );
+    }
+
+    #[test]
+    fn from_label_image_rejects_a_complex_image() {
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(
+            LabelMap::from_label_image(&img, 0),
+            Err(Error::RequiresIntegerPixelType(PixelId::ComplexFloat32))
+        );
+    }
+
+    #[test]
     fn from_label_image_rejects_a_float_image() {
         let img = Image::from_vec(&[2, 2], vec![0.0f32; 4]).unwrap();
         assert_eq!(

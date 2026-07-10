@@ -49,12 +49,14 @@ pub mod change_label;
 pub mod clamp;
 pub mod coherence_enhancing_diffusion;
 pub mod colliding_fronts;
+pub mod complex;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
 pub mod deconvolution;
 pub mod demons;
 pub mod denoise;
+pub mod dicom_orient;
 pub mod displacement_field;
 pub mod distance;
 pub mod edge;
@@ -81,6 +83,7 @@ pub mod label_fusion;
 pub mod label_intensity;
 pub mod label_map;
 pub mod label_map_overlay;
+pub mod label_set_morphology;
 pub mod label_shape;
 pub mod label_to_rgb;
 pub mod level_set;
@@ -94,6 +97,7 @@ pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
 pub mod object_morphology;
+pub mod objectness;
 pub mod overlap;
 pub mod patch_based_denoising;
 pub mod projection;
@@ -157,6 +161,10 @@ pub use demons::{
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
     discrete_gaussian_derivative, mean, median,
+};
+pub use dicom_orient::{
+    DEFAULT_ORIENTATION, DicomOrientResult, dicom_orient, get_direction_cosines_from_orientation,
+    get_orientation_from_direction_cosines,
 };
 pub use displacement_field::{
     DisplacementFieldJacobianDeterminantSettings, InvertDisplacementFieldResult,
@@ -369,18 +377,22 @@ fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Resu
 ///
 /// The inverse of [`Image::to_f64_vec`], and scalar-only for the same reason:
 /// `vals` is one element per pixel, and [`dispatch_scalar!`] would resolve a
-/// vector `target` to its *component* type, quietly producing a scalar image
-/// of that component type. Rejecting a vector `target` with the same
-/// [`sitk_core::Error::RequiresScalarPixelType`] the read side raises keeps the
-/// pair symmetric: every scalar filter enters through `to_f64_vec` and leaves
-/// through here, and neither end can be handed a vector image.
+/// non-scalar `target` to its *component* type, quietly producing a scalar
+/// image of that component type — or, for a complex `target`, an `N`-element
+/// buffer where `assemble` demands `2N`. Rejecting every non-scalar `target`
+/// with the same [`sitk_core::Error::RequiresScalarPixelType`] the read side
+/// raises keeps the pair symmetric: every scalar filter enters through
+/// `to_f64_vec` and leaves through here, and neither end can be handed a
+/// non-scalar image. The test is a whitelist on
+/// [`PixelId::is_scalar`](sitk_core::PixelId::is_scalar), matching
+/// `Image::require_scalar`.
 pub(crate) fn image_from_f64(
     target: PixelId,
     size: &[usize],
     geom: &Image,
     vals: &[f64],
 ) -> Result<Image> {
-    if target.is_vector() {
+    if !target.is_scalar() {
         return Err(sitk_core::Error::RequiresScalarPixelType(target).into());
     }
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
@@ -402,6 +414,14 @@ pub(crate) fn image_from_f64(
 /// (`NumericTraits<VariableLengthVector<T>>::RealType` is
 /// `VariableLengthVector<NumericTraits<T>::RealType>`), so the projection never
 /// silently drops a pixel type's multi-component-ness.
+///
+/// A complex pixel type maps to its *component's* real type, dropping the
+/// complex-ness — `NumericTraits<std::complex<float>>::RealType` is
+/// `std::complex<double>` upstream. No caller reaches that arm: every filter
+/// routing through here declares a `pixel_types` list that excludes complex and
+/// enters via `to_f64_vec`, which rejects a complex image at the scalar seam.
+/// The arm nevertheless yields the right answer for the one place it *is* the
+/// rule — `ComplexToReal`'s `output_pixel_type: InputImageType::PixelType::value_type`.
 pub(crate) fn real_pixel_id(input: PixelId) -> PixelId {
     let real = match input.component_id() {
         PixelId::Float32 => PixelId::Float32,
@@ -1071,7 +1091,10 @@ mod tests {
 /// signatures: they reach the buffer through the component-aware accessors
 /// ([`Image::component_slice`], [`Image::components_to_f64_vec`]) and check the
 /// pixel type themselves, because for them a vector image is the *only* legal
-/// input.
+/// input. [`crate::dicom_orient`] is a third case: it accepts *either* scalar
+/// or vector, dispatching on [`sitk_core::PixelId::is_vector`] and, for a
+/// vector image, decomposing into components with [`Image::extract_component`]
+/// before ever reaching the scalar seam.
 #[cfg(test)]
 mod vector_guard {
     use super::*;
@@ -1188,5 +1211,118 @@ mod vector_guard {
             real_pixel_id(PixelId::VectorFloat32),
             PixelId::VectorFloat32
         );
+    }
+}
+
+/// The same structural guard, exercised against a **complex** image.
+///
+/// [`vector_guard`] proves that no scalar filter can read a vector image. That
+/// proof rested on `Image::require_scalar` rejecting `is_vector()` — a
+/// blacklist, which a complex image (a *basic* pixel type upstream, whose
+/// buffer nonetheless holds two components per pixel) would have walked
+/// straight through, handing a `2N`-long slice to a consumer that indexes it
+/// per pixel. The guard is now a whitelist on
+/// [`PixelId::is_scalar`](sitk_core::PixelId::is_scalar), and these cases pin
+/// each route to the buffer against the category that used to bypass it.
+///
+/// The complex-consuming filters — [`crate::complex`] — are the exception, and
+/// they say so in their signatures: they reach the buffer through
+/// [`Image::complex_components`] and check the pixel type themselves.
+#[cfg(test)]
+mod complex_guard {
+    use super::*;
+    use crate::morphology::StructuringElement;
+
+    /// A 2x2 `ComplexFloat32` image: 4 pixels, 8 buffer components.
+    fn complex_image() -> Image {
+        Image::new(&[2, 2], PixelId::ComplexFloat32)
+    }
+
+    fn assert_requires_scalar(err: FilterError, expected: PixelId) {
+        match err {
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(id)) => {
+                assert_eq!(id, expected)
+            }
+            other => panic!("expected RequiresScalarPixelType, got {other:?}"),
+        }
+    }
+
+    /// Math op: `sqrt` reads through `scalar_slice` inside `unary_pixel_apply`.
+    #[test]
+    fn math_filter_rejects_a_complex_image() {
+        let err = crate::math::sqrt(&complex_image()).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Binary op: `require_same_shape` compares `pixel_id`, which differs.
+    #[test]
+    fn binary_math_filter_rejects_a_complex_operand() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        assert!(crate::math::absolute_value_difference(&scalar, &complex_image()).is_err());
+    }
+
+    /// Morphology: reads through a `NeighborhoodIterator`, which takes a
+    /// `ScalarView` at construction.
+    #[test]
+    fn morphology_filter_rejects_a_complex_image() {
+        let kernel = StructuringElement::ball(&[1, 1]);
+        let err = crate::morphology::grayscale_dilate(&complex_image(), &kernel).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Level set: reads through `to_f64_vec`.
+    #[test]
+    fn level_set_filter_rejects_a_complex_image() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        let err = crate::level_set::threshold_segmentation_level_set(
+            &complex_image(),
+            &scalar,
+            0.0,
+            1.0,
+            0.02,
+            1.0,
+            1.0,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Boundary conditions: `constant_pad` reaches pixels only through
+    /// `Image::scalar_view`.
+    #[test]
+    fn pad_filter_rejects_a_complex_image() {
+        let err =
+            crate::geometry::constant_pad(&complex_image(), &[1, 1], &[1, 1], 0.0).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// `patch_based_denoising` reads through `Image::scalar_slice`. Sized to
+    /// clear the patch-fits-in-image check, so this pins the guard rather than
+    /// an earlier validation error.
+    #[test]
+    fn patch_based_denoising_rejects_a_complex_image() {
+        let img = Image::new(&[9, 9], PixelId::ComplexFloat64);
+        let err = crate::patch_based_denoising(&img, &Default::default()).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat64);
+    }
+
+    /// The write side of the seam. A complex `target` dispatches to its
+    /// component type, so `build_from_f64` would produce an `N`-element buffer
+    /// where `assemble` demands `2N`; the guard rejects it at the seam instead,
+    /// symmetric with the read side.
+    #[test]
+    fn image_from_f64_rejects_a_complex_target() {
+        let geom = Image::new(&[2, 2], PixelId::Float32);
+        let err = image_from_f64(PixelId::ComplexFloat32, &[2, 2], &geom, &[0.0; 4]).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// The complex-consuming filters are the exception, and only they.
+    #[test]
+    fn the_complex_filters_accept_a_complex_image() {
+        assert!(crate::complex::complex_to_real(&complex_image()).is_ok());
+        assert!(crate::complex::complex_to_modulus(&complex_image()).is_ok());
     }
 }

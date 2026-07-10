@@ -941,6 +941,30 @@ mod tests {
     }
 
     #[test]
+    fn a_complex_label_image_is_rejected() {
+        let l = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        let f = Image::from_vec(&[2, 1], vec![1.0f64, 2.0]).unwrap();
+        assert_eq!(
+            label_intensity_statistics(&l, &f, &Default::default()),
+            Err(FilterError::RequiresIntegerPixelType(
+                PixelId::ComplexFloat32
+            ))
+        );
+    }
+
+    #[test]
+    fn a_complex_feature_image_is_rejected() {
+        let l = Image::from_vec(&[2, 1], vec![1u8, 1]).unwrap();
+        let f = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        assert_eq!(
+            label_intensity_statistics(&l, &f, &Default::default()),
+            Err(FilterError::Core(
+                sitk_core::Error::RequiresScalarPixelType(PixelId::ComplexFloat32)
+            ))
+        );
+    }
+
+    #[test]
     fn a_size_mismatch_is_rejected() {
         let l = Image::from_vec(&[2, 1], vec![1u8, 1]).unwrap();
         let f = Image::from_vec(&[3, 1], vec![1.0f64, 2.0, 3.0]).unwrap();

@@ -946,9 +946,12 @@ fn integer_pixel_type_max(pixel_id: PixelId) -> Option<f64> {
         PixelId::Int32 | PixelId::VectorInt32 => Some(i32::MAX as f64),
         PixelId::UInt64 | PixelId::VectorUInt64 => Some(u64::MAX as f64),
         PixelId::Int64 | PixelId::VectorInt64 => Some(i64::MAX as f64),
-        PixelId::Float32 | PixelId::VectorFloat32 | PixelId::Float64 | PixelId::VectorFloat64 => {
-            None
-        }
+        PixelId::Float32
+        | PixelId::ComplexFloat32
+        | PixelId::VectorFloat32
+        | PixelId::Float64
+        | PixelId::ComplexFloat64
+        | PixelId::VectorFloat64 => None,
     }
 }
 

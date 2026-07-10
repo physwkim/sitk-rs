@@ -637,6 +637,42 @@ mod tests {
         ));
     }
 
+    /// The three entry points reject a complex feature image: the label map's
+    /// own pixel type cannot be complex (`LabelMap::new` refuses it), and the
+    /// feature image goes through `Image::to_f64_vec`, whose `require_scalar`
+    /// whitelist excludes the two complex ids.
+    #[test]
+    fn a_complex_feature_image_is_rejected_by_both_overlays() {
+        let map = map_of(&[2, 1], &[(1, &[([0, 0], 1)])]);
+        let feature = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        assert_eq!(
+            label_map_overlay(&map, &feature, 0.5, &[]),
+            Err(FilterError::Core(
+                sitk_core::Error::RequiresScalarPixelType(PixelId::ComplexFloat32)
+            ))
+        );
+        let settings = LabelMapContourOverlaySettings {
+            dilation_radius: vec![0, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            label_map_contour_overlay(&map, &feature, &settings),
+            Err(FilterError::Core(
+                sitk_core::Error::RequiresScalarPixelType(PixelId::ComplexFloat32)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_complex_label_map_cannot_be_constructed() {
+        assert!(matches!(
+            LabelMap::new(&[2, 1], PixelId::ComplexFloat32, 0),
+            Err(sitk_core::Error::RequiresIntegerPixelType(
+                PixelId::ComplexFloat32
+            ))
+        ));
+    }
+
     #[test]
     fn label_map_overlay_passes_the_background_through_as_grey() {
         let map = map_of(&[2, 1], &[(1, &[([0, 0], 1)])]);

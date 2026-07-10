@@ -677,6 +677,17 @@ mod tests {
     }
 
     #[test]
+    fn label_image_to_label_map_rejects_a_complex_image() {
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(
+            label_image_to_label_map(&img, 0.0),
+            Err(FilterError::RequiresUnsignedIntegerPixelType(
+                PixelId::ComplexFloat32
+            ))
+        );
+    }
+
+    #[test]
     fn label_image_to_label_map_rejects_a_four_dimensional_image() {
         let img = Image::from_vec(&[2, 2, 2, 2], vec![0u8; 16]).unwrap();
         assert_eq!(
@@ -851,6 +862,17 @@ mod tests {
         assert_eq!(
             binary_image_to_label_map(&img, &Default::default()),
             Err(FilterError::RequiresIntegerPixelType(PixelId::Float32))
+        );
+    }
+
+    #[test]
+    fn binary_image_to_label_map_rejects_a_complex_image() {
+        let img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        assert_eq!(
+            binary_image_to_label_map(&img, &Default::default()),
+            Err(FilterError::RequiresIntegerPixelType(
+                PixelId::ComplexFloat32
+            ))
         );
     }
 
