@@ -47,9 +47,9 @@
 //! `max_votes = votes[0]`, then for `l = 1 ..`, a **strictly greater** count
 //! takes the lead (and raises `max_votes`), while a count merely *equal* to
 //! `max_votes` sets the winner to `label_for_undecided_pixels` **without**
-//! raising `max_votes`. A later, strictly-larger count therefore overrides an
-//! earlier tie, and a tie against a stale `max_votes` still marks the voxel
-//! undecided.
+//! raising `max_votes` (a no-op — the tying count already equals it). A
+//! later, strictly-larger count overrides an earlier tie, so the scan marks
+//! a voxel undecided exactly when the global maximum is non-unique.
 //!
 //! When `label_for_undecided_pixels` is unset the label is `max_label + 1`.
 //! Both the default and a caller-supplied value are `static_cast` to the
