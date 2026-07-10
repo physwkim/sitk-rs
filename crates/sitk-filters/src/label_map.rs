@@ -275,7 +275,7 @@ pub fn change_label_label_map(map: &LabelMap, change_map: &[(f64, f64)]) -> Resu
     // new background value.
     if let Some(&new_background) = cmap.get(&out.background()) {
         if new_background != out.background() {
-            out.set_background(new_background);
+            out.set_background(new_background)?;
         }
     }
 

@@ -105,6 +105,14 @@ pub enum Error {
     #[error("label {0} is the label map's background value")]
     LabelIsBackground(i64),
 
+    /// A label (or a background value) outside the `NumericTraits` range of the
+    /// [`LabelMap`](crate::LabelMap)'s `pixel_id` was offered to it. ITK cannot
+    /// represent such a state at all — its `LabelType` *is* the label image's
+    /// pixel type, so the conversion happens in the caller's `static_cast`. Here
+    /// a label is an `i64` throughout, so the map enforces the range itself.
+    #[error("label {label} is not representable in a {pixel_id:?} label image")]
+    LabelOutOfRange { label: i64, pixel_id: PixelId },
+
     /// [`LabelMap::push_label_object`](crate::LabelMap::push_label_object) found
     /// no free label. Upstream's `itkExceptionStringMacro("Can't push the label
     /// object: the label map is full.")` (`itkLabelMap.hxx:431-434`).

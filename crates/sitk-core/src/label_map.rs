@@ -73,6 +73,22 @@
 //! - `LabelObject::Size()` accumulates into an `int` (`itkLabelObject.hxx:217`),
 //!   overflowing above 2^31 pixels. [`LabelObject::size`] returns `u64`.
 //!
+//! ## The label-range invariant
+//!
+//! A label here is an `i64`, where `itk::LabelMap`'s `LabelType` *is* the label
+//! image's pixel type — so upstream cannot represent an out-of-range label at
+//! all, and the narrowing happens in the caller's `static_cast`. This port keeps
+//! the equivalent guarantee by construction instead: **every key of a
+//! [`LabelMap`], and its background value, lies inside `pixel_id`'s
+//! `NumericTraits` range** (`PixelId::integer_scalar_bounds`), so
+//! [`LabelMap::to_label_image`] never silently quantizes a label. The single
+//! owner is the private `insert_object`, which every public key-creating path
+//! — [`LabelMap::add_label_object`], [`LabelMap::push_label_object`] and
+//! [`LabelMap::set_line`] — goes through; it also owns
+//! `background ∉ objects.keys()`. [`LabelMap::new`] and
+//! [`LabelMap::set_background`] apply the same range test to the background.
+//! Out of range is [`Error::LabelOutOfRange`].
+//!
 //! Double coverage *between* objects of different labels is still
 //! representable, because ITK's `LabelUniqueLabelMapFilter` exists precisely to
 //! remove it and `LabelMap::GetPixel` (`itkLabelMap.hxx:155-170`) is specified
@@ -390,6 +406,12 @@ impl LabelMap {
         let label_bounds = pixel_id
             .integer_scalar_bounds()
             .ok_or(Error::RequiresIntegerPixelType(pixel_id))?;
+        if background < label_bounds.0 || background > label_bounds.1 {
+            return Err(Error::LabelOutOfRange {
+                label: background,
+                pixel_id,
+            });
+        }
         Ok(LabelMap {
             size: size.to_vec(),
             spacing: vec![1.0; dim],
@@ -482,9 +504,19 @@ impl LabelMap {
     /// The eviction is what keeps `background ∉ objects.keys()` true by
     /// construction. Upstream spells the same sequence out at
     /// `itkChangeLabelLabelMapFilter.hxx:114-126`.
-    pub fn set_background(&mut self, value: i64) -> Option<LabelObject> {
+    /// The new background must itself be representable in `pixel_id`, for the
+    /// same reason a label must: [`LabelMap::to_label_image`] fills every
+    /// uncovered pixel with it.
+    pub fn set_background(&mut self, value: i64) -> Result<Option<LabelObject>> {
+        let (min, max) = self.label_bounds;
+        if value < min || value > max {
+            return Err(Error::LabelOutOfRange {
+                label: value,
+                pixel_id: self.pixel_id,
+            });
+        }
         self.background = value;
-        self.objects.remove(&value)
+        Ok(self.objects.remove(&value))
     }
 
     /// `itkLabelMap.hxx:148-153`.
@@ -525,15 +557,39 @@ impl LabelMap {
     /// and then throws on at every `GetLabelObject`/`RemoveLabel`
     /// (`itkLabelMap.hxx:110-116`, `:453-459`).
     pub fn add_label_object(&mut self, object: LabelObject) -> Result<()> {
+        self.insert_object(object)
+    }
+
+    /// The single owner of `self.objects` insertion, and therefore of the two
+    /// key invariants: `background ∉ objects.keys()`, and every key lies inside
+    /// `pixel_id`'s `NumericTraits` range so that
+    /// [`LabelMap::to_label_image`] never silently quantizes a label. Every
+    /// public path that can create a key — [`LabelMap::add_label_object`],
+    /// [`LabelMap::push_label_object`] (through it) and [`LabelMap::set_line`] —
+    /// goes through here.
+    fn insert_object(&mut self, object: LabelObject) -> Result<()> {
         if object.dimension != self.dimension() {
             return Err(Error::GeometryMismatch {
                 dimension: self.dimension(),
             });
         }
-        if object.label == self.background {
-            return Err(Error::LabelIsBackground(object.label));
-        }
+        self.check_label(object.label)?;
         self.objects.insert(object.label, object);
+        Ok(())
+    }
+
+    /// A label may be neither the background nor outside `pixel_id`'s range.
+    fn check_label(&self, label: i64) -> Result<()> {
+        if label == self.background {
+            return Err(Error::LabelIsBackground(label));
+        }
+        let (min, max) = self.label_bounds;
+        if label < min || label > max {
+            return Err(Error::LabelOutOfRange {
+                label,
+                pixel_id: self.pixel_id,
+            });
+        }
         Ok(())
     }
 
@@ -632,8 +688,7 @@ impl LabelMap {
             None => {
                 let mut object = LabelObject::new(label, dim)?;
                 object.add_line(index, length)?;
-                self.objects.insert(label, object);
-                Ok(())
+                self.insert_object(object)
             }
         }
     }
@@ -990,11 +1045,106 @@ mod tests {
     }
 
     #[test]
+    fn add_label_object_accepts_the_pixel_types_bounds_and_rejects_beyond_them() {
+        // UInt8 bounds are (0, 255); background 1 frees both ends.
+        let mut map = LabelMap::new(&[3, 1], PixelId::UInt8, 1).unwrap();
+        assert_eq!(
+            map.add_label_object(LabelObject::new(0, 2).unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(255, 2).unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(-1, 2).unwrap()),
+            Err(Error::LabelOutOfRange {
+                label: -1,
+                pixel_id: PixelId::UInt8
+            })
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(256, 2).unwrap()),
+            Err(Error::LabelOutOfRange {
+                label: 256,
+                pixel_id: PixelId::UInt8
+            })
+        );
+    }
+
+    #[test]
+    fn add_label_object_honours_a_signed_pixel_types_bounds() {
+        // Int8 bounds are (-128, 127).
+        let mut map = LabelMap::new(&[3, 1], PixelId::Int8, 0).unwrap();
+        assert_eq!(
+            map.add_label_object(LabelObject::new(-128, 2).unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(127, 2).unwrap()),
+            Ok(())
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(-129, 2).unwrap()),
+            Err(Error::LabelOutOfRange {
+                label: -129,
+                pixel_id: PixelId::Int8
+            })
+        );
+        assert_eq!(
+            map.add_label_object(LabelObject::new(128, 2).unwrap()),
+            Err(Error::LabelOutOfRange {
+                label: 128,
+                pixel_id: PixelId::Int8
+            })
+        );
+    }
+
+    #[test]
+    fn set_line_goes_through_the_same_bounds_seam() {
+        let mut map = LabelMap::new(&[3, 1], PixelId::UInt8, 0).unwrap();
+        assert_eq!(map.set_line(&[0, 0], 1, 255), Ok(()));
+        assert_eq!(
+            map.set_line(&[1, 0], 1, 256),
+            Err(Error::LabelOutOfRange {
+                label: 256,
+                pixel_id: PixelId::UInt8
+            })
+        );
+        assert_eq!(map.number_of_label_objects(), 1);
+    }
+
+    #[test]
+    fn new_rejects_a_background_outside_the_pixel_types_range() {
+        assert_eq!(
+            LabelMap::new(&[3, 1], PixelId::UInt8, 256),
+            Err(Error::LabelOutOfRange {
+                label: 256,
+                pixel_id: PixelId::UInt8
+            })
+        );
+        assert!(LabelMap::new(&[3, 1], PixelId::UInt8, 255).is_ok());
+    }
+
+    #[test]
+    fn set_background_rejects_a_value_outside_the_pixel_types_range() {
+        let mut map = LabelMap::new(&[3, 1], PixelId::UInt8, 0).unwrap();
+        assert_eq!(
+            map.set_background(-1),
+            Err(Error::LabelOutOfRange {
+                label: -1,
+                pixel_id: PixelId::UInt8
+            })
+        );
+        assert_eq!(map.background(), 0);
+    }
+
+    #[test]
     fn set_background_evicts_the_colliding_object() {
         let mut map = LabelMap::new(&[3, 1], PixelId::UInt8, 0).unwrap();
         map.set_line(&[0, 0], 1, 1).unwrap();
         map.set_line(&[1, 0], 1, 2).unwrap();
-        let evicted = map.set_background(2).unwrap();
+        let evicted = map.set_background(2).unwrap().unwrap();
         assert_eq!(evicted.label(), 2);
         assert_eq!(map.background(), 2);
         assert_eq!(map.labels().collect::<Vec<_>>(), vec![1]);
