@@ -4187,6 +4187,26 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// `WriteSlice`'s `colorType` switch on `numComp` has arms only for 1-3
+    /// and a `default:` that always picks a declared 4-channel `RGBA` write
+    /// for anything else (itkPNGImageIO.cxx:579-600), silently dropping every
+    /// row's trailing components. PNG has no color type past 4 channels, so
+    /// that file could never round-trip; **fixed §2.126** — this port refuses
+    /// the write instead, and leaves no file behind.
+    #[test]
+    fn png_write_of_a_five_component_image_is_rejected() {
+        let img = Image::from_vec_vector::<u8>(&[2, 2], 5, vec![0u8; 20]).unwrap();
+        let path = tmp_path("five_component.png");
+
+        let result = write_image(&img, &path);
+
+        assert!(
+            matches!(&result, Err(IoError::PngWriteRejected(m)) if m.contains("§2.126")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
+    }
+
     /// Fixed §1.59: upstream's `WriteSlice` opens the file with
     /// `fopen(fileName, "wb")` — truncating it immediately — before its
     /// component-type switch's `default:` throws "PNG supports unsigned char

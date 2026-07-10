@@ -91,7 +91,7 @@
 //! out of the file it produces; [`write`] refuses it instead of reproducing
 //! the silent data loss. **Fixed §2.125** — see [`IoError::PngWriteRejected`].
 //!
-//! # A >4-component vector image writes deterministic garbage
+//! # A >4-component vector image is refused
 //!
 //! `WriteSlice`'s `colorType` switch on `numComp` has arms for 1–3 and a
 //! `default:` that always picks `PNG_COLOR_TYPE_RGB_ALPHA` — 4 declared
@@ -100,13 +100,10 @@
 //! 8`, `:686-693`), so each row starts at the right offset; but
 //! `png_write_image` reads only `width * 4 * bitDepth / 8` bytes from each —
 //! the declared channel count — leaving every row's trailing
-//! `(numComp - 4)` components' worth of bytes untouched and unwritten. No
-//! error. Ledger §2.126.
-//!
-//! [`write`] reproduces that truncation through
-//! [`rows_for_declared_channels`]: it is handed the whole flat buffer, the
-//! *actual* per-row byte stride, and the *declared* one, and copies only the
-//! declared-length prefix of each of `height` actual-length rows.
+//! `(numComp - 4)` components' worth of bytes untouched and unwritten, with no
+//! error upstream. PNG has no color type past 4 channels, so such a write
+//! could never round-trip; [`write`] refuses it instead of reproducing the
+//! truncation. **Fixed §2.126** — see [`IoError::PngWriteRejected`].
 //!
 //! # Not implemented
 //!
@@ -302,7 +299,10 @@ fn component_bit_depth(component: PixelId) -> Option<BitDepth> {
     }
 }
 
-/// `WriteSlice`'s `colorType` switch on `numComp` (itkPNGImageIO.cxx:579-600).
+/// `WriteSlice`'s `colorType` switch on `numComp` (itkPNGImageIO.cxx:579-600),
+/// restricted to the 1-4 range [`write`] admits after its own §2.126 guard —
+/// upstream's `default:` arm collapsing every higher count to `Rgba` is the
+/// bug that guard exists to refuse, not a case for this function to repeat.
 /// `GetWritePalette()` is unreachable (§4.87), so `numComp == 1` always
 /// selects `Grayscale`, never `Palette`.
 fn color_type_for(number_of_components: usize) -> ColorType {
@@ -310,7 +310,10 @@ fn color_type_for(number_of_components: usize) -> ColorType {
         1 => ColorType::Grayscale,
         2 => ColorType::GrayscaleAlpha,
         3 => ColorType::Rgb,
-        _ => ColorType::Rgba,
+        4 => ColorType::Rgba,
+        other => unreachable!(
+            "write() must reject a {other}-component image before calling color_type_for (§2.126)"
+        ),
     }
 }
 
@@ -320,28 +323,6 @@ fn buffer_to_be_bytes(buffer: &PixelBuffer) -> Vec<u8> {
         PixelBuffer::UInt16(v) => v.iter().flat_map(|x| x.to_be_bytes()).collect(),
         other => unreachable!("{:?} is not a PNG component type", other.component_id()),
     }
-}
-
-/// Copy only the first `declared_channels` samples of each pixel, for the
-/// first `height` rows of `all_bytes`. This is [`write`]'s single reproduction
-/// of both the row-truncation quirk (§2.126) and the first-slice-only quirk
-/// (§2.125) — see the module doc.
-fn rows_for_declared_channels(
-    all_bytes: &[u8],
-    width: usize,
-    height: usize,
-    actual_components: usize,
-    declared_channels: usize,
-    bytes_per_sample: usize,
-) -> Vec<u8> {
-    let actual_row = width * actual_components * bytes_per_sample;
-    let declared_row = width * declared_channels * bytes_per_sample;
-    let mut out = Vec::with_capacity(declared_row * height);
-    for row in 0..height {
-        let start = row * actual_row;
-        out.extend_from_slice(&all_bytes[start..start + declared_row]);
-    }
-    out
 }
 
 /// Write a `.png` file.
@@ -378,6 +359,23 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
             image.dimension()
         )));
     }
+    // Fixed §2.126: `WriteSlice`'s `colorType` switch on `numComp` has arms
+    // only for 1-3 and a `default:` that always picks
+    // `PNG_COLOR_TYPE_RGB_ALPHA` — 4 declared channels — for anything else
+    // (itkPNGImageIO.cxx:579-600), so a >4-component image's every row is
+    // silently truncated to its first 4 channels' worth of bytes, with no
+    // error. PNG has no color type past 4 channels, so such a write could
+    // never round-trip; refuse it instead of reproducing the truncation.
+    let actual_components = image.buffer_stride();
+    if actual_components > 4 {
+        return Err(IoError::PngWriteRejected(format!(
+            "PNG has no color type for a {actual_components}-component vector \
+             image; WriteSlice's colorType switch collapses any count above 4 \
+             to a declared RGBA (4-channel) write and silently drops the rest \
+             of each row, with no error (itkPNGImageIO.cxx:579-600) — \
+             doc/upstream-findings.md §2.126"
+        )));
+    }
 
     let file = std::fs::File::create(path)?;
 
@@ -387,20 +385,9 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     } else {
         1
     };
-    let actual_components = image.buffer_stride();
     let color = color_type_for(actual_components);
-    let declared_channels = color.samples();
-    let bytes_per_sample = if bit_depth == BitDepth::Sixteen { 2 } else { 1 };
 
-    let all_bytes = buffer_to_be_bytes(image.buffer());
-    let data = rows_for_declared_channels(
-        &all_bytes,
-        width,
-        height,
-        actual_components,
-        declared_channels,
-        bytes_per_sample,
-    );
+    let data = buffer_to_be_bytes(image.buffer());
 
     let mut encoder = Encoder::new(file, width as u32, height as u32);
     encoder.set_color(color);
@@ -557,33 +544,22 @@ mod tests {
     }
 
     #[test]
-    fn rows_for_declared_channels_truncates_each_row_to_the_declared_prefix() {
-        // Two "rows" of 5 components each; declared channels is 4 (RGBA),
-        // reproducing the >4-component write quirk (§2.126).
-        let all: Vec<u8> = (0..10).collect();
-        let out = rows_for_declared_channels(&all, 1, 2, 5, 4, 1);
-        assert_eq!(out, vec![0, 1, 2, 3, 5, 6, 7, 8]);
-    }
-
-    #[test]
-    fn rows_for_declared_channels_stops_after_the_requested_height() {
-        // The helper still takes an explicit row count independently of the
-        // buffer's length — exercised here directly, since `write` (fixed
-        // §2.125) now rejects any 3-D-or-higher image before this helper ever
-        // sees one, so a `height` shorter than the buffer no longer arises
-        // through the public API.
-        let all: Vec<u8> = (0..9).collect();
-        let out = rows_for_declared_channels(&all, 1, 1, 3, 3, 1);
-        assert_eq!(out, vec![0, 1, 2]);
-    }
-
-    #[test]
     fn color_type_for_never_selects_palette() {
         assert_eq!(color_type_for(1), ColorType::Grayscale);
         assert_eq!(color_type_for(2), ColorType::GrayscaleAlpha);
         assert_eq!(color_type_for(3), ColorType::Rgb);
         assert_eq!(color_type_for(4), ColorType::Rgba);
-        assert_eq!(color_type_for(5), ColorType::Rgba);
+    }
+
+    /// Fixed §2.126: `write` refuses a >4-component image before ever calling
+    /// `color_type_for`, so a 5th arm collapsing to `Rgba` — upstream's
+    /// `default:` bug — has no reason to exist; this pins that the guard is
+    /// enforced by construction rather than by every caller remembering to
+    /// check first.
+    #[test]
+    #[should_panic(expected = "5-component")]
+    fn color_type_for_panics_rather_than_silently_collapsing_a_higher_count() {
+        color_type_for(5);
     }
 
     #[test]

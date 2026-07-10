@@ -132,8 +132,10 @@ pub enum IoError {
     /// A PNG write this port refuses outright rather than silently emitting a
     /// lossy file: a non-2-dimensional image, which upstream's `WriteSlice`
     /// writes only the first Z-slice of with no error (itkPNGImageIO.cxx:605,
-    /// ledger §2.125). PNG has no container for a third axis, so such a file
-    /// could never round-trip.
+    /// ledger §2.125), or a vector image of more than four components, which
+    /// upstream's `colorType` switch silently truncates every row to a
+    /// declared 4-channel prefix (`:579-600`, ledger §2.126). PNG has no
+    /// container for either shape, so neither file could round-trip.
     #[error("cannot write PNG file: {0}")]
     PngWriteRejected(String),
 
