@@ -81,10 +81,21 @@
 //! A `TENSORS` file is readable by ITK but not by SimpleITK:
 //! `GetPixelIDFromImageIO` has no `SYMMETRICSECONDRANKTENSOR` arm and ends in
 //! `"Unknown PixelType"` (sitkImageReaderBase.cxx:213-240). This port
-//! **implements** the read (ledger §3.37): a `TENSORS` attribute loads as a
-//! 6-component vector image — the six components
-//! `InternalReadImageInformation` sets (`itkVTKImageIO.cxx:341-351`), in on-disk
-//! order, since VTK (unlike NIfTI) applies no component reordering.
+//! **implements** the read (ledger §3.37): a `TENSORS` attribute stores the full
+//! 9-component 3×3 matrix per pixel on disk, and `VTKImageIO` reads all nine but
+//! keeps the six symmetric components at row-major indices `[0,1,2,4,5,8]` — the
+//! diagonal and upper triangle `[a,b,c,d,e,f]` of
+//!
+//! ```text
+//! a b c
+//! b d e
+//! c e f
+//! ```
+//!
+//! (ASCII `ReadTensorBuffer` hit-hit-hit / skip-hit-hit / skip-skip-hit,
+//! `itkVTKImageIO.cxx:415-451`; binary `ReadSymmetricTensorBufferAsBinary`
+//! row1=3 / seek1 / row2=2 / seek2 / row3=1, `:494-525`). The result loads as a
+//! 6-component vector image.
 //!
 //! # What a SimpleITK image writes as
 //!
@@ -316,9 +327,9 @@ impl Header {
             // SimpleITK's `GetPixelIDFromImageIO` has no `SYMMETRICSECONDRANKTENSOR`
             // arm, so a `TENSORS` file that `VTKImageIO` reads fine is unreadable
             // through SimpleITK ("Unknown PixelType"). This port's `Image` can hold
-            // the data, so the tensor loads as a 6-component vector image — the six
-            // components `InternalReadImageInformation` sets, in on-disk order
-            // (VTK, unlike NIfTI, does not reorder them). Ledger §3.37.
+            // the data, so the tensor loads as a 6-component vector image: `read`
+            // reads the full 9-component 3×3 matrix from disk and keeps the six
+            // symmetric components at indices [0,1,2,4,5,8]. Ledger §3.37.
             VtkPixelType::Vector
             | VtkPixelType::Rgb
             | VtkPixelType::Rgba
@@ -567,6 +578,48 @@ fn buffer_from_be_bytes(component: PixelId, bytes: &[u8]) -> PixelBuffer {
         PixelId::Float32 => unpack!(f32, Float32),
         PixelId::Float64 => unpack!(f64, Float64),
         other => unreachable!("{other:?} is not a component type"),
+    }
+}
+
+/// The row-major indices of an on-disk 3×3 tensor that `VTKImageIO` keeps —
+/// the diagonal and upper triangle `[a,b,c,d,e,f]` of
+///
+/// ```text
+/// a b c
+/// b d e
+/// c e f
+/// ```
+///
+/// i.e. `ReadTensorBuffer`'s hit-hit-hit / skip-hit-hit / skip-skip-hit pattern
+/// (itkVTKImageIO.cxx:425-448) and `ReadSymmetricTensorBufferAsBinary`'s
+/// row1=3 / seek1 / row2=2 / seek2 / row3=1 (`:494-525`). §3.37.
+const TENSOR_KEEP: [usize; 6] = [0, 1, 2, 4, 5, 8];
+
+/// Compact a buffer of full 9-component 3×3 tensors down to the six kept
+/// symmetric components per pixel, preserving on-disk order `[a,b,c,d,e,f]`.
+fn keep_symmetric_tensor(buffer: PixelBuffer) -> PixelBuffer {
+    macro_rules! keep {
+        ($v:expr, $variant:ident) => {{
+            let mut out = Vec::with_capacity($v.len() / 9 * 6);
+            for chunk in $v.chunks_exact(9) {
+                for &k in &TENSOR_KEEP {
+                    out.push(chunk[k]);
+                }
+            }
+            PixelBuffer::$variant(out)
+        }};
+    }
+    match buffer {
+        PixelBuffer::UInt8(v) => keep!(v, UInt8),
+        PixelBuffer::Int8(v) => keep!(v, Int8),
+        PixelBuffer::UInt16(v) => keep!(v, UInt16),
+        PixelBuffer::Int16(v) => keep!(v, Int16),
+        PixelBuffer::UInt32(v) => keep!(v, UInt32),
+        PixelBuffer::Int32(v) => keep!(v, Int32),
+        PixelBuffer::UInt64(v) => keep!(v, UInt64),
+        PixelBuffer::Int64(v) => keep!(v, Int64),
+        PixelBuffer::Float32(v) => keep!(v, Float32),
+        PixelBuffer::Float64(v) => keep!(v, Float64),
     }
 }
 
@@ -858,7 +911,14 @@ pub fn read(path: &Path) -> Result<Image> {
     let header = parse_header(&mut file)?;
     let pixel_id = header.pixel_id()?;
 
-    let count = header.number_of_pixels() * header.components;
+    // A `TENSORS` attribute stores the full 9-component 3×3 matrix per pixel on
+    // disk; `VTKImageIO` reads all nine and keeps the six symmetric components at
+    // row-major indices [0,1,2,4,5,8] (`ReadTensorBuffer` /
+    // `ReadSymmetricTensorBufferAsBinary`, itkVTKImageIO.cxx:415-451, 494-525).
+    // Every other pixel type stores exactly `components` values per pixel. §3.37.
+    let tensor = header.pixel_type == VtkPixelType::SymmetricSecondRankTensor;
+    let on_disk_components = if tensor { 9 } else { header.components };
+    let count = header.number_of_pixels() * on_disk_components;
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(header.header_size))?;
 
@@ -874,6 +934,13 @@ pub fn read(path: &Path) -> Result<Image> {
         file.read_exact(&mut data)
             .map_err(|_| IoError::TruncatedData)?;
         buffer_from_be_bytes(header.component, &data)
+    };
+
+    // Collapse each on-disk 3×3 tensor to the six kept symmetric components.
+    let buffer = if tensor {
+        keep_symmetric_tensor(buffer)
+    } else {
+        buffer
     };
 
     let dim = header.size.len();
