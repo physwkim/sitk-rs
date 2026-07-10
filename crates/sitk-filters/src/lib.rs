@@ -101,6 +101,7 @@ pub mod region_growing;
 pub mod regional_extrema;
 pub mod reinitialize_level_set;
 pub mod scalar_connected_component;
+pub mod scalar_to_rgb_colormap;
 pub mod sharpening;
 pub mod shrink;
 pub mod slic;
@@ -263,6 +264,7 @@ pub use regional_extrema::{
 };
 pub use reinitialize_level_set::reinitialize_level_set;
 pub use scalar_connected_component::scalar_connected_component;
+pub use scalar_to_rgb_colormap::{Colormap, scalar_to_rgb_colormap};
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::{bin_shrink, shrink};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
@@ -416,6 +418,50 @@ fn quantize_to_pixel_type_impl<T: Scalar>(v: f64) -> f64 {
 /// before the underlying filter ever sees it.
 pub(crate) fn quantize_to_pixel_type(target: PixelId, v: f64) -> f64 {
     dispatch_scalar!(target, quantize_to_pixel_type_impl, v)
+}
+
+/// `itk::NumericTraits<T>::max()` (`itkNumericTraits.h`'s
+/// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`, `std::numeric_limits<T>::max()` for
+/// every basic type with no ITK override -- unlike `min()`, which floating
+/// types override to the smallest *positive* normalized value; see
+/// [`numeric_traits_min`]).
+pub(crate) fn numeric_traits_max(id: PixelId) -> f64 {
+    match id.component_id() {
+        PixelId::UInt8 => u8::MAX as f64,
+        PixelId::Int8 => i8::MAX as f64,
+        PixelId::UInt16 => u16::MAX as f64,
+        PixelId::Int16 => i16::MAX as f64,
+        PixelId::UInt32 => u32::MAX as f64,
+        PixelId::Int32 => i32::MAX as f64,
+        PixelId::UInt64 => u64::MAX as f64,
+        PixelId::Int64 => i64::MAX as f64,
+        PixelId::Float32 => f32::MAX as f64,
+        PixelId::Float64 => f64::MAX,
+        _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
+    }
+}
+
+/// `itk::NumericTraits<T>::min()` (`itkNumericTraits.h`'s
+/// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`): `std::numeric_limits<T>::min()` for
+/// every integer type (the most-negative representable value), but for
+/// `float`/`double` ITK overrides it to `std::numeric_limits<T>::min()`'s
+/// *own* meaning for floating types -- the smallest *positive* normalized
+/// value (`FLT_MIN`/`DBL_MIN`), not the most negative representable value.
+/// Rust's `f32::MIN_POSITIVE`/`f64::MIN_POSITIVE` are the exact equivalents.
+pub(crate) fn numeric_traits_min(id: PixelId) -> f64 {
+    match id.component_id() {
+        PixelId::UInt8 => u8::MIN as f64,
+        PixelId::Int8 => i8::MIN as f64,
+        PixelId::UInt16 => u16::MIN as f64,
+        PixelId::Int16 => i16::MIN as f64,
+        PixelId::UInt32 => u32::MIN as f64,
+        PixelId::Int32 => i32::MIN as f64,
+        PixelId::UInt64 => u64::MIN as f64,
+        PixelId::Int64 => i64::MIN as f64,
+        PixelId::Float32 => f32::MIN_POSITIVE as f64,
+        PixelId::Float64 => f64::MIN_POSITIVE,
+        _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
+    }
 }
 
 fn require_same_shape(a: &Image, b: &Image) -> Result<()> {

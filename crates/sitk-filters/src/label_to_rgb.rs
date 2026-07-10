@@ -197,26 +197,6 @@ pub fn label_to_rgb(label_img: &Image, background_value: f64, colormap: &[u8]) -
     Ok(out)
 }
 
-/// `NumericTraits<T>::max()` (`itkNumericTraits.h`'s
-/// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`, `std::numeric_limits<T>::max()` for
-/// every basic type with no ITK override -- unlike `min()`, which floating
-/// types override to the smallest *positive* normalized value).
-fn numeric_traits_max(id: PixelId) -> f64 {
-    match id.component_id() {
-        PixelId::UInt8 => u8::MAX as f64,
-        PixelId::Int8 => i8::MAX as f64,
-        PixelId::UInt16 => u16::MAX as f64,
-        PixelId::Int16 => i16::MAX as f64,
-        PixelId::UInt32 => u32::MAX as f64,
-        PixelId::Int32 => i32::MAX as f64,
-        PixelId::UInt64 => u64::MAX as f64,
-        PixelId::Int64 => i64::MAX as f64,
-        PixelId::Float32 => f32::MAX as f64,
-        PixelId::Float64 => f64::MAX,
-        _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
-    }
-}
-
 /// Unlike [`crate::require_same_shape`], `image` and `label_image` may
 /// legitimately differ in pixel type (`LabelOverlayImageFilter.yaml`'s
 /// `pixel_types`/`pixel_types2`), so only their size is checked here.
@@ -290,7 +270,7 @@ pub fn label_overlay(
 
     let base_id = image.pixel_id();
     let base_vals = image.to_f64_vec()?;
-    let value_max = numeric_traits_max(base_id);
+    let value_max = crate::numeric_traits_max(base_id);
 
     let colors = build_color_table(colormap);
     let scaled_colors: Vec<[f64; 3]> = colors
