@@ -482,12 +482,14 @@ enum OptimizerKind {
     ConjugateGradientLineSearch(ConjugateGradientLineSearchOptimizer),
     /// Bound-constrained limited-memory BFGS (`itk::LBFGSBOptimizerv4`). Unlike
     /// the gradient-descent optimizers it does **not** use parameter scales or a
-    /// learning rate — it drives the raw metric gradient through a line search —
-    /// and it optionally clamps every parameter to a scalar `[lower, upper]` box.
+    /// learning rate — it drives the metric gradient through a line search — and
+    /// it optionally clamps every parameter to a scalar `[lower, upper]` box. The
+    /// optimizer weights still apply, through the gradient (ledger §2.117).
     Lbfgsb(LbfgsbConfig),
     /// Unconstrained limited-memory BFGS (`itk::LBFGS2Optimizerv4`). Like
     /// [`Lbfgsb`](Self::Lbfgsb) it ignores parameter scales and the learning
-    /// rate, driving the raw metric gradient through its own line search.
+    /// rate, driving the metric gradient through its own line search; the
+    /// optimizer weights still apply, through the gradient (ledger §2.117).
     Lbfgs2(LBFGS2Optimizer),
     /// Nelder–Mead downhill simplex (`itk::AmoebaOptimizerv4`).
     Amoeba(AmoebaOptimizer),
@@ -503,8 +505,9 @@ enum OptimizerKind {
 impl OptimizerKind {
     /// Whether this optimizer ignores parameter scales and the learning-rate
     /// estimator. Both L-BFGS variants force identity scales in ITK
-    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the raw
-    /// metric gradient directly.
+    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the metric
+    /// gradient directly. This concerns *scales* only — the optimizer *weights*
+    /// are applied to these optimizers' gradient separately (ledger §2.117).
     fn ignores_scales(&self) -> bool {
         matches!(self, OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_))
     }
@@ -1153,7 +1156,7 @@ impl ImageRegistrationMethod {
     /// `itkGradientDescentOptimizerv4.hxx:205-239`), and are the documented way
     /// to hold a parameter constant: a zero weight freezes it.
     ///
-    /// Three upstream behaviors this reproduces:
+    /// Three behaviors:
     ///
     /// - The length must equal the transform's
     ///   [`number_of_local_parameters`], **not** its parameter count. For a
@@ -1164,12 +1167,16 @@ impl ImageRegistrationMethod {
     /// - Weights within `1e-4` of `1.0` are treated as exactly identity and
     ///   never multiplied in (`m_WeightsAreIdentity`,
     ///   `itkObjectToObjectOptimizerBase.cxx:143-166`; ledger §2.116).
-    /// - The length is validated for **every** optimizer, but only the
-    ///   gradient-descent family applies the weights. The vnl-backed
-    ///   optimizers — `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and the
-    ///   gradient-free `AmoebaOptimizerv4` — validate and then ignore them.
-    ///   `LBFGS2Optimizerv4` derives from the gradient-descent template and
-    ///   *does* apply them (ledger §2.117).
+    /// - The weights are honored by **every** optimizer this crate exposes.
+    ///   Upstream validates them for every v4 optimizer but only the
+    ///   gradient-descent family actually applies them — the vnl-backed
+    ///   `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and gradient-free
+    ///   `AmoebaOptimizerv4` validate and then silently ignore a well-sized
+    ///   array. This port instead applies them uniformly (ledger §2.117): the
+    ///   scale-consuming optimizers fold the weights into their per-parameter
+    ///   step scaling, and the two L-BFGS optimizers — which ignore that scaling
+    ///   — apply the weights to the gradient they descend. A zero weight freezes
+    ///   its parameter exactly on every path.
     ///
     /// An empty vector (the default) means identity.
     ///
@@ -2365,18 +2372,22 @@ impl ImageRegistrationMethod {
         };
 
         // ITK modifies the gradient in place by `weights[j % n] / scales[j % n]`
-        // (`ModifyGradientByScalesOverSubRange`). This crate's optimizers instead
-        // *divide* the gradient by a per-parameter array, so the driver hands
-        // them the reciprocal of that factor, `scales[j] / weights[j % n]`.
-        // A zero weight — upstream's documented way to hold a parameter constant
-        // — becomes an infinite divisor, and `g / ∞ == 0` is exactly the frozen
-        // parameter `g * 0 == 0` gives ITK.
+        // (`ModifyGradientByScalesOverSubRange`). This crate's optimizers that
+        // consume `scales` instead *divide* the gradient by a per-parameter
+        // array, so the driver folds the weights into that array as its
+        // reciprocal, `scales[j] / weights[j % n]`. A zero weight — upstream's
+        // documented way to hold a parameter constant — becomes an infinite
+        // divisor, and `g / ∞ == 0` is exactly the frozen parameter `g * 0 == 0`
+        // gives ITK.
         //
-        // The optimizers that ignore scales ignore the weights with them: only
-        // the gradient-descent family owns `ModifyGradientByScalesOverSubRange`
-        // (ledger §2.117).
+        // The two L-BFGS variants ignore the estimated/manual `scales` (ITK
+        // forces identity scales on the vnl-backed LBFGSB), so weights cannot
+        // ride in on this array for them; they apply the weights directly to the
+        // gradient they descend instead — see `weighted_objective!` below. Either
+        // way the weights are honored for every optimizer (ledger §2.117).
         let weights = &self.optimizer_weights;
-        let scales: Vec<f64> = if ignores_scales || weights_are_identity(weights) {
+        let apply_weights = !weights_are_identity(weights);
+        let scales: Vec<f64> = if ignores_scales || !apply_weights {
             scales
         } else {
             scales
@@ -2407,6 +2418,29 @@ impl ImageRegistrationMethod {
                     (m.value, m.derivative)
                 }
             };
+        }
+        // The objective with the optimizer weights applied to the gradient the
+        // optimizer descends, `g[j] *= weights[j % n]` — ITK's
+        // `ModifyGradientByScales` mechanism. Used by the two L-BFGS variants,
+        // which ignore the `scales` array the weights otherwise fold into, so the
+        // weights would be validated then silently dropped without this. A zero
+        // weight zeroes that gradient component at every evaluation, which for a
+        // diagonally-initialized (quasi-)Newton method keeps the parameter
+        // exactly at its start — the two-loop recursion never gives a frozen
+        // component a nonzero search direction (ledger §2.117).
+        macro_rules! weighted_objective {
+            () => {{
+                let mut base = objective!();
+                move |p: &[f64]| {
+                    let (v, mut g) = base(p);
+                    if apply_weights {
+                        for (j, gj) in g.iter_mut().enumerate() {
+                            *gj *= weights[j % weights.len()];
+                        }
+                    }
+                    (v, g)
+                }
+            }};
         }
         // The line searches take an `Objective` so their golden-section probes
         // reach `ActiveMetric::value` instead of the closure adapter's
@@ -2567,15 +2601,17 @@ impl ImageRegistrationMethod {
                 }
             }
             OptimizerKind::Lbfgsb(cfg) => {
-                // No scales, no learning-rate estimation: LBFGSB minimizes the raw
+                // No scales and no learning-rate estimation: LBFGSB minimizes the
                 // metric directly under its own bound/convergence configuration.
+                // The optimizer weights still apply, through the gradient.
                 let optimizer = cfg.build(nparams);
-                optimizer.optimize(start, objective!())
+                optimizer.optimize(start, weighted_objective!())
             }
             OptimizerKind::Lbfgs2(l) => {
                 // Unbounded L-BFGS; like LBFGSB it ignores scales and drives the
-                // raw metric gradient through its own line search.
-                l.optimize(start, objective!())
+                // metric gradient through its own line search, with the optimizer
+                // weights applied to that gradient.
+                l.optimize(start, weighted_objective!())
             }
             // The four gradient-free optimizers below take the *unscaled*
             // parameters and apply `scales` themselves — each ports ITK's
@@ -3557,6 +3593,44 @@ mod tests {
             (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
             "recovered {p:?}, expected [{tx}, {ty}], metric {}",
             result.metric_value
+        );
+    }
+
+    #[test]
+    fn lbfgs2_applies_the_optimizer_weights() {
+        // LBFGS2Optimizerv4 derives from the gradient-descent template and calls
+        // ModifyGradientByScales in EvaluateCost, so — unlike the vnl-backed
+        // L-BFGS-B — it does apply well-sized weights (ledger §2.117). A zero
+        // weight freezes its parameter exactly.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let run = |weights: Vec<f64>| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_lbfgs2(1e-8, 0, 6, 0, 1e-5, 40, 1e-20, 1e20, 1e-4)
+                .set_optimizer_weights(weights);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .transform
+                .parameters()
+        };
+
+        // Unweighted, both parameters recover the shift (ty = −2 here).
+        let free = run(Vec::new());
+        assert!(
+            (free[0] - tx).abs() < 1e-3 && (free[1] - ty).abs() < 1e-3,
+            "unweighted recovered {free:?}, expected [{tx}, {ty}]"
+        );
+
+        // A zero y-weight freezes y at its initial 0 exactly while x converges.
+        let frozen = run(vec![1.0, 0.0]);
+        assert_eq!(
+            frozen[1], 0.0,
+            "the zero-weighted parameter moved to {}",
+            frozen[1]
+        );
+        assert!(
+            (frozen[0] - tx).abs() < 5e-2,
+            "the unfrozen parameter recovered {} not ≈{tx}",
+            frozen[0]
         );
     }
 
@@ -5696,11 +5770,15 @@ mod tests {
     }
 
     #[test]
-    fn lbfgsb_validates_the_weights_length_and_then_ignores_the_weights() {
+    fn lbfgsb_validates_the_weights_length_and_applies_them() {
         // ObjectToObjectOptimizerBase::StartOptimization validates m_Weights for
-        // every v4 optimizer, but only the gradient-descent family owns
-        // ModifyGradientByScalesOverSubRange. So L-BFGS-B rejects a mis-sized
-        // array and silently discards a well-sized one (ledger §2.117).
+        // every v4 optimizer. Upstream's vnl-backed L-BFGS-B then validates and
+        // then silently *drops* a well-sized array, because only the
+        // gradient-descent family owns ModifyGradientByScalesOverSubRange. This
+        // port honors the weights instead (ledger §2.117): they scale the
+        // gradient L-BFGS-B descends, so a zero weight freezes its parameter
+        // exactly, the same documented "hold a parameter constant" behavior
+        // gradient descent gives.
         let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
         let moving = gaussian(40, 40, 23.0, 18.0, 7.0, 1.0);
         let run = |weights: Vec<f64>| {
@@ -5710,12 +5788,28 @@ mod tests {
             reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
         };
 
-        // A zero weight would freeze y under gradient descent; L-BFGS-B ignores
-        // it and still recovers the full translation.
-        let weighted = run(vec![1.0, 0.0]).unwrap().transform.parameters();
+        // Unweighted, L-BFGS-B recovers the full translation, y ≈ −2.
         let unweighted = run(Vec::new()).unwrap().transform.parameters();
-        assert_eq!(weighted, unweighted);
-        assert!((weighted[1] + 2.0).abs() < 1e-2, "y = {}", weighted[1]);
+        assert!(
+            (unweighted[1] + 2.0).abs() < 1e-2,
+            "unweighted y = {}",
+            unweighted[1]
+        );
+
+        // A zero y-weight freezes y at its initial 0 exactly, while x still
+        // converges (to the best x under the y = 0 constraint, which the
+        // y-mismatch pulls slightly off 3).
+        let weighted = run(vec![1.0, 0.0]).unwrap().transform.parameters();
+        assert_eq!(
+            weighted[1], 0.0,
+            "the zero-weighted parameter moved to {}",
+            weighted[1]
+        );
+        assert!(
+            (weighted[0] - 3.0).abs() < 5e-2,
+            "the unfrozen parameter recovered {} not ≈3",
+            weighted[0]
+        );
 
         // The length is still validated.
         let err = run(vec![1.0, 1.0, 1.0]).unwrap_err();
