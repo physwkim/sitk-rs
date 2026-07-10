@@ -51,17 +51,25 @@
 //! the row sum of the same accumulation, so every row of the operator sums to
 //! zero and a constant image is a fixed point exactly.
 //!
-//! # Faithfully-reproduced upstream behaviors, rather than "fixed"
+//! # Upstream bugs corrected here rather than reproduced
 //!
-//! - **`feature_scale` smooths along axis 0 only.**
+//! - **§1.22 — `feature_scale` smoothed along axis 0 only.**
 //!   `StructureTensorImageFilter::GenerateData` smooths the outer-product image
 //!   with `itk::RecursiveGaussianImageFilter`, which is the *single-direction*
-//!   `RecursiveSeparableImageFilter` (its `m_Direction` defaults to `0` and the
-//!   filter never sets it), not the all-axes
-//!   `SmoothingRecursiveGaussianImageFilter`. So `K_ρ` in the structure-tensor
-//!   definition is applied along the first image axis and no other. This port
-//!   reproduces that. (`noise_scale`'s `K_σ` *is* isotropic: it goes through
-//!   `GradientRecursiveGaussianImageFilter`, which does smooth every axis.)
+//!   `RecursiveSeparableImageFilter` — its `m_Direction` defaults to `0` and
+//!   `GenerateData` calls only `SetSigma`, never `SetDirection`
+//!   (`itkStructureTensorImageFilter.hxx:125-128`). So upstream's `K_ρ` is
+//!   applied along the first image axis and no other, which is not a Gaussian
+//!   kernel in the structure-tensor definition `S := K_ρ * (∇u_σ ⊗ ∇u_σ)` and
+//!   makes every output of the filter depend on how the axes happen to be
+//!   ordered. This port applies `K_ρ` isotropically, with `feature_scale` as
+//!   the sigma on every axis — the separable form of the all-axes
+//!   `SmoothingRecursiveGaussianImageFilter` upstream evidently meant, and what
+//!   `noise_scale`'s `K_σ` already does via
+//!   `GradientRecursiveGaussianImageFilter`.
+//!
+//! # Faithfully-reproduced upstream behaviors, rather than "fixed"
+//!
 //! - **SimpleITK's yaml doc has the CED/EED formulas swapped** relative to the
 //!   code: the "Coherence Enhancing Diffusion" heading carries the EED formula
 //!   `g(μᵢ − μ_min)` with `g(s) = 1 − (1−α)·exp(−(λ/s)^m)` and vice versa. The
@@ -173,8 +181,8 @@ pub struct CoherenceEnhancingDiffusionSettings {
     /// units. Isotropic (all axes).
     pub noise_scale: f64,
     /// `ρ`: the Gaussian scale at which the gradient outer product is
-    /// averaged, in physical units. **Applied along axis 0 only**, reproducing
-    /// ITK's use of the single-direction `RecursiveGaussianImageFilter`.
+    /// averaged, in physical units. Isotropic (all axes) — see §1.22 in the
+    /// module doc, where upstream applies it along axis 0 alone.
     pub feature_scale: f64,
     /// Exponent `m` of the transfer functions. See [`Enhancement`].
     pub exponent: f64,
@@ -438,8 +446,8 @@ fn itk_maximum(values: impl Iterator<Item = f64>) -> f64 {
 /// `StructureTensorImageFilter::GenerateData` for a scalar image:
 /// `K_ρ * (∇u_σ ⊗ ∇u_σ)`, optionally rescaled for unit maximum trace.
 ///
-/// `K_σ` is isotropic (`GradientRecursiveGaussianImageFilter`); `K_ρ` runs
-/// along axis 0 only (`RecursiveGaussianImageFilter`, `m_Direction == 0`).
+/// Both `K_σ` (`GradientRecursiveGaussianImageFilter`) and `K_ρ` are isotropic.
+/// Upstream's `K_ρ` runs along axis 0 only; see §1.22 in the module doc.
 fn structure_tensor(
     data: &[f64],
     size: &[usize],
@@ -484,10 +492,12 @@ fn structure_tensor(
         }
     }
 
-    // `K_rho`, along axis 0 only. Componentwise, as
-    // `RecursiveGaussianImageFilter<TensorImageType>` is.
-    let mut rho = vec![0.0; dim];
-    rho[0] = feature_scale;
+    // `K_rho`, isotropic over every axis (§1.22: upstream reaches for the
+    // single-direction `RecursiveGaussianImageFilter` and never calls
+    // `SetDirection`, so its `m_Direction == 0` applies `K_rho` along axis 0
+    // alone). Componentwise, as `RecursiveGaussianImageFilter<TensorImageType>`
+    // is.
+    let rho = vec![feature_scale; dim];
     for i in 0..dim {
         for j in i..dim {
             let comp: Vec<f64> = tensors.iter().map(|t| t[i][j]).collect();
@@ -1088,12 +1098,12 @@ mod tests {
 
     /// A ramp `u(x, y) = x`. `∇u = (1, 0)`, so `S = [[1, 0], [0, 0]]`.
     ///
-    /// The grid is 64 wide because `K_ρ` smooths *along x* (the upstream
-    /// axis-0-only quirk) and so drags the two boundary columns' bad
-    /// derivative estimates toward the centre; 64 puts the centre 16 `ρ` away
-    /// and the residual under 1e-9. See
-    /// `the_feature_scale_smooths_along_axis_zero_only`, which pins the same
-    /// contamination on a narrow grid.
+    /// The grid is 64 wide because the (now isotropic, §1.22) `K_ρ` drags the
+    /// two boundary columns' bad x-derivative estimates toward the centre along
+    /// x; 64 puts the centre 16 `ρ` away and the residual under 1e-9. `S_00`
+    /// is constant along y, so the y-axis smoothing adds nothing and 16 rows
+    /// suffice there. See `the_feature_scale_smooths_every_axis_isotropically`,
+    /// which pins the isotropy directly.
     #[test]
     fn structure_tensor_of_a_ramp_is_the_hand_computed_outer_product() {
         let (nx, ny) = (64, 16);
@@ -1114,9 +1124,10 @@ mod tests {
 
     #[test]
     fn structure_tensor_of_a_ramp_along_y_is_the_transposed_outer_product() {
-        // Only 32 wide: `K_ρ` smooths along x, where `S_11` is constant, so
-        // no boundary error is dragged in and the centre is exact.
-        let (nx, ny) = (32, 32);
+        // The exact transpose of the x-ramp test: `S_11` now varies along y and
+        // (isotropic §1.22 `K_ρ`) is smeared from the y-boundary, so the grid is
+        // 64 *tall* to put the centre 16 `ρ` from it, mirroring the x case.
+        let (nx, ny) = (16, 64);
         let data: Vec<f64> = (0..nx * ny).map(|p| (p / nx) as f64).collect();
         let t = structure_tensor(
             &data,
@@ -1129,7 +1140,9 @@ mod tests {
         )
         .unwrap();
         let center = (ny / 2) * nx + nx / 2;
-        assert_mat_close(&t[center], &mat2(0.0, 0.0, 1.0), 2, 1e-12);
+        // Same 1e-8 residual as the x-ramp: the two are transposes and `K_ρ` is
+        // isotropic, so the boundary contamination is identical.
+        assert_mat_close(&t[center], &mat2(0.0, 0.0, 1.0), 2, 1e-8);
     }
 
     #[test]
@@ -1170,27 +1183,27 @@ mod tests {
         assert!((max_trace - 1.0).abs() < 1e-12, "{max_trace}");
     }
 
+    /// §1.22 fix: `K_ρ` is isotropic, so the whole structure-tensor pipeline
+    /// commutes with transposing the image.
+    ///
+    /// Take a square 16×16 ramp along x, `u(x,y) = x`, and its exact transpose,
+    /// `v(x,y) = y`. Both have a single nonzero structure-tensor component
+    /// (`S_00` and `S_11` respectively) equal to `1` in the interior and wrong
+    /// in the two boundary lines, where the replicating recursion cannot see
+    /// the ramp continue. With unit isotropic spacing, identity direction and
+    /// isotropic `σ`/`ρ`, transposing the input transposes `S`, so at the
+    /// (self-transpose) centre pixel `S^u_00` and `S^v_11` must be **equal**:
+    ///
+    ///     S^v_11(x, y) = S^u_00(y, x),  and the centre has x == y.
+    ///
+    /// Both therefore carry the same boundary contamination — the `1.4e-3` that
+    /// `K_ρ` drags inward from eight pixels away. Upstream's axis-0-only `K_ρ`
+    /// smeared `S^u_00` (which varies along x, the smoothed axis) but left
+    /// `S^v_11` (which varies along y) at the bare `3.3e-9` error of an
+    /// unsmoothed recursive derivative — an asymmetry of five orders of
+    /// magnitude between an image and its own transpose.
     #[test]
-    fn the_feature_scale_smooths_along_axis_zero_only() {
-        // Upstream quirk: `K_rho` goes through the single-direction
-        // `RecursiveGaussianImageFilter` (`m_Direction == 0`), so it smooths
-        // along axis 0 and no other.
-        //
-        // Take a 16-wide ramp along x and its exact transpose, a ramp along y.
-        // Both have one nonzero structure-tensor component, equal to 1 in the
-        // interior and wrong in the two boundary lines, where the replicating
-        // recursion cannot see the ramp continue.
-        //
-        //   * The x-ramp's `S_00` varies along x, the axis `K_rho` smooths, so
-        //     the boundary error is dragged inward: at the centre it is off by
-        //     1.4e-3.
-        //   * The y-ramp's `S_11` varies along y, which `K_rho` never touches,
-        //     so at the centre it retains the bare 3.3e-9 error of a recursive
-        //     first derivative eight pixels from a replicating boundary.
-        //
-        // An isotropic `K_rho` would contaminate both alike and the two errors
-        // would match. Instead they differ by five orders of magnitude, and
-        // that asymmetry *is* the quirk.
+    fn the_feature_scale_smooths_every_axis_isotropically() {
         let n = 16;
         let dx: Vec<f64> = (0..n * n).map(|p| (p % n) as f64).collect();
         let dy: Vec<f64> = (0..n * n).map(|p| (p / n) as f64).collect();
@@ -1200,33 +1213,28 @@ mod tests {
         let ty = structure_tensor(&dy, &[n, n], &sp, &dir, 0.5, 2.0, false).unwrap();
         let c = (n / 2) * n + n / 2;
 
-        let smeared = (tx[c][0][0] - 1.0).abs();
-        let untouched = (ty[c][1][1] - 1.0).abs();
+        let x_err = (tx[c][0][0] - 1.0).abs();
+        let y_err = (ty[c][1][1] - 1.0).abs();
         assert!(
-            smeared > 1e-3,
-            "x-ramp should be smeared by K_rho: {smeared}"
+            (tx[c][0][0] - ty[c][1][1]).abs() < 1e-14,
+            "K_rho is not isotropic: S^u_00 = {}, S^v_11 = {}",
+            tx[c][0][0],
+            ty[c][1][1]
         );
-        assert!(
-            untouched < 1e-8,
-            "y-ramp must be untouched by K_rho: {untouched}"
-        );
-        assert!(
-            smeared > 1e5 * untouched,
-            "K_rho looks isotropic: {smeared} vs {untouched}"
-        );
+        // Both are smeared alike, and both really are smeared: upstream left
+        // the y-ramp's error below 1e-8.
+        assert!(x_err > 1e-3, "x-ramp should be smeared by K_rho: {x_err}");
+        assert!(y_err > 1e-3, "y-ramp should be smeared by K_rho: {y_err}");
 
-        // Concretely: the y-ramp's `S_11` is the *unsmoothed* squared gradient,
-        // recovered to rounding by the axis-0 pass over a signal constant in x.
-        let g = recursive_gaussian_with_order(
-            &scalar_image(&[n, n], &sp, dy.clone()).unwrap(),
-            &[0.5, 0.5],
-            &[GaussianOrder::ZeroOrder, GaussianOrder::FirstOrder],
-            false,
-        )
-        .unwrap()
-        .to_f64_vec()
-        .unwrap();
-        assert!((ty[c][1][1] - g[c] * g[c]).abs() < 1e-15);
+        // The transpose symmetry holds over the whole image, not just the
+        // centre: S^v_11(x, y) == S^u_00(y, x) at every pixel.
+        for y in 0..n {
+            for x in 0..n {
+                let a = tx[x + n * y][0][0];
+                let b = ty[y + n * x][1][1];
+                assert!((a - b).abs() < 1e-14, "({x},{y}): {a} != {b}");
+            }
+        }
     }
 
     // ---- the assembled operator ----
