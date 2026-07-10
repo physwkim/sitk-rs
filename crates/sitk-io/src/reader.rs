@@ -158,7 +158,16 @@ impl ImageFileReader {
     /// sitkImageFileReader.cxx:39-67): the retained axes' origin shifted by the
     /// retained axes' own index, through the output (identity, when reduced)
     /// direction and spacing. A collapsed axis's index selects its slice but
-    /// never shifts the origin.
+    /// never shifts the origin — but note this reader has already discarded the
+    /// file's oblique frame for a reduced dimension (identity collapse, §3.27),
+    /// so there is no oblique world frame here for that shift to be "correct"
+    /// in; the collapsed-axis origin drop is a consequence of the §3.27
+    /// identity contract, not the §2.75 quirk. The §2.75 fix — taking the
+    /// retained physical components of the full `TransformIndexToPhysicalPoint`
+    /// so an oblique slice `k` lands at its true world corner — lives in the
+    /// direction-preserving `ExtractImageFilter` path
+    /// (`sitk_filters::geometry::extract`), which keeps the oblique submatrix
+    /// and so has a coherent frame to be correct in.
     pub fn execute(&mut self) -> Result<Image> {
         let io = reader_for(&self.file_name)?;
         let info = io.read_information(&self.file_name)?;
