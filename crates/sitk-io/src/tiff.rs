@@ -147,7 +147,7 @@
 //! Both are heap buffer overflows in C++. They are not expressible in safe
 //! Rust, so [`read`] keeps upstream's `page`-indexed offset and returns
 //! [`IoError::UnsupportedTiffFeature`] when it would leave the buffer. Ledger
-//! §1.68.
+//! §1.66.
 //!
 //! # Mixed page geometry is an over-read upstream, an error here
 //!
@@ -471,7 +471,7 @@ struct Layout {
 /// (`SAMPLEFORMAT_VOID`) or an unrecognised one leaves `m_ComponentType` at
 /// whatever the previous read, or the constructor's `UCHAR`, left there, and
 /// `ReadGenericImage<unsigned char>` then copies one byte per four-byte sample.
-/// That stale-state bug (ledger §1.66) has no analogue here — this function is
+/// That stale-state bug (ledger §1.68) has no analogue here — this function is
 /// pure — so the case is refused instead.
 fn component_type(bits_per_sample: u16, sample_format: u16) -> Result<PixelId> {
     Ok(match (bits_per_sample, sample_format) {
@@ -483,7 +483,7 @@ fn component_type(bits_per_sample: u16, sample_format: u16) -> Result<PixelId> {
         (32, other) => {
             return unsupported(format!(
                 "TIFF SampleFormat {other} at 32 bits per sample leaves m_ComponentType \
-                 unassigned upstream (itkTIFFImageIO.cxx:406-420) — doc/upstream-findings.md §1.66"
+                 unassigned upstream (itkTIFFImageIO.cxx:406-420) — doc/upstream-findings.md §1.68"
             ));
         }
         (_, 2) => PixelId::Int16,
@@ -782,7 +782,7 @@ fn read_current_page(
         return unsupported(format!(
             "ReadVolume offsets page {} by its directory index rather than by a running count of \
              the pages it keeps, so this file overflows its {}-slice buffer upstream \
-             (itkTIFFImageIO.cxx:170) — doc/upstream-findings.md §1.68",
+             (itkTIFFImageIO.cxx:170) — doc/upstream-findings.md §1.66",
             pixel_offset / page_len.max(1),
             layout.size.get(2).copied().unwrap_or(1)
         ));
@@ -1309,7 +1309,6 @@ impl ImageIo for TiffImageIo {
     /// `CanWriteFile` is `HasSupportedWriteExtension(name, false)`
     /// (itkTIFFImageIO.cxx:542-553) — case-**sensitive**, unlike the trait's
     /// case-insensitive default. `foo.TIFF` is claimed, `foo.Tiff` is not.
-    /// Ledger §2.142.
     fn can_write_file(&self, path: &Path) -> bool {
         has_supported_extension(path, self.supported_write_extensions(), false)
     }
@@ -1643,7 +1642,7 @@ mod tests {
     /// Three directories in the order `[REDUCEDIMAGE, 0, 0]`: `m_SubFiles == 2`
     /// so the volume has two slices, but `ReadVolume` offsets the two kept pages
     /// by their *directory* indices, 1 and 2 — writing past the end of a
-    /// two-slice buffer. Ledger §1.68, shape 1.
+    /// two-slice buffer. Ledger §1.66, shape 1.
     #[test]
     fn an_ignored_page_before_a_kept_one_would_overflow_the_volume() {
         let bytes = build_tiff(vec![
@@ -1658,7 +1657,7 @@ mod tests {
 
         assert_eq!(information.size, vec![2, 2, 2]);
         assert!(
-            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§1.68")),
+            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§1.66")),
             "{image:?}"
         );
     }
@@ -1666,7 +1665,7 @@ mod tests {
     /// Two directories, the first with no `SUBFILETYPE` tag at all and the
     /// second tagged `0`: `m_SubFiles == 1` and `m_IgnoredSubFiles == 0`, so the
     /// volume gets one slice while `ReadVolume` reads both directories and
-    /// places the second at slice 1. Ledger §1.68, shape 2.
+    /// places the second at slice 1. Ledger §1.66, shape 2.
     #[test]
     fn an_untagged_page_beside_a_tagged_one_would_overflow_the_volume() {
         let bytes = build_tiff(vec![gray_page(2, 2, None, 1), gray_page(2, 2, Some(0), 2)]);
@@ -1677,7 +1676,7 @@ mod tests {
 
         assert_eq!(information.size, vec![2, 2, 1]);
         assert!(
-            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§1.68")),
+            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§1.66")),
             "{image:?}"
         );
     }
@@ -1730,7 +1729,7 @@ mod tests {
     }
 
     /// `component_type`'s ladder, including the `BitsPerSample == 32` arm with
-    /// no `default:` (§1.66) and the `bits > 32` fall-through to `USHORT`.
+    /// no `default:` (§1.68) and the `bits > 32` fall-through to `USHORT`.
     #[test]
     fn component_type_follows_the_bits_and_sample_format_ladder() {
         assert_eq!(component_type(8, 1).unwrap(), PixelId::UInt8);
