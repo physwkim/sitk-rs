@@ -45,6 +45,7 @@ use std::path::Path;
 use sitk_core::{Image, PixelId};
 
 use crate::error::{IoError, Result};
+use crate::gipl::GiplImageIo;
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
@@ -171,6 +172,7 @@ pub fn has_supported_extension(path: &Path, extensions: &[&str], ignore_case: bo
 static META_IMAGE_IO: MetaImageIo = MetaImageIo;
 static NRRD_IMAGE_IO: NrrdImageIo = NrrdImageIo;
 static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
+static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -178,15 +180,28 @@ static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
 /// both `CreateImageIO` and `GetRegisteredImageIOs` iterate. Probe order is
 /// this order, so an earlier entry wins a tie.
 ///
-/// [`MetaImageIo`], [`NrrdImageIo`] and [`NiftiImageIo`] advertise disjoint
-/// extension sets, so their relative order decides nothing for a named file.
-/// It does matter in phase 2 of [`create_image_io`], where an extension-less
-/// path is offered to every IO in turn: `MetaImageIo::can_read_file` re-checks
-/// the extension and declines, `NrrdImageIo::can_read_file` probes the magic
-/// and may claim it, and `NiftiImageIo::can_read_file` then resolves the file
-/// through `nifti_findhdrname` and may claim it.
+/// [`MetaImageIo`], [`NrrdImageIo`] and [`NiftiImageIo`]
+/// advertise disjoint extension sets, so their relative order decides nothing
+/// for a named file. It does matter in phase 2 of [`create_image_io`], where an
+/// extension-less path is offered to every IO in turn: `MetaImageIo::
+/// can_read_file` re-checks the extension and declines, `NrrdImageIo::
+/// can_read_file` probes the magic and may claim it, and `NiftiImageIo::
+/// can_read_file` then resolves the file through `nifti_findhdrname` and may
+/// claim it.
+///
+/// [`GiplImageIo`] advertises *no* extensions — `itk::GiplImageIO`'s
+/// constructor registers none — so it is reachable only from phase 2, where its
+/// own `CheckExtension` gate makes it claim `.gipl` and `.gipl.gz` and nothing
+/// else.
+///
+/// [`GiplImageIo`]: crate::gipl::GiplImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
-    const IOS: &[&dyn ImageIo] = &[&META_IMAGE_IO, &NRRD_IMAGE_IO, &NIFTI_IMAGE_IO];
+    const IOS: &[&dyn ImageIo] = &[
+        &META_IMAGE_IO,
+        &NRRD_IMAGE_IO,
+        &NIFTI_IMAGE_IO,
+        &GIPL_IMAGE_IO,
+    ];
     IOS
 }
 

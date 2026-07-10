@@ -28,6 +28,7 @@
 //! see [`transform_io`].
 
 pub mod error;
+pub mod gipl;
 pub mod image_io;
 pub mod meta_image;
 pub mod nifti;
@@ -389,7 +390,7 @@ mod tests {
     fn registry_lists_each_image_io_by_class_name() {
         assert_eq!(
             registered_image_ios(),
-            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
+            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO", "GiplImageIO"]
         );
         assert_eq!(
             image_io_by_name("MetaImageIO").unwrap().name(),
@@ -402,6 +403,10 @@ mod tests {
         assert_eq!(
             image_io_by_name("NiftiImageIO").unwrap().name(),
             "NiftiImageIO"
+        );
+        assert_eq!(
+            image_io_by_name("GiplImageIO").unwrap().name(),
+            "GiplImageIO"
         );
         assert!(matches!(
             image_io_by_name("PNGImageIO"),
@@ -528,7 +533,7 @@ mod tests {
         ));
         assert_eq!(
             writer.registered_image_ios(),
-            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
+            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO", "GiplImageIO"]
         );
     }
 
@@ -2704,5 +2709,409 @@ mod tests {
         let claimed = create_image_io(&path, FileMode::Read).is_some();
         std::fs::remove_file(&path).ok();
         assert!(!claimed);
+    }
+
+    // ======================================================================
+    // GIPL — itk::GiplImageIO
+    // ======================================================================
+
+    /// Hand-author the 256-byte header `ReadImageInformation` walks, so a test
+    /// can move one field at a time.
+    fn gipl_header(
+        dims: [u16; 4],
+        image_type: u16,
+        pixdim: [f32; 4],
+        origin: [f64; 4],
+        magic: u32,
+    ) -> Vec<u8> {
+        let mut h = Vec::with_capacity(256);
+        for d in dims {
+            h.extend_from_slice(&d.to_be_bytes());
+        }
+        h.extend_from_slice(&image_type.to_be_bytes());
+        for p in pixdim {
+            h.extend_from_slice(&p.to_be_bytes());
+        }
+        h.resize(h.len() + 80, 0); // line1
+        h.resize(h.len() + 98, 0); // matrix, flag1, flag2, min, max
+        for o in origin {
+            h.extend_from_slice(&o.to_be_bytes());
+        }
+        h.resize(h.len() + 16, 0); // pixval_offset, pixval_cal, user_def1, user_def2
+        h.extend_from_slice(&magic.to_be_bytes());
+        assert_eq!(h.len(), gipl::HEADER_SIZE);
+        h
+    }
+
+    /// Every byte `GiplImageIO::Write` emits before the pixel data
+    /// (itkGiplImageIO.cxx:684-991): four big-endian `dims` with the unused
+    /// axes padded to `1`, `image_type`, four `pixdim` floats padded to `1.0`,
+    /// the fixed `"No Patient Information"` text, 98 zero bytes covering the
+    /// discarded `matrix`/`flag1`/`flag2`/`min`/`max`, four `origin` doubles,
+    /// 16 more zero bytes, and `GIPL_MAGIC_NUMBER` at offset 252.
+    #[test]
+    fn gipl_header_pins_bytes_for_a_3d_image() {
+        let data: Vec<i16> = (0..24).map(|i| i as i16 - 5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+
+        let path = tmp_path("pin.gipl");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let mut expected = gipl_header(
+            [4, 3, 2, 1],
+            15, // GIPL_SHORT
+            [0.5, 1.25, 3.0, 1.0],
+            [-2.0, 4.0, 7.5, 0.0],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        expected[26..26 + 22].copy_from_slice(b"No Patient Information");
+
+        assert_eq!(&bytes[..gipl::HEADER_SIZE], &expected[..]);
+        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 24 * 2);
+        assert_eq!(&bytes[252..256], &[0xef, 0xff, 0xe9, 0xb0]);
+        // The pixel data is big-endian: -5 is 0xfffb.
+        assert_eq!(&bytes[256..258], &[0xff, 0xfb]);
+    }
+
+    /// The six component types `SwapBytesIfNecessary` has an arm for, at 2-D
+    /// and 3-D. A 2-D image comes back **3-D** — `Write` pads `dims` with `1`
+    /// and `ReadImageInformation` counts every non-zero slot below index 3
+    /// (§2.94) — but the pixel values are exact.
+    #[test]
+    fn gipl_roundtrip_every_supported_scalar_type_2d_and_3d() {
+        macro_rules! case {
+            ($ty:ty, $size:expr, $expected_size:expr, $name:expr) => {{
+                let count: usize = $size.iter().product();
+                let data: Vec<$ty> = (0..count as u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&$size, data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+                assert_eq!(back.size(), &$expected_size[..], $name);
+            }};
+        }
+        macro_rules! both {
+            ($ty:ty, $stem:expr) => {{
+                case!($ty, [4usize, 2], [4usize, 2, 1], concat!($stem, "_2d.gipl"));
+                case!(
+                    $ty,
+                    [4usize, 2, 3],
+                    [4usize, 2, 3],
+                    concat!($stem, "_3d.gipl")
+                );
+            }};
+        }
+        both!(u8, "gipl_u8");
+        both!(i8, "gipl_i8");
+        both!(u16, "gipl_u16");
+        both!(i16, "gipl_i16");
+        both!(f32, "gipl_f32");
+        both!(f64, "gipl_f64");
+    }
+
+    /// Spacing and origin survive; the direction matrix does not exist in the
+    /// format and reads back as the identity.
+    #[test]
+    fn gipl_roundtrip_preserves_spacing_and_origin_and_drops_direction() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32 * 0.5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+        img.set_direction(&[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+
+        let path = tmp_path("geom.gipl");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.size(), &[4, 3, 2]);
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.spacing(), &[0.5, 1.25, 3.0]);
+        assert_eq!(back.origin(), &[-2.0, 4.0, 7.5]);
+        assert_eq!(
+            back.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+        // `pixdim` is `float`, so a spacing that is not exactly representable in
+        // f32 does not survive; these three are.
+        assert!(back.meta_data_keys().is_empty());
+    }
+
+    /// The unit third axis a 2-D write invents carries spacing `1.0` and origin
+    /// `0.0` — `Write`'s `else` arms (itkGiplImageIO.cxx:807, :910).
+    #[test]
+    fn gipl_two_dimensional_image_reads_back_as_three_dimensional() {
+        let mut img = Image::from_vec(&[3, 2], vec![1u8, 2, 3, 4, 5, 6]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[1.0, -1.0]).unwrap();
+
+        let path = tmp_path("two_d.gipl");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 3);
+        assert_eq!(back.size(), &[3, 2, 1]);
+        assert_eq!(back.spacing(), &[0.5, 2.0, 1.0]);
+        assert_eq!(back.origin(), &[1.0, -1.0, 0.0]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// `SwapBytesIfNecessary` has no `INT`/`UINT` arm, so `Write` throws
+    /// `"Pixel Type Unknown"` — *after* the full 256-byte header is on disk
+    /// (§1.52). The half-written file is left behind, exactly as upstream's
+    /// truncating `OpenFileForWriting` plus unwinding `ofstream` destructor
+    /// leaves it.
+    #[test]
+    fn gipl_int32_write_leaves_the_header_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i32, 2, 3, 4]).unwrap();
+        let path = tmp_path("int32.gipl");
+        let result = write_image(&img, &path);
+        let written = std::fs::read(&path).unwrap();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{result:?}"
+        );
+        assert_eq!(written.len(), gipl::HEADER_SIZE);
+        assert_eq!(&written[8..10], &32u16.to_be_bytes()); // GIPL_INT was written
+
+        // And reading such a file fails on the same missing swap arm.
+        let read_back = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&read_back, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{read_back:?}"
+        );
+    }
+
+    /// A 64-bit integer has no `image_type` at all, and `Write`'s own switch
+    /// throws `"Invalid type"` after only the four `dims` values are out
+    /// (itkGiplImageIO.cxx:759-761) — an 8-byte file.
+    #[test]
+    fn gipl_int64_write_leaves_eight_bytes_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i64, 2, 3, 4]).unwrap();
+        let path = tmp_path("int64.gipl");
+        let result = write_image(&img, &path);
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Invalid type")),
+            "{result:?}"
+        );
+        assert_eq!(written, [0, 2, 0, 2, 0, 1, 0, 1]);
+    }
+
+    /// `CheckExtension` claims `.gipl.gz` for reading and writing; upstream then
+    /// reaches for zlib. This workspace has none (§5.8), so both fail naming it.
+    #[test]
+    fn gipl_gz_is_claimed_and_then_refused_for_the_missing_zlib() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("compressed.gipl.gz");
+
+        assert!(create_image_io(&path, FileMode::Write).is_some());
+        let result = write_image(&img, &path);
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
+            "{result:?}"
+        );
+        assert!(!path.exists(), "write must not create the file");
+
+        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
+        assert!(create_image_io(&path, FileMode::Read).is_some());
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
+            "{result:?}"
+        );
+    }
+
+    /// `numberofdimension` is a population count over the first three `dims`
+    /// slots, not the length of their leading non-zero run, while
+    /// `m_Dimensions[i] = dims[i]` copies the *first* `NDims` slots
+    /// (itkGiplImageIO.cxx:294-312). `[4, 0, 5, 1]` therefore yields a 2-D image
+    /// sized `[4, 0]` — the `5` is counted and then never read. §2.94.
+    #[test]
+    fn gipl_dimension_count_is_a_population_count_not_a_leading_run() {
+        let path = tmp_path("popcount.gipl");
+        let header = gipl_header(
+            [4, 0, 5, 1],
+            8, // GIPL_U_CHAR
+            [2.0, 3.0, 4.0, 1.0],
+            [10.0, 20.0, 30.0, 0.0],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 2);
+        assert_eq!(back.size(), &[4, 0]);
+        assert_eq!(back.spacing(), &[2.0, 3.0]);
+        assert_eq!(back.origin(), &[10.0, 20.0]);
+        assert_eq!(back.number_of_pixels(), 0);
+    }
+
+    /// `CanReadFile` accepts either magic number, at offset 252
+    /// (itkGiplImageIO.cxx:135). `ReadImageInformation` re-reads the same four
+    /// bytes and never compares them (§2.93), so the second variant reads fine.
+    #[test]
+    fn gipl_both_magic_numbers_are_accepted_and_a_wrong_one_is_not() {
+        for (magic, label) in [
+            (gipl::GIPL_MAGIC_NUMBER, "magic1.gipl"),
+            (gipl::GIPL_MAGIC_NUMBER2, "magic2.gipl"),
+        ] {
+            let path = tmp_path(label);
+            let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], magic);
+            bytes.extend_from_slice(&[7, 8, 9, 10]);
+            std::fs::write(&path, &bytes).unwrap();
+            let back = read_image(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(
+                back.scalar_slice::<u8>().unwrap(),
+                &[7, 8, 9, 10],
+                "{label}"
+            );
+        }
+
+        let path = tmp_path("badmagic.gipl");
+        let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], 0xdead_beef);
+        bytes.extend_from_slice(&[7, 8, 9, 10]);
+        std::fs::write(&path, &bytes).unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `GIPL_MAGIC_NUMBER2` is 719555000 and `GIPL_MAGIC_NUMBER` 4026526128.
+    #[test]
+    fn gipl_magic_numbers_have_their_documented_decimal_values() {
+        assert_eq!(gipl::GIPL_MAGIC_NUMBER, 4_026_526_128);
+        assert_eq!(gipl::GIPL_MAGIC_NUMBER2, 719_555_000);
+    }
+
+    /// `Write` never consults `m_NumberOfComponents` for the header but
+    /// `GetImageSizeInBytes()` does, so a 3-component image writes a scalar
+    /// `image_type` and three times the described bytes. Reading it back gives a
+    /// scalar image holding the first `numPixels` components (§2.96).
+    #[test]
+    fn gipl_vector_image_writes_a_scalar_header_and_reads_back_scalar() {
+        let data: Vec<u8> = (0..12).collect();
+        let img = Image::from_vec_vector::<u8>(&[2, 2], 3, data).unwrap();
+        let path = tmp_path("vector.gipl");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 12);
+        assert_eq!(&bytes[8..10], &8u16.to_be_bytes()); // GIPL_U_CHAR, not a vector
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.size(), &[2, 2, 1]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3]);
+    }
+
+    /// Upstream's `success = !m_Ifstream.bad()` accepts a short read and leaves
+    /// the buffer tail uninitialised (§1.53); this port refuses it (§4.65).
+    #[test]
+    fn gipl_truncated_pixel_data_is_an_error() {
+        let path = tmp_path("short.gipl");
+        let mut bytes = gipl_header([4, 4, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[1, 2, 3]); // 16 pixels declared, 3 present
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// A header shorter than 256 bytes leaves upstream's `pixdim` / `origin`
+    /// locals indeterminate; refused here (§4.69).
+    #[test]
+    fn gipl_short_header_is_an_error() {
+        let path = tmp_path("stub.gipl");
+        let header = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        std::fs::write(&path, &header[..200]).unwrap();
+        // `can_read_file` cannot reach offset 252 either.
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = gipl::read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// `read_image_information` touches only the header. This one declares
+    /// 65535³ voxels of `double` and carries none of them.
+    #[test]
+    fn gipl_read_image_information_does_not_load_pixels() {
+        let path = tmp_path("huge.gipl");
+        let header = gipl_header(
+            [65535, 65535, 65535, 1],
+            65, // GIPL_DOUBLE
+            [1.0; 4],
+            [0.0; 4],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::Float64);
+        assert_eq!(info.dimension, 3);
+        assert_eq!(info.number_of_components, 1);
+        assert_eq!(info.size, vec![65535, 65535, 65535]);
+        assert!(info.metadata.is_empty());
+    }
+
+    /// An `image_type` outside the table leaves `m_ComponentType` unknown and
+    /// SimpleITK's `ExecuteInternalReadScalar` reaches its `"Logic error!"`.
+    #[test]
+    fn gipl_unknown_image_type_is_rejected() {
+        let path = tmp_path("weird_type.gipl");
+        let header = gipl_header(
+            [2, 2, 1, 1],
+            200,
+            [1.0; 4],
+            [0.0; 4],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("image_type 200")),
+            "{result:?}"
+        );
+    }
+
+    /// `GIPL_BINARY` (1) reads as `UCHAR`, like `GIPL_U_CHAR` (8)
+    /// (itkGiplImageIO.cxx:333-341).
+    #[test]
+    fn gipl_binary_image_type_reads_as_uint8() {
+        let path = tmp_path("binary_type.gipl");
+        let mut bytes = gipl_header([2, 1, 1, 1], 1, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[0, 1]);
+        std::fs::write(&path, &bytes).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1]);
     }
 }
