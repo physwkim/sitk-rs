@@ -45,24 +45,31 @@
 //!
 //! Reading that back cannot reconstruct the sub-transform queue — the file
 //! carries no boundary between sub-transforms, only one concatenated
-//! parameter vector — so [`read_transform_list`] always creates a **fresh,
-//! empty** `CompositeTransform` for that name and then calls
-//! [`sitk_transform::ParametricTransform::set_fixed_parameters`] /
-//! `set_parameters` on it, exactly as for any other transform. An empty
+//! parameter vector — so upstream's `Read` always creates a **fresh, empty**
+//! `CompositeTransform` for that name and then calls `SetFixedParameters` /
+//! `SetParametersByValue` on it, exactly as for any other transform. An empty
 //! composite expects zero parameters and zero fixed parameters
 //! (`GetNumberOfParameters`/`GetNumberOfLocalParameters` over an empty
 //! `GetTransformsToOptimizeQueue()`, `itkCompositeTransform.hxx:594-620`), so
 //! that round-trips; a **non-empty** composite's aggregate vectors are
-//! (almost always) non-empty and `set_fixed_parameters` fails with
-//! [`sitk_transform::TransformError::InvalidFixedParameters`] — this is
-//! upstream's own behavior, not a gap this port adds: ITK's own test suite
-//! for this IO (`itkIOTransformMatlabGTest.cxx`) exercises exactly one
-//! composite case, `WriteAndReadEmptyCompositeTransform`, and no non-empty
-//! one. See ledger §1.69/§2.144.
+//! (almost always) non-empty, so on read `SetFixedParameters` fails a
+//! parameter-count check — a file only upstream's own writer produces and its
+//! own reader cannot load. ITK's own test suite for this IO
+//! (`itkIOTransformMatlabGTest.cxx`) exercises exactly one composite case,
+//! `WriteAndReadEmptyCompositeTransform`, and no non-empty one.
 //!
-//! One consequence: because `Write` never special-cases `CompositeTransform`
-//! at all, this format places **no restriction on composite nesting** — a
-//! composite containing a composite writes without error, unlike `.tfm`
+//! This port does **not** reproduce that write-then-fail asymmetry (§5.29,
+//! option b): [`write_transform`] refuses a non-empty composite up front with
+//! [`IoError::UnsupportedMatlabTransformFeature`], so the failure surfaces at
+//! write rather than on a later read, and no unreadable file is produced. An
+//! empty composite still writes and round-trips through
+//! [`read_transform_list`], whose fresh empty `CompositeTransform` accepts the
+//! empty aggregate vectors. See ledger §1.69/§2.144.
+//!
+//! The same guard covers nesting: because a composite containing a composite
+//! makes the outer composite non-empty, [`write_transform`] refuses it too —
+//! where upstream's `Write` never special-cases `CompositeTransform` at all
+//! and so places **no restriction on composite nesting**, unlike `.tfm`
 //! (`"Composite Transform can only be 1st transform in a file"`) and `.h5`
 //! (the same message). See ledger §2.145.
 //!
@@ -353,11 +360,33 @@ pub(crate) fn read_transform_list(path: &Path) -> Result<Vec<Transform>> {
 /// (`itkMatlabTransformIO.cxx:125-142`) over `vnl_matlab_write`'s 1-D array
 /// overload (`vnl_matlab_write.cxx:163-183`).
 ///
-/// No flattening: see the module doc's "No composite flattening" section. A
-/// [`Transform::Composite`] is written through the same generic
-/// `parameters()`/`fixed_parameters()` calls as every other transform, with
-/// no dispatch on its variant at all.
+/// No flattening: see the module doc's "No composite flattening" section.
+/// Every non-composite transform, and an *empty* composite, is written through
+/// the same generic `parameters()`/`fixed_parameters()` calls. A **non-empty**
+/// composite is refused up front (see below).
 pub(crate) fn write_transform(transform: &Transform, path: &Path) -> Result<()> {
+    // §2.144/§2.145 (§5.29, option b): upstream's `Write` writes a non-empty
+    // composite as one opaque record pair — its aggregate parameter vectors,
+    // with no sub-transform boundary anywhere in the file — and
+    // [`read_transform_list`] can only rebuild a fresh *empty* composite from
+    // that name, so the parameter counts mismatch and the file never reads
+    // back. Rather than reproduce that asymmetry (a file only this IO's own
+    // writer can produce and its own reader cannot load), refuse the write, so
+    // the failure surfaces here instead of on a later read. An empty composite
+    // still writes and round-trips. A *nested* composite is caught by the same
+    // guard: the outer composite is non-empty (§2.145).
+    if let Transform::Composite(composite) = transform {
+        if !composite.transforms().is_empty() {
+            return Err(IoError::UnsupportedMatlabTransformFeature(format!(
+                "a non-empty CompositeTransform cannot be written to a .mat file and read \
+                 back — MatlabTransformIO records one concatenated parameter vector with no \
+                 sub-transform boundary (doc/upstream-findings.md §2.144/§2.145), so the {} \
+                 sub-transform(s) here would be unrecoverable",
+                composite.transforms().len()
+            )));
+        }
+    }
+
     let mut out = Vec::new();
     write_record(
         &mut out,
@@ -552,29 +581,27 @@ mod tests {
         assert_eq!(read, transform);
     }
 
-    /// The upstream limitation the module doc describes: a non-empty
-    /// composite's aggregate fixed-parameter vector is non-empty, but reading
-    /// it back always creates a fresh, empty composite that expects zero.
+    /// §2.144 / §5.29: a non-empty composite would write as one opaque record
+    /// pair that can never be read back, so this port refuses it at write —
+    /// the failure surfaces here, not on a later read — and produces no file.
     #[test]
-    fn a_non_empty_composite_written_to_mat_cannot_be_read_back() {
+    fn a_non_empty_composite_is_rejected_at_write() {
         let transform = composite();
         let path = tmp_path("non_empty_composite.mat");
-        dispatch_write(&transform, &path).unwrap();
-        let result = read_transform(&path);
-        let _ = std::fs::remove_file(&path);
-        assert!(matches!(
-            result,
-            Err(IoError::Transform(
-                sitk_transform::TransformError::InvalidFixedParameters { .. }
-            ))
-        ));
+        let result = dispatch_write(&transform, &path);
+        assert!(
+            matches!(result, Err(IoError::UnsupportedMatlabTransformFeature(_))),
+            "{result:?}"
+        );
+        assert!(!path.exists());
     }
 
-    /// `Write` never special-cases `CompositeTransform`, so nesting one
-    /// composite inside another writes without error — unlike `.tfm`/`.h5`,
-    /// which both reject it.
+    /// §2.145: a composite nested inside another is caught by the same
+    /// non-empty guard (the outer composite is non-empty), so it is refused at
+    /// write here too — unlike upstream, whose `Write` never special-cases
+    /// `CompositeTransform` and would write the same unreadable file.
     #[test]
-    fn a_nested_composite_writes_without_error() {
+    fn a_nested_composite_is_rejected_at_write() {
         let mut inner = CompositeTransform::new(2);
         inner
             .add_transform(TranslationTransform::new(vec![1.0, 2.0]).into())
@@ -585,8 +612,11 @@ mod tests {
 
         let path = tmp_path("nested_composite.mat");
         let result = dispatch_write(&transform, &path);
-        let _ = std::fs::remove_file(&path);
-        assert!(result.is_ok());
+        assert!(
+            matches!(result, Err(IoError::UnsupportedMatlabTransformFeature(_))),
+            "{result:?}"
+        );
+        assert!(!path.exists());
     }
 
     #[test]
