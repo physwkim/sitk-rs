@@ -228,8 +228,8 @@ pub use math::{
     binary_magnitude, binary_magnitude_in_place, bounded_reciprocal, bounded_reciprocal_in_place,
     cos, cos_in_place, divide_floor, divide_floor_in_place, divide_real, exp, exp_in_place,
     exp_negative, exp_negative_in_place, log, log_in_place, log10, log10_in_place, nary_add,
-    nary_maximum, pow, pow_in_place, sin, sin_in_place, sqrt, sqrt_in_place, square,
-    square_in_place, squared_difference, squared_difference_in_place, tan, tan_in_place,
+    nary_maximum, pow, pow_in_place, round, round_in_place, sin, sin_in_place, sqrt, sqrt_in_place,
+    square, square_in_place, squared_difference, squared_difference_in_place, tan, tan_in_place,
     ternary_add, ternary_add_in_place, ternary_magnitude, ternary_magnitude_in_place,
     ternary_magnitude_squared, ternary_magnitude_squared_in_place,
 };
