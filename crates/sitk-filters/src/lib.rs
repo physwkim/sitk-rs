@@ -77,6 +77,7 @@ pub mod join_series;
 pub mod kmeans;
 pub mod label;
 pub mod label_fusion;
+pub mod label_set_morphology;
 pub mod label_shape;
 pub mod level_set;
 mod linalg;
