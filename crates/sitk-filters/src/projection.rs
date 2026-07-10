@@ -35,7 +35,7 @@
 //! fixed-output-type `pixeltype: Output` parameters (e.g.
 //! [`crate::binary_threshold`]'s `inside`/`outside`).
 //!
-//! ## Collapsed-axis geometry, verbatim including a real upstream quirk
+//! ## Collapsed-axis geometry (upstream origin bug fixed here — §1.1)
 //!
 //! Every filter here shares `ProjectionImageFilter::GenerateOutputInformation`,
 //! and since SimpleITK's generated wrappers for this whole family use
@@ -48,27 +48,36 @@
 //! direction copied unchanged (same-dimension in/out is a straight
 //! `outDirection[i][j] = inDirection[i][j]` copy).
 //!
-//! The collapsed axis's origin shift is copied *verbatim* from the .hxx:
-//! `outOrigin[i] = inOrigin[i] + (i - 1) * inSpacing[i] / 2`, where `i` is the
-//! loop variable, which in that branch equals `m_ProjectionDimension` itself
-//! — **not** `inputSize[i]`. A physically-sensible shift centering the
-//! collapsed extent would need `(inputSize[axis] - 1)`, not `(axis - 1)`; this
-//! reads like a bug (using the axis index instead of the axis's pixel count),
-//! but it is what current ITK (checked against `v6.0b02-5846-ge46eb723a5`,
-//! `Modules/Filtering/ImageStatistics/include/itkProjectionImageFilter.hxx`)
-//! actually computes, unchanged back through this checkout's full history for
-//! this file (only whitespace/style reformatting touched the line). Per this
-//! crate's porting rule (match upstream exactly, cite it, don't silently
-//! "fix" it), it is reproduced here bit-for-bit rather than corrected.
+//! The collapsed axis's origin is **corrected** here relative to released ITK.
+//! Upstream computes `outOrigin[i] = inOrigin[i] + (i - 1) * inSpacing[i] / 2`
+//! (`Modules/Filtering/ImageStatistics/include/itkProjectionImageFilter.hxx:88`
+//! at `v6.0b02-5846-ge46eb723a5`), where `i` is the loop variable — the axis
+//! *index*, not the axis's pixel count. Since `i` is `unsigned int`, `axis == 0`
+//! (SimpleITK's `default: 0u` in every yaml above, always applied because the
+//! generated code calls `SetProjectionDimension` unconditionally) wraps `i - 1`
+//! to `UINT_MAX`, shifting the origin by roughly `2^32 · spacing / 2`. For
+//! `axis >= 1` the shift is small but still wrong. Reported as item B1 of ITK
+//! issue #6575; fixed in this port to match the upstream fix branch
+//! `bug-projection-collapsed-axis-origin`
+//! (`BUG: Center collapsed-axis origin in projection and accumulate filters`).
 //!
-//! ITK's `i` is `unsigned int`, so for `axis == 0` — SimpleITK's own default
-//! `ProjectionDimension` (`default: 0u` in every yaml above) — `i - 1`
-//! silently wraps to `UINT_MAX` (a huge origin shift), rather than picking the
-//! "no projection dimension set" (last-axis) default ITK's own C++
-//! constructor uses; SimpleITK's generated code always calls
-//! `SetProjectionDimension` unconditionally, so this wraparound is live for
-//! every default-constructed call in SimpleITK. This port reproduces the
-//! 32-bit wraparound with `(axis as u32).wrapping_sub(1)`.
+//! The corrected rule: the single output pixel (index `0` along `axis`) sits at
+//! the center of the input's physical extent along `axis`. In continuous index
+//! space that center is `(inputSize[axis] - 1) / 2` — an ITK image's start
+//! index is folded in upstream as `inputIndex[axis] + (inputSize[axis] - 1) / 2`,
+//! but a SimpleITK/`sitk_core` image always starts at index `0`, so the term
+//! vanishes here. The physical shift is that continuous-index offset times the
+//! spacing, carried through the direction matrix's `axis` **column**, so it has
+//! a component in *every* coordinate:
+//!
+//! ```text
+//! centerOffset  = (inputSize[axis] - 1) / 2 * inSpacing[axis]
+//! outOrigin[d] += inDirection[d][axis] * centerOffset      for every d
+//! ```
+//!
+//! For an identity direction this reduces to
+//! `outOrigin[axis] = inOrigin[axis] + (inputSize[axis] - 1) * inSpacing[axis] / 2`
+//! with the other components untouched.
 
 use crate::error::{FilterError, Result};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
@@ -137,8 +146,8 @@ fn project_lines(
 }
 
 /// Shared driver for every projection filter: validate `axis`, reduce every
-/// line along it, and rebuild the collapsed-axis geometry (see the module
-/// doc for the exact, verbatim-from-ITK origin/spacing formula).
+/// line along it, and rebuild the collapsed-axis geometry (see the module doc
+/// for the origin/spacing formula, including the §1.1 origin-centering fix).
 ///
 /// Errors with [`FilterError::InvalidDirection`] if `axis` is not a valid
 /// axis of `img` (`itkProjectionImageFilter.hxx`'s own
@@ -172,9 +181,17 @@ fn project(
     out_spacing[axis] = in_spacing[axis] * in_size[axis] as f64;
     out.set_spacing(&out_spacing)?;
 
+    // Center the collapsed axis on the input's physical extent: the single
+    // output pixel (index 0 along `axis`) must land on the input's center
+    // along that axis. The shift follows the direction matrix's `axis` column,
+    // so it has a component in every coordinate. See the module doc.
+    let in_direction = img.direction();
+    let center_index = (in_size[axis] as f64 - 1.0) / 2.0;
+    let center_offset = center_index * in_spacing[axis];
     let mut out_origin = in_origin.to_vec();
-    let shift = (axis as u32).wrapping_sub(1) as f64 * in_spacing[axis] / 2.0;
-    out_origin[axis] = in_origin[axis] + shift;
+    for (d, o) in out_origin.iter_mut().enumerate() {
+        *o += in_direction[d * dim + axis] * center_offset;
+    }
     out.set_origin(&out_origin)?;
 
     Ok(out)
@@ -573,43 +590,88 @@ mod tests {
         assert_eq!(out.spacing()[1], img.spacing()[1]);
     }
 
+    /// §1.1 fix: the collapsed axis's origin is centered on the *input's*
+    /// physical extent along that axis — driven by `inputSize[axis]`, not by
+    /// the axis index that upstream's `(i - 1)` accidentally uses.
+    ///
+    /// Sizes 2/3/4 are deliberately all different from their axis indices, so
+    /// the correct value and the upstream `(i - 1) * spacing / 2` value differ
+    /// on every axis. Image: size `[2, 3, 4]`, spacing `[1, 5, 7]`, origin
+    /// `[10, 20, 30]`, identity direction. `shift = (size-1)/2 * spacing`:
+    ///
+    /// - axis 0: `(2-1)/2 * 1 = 0.5` → `origin[0] = 10 + 0.5 = 10.5`
+    ///   (upstream: `(0-1)` wraps → `+2^31`; see the axis-zero test below)
+    /// - axis 1: `(3-1)/2 * 5 = 5.0` → `origin[1] = 20 + 5.0 = 25.0`
+    ///   (upstream would give `(1-1)*5/2 = 0` → `20.0`)
+    /// - axis 2: `(4-1)/2 * 7 = 10.5` → `origin[2] = 30 + 10.5 = 40.5`
+    ///   (upstream would give `(2-1)*7/2 = 3.5` → `33.5`)
+    ///
+    /// Cross-check axis 2 independently: the input's four pixel centers along
+    /// z are at `30, 37, 44, 51`; their midpoint is `(30 + 51) / 2 = 40.5`.
     #[test]
-    fn geometry_origin_shift_matches_axis_index_not_axis_size() {
-        // itkProjectionImageFilter.hxx: outOrigin[i] = inOrigin[i] +
-        // (i - 1) * inSpacing[i] / 2, where `i` is the *axis index*, not the
-        // axis's pixel count. Use a 3-D image so axis 1 (shift (1-1)=0) and
-        // axis 2 (shift (2-1)=1) are both directly reachable without hitting
-        // the axis-0 wraparound (covered separately below).
-        let mut img = Image::new(&[2, 2, 2], PixelId::Float64);
+    fn geometry_origin_centers_the_collapsed_axis_on_the_input_extent() {
+        let mut img = Image::new(&[2, 3, 4], PixelId::Float64);
         img.set_spacing(&[1.0, 5.0, 7.0]).unwrap();
         img.set_origin(&[10.0, 20.0, 30.0]).unwrap();
 
+        let out0 = mean_projection(&img, 0).unwrap();
+        assert_eq!(out0.origin(), &[10.5, 20.0, 30.0]);
+
         let out1 = mean_projection(&img, 1).unwrap();
-        // (1 - 1) * 5.0 / 2 == 0.0
-        assert_eq!(out1.origin()[1], 20.0);
+        assert_eq!(out1.origin(), &[10.0, 25.0, 30.0]);
 
         let out2 = mean_projection(&img, 2).unwrap();
-        // (2 - 1) * 7.0 / 2 == 3.5
-        assert_eq!(out2.origin()[2], 33.5);
-
-        // Retained axes' origin is untouched on both.
-        assert_eq!(out1.origin()[0], 10.0);
-        assert_eq!(out2.origin()[0], 10.0);
+        assert_eq!(out2.origin(), &[10.0, 20.0, 40.5]);
     }
 
+    /// §1.1 fix, axis 0 specifically: SimpleITK's default `ProjectionDimension`
+    /// is `0u`, which is exactly where upstream's `unsigned int i - 1`
+    /// underflows to `UINT_MAX` and shifts the origin by `~2^31 * spacing`.
+    /// The corrected shift is the ordinary centering one.
+    ///
+    /// Image: size `[2, 2]`, spacing `[2, 1]`, origin `[0, 0]`. The two pixel
+    /// centers along x sit at `0.0` and `2.0`, so the extent's center is
+    /// `1.0`; equivalently `(2-1)/2 * 2.0 = 1.0`. Upstream would produce
+    /// `(0u - 1) as f64 * 2.0 / 2.0 = 4294967295.0`.
     #[test]
-    fn geometry_origin_shift_wraps_for_axis_zero_matching_itk_unsigned_underflow() {
-        // SimpleITK's own default ProjectionDimension is 0u, which is exactly
-        // where ITK's `unsigned int i - 1` underflows to `UINT_MAX` instead
-        // of the "sensible" shift. This port reproduces that wraparound
-        // rather than silently avoiding it.
+    fn geometry_origin_for_axis_zero_is_centered_not_unsigned_wrapped() {
         let mut img = Image::new(&[2, 2], PixelId::Float64);
         img.set_spacing(&[2.0, 1.0]).unwrap();
         img.set_origin(&[0.0, 0.0]).unwrap();
         let out = mean_projection(&img, 0).unwrap();
-        let expected_shift = (0u32.wrapping_sub(1)) as f64 * 2.0 / 2.0;
-        assert_eq!(out.origin()[0], expected_shift);
-        assert!(expected_shift > 1.0e9); // sanity: this really is huge, not 0.
+        assert_eq!(out.origin(), &[1.0, 0.0]);
+
+        // The value upstream computes, asserted absent rather than merely
+        // "small": (0u32 - 1) as f64 * 2.0 / 2.0.
+        let upstream_wrapped = (0u32.wrapping_sub(1)) as f64 * 2.0 / 2.0;
+        assert_eq!(upstream_wrapped, 4_294_967_295.0);
+        assert_ne!(out.origin()[0], upstream_wrapped);
+    }
+
+    /// §1.1 fix, direction-aware half: the centering shift is a *physical*
+    /// vector `direction[:, axis] * centerOffset`, so with a non-identity
+    /// direction it has components in coordinates other than `axis`. Upstream
+    /// only ever touched `outOrigin[axis]`.
+    ///
+    /// 2-D image, size `[2, 3]`, spacing `[1, 2]`, origin `[0, 0]`, direction
+    /// the exact 90° rotation `[[0, -1], [1, 0]]` (row-major `[0,-1,1,0]`).
+    /// Project axis 1: `centerOffset = (3-1)/2 * 2.0 = 2.0`. Column 1 of the
+    /// direction matrix is `(direction[0][1], direction[1][1]) = (-1, 0)`, so
+    /// `outOrigin = (0, 0) + (-1, 0) * 2.0 = (-2, 0)`.
+    ///
+    /// Cross-check by physical points: input index `(0, j)` maps to
+    /// `origin + D * S * (0, j) = (-2j, 0)`, i.e. `(0,0)`, `(-2,0)`, `(-4,0)`
+    /// for `j = 0,1,2` — midpoint `(-2, 0)`, matching. All values exact in
+    /// binary floating point (`sin`/`cos` never enter).
+    #[test]
+    fn geometry_origin_centering_follows_the_direction_matrix_column() {
+        let mut img = Image::new(&[2, 3], PixelId::Float64);
+        img.set_spacing(&[1.0, 2.0]).unwrap();
+        img.set_origin(&[0.0, 0.0]).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+
+        let out = mean_projection(&img, 1).unwrap();
+        assert_eq!(out.origin(), &[-2.0, 0.0]);
     }
 
     #[test]
@@ -666,22 +728,27 @@ mod tests {
         assert_eq!(out.pixel_id(), PixelId::UInt8);
     }
 
-    /// Inherits `project`'s shared, verbatim-from-ITK origin-shift formula —
-    /// same assertions as `geometry_origin_shift_matches_axis_index_not_axis_size`
+    /// Inherits `project`'s shared, §1.1-corrected origin-centering — same
+    /// image and same hand-derived values as
+    /// `geometry_origin_centers_the_collapsed_axis_on_the_input_extent`
     /// above, just through `binary_threshold_projection` instead of
-    /// `mean_projection`.
+    /// `mean_projection`, confirming every filter in the family shares the fix.
     #[test]
-    fn origin_shift_matches_the_shared_projection_formula() {
-        let mut img = Image::new(&[2, 2, 2], PixelId::Float64);
+    fn origin_centering_is_shared_by_every_projection_filter() {
+        let mut img = Image::new(&[2, 3, 4], PixelId::Float64);
         img.set_spacing(&[1.0, 5.0, 7.0]).unwrap();
         img.set_origin(&[10.0, 20.0, 30.0]).unwrap();
 
-        let out1 = binary_threshold_projection(&img, 1, 0.0, 1, 0).unwrap();
-        // (1 - 1) * 5.0 / 2 == 0.0
-        assert_eq!(out1.origin()[1], 20.0);
+        // (2-1)/2 * 1 = 0.5
+        let out0 = binary_threshold_projection(&img, 0, 0.0, 1, 0).unwrap();
+        assert_eq!(out0.origin(), &[10.5, 20.0, 30.0]);
 
+        // (3-1)/2 * 5 = 5.0
+        let out1 = binary_threshold_projection(&img, 1, 0.0, 1, 0).unwrap();
+        assert_eq!(out1.origin(), &[10.0, 25.0, 30.0]);
+
+        // (4-1)/2 * 7 = 10.5
         let out2 = binary_threshold_projection(&img, 2, 0.0, 1, 0).unwrap();
-        // (2 - 1) * 7.0 / 2 == 3.5
-        assert_eq!(out2.origin()[2], 33.5);
+        assert_eq!(out2.origin(), &[10.0, 20.0, 40.5]);
     }
 }
