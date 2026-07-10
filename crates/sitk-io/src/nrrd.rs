@@ -783,7 +783,7 @@ const MAGICS: [&str; 7] = [
 // ---------------------------------------------------------------------------
 
 /// C's `%.<prec>g` for a finite `f64`, exponent padded to at least two digits.
-fn c_format_g(v: f64, prec: usize) -> String {
+pub(crate) fn c_format_g(v: f64, prec: usize) -> String {
     let prec = prec.max(1);
     // The decimal exponent C would use for `%e` at precision `prec - 1`, i.e.
     // after rounding. Rust's `{:e}` prints `m.mmme<exp>` with no `+` and no

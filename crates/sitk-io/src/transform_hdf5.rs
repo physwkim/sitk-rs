@@ -70,11 +70,11 @@ const TRANSFORM_PARAMS_MISSPELLED: &str = "TranformParameters";
 
 /// `itk::Version::GetITKVersion()` — the ITK release this port mirrors
 /// (`ITK/CMake/itkVersion.cmake:2-4`).
-const ITK_VERSION: &str = "6.0.0";
+pub(crate) const ITK_VERSION: &str = "6.0.0";
 
 /// What this port writes to `/HDFVersion` in place of libhdf5's `H5_VERS_INFO`,
 /// there being no libhdf5 here (ledger §4.83). Nothing reads it.
-const HDF_VERSION: &str = "rust-hdf5 library version: 0.3.2";
+pub(crate) const HDF_VERSION: &str = "rust-hdf5 library version: 0.3.2";
 
 /// The extensions `HDF5TransformIOTemplate::CanWriteFile` claims
 /// (`itkHDF5TransformIO.cxx:76-96`) — every extension Wikipedia listed for HDF,

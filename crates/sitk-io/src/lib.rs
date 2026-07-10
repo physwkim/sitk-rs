@@ -37,6 +37,7 @@
 pub mod compression;
 pub mod error;
 pub mod gipl;
+pub mod image_hdf5;
 pub mod image_io;
 pub mod meta_image;
 pub mod nifti;
@@ -431,7 +432,8 @@ mod tests {
                 "NiftiImageIO",
                 "GiplImageIO",
                 "VTKImageIO",
-                "PNGImageIO"
+                "PNGImageIO",
+                "HDF5ImageIO"
             ]
         );
         assert_eq!(
@@ -452,6 +454,10 @@ mod tests {
         );
         assert_eq!(image_io_by_name("VTKImageIO").unwrap().name(), "VTKImageIO");
         assert_eq!(image_io_by_name("PNGImageIO").unwrap().name(), "PNGImageIO");
+        assert_eq!(
+            image_io_by_name("HDF5ImageIO").unwrap().name(),
+            "HDF5ImageIO"
+        );
         assert!(matches!(
             image_io_by_name("JPEGImageIO"),
             Err(IoError::UnknownImageIo(name)) if name == "JPEGImageIO"
@@ -585,7 +591,8 @@ mod tests {
                 "NiftiImageIO",
                 "GiplImageIO",
                 "VTKImageIO",
-                "PNGImageIO"
+                "PNGImageIO",
+                "HDF5ImageIO"
             ]
         );
     }
