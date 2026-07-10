@@ -13,8 +13,10 @@
 //! | this module's public surface | `DemonsRegistrationFilter.yaml` |
 //!
 //! [`fast_symmetric_forces_demons_registration`] is the same solver over
-//! `ESMDemonsRegistrationFunction`. Every filter in the family reports the same
-//! three measurements, so they share [`DemonsResult`].
+//! `ESMDemonsRegistrationFunction`, and
+//! [`symmetric_forces_demons_registration`] over
+//! `SymmetricForcesDemonsRegistrationFunction`. Every filter in the family
+//! reports the same three measurements, so they share [`DemonsResult`].
 //!
 //! The rest of this page describes [`demons_registration`] itself.
 //!
@@ -113,6 +115,7 @@ mod esm;
 mod fast_symmetric;
 mod field;
 mod image_function;
+mod symmetric;
 
 use sitk_core::Image;
 
@@ -125,6 +128,7 @@ pub use esm::EsmGradient;
 pub use fast_symmetric::{
     FastSymmetricForcesDemonsParams, fast_symmetric_forces_demons_registration,
 };
+pub use symmetric::{SymmetricForcesDemonsParams, symmetric_forces_demons_registration};
 
 /// The yaml's parameter surface. [`Default`] carries the yaml defaults.
 #[derive(Clone, Debug, PartialEq)]

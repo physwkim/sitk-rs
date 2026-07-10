@@ -42,6 +42,18 @@ impl Field {
         &self.data[pixel * dim..pixel * dim + dim]
     }
 
+    /// Encode a multi-index into a linear pixel offset, first index fastest —
+    /// the inverse of [`Field::multi_index`].
+    pub(crate) fn offset(&self, index: &[usize]) -> usize {
+        let mut stride = 1usize;
+        let mut offset = 0usize;
+        for (&component, &extent) in index.iter().zip(&self.size) {
+            offset += component * stride;
+            stride *= extent;
+        }
+        offset
+    }
+
     /// Decode a linear pixel offset into a multi-index, first index fastest.
     pub(crate) fn multi_index(&self, mut pixel: usize, index: &mut [usize]) {
         for (component, &extent) in index.iter_mut().zip(&self.size) {

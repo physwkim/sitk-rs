@@ -140,8 +140,9 @@ pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
 pub use demons::{
-    DemonsParams, DemonsResult, EsmGradient, FastSymmetricForcesDemonsParams, demons_registration,
-    fast_symmetric_forces_demons_registration,
+    DemonsParams, DemonsResult, EsmGradient, FastSymmetricForcesDemonsParams,
+    SymmetricForcesDemonsParams, demons_registration, fast_symmetric_forces_demons_registration,
+    symmetric_forces_demons_registration,
 };
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
