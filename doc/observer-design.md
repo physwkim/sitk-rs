@@ -189,8 +189,8 @@ in `CreateOptimizer` and cleared in `OnActiveProcessDelete`
   `sitkProcessObject.h:315-317`'s claim — "The expected behavior is that not
   exception should be throw out of this processes Execute method" — is **false
   for path (1)**: the `ProcessAborted` (an `itk::ExceptionObject` subclass,
-  `itkExceptionObject.h:223-228`) escapes `Execute`. Candidate §3 ledger entry;
-  not filed here, this document only claims the §5.23 row.
+  `itkExceptionObject.h:223-228`) escapes `Execute`. Filed as ledger §3.44
+  at merge (this document's own ledger claim is the §5.23 row).
 
 ### 1.6 The registration method's own routing
 
