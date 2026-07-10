@@ -59,6 +59,24 @@
 //! `min(image_max, UpperBoundary)`) only bounds where the *lower* threshold
 //! candidate is searched; it is never itself used as a binarization bound.
 //!
+//! ## `UpperBoundary` below `image_min` collapses the search, not underflows it
+//!
+//! ITK clamps `upperBound` only from above (`upperBound =
+//! std::min(upperBound, m_UpperBoundary)`) and never pins it back up to the
+//! image minimum. A caller who passes `UpperBoundary < image_min` therefore
+//! leaves upstream's `upperBound` strictly below `lowerBound`, and its very
+//! first `(upperBound - lowerBound)` relies on unsigned wraparound (signed
+//! overflow is UB) to seed a garbage bisection over a nonsensical interval.
+//! This port instead clamps `upper_bound0 = max(min(image_max, UpperBoundary),
+//! image_min)`, so the search interval `[image_min, upper_bound0]` can never
+//! be inverted -- [`bisect`]'s plain (non-wrapping) subtraction would
+//! otherwise debug-panic / release-wrap on it. The degenerate input collapses
+//! to a zero-width interval: the loop never runs, `threshold_value` stays at
+//! `image_min`, and the final `binary_threshold` over the empty `[image_min,
+//! UpperBoundary]` range (with `UpperBoundary < image_min`) yields an
+//! all-background output -- the sensible reading of "no pixel sits at or below
+//! an upper boundary set beneath the darkest pixel."
+//!
 //! ## `NumberOfObjects` is 0 unless the loop runs at least once
 //!
 //! `m_NumberOfObjects` is only assigned inside the `while` loop body. A
@@ -253,11 +271,25 @@ fn threshold_max_cc_typed<T: Scalar + Bisect>(
     // Rust's saturating `as` cast already clamps to T's representable
     // range, reproducing that `min` with no extra code.
     let upper_boundary_native = T::from_f64(upper_boundary);
-    let upper_bound0 = if image_max < upper_boundary_native {
+    let mut upper_bound0 = if image_max < upper_boundary_native {
         image_max
     } else {
         upper_boundary_native
     };
+    // Pin the search's upper bound back up to `image_min` so the bisection
+    // interval `[image_min, upper_bound0]` can never be inverted. ITK clamps
+    // only from above -- `upperBound = std::min(upperBound, m_UpperBoundary)`
+    // (itkThresholdMaximumConnectedComponentsImageFilter.hxx:98) -- and never
+    // pins `upperBound` back up to the minimum, so a caller-supplied
+    // `UpperBoundary < image_min` leaves `upperBound < lowerBound` and its
+    // first `(upperBound - lowerBound)` relies on unsigned wraparound (signed
+    // overflow is UB) to seed a garbage search. Here `upper_bound0.sub(...)`
+    // is plain subtraction, so the same inversion would debug-panic / release-
+    // wrap in [`bisect`]. Clamping to `image_min` collapses the degenerate
+    // input to a zero-width interval instead (see the module doc).
+    if upper_bound0 < image_min {
+        upper_bound0 = image_min;
+    }
     let minimum_object_size = minimum_object_size as u64;
 
     let (threshold_value, number_of_objects) = bisect(image_min, upper_bound0, |t: T| {
@@ -558,6 +590,24 @@ mod tests {
         assert_eq!(result.threshold_value, -50.0);
         let out = result.image.scalar_slice::<u8>().unwrap();
         assert_eq!(out, &[1, 1, 1]);
+    }
+
+    #[test]
+    fn upper_boundary_below_image_min_collapses_to_all_background() {
+        // Pins the "UpperBoundary below image_min" section: image_min = 10,
+        // upper_boundary = 5 (< 10). Without the clamp, `upper_bound0 =
+        // min(image_max, 5) = 5 < 10 = image_min`, and bisect's first
+        // `upper_bound0.sub(image_min)` = `5u8 - 10u8` debug-panics / release-
+        // wraps *before* the `> 2` loop guard. With the clamp, `upper_bound0`
+        // is pinned to image_min (10): span 0, loop never runs, threshold_value
+        // = image_min = 10, number_of_objects = 0. The final binary_threshold
+        // over [10, 5] is an empty interval, so every pixel is background.
+        let img = img_2d(3, 1, vec![10u8, 20, 30]);
+        let result = threshold_maximum_connected_components(&img, 0, 5.0, 1, 0).unwrap();
+        assert_eq!(result.threshold_value, 10.0);
+        assert_eq!(result.number_of_objects, 0);
+        let out = result.image.scalar_slice::<u8>().unwrap();
+        assert_eq!(out, &[0, 0, 0]);
     }
 
     #[test]
