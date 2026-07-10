@@ -27,6 +27,18 @@ pub enum RegistrationError {
     #[error("Size of weights ({got}) must equal number of local parameters ({expected}).")]
     OptimizerWeightsLength { got: usize, expected: usize },
 
+    /// Non-empty optimizer weights were set for one of the four gradient-free
+    /// optimizers (Amoeba, Powell, (1+1) evolutionary, Exhaustive). Those
+    /// optimizers apply parameter scales *multiplicatively* and never compute the
+    /// metric gradient, so the weights have no vehicle to act through — ITK
+    /// validates their length then silently ignores them. Rather than expose an
+    /// inert parameter (ledger §2.117), this port rejects them; the `optimizer`
+    /// field names which one. The gradient family still honors its weights.
+    #[error(
+        "optimizer weights are not applicable to gradient-free optimizers (optimizer: {optimizer})"
+    )]
+    OptimizerWeightsNotApplicable { optimizer: &'static str },
+
     /// No sampled fixed point mapped inside the moving image, so the metric is
     /// undefined. Usually means the initial transform is far off.
     #[error("no valid sample points: every fixed point mapped outside the moving image")]
