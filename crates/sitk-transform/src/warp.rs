@@ -279,16 +279,22 @@ impl WarpImageFilter {
 /// # Deviation: the size is compared too
 ///
 /// ITK compares only the three geometry vectors. When they agree but the output
-/// is *larger* than the field, its `ImageRegionConstIterator fieldIt(fieldPtr,
-/// outputRegionForThread)` (itkWarpImageFilter.hxx:294) walks past the end of
-/// the field's buffer — a heap over-read, since `GenerateInputRequestedRegion`
-/// has already fallen back to the field's largest possible region when the
-/// output's requested region failed to verify (hxx:407-410). Adding the size to
-/// the test costs nothing on the path ITK actually intends (where the output
-/// *is* the field's region, the sizes are equal by construction) and sends the
-/// over-reading case down the general path instead, where the field is sampled
-/// at physical points and clamped at its border. That is defined behaviour, and
-/// is what the general path would have produced for an equal-size field anyway.
+/// is *larger* than the field, the fast path constructs
+/// `ImageRegionConstIterator fieldIt(fieldPtr, outputRegionForThread)`
+/// (itkWarpImageFilter.hxx:294) over a region exceeding the field's buffer —
+/// `GenerateInputRequestedRegion` has already fallen back to the field's
+/// largest possible region when the output's requested region failed to verify
+/// (hxx:407-410), silencing the pipeline's own check. ITK does **not** read out
+/// of bounds there: the iterator constructor's containment assert
+/// (itkImageConstIterator.h:207-212) throws in release builds and aborts in
+/// debug. The upstream defect is therefore a spurious failure — a valid
+/// configuration dies with an internal iterator error instead of being warped.
+/// Adding the size to the test costs nothing on the path ITK actually intends
+/// (where the output *is* the field's region, the sizes are equal by
+/// construction) and sends the mismatched case down the general path, where the
+/// field is sampled at physical points and clamped at its border — so this port
+/// **produces output where ITK throws**. Reported upstream (ITK #6575, item
+/// B34).
 fn same_information(
     out_size: &[usize],
     out_spacing: &[f64],
