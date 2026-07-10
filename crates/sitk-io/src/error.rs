@@ -161,7 +161,7 @@ pub enum IoError {
     /// photometric interpretation libtiff renders through
     /// `TIFFReadRGBAImageOriented` (§4.100, §4.102); the two multi-page buffer
     /// overflows `ReadVolume` commits, which safe Rust cannot reproduce
-    /// (§1.67, §1.68). See [`crate::tiff`].
+    /// (§1.67, §1.66). See [`crate::tiff`].
     #[error("unsupported TIFF feature: {0}")]
     UnsupportedTiffFeature(String),
 
