@@ -79,15 +79,22 @@
 //! (itkNormalizedCorrelationImageFilter.hxx:230-234) — never computed at
 //! all, so it costs nothing extra to check first.
 //!
-//! Neither division is guarded upstream: a constant-valued template makes
-//! `k == 0.0` (so every `t'[i]` is `0.0 / 0.0 == NaN`, propagating to every
-//! output pixel), and a locally-constant image neighborhood makes
-//! `denominator == 0.0` — and, since `Σt'[i] == 0` exactly, `numerator` is
-//! *also* exactly `0.0` there, so the quotient is `NaN` rather than `±∞`.
-//! This port reproduces both by doing the same `f64` arithmetic ITK does in
-//! `OutputPixelRealType` (`NumericTraits<OutputPixelType>::RealType`, itself
-//! always `f32`/`f64` since [`crate::real_pixel_id`] is `OutputPixelType`)
-//! with no extra guard. Tracked in the upstream-findings ledger, §1.43.
+//! Neither division was guarded upstream: a constant-valued template made
+//! `k == 0.0` (so every `t'[i]` was `0.0 / 0.0 == NaN`, propagating to every
+//! output pixel), and a locally-constant image neighborhood made
+//! `denominator == 0.0` — and, since `Σt'[i] == 0` exactly, `numerator` was
+//! *also* exactly `0.0` there, so the quotient was `NaN` rather than `±∞`.
+//! **Fixed in this port** (2026-07-11, ledger §1.43, filed as B46 of #6575):
+//! both mechanisms are the same underlying condition — the reference signal
+//! (template or image neighborhood) carries no variance to correlate
+//! against — so both quotients are now a defined `0.0`, matching this
+//! filter's own "correlation undefined → 0" convention already used for
+//! pixels outside the mask (`itkNormalizedCorrelationImageFilter.hxx:230-234`).
+//! [`normalize_template`] guards on the template's variance itself rather
+//! than the literal `k == 0.0` case, so a single-coefficient template
+//! (`num == 1`, whose variance is `0.0 / 0.0 == NaN` rather than exactly
+//! `0.0`) is covered by the same guard instead of reintroducing a NaN
+//! through a different arithmetic path.
 //!
 //! # Output pixel type
 //!
@@ -212,13 +219,20 @@ fn padded_template_coefficients(
 
 /// Mean-center and unit-normalize the template operator's coefficients
 /// (itkNormalizedCorrelationImageFilter.hxx:99-133): `k` is chosen so that
-/// `Σ normalized[i]² == 1`.
+/// `Σ normalized[i]² == 1`. Fixed upstream bug (module docs, ledger §1.43):
+/// a template with no variance -- constant-valued, or a single coefficient,
+/// whose variance is `0.0 / 0.0` rather than exactly `0.0` -- carries no
+/// shape to correlate against, so every coefficient normalizes to a defined
+/// `0.0` instead of `(v - mean) / 0.0`.
 fn normalize_template(coeffs: &[f64]) -> Vec<f64> {
     let num = coeffs.len() as f64;
     let sum: f64 = coeffs.iter().sum();
     let sum_of_squares: f64 = coeffs.iter().map(|v| v * v).sum();
     let mean = sum / num;
     let var = (sum_of_squares - sum * sum / num) / (num - 1.0);
+    if var.is_nan() || var <= 0.0 {
+        return vec![0.0; coeffs.len()];
+    }
     let std = var.sqrt();
     let k = std * (num - 1.0).sqrt();
     coeffs.iter().map(|&v| (v - mean) / k).collect()
@@ -286,7 +300,14 @@ pub fn normalized_correlation(
         let sum: f64 = values.iter().sum();
         let sum_of_squares: f64 = values.iter().map(|&v| v * v).sum();
         let denominator = (sum_of_squares - sum * sum / real_template_size).sqrt();
-        out.push(numerator / denominator);
+        // Fixed upstream bug (module docs, ledger §1.43): a locally constant
+        // neighborhood carries no variance to correlate against, so the
+        // coefficient is a defined `0.0` instead of `numerator / 0.0`.
+        out.push(if denominator == 0.0 {
+            0.0
+        } else {
+            numerator / denominator
+        });
     }
 
     let output_id = crate::real_pixel_id(image.pixel_id());
@@ -349,27 +370,41 @@ mod tests {
         );
     }
 
-    /// A locally constant image neighborhood makes both `numerator` and
-    /// `denominator` exactly `0.0` (the normalized template always sums to
-    /// zero), so the quotient is `NaN`, not `0.0` or `±inf` -- neither ITK
-    /// nor this port guards the division.
+    /// Fixed upstream bug (module docs, ledger §1.43): a locally constant
+    /// image neighborhood makes both `numerator` and `denominator` exactly
+    /// `0.0` (the normalized template always sums to zero) -- previously an
+    /// unguarded `NaN`, now a defined `0.0`, matching the filter's own
+    /// "correlation undefined -> 0" convention used outside the mask.
     #[test]
-    fn a_flat_neighborhood_produces_nan_not_a_guarded_zero() {
+    fn a_flat_neighborhood_produces_a_defined_zero_not_nan() {
         let image = img_f32(&[5], vec![4.0, 4.0, 4.0, 4.0, 4.0]);
         let template = img_f32(&[3], vec![1.0, 0.0, 2.0]);
         let out = normalized_correlation(&image, None, &template).unwrap();
-        assert!(out.scalar_slice::<f32>().unwrap()[2].is_nan());
+        assert_eq!(out.scalar_slice::<f32>().unwrap()[2], 0.0);
     }
 
-    /// A constant-valued template makes `k == 0.0`, so every normalized
-    /// coefficient is `0.0 / 0.0 == NaN`, propagating to every output pixel
-    /// regardless of the image.
+    /// Fixed upstream bug (module docs, ledger §1.43): a constant-valued
+    /// template has zero variance, so every normalized coefficient is now a
+    /// defined `0.0` instead of `0.0 / 0.0 == NaN` -- the whole output is
+    /// `0.0` regardless of the image, since every `numerator` is `Σ v[i]·0`.
     #[test]
-    fn a_constant_template_produces_nan_everywhere() {
+    fn a_constant_template_produces_a_defined_zero_everywhere() {
         let image = img_f32(&[5], vec![5.0, 1.0, 8.0, 2.0, 9.0]);
         let template = img_f32(&[3], vec![3.0, 3.0, 3.0]);
         let out = normalized_correlation(&image, None, &template).unwrap();
-        assert!(out.scalar_slice::<f32>().unwrap()[2].is_nan());
+        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[0.0f32; 5]);
+    }
+
+    /// Fixed upstream bug (module docs, ledger §1.43): a single-coefficient
+    /// template's variance is `0.0 / 0.0 == NaN` (not exactly `0.0`), a
+    /// different arithmetic path to the same "no variance to correlate
+    /// against" condition; [`normalize_template`]'s guard covers it too.
+    #[test]
+    fn a_single_pixel_template_has_no_variance_and_produces_a_defined_zero() {
+        let image = img_f32(&[5], vec![5.0, 1.0, 8.0, 2.0, 9.0]);
+        let template = img_f32(&[1], vec![7.0]);
+        let out = normalized_correlation(&image, None, &template).unwrap();
+        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[0.0f32; 5]);
     }
 
     #[test]
