@@ -274,11 +274,13 @@ pub fn box_mean(img: &Image, radius: &[usize]) -> Result<Image> {
 /// exactly like [`box_mean`] (see [`box_accumulate`]'s doc comment).
 /// Narrowed back to `img`'s own pixel type.
 ///
-/// At `radius = [0, ..., 0]` every box has `N = 1`, so `N - 1 = 0`: the
-/// numerator is `0.0` too (`Σ² == Σ²/1` exactly for a single sample), giving
-/// `0.0 / 0.0 = NaN` for every output pixel. `itkBoxUtilities.h` does not
-/// guard this division either, so this port reproduces the NaN rather than
-/// special-casing it away.
+/// At `radius = [0, ..., 0]` every box has `N = 1`: upstream's `N - 1`
+/// divisor is then `0`, and since the numerator is also exactly `0.0` for a
+/// single sample (`Σ² == Σ²/1`), `itkBoxUtilities.h`'s unguarded division
+/// gives `0.0 / 0.0 = NaN` for every output pixel. This port instead treats
+/// a single-sample box as having zero spread -- the only value consistent
+/// with the sample standard deviation's own meaning -- and returns `0.0`
+/// there rather than propagating a NaN.
 ///
 /// Errors if `radius.len() != img.dimension()`.
 pub fn box_sigma(img: &Image, radius: &[usize]) -> Result<Image> {
@@ -298,6 +300,9 @@ pub fn box_sigma(img: &Image, radius: &[usize]) -> Result<Image> {
         .map(|flat| {
             let center: Vec<usize> = (0..dim).map(|d| (flat / strides_[d]) % size[d]).collect();
             let (sum, sumsq, count) = box_accumulate(&vals, &size, &strides_, &center, radius);
+            if count == 1 {
+                return 0.0;
+            }
             let count_f = count as f64;
             ((sumsq - sum * sum / count_f) / (count_f - 1.0)).sqrt()
         })
@@ -1372,15 +1377,15 @@ mod tests {
         assert!((out.to_f64_vec().unwrap()[0] - 0.5f64.sqrt()).abs() < 1e-12);
     }
 
-    /// `radius = [0, 0]`: every box has `N = 1`, so the `N - 1` divisor is
-    /// `0` and the (also-zero) numerator gives `0.0 / 0.0 = NaN` -- an
-    /// upstream quirk this port reproduces rather than guards against (see
-    /// [`box_sigma`]'s doc comment).
+    /// `radius = [0, 0]`: every box has `N = 1`, so upstream's unguarded
+    /// `0.0 / 0.0` division would give NaN; this port's fixed sample-spread
+    /// convention returns `0.0` for every pixel instead (see [`box_sigma`]'s
+    /// doc comment).
     #[test]
-    fn box_sigma_radius_zero_is_nan_everywhere() {
+    fn box_sigma_radius_zero_is_zero_everywhere() {
         let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         let out = box_sigma(&img, &[0, 0]).unwrap();
-        assert!(out.to_f64_vec().unwrap().iter().all(|v| v.is_nan()));
+        assert_eq!(out.to_f64_vec().unwrap(), vec![0.0, 0.0, 0.0]);
     }
 
     #[test]
