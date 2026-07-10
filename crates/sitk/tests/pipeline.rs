@@ -60,13 +60,30 @@ fn read_filter_resample_write_roundtrip() {
 
     assert_eq!(mask_back.pixel_id(), PixelId::UInt8);
     // A read installs the ImageIO's meta-data dictionary
-    // (itkMetaImageIO.cxx:270-278); a filter output has none. Compare the rest.
+    // (itkMetaImageIO.cxx:270-278) plus the reader's geometry-normalization
+    // records (`ITK_original_*`, itkImageFileReader.hxx:216-239); a filter
+    // output has none. Compare the rest.
     assert_eq!(
         mask_back.meta_data_keys(),
-        vec!["ITK_InputFilterName", "Modality"]
+        vec![
+            "ITK_InputFilterName",
+            "ITK_original_direction",
+            "ITK_original_spacing",
+            "Modality",
+        ]
     );
-    mask_back.erase_meta_data("ITK_InputFilterName");
-    mask_back.erase_meta_data("Modality");
+    // The mask's spacing is positive, so nothing flipped; the records are the
+    // raw grid the reader saw.
+    assert_eq!(mask_back.meta_data("ITK_original_spacing"), Some("2 0.5"));
+    assert_eq!(
+        mask_back.meta_data("ITK_original_direction"),
+        Some("1 0 0 1")
+    );
+    for key in ["ITK_InputFilterName", "Modality"] {
+        mask_back.erase_meta_data(key);
+    }
+    mask_back.erase_meta_data("ITK_original_direction");
+    mask_back.erase_meta_data("ITK_original_spacing");
     assert_eq!(mask_back, mask);
     // Values in [10,40]: biased pixels 21..56 step... check a couple.
     // biased[d] = d*5 + 1 for d in 0..12 -> 1,6,11,16,21,26,31,36,41,46,51,56

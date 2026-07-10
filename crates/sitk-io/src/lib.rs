@@ -72,10 +72,15 @@ pub use writer::{ImageFileWriter, WriteOptions};
 /// Read an image, letting the [`registry`] pick the format —
 /// `itk::simple::ReadImage` (sitkImageFileReader.cxx:70-78).
 ///
-/// The returned image carries the file's meta-data dictionary.
+/// The returned image carries the file's meta-data dictionary, and its geometry
+/// is normalized exactly as [`ImageFileReader::execute`] does — the negative
+/// spacing sign-flip plus the `ITK_original_*` records
+/// ([`reader::normalize_reader_geometry`], `itkImageFileReader.hxx:216-239`).
 pub fn read_image<P: AsRef<Path>>(path: P) -> Result<Image> {
     let path = path.as_ref();
-    image_io::reader_for(path)?.read(path)
+    let mut image = image_io::reader_for(path)?.read(path)?;
+    reader::normalize_reader_geometry(&mut image)?;
+    Ok(image)
 }
 
 /// Write an image, letting the [`registry`] pick the format —
@@ -719,12 +724,18 @@ mod tests {
         let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
+        // The reader's geometry normalization adds `ITK_original_spacing` and
+        // `ITK_original_direction` on top of the IO's own dictionary keys — the
+        // header's spacing is the default `1 1` (positive, so no flip) and the
+        // direction is the identity.
         assert_eq!(
             img.meta_data_keys(),
             vec![
                 "ITK_ExperimentDate",
                 "ITK_InputFilterName",
                 "ITK_VoxelUnits",
+                "ITK_original_direction",
+                "ITK_original_spacing",
                 "Modality",
                 "MyTag",
                 "elementspacing",
@@ -736,6 +747,8 @@ mod tests {
         assert_eq!(img.meta_data("ITK_ExperimentDate"), Some("2026.07.10"));
         assert_eq!(img.meta_data("MyTag"), Some("some value"));
         assert_eq!(img.meta_data("elementspacing"), Some("9 9"));
+        assert_eq!(img.meta_data("ITK_original_spacing"), Some("1 1"));
+        assert_eq!(img.meta_data("ITK_original_direction"), Some("1 0 0 1"));
         assert_eq!(img.spacing(), &[1.0, 1.0]);
     }
 
@@ -750,11 +763,54 @@ mod tests {
         let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
+        // `ITK_original_*` ride along from the reader's geometry normalization
+        // (the written image is default 2-D geometry: unit spacing, identity
+        // direction).
         assert_eq!(
             back.meta_data_keys(),
-            vec!["ITK_InputFilterName", "Modality"]
+            vec![
+                "ITK_InputFilterName",
+                "ITK_original_direction",
+                "ITK_original_spacing",
+                "Modality",
+            ]
         );
         assert_eq!(back.meta_data("Modality"), Some("MET_MOD_UNKNOWN"));
+        assert_eq!(back.meta_data("ITK_original_spacing"), Some("1 1"));
+        assert_eq!(back.meta_data("ITK_original_direction"), Some("1 0 0 1"));
+    }
+
+    /// End-to-end: a MetaImage on disk carries a negative `ElementSpacing`
+    /// component (MetaIO preserves the sign; upstream's own producer of this is
+    /// GDCM's negative Z-spacing, `itkGDCMImageIO.cxx:703`). The reader's
+    /// geometry normalization flips it positive, negates the matching direction
+    /// column, and records both raw values under `ITK_original_*`
+    /// (`itkImageFileReader.hxx:216-239`).
+    #[test]
+    fn read_image_flips_a_negative_metaimage_spacing() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             ElementSpacing = 2 -3\n\
+             DimSize = 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LOCAL\n";
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&[10u8, 20, 30, 40]);
+        let path = tmp_path("negative_spacing.mha");
+        std::fs::write(&path, bytes).unwrap();
+
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Spacing is positive on both axes; axis 1's direction column flipped.
+        assert_eq!(img.spacing(), &[2.0, 3.0]);
+        assert_eq!(img.direction(), &[1.0, 0.0, 0.0, -1.0]);
+        // The buffer is untouched by the geometry flip.
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[10, 20, 30, 40]);
+        // The raw on-disk geometry stays recoverable, negative sign and all.
+        assert_eq!(img.meta_data("ITK_original_spacing"), Some("2 -3"));
+        assert_eq!(img.meta_data("ITK_original_direction"), Some("1 0 0 1"));
     }
 
     // ---- header field precedence and boolean parsing ----------------------
@@ -3105,9 +3161,19 @@ mod tests {
             &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         );
         assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
-        // `pixdim` is `float`, so a spacing that is not exactly representable in
-        // f32 does not survive; these three are.
-        assert!(back.meta_data_keys().is_empty());
+        // GIPL itself puts nothing in the dictionary, but the reader's geometry
+        // normalization records the (positive, so unflipped) spacing and the
+        // identity direction it read back. `pixdim` is `float`, so a spacing not
+        // exactly representable in f32 would not survive; these three are.
+        assert_eq!(
+            back.meta_data_keys(),
+            vec!["ITK_original_direction", "ITK_original_spacing"]
+        );
+        assert_eq!(back.meta_data("ITK_original_spacing"), Some("0.5 1.25 3"));
+        assert_eq!(
+            back.meta_data("ITK_original_direction"),
+            Some("1 0 0 0 1 0 0 0 1")
+        );
     }
 
     /// The unit third axis a 2-D write invents carries spacing `1.0` and origin

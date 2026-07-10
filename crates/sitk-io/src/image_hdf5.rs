@@ -1168,7 +1168,13 @@ mod tests {
             let path = tmp_path(&format!("dispatch{extension}"));
             let image = image_2d(PixelBuffer::Float32((0..12).map(|i| i as f32).collect()));
             write_image(&image, &path).unwrap();
-            assert_eq!(read_image(&path).unwrap(), image, "{extension}");
+            // `read_image` runs the reader's geometry normalization, which
+            // records the raw spacing/direction under `ITK_original_*`; this
+            // dispatch test only cares that the image itself round-trips.
+            let mut back = read_image(&path).unwrap();
+            back.erase_meta_data("ITK_original_spacing");
+            back.erase_meta_data("ITK_original_direction");
+            assert_eq!(back, image, "{extension}");
             let _ = std::fs::remove_file(&path);
         }
     }
