@@ -53,6 +53,7 @@ pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
 pub mod deconvolution;
+pub mod demons;
 pub mod denoise;
 pub mod displacement_field;
 pub mod distance;
@@ -139,6 +140,13 @@ pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
+};
+pub use demons::{
+    DemonsParams, DemonsResult, DiffeomorphicDemonsParams, EsmGradient,
+    FastSymmetricForcesDemonsParams, LevelSetMotionParams, SymmetricForcesDemonsParams,
+    demons_registration, diffeomorphic_demons_registration,
+    fast_symmetric_forces_demons_registration, level_set_motion_registration,
+    symmetric_forces_demons_registration,
 };
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,

@@ -421,7 +421,7 @@ fn modified_bessel_i_derivative_operator(n: i32, y: f64) -> f64 {
 /// `2·radius + 1`-length kernel, `radius = tail_count`; `variance == 0.0`
 /// still yields the 3-tap identity kernel `[0.0, 1.0, 0.0]` (`radius == 1`),
 /// never a literal `radius == 0`.
-fn gaussian_operator_kernel(
+pub(crate) fn gaussian_operator_kernel(
     variance: f64,
     maximum_error: f64,
     maximum_kernel_width: u32,

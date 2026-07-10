@@ -631,6 +631,13 @@ pub enum FilterError {
     #[error("subsampling factor must be >= 1, got {0}")]
     InvalidSubsamplingFactor(u32),
 
+    /// `GaussianOperator::SetMaximumError` throws "Maximum Error Must be in the
+    /// range [ 0.0 , 1.0 ]" when the value is not strictly inside `(0, 1)`
+    /// (itkGaussianOperator.h:86-95 — the message says closed, the test is
+    /// open).
+    #[error("Gaussian maximum error must lie strictly inside (0, 1), got {0}")]
+    GaussianMaximumErrorOutOfRange(f64),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
