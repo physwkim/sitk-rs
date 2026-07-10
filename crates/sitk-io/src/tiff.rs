@@ -101,10 +101,11 @@
 //! page reads back as a vector image with every sample intact.
 //!
 //! A `MINISWHITE` page is decodable only where the `tiff` crate can invert it:
-//! its `invert_colors` handles single-sample `Gray` with an unsigned-integer or
-//! 32/64-bit float sample and nothing else (decoder/mod.rs:713-769), so a
-//! multi-sample `MINISWHITE` page (`ColorType::Multiband`) or a signed /
-//! non-32-bit-float single-sample one makes [`read`] error with
+//! its `invert_colors` handles single-sample `Gray` with an unsigned-integer
+//! sample at a conformant bit depth (1/2/4/8/16/32/64) or a 32/64-bit float
+//! sample and nothing else (decoder/mod.rs:713-769), so a multi-sample
+//! `MINISWHITE` page (`ColorType::Multiband`), a signed / non-32-bit-float
+//! single-sample one, or an odd-width `Gray` makes [`read`] error with
 //! `UnknownInterpretation`. [`layout_for`] refuses those at
 //! `read_information` time (`crate_can_invert_whiteiszero`) so the header does
 //! not advertise components [`read`] cannot deliver — the same
@@ -514,7 +515,9 @@ fn crate_can_invert_whiteiszero(color: &ColorType, sample_format: u16) -> bool {
         ColorType::Gray(bits) => match sample_format {
             2 => false,                   // SampleFormat::Int
             3 => matches!(bits, 32 | 64), // SampleFormat::IEEEFP
-            _ => true,                    // SampleFormat::Uint / default
+            // SampleFormat::Uint / default: invert_colors accepts only the
+            // conformant bit depths; an odd width (e.g. Gray(24)) hits its `_`.
+            _ => matches!(bits, 1 | 2 | 4 | 8 | 16 | 32 | 64),
         },
         _ => false, // Multiband and every non-gray interpretation
     }
@@ -615,9 +618,10 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
         // guard: `read` decodes through `decoder.read_image()`, which for a
         // `WhiteIsZero` page inverts every sample via the crate's
         // `invert_colors`. That table handles only single-sample `Gray` with an
-        // unsigned-integer sample (any width) or a 32/64-bit IEEE-float sample
-        // (decoder/mod.rs:713-769). A multi-sample page (`ColorType::Multiband`)
-        // or a signed-integer / non-32-bit-float single-sample page is a shape
+        // unsigned-integer sample at a conformant bit depth (1/2/4/8/16/32/64)
+        // or a 32/64-bit IEEE-float sample (decoder/mod.rs:713-769). A
+        // multi-sample page (`ColorType::Multiband`), a signed-integer /
+        // non-32-bit-float single-sample page, or an odd-width `Gray` is a shape
         // the table omits, so `invert_colors` returns `UnknownInterpretation`
         // and `read` errors. Refuse it here so `read_information` does not
         // advertise components `read` cannot deliver. `BlackIsZero` is never
@@ -1651,6 +1655,49 @@ mod tests {
             matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§2.140")),
             "read should refuse signed MINISWHITE: {image:?}"
         );
+    }
+
+    /// §2.140, odd-bit-depth `MINISWHITE` corner. `invert_colors` accepts a
+    /// `Gray` + `Uint` sample only at the conformant depths 1/2/4/8/16/32/64
+    /// (decoder/mod.rs:713-769); a `Gray(24)` page constructs fine in the crate
+    /// (image.rs:252 rejects only zero/inconsistent bits) but errors at
+    /// `invert_colors`' `_` arm. In this port such a page is refused earlier, by
+    /// `layout_for`'s BitsPerSample guard (bits ∉ {8,16,32}, §4.102), for both
+    /// `read_information` and `read` — so the two agree and never advertise a
+    /// page the other rejects. `crate_can_invert_whiteiszero` is tightened to
+    /// mirror `invert_colors` independently of that guard, verified directly.
+    #[test]
+    fn odd_bit_depth_minis_white_is_refused_by_both_read_paths() {
+        // Gray(24) single-sample MINISWHITE, unsigned (no SampleFormat tag).
+        let bytes = build_tiff(vec![Page {
+            entries: base_entries(2, 2, 24, 1, 0), // photometric 0 == MINISWHITE
+            pixels: vec![0u8; 2 * 2 * 3],          // 3 bytes per 24-bit sample
+        }]);
+        let path = write_fixture("sitk_io_tiff_minis_white_gray24.tif", &bytes);
+        let info = read_information(&path);
+        let image = read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&info, Err(IoError::UnsupportedTiffFeature(_))),
+            "read_information should refuse Gray(24) MINISWHITE: {info:?}"
+        );
+        assert!(
+            matches!(&image, Err(IoError::UnsupportedTiffFeature(_))),
+            "read should refuse Gray(24) MINISWHITE: {image:?}"
+        );
+        assert_eq!(
+            info.is_err(),
+            image.is_err(),
+            "read_information and read must agree on refusal"
+        );
+
+        // Directly exercise the tightened Uint arm the BitsPerSample guard shadows.
+        assert!(!crate_can_invert_whiteiszero(&ColorType::Gray(24), 1));
+        assert!(crate_can_invert_whiteiszero(&ColorType::Gray(8), 1));
+        assert!(crate_can_invert_whiteiszero(&ColorType::Gray(16), 1));
+        assert!(!crate_can_invert_whiteiszero(&ColorType::Gray(16), 3)); // f16: unsupported IEEEFP width
+        assert!(crate_can_invert_whiteiszero(&ColorType::Gray(32), 3)); // f32
+        assert!(!crate_can_invert_whiteiszero(&ColorType::Gray(8), 2)); // signed
     }
 
     /// `ORIENTATION_BOTLEFT` sends scanline `row` to `height - 1 - row`
