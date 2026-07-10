@@ -1341,13 +1341,10 @@ fn seed_flat_index(seed: &[usize], size: &[usize]) -> Result<usize> {
 
 /// `NumericTraits<InputPixelType>::RealType` — the pixel type of the
 /// `RealImageType` that `IsolatedWatershedImageFilter` runs its gradient
-/// magnitude and its watershed on. `float` stays `float`; everything else,
-/// integer types included, becomes `double`.
-fn real_pixel_type(pixel_id: PixelId) -> PixelId {
-    match pixel_id {
-        PixelId::Float32 => PixelId::Float32,
-        _ => PixelId::Float64,
-    }
+/// magnitude and its watershed on. `double` for **every** scalar input type:
+/// `NumericTraits<float>::RealType` is `double` (itkNumericTraits.h:1349/1356).
+fn real_pixel_type(_pixel_id: PixelId) -> PixelId {
+    PixelId::Float64
 }
 
 /// `itk::IsolatedWatershedImageFilter`: bisect the watershed waterlevel until
@@ -1356,8 +1353,8 @@ fn real_pixel_type(pixel_id: PixelId) -> PixelId {
 /// The pipeline is `GradientMagnitudeImageFilter` → `WatershedImageFilter`,
 /// with **no** smoothing stage — no Gaussian blur, no anisotropic diffusion.
 /// The gradient magnitude is computed at `NumericTraits<InputPixelType>::RealType`
-/// precision (`double` for every integer input), not at the `float` that
-/// SimpleITK's standalone `gradient_magnitude` would give.
+/// precision (`double` for **every** scalar input, `float` included), not at
+/// the `float` that SimpleITK's standalone `gradient_magnitude` would give.
 ///
 /// The bisection starts at `guess = upper_value_limit` and halves
 /// `[lower, upper]` while `lower + isolated_value_tolerance < guess`, where
@@ -1974,15 +1971,16 @@ mod tests {
     }
 
     /// The gradient magnitude runs at `NumericTraits<InputPixelType>::RealType`,
-    /// which is `double` for every integer input and `float` only for a `float`
-    /// input. SimpleITK's standalone `GradientMagnitudeImageFilter` yaml instead
-    /// fixes the output at `float`, so this is not the same seam.
+    /// which is `double` for **every** scalar input — `float` included
+    /// (`NumericTraits<float>::RealType` is `double`). SimpleITK's standalone
+    /// `GradientMagnitudeImageFilter` yaml instead fixes the output at `float`,
+    /// so this is not the same seam.
     #[test]
     fn the_gradient_magnitude_runs_at_real_type() {
         assert_eq!(real_pixel_type(PixelId::UInt8), PixelId::Float64);
         assert_eq!(real_pixel_type(PixelId::Int16), PixelId::Float64);
         assert_eq!(real_pixel_type(PixelId::Float64), PixelId::Float64);
-        assert_eq!(real_pixel_type(PixelId::Float32), PixelId::Float32);
+        assert_eq!(real_pixel_type(PixelId::Float32), PixelId::Float64);
     }
 
     /// A constant image has a zero gradient magnitude everywhere, which is the

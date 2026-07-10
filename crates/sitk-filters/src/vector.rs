@@ -92,9 +92,9 @@ pub fn vector_index_selection_cast(
 ///
 /// The norm accumulates in `VariableLengthVector::RealValueType` =
 /// `NumericTraits<T>::RealType` (itkVariableLengthVector.hxx:391-399,
-/// `GetSquaredNorm`), which is `f32` for an `f32` component type and `f64` for
-/// every other one — so an `f32` input sums its squares in `f32`, as ITK does,
-/// and an integer input sums in `f64`.
+/// `GetSquaredNorm`), which is `double` for **every** scalar component type —
+/// `NumericTraits<float>::RealType` is `double` (itkNumericTraits.h:1349/1356)
+/// — so this port sums squares in `f64` for all inputs, `f32` included.
 ///
 /// The functor is `static_cast<TOutput>(A.GetNorm())`; that cast is undefined
 /// in C++ when the norm exceeds an integer output's range, and saturates here.
@@ -113,20 +113,14 @@ fn vector_magnitude_typed<T: Scalar>(img: &Image) -> Result<Image> {
     let n = img.number_of_components_per_pixel();
     let components = img.component_slice::<T>()?;
 
-    // `RealValueType` is `float` only for a `float` component type.
-    let norm: fn(&[T]) -> f64 = if T::PIXEL_ID == PixelId::Float32 {
-        |pixel| {
-            let sum: f32 = pixel.iter().map(|&c| (c.as_f64() as f32).powi(2)).sum();
-            f64::from(sum.sqrt())
-        }
-    } else {
-        |pixel| {
-            pixel
-                .iter()
-                .map(|&c| c.as_f64().powi(2))
-                .sum::<f64>()
-                .sqrt()
-        }
+    // `RealValueType` = `NumericTraits<T>::RealType` is `double` for every
+    // scalar component type, `float` included (itkNumericTraits.h:1349/1356).
+    let norm = |pixel: &[T]| -> f64 {
+        pixel
+            .iter()
+            .map(|&c| c.as_f64().powi(2))
+            .sum::<f64>()
+            .sqrt()
     };
 
     let out: Vec<T> = components
@@ -145,19 +139,21 @@ fn vector_magnitude_typed<T: Scalar>(img: &Image) -> Result<Image> {
 /// The functor is `static_cast<TOutput>(std::exp(-1.0 * A.GetNorm()))`
 /// (itkEdgePotentialImageFilter.h:57). `A.GetNorm()` is
 /// `VariableLengthVector::GetNorm` (itkVariableLengthVector.hxx:382-401), whose
-/// accumulator is `RealValueType` = `NumericTraits<T>::RealType` — `f32` for an
-/// `f32` component type, `f64` for every other one. `-1.0 * norm` then promotes
-/// to `double` before `std::exp`, so the exponential is always evaluated in
-/// `f64`; only the squared-norm accumulation is narrow. This is the same
-/// accumulator rule [`vector_magnitude`] follows.
+/// accumulator is `RealValueType` = `NumericTraits<T>::RealType` — `double` for
+/// **every** scalar component type (`NumericTraits<float>::RealType` is
+/// `double`, itkNumericTraits.h:1349/1356) — and `std::exp` runs on `double`
+/// too, so the whole computation is `f64` for all inputs. Same accumulator
+/// rule as [`vector_magnitude`].
 ///
-/// The output pixel type is the yaml's `output_pixel_type`,
+/// The output pixel type: the yaml's `output_pixel_type` is
 /// `NumericTraits<NumericTraits<PixelType>::ValueType>::RealType` — the *real*
-/// type of the component type, so [`PixelId::Float32`] for a
-/// [`PixelId::VectorFloat32`] input and [`PixelId::Float64`] for every other
-/// input, integer components included. Unlike [`vector_magnitude`] there is no
-/// narrowing cast to worry about: every value of `exp(-|g|)` lies in `(0, 1]`
-/// and the output is floating point.
+/// type of the component type, which is `double` for every input, so upstream
+/// always outputs [`PixelId::Float64`]. **This port currently diverges**: it
+/// outputs [`PixelId::Float32`] for a [`PixelId::VectorFloat32`] input (the
+/// §2.39/§5.6 RealType misbelief; the value itself is computed in `f64` and
+/// narrowed once). Flipping the output type is a breaking change tracked in
+/// the upstream-findings ledger §5.6. There is no narrowing *range* concern
+/// either way: every value of `exp(-|g|)` lies in `(0, 1]`.
 ///
 /// Errors with [`Error::RequiresVectorPixelType`] on a scalar image
 /// (`pixel_types: VectorPixelIDTypeList`). ITK's own constraint is
@@ -174,14 +170,16 @@ fn edge_potential_typed<T: Scalar>(img: &Image) -> Result<Image> {
     let n = img.number_of_components_per_pixel();
     let components = img.component_slice::<T>()?;
 
-    // `RealValueType` is `float` only for a `float` component type; the
-    // exponential itself is always taken in `f64` (`-1.0 * norm` promotes).
+    // The computation is `f64` throughout (`RealValueType` is `double` even
+    // for a `float` component); only the output pixel type still splits —
+    // Float32 for VectorFloat32 is a §5.6 divergence from the yaml's
+    // always-double `output_pixel_type`.
     let mut result = if T::PIXEL_ID == PixelId::Float32 {
         let out: Vec<f32> = components
             .chunks_exact(n)
             .map(|pixel| {
-                let sum: f32 = pixel.iter().map(|&c| (c.as_f64() as f32).powi(2)).sum();
-                (-f64::from(sum.sqrt())).exp() as f32
+                let sum: f64 = pixel.iter().map(|&c| c.as_f64().powi(2)).sum();
+                (-sum.sqrt()).exp() as f32
             })
             .collect();
         Image::from_vec(img.size(), out)?

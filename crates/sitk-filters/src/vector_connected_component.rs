@@ -26,10 +26,11 @@
 //! `static_cast<ValueType>(1.0 - |dot(a, b)|) <= threshold`
 //!
 //! where `dot(a, b) = sum_i a[i]*b[i]`, accumulated in
-//! `NumericTraits<ValueType>::RealType` -- `f32` only for an `f32` component
-//! type, `f64` otherwise, the same precision split
+//! `NumericTraits<ValueType>::RealType` -- `double` for **every** scalar
+//! component type (`NumericTraits<float>::RealType` is `double`,
+//! itkNumericTraits.h:1349/1356), the same accumulator rule
 //! [`crate::vector::vector_magnitude`]'s `GetSquaredNorm`-style accumulation
-//! already uses. `threshold` is `DistanceThreshold` cast to the component
+//! uses. `threshold` is `DistanceThreshold` cast to the component
 //! type (`static_cast<InputValueType>`, matching
 //! `VectorConnectedComponentImageFilter.yaml`'s `pixeltype: Input` cast).
 //!
@@ -60,7 +61,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::reconstruction::{Half, NeighborWalker};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use sitk_core::{Image, Scalar, dispatch_scalar};
 
 fn find(parent: &mut [usize], x: usize) -> usize {
     let mut root = x;
@@ -86,19 +87,13 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 
 /// `Functor::SimilarVectorsFunctor::operator()`; see the module docs.
 fn similar<T: Scalar>(a: &[T], b: &[T], threshold: T) -> bool {
-    let dot: f64 = if T::PIXEL_ID == PixelId::Float32 {
-        let sum: f32 = a
-            .iter()
-            .zip(b)
-            .map(|(&x, &y)| (x.as_f64() as f32) * (y.as_f64() as f32))
-            .sum();
-        f64::from(sum)
-    } else {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| x.as_f64() * y.as_f64())
-            .sum()
-    };
+    // The dot product accumulates in `NumericTraits<ValueType>::RealType`,
+    // which is `double` even for a `float` component type.
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| x.as_f64() * y.as_f64())
+        .sum();
     T::from_f64(1.0 - dot.abs()).as_f64() <= threshold.as_f64()
 }
 
@@ -174,6 +169,7 @@ pub fn vector_connected_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sitk_core::PixelId;
 
     fn vec_img(size: &[usize], components: usize, data: Vec<f64>) -> Image {
         Image::from_vec_vector(size, components, data).unwrap()

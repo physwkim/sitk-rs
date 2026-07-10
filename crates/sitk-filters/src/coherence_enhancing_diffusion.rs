@@ -92,11 +92,13 @@
 //!
 //! # Deviations
 //!
-//! ITK's `TScalar` is `NumericTraits<PixelType>::RealType`, so a `Float32`
-//! image runs the entire pipeline — structure tensor, eigenanalysis, Selling
-//! decomposition, Euler steps — in single precision. This port computes in
-//! `f64` throughout and narrows once, at the output. Bit-exact agreement is out
-//! of reach either way: ITK's `SymmetricEigenAnalysis` is a different
+//! ITK's `TScalar` defaults to `NumericTraits<PixelType>::RealType`, which is
+//! `double` for **every** scalar pixel type, `float` included
+//! (itkNumericTraits.h:1349/1356) — so upstream also runs the entire pipeline
+//! — structure tensor, eigenanalysis, Selling decomposition, Euler steps — in
+//! double precision, and this port's `f64`-throughout matches that rule
+//! rather than diverging from it. Bit-exact agreement is still out
+//! of reach: ITK's `SymmetricEigenAnalysis` is a different
 //! eigensolver from the cyclic Jacobi in [`crate::linalg`], and the two agree
 //! only to solver accuracy.
 //!

@@ -96,9 +96,13 @@ use crate::error::{FilterError, Result};
 use crate::fft::{self, Complex};
 use crate::image_from_f64;
 
-/// `NumericTraits<T>::RealType`, the pixel type both filters' yaml declares
-/// for the output: `Float32` for a `Float32` input, `Float64` for everything
-/// else (every integer type, and `Float64` itself).
+/// Output pixel-type mapping for both filters: `Float32` for a `Float32`
+/// input, `Float64` for everything else. **Diverges from ITK**: the yaml
+/// declares `NumericTraits<T>::RealType`, which is `double` for every scalar
+/// type *including* `float` (itkNumericTraits.h:1349/1356), so upstream
+/// always outputs `Float64`. Breaking to fix; tracked in the
+/// upstream-findings ledger §5.6 (same family as
+/// `math::real_type`/`lib.rs::real_pixel_id`).
 fn real_type(id: PixelId) -> PixelId {
     match id {
         PixelId::Float32 => PixelId::Float32,

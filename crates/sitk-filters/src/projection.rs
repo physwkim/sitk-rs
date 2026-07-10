@@ -73,11 +73,13 @@
 use crate::error::{FilterError, Result};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
-/// `NumericTraits<T>::RealType` pixel-type mapping used by
-/// [`mean_projection`], [`sum_projection`], and
-/// [`standard_deviation_projection`]: stays `Float32` for a `Float32` input,
-/// promotes everything else (every integer type, and `Float64` itself) to
-/// `Float64`.
+/// Output pixel-type mapping used by [`mean_projection`], [`sum_projection`],
+/// and [`standard_deviation_projection`]: stays `Float32` for a `Float32`
+/// input, promotes everything else to `Float64`. **Diverges from ITK**:
+/// `NumericTraits<T>::RealType` is `double` for every scalar type *including*
+/// `float` (itkNumericTraits.h:1349/1356), so upstream always outputs
+/// `Float64`. Breaking to fix; tracked in the upstream-findings ledger §5.6
+/// (same family as `math::real_type`/`lib.rs::real_pixel_id`).
 fn real_type(id: PixelId) -> PixelId {
     match id {
         PixelId::Float32 => PixelId::Float32,

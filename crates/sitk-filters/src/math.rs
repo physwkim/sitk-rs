@@ -405,10 +405,15 @@ pub fn divide_floor_in_place(a: Image, b: &Image) -> Result<Image> {
     two_image_f64_in_place(a, b, &|x, y| (x / y).floor())
 }
 
-/// `NumericTraits<T>::RealType` pixel-type mapping used by [`divide_real`]:
-/// stays `Float32` for a `Float32` input, promotes everything else (every
-/// integer type, and `Float64` itself) to `Float64`. Mirrors
-/// `intensity::real_type`/`projection::real_type`.
+/// Output pixel-type mapping used by [`divide_real`]: stays `Float32` for a
+/// `Float32` input, promotes everything else to `Float64`. **Diverges from
+/// ITK**: the yaml's `output_pixel_type` is `NumericTraits<T>::RealType`,
+/// which is `double` for every scalar type *including* `float`
+/// (itkNumericTraits.h:1349/1356) — upstream always outputs `Float64`.
+/// Flipping `Float32 → Float64` is a breaking change tracked in the
+/// upstream-findings ledger §5.6. Mirrors `intensity::real_type` /
+/// `projection::real_type` / `fft_correlation::real_type` /
+/// `lib.rs::real_pixel_id` (same family).
 fn real_type(id: PixelId) -> PixelId {
     match id {
         PixelId::Float32 => PixelId::Float32,
@@ -423,12 +428,10 @@ fn real_type(id: PixelId) -> PixelId {
 /// [`divide_floor`], the output is always real, so there is no
 /// integer-narrowing special case: `b == 0` naturally yields `+inf`/`-inf`/
 /// `NaN` under IEEE 754, preserved exactly since the output pixel type is
-/// always floating-point. This crate computes the division itself in `f64`
-/// for every input type rather than `DivReal`'s per-type `RealType(A) /
-/// RealType(B)` (which divides in `f32` precision when the input is
-/// `Float32`); this is a known ULP-level precision simplification, matching
-/// how `intensity::normalize` and other multi-image reductions in this
-/// crate already promote uniformly to `f64` (see the module docs).
+/// always floating-point. The division itself runs in `f64`, which **matches**
+/// `DivReal`'s `RealType(A) / RealType(B)` exactly — `RealType` is `double`
+/// for every scalar input type, `Float32` included. The only divergence is
+/// the output pixel type for `Float32` inputs (see [`real_type`], §5.6).
 ///
 /// No in-place variant: like [`intensity::normalize`](crate::intensity::normalize),
 /// the output pixel type does not generally match the input's, so there is

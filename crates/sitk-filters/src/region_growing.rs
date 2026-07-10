@@ -122,10 +122,10 @@
 //! `NumericTraits<ComponentPixelType>::RealType` — the precision the
 //! reference accumulates in — is `double` for every ITK scalar component
 //! type except `long double` (`itkNumericTraits.h`'s per-type
-//! specializations), so unlike [`vector_magnitude`](crate::vector_magnitude)
-//! (whose norm narrows to `f32` for an `f32` component), this port widens
-//! every component type to `f64` unconditionally, matching the reference's
-//! own precision exactly rather than approximating it.
+//! specializations), so this port widens every component type to `f64`
+//! unconditionally, matching the reference's own precision exactly — the
+//! same accumulator rule [`vector_magnitude`](crate::vector_magnitude)
+//! follows.
 //!
 //! The initial mean/covariance are the *average of each in-bounds seed's
 //! own* `initial_neighborhood_radius`-sized box statistics

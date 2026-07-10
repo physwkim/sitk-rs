@@ -377,8 +377,13 @@ pub(crate) fn image_from_f64(
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
 }
 
-/// `itk::NumericTraits<PixelType>::RealType` (itkNumericTraits.h): `float` for
-/// a `float` pixel, `double` for every integer pixel and for `double` itself.
+/// Real-pixel-type mapping: `Float32` stays `Float32`, everything else maps
+/// to `Float64`. **Diverges from ITK**:
+/// `itk::NumericTraits<PixelType>::RealType` is `double` for every scalar
+/// pixel type *including* `float` (itkNumericTraits.h:1349/1356), so the
+/// upstream rule always resolves to `double`. Flipping `Float32 → Float64`
+/// changes `fast_marching`/`anti_alias_binary` output pixel types — breaking;
+/// tracked in the upstream-findings ledger §5.6.
 ///
 /// SimpleITK yamls that declare `output_pixel_type: typename
 /// itk::NumericTraits<typename InputImageType::PixelType>::RealType` — among

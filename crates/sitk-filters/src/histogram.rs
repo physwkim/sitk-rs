@@ -23,13 +23,12 @@
 //! `margin == 0`, so every bin edge collapses to the same value and every
 //! pixel clips into the *last* bin — not bin 0.
 //!
-//! ITK computes bin edges in `NumericTraits<T>::RealType`: `float` for a
-//! `Float32` image via `ImageToHistogramFilter`, but
-//! `ScalarImageToHistogramGenerator` hardcodes `Histogram<double>` regardless
-//! of pixel type — so the two upstream Otsu filters do not even agree with
-//! each other on bin-edge precision for `Float32` inputs. This port computes
-//! bin edges in `f64` uniformly for every caller, which only differs from
-//! upstream in low-order bits for `Float32` images.
+//! ITK computes bin edges in `NumericTraits<T>::RealType`, which is `double`
+//! for **every** scalar pixel type including `float`
+//! (itkNumericTraits.h:1349/1356) — and `ScalarImageToHistogramGenerator`
+//! hardcodes `Histogram<double>` outright — so both upstream Otsu paths run
+//! bin edges in `double` for every input. This port computes bin edges in
+//! `f64` uniformly for every caller, matching that rule exactly.
 
 use crate::error::{FilterError, Result};
 

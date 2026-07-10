@@ -136,9 +136,12 @@ impl PartialEq for TrialNode {
 
 impl Eq for TrialNode {}
 
-/// The arrival-time pixel type for a given speed pixel type: SimpleITK's
-/// `output_pixel_type: NumericTraits<InputPixelType>::RealType`, i.e. `float`
-/// for a `float` speed image and `double` for everything else.
+/// The arrival-time pixel type for a given speed pixel type. SimpleITK's
+/// `output_pixel_type` is `NumericTraits<InputPixelType>::RealType`, which is
+/// `double` for **every** scalar input (`NumericTraits<float>::RealType` is
+/// `double`, itkNumericTraits.h:1349/1356); this port's [`real_pixel_id`]
+/// currently keeps `Float32 → Float32` — a documented divergence tracked in
+/// the upstream-findings ledger §5.6.
 pub fn output_pixel_id(speed: PixelId) -> PixelId {
     real_pixel_id(speed)
 }
