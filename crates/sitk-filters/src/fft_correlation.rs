@@ -67,18 +67,21 @@
 //! [`fft_normalized_correlation`] for how the required overlap is derived from
 //! the two parameters.
 //!
+//! # Transform lengths
+//!
+//! This filter does **not** use `itkFFTPadImageFilter`, and its valid lengths
+//! are not the FFT backend's `SizeGreatestPrimeFactor`. It carries its own
+//! search: [`find_closest_valid_dimension`] (hxx:549-564) walks up from
+//! `size(fixed) + size(moving) - 1` until `FactorizeNumber` (hxx:528-545)
+//! divides the length away by 2s, 3s and 5s alone — "These are the only
+//! factors that are valid for the FFT calculation", says a comment written for
+//! a backend that is no longer the default. `FFTConvolutionImageFilter` on the
+//! same PocketFFT backend accepts factors up to 11 (ledger §2.94). Ported as
+//! written, so this crate's correlation transform lengths match upstream's
+//! exactly.
+//!
 //! # Deliberate divergences from ITK
 //!
-//! - **Transform lengths.** ITK pads each axis to
-//!   `FindClosestValidDimension` (hxx:549-564), the smallest length ≥
-//!   `size(fixed) + size(moving) - 1` factoring into 2s, 3s and 5s. This
-//!   crate's transform is radix-2 ([`crate::fft`]), so each axis is padded to
-//!   [`crate::fft::padded_length`] — the next power of two, which is a valid
-//!   ITK length too, merely not always the smallest one. The result is
-//!   unchanged: both lengths are ≥ the combined size, so the circular
-//!   convolution of the zero-padded buffers agrees with the linear one over
-//!   the whole `[0, combined)` region ITK crops out (hxx:419-427), and the
-//!   crop is to the analytic combined size either way.
 //! - **Precision.** ITK computes the transforms and every pixel-wise stage in
 //!   `RealPixelType` — `float` for a `float` input. This port computes in
 //!   `f64` throughout and narrows once, when the output image is built. The
@@ -141,6 +144,46 @@ fn element_round(values: &mut [f64]) {
     for v in values.iter_mut() {
         *v = (*v + 0.5).floor();
     }
+}
+
+// ---- transform lengths ----------------------------------------------------
+
+/// `FactorizeNumber` (hxx:528-545): divide `n` by 2, then 3, then 5, as often
+/// as each divides, and return what is left. `1` means the length is valid.
+///
+/// The `for (offset = 1; offset <= 3; ++offset)` loop with `ifac += offset` is
+/// upstream's way of walking `ifac` through `2, 3, 5`.
+///
+/// **Divergence.** `FactorizeNumber(0)` never terminates upstream: `0 % 2 == 0`
+/// and `0 / 2 == 0`, so the inner `for (; n % ifac == 0;)` spins forever. A
+/// zero-extent input axis reaches it through `combinedImageSize = 0`. This port
+/// returns `0` (an unfactorable length) instead of hanging — ledger §4.64.
+fn factorize_number(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut n = n;
+    let mut ifac = 2usize;
+    for offset in 1..=3usize {
+        while n % ifac == 0 {
+            n /= ifac;
+        }
+        ifac += offset;
+    }
+    n
+}
+
+/// `FindClosestValidDimension` (hxx:549-564): the smallest length `>= n` whose
+/// only prime factors are 2, 3 and 5.
+///
+/// Not `itkFFTPadImageFilter`'s search, and not the FFT backend's greatest
+/// prime factor — see the module docs.
+fn find_closest_valid_dimension(n: usize) -> usize {
+    let mut candidate = n;
+    while factorize_number(candidate) != 1 {
+        candidate += 1;
+    }
+    candidate
 }
 
 // ---- FFT stages -----------------------------------------------------------
@@ -307,13 +350,13 @@ fn generate_data(
     rotate(&mut moving_mask);
 
     // The size of the correlation of the two images, and the transform length
-    // this crate's radix-2 backend pads it to.
+    // upstream rounds it up to (hxx:155-162).
     let combined_size: Vec<usize> = (0..dim)
         .map(|d| fixed.size()[d] + moving.size()[d] - 1)
         .collect();
     let fft_size: Vec<usize> = combined_size
         .iter()
-        .map(|&n| fft::padded_length(n))
+        .map(|&n| find_closest_valid_dimension(n))
         .collect();
 
     let fixed_fft = forward_fft(&fixed_image, fixed.size(), &fft_size);
@@ -490,6 +533,47 @@ mod tests {
 
     fn img(size: &[usize], data: Vec<f64>) -> Image {
         Image::from_vec(size, data).unwrap()
+    }
+
+    // ---- transform lengths (ledger §2.94, §4.64) ---------------------------
+
+    /// `FactorizeNumber` divides out 2s, 3s and 5s and nothing else, so a
+    /// length is valid exactly when it is 5-smooth.
+    #[test]
+    fn find_closest_valid_dimension_accepts_only_two_three_and_five() {
+        fn five_smooth(mut n: usize) -> bool {
+            for f in [2usize, 3, 5] {
+                while n % f == 0 {
+                    n /= f;
+                }
+            }
+            n == 1
+        }
+        for n in 1..=200usize {
+            let m = find_closest_valid_dimension(n);
+            assert!(m >= n, "{n} -> {m} shrank");
+            assert!(five_smooth(m), "{n} -> {m} is not 5-smooth");
+            for candidate in n..m {
+                assert!(!five_smooth(candidate), "{n} overshot past {candidate}");
+            }
+        }
+        // 7 is a fast PocketFFT radix, so `FFTConvolutionImageFilter` leaves 49
+        // alone while this filter walks it up to 50 = 2 * 5^2.
+        assert_eq!(find_closest_valid_dimension(49), 50);
+        assert_eq!(crate::fft::padded_length(49), 49);
+        // The two rules agree wherever the length is already 5-smooth.
+        for n in [1usize, 8, 12, 100, 128] {
+            assert_eq!(find_closest_valid_dimension(n), n);
+            assert_eq!(crate::fft::padded_length(n), n);
+        }
+    }
+
+    /// `FactorizeNumber(0)` spins forever upstream; here it reports "no
+    /// factorization" and the search moves on. Ledger §4.64.
+    #[test]
+    fn factorize_number_of_zero_terminates() {
+        assert_eq!(factorize_number(0), 0);
+        assert_eq!(find_closest_valid_dimension(0), 1);
     }
 
     fn values(image: &Image) -> Vec<f64> {
