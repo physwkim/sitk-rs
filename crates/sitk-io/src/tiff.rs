@@ -216,17 +216,24 @@
 //! `m_Compression` on `m_UseCompression` (`:692-716`). `None` (the default)
 //! keeps the prior behaviour: `COMPRESSION_NONE` ↔ `COMPRESSION_PACKBITS`.
 //!
-//! `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality` is
-//! `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor seeds
-//! it with `75` (`:213`). It reaches libtiff only through
+//! Upstream's `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality`
+//! is `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor
+//! seeds it with `75` (`:213`). It reaches libtiff only through
 //! `TIFFSetField(tif, TIFFTAG_JPEGQUALITY, ...)` inside
-//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). This
-//! crate cannot write JPEG at all (§3.51), so
-//! [`WriteOptions::compression_level`] is still dead here — but through SimpleITK, `SetCompressor("JPEG")` plus
-//! `UseCompressionOn()` makes the level live as the JPEG quality.
-//! It is also the only `ImageIOBase` in this crate that leaves
+//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751) — a
+//! mapping this port cannot reproduce, since it cannot write JPEG at all
+//! (§3.51). It is also the only `ImageIOBase` in this crate that leaves
 //! `m_MaximumCompressionLevel` at its `100` default rather than lowering it to
 //! `9` (itkImageIOBase.h:830). Ledger §3.52.
+//!
+//! **Fixed §3.52** — rather than leave [`WriteOptions::compression_level`]
+//! permanently dead here (there being no pure-Rust JPEG encoder for it to
+//! drive), it now controls the ratio of the one compressor this port can
+//! actually vary: `deflate_level_for` maps the resolved `1..=9` level onto
+//! [`TiffCompressor::Deflate`]'s three [`DeflateLevel`] tiers. This is a new
+//! use of the knob, not a port of one upstream ever had — TIFF's
+//! `CompressionLevel` never controlled a Deflate ratio in `itkTIFFImageIO`,
+//! only JPEG quality.
 //!
 //! On read, every compression scheme libtiff has a codec for is accepted
 //! (`TIFFIsCODECConfigured`). The `tiff` crate supports `None`, `LZW`,
@@ -1146,13 +1153,31 @@ where
 pub enum TiffCompressor {
     /// `COMPRESSION_LZW`.
     Lzw,
-    /// `COMPRESSION_ADOBE_DEFLATE` (tag `8`), at the `tiff` crate's own
-    /// `DeflateLevel::default()` ratio (`Balanced`). `WriteOptions::compression_level`
-    /// does not yet reach this — ledger §3.52.
+    /// `COMPRESSION_ADOBE_DEFLATE` (tag `8`). Ratio set by
+    /// [`WriteOptions::compression_level`] through [`deflate_level_for`] —
+    /// fixed §3.52.
     Deflate,
     /// `COMPRESSION_PACKBITS` — the same compressor a bare
     /// [`WriteOptions::use_compression`] already selects.
     PackBits,
+}
+
+/// Fixed §3.52: partitions [`WriteOptions::resolved_level`]'s clamped `1..=9`
+/// (`itkImageIOBase.h:288`'s `1..=GetMaximumCompressionLevel()`) into the
+/// three tiers [`DeflateLevel`] exposes, each discriminant sitting at the
+/// middle of its own bucket (`Fast = 1`, `Balanced = 6`, `Best = 9`).
+///
+/// Upstream never mapped `CompressionLevel` to a Deflate ratio at all — on a
+/// TIFF the field is JPEG quality, full stop (`itkTIFFImageIO.h:171-179`,
+/// `:749`), and this port cannot write JPEG (§3.51). Rather than leave the
+/// level permanently dead now that [`TiffCompressor::Deflate`] exists, it
+/// drives the ratio of the one compressor this port can actually vary.
+fn deflate_level_for(level: i32) -> DeflateLevel {
+    match level {
+        ..=3 => DeflateLevel::Fast,
+        4..=6 => DeflateLevel::Balanced,
+        _ => DeflateLevel::Best,
+    }
 }
 
 /// Write a `.tif` / `.tiff` file.
@@ -1222,8 +1247,11 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
         match options.compressor {
             None | Some(TiffCompressor::PackBits) => Compression::Packbits,
             Some(TiffCompressor::Lzw) => Compression::Lzw,
-            // `compression_level` does not vary this ratio yet — ledger §3.52.
-            Some(TiffCompressor::Deflate) => Compression::Deflate(DeflateLevel::default()),
+            Some(TiffCompressor::Deflate) => {
+                // `DeflateLevel::Balanced as u8`'s `6` is the crate's own
+                // `Default`, used when `compression_level` is left at `-1`.
+                Compression::Deflate(deflate_level_for(options.resolved_level(6)))
+            }
         }
     };
 
@@ -1732,6 +1760,34 @@ mod tests {
         assert_eq!(rows_per_strip(1024, 1, 16), 512);
         // A scanline larger than 1 MiB still gets one row.
         assert_eq!(rows_per_strip(2_000_000, 1, 8), 1);
+    }
+
+    /// Fixed §3.52: the clamped `1..=9` `compression_level` range partitions
+    /// into exactly three `DeflateLevel` tiers, each discriminant at the
+    /// middle of its own bucket.
+    #[test]
+    fn deflate_level_for_partitions_one_through_nine_into_three_tiers() {
+        for level in 1..=3 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Fast,
+                "level {level}"
+            );
+        }
+        for level in 4..=6 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Balanced,
+                "level {level}"
+            );
+        }
+        for level in 7..=9 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Best,
+                "level {level}"
+            );
+        }
     }
 
     /// libtiff's `DoubleToRational` easy paths, and the continued-fraction one

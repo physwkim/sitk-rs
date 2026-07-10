@@ -4739,6 +4739,55 @@ mod tests {
         assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §3.52: `deflate_level_for`'s three tiers are byte-identical
+    /// within a tier and strictly ordered `Fast > Balanced > Best` across
+    /// tiers — a 256x256 texture with both fine and coarse repetition, so
+    /// zlib's effort level actually has room to matter. Upstream never had a
+    /// Deflate-ratio knob to pin against; this is pinned directly against the
+    /// `tiff` crate's own flate2-backed output.
+    #[test]
+    fn tiff_deflate_compression_level_selects_one_of_three_ratio_tiers() {
+        let data: Vec<u8> = (0..256 * 256u32)
+            .map(|i| (((i % 251) + (i / 37) % 17) % 256) as u8)
+            .collect();
+        let img = Image::from_vec(&[256, 256], data.clone()).unwrap();
+
+        let size_at = |level: i32| -> u64 {
+            let path = tmp_path(&format!("deflate_tier_{level}.tif"));
+            let mut writer = ImageFileWriter::new();
+            writer
+                .set_file_name(&path)
+                .use_compression_on()
+                .set_compression_level(level)
+                .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+            writer.execute(&img).unwrap();
+            let back = read_image(&path).unwrap();
+            assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+            let len = std::fs::metadata(&path).unwrap().len();
+            std::fs::remove_file(&path).ok();
+            len
+        };
+
+        let fast = size_at(1);
+        let balanced = size_at(4);
+        let best = size_at(7);
+
+        assert_eq!(fast, size_at(2));
+        assert_eq!(fast, size_at(3));
+        assert_eq!(balanced, size_at(5));
+        assert_eq!(balanced, size_at(6));
+        assert_eq!(best, size_at(8));
+        assert_eq!(best, size_at(9));
+
+        assert!(fast > balanced, "{fast} !> {balanced}");
+        assert!(balanced > best, "{balanced} !> {best}");
+
+        // `-1` resolves to this crate's own `6` default, and `100` clamps
+        // (itkImageIOBase.h:288) to `9` — `Balanced` and `Best` respectively.
+        assert_eq!(size_at(-1), balanced, "default is the Balanced tier");
+        assert_eq!(size_at(100), best, "100 clamps to 9, the Best tier");
+    }
+
     /// Fixed §3.51: `if (m_UseCompression) { switch (m_Compression) {...} }
     /// else { compression = COMPRESSION_NONE; }` (itkTIFFImageIO.cxx:692-716)
     /// — an explicit compressor never overrides `UseCompressionOff`.
@@ -4767,9 +4816,13 @@ mod tests {
     }
 
     /// `SetCompressionLevel` is TIFF's *JPEG quality*
-    /// (itkTIFFImageIO.cxx:213, itkTIFFImageIO.h:171-179), and the only site that
-    /// reads it is the unreachable `JPEG` arm (`:749`) —
-    /// so it changes nothing about the bytes written. Ledger §3.52.
+    /// (itkTIFFImageIO.cxx:213, itkTIFFImageIO.h:171-179), and upstream's only
+    /// site that reads it is the unreachable `JPEG` arm (`:749`). This port
+    /// now gives the level a use of its own for `TiffCompressor::Deflate`
+    /// (§3.52, `tiff_deflate_compression_level_selects_one_of_three_ratio_tiers`)
+    /// — but the *default* compressor stays `PackBits`, which has no ratio to
+    /// vary, so for a write with no explicit compressor the level still
+    /// changes nothing about the bytes written.
     #[test]
     fn tiff_compression_level_does_not_change_the_written_bytes() {
         let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
