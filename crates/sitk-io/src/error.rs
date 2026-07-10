@@ -277,6 +277,47 @@ pub enum IoError {
     /// (sitkTransform.cxx:718-722).
     #[error("unable to read a transform of dimension {0}: only 2D and 3D are supported")]
     UnsupportedTransformDimension(usize),
+
+    /// A JPEG feature this port does not implement, or that SimpleITK's
+    /// wrapping layer cannot represent: a >8-bit-precision (12-bit lossless)
+    /// JPEG, which `itk::JPEGImageIO` cannot read either since its own
+    /// `m_ComponentType` is hard-coded `UCHAR` at compile time
+    /// (itkJPEGImageIO.cxx:292-297); a frame with a component count other
+    /// than 1, 3 or 4, which `jpeg-decoder` itself refuses
+    /// (`UnsupportedFeature::ComponentCount`); or a write of an image whose
+    /// component count is not 1 or 3, which upstream's `WriteSlice` accepts
+    /// into an ill-defined `JCS_UNKNOWN` encoding with only a warning
+    /// (itkJPEGImageIO.cxx:521-533) but `jpeg-encoder`'s typed `ColorType`
+    /// has no counterpart for. See [`crate::jpeg`] and ledger §4.
+    #[error("unsupported JPEG feature: {0}")]
+    UnsupportedJpegFeature(String),
+
+    /// A JPEG feature `JPEGImageIO::Write` itself refuses with a thrown
+    /// exception: a non-2-dimensional image (`:460-463`, unlike
+    /// `PNGImageIO`'s silent first-slice-only write, ledger §2.125) or a
+    /// non-`unsigned char` component type (`:465-468`).
+    #[error("cannot write JPEG file: {0}")]
+    JpegWriteRejected(String),
+
+    /// A JPEG file failed to decode, or its header failed to parse — a bad
+    /// magic number `jpeg-decoder` itself caught past this crate's own
+    /// two-byte SOI check, a truncated/corrupt entropy-coded scan, or an
+    /// unsupported JPEG feature `jpeg-decoder` names directly (arithmetic
+    /// coding, hierarchical JPEG, DNL). Upstream has no single equivalent:
+    /// libjpeg's error handler longjmps out of `jpeg_read_header`
+    /// (`"Error JPEGImageIO could not open file: ..."`,
+    /// itkJPEGImageIO.cxx:356-360) or, mid-scanline, is caught as a
+    /// *warning* that returns a partially-filled buffer
+    /// (`:228-235`, `:267-273`) — not expressible in safe Rust, matching
+    /// ledger §4.75; this port raises an error for either failure point.
+    #[error("jpeg decoding error: {0}")]
+    JpegDecode(#[from] jpeg_decoder::Error),
+
+    /// A JPEG image failed to encode — a `jpeg-encoder` internal I/O failure,
+    /// or a data-length mismatch this crate's own checks should have already
+    /// ruled out.
+    #[error("jpeg encoding error: {0}")]
+    JpegEncode(#[from] jpeg_encoder::EncodingError),
 }
 
 /// Convenience alias for IO results.

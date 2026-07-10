@@ -47,6 +47,7 @@ use sitk_core::{Image, PixelId};
 use crate::error::{IoError, Result};
 use crate::gipl::GiplImageIo;
 use crate::image_hdf5::Hdf5ImageIo;
+use crate::jpeg::JpegImageIo;
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
@@ -185,6 +186,7 @@ static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 static PNG_IMAGE_IO: PngImageIo = PngImageIo;
 static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
+static JPEG_IMAGE_IO: JpegImageIo = JpegImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -210,10 +212,14 @@ static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
 /// `can_read_file` ignores them entirely and probes for an `/ITKImage` link, so
 /// phase 2 lets it claim an HDF5 image under any name at all.
 ///
+/// [`JpegImageIo`] advertises `.jpg`/`.JPG`/`.jpeg`/`.JPEG`, disjoint from every
+/// other IO's extension set.
+///
 /// [`VtkImageIo`]: crate::vtk::VtkImageIo
 /// [`GiplImageIo`]: crate::gipl::GiplImageIo
 /// [`PngImageIo`]: crate::png::PngImageIo
 /// [`Hdf5ImageIo`]: crate::image_hdf5::Hdf5ImageIo
+/// [`JpegImageIo`]: crate::jpeg::JpegImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
         &META_IMAGE_IO,
@@ -223,6 +229,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &VTK_IMAGE_IO,
         &PNG_IMAGE_IO,
         &HDF5_IMAGE_IO,
+        &JPEG_IMAGE_IO,
     ];
     IOS
 }

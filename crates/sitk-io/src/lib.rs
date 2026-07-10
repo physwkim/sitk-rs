@@ -39,6 +39,7 @@ pub mod error;
 pub mod gipl;
 pub mod image_hdf5;
 pub mod image_io;
+pub mod jpeg;
 pub mod meta_image;
 pub mod nifti;
 pub mod nrrd;
@@ -406,14 +407,14 @@ mod tests {
         assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
     }
 
-    /// No registered `ImageIo` advertises `.jpg`, so `CreateImageIO` returns
+    /// No registered `ImageIo` advertises `.bmp`, so `CreateImageIO` returns
     /// null and `ImageFileWriter::GetImageIOBase` throws "Unable to determine
     /// ImageIO writer" (sitkImageFileWriter.cxx:207-210).
     #[test]
     fn unknown_extension_errors() {
         let img = Image::new(&[2, 2], PixelId::UInt8);
         assert!(matches!(
-            write_image(&img, tmp_path("x.jpg")),
+            write_image(&img, tmp_path("x.bmp")),
             Err(IoError::NoWriterFound(_))
         ));
     }
@@ -433,7 +434,8 @@ mod tests {
                 "GiplImageIO",
                 "VTKImageIO",
                 "PNGImageIO",
-                "HDF5ImageIO"
+                "HDF5ImageIO",
+                "JPEGImageIO"
             ]
         );
         assert_eq!(
@@ -458,9 +460,13 @@ mod tests {
             image_io_by_name("HDF5ImageIO").unwrap().name(),
             "HDF5ImageIO"
         );
+        assert_eq!(
+            image_io_by_name("JPEGImageIO").unwrap().name(),
+            "JPEGImageIO"
+        );
         assert!(matches!(
-            image_io_by_name("JPEGImageIO"),
-            Err(IoError::UnknownImageIo(name)) if name == "JPEGImageIO"
+            image_io_by_name("BMPImageIO"),
+            Err(IoError::UnknownImageIo(name)) if name == "BMPImageIO"
         ));
     }
 
@@ -576,9 +582,9 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(written.starts_with(b"NRRD"));
 
-        // PNG is now registered (unlike when this test was written), so an
-        // unregistered name is needed for the negative case.
-        writer.set_image_io(Some("JPEGImageIO"));
+        // PNG, HDF5 and JPEG are now registered (unlike when this test was
+        // written), so an unregistered name is needed for the negative case.
+        writer.set_image_io(Some("BMPImageIO"));
         assert!(matches!(
             writer.execute(&img),
             Err(IoError::UnknownImageIo(_))
@@ -592,7 +598,8 @@ mod tests {
                 "GiplImageIO",
                 "VTKImageIO",
                 "PNGImageIO",
-                "HDF5ImageIO"
+                "HDF5ImageIO",
+                "JPEGImageIO"
             ]
         );
     }
@@ -4181,5 +4188,112 @@ mod tests {
 
         assert!(claimed);
         assert!(matches!(&result, Err(IoError::PngDecode(_))), "{result:?}");
+    }
+
+    // ---- JPEG ---------------------------------------------------------------
+
+    /// JPEG is lossy, so only dimensions and pixel type round-trip exactly —
+    /// not exact bytes.
+    #[test]
+    fn jpeg_roundtrip_grayscale_uint8() {
+        let data: Vec<u8> = (0..(16 * 12))
+            .map(|i| ((i * 37 + i * i) % 256) as u8)
+            .collect();
+        let img = Image::from_vec(&[16, 12], data).unwrap();
+        let path = tmp_path("gray_u8.jpg");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.size(), &[16, 12]);
+    }
+
+    #[test]
+    fn jpeg_roundtrip_rgb_vector_uint8() {
+        let data: Vec<u8> = (0..(20 * 10 * 3)).map(|i| ((i * 53) % 256) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[20, 10], 3, data).unwrap();
+        let path = tmp_path("rgb_u8.jpg");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.size(), &[20, 10]);
+    }
+
+    /// `Write` throws outright when `GetNumberOfDimensions() != 2`
+    /// (itkJPEGImageIO.cxx:459-463) — unlike PNG, which silently writes only
+    /// the first Z-slice (ledger §2.125). No file is left behind. Ledger
+    /// §2.135.
+    #[test]
+    fn jpeg_write_of_a_three_dimensional_image_is_rejected() {
+        let img = Image::from_vec(&[2, 2, 3], vec![0u8; 12]).unwrap();
+        let path = tmp_path("three_d.jpg");
+
+        let result = write_image(&img, &path);
+
+        assert!(
+            matches!(&result, Err(IoError::JpegWriteRejected(m)) if m.contains("2-dimensional")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// `CanReadFile`'s magic check rejects a `.jpg`-named file whose content
+    /// is not a JPEG, so `create_image_io` never selects [`jpeg`] for it and
+    /// the top-level [`read_image`] reports [`IoError::NoReaderFound`] rather
+    /// than [`IoError::JpegDecode`] — that error is only observable by
+    /// calling [`jpeg::read`]/[`jpeg::read_information`] directly, bypassing
+    /// the registry, exactly as the analogous PNG/GIPL/VTK tests do.
+    #[test]
+    fn jpeg_garbage_bytes_under_a_jpg_extension_are_not_claimed_for_reading() {
+        let path = tmp_path("garbage.jpg");
+        std::fs::write(&path, b"this is not a jpeg file, but is long enough\n").unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        let direct_read = jpeg::read(&path);
+        let direct_info = jpeg::read_information(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+        assert!(
+            matches!(&direct_read, Err(IoError::JpegDecode(_))),
+            "{direct_read:?}"
+        );
+        assert!(
+            matches!(&direct_info, Err(IoError::JpegDecode(_))),
+            "{direct_info:?}"
+        );
+    }
+
+    /// Unlike the garbage-bytes case, `CanReadFile` parses the *header*
+    /// completely (itkJPEGImageIO.cxx:141-155) but never touches the
+    /// entropy-coded scan data that follows it — so a file with a genuine
+    /// header but a truncated scan *is* claimed, and the decode failure
+    /// surfaces through the registry as [`IoError::JpegDecode`]. The JPEG
+    /// counterpart of `png_truncated_idat_is_claimed_and_then_a_decode_error`.
+    #[test]
+    fn jpeg_truncated_scan_data_is_claimed_and_then_a_decode_error() {
+        let img = Image::from_vec(&[32, 32], vec![0u8; 32 * 32]).unwrap();
+        let path = tmp_path("truncated.jpg");
+        write_image(&img, &path).unwrap();
+
+        let full = std::fs::read(&path).unwrap();
+        let truncated = &full[..full.len() - 20];
+        std::fs::write(&path, truncated).unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(claimed);
+        assert!(matches!(&result, Err(IoError::JpegDecode(_))), "{result:?}");
     }
 }
