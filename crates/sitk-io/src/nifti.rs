@@ -2191,8 +2191,11 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
 /// (nifti1_io.c:5030-5034) — for `COMPLEX64` the swap size is `4`, so the real
 /// and imaginary halves are swapped independently.
 ///
-/// `FLOAT32`/`FLOAT64`/`COMPLEX64`/`COMPLEX128` also get the `IS_GOOD_FLOAT`
-/// treatment (:5036-5070): a NaN or infinity read from disk becomes `0`.
+/// `FLOAT32`/`FLOAT64`/`COMPLEX64`/`COMPLEX128` are read verbatim. Upstream's
+/// `IS_GOOD_FLOAT` block (:5036-5070) maps every NaN or infinity read from disk
+/// to `0` — silent, irreversible pixel-data loss active only on glibc (where
+/// `<math.h>` defines `isfinite` as a macro). This port **fixes** that at
+/// source and preserves the non-finite pixels (ledger §2.90).
 fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
     macro_rules! unpack {
         ($ty:ty, $variant:ident) => {{
@@ -2212,25 +2215,6 @@ fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
             )
         }};
     }
-    macro_rules! unpack_float {
-        ($ty:ty, $variant:ident) => {{
-            const S: usize = std::mem::size_of::<$ty>();
-            PixelBuffer::$variant(
-                bytes
-                    .chunks_exact(S)
-                    .map(|c| {
-                        let a: [u8; S] = c.try_into().expect("chunks_exact yields S bytes");
-                        let v = if swapped {
-                            <$ty>::from_be_bytes(a)
-                        } else {
-                            <$ty>::from_le_bytes(a)
-                        };
-                        if v.is_finite() { v } else { 0.0 }
-                    })
-                    .collect(),
-            )
-        }};
-    }
     match datatype {
         NIFTI_TYPE_UINT8 | NIFTI_TYPE_RGB24 | NIFTI_TYPE_RGBA32 => {
             PixelBuffer::UInt8(bytes.to_vec())
@@ -2242,8 +2226,8 @@ fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
         NIFTI_TYPE_UINT32 => unpack!(u32, UInt32),
         NIFTI_TYPE_INT64 => unpack!(i64, Int64),
         NIFTI_TYPE_UINT64 => unpack!(u64, UInt64),
-        NIFTI_TYPE_FLOAT32 | NIFTI_TYPE_COMPLEX64 => unpack_float!(f32, Float32),
-        NIFTI_TYPE_FLOAT64 | NIFTI_TYPE_COMPLEX128 => unpack_float!(f64, Float64),
+        NIFTI_TYPE_FLOAT32 | NIFTI_TYPE_COMPLEX64 => unpack!(f32, Float32),
+        NIFTI_TYPE_FLOAT64 | NIFTI_TYPE_COMPLEX128 => unpack!(f64, Float64),
         _ => unreachable!("datatype validated by read_info"),
     }
 }

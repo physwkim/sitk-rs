@@ -1704,21 +1704,33 @@ mod tests {
     }
 
     /// `nifti_read_buffer`'s `#ifdef isfinite` block (nifti1_io.c:5036-5070) is
-    /// live on glibc, which defines `isfinite` as a macro: every non-finite
-    /// float read from disk becomes zero. Platform-dependent upstream behaviour,
-    /// pinned for Linux (ledger §2.90).
+    /// live on glibc, which defines `isfinite` as a macro, and maps every
+    /// non-finite float read from disk to zero — silent, irreversible pixel-data
+    /// loss. This port **fixes** it: NaN and ±Inf survive the round trip
+    /// (ledger §2.90).
     #[test]
-    fn nii_non_finite_pixels_are_zeroed_on_read() {
-        let img = Image::from_vec(&[3, 1], vec![f32::NAN, f32::INFINITY, 1.5]).unwrap();
+    fn nii_non_finite_pixels_are_preserved_on_read() {
+        let img = Image::from_vec(
+            &[4, 1],
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5],
+        )
+        .unwrap();
         let path = tmp_path("nonfinite.nii");
         write_image(&img, &path).unwrap();
-        // The writer stores them verbatim; only the reader sanitises.
+        // The writer stores them verbatim.
         let bytes = std::fs::read(&path).unwrap();
         assert!(f32::from_le_bytes(bytes[352..356].try_into().unwrap()).is_nan());
 
         let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(back.scalar_slice::<f32>().unwrap(), &[0.0, 0.0, 1.5]);
+        let pixels = back.scalar_slice::<f32>().unwrap();
+        assert!(
+            pixels[0].is_nan(),
+            "NaN pixel was not preserved: {pixels:?}"
+        );
+        assert_eq!(pixels[1], f32::INFINITY);
+        assert_eq!(pixels[2], f32::NEG_INFINITY);
+        assert_eq!(pixels[3], 1.5);
     }
 
     /// A gzipped NIfTI is claimed by the registry and round-trips. Compression
