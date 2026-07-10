@@ -205,10 +205,10 @@
 //!   encapsulates every tag into `m_MetaDataDictionary` keyed by
 //!   `TIFFFieldName(field)`, dispatching on `TIFFFieldDataType`,
 //!   `TIFFFieldReadCount` and `TIFFFieldPassCount`
-//!   (itkTIFFImageIO.cxx:1054-1256). That machinery is libtiff's field
+//!   (itkTIFFImageIO.cxx:1055-1256). That machinery is libtiff's field
 //!   registry, which the `tiff` crate does not expose — its `Tag` enum carries
 //!   no names, read counts or pass-count flags. [`read_information`] therefore
-//!   returns an empty dictionary. Ledger §4.92, §5.26.
+//!   returns an empty dictionary. Ledger §4.97.
 //! * **`SetColorPalette` / `WritePalette`.** `InternalWrite` writes
 //!   `PHOTOMETRIC_PALETTE` and a colour map when `GetWritePalette()` is on and
 //!   the image is scalar (itkTIFFImageIO.cxx:724-738, :1000-1052). SimpleITK

@@ -4193,7 +4193,7 @@ mod tests {
     // ---- TIFF --------------------------------------------------------------
 
     /// The 2-D scalar round-trips, one per `SampleFormat` / bit-depth pair the
-    /// `component_type` ladder (itkTIFFImageIO.cxx:341-366) can name.
+    /// `component_type` ladder (itkTIFFImageIO.cxx:395-431) can name.
     #[test]
     fn tiff_roundtrip_scalar_uint8() {
         let data: Vec<u8> = (0..12u32).map(|i| (i * 23) as u8).collect();
@@ -4277,9 +4277,9 @@ mod tests {
         assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
     }
 
-    /// Four components become `PHOTOMETRIC_RGB` plus one `EXTRASAMPLE_ASSOCALPHA`
-    /// (itkTIFFImageIO.cxx:735-745), and `GetFormat` reads that back as
-    /// `RGB_` with four components.
+    /// Four components become `PHOTOMETRIC_RGB` (itkTIFFImageIO.cxx:731) plus one
+    /// `EXTRASAMPLE_ASSOCALPHA` (`:678-690`), and `GetFormat` reads that back as
+    /// `RGB_` with four components (`:107-110`, `:441-444`).
     #[test]
     fn tiff_roundtrip_rgba_vector_uint16() {
         let data: Vec<u16> = (0..48u32).map(|i| (i * 4111 + 29) as u16).collect();
@@ -4295,7 +4295,7 @@ mod tests {
     }
 
     /// `InternalWrite` sends every component count other than 1 down the
-    /// `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:722-745), so a two-component
+    /// `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:725-732), so a two-component
     /// image is written as RGB with `SamplesPerPixel = 2` — a file no TIFF
     /// reader can interpret as colour, and which upstream's own reader takes
     /// back as a *one*-component grayscale of half-rows (§2.136). This port
@@ -4317,8 +4317,8 @@ mod tests {
 
     /// A 3-D image writes one directory per slice, each tagged
     /// `FILETYPE_PAGE` with a `TIFFTAG_PAGENUMBER` of `(page, total)`
-    /// (itkTIFFImageIO.cxx:799-813). `m_SubFiles` counts only `SUBFILETYPE == 0`
-    /// directories, so on the way back in every page is `FILETYPE_PAGE`,
+    /// (itkTIFFImageIO.cxx:800-806). `m_SubFiles` counts only `SUBFILETYPE == 0`
+    /// directories (itkTIFFReaderInternal.cxx:231-251), so on the way back in every page is `FILETYPE_PAGE`,
     /// `m_SubFiles == 0`, and the depth comes from `m_NumberOfPages`.
     #[test]
     fn tiff_roundtrip_three_dimensional_volume() {
@@ -4356,7 +4356,7 @@ mod tests {
     }
 
     /// A zero spacing writes no resolution tags at all
-    /// (itkTIFFImageIO.cxx:792), and the reader's `m_ResolutionUnit > 0` guard
+    /// (itkTIFFImageIO.cxx:792), and the reader's `m_ResolutionUnit > 0` guard (`:375`)
     /// then leaves the spacing at its `1.0` seed.
     #[test]
     fn tiff_unit_spacing_is_the_default_when_no_resolution_is_written() {
@@ -4373,7 +4373,7 @@ mod tests {
 
     /// `m_UseCompression` picks between `COMPRESSION_NONE` and this port's only
     /// reachable compressor, `COMPRESSION_PACKBITS`
-    /// (itkTIFFImageIO.cxx:243-246, :769-775). The image must survive the
+    /// (itkTIFFImageIO.cxx:214, :259-265, :694-712). The image must survive the
     /// round-trip through multi-row strips — upstream sizes strips at
     /// `1 MiB / scanlinesize` rows regardless of the compressor
     /// (itkTIFFImageIO.cxx:784), where the `tiff` crate's own `PackBits` default
@@ -4402,7 +4402,8 @@ mod tests {
     }
 
     /// `SetCompressionLevel` is TIFF's *JPEG quality*
-    /// (itkTIFFImageIO.cxx:248-251), and no reachable compressor consults it —
+    /// (itkTIFFImageIO.cxx:213, itkTIFFImageIO.h:171-179), and the only site that
+    /// reads it is the unreachable `JPEG` arm (`:749`) —
     /// so it changes nothing about the bytes written. Ledger §3.50.
     #[test]
     fn tiff_compression_level_does_not_change_the_written_bytes() {
@@ -4422,8 +4423,9 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    /// `TIFFImageIO::CanWriteFile` lower-cases nothing
-    /// (itkTIFFImageIO.cxx:180-200): it compares the extension against
+    /// `TIFFImageIO::CanWriteFile` lower-cases nothing — it is
+    /// `HasSupportedWriteExtension(name, false)` (itkTIFFImageIO.cxx:542-553),
+    /// whose `false` is `ignoreCase`, so it compares the extension against
     /// `.tif`/`.TIF`/`.tiff`/`.TIFF` verbatim, so a `.Tif` file finds no writer.
     #[test]
     fn tiff_mixed_case_extension_finds_no_writer() {
@@ -4438,8 +4440,9 @@ mod tests {
         );
     }
 
-    /// `TIFFImageIO::CanReadFile` ignores the file name entirely and asks
-    /// libtiff to open the file (itkTIFFImageIO.cxx:161-178), so a TIFF under
+    /// `TIFFImageIO::CanReadFile` ignores the file name entirely (beyond rejecting
+    /// an empty one) and asks libtiff to open the file
+    /// (itkTIFFImageIO.cxx:30-50), so a TIFF under
     /// any extension is claimed for reading — where `PNGImageIO` and the rest
     /// gate on the extension first.
     #[test]
