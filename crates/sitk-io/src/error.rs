@@ -382,6 +382,127 @@ pub enum IoError {
     /// (itkGDCMImageIO.cxx:284).
     #[error("dicom read error: {0}")]
     DicomRead(String),
+
+    /// `ImageSeriesReader::Execute` with no file names —
+    /// `"File names information is empty. Cannot read series."`
+    /// (sitkImageSeriesReader.cxx:198-201).
+    #[error("File names information is empty. Cannot read series.")]
+    EmptySeriesFileNames,
+
+    /// The series' promoted dimension (the first file's own dimension, plus
+    /// one for the stack, minus one again if a 4-D promotion collapsed back to
+    /// 3-D) fell outside `2..=SITK_MAX_DIMENSION`. `ImageSeriesReader::Execute`
+    /// throws `"The file in the series have unsupported N dimensions."`, where
+    /// `N` is the promoted dimension minus one (sitkImageSeriesReader.cxx:
+    /// 231-234).
+    #[error("The file in the series have unsupported {0} dimensions.")]
+    UnsupportedSeriesDimension(usize),
+
+    /// A slice's own size (padded to the series' output dimension) does not
+    /// match the size established by the series' first file.
+    /// `itk::ImageSeriesReader::GenerateData` throws `"Size mismatch! The
+    /// size of  ... is ... and does not match the required size ... from
+    /// file ..."` — including the upstream double space after "of"
+    /// (itkImageSeriesReader.hxx:356-360).
+    #[error(
+        "Size mismatch! The size of  {file} is {size:?} and does not match \
+         the required size {expected:?} from file {reference_file}"
+    )]
+    SeriesSizeMismatch {
+        /// The slice whose size disagreed.
+        file: PathBuf,
+        /// That slice's own size, padded to the series' output dimension.
+        size: Vec<usize>,
+        /// The size established by the series' first file.
+        expected: Vec<usize>,
+        /// The file the required size came from.
+        reference_file: PathBuf,
+    },
+
+    /// A slice's pixel type (or, for a vector image, its component count)
+    /// disagrees with the series' first file. Upstream has no such check:
+    /// `itk::ImageFileReader<TOutputImage>` silently casts every slice's raw
+    /// samples into the series' fixed compile-time pixel type, which can
+    /// narrow lossily (documented at sitkImageSeriesReader.h:56-65, "If this
+    /// leads to a narrowing conversion ... the returned image does not
+    /// represent the data correctly"). This crate has no pixel-type-casting
+    /// `ImageIo` layer anywhere (`ImageFileReader` does not implement
+    /// `SetOutputPixelType` either), so silently proceeding would corrupt the
+    /// shared output buffer rather than merely mis-cast a value; this is a
+    /// deliberate divergence, not a reproduction of the upstream behavior.
+    #[error(
+        "pixel type mismatch in series: {file} is {pixel_type}, expected \
+         {expected} (this port does not cast slice pixel types, unlike \
+         upstream's implicit narrowing cast)"
+    )]
+    SeriesPixelTypeMismatch {
+        /// The slice whose pixel type disagreed.
+        file: PathBuf,
+        /// That slice's own pixel type, as `GetPixelIDValueAsString` would
+        /// print it.
+        pixel_type: &'static str,
+        /// The series' pixel type, from the first file.
+        expected: &'static str,
+    },
+
+    /// A slice index passed to [`meta_data_keys`](crate::image_series_reader::ImageSeriesReader::meta_data_keys) /
+    /// [`has_meta_data_key`](crate::image_series_reader::ImageSeriesReader::has_meta_data_key) /
+    /// [`meta_data`](crate::image_series_reader::ImageSeriesReader::meta_data) is
+    /// out of range for the dictionaries actually collected.
+    /// `GetMetaDataKeysCustomCast::CustomCast` and its siblings index with
+    /// `std::vector::at`, which throws `std::out_of_range`
+    /// (sitkMetaDataDictionaryCustomCast.hxx:44,55,84).
+    #[error("slice index {slice} is out of range for the {len} collected meta-data dictionaries")]
+    SeriesSliceIndexOutOfRange {
+        /// The requested slice index.
+        slice: usize,
+        /// The number of dictionaries actually collected.
+        len: usize,
+    },
+
+    /// `ImageSeriesWriter::ExecuteInternal` with no file names —
+    /// `"The parameter \"FileNames\" is empty!"` (sitkImageSeriesWriter.cxx:
+    /// 219-222).
+    #[error("The parameter \"FileNames\" is empty!")]
+    EmptySeriesWriterFileNames,
+
+    /// `ImageSeriesWriter` dispatches through the same `MemberFunctionFactory`
+    /// machinery as the single-file writer, but registers only dimension 3
+    /// (`RegisterMemberFunctions<PixelIDTypeList, 3>()`,
+    /// sitkImageSeriesWriter.cxx:49-50) — a 2-D or 4-D-and-up image reaches
+    /// `GetMemberFunction`'s generic `"Pixel type: ... is not supported in
+    /// ...D by ..."` (sitkMemberFunctionFactory.hxx). `typeid(ObjectType).
+    /// name()` has no Rust equivalent, so this substitutes the class's own
+    /// name.
+    #[error("Pixel type: {pixel_type} is not supported in {dimension}D by ImageSeriesWriter.")]
+    SeriesWriterUnsupportedDimension {
+        /// The image's own pixel type, as `GetPixelIDValueAsString` would
+        /// print it.
+        pixel_type: &'static str,
+        /// The image's own dimension (anything other than 3).
+        dimension: usize,
+    },
+
+    /// A file name passed to `ImageSeriesWriter` has (or, having no `.` at
+    /// all, silently becomes) a DICOM extension.
+    /// `ImageSeriesWriter::ExecuteInternal` throws `"ImageSeriesWriter does
+    /// not support writing a DICOM series!"` (sitkImageSeriesWriter.cxx:
+    /// 225-235); the message carries no file name upstream, so neither does
+    /// this variant.
+    #[error("ImageSeriesWriter does not support writing a DICOM series!")]
+    SeriesWriterDicomRejected,
+
+    /// The number of file names does not match the image's Z size.
+    /// `itk::ImageSeriesWriter::WriteFiles` throws `"The number of filenames
+    /// passed is ... but ... were expected "` — including the upstream
+    /// trailing space (itkImageSeriesWriter.hxx:240-244).
+    #[error("The number of filenames passed is {actual} but {expected} were expected ")]
+    SeriesFileNameCountMismatch {
+        /// The number of file names actually given.
+        actual: usize,
+        /// The image's own Z size.
+        expected: usize,
+    },
 }
 
 /// Convenience alias for IO results.
