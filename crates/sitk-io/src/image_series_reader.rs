@@ -15,7 +15,7 @@ use sitk_core::{Complex, Image, PixelBuffer, PixelId, matrix};
 
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, reader_for};
-use crate::reader::normalize_reader_geometry;
+use crate::reader::{join_f64, normalize_reader_geometry};
 
 /// `SimpleITK_MAX_DIMENSION` (CMake `SimpleITK_MAX_DIMENSION_DEFAULT`), the
 /// ceiling `ImageSeriesReader::Execute` enforces on the promoted dimension
@@ -395,12 +395,22 @@ impl ImageSeriesReader {
             let file_idx = if self.reverse_order { n - 1 - i } else { i };
             let path = self.file_names[file_idx].clone();
             let mut slice_image = io.read(&path)?;
+            // Upstream reads each slice through `ImageFileReader<TOutputImage>`,
+            // the *stacked* type (itkImageSeriesReader.h:226): it pads the slice
+            // geometry to the output dimension (degenerate axes get spacing 1.0
+            // and an identity row/column, itkImageFileReader.hxx:195-214) and
+            // then records `ITK_original_*` from the padded, *pre-flip* geometry
+            // (:216-221) before flipping negative spacing (:226-236). Capture the
+            // raw slice geometry now so the collected dicts carry those padded
+            // pre-flip originals rather than the native-dimension ones
+            // `normalize_reader_geometry` records on the slice itself.
+            let slice_dim = slice_image.dimension();
+            let raw_slice_spacing = slice_image.spacing().to_vec();
+            let raw_slice_direction = slice_image.direction().to_vec();
             // Every slice goes through the same `ImageFileReader` normalization
-            // upstream applies per file (itkImageSeriesReader.hxx:106-109,327):
-            // negative spacing flips positive and the raw geometry is recorded
-            // under `ITK_original_*`, which the collected per-slice dictionaries
-            // then copy (itkImageFileReader.hxx:219-221,
-            // itkImageSeriesReader.hxx:468).
+            // upstream applies per file: negative spacing flips positive and the
+            // slice image used for stacking keeps its native geometry
+            // (itkImageSeriesReader.hxx:106-109,327,468).
             normalize_reader_geometry(&mut slice_image)?;
             if slice_image.pixel_id() != pixel_id {
                 return Err(IoError::SeriesPixelTypeMismatch {
@@ -438,6 +448,27 @@ impl ImageSeriesReader {
 
             if collect_metadata {
                 let mut dict = image_metadata(&slice_image);
+                // Replace the native-dimension `ITK_original_*` that
+                // `normalize_reader_geometry` recorded on the slice with the
+                // padded, pre-flip geometry upstream's
+                // `ImageFileReader<TOutputImage>` records: spacing padded with
+                // 1.0, the raw direction embedded in an out_dim identity
+                // (itkImageFileReader.hxx:195-221). `pad_axes` performs exactly
+                // that embedding; `join_f64` is the same formatter the
+                // single-file path uses, so the strings are byte-identical.
+                let (_, orig_spacing, _, orig_direction) = pad_axes(
+                    slice_dim,
+                    out_dim,
+                    slice_image.size(),
+                    &raw_slice_spacing,
+                    slice_image.origin(),
+                    &raw_slice_direction,
+                );
+                dict.insert("ITK_original_spacing".to_string(), join_f64(&orig_spacing));
+                dict.insert(
+                    "ITK_original_direction".to_string(),
+                    join_f64(&orig_direction),
+                );
                 if non_uniform {
                     dict.insert(
                         "ITK_non_uniform_sampling_deviation".to_string(),
@@ -908,17 +939,20 @@ mod tests {
         );
 
         // Every collected per-slice dictionary carries the raw geometry under
-        // `ITK_original_*`, exactly as upstream's per-file `ImageFileReader`
-        // records and the series reader copies.
+        // `ITK_original_*`, padded to the stacked output dimension exactly as
+        // upstream's `ImageFileReader<TOutputImage>` records it (the native 2-D
+        // slice geometry embedded in the 3-D output: spacing padded with 1.0,
+        // the raw 2×2 direction embedded in a 3×3 identity, all pre-flip —
+        // itkImageFileReader.hxx:195-221).
         for slice in 0..2 {
             assert_eq!(
                 reader.meta_data(slice, "ITK_original_spacing").unwrap(),
-                Some("2 -3"),
+                Some("2 -3 1"),
                 "slice {slice} ITK_original_spacing"
             );
             assert_eq!(
                 reader.meta_data(slice, "ITK_original_direction").unwrap(),
-                Some("1 0 0 1"),
+                Some("1 0 0 0 1 0 0 0 1"),
                 "slice {slice} ITK_original_direction"
             );
         }
