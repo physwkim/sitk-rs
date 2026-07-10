@@ -4189,4 +4189,291 @@ mod tests {
         assert!(claimed);
         assert!(matches!(&result, Err(IoError::PngDecode(_))), "{result:?}");
     }
+
+    // ---- TIFF --------------------------------------------------------------
+
+    /// The 2-D scalar round-trips, one per `SampleFormat` / bit-depth pair the
+    /// `component_type` ladder (itkTIFFImageIO.cxx:341-366) can name.
+    #[test]
+    fn tiff_roundtrip_scalar_uint8() {
+        let data: Vec<u8> = (0..12u32).map(|i| (i * 23) as u8).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("scalar_u8.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn tiff_roundtrip_scalar_int8() {
+        let data: Vec<i8> = (0..12i32).map(|i| (i * 17 - 100) as i8).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("scalar_i8.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::Int8);
+        assert_eq!(back.scalar_slice::<i8>().unwrap(), data.as_slice());
+    }
+
+    /// Both libtiff and the `tiff` crate hand back samples already in host
+    /// order, so a 16-bit round-trip needs no byte swap on either side — unlike
+    /// PNG, whose big-endian samples the port swaps by hand.
+    #[test]
+    fn tiff_roundtrip_scalar_uint16() {
+        let data: Vec<u16> = (0..12u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("scalar_u16.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::UInt16);
+        assert_eq!(back.scalar_slice::<u16>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn tiff_roundtrip_scalar_int16() {
+        let data: Vec<i16> = (0..12i32).map(|i| (i * 4111 - 20_000) as i16).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("scalar_i16.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::Int16);
+        assert_eq!(back.scalar_slice::<i16>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn tiff_roundtrip_scalar_float32() {
+        let data: Vec<f32> = (0..12u32).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("scalar_f32.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn tiff_roundtrip_rgb_vector_uint8() {
+        let data: Vec<u8> = (0..36u32).map(|i| (i * 7) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 3, data.clone()).unwrap();
+        let path = tmp_path("rgb_u8.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Four components become `PHOTOMETRIC_RGB` plus one `EXTRASAMPLE_ASSOCALPHA`
+    /// (itkTIFFImageIO.cxx:735-745), and `GetFormat` reads that back as
+    /// `RGB_` with four components.
+    #[test]
+    fn tiff_roundtrip_rgba_vector_uint16() {
+        let data: Vec<u16> = (0..48u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec_vector::<u16>(&[4, 3], 4, data.clone()).unwrap();
+        let path = tmp_path("rgba_u16.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(back.number_of_components_per_pixel(), 4);
+        assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
+    }
+
+    /// `InternalWrite` sends every component count other than 1 down the
+    /// `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:722-745), so a two-component
+    /// image is written as RGB with `SamplesPerPixel = 2` — a file no TIFF
+    /// reader can interpret as colour, and which upstream's own reader takes
+    /// back as a *one*-component grayscale of half-rows (§2.136). This port
+    /// writes the same bytes and refuses to read them.
+    #[test]
+    fn tiff_write_of_a_two_component_image_emits_photometric_rgb_with_two_samples() {
+        let data: Vec<u8> = (0..24u32).map(|i| i as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data).unwrap();
+        let path = tmp_path("two_component.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&back, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("SamplesPerPixel = 2")),
+            "{back:?}"
+        );
+    }
+
+    /// A 3-D image writes one directory per slice, each tagged
+    /// `FILETYPE_PAGE` with a `TIFFTAG_PAGENUMBER` of `(page, total)`
+    /// (itkTIFFImageIO.cxx:799-813). `m_SubFiles` counts only `SUBFILETYPE == 0`
+    /// directories, so on the way back in every page is `FILETYPE_PAGE`,
+    /// `m_SubFiles == 0`, and the depth comes from `m_NumberOfPages`.
+    #[test]
+    fn tiff_roundtrip_three_dimensional_volume() {
+        let data: Vec<u8> = (0..24u32).map(|i| (i * 3) as u8).collect();
+        let img = Image::from_vec(&[4, 2, 3], data.clone()).unwrap();
+        let path = tmp_path("volume_u8.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 3);
+        assert_eq!(back.size(), &[4, 2, 3]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// `WriteImageInformation` writes `25.4 / spacing` as an inch resolution and
+    /// `ReadImageInformation` divides it back out — but libtiff's
+    /// `TIFFTAG_XRESOLUTION` field is a `float`, so a spacing survives only to
+    /// `f32` precision, and never exactly. Ledger §2.138.
+    #[test]
+    fn tiff_spacing_round_trips_only_to_float_precision() {
+        let mut img = Image::from_vec(&[2, 2], vec![0u8; 4]).unwrap();
+        img.set_spacing(&[0.5, 0.25]).unwrap();
+        let path = tmp_path("spacing.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // 25.4/0.5 = 50.8 and 25.4/0.25 = 101.6 are both exact in `f32`'s
+        // mantissa only to within an ulp; the recovered spacing is off by one.
+        let spacing = back.spacing();
+        assert!((spacing[0] - 0.5).abs() < 1e-7, "{spacing:?}");
+        assert!((spacing[1] - 0.25).abs() < 1e-7, "{spacing:?}");
+        assert_ne!(spacing, &[0.5, 0.25]);
+    }
+
+    /// A zero spacing writes no resolution tags at all
+    /// (itkTIFFImageIO.cxx:792), and the reader's `m_ResolutionUnit > 0` guard
+    /// then leaves the spacing at its `1.0` seed.
+    #[test]
+    fn tiff_unit_spacing_is_the_default_when_no_resolution_is_written() {
+        let img = Image::from_vec(&[2, 2], vec![0u8; 4]).unwrap();
+        let path = tmp_path("no_resolution.tif");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Spacing 1.0 → resolution 25.4 → spacing 1.0000000150184933.
+        assert!((back.spacing()[0] - 1.0).abs() < 1e-7);
+        assert_eq!(back.origin(), &[0.0, 0.0]);
+    }
+
+    /// `m_UseCompression` picks between `COMPRESSION_NONE` and this port's only
+    /// reachable compressor, `COMPRESSION_PACKBITS`
+    /// (itkTIFFImageIO.cxx:243-246, :769-775). The image must survive the
+    /// round-trip through multi-row strips — upstream sizes strips at
+    /// `1 MiB / scanlinesize` rows regardless of the compressor
+    /// (itkTIFFImageIO.cxx:784), where the `tiff` crate's own `PackBits` default
+    /// would be one row per strip.
+    #[test]
+    fn tiff_packbits_compression_round_trips_through_multi_row_strips() {
+        // 64x64 of a low-entropy pattern: PackBits must actually shrink it, and
+        // 64 rows of 64 bytes are one 4 KiB strip, well under the 1 MiB target.
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data.clone()).unwrap();
+
+        let plain = tmp_path("packbits_off.tif");
+        let packed = tmp_path("packbits_on.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+        write_image_with(&img, &packed, true, -1).unwrap();
+
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let packed_len = std::fs::metadata(&packed).unwrap().len();
+        let back = read_image(&packed).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&packed).ok();
+
+        assert!(packed_len < plain_len, "{packed_len} !< {plain_len}");
+        assert_eq!(back.size(), &[64, 64]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// `SetCompressionLevel` is TIFF's *JPEG quality*
+    /// (itkTIFFImageIO.cxx:248-251), and no reachable compressor consults it —
+    /// so it changes nothing about the bytes written. Ledger §3.50.
+    #[test]
+    fn tiff_compression_level_does_not_change_the_written_bytes() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data).unwrap();
+
+        let default_level = tmp_path("level_default.tif");
+        let max_level = tmp_path("level_max.tif");
+        write_image_with(&img, &default_level, true, -1).unwrap();
+        write_image_with(&img, &max_level, true, 100).unwrap();
+
+        let a = std::fs::read(&default_level).unwrap();
+        let b = std::fs::read(&max_level).unwrap();
+        std::fs::remove_file(&default_level).ok();
+        std::fs::remove_file(&max_level).ok();
+
+        assert_eq!(a, b);
+    }
+
+    /// `TIFFImageIO::CanWriteFile` lower-cases nothing
+    /// (itkTIFFImageIO.cxx:180-200): it compares the extension against
+    /// `.tif`/`.TIF`/`.tiff`/`.TIFF` verbatim, so a `.Tif` file finds no writer.
+    #[test]
+    fn tiff_mixed_case_extension_finds_no_writer() {
+        let img = Image::from_vec(&[2, 2], vec![0u8; 4]).unwrap();
+        let path = tmp_path("mixed_case.Tif");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::NoWriterFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `TIFFImageIO::CanReadFile` ignores the file name entirely and asks
+    /// libtiff to open the file (itkTIFFImageIO.cxx:161-178), so a TIFF under
+    /// any extension is claimed for reading — where `PNGImageIO` and the rest
+    /// gate on the extension first.
+    #[test]
+    fn tiff_content_is_claimed_for_reading_under_any_extension() {
+        let data: Vec<u8> = (0..12u32).map(|i| i as u8).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let written = tmp_path("named.tif");
+        write_image(&img, &written).unwrap();
+
+        let renamed = tmp_path("named.unknown-extension");
+        std::fs::rename(&written, &renamed).unwrap();
+        let io = create_image_io(&renamed, FileMode::Read);
+        let back = read_image(&renamed).unwrap();
+        std::fs::remove_file(&renamed).ok();
+
+        assert_eq!(io.map(|io| io.name()), Some("TIFFImageIO"));
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// The other side of that coin: a non-TIFF under a `.tif` name is not
+    /// claimed, because the claim is the successful open.
+    #[test]
+    fn tiff_garbage_bytes_under_a_tiff_extension_are_not_claimed_for_reading() {
+        let path = tmp_path("garbage.tif");
+        std::fs::write(&path, b"this is not a tiff file, but is long enough\n").unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(&result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
 }
