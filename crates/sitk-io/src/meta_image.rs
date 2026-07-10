@@ -1,4 +1,4 @@
-//! MetaImage (`.mha` / `.mhd` + `.raw`) reader and writer.
+//! MetaImage (`.mha` / `.mhd` + `.raw`) reader and writer — `itk::MetaImageIO`.
 //!
 //! MetaImage is ITK's native uncompressed format: a plain-text `Key = Value`
 //! header followed by (or referencing) a raw binary pixel dump. It round-trips
@@ -6,6 +6,9 @@
 //! full spacing / origin / direction geometry, which makes it the right
 //! Phase-0 format for exercising the whole core model without pulling in an
 //! external image crate.
+//!
+//! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::ImageIo)
+//! implementor; [`read`] and [`write`] are its free-function core.
 //!
 //! # Channels: scalar, vector, and complex
 //!
@@ -31,13 +34,139 @@
 //! bytes are preserved; the "this was complex" bit is not, because MetaIO
 //! never recorded it.
 //!
-//! Not yet supported: compressed data.
+//! # Header fields
+//!
+//! `MET_Read` compares a header line's key against the registered field names
+//! with `strcmp` (metaUtils.cxx:1191), so key matching is **case-sensitive**,
+//! and the registered set is exactly [`RECOGNIZED_FIELDS`]
+//! (metaObject.cxx:1204-1306, metaImage.cxx:2144-2213). A key outside that set
+//! is not an error: `MET_Read` stores it verbatim as a string in the object's
+//! "additional read fields" (metaUtils.cxx:1398-1412), and
+//! `MetaImageIO::ReadImageInformation` copies each one into the ITK meta-data
+//! dictionary (itkMetaImageIO.cxx:280-287) — so custom tags survive a read.
+//!
+//! `ElementDataFile` is marked `terminateRead` (metaImage.cxx:2212), so parsing
+//! stops there and anything after it is pixel data (`LOCAL`), a filename, or a
+//! slice list — never another header field.
+//!
+//! Which value wins when a field has aliases is decided by MetaIO's *fixed
+//! apply order* in `M_Read`, not by the order the lines appear in the file
+//! (metaObject.cxx:1618-1707):
+//!
+//! * origin: `Offset`, then `Position`, then `Origin` — last write wins, so
+//!   `Origin` beats `Position` beats `Offset`;
+//! * direction: `Orientation`, then `Rotation`, then `TransformMatrix` — so
+//!   `TransformMatrix` beats both;
+//! * byte order: `ElementByteOrderMSB`, then `BinaryDataByteOrderMSB` — so
+//!   `BinaryDataByteOrderMSB` beats `ElementByteOrderMSB`.
+//!
+//! `Position`, `Origin`, `Orientation` and `Rotation` are only consulted when
+//! `FileFormatVersion` is `0`, its default (metaObject.cxx:1662).
+//!
+//! A boolean field is true iff its **first character** is `T`, `t`, or `1`
+//! (metaObject.cxx:1586-1642) — not the string `"true"`. `BinaryData = 1` and
+//! `CompressedData = TRUE` are both true; `CompressedData = yes` is false.
+//!
+//! # Byte order
+//!
+//! `MetaImageIO::Read` calls `ElementByteOrderFix` (itkMetaImageIO.cxx:348,359),
+//! which swaps each component in place when the file's byte order differs from
+//! the machine's (metaImage.cxx:845-852). Both `BinaryDataByteOrderMSB = True`
+//! and `ElementByteOrderMSB = True` therefore select big-endian components on
+//! read. [`read`] decodes with `from_be_bytes` instead of swapping, which is
+//! the same result on every host.
+//!
+//! # `ElementDataFile` forms
+//!
+//! * `LOCAL` (case-insensitively `Local`/`local` only — metaImage.cxx:1311)
+//!   puts the pixel data straight after the header line.
+//! * `LIST` — see [`read`] — names one file per slice, on the header lines that
+//!   follow.
+//! * anything else is a single raw filename, resolved against the header's own
+//!   directory.
+//!
+//! Not yet supported: compressed data (`CompressedData = True`), and MetaIO's
+//! `printf`-pattern slice form (`ElementDataFile = slice%03d.raw 1 20 1`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sitk_core::{Image, PixelBuffer, PixelId};
 
 use crate::error::{IoError, Result};
+use crate::image_io::{ImageInformation, ImageIo};
+
+/// Every header field name MetaIO registers for reading, in registration order:
+/// `MetaObject::M_SetupReadFields` (metaObject.cxx:1204-1306) followed by
+/// `MetaImage::M_SetupReadFields` (metaImage.cxx:2144-2213). Matched
+/// case-sensitively, as `MET_Read`'s `strcmp` does. Anything else in the header
+/// is an "additional read field" and lands in the meta-data dictionary.
+pub const RECOGNIZED_FIELDS: &[&str] = &[
+    // MetaObject
+    "ObjectType",
+    "ObjectSubType",
+    "FileFormatVersion",
+    "Comment",
+    "AcquisitionDate",
+    "NDims",
+    "Name",
+    "ID",
+    "ParentID",
+    "CompressedData",
+    "CompressedDataSize",
+    "BinaryData",
+    "ElementByteOrderMSB",
+    "BinaryDataByteOrderMSB",
+    "Color",
+    "Position",
+    "Origin",
+    "Offset",
+    "TransformMatrix",
+    "Rotation",
+    "Orientation",
+    "CenterOfRotation",
+    "DistanceUnits",
+    "AnatomicalOrientation",
+    "ElementSpacing",
+    // MetaImage
+    "DimSize",
+    "HeaderSize",
+    "Modality",
+    "ImagePosition",
+    "ElementOrigin",
+    "ElementDirection",
+    "SequenceID",
+    "ElementMin",
+    "ElementMax",
+    "ElementNumberOfChannels",
+    "ElementSize",
+    "ElementNBits",
+    "ElementToIntensityFunctionSlope",
+    "ElementToIntensityFunctionOffset",
+    "ElementType",
+    "ElementDataFile",
+];
+
+/// The six `MET_ImageModalityTypeName` strings (metaImageTypes.h:34-40).
+const MODALITY_NAMES: &[&str] = &[
+    "MET_MOD_CT",
+    "MET_MOD_MR",
+    "MET_MOD_NM",
+    "MET_MOD_US",
+    "MET_MOD_OTHER",
+    "MET_MOD_UNKNOWN",
+];
+
+/// The `MET_DistanceUnitsTypeName` strings other than the unknown `"?"`
+/// (metaTypes.h:168-171).
+const DISTANCE_UNIT_NAMES: &[&str] = &["um", "mm", "cm"];
+
+/// MetaIO's boolean rule: true iff the value's first character is `T`, `t`, or
+/// `1` (metaObject.cxx:1586-1642). An empty value reads the field buffer's
+/// terminating NUL, so it is false.
+fn met_bool(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'T' | b't' | b'1'))
+}
 
 /// MetaIO `ElementType` string for a pixel id's *component* type — MetaIO names
 /// the component type in `ElementType` and the count in
@@ -153,6 +282,12 @@ fn fmt_vec_f64(v: &[f64]) -> String {
 /// `ElementNumberOfChannels` is [`Image::buffer_stride`], not
 /// [`Image::number_of_components_per_pixel`] — see the module docs for why
 /// those two disagree for a complex image.
+///
+/// The image's meta-data dictionary is **not** written.
+/// `MetaImageIO::WriteImageInformation` emits every dictionary entry as a
+/// header field (itkMetaImageIO.cxx:416-470); this port's writer is pinned to
+/// its current bytes, so a read/write round trip drops the dictionary rather
+/// than growing `ITK_InputFilterName` and `Modality` lines it never had.
 fn build_header(img: &Image, element_data_file: &str) -> String {
     let dim = img.dimension();
     let dim_size = img
@@ -221,6 +356,7 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The resolved header of a MetaImage file.
 struct Header {
     size: Vec<usize>,
     spacing: Vec<f64>,
@@ -231,8 +367,11 @@ struct Header {
     big_endian: bool,
     compressed: bool,
     element_data_file: String,
-    /// Byte offset in the original buffer where pixel data begins (for LOCAL).
+    /// Byte offset in the original buffer where the `ElementDataFile` line
+    /// ends: pixel data for `LOCAL`, slice filenames for `LIST`.
     data_offset: usize,
+    /// The ITK meta-data dictionary this header produces.
+    metadata: BTreeMap<String, String>,
 }
 
 fn parse_f64_list(s: &str) -> Result<Vec<f64>> {
@@ -241,18 +380,13 @@ fn parse_f64_list(s: &str) -> Result<Vec<f64>> {
         .collect()
 }
 
-fn parse_header(bytes: &[u8]) -> Result<Header> {
-    let mut dims = None;
-    let mut size = None;
-    let mut spacing = None;
-    let mut origin = None;
-    let mut direction = None;
-    let mut element_type = None;
-    let mut channels = 1usize;
-    let mut big_endian = false;
-    let mut compressed = false;
-
-    // Scan line by line over the header text without decoding the binary tail.
+/// Split the header text into `(key, value)` pairs, stopping after
+/// `ElementDataFile` — the field MetaIO marks `terminateRead`.
+///
+/// Returns the pairs in file order plus the byte offset just past the
+/// `ElementDataFile` line.
+fn scan_fields(bytes: &[u8]) -> Result<(Vec<(String, String)>, usize)> {
+    let mut fields = Vec::new();
     let mut pos = 0usize;
     loop {
         let nl = bytes[pos..]
@@ -268,68 +402,23 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
         let (key, value) = line.split_once('=').ok_or(IoError::MalformedHeader)?;
         let key = key.trim();
         let value = value.trim();
+        fields.push((key.to_string(), value.to_string()));
 
-        match key.to_ascii_lowercase().as_str() {
-            "ndims" => {
-                dims = Some(
-                    value
-                        .parse::<usize>()
-                        .map_err(|_| IoError::MalformedHeader)?,
-                )
-            }
-            "dimsize" => {
-                size = Some(
-                    value
-                        .split_whitespace()
-                        .map(|t| t.parse::<usize>().map_err(|_| IoError::MalformedHeader))
-                        .collect::<Result<Vec<_>>>()?,
-                )
-            }
-            "elementspacing" => spacing = Some(parse_f64_list(value)?),
-            "offset" | "position" | "origin" => origin = Some(parse_f64_list(value)?),
-            "transformmatrix" | "orientation" | "rotation" => {
-                direction = Some(parse_f64_list(value)?)
-            }
-            "elementtype" => element_type = Some(parse_element_type(value)?),
-            "elementnumberofchannels" => {
-                channels = value
-                    .parse::<usize>()
-                    .map_err(|_| IoError::MalformedHeader)?
-            }
-            "binarydatabyteordermsb" | "elementbyteordermsb" => {
-                big_endian = value.eq_ignore_ascii_case("true")
-            }
-            "compresseddata" => compressed = value.eq_ignore_ascii_case("true"),
-            "elementdatafile" => {
-                let dims = dims.ok_or(IoError::MalformedHeader)?;
-                let size = size.ok_or(IoError::MalformedHeader)?;
-                let element_type = element_type.ok_or(IoError::MalformedHeader)?;
-                if size.len() != dims {
-                    return Err(IoError::MalformedHeader);
-                }
-                let spacing = spacing.unwrap_or_else(|| vec![1.0; dims]);
-                let origin = origin.unwrap_or_else(|| vec![0.0; dims]);
-                let direction = direction.unwrap_or_else(|| identity(dims));
-                if spacing.len() != dims || origin.len() != dims || direction.len() != dims * dims {
-                    return Err(IoError::MalformedHeader);
-                }
-                return Ok(Header {
-                    size,
-                    spacing,
-                    origin,
-                    direction,
-                    element_type,
-                    channels,
-                    big_endian,
-                    compressed,
-                    element_data_file: value.to_string(),
-                    data_offset: next,
-                });
-            }
-            _ => {} // ignore unrecognised MetaIO tags
+        if key == "ElementDataFile" {
+            return Ok((fields, next));
         }
         pos = next;
     }
+}
+
+/// The last occurrence of `name`, since `MET_Read` overwrites the one field
+/// record each time the key reappears.
+fn last<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .rev()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 fn identity(n: usize) -> Vec<f64> {
@@ -338,6 +427,215 @@ fn identity(n: usize) -> Vec<f64> {
         m[i * n + i] = 1.0;
     }
     m
+}
+
+/// Build the ITK meta-data dictionary for a parsed header, in
+/// `MetaImageIO::ReadImageInformation`'s insertion order
+/// (itkMetaImageIO.cxx:270-304): class name, modality, then the additional
+/// (unrecognized) fields — which therefore *overwrite* the first two if a file
+/// carries a literal `ITK_InputFilterName` tag — then the two optional keys.
+fn build_metadata(fields: &[(String, String)]) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("ITK_InputFilterName".to_string(), "MetaImageIO".to_string());
+
+    // `MET_StringToImageModality` falls back to MET_MOD_UNKNOWN on no match,
+    // and MetaImage::Clear() initialises m_Modality to it (metaImageUtils.cxx:
+    // 28-44, metaImage.cxx:438).
+    let modality = last(fields, "Modality")
+        .and_then(|v| MODALITY_NAMES.iter().find(|n| **n == v))
+        .copied()
+        .unwrap_or("MET_MOD_UNKNOWN");
+    metadata.insert("Modality".to_string(), modality.to_string());
+
+    for (key, value) in fields {
+        if !RECOGNIZED_FIELDS.contains(&key.as_str()) {
+            metadata.insert(key.clone(), value.clone());
+        }
+    }
+
+    // ITK_VoxelUnits only when DistanceUnits parsed to something other than
+    // the unknown "?" (itkMetaImageIO.cxx:294-298).
+    let units = last(fields, "DistanceUnits")
+        .and_then(|units| DISTANCE_UNIT_NAMES.iter().find(|n| **n == units));
+    if let Some(name) = units {
+        metadata.insert("ITK_VoxelUnits".to_string(), (*name).to_string());
+    }
+    if let Some(date) = last(fields, "AcquisitionDate").filter(|d| !d.is_empty()) {
+        metadata.insert("ITK_ExperimentDate".to_string(), date.to_string());
+    }
+    metadata
+}
+
+fn parse_header(bytes: &[u8]) -> Result<Header> {
+    let (fields, data_offset) = scan_fields(bytes)?;
+
+    let dims: usize = last(&fields, "NDims")
+        .ok_or(IoError::MalformedHeader)?
+        .parse()
+        .map_err(|_| IoError::MalformedHeader)?;
+    let size: Vec<usize> = last(&fields, "DimSize")
+        .ok_or(IoError::MalformedHeader)?
+        .split_whitespace()
+        .map(|t| t.parse::<usize>().map_err(|_| IoError::MalformedHeader))
+        .collect::<Result<Vec<_>>>()?;
+    let element_type =
+        parse_element_type(last(&fields, "ElementType").ok_or(IoError::MalformedHeader)?)?;
+    if size.len() != dims {
+        return Err(IoError::MalformedHeader);
+    }
+
+    let spacing = match last(&fields, "ElementSpacing") {
+        Some(v) => parse_f64_list(v)?,
+        None => vec![1.0; dims],
+    };
+
+    // Alias precedence is MetaIO's fixed apply order, not the file's line
+    // order: Offset, then Position, then Origin (metaObject.cxx:1653-1675).
+    // Position/Origin/Orientation/Rotation only apply at FileFormatVersion 0.
+    let legacy = last(&fields, "FileFormatVersion")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(true);
+    let mut origin = vec![0.0; dims];
+    let mut direction = identity(dims);
+    for key in ["Offset", "Position", "Origin"] {
+        if legacy || key == "Offset" {
+            if let Some(v) = last(&fields, key) {
+                origin = parse_f64_list(v)?;
+            }
+        }
+    }
+    for key in ["Orientation", "Rotation", "TransformMatrix"] {
+        if legacy || key == "TransformMatrix" {
+            if let Some(v) = last(&fields, key) {
+                direction = parse_f64_list(v)?;
+            }
+        }
+    }
+    if spacing.len() != dims || origin.len() != dims || direction.len() != dims * dims {
+        return Err(IoError::MalformedHeader);
+    }
+
+    let channels = match last(&fields, "ElementNumberOfChannels") {
+        Some(v) => v.parse::<usize>().map_err(|_| IoError::MalformedHeader)?,
+        None => 1,
+    };
+
+    // ElementByteOrderMSB first, BinaryDataByteOrderMSB second, so the latter
+    // wins when both are present (metaObject.cxx:1618-1642).
+    let mut big_endian = false;
+    for key in ["ElementByteOrderMSB", "BinaryDataByteOrderMSB"] {
+        if let Some(v) = last(&fields, key) {
+            big_endian = met_bool(v);
+        }
+    }
+    let compressed = last(&fields, "CompressedData")
+        .map(met_bool)
+        .unwrap_or(false);
+
+    let element_data_file = last(&fields, "ElementDataFile")
+        .ok_or(IoError::MalformedHeader)?
+        .to_string();
+
+    Ok(Header {
+        size,
+        spacing,
+        origin,
+        direction,
+        element_type,
+        channels,
+        big_endian,
+        compressed,
+        element_data_file,
+        data_offset,
+        metadata: build_metadata(&fields),
+    })
+}
+
+/// `MET_GetFilePath` + `FileIsFullPath`: resolve `name` against the header's
+/// own directory unless it is already absolute (metaImage.cxx:1355-1363).
+fn resolve_sibling(header_path: &Path, name: &str) -> PathBuf {
+    let name = Path::new(name);
+    if name.is_absolute() {
+        name.to_path_buf()
+    } else {
+        header_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(name)
+    }
+}
+
+/// Strip the trailing whitespace and non-printable characters MetaIO strips
+/// from a `LIST` slice name (metaImage.cxx:1352-1356). The loop guard is
+/// `j > 0`, so the first character is never stripped.
+fn trim_slice_name(line: &str) -> &str {
+    let mut end = line.len();
+    while end > 1 {
+        let b = line.as_bytes()[end - 1];
+        if b.is_ascii_whitespace() || !(0x20..=0x7e).contains(&b) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &line[..end]
+}
+
+/// `ElementDataFile = LIST [fileImageDim]`: how many axes live *inside* each
+/// slice file, and therefore how many files there are.
+///
+/// `MetaImage::Read` reads the optional second word with `atof` and falls back
+/// to `NDims - 1` when it is `0` or greater than `NDims`
+/// (metaImage.cxx:1318-1333).
+fn list_file_image_dim(element_data_file: &str, dims: usize) -> usize {
+    let requested = element_data_file
+        .split_whitespace()
+        .nth(1)
+        .and_then(|w| w.parse::<f64>().ok())
+        .map(|f| f as i64);
+    match requested {
+        // Upstream's guard is `(fileImageDim == 0) || (fileImageDim > m_NDims)`.
+        // A negative value slips through it and indexes `m_DimSize[-1]`; this
+        // port folds negatives into the same fallback. `fileImageDim == NDims`
+        // slips through too and reads the uninitialised `m_SubQuantity[NDims]`;
+        // here it means "one file holding the whole image", which is what the
+        // surrounding arithmetic implies.
+        Some(d) if d > 0 && (d as usize) <= dims => d as usize,
+        _ => dims.saturating_sub(1),
+    }
+}
+
+/// Gather the pixel bytes named by an `ElementDataFile = LIST` header.
+///
+/// Each of the `totalFiles = prod(DimSize[fileImageDim..NDims])` lines after
+/// the `ElementDataFile` line names one file holding
+/// `prod(DimSize[..fileImageDim])` pixels, concatenated in line order
+/// (metaImage.cxx:1318-1387).
+///
+/// Upstream's read loop is `for (i = 0; i < totalFiles && !_stream->eof(); ++i)`
+/// and returns success even when the list ran out early, leaving the tail of
+/// the freshly `new`-ed buffer uninitialised. That is unreproducible in safe
+/// Rust and indistinguishable from a corrupt file, so a short list is
+/// [`IoError::TruncatedData`] here.
+fn read_list_data(path: &Path, header: &Header, tail: &[u8]) -> Result<Vec<u8>> {
+    let dims = header.size.len();
+    let file_image_dim = list_file_image_dim(&header.element_data_file, dims);
+    let per_file_pixels: usize = header.size[..file_image_dim].iter().product();
+    let per_file_bytes = per_file_pixels * header.channels * header.element_type.size_in_bytes();
+    let total_files: usize = header.size[file_image_dim..].iter().product();
+
+    let text = std::str::from_utf8(tail).map_err(|_| IoError::MalformedHeader)?;
+    let mut lines = text.lines();
+    let mut data = Vec::with_capacity(per_file_bytes * total_files);
+    for _ in 0..total_files {
+        let name = lines.next().ok_or(IoError::TruncatedData)?;
+        let slice = std::fs::read(resolve_sibling(path, trim_slice_name(name)))?;
+        if slice.len() < per_file_bytes {
+            return Err(IoError::TruncatedData);
+        }
+        data.extend_from_slice(&slice[..per_file_bytes]);
+    }
+    Ok(data)
 }
 
 /// Read a MetaImage from `.mha` or `.mhd`.
@@ -353,6 +651,10 @@ fn identity(n: usize) -> Vec<f64> {
 /// components per pixel ([`sitk_core::Error::InvalidComponentCount`]), and a
 /// channel count the file's actual data is too short for is rejected as
 /// [`IoError::TruncatedData`].
+///
+/// The returned image carries the header's meta-data dictionary, as
+/// `itk::ImageFileReader` copies the `ImageIO`'s onto its output
+/// (itkImageFileReader.hxx:242).
 pub fn read(path: &Path) -> Result<Image> {
     let bytes = std::fs::read(path)?;
     let header = parse_header(&bytes)?;
@@ -364,14 +666,13 @@ pub fn read(path: &Path) -> Result<Image> {
     let n: usize = header.size.iter().product();
     let byte_len = n * header.channels * header.element_type.size_in_bytes();
 
-    let data: Vec<u8> = if header.element_data_file.eq_ignore_ascii_case("local") {
+    let edf = &header.element_data_file;
+    let data: Vec<u8> = if edf.eq_ignore_ascii_case("local") {
         bytes[header.data_offset..].to_vec()
+    } else if edf.len() >= 4 && &edf[..4] == "LIST" {
+        read_list_data(path, &header, &bytes[header.data_offset..])?
     } else {
-        let raw_path: PathBuf = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(&header.element_data_file);
-        std::fs::read(raw_path)?
+        std::fs::read(resolve_sibling(path, edf))?
     };
 
     if data.len() < byte_len {
@@ -379,7 +680,7 @@ pub fn read(path: &Path) -> Result<Image> {
     }
     let buffer = buffer_from_bytes(header.element_type, &data[..byte_len], header.big_endian)?;
 
-    if header.channels == 1 {
+    let mut image = if header.channels == 1 {
         Image::from_parts(
             buffer,
             header.size,
@@ -397,5 +698,128 @@ pub fn read(path: &Path) -> Result<Image> {
             header.direction,
         )
     }
-    .map_err(IoError::Core)
+    .map_err(IoError::Core)?;
+
+    for (key, value) in &header.metadata {
+        image.set_meta_data(key, value);
+    }
+    Ok(image)
+}
+
+/// Read just the header text: every line up to and including `ElementDataFile`.
+///
+/// `MetaImage::Read(name, /*_readElements=*/false)` stops at that line too —
+/// its field record is `terminateRead` — so an `.mha`'s pixel tail is never
+/// touched, however large it is.
+fn read_header_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut bytes = Vec::new();
+    loop {
+        let start = bytes.len();
+        if reader.read_until(b'\n', &mut bytes)? == 0 {
+            return Ok(bytes);
+        }
+        let line = String::from_utf8_lossy(&bytes[start..]);
+        if line.split_once('=').map(|(k, _)| k.trim()) == Some("ElementDataFile") {
+            return Ok(bytes);
+        }
+    }
+}
+
+/// Read the header only — geometry, pixel type, and meta-data dictionary.
+pub fn read_information(path: &Path) -> Result<ImageInformation> {
+    let bytes = read_header_bytes(path)?;
+    let header = parse_header(&bytes)?;
+    let dimension = header.size.len();
+    let pixel_id = if header.channels == 1 {
+        header.element_type
+    } else {
+        header.element_type.vector_id()
+    };
+    Ok(ImageInformation {
+        pixel_id,
+        dimension,
+        number_of_components: header.channels,
+        size: header.size,
+        spacing: header.spacing,
+        origin: header.origin,
+        direction: header.direction,
+        metadata: header.metadata,
+    })
+}
+
+/// `MetaImage::CanRead`'s content probe: the first 8000 bytes, truncated at the
+/// first NUL, must contain `NDims` (metaImage.cxx:1201-1228).
+///
+/// Upstream builds `std::string header(buf)` — which stops at the first NUL —
+/// and then `resize`s it back up with NUL padding, so `NDims` occurring after
+/// an embedded NUL is invisible to the probe. Reproduced by searching only the
+/// prefix before the first NUL.
+fn content_looks_like_meta_image(path: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    if file.take(8000).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    let head = match head.iter().position(|&b| b == 0) {
+        Some(nul) => &head[..nul],
+        None => &head[..],
+    };
+    head.windows(5).any(|w| w == b"NDims")
+}
+
+/// `itk::MetaImageIO`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetaImageIo;
+
+impl ImageIo for MetaImageIo {
+    fn name(&self) -> &'static str {
+        "MetaImageIO"
+    }
+
+    fn supported_read_extensions(&self) -> &'static [&'static str] {
+        &[".mha", ".mhd"]
+    }
+
+    fn supported_write_extensions(&self) -> &'static [&'static str] {
+        &[".mha", ".mhd"]
+    }
+
+    /// `MetaImageIO::CanReadFile` delegates straight to `MetaImage::CanRead`
+    /// (itkMetaImageIO.cxx:87-99), which re-checks the extension itself — with
+    /// a **case-sensitive** `rfind(".mhd")` / `rfind(".mha")`
+    /// (metaImage.cxx:1184-1199) — before looking at the content.
+    ///
+    /// Two consequences, both upstream's and both reproduced here. A file whose
+    /// content is a MetaImage header but whose name is `data.foo` is *not*
+    /// readable, even though the registry's phase 2 offers it a second chance:
+    /// content never overrides a missing extension for this IO. And `IMG.MHA`
+    /// is writable (`CanWriteFile` is case-insensitive) yet not readable,
+    /// because `ImageIOFactory` matches the extension case-insensitively and
+    /// then `MetaImage::CanRead` rejects the uppercase spelling.
+    fn can_read_file(&self, path: &Path) -> bool {
+        let name = path.as_os_str().to_string_lossy();
+        if !(name.ends_with(".mha") || name.ends_with(".mhd")) {
+            return false;
+        }
+        content_looks_like_meta_image(path)
+    }
+
+    fn read_information(&self, path: &Path) -> Result<ImageInformation> {
+        read_information(path)
+    }
+
+    fn read(&self, path: &Path) -> Result<Image> {
+        read(path)
+    }
+
+    fn write(&self, image: &Image, path: &Path) -> Result<()> {
+        write(image, path)
+    }
 }
