@@ -82,6 +82,7 @@ pub mod label;
 pub mod label_fusion;
 pub mod label_intensity;
 pub mod label_map;
+pub mod label_map_mask;
 pub mod label_map_overlay;
 pub mod label_map_to_binary;
 pub mod label_set_morphology;

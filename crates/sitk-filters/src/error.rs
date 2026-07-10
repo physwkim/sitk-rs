@@ -653,6 +653,30 @@ pub enum FilterError {
     #[error("this filter requires at least one input label map")]
     EmptyLabelMapList,
 
+    /// `LabelMapMaskImageFilter.yaml`'s `pixel_types2` is
+    /// `typelist2::append<BasicPixelIDTypeList, ComplexPixelIDTypeList>::type`:
+    /// the feature image may be any scalar or complex image, but not a vector
+    /// one, and the yaml declares no `vector_pixel_types_by_component2` fallback.
+    #[error("this filter requires a scalar or complex pixel type, got {0:?}")]
+    RequiresNonVectorPixelType(PixelId),
+
+    /// `LabelMapMaskImageFilter` reads its label object through
+    /// `LabelMap::GetLabelObject` (`itkLabelMapMaskImageFilter.hxx:168`, `:262`),
+    /// which throws "No label object with label L." when the map holds none
+    /// (`itkLabelMap.hxx:109-126`). Only a `Label` equal to the map's background
+    /// value takes the other branch.
+    #[error("the label map holds no object with label {label}")]
+    LabelMapMaskLabelNotFound { label: i64 },
+
+    /// `LabelMapMaskImageFilter::GenerateOutputInformation`'s bounding-box loops
+    /// (`itkLabelMapMaskImageFilter.hxx:108-151`, `:169-201`) never guard against
+    /// an object set with no lines: `mins` stays at `IndexValueType::max()`,
+    /// `maxs` at `NonpositiveMin()`, and `maxs - mins + 1` overflows. This port
+    /// refuses the crop instead — see [`crate::label_map_mask`]'s upstream
+    /// finding 3.
+    #[error("crop was requested but the selected label objects have no pixels")]
+    LabelMapMaskEmptyCropRegion,
+
     /// `DICOMOrientImageFilter::ImageDimension` is `static_assert`ed to `3`
     /// (`itkDICOMOrientImageFilter.h:142`), and `DICOMOrientImageFilter.yaml`'s
     /// `custom_register` only instantiates the SimpleITK wrapper for 3-D
