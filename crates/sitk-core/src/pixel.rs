@@ -145,6 +145,17 @@ impl PixelId {
         matches!(self.component_id(), PixelId::Float32 | PixelId::Float64)
     }
 
+    /// `true` for the ten scalar integer pixel types — SimpleITK's
+    /// `IntegerPixelIDTypeList` (`sitkPixelIDTypeLists.h:159`), which is what a
+    /// label image's pixel type must be drawn from.
+    ///
+    /// A vector id is *not* an integer scalar even when its components are:
+    /// `dispatch_scalar!` would resolve it to that component type and quietly
+    /// read an interleaved buffer as one value per pixel.
+    pub const fn is_integer_scalar(self) -> bool {
+        !self.is_vector() && !self.is_floating_point()
+    }
+
     /// `true` when this pixel's *components* can represent a negative value:
     /// the signed integer types and the two floating-point types.
     pub const fn is_signed(self) -> bool {

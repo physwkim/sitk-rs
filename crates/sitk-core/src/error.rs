@@ -70,6 +70,33 @@ pub enum Error {
         index: usize,
         components_per_pixel: usize,
     },
+
+    /// A label-only operation was handed a floating-point or vector image.
+    ///
+    /// SimpleITK expresses the same restriction at compile time:
+    /// `LabelImageToLabelMapFilter.yaml` declares
+    /// `pixel_types: UnsignedIntegerPixelIDTypeList`, so the filter is never
+    /// instantiated for a float or vector pixel id.
+    #[error("this operation requires an integer scalar pixel type, got {0:?}")]
+    RequiresIntegerPixelType(PixelId),
+
+    /// A [`LabelMap`](crate::LabelMap) was asked for a dimension outside
+    /// `1..=`[`MAX_DIM`](crate::label_map::MAX_DIM).
+    #[error("label maps support dimensions 1..=3, got {0}")]
+    UnsupportedLabelMapDimension(usize),
+
+    /// A [`LabelObjectLine`](crate::LabelObjectLine) would have covered no
+    /// pixels. Upstream stores such a line; the "optimized" invariant of
+    /// [`LabelObject`](crate::LabelObject) makes it unrepresentable.
+    #[error("a label object line must cover at least one pixel, got length {0}")]
+    NonPositiveLineLength(i64),
+
+    /// A [`LabelObject`](crate::LabelObject) carrying the map's background
+    /// value was inserted into a [`LabelMap`](crate::LabelMap). Upstream admits
+    /// it into the container and then throws at every `GetLabelObject` and
+    /// `RemoveLabel` (`itkLabelMap.hxx:110-116`, `:453-459`).
+    #[error("label {0} is the label map's background value")]
+    LabelIsBackground(i64),
 }
 
 /// Convenience alias for core results.
