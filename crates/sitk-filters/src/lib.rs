@@ -193,8 +193,8 @@ pub use geometry::{
     zero_flux_neumann_pad,
 };
 pub use gradient::{
-    derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
-    laplacian_recursive_gaussian, sobel_edge_detection,
+    derivative, gradient, gradient_magnitude, gradient_magnitude_recursive_gaussian,
+    gradient_recursive_gaussian, laplacian, laplacian_recursive_gaussian, sobel_edge_detection,
 };
 pub use grid_utility::{checker_board, paste, tile};
 pub use histogram_matching::histogram_matching;

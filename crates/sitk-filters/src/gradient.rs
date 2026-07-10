@@ -3,39 +3,52 @@
 //! `itkDerivativeImageFilter.h` (+ `itkDerivativeOperator.h`),
 //! `itkLaplacianImageFilter.h` (+ `itkLaplacianOperator.h`),
 //! `itkSobelEdgeDetectionImageFilter.h` (+ `itkSobelOperator.h`),
-//! `itkGradientMagnitudeRecursiveGaussianImageFilter.h`, and
-//! `itkLaplacianRecursiveGaussianImageFilter.h`.
+//! `itkGradientMagnitudeRecursiveGaussianImageFilter.h`,
+//! `itkLaplacianRecursiveGaussianImageFilter.h`, `itkGradientImageFilter.h`,
+//! and `itkGradientRecursiveGaussianImageFilter.h`.
 //!
-//! The four direct (non-Gaussian) filters share one substrate: walk a
+//! The five direct (non-Gaussian) filters share one substrate: walk a
 //! [`NeighborhoodIterator`] over an `f64` copy of the input under
-//! [`ZeroFluxNeumannBoundaryCondition`] — the boundary condition all four use
+//! [`ZeroFluxNeumannBoundaryCondition`] — the boundary condition all five use
 //! in ITK — narrowing back to the output pixel type (`crate::image_from_f64`)
-//! only once, at the end.
+//! only once, at the end. [`gradient`] is the vector-output member of this
+//! group: it assembles all `dim` central-difference components per pixel in
+//! one neighborhood pass instead of returning a scalar.
 //!
-//! [`gradient_magnitude_recursive_gaussian`] and [`laplacian_recursive_gaussian`]
-//! instead compose per-axis calls to [`recursive_gaussian_with_order`], exactly
-//! as ITK's `GradientMagnitudeRecursiveGaussianImageFilter`/
-//! `LaplacianRecursiveGaussianImageFilter` compose per-axis
-//! `RecursiveGaussianImageFilter`s (one [`GaussianOrder::FirstOrder`] or
-//! [`GaussianOrder::SecondOrder`] axis, [`GaussianOrder::ZeroOrder`] elsewhere)
-//! — then divide each axis's contribution by `spacing[d]` (gradient) or
-//! `spacing[d]^2` (Laplacian) *again*: `recursive_gaussian_with_order`'s own
-//! `sigmad = sigma / spacing[d]` reparametrization makes its derivative output
-//! index-space, and these two filters need it in physical space, matching
-//! ITK's `GenerateData` (`a + Math::sqr(b / spacing[dim])` and
-//! `a + b * (1.0 / spacing2)` respectively).
+//! [`gradient_magnitude_recursive_gaussian`], [`laplacian_recursive_gaussian`]
+//! and [`gradient_recursive_gaussian`] instead compose per-axis calls to
+//! [`recursive_gaussian_with_order`]/`recursive_gaussian_f64`, exactly as
+//! ITK's `GradientMagnitudeRecursiveGaussianImageFilter`/
+//! `LaplacianRecursiveGaussianImageFilter`/`GradientRecursiveGaussianImageFilter`
+//! compose per-axis `RecursiveGaussianImageFilter`s (one
+//! [`GaussianOrder::FirstOrder`] or [`GaussianOrder::SecondOrder`] axis,
+//! [`GaussianOrder::ZeroOrder`] elsewhere) — then divide each axis's
+//! contribution by `spacing[d]` (gradient) or `spacing[d]^2` (Laplacian)
+//! *again*: `recursive_gaussian_with_order`'s own `sigmad = sigma /
+//! spacing[d]` reparametrization makes its derivative output index-space, and
+//! these filters need it in physical space, matching ITK's `GenerateData`
+//! (`a + Math::sqr(b / spacing[dim])` and `a + b * (1.0 / spacing2)`
+//! respectively) and `itkGradientRecursiveGaussianImageFilter.hxx`'s
+//! `it.Get() / spacing`.
 //!
 //! Output pixel type follows SimpleITK's yaml: [`gradient_magnitude`],
 //! [`gradient_magnitude_recursive_gaussian`] and [`laplacian_recursive_gaussian`]
 //! all declare `output_pixel_type: float` and so always produce
 //! [`PixelId::Float32`]; [`derivative`], [`laplacian`] and
 //! [`sobel_edge_detection`] declare `RealPixelIDTypeList` with no override and
-//! so keep the input's pixel type.
+//! so keep the input's pixel type; [`gradient`] and
+//! [`gradient_recursive_gaussian`] fix their `output_image_type` to
+//! `itk::VectorImage<float, D>` and so always produce
+//! [`PixelId::VectorFloat32`], regardless of input pixel type.
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
-use sitk_core::{Image, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition};
+use crate::recursive_gaussian::{
+    GaussianOrder, recursive_gaussian_f64, recursive_gaussian_with_order,
+};
+use sitk_core::{
+    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition, matrix,
+};
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry (spacing in
 /// particular), used as the working buffer for every filter in this module.
@@ -411,6 +424,197 @@ pub fn laplacian_recursive_gaussian(
     }
 
     image_from_f64(PixelId::Float32, img.size(), img, &acc)
+}
+
+// ---- gradient (plain, vector output) ---------------------------------------
+
+/// `GradientImageFilter` (`itkGradientImageFilter.hxx`): the per-axis central
+/// difference `(f(x+e_d) - f(x-e_d)) / (2 * scale_d)` at every pixel,
+/// assembled into a `dim`-component covariant-vector image — one component
+/// per axis — under [`ZeroFluxNeumannBoundaryCondition`]
+/// (`itkGradientImageFilter.h:229-231`, the filter's default
+/// `m_BoundaryCondition`).
+///
+/// `use_image_spacing` (ITK's `UseImageSpacing`, `GradientImageFilter.yaml`
+/// default `true`, matching the ITK class default at
+/// `itkGradientImageFilter.h:222`) sets `scale_d = spacing[d]`; off,
+/// `scale_d = 1`. Each axis's weight is exactly
+/// `derivative_operator_coefficients(1)`, reversed and (if
+/// `use_image_spacing`) scaled by `1/spacing[d]` — the same per-axis
+/// coefficients [`derivative`] uses, evaluated here for every axis at once
+/// and assembled into one vector pixel instead of `dim` separate scalar
+/// calls.
+///
+/// `use_image_direction` (ITK's `UseImageDirection`) rotates the assembled
+/// gradient vector by the image's direction cosine matrix
+/// (`itkImageBase.h:634-653`'s `TransformLocalVectorToPhysicalVector`:
+/// `output = Direction * input`, row-major, no spacing) before it is written
+/// out — **`GradientImageFilter.yaml`'s wrapped default is `false`**
+/// (`GradientImageFilter.yaml:23-25`), even though the underlying ITK class
+/// itself defaults this flag to `true` (`itkGradientImageFilter.h:226`,
+/// `bool m_UseImageDirection{ true }`) — the same ITK-class-default-vs-yaml-
+/// wrapped-default split already documented for [`sobel_edge_detection`]'s
+/// `use_legacy_operator_coefficients`.
+///
+/// Output is always [`PixelId::VectorFloat32`] with `dim` components
+/// (`GradientImageFilter.yaml:7`'s `output_image_type:
+/// itk::VectorImage<float, InputImageType::ImageDimension>`; the yaml's
+/// `filter_type` also fixes the two extra ITK template parameters
+/// (`OperatorValueType`, `OutputValueType`) to `float`, so upstream computes
+/// this filter's arithmetic at `float` precision — this port instead computes
+/// in `f64` throughout, like every other filter in this module, and narrows
+/// only at the final `f32` output; the two-tap central-difference weights are
+/// exact halves in either precision, so this does not change any documented
+/// value beyond ULP-level rounding).
+///
+/// Scalar input only (`pixel_types: BasicPixelIDTypeList`, no vector variant)
+/// — a vector or complex image is rejected the same way every other
+/// scalar-only filter in this module is, through the `scratch_f64`/
+/// `to_f64_vec` scalar seam's [`sitk_core::Error::RequiresScalarPixelType`].
+pub fn gradient(img: &Image, use_image_spacing: bool, use_image_direction: bool) -> Result<Image> {
+    let dim = img.dimension();
+    let spacing = img.spacing().to_vec();
+    let direction = img.direction().to_vec();
+    let scratch = scratch_f64(img)?;
+    let radius = vec![1usize; dim];
+    let iter =
+        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    let data: Vec<f32> = iter
+        .flat_map(|(_, nb)| {
+            let mut off = vec![0i64; dim];
+            let mut vector = vec![0.0f64; dim];
+            for d in 0..dim {
+                off[d] = 1;
+                let plus = nb.get(&off);
+                off[d] = -1;
+                let minus = nb.get(&off);
+                off[d] = 0;
+                let mut g = 0.5 * (plus - minus);
+                if use_image_spacing {
+                    g /= spacing[d];
+                }
+                vector[d] = g;
+            }
+            if use_image_direction {
+                vector = matrix::mat_vec(&direction, &vector, dim);
+            }
+            vector.into_iter().map(f32::from_f64)
+        })
+        .collect();
+
+    let mut result = Image::from_vec_vector(img.size(), dim, data)?;
+    result.copy_geometry_from(img);
+    Ok(result)
+}
+
+// ---- gradient_recursive_gaussian --------------------------------------------
+
+/// `GradientRecursiveGaussianImageFilter`
+/// (`itkGradientRecursiveGaussianImageFilter.hxx`): the gradient of `img`
+/// convolved with a Gaussian of physical-space `sigma` (isotropic — one value
+/// for every axis, matching ITK's single `Sigma` parameter,
+/// `GradientRecursiveGaussianImageFilter.yaml:9-11`, default `1.0`), assembled
+/// into a covariant-vector image.
+///
+/// For each axis `d`, this composes per-axis `recursive_gaussian_f64` calls
+/// exactly like [`gradient_magnitude_recursive_gaussian`] does —
+/// [`GaussianOrder::FirstOrder`] on axis `d`, [`GaussianOrder::ZeroOrder`] on
+/// the rest — then divides that axis's derivative by `spacing[d]` again to
+/// convert it from `recursive_gaussian_f64`'s index space to physical space,
+/// matching the hxx's explicit `it.Get() / spacing`
+/// (`itkGradientRecursiveGaussianImageFilter.hxx:245-251`). Axis `d`'s result
+/// becomes output component `d` (scalar input) or `nc * dim + d` for input
+/// component `nc` (vector input, `itkGradientRecursiveGaussianImageFilter.hxx:239`'s
+/// `m_ImageAdaptor->SelectNthElement(nc * ImageDimension + dim)`).
+///
+/// **Cascade order.** As with [`crate::smoothing_recursive_gaussian`], ITK's actual
+/// pipeline processes the derivative axis first and the isotropic-sigma
+/// smoothing axes after, in a specific per-`dim` order
+/// (`itkGradientRecursiveGaussianImageFilter.hxx:205-256`); this port always
+/// processes axes `0..D` in the crate's canonical order, matching how
+/// [`gradient_magnitude_recursive_gaussian`]/[`laplacian_recursive_gaussian`]
+/// already do it. Since `Sigma` is isotropic, every smoothing axis uses the
+/// same sigma regardless of cascade order, so the two orders compute the same
+/// separable composition and can only disagree at the ULP level.
+///
+/// **Vector images.** `pixel_types` is `BasicPixelIDTypeList` **+**
+/// `VectorPixelIDTypeList` (`GradientRecursiveGaussianImageFilter.yaml:6`);
+/// each input component is processed independently
+/// (`itkGradientRecursiveGaussianImageFilter.hxx:185-191`'s `nComponents`
+/// loop), via [`sitk_core::Image::extract_component`]. A complex image falls
+/// through to the scalar branch and is rejected there by `to_f64_vec`, the
+/// same as [`crate::smoothing_recursive_gaussian`].
+///
+/// `normalize_across_scale` is ITK's `NormalizeAcrossScale`
+/// (`GradientRecursiveGaussianImageFilter.yaml:19-21`, default `false`,
+/// matching the ITK class default at
+/// `itkGradientRecursiveGaussianImageFilter.h:254`).
+///
+/// `use_image_direction` (ITK's `UseImageDirection`) rotates each assembled
+/// `dim`-component gradient sub-vector — one per input component — by the
+/// direction cosine matrix (`TransformOutputPixel`,
+/// `itkGradientRecursiveGaussianImageFilter.hxx:271-283` /
+/// `itkGradientRecursiveGaussianImageFilter.h:211-237`: `output = Direction *
+/// input`, row-major, no spacing). **`GradientRecursiveGaussianImageFilter.yaml`'s
+/// wrapped default is `false`** (`GradientRecursiveGaussianImageFilter.yaml:29-31`),
+/// even though the ITK class itself defaults this flag to `true`
+/// (`itkGradientRecursiveGaussianImageFilter.h:257`,
+/// `bool m_UseImageDirection{ true }`) — the same split as [`gradient`]'s
+/// `use_image_direction`.
+///
+/// Output is always [`PixelId::VectorFloat32`], with `dim * input_components`
+/// components (`GradientRecursiveGaussianImageFilter.yaml:7`'s
+/// `output_image_type: itk::VectorImage<float, ImageDimension>`, sized by
+/// `itkGradientRecursiveGaussianImageFilter.hxx:298`'s
+/// `SetNumberOfComponentsPerPixel(inputComponents * ImageDimension)`).
+///
+/// Errors if `sigma < 0`, or an axis (every axis, since `sigma` is shared) has
+/// fewer than four pixels.
+pub fn gradient_recursive_gaussian(
+    img: &Image,
+    sigma: f64,
+    normalize_across_scale: bool,
+    use_image_direction: bool,
+) -> Result<Image> {
+    let dim = img.dimension();
+    let spacing = img.spacing().to_vec();
+    let direction = img.direction().to_vec();
+    let sigma_array = vec![sigma; dim];
+    let input_components = img.number_of_components_per_pixel();
+
+    let mut out = vec![0.0f64; img.number_of_pixels() * input_components * dim];
+
+    for nc in 0..input_components {
+        let component = if img.pixel_id().is_vector() {
+            img.extract_component(nc)?
+        } else {
+            img.clone()
+        };
+        for d in 0..dim {
+            let mut orders = vec![GaussianOrder::ZeroOrder; dim];
+            orders[d] = GaussianOrder::FirstOrder;
+            let deriv =
+                recursive_gaussian_f64(&component, &sigma_array, &orders, normalize_across_scale)?;
+            let inv_spacing = 1.0 / spacing[d];
+            for (p, &v) in deriv.iter().enumerate() {
+                out[p * input_components * dim + nc * dim + d] = v * inv_spacing;
+            }
+        }
+    }
+
+    if use_image_direction {
+        for g in 0..(img.number_of_pixels() * input_components) {
+            let base = g * dim;
+            let rotated = matrix::mat_vec(&direction, &out[base..base + dim], dim);
+            out[base..base + dim].copy_from_slice(&rotated);
+        }
+    }
+
+    let data: Vec<f32> = out.into_iter().map(f32::from_f64).collect();
+    let mut result = Image::from_vec_vector(img.size(), input_components * dim, data)?;
+    result.copy_geometry_from(img);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -931,5 +1135,285 @@ mod tests {
         let img = Image::from_vec(&[9, 9, 9], vec![3.0f64; 9 * 9 * 9]).unwrap();
         let out = laplacian_recursive_gaussian(&img, 1.0, false).unwrap();
         assert!(out.to_f64_vec().unwrap().iter().all(|&v| v.abs() < 1e-4));
+    }
+
+    // ---- gradient ----
+
+    #[test]
+    fn gradient_constant_image_is_zero() {
+        let img = Image::from_vec(&[5, 5], vec![7.0f64; 25]).unwrap();
+        let out = gradient(&img, true, false).unwrap();
+        assert!(out.components_to_f64_vec().iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn gradient_linear_ramp_matches_slope_over_spacing() {
+        let (w, h) = (7usize, 7usize);
+        let slope = 3.0;
+        let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
+        img.set_spacing(&[2.0, 1.0]).unwrap();
+        let out = gradient(&img, true, false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 2);
+        let vals = out.components_to_f64_vec();
+        // interior point (3,3): dI/dx = slope/spacing_x = 1.5, dI/dy = 0.
+        let idx = (3 * w + 3) * 2;
+        assert!((vals[idx] - slope / 2.0).abs() < 1e-6);
+        assert!(vals[idx + 1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn gradient_use_image_spacing_false_ignores_spacing() {
+        let (w, h) = (7usize, 7usize);
+        let slope = 3.0;
+        let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
+        img.set_spacing(&[2.0, 1.0]).unwrap();
+        let out = gradient(&img, false, false).unwrap();
+        let vals = out.components_to_f64_vec();
+        let idx = (3 * w + 3) * 2;
+        assert!((vals[idx] - slope).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gradient_border_uses_zero_flux_neumann() {
+        // 1-D-in-2-D row: x = 0,1,4,9,16 (squares); zero-flux clamps the
+        // neighbor past the edge, matching gradient_magnitude's border test.
+        let w = 5;
+        let img = Image::from_vec(&[w, 1], vec![0.0f64, 1.0, 4.0, 9.0, 16.0]).unwrap();
+        let out = gradient(&img, true, false).unwrap();
+        let vals = out.components_to_f64_vec();
+        // at x=0: neighbors clamp to (0, 1) -> (1-0)/2 = 0.5.
+        assert!((vals[0] - 0.5).abs() < 1e-9);
+        // at x=4 (last): neighbors clamp to (9, 16) -> (16-9)/2 = 3.5.
+        assert!((vals[4 * 2] - 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gradient_output_is_always_vector_float32() {
+        let img = Image::from_vec(&[3, 3, 3], vec![1u8; 27]).unwrap();
+        let out = gradient(&img, true, false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 3);
+    }
+
+    #[test]
+    fn gradient_yaml_default_use_image_direction_false_does_not_rotate() {
+        // GradientImageFilter.yaml's wrapped default for UseImageDirection is
+        // `false`, unlike the ITK class default of `true` -- pin that a
+        // non-identity direction matrix has no effect at the yaml default.
+        let (w, h) = (7usize, 7usize);
+        let slope = 3.0;
+        let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let out = gradient(&img, true, false).unwrap();
+        let vals = out.components_to_f64_vec();
+        let idx = (3 * w + 3) * 2;
+        assert!((vals[idx] - slope).abs() < 1e-6);
+        assert!(vals[idx + 1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn gradient_use_image_direction_true_rotates_by_direction_matrix() {
+        // Direction [0,-1,1,0] (row-major) is a 90-degree CCW rotation:
+        // mat_vec gives output = (-v1, v0). At the interior point the
+        // un-rotated gradient is (slope, 0), so the rotated result must be
+        // (0, slope).
+        let (w, h) = (7usize, 7usize);
+        let slope = 3.0;
+        let mut img = Image::from_vec(&[w, h], ramp_2d(w, h, slope)).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let out = gradient(&img, true, true).unwrap();
+        let vals = out.components_to_f64_vec();
+        let idx = (3 * w + 3) * 2;
+        assert!(vals[idx].abs() < 1e-6);
+        assert!((vals[idx + 1] - slope).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gradient_rejects_a_vector_image() {
+        let img = Image::from_vec_vector(&[4, 4], 2, vec![1.0f32; 32]).unwrap();
+        assert!(matches!(
+            gradient(&img, true, false).unwrap_err(),
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::VectorFloat32
+            ))
+        ));
+    }
+
+    #[test]
+    fn gradient_rejects_a_complex_image() {
+        let img = Image::new(&[8, 8], PixelId::ComplexFloat32);
+        assert!(matches!(
+            gradient(&img, true, false).unwrap_err(),
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
+        ));
+    }
+
+    // ---- gradient_recursive_gaussian ----
+
+    #[test]
+    fn grg_scalar_interior_matches_slope_over_spacing_on_a_ramp() {
+        // Away from the boundary, Gaussian-smoothing a linear ramp leaves it
+        // unchanged, so the recursive-Gaussian gradient's interior value
+        // matches the plain central-difference slope/spacing.
+        let n = 61usize;
+        let margin = 20usize;
+        let slope = 2.5;
+        let mut img = Image::from_vec(&[n, n], ramp_2d(n, n, slope)).unwrap();
+        img.set_spacing(&[2.0, 1.0]).unwrap();
+        let out = gradient_recursive_gaussian(&img, 1.5, false, false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 2);
+        let vals = out.components_to_f64_vec();
+        for y in margin..(n - margin) {
+            for x in margin..(n - margin) {
+                let idx = (y * n + x) * 2;
+                assert!(
+                    (vals[idx] - slope / 2.0).abs() < 1e-3,
+                    "at ({x},{y}): dx {} expected {}",
+                    vals[idx],
+                    slope / 2.0
+                );
+                assert!(
+                    vals[idx + 1].abs() < 1e-3,
+                    "at ({x},{y}): dy {} expected 0",
+                    vals[idx + 1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grg_output_is_always_vector_float32() {
+        let img = Image::from_vec(&[16, 16], vec![1u8; 256]).unwrap();
+        let out = gradient_recursive_gaussian(&img, 1.0, false, false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 2);
+    }
+
+    #[test]
+    fn grg_normalize_across_scale_scales_the_first_order_output_by_sigma() {
+        // NormalizeAcrossScale multiplies FirstOrder output by an extra
+        // sigma^1 = sigma (Lindeberg scale-space normalization); it is not
+        // inert here the way it is for SmoothingRecursiveGaussian's
+        // ZeroOrder-only recursion.
+        let n = 61usize;
+        let slope = 2.5;
+        let sigma = 1.5;
+        let img = Image::from_vec(&[n, n], ramp_2d(n, n, slope)).unwrap();
+        let plain = gradient_recursive_gaussian(&img, sigma, false, false)
+            .unwrap()
+            .components_to_f64_vec();
+        let normalized = gradient_recursive_gaussian(&img, sigma, true, false)
+            .unwrap()
+            .components_to_f64_vec();
+        let idx = (30 * n + 30) * 2;
+        assert!(
+            (normalized[idx] - plain[idx] * sigma).abs() < 1e-3,
+            "normalized {} expected {}",
+            normalized[idx],
+            plain[idx] * sigma
+        );
+    }
+
+    #[test]
+    fn grg_vector_image_differentiates_each_component_independently() {
+        // Two components with different profiles on a proper 2-D image
+        // (both axes need >= 4 pixels for the recursion): component 0 an
+        // impulse, component 1 a ramp along x -- verifies each is filtered
+        // on its own and that the vector composite matches running the
+        // scalar composite on each extracted component, laid out as
+        // nc*dim + d.
+        let n = 21;
+        let mut data = vec![0.0f64; n * n * 2];
+        for y in 0..n {
+            for x in 0..n {
+                let p = y * n + x;
+                data[p * 2] = if x == n / 2 && y == n / 2 { 100.0 } else { 0.0 };
+                data[p * 2 + 1] = x as f64;
+            }
+        }
+        let img = Image::from_vec_vector(&[n, n], 2, data).unwrap();
+
+        let out = gradient_recursive_gaussian(&img, 1.5, false, false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 4); // dim(2) * input_components(2)
+        let vector_out = out.components_to_f64_vec();
+
+        for c in 0..2 {
+            let scalar_component = img.extract_component(c).unwrap();
+            let scalar_out = gradient_recursive_gaussian(&scalar_component, 1.5, false, false)
+                .unwrap()
+                .components_to_f64_vec();
+            for p in 0..(n * n) {
+                for d in 0..2 {
+                    let expected = scalar_out[p * 2 + d];
+                    let got = vector_out[p * 4 + c * 2 + d];
+                    assert!(
+                        (got - expected).abs() < 1e-9,
+                        "component {c} axis {d} pixel {p}: got {got}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grg_yaml_default_use_image_direction_false_does_not_rotate() {
+        let n = 61usize;
+        let slope = 2.5;
+        let mut img = Image::from_vec(&[n, n], ramp_2d(n, n, slope)).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let out = gradient_recursive_gaussian(&img, 1.5, false, false).unwrap();
+        let vals = out.components_to_f64_vec();
+        let idx = (30 * n + 30) * 2;
+        assert!((vals[idx] - slope).abs() < 1e-3);
+        assert!(vals[idx + 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn grg_use_image_direction_true_rotates_by_direction_matrix() {
+        let n = 61usize;
+        let slope = 2.5;
+        let mut img = Image::from_vec(&[n, n], ramp_2d(n, n, slope)).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let out = gradient_recursive_gaussian(&img, 1.5, false, true).unwrap();
+        let vals = out.components_to_f64_vec();
+        let idx = (30 * n + 30) * 2;
+        // un-rotated gradient at the interior is (slope, 0); rotated by
+        // [0,-1,1,0] (mat_vec: output = (-v1, v0)) gives (0, slope).
+        assert!(vals[idx].abs() < 1e-3);
+        assert!((vals[idx + 1] - slope).abs() < 1e-3);
+    }
+
+    #[test]
+    fn grg_rejects_a_complex_image() {
+        let img = Image::new(&[8, 8], PixelId::ComplexFloat32);
+        assert!(matches!(
+            gradient_recursive_gaussian(&img, 1.0, false, false).unwrap_err(),
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
+        ));
+    }
+
+    #[test]
+    fn grg_negative_sigma_is_rejected() {
+        let img = Image::new(&[8, 8], PixelId::Float64);
+        assert!(matches!(
+            gradient_recursive_gaussian(&img, -1.0, false, false),
+            Err(FilterError::InvalidSigma(_))
+        ));
+    }
+
+    #[test]
+    fn grg_short_axis_is_rejected() {
+        let img = Image::new(&[2, 8], PixelId::Float64);
+        assert!(matches!(
+            gradient_recursive_gaussian(&img, 1.0, false, false),
+            Err(FilterError::AxisTooShortForRecursion { axis: 0, len: 2 })
+        ));
     }
 }
