@@ -35,6 +35,7 @@
 //! [`transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`transform_matlab`]).
 
 pub mod compression;
+pub mod dicom;
 pub mod error;
 pub mod gipl;
 pub mod image_hdf5;
@@ -438,7 +439,8 @@ mod tests {
                 "PNGImageIO",
                 "HDF5ImageIO",
                 "JPEGImageIO",
-                "TIFFImageIO"
+                "TIFFImageIO",
+                "GDCMImageIO"
             ]
         );
         assert_eq!(
@@ -470,6 +472,12 @@ mod tests {
         assert_eq!(
             image_io_by_name("TIFFImageIO").unwrap().name(),
             "TIFFImageIO"
+        );
+        // Upstream's DICOM reader reports `GDCMImageIO`, not `DICOMImageIO`:
+        // `itkOverrideGetNameOfClassMacro(GDCMImageIO)` (itkGDCMImageIO.h:138).
+        assert_eq!(
+            image_io_by_name("GDCMImageIO").unwrap().name(),
+            "GDCMImageIO"
         );
         assert!(matches!(
             image_io_by_name("BMPImageIO"),
@@ -607,7 +615,8 @@ mod tests {
                 "PNGImageIO",
                 "HDF5ImageIO",
                 "JPEGImageIO",
-                "TIFFImageIO"
+                "TIFFImageIO",
+                "GDCMImageIO"
             ]
         );
     }
