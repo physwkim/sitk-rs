@@ -1511,13 +1511,12 @@ mod tests {
         );
     }
 
-    /// `RescaleFunction(buffer, slope, inter, numElts)` is handed the *voxel*
-    /// count, not the component count (itkNiftiImageIO.cxx:513-548), so on a
-    /// complex image only the first `numElts` of the `2 * numElts` interleaved
-    /// floats are rescaled: the first half of the pixels get both parts scaled,
-    /// the second half get neither. Upstream bug, reproduced (ledger §1.50).
+    /// Fixed §1.50: `RescaleFunction(buffer, slope, inter, count)` now passes
+    /// `numElts * GetNumberOfComponents()`, not just `numElts` — the *voxel*
+    /// count — so a complex image's full `2 * numElts` interleaved buffer is
+    /// rescaled, both real and imaginary parts of every voxel alike.
     #[test]
-    fn nii_rescale_of_a_complex_image_only_touches_the_first_half_of_the_buffer() {
+    fn nii_rescale_of_a_complex_image_covers_every_component() {
         let data: Vec<Complex<f32>> = (1..=6)
             .map(|i| Complex::new(i as f32, -(i as f32)))
             .collect();
@@ -1531,9 +1530,9 @@ mod tests {
         assert_eq!(back.pixel_id(), PixelId::ComplexFloat32);
         assert_eq!(
             back.component_slice::<f32>().unwrap(),
-            // components 0..5 scaled by 10, components 6..11 untouched
+            // every component of every voxel scaled by 10
             &[
-                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 4.0, -4.0, 5.0, -5.0, 6.0, -6.0
+                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 40.0, -40.0, 50.0, -50.0, 60.0, -60.0
             ]
         );
     }

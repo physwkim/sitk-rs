@@ -71,9 +71,11 @@
 //! on-disk component type is an **integer**, the type reported to the caller is
 //! promoted to `float` — so `PixelId::Int16` on disk becomes
 //! [`PixelId::Float32`] in memory. `float`/`double` on disk keep their type.
-//! The rescale itself, `RescaleFunction` (:239-247), is applied to the first
-//! `numElts` **components** of the buffer, where `numElts` is the *voxel*
-//! count — see ledger §1.50 for what that does to a multi-component image.
+//! The rescale itself, `RescaleFunction` (:239-247), covers every component of
+//! every voxel — `numElts * GetNumberOfComponents()` elements. Upstream bug
+//! §1.50, fixed in this port, passed only `numElts` (the *voxel* count), so a
+//! multi-component image (e.g. `COMPLEX64`, `2·numElts` floats) had its tail
+//! left unrescaled.
 //!
 //! # Vector images and `intent_code`
 //!
@@ -2260,13 +2262,16 @@ fn cast_to_f32(buf: &PixelBuffer) -> Vec<f32> {
 }
 
 /// `RescaleFunction` (itkNiftiImageIO.cxx:237-247), applied to the first
-/// `count` components of the buffer.
+/// `count` elements of the buffer.
 ///
-/// `count` is `numElts` — the **voxel** count, not the component count — so on
-/// a multi-component image only a prefix of the buffer is rescaled. That is
-/// upstream's behaviour verbatim (ledger §1.50). The integer arms of upstream's
-/// dispatch (:518-548) are dead: `ReadImageInformation` has already promoted
-/// every integer component type to `float`.
+/// Fixed §1.50: upstream calls `RescaleFunction(buffer, ..., numElts)` with
+/// `numElts` — the **voxel** count — rather than `numElts * GetNumberOfComponents()`,
+/// so on a multi-component image (e.g. a `COMPLEX64` buffer, `2·numElts`
+/// floats) only a prefix of the buffer is rescaled and the tail keeps its raw
+/// on-disk values. `count` here is `numElts * components`, covering every
+/// component of every voxel. The integer arms of upstream's dispatch
+/// (:518-548) are dead: `ReadImageInformation` has already promoted every
+/// integer component type to `float`.
 fn rescale(buf: &mut PixelBuffer, slope: f64, intercept: f64, count: usize) {
     match buf {
         PixelBuffer::Float32(v) => {
@@ -2415,7 +2420,7 @@ pub fn read(path: &Path) -> Result<Image> {
             &mut buffer,
             info.rescale_slope,
             info.rescale_intercept,
-            num_elts,
+            num_elts * info.components,
         );
     }
 
