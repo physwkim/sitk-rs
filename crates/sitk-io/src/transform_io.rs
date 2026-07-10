@@ -15,8 +15,10 @@
 //! ```
 //!
 //! Only the `double` precision variant exists here, matching SimpleITK, which
-//! instantiates `TransformFileReader`/`Writer` on `double` alone. The `.h5`,
-//! `.mat` and `.hdf5` formats are out of scope (ledger §5.8).
+//! instantiates `TransformFileReader`/`Writer` on `double` alone. `.h5` /
+//! `.hdf5` live in [`crate::transform_hdf5`], which [`read_transform`] and
+//! [`write_transform`] dispatch to; the MATLAB `.mat` format is out of scope
+//! (ledger §5.8).
 //!
 //! # Fidelity notes
 //!
@@ -43,6 +45,7 @@ use sitk_transform::{
 };
 
 use crate::error::{IoError, Result};
+use crate::transform_hdf5;
 
 /// How deep `ComponentTransformFile:` references may nest before the reader
 /// gives up. ITK has no such limit and recurses until the C++ stack is
@@ -203,7 +206,7 @@ fn longest_f64_prefix(token: &str) -> Option<(f64, usize)> {
 /// File` naming, say, `TranslationTransform_2_2` aborts the read with a
 /// std-library exception rather than an ITK one (ledger §1.45). Here that is a
 /// plain [`IoError::UnknownTransformType`].
-fn correct_transform_precision_type(name: &str) -> Result<String> {
+pub(crate) fn correct_transform_precision_type(name: &str) -> Result<String> {
     if name.contains("double") {
         return Ok(name.to_string());
     }
@@ -243,7 +246,7 @@ fn identity_matrix(dim: usize) -> Vec<f64> {
 /// `"Unregistered transform type"` on a miss; the registry holds the same
 /// families this crate implements, restricted here to the 2D/3D instantiations
 /// SimpleITK exposes.
-fn create_transform(type_name: &str) -> Result<Transform> {
+pub(crate) fn create_transform(type_name: &str) -> Result<Transform> {
     let (class_name, dim) = split_transform_type_name(type_name)?;
     let unsupported = || IoError::UnknownTransformType(type_name.to_string());
 
@@ -448,11 +451,22 @@ fn read_component_file(master: &Path, value: &str, depth: usize) -> Result<Trans
 /// minus the `KernelTransform` special case: if the first transform read is a
 /// `CompositeTransform`, every following transform is added to it and it alone
 /// is returned.
+///
+/// `TransformIOFactory::CreateTransformIO` polls every registered IO's
+/// `CanReadFile` in registration order. Only two are ported: the Insight legacy
+/// text IO, which looks at the extension alone, and
+/// [`crate::transform_hdf5`], which looks at the *content* alone. This port
+/// asks the text IO first, so an HDF5 file misnamed `.tfm` is parsed as text
+/// and fails, where ITK's answer depends on its factory registration order
+/// (ledger §4.80).
 fn read_and_fold(path: &Path, depth: usize) -> Result<Vec<Transform>> {
-    if !can_handle(path) {
+    let list = if can_handle(path) {
+        read_transform_list(path, depth)?
+    } else if transform_hdf5::can_read_file(path) {
+        transform_hdf5::read_transform_list(path)?
+    } else {
         return Err(IoError::NoTransformReaderFound(path.to_path_buf()));
-    }
-    let list = read_transform_list(path, depth)?;
+    };
     if list.is_empty() {
         return Err(IoError::NoTransformInFile(path.to_path_buf()));
     }
@@ -477,8 +491,9 @@ fn can_handle(path: &Path) -> bool {
     )
 }
 
-/// Read a transform from an Insight legacy transform file (`.tfm` / `.txt`) —
-/// `itk::simple::ReadTransform` (`sitkTransform.cxx:668-723`).
+/// Read a transform from an Insight legacy transform file (`.tfm` / `.txt`) or
+/// an HDF5 one (any file holding a `/TransformGroup`, conventionally `.h5` /
+/// `.hdf5`) — `itk::simple::ReadTransform` (`sitkTransform.cxx:668-723`).
 ///
 /// A file may hold several transforms; as upstream, only the first is returned
 /// (SimpleITK prints a warning here, which this port has no channel for —
@@ -524,7 +539,8 @@ fn print_vector(out: &mut String, values: &[f64]) {
 
 /// Write a transform to an Insight legacy transform file (`.tfm` / `.txt`) —
 /// `itk::simple::WriteTransform` (`sitkTransform.cxx:731-737`) over
-/// `TxtTransformIOTemplate::Write` (`itkTxtTransformIO.cxx:242-296`).
+/// `TxtTransformIOTemplate::Write` (`itkTxtTransformIO.cxx:242-296`) — or to an
+/// HDF5 one, for the eight extensions [`crate::transform_hdf5`] claims.
 ///
 /// A [`CompositeTransform`] is written as a `CompositeTransform` line with no
 /// parameters, followed by each of its sub-transforms in queue order — the
@@ -541,11 +557,14 @@ fn print_vector(out: &mut String, values: &[f64]) {
 /// ```
 pub fn write_transform<P: AsRef<Path>>(transform: &Transform, path: P) -> Result<()> {
     let path = path.as_ref();
-    if !can_handle(path) {
-        return Err(IoError::NoTransformWriterFound(path.to_path_buf()));
+    if can_handle(path) {
+        std::fs::write(path, serialize(transform)?)?;
+        Ok(())
+    } else if transform_hdf5::can_write_file(path) {
+        transform_hdf5::write_transform(transform, path)
+    } else {
+        Err(IoError::NoTransformWriterFound(path.to_path_buf()))
     }
-    std::fs::write(path, serialize(transform)?)?;
-    Ok(())
 }
 
 /// The exact byte content [`write_transform`] puts on disk.
@@ -875,15 +894,29 @@ mod tests {
         assert!(matches!(result, Err(IoError::MalformedTransformFile(_))));
     }
 
+    /// `.mat` is `MatlabTransformIO`'s, which this crate does not port; no other
+    /// IO claims it, so both directions fail as `TransformFileReader` /
+    /// `Writer` do when `CreateTransformIO` returns null.
     #[test]
     fn an_unknown_extension_is_rejected() {
         let transform: Transform = TranslationTransform::new(vec![1.0, 2.0]).into();
         assert!(matches!(
-            write_transform(&transform, tmp_path("bad.h5")),
+            write_transform(&transform, tmp_path("bad.mat")),
             Err(IoError::NoTransformWriterFound(_))
         ));
         assert!(matches!(
-            read_transform(tmp_path("bad.h5")),
+            read_transform(tmp_path("bad.mat")),
+            Err(IoError::NoTransformReaderFound(_))
+        ));
+    }
+
+    /// A `.h5` path that does not exist is not readable — `H5Fis_hdf5` fails and
+    /// `HDF5TransformIO::CanReadFile`'s `catch (...)` returns false — but it is
+    /// writable, since `CanWriteFile` looks only at the extension.
+    #[test]
+    fn a_missing_hdf5_file_is_not_readable() {
+        assert!(matches!(
+            read_transform(tmp_path("missing.h5")),
             Err(IoError::NoTransformReaderFound(_))
         ));
     }

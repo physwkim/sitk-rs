@@ -196,6 +196,20 @@ pub enum IoError {
     #[error("unregistered transform type: {0}")]
     UnknownTransformType(String),
 
+    /// The HDF5 layer refused a transform file. Upstream wraps every
+    /// `H5::Exception` in an `itkExceptionMacro` carrying `getCDetailMsg()`
+    /// (itkHDF5TransformIO.cxx:341-344, :420-423).
+    #[error("hdf5 error: {0}")]
+    Hdf5(#[from] rust_hdf5::Hdf5Error),
+
+    /// An HDF5 transform file this port refuses but `itk::HDF5TransformIO`
+    /// reads, because libhdf5 would convert the stored elements on the way out
+    /// and [`rust_hdf5`] hands back the stored bytes — a big-endian parameter
+    /// dataset, or a float element neither 4 nor 8 bytes wide.
+    /// See [`crate::transform_hdf5`] and ledger §4.81, §4.82.
+    #[error("unsupported HDF5 transform file: {0}")]
+    UnsupportedHdf5Transform(String),
+
     /// The transform read is neither 2D nor 3D. `itk::simple::ReadTransform`
     /// throws `"Unable to transform with InputSpaceDimension: ..."`
     /// (sitkTransform.cxx:718-722).

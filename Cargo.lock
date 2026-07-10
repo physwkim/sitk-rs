@@ -62,6 +62,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-hdf5"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76d9a3a248d812fc26bb6342fa6c978bf08ff3c801418608854678d462b7c52c"
+dependencies = [
+ "flate2",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,6 +107,7 @@ name = "sitk-io"
 version = "0.0.1"
 dependencies = [
  "flate2",
+ "rust-hdf5",
  "sitk-core",
  "sitk-transform",
  "thiserror",

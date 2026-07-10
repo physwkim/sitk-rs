@@ -12,3 +12,9 @@ sitk-core.workspace = true
 sitk-transform.workspace = true
 thiserror.workspace = true
 flate2.workspace = true
+# Pure-Rust HDF5 (superblock/heap/btree writer + reader), used by
+# `transform_hdf5` for `.h5` / `.hdf5` transform files. The C-binding `hdf5`
+# crate is deliberately not used — ledger §5.8. `deflate` is the crate's
+# default feature and rides on the same flate2/miniz_oxide backend as
+# `crate::compression`.
+rust-hdf5 = "0.3"
