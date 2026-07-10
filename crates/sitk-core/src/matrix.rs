@@ -110,6 +110,49 @@ pub fn identity(n: usize) -> Vec<f64> {
     m
 }
 
+/// The absolute value of the determinant of a row-major `n x n` matrix, via
+/// Gaussian elimination with partial pivoting (no back-substitution, unlike
+/// [`invert`] — only the product of the pivots is needed).
+///
+/// A row swap flips the sign of the determinant but not its magnitude, so
+/// pivoting needs no sign bookkeeping; the final `.abs()` discards it. Unlike
+/// [`invert`], this never reports a matrix singular by an arbitrary pivot
+/// threshold: a zero pivot makes the determinant exactly zero, which is
+/// simply returned rather than treated as an error.
+pub fn determinant_magnitude(m: &[f64], n: usize) -> f64 {
+    debug_assert_eq!(m.len(), n * n);
+    let mut a = m.to_vec();
+    let mut det = 1.0;
+    for col in 0..n {
+        let mut pivot_row = col;
+        let mut pivot_val = a[col * n + col].abs();
+        for row in (col + 1)..n {
+            let val = a[row * n + col].abs();
+            if val > pivot_val {
+                pivot_val = val;
+                pivot_row = row;
+            }
+        }
+        if pivot_val == 0.0 {
+            return 0.0;
+        }
+        if pivot_row != col {
+            for k in 0..n {
+                a.swap(col * n + k, pivot_row * n + k);
+            }
+        }
+        let pivot = a[col * n + col];
+        det *= pivot;
+        for row in (col + 1)..n {
+            let factor = a[row * n + col] / pivot;
+            for k in col..n {
+                a[row * n + k] -= factor * a[col * n + k];
+            }
+        }
+    }
+    det.abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +192,38 @@ mod tests {
     fn singular_matrix_returns_none() {
         let m = [1.0, 2.0, 2.0, 4.0];
         assert!(invert(&m, 2).is_none());
+    }
+
+    #[test]
+    fn determinant_magnitude_of_identity_is_one() {
+        assert_eq!(determinant_magnitude(&identity(3), 3), 1.0);
+    }
+
+    #[test]
+    fn determinant_magnitude_matches_manual_2x2() {
+        // det([[1,2],[3,4]]) = 1*4 - 2*3 = -2.
+        let m = [1.0, 2.0, 3.0, 4.0];
+        assert!((determinant_magnitude(&m, 2) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn determinant_magnitude_discards_the_sign() {
+        // A row swap of the identity has determinant -1; the magnitude is 1.
+        let swapped = [0.0, 1.0, 1.0, 0.0];
+        assert_eq!(determinant_magnitude(&swapped, 2), 1.0);
+    }
+
+    #[test]
+    fn determinant_magnitude_of_singular_matrix_is_zero() {
+        let m = [1.0, 2.0, 2.0, 4.0];
+        assert_eq!(determinant_magnitude(&m, 2), 0.0);
+    }
+
+    #[test]
+    fn determinant_magnitude_matches_manual_3x3() {
+        // det([[6,6,0],[6,24,0],[0,0,1]]) = 1 * (6*24 - 6*6) = 108.
+        let m = [6.0, 6.0, 0.0, 6.0, 24.0, 0.0, 0.0, 0.0, 1.0];
+        assert!((determinant_magnitude(&m, 3) - 108.0).abs() < 1e-9);
     }
 
     #[test]

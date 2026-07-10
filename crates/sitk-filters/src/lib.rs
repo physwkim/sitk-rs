@@ -110,6 +110,7 @@ pub mod threshold;
 pub mod threshold_maximum_connected_components;
 pub mod toboggan;
 pub mod vector;
+pub mod vector_connected_component;
 pub mod watershed;
 pub mod watershed_classic;
 
@@ -242,8 +243,8 @@ pub use reconstruction::{
 };
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
-    IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
-    neighborhood_connected,
+    IsolatedConnectedResult, VectorConfidenceConnectedResult, confidence_connected,
+    connected_threshold, isolated_connected, neighborhood_connected, vector_confidence_connected,
 };
 pub use regional_extrema::{
     ValuedRegionalExtremaResult, regional_maxima, regional_minima, valued_regional_maxima,
@@ -259,7 +260,7 @@ pub use slice::slice;
 pub use smoothing::smooth_gaussian;
 pub use sources::{
     GaborSourceSettings, GaussianSourceSettings, GridSourceSettings, SourceGeometry, gabor_source,
-    gaussian_source, grid_source,
+    gaussian_source, grid_source, physical_point_source,
 };
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,
@@ -271,6 +272,7 @@ pub use threshold_maximum_connected_components::{
 };
 pub use toboggan::toboggan;
 pub use vector::{compose, edge_potential, vector_index_selection_cast, vector_magnitude};
+pub use vector_connected_component::vector_connected_component;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 pub use watershed_classic::{
     IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,

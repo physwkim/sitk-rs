@@ -224,6 +224,13 @@ pub enum FilterError {
     /// here; ITK's `FiniteDifferenceImageFilter::GenerateData` separately warns
     /// "Output pixel type MUST be float or double to prevent computational
     /// errors".
+    ///
+    /// Also reused for `pixel_types: RealVectorPixelIDTypeList`
+    /// (`VectorConnectedComponentImageFilter`): the same restriction, checked
+    /// against the *component* type of a vector image rather than a scalar
+    /// image's own type (`itkVectorConnectedComponentImageFilter.h`'s
+    /// `InputValyeTypeIsFloatingCheck` concept check -- sic, upstream's own
+    /// typo).
     #[error("this filter requires a floating-point pixel type, got {0:?}")]
     RequiresRealPixelType(PixelId),
 
