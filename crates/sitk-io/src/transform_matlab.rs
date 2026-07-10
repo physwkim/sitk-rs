@@ -76,14 +76,17 @@
 //!
 //! # Fidelity notes
 //!
-//! Byte-swap detection reproduces `vnl_matlab_readhdr::read_hdr`'s `switch`
-//! over 7 literal "recognized native" `type` values
-//! (`vnl_matlab_read.cxx:124-150`) faithfully, including its missing
-//! `1010` case — a big-endian, column-wise, single-precision file is
-//! misclassified as needing a swap it does not need. This is a genuine
-//! upstream/VXL bug (ledger §1.69), reproduced because it costs nothing to
-//! keep and is unreachable from anything this crate itself writes (the writer
-//! only ever emits `type = 0`).
+//! Byte-swap detection is modelled on `vnl_matlab_readhdr::read_hdr`'s
+//! `switch` over "recognized native" `type` values
+//! (`vnl_matlab_read.cxx:124-150`), but recognizes all 8 legal
+//! `precision | storage | byte_order` combinations `vnl_matlab_header.h`'s
+//! `type_t` can compose, not just the 7 upstream's own switch lists —
+//! upstream is missing `1010` (big-endian, column-wise, single-precision),
+//! so a genuinely big-endian single-precision `.mat` file misclassifies as
+//! needing a swap it does not need. Fixed in this port (ledger §1.69): `1010`
+//! is exactly as native as its seven siblings, and recognizing it costs
+//! nothing (the writer only ever emits `type = 0`, so this is purely a
+//! foreign-file read-path correction).
 //!
 //! A complex-valued record (`imag != 0`) is refused outright
 //! ([`IoError::UnsupportedMatlabTransformFeature`]) rather than reproduced.
@@ -208,10 +211,15 @@ fn parse_header(reader: &mut impl Read, buf: &[u8; 20]) -> Result<MatHeader> {
     let mut imag = i32::from_le_bytes(buf[12..16].try_into().unwrap());
     let mut namlen = i32::from_le_bytes(buf[16..20].try_into().unwrap());
 
-    // `need_swap` is true unless `type` is one of the 7 literal "recognized
-    // native" values, or 0 (`vnl_matlab_read.cxx:124-150`); `1010` is missing
-    // from upstream's own list (ledger §1.69).
-    let need_swap = !matches!(ty, 0 | 10 | 100 | 110 | 1000 | 1100 | 1110);
+    // `need_swap` is false for `type == 0` (native little-endian double) or
+    // for any of the 8 legal `precision | storage | byte_order` combinations
+    // built from `vnl_matlab_header.h`'s `type_t` (`SINGLE=10`,
+    // `ROW_WISE=100`, `BIG_ENDIAN=1000`) — upstream's own switch
+    // (`vnl_matlab_read.cxx:124-150`) lists only 7 of the 8, omitting `1010`
+    // (big-endian, column-wise, single-precision); this port recognizes all
+    // eight, since `1010` is exactly as native as its seven siblings
+    // (ledger §1.69, fixed in this port).
+    let need_swap = !matches!(ty, 0 | 10 | 100 | 110 | 1000 | 1010 | 1100 | 1110);
     if need_swap {
         ty = ty.swap_bytes();
         rows = rows.swap_bytes();
@@ -689,6 +697,40 @@ mod tests {
         write_record(&mut out, "fixed", &[]);
 
         let path = tmp_path("float_precision.mat");
+        std::fs::write(&path, out).unwrap();
+        let read = read_transform(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            read.itk_transform_type_name(),
+            "TranslationTransform_double_2_2"
+        );
+        assert_eq!(read.parameters(), vec![1.0, 2.0]);
+    }
+
+    /// `type = 1010` (single-precision, column-wise, the "big-endian" tag
+    /// bit set) is one of the 8 legal `vnl_matlab_header::type_t`
+    /// combinations, but upstream's own `switch` in `read_hdr` omits it —
+    /// the one genuinely-native encoding its own list is missing (ledger
+    /// §1.69, fixed in this port). Before the fix this fell to `need_swap =
+    /// true`, byte-swapping `rows`/`cols` into huge garbage and failing the
+    /// read; this pins that it is now recognized as native, exactly like its
+    /// seven siblings (`a_float_precision_file_reads_as_double` for `10`).
+    #[test]
+    fn type_1010_is_recognized_as_native_and_needs_no_swap() {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1010i32.to_le_bytes());
+        out.extend_from_slice(&2i32.to_le_bytes());
+        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        let name = "TranslationTransform_float_2_2";
+        out.extend_from_slice(&((name.len() + 1) as i32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&1.0f32.to_le_bytes());
+        out.extend_from_slice(&2.0f32.to_le_bytes());
+        write_record(&mut out, "fixed", &[]);
+
+        let path = tmp_path("type_1010.mat");
         std::fs::write(&path, out).unwrap();
         let read = read_transform(&path).unwrap();
         let _ = std::fs::remove_file(&path);

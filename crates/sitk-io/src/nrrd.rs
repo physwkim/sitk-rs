@@ -55,11 +55,10 @@
 //!
 //! `axis mins` / `axis maxs` never touch the spacing. They feed
 //! `nrrdOriginCalculate` (simple.c:229-302), which is consulted only when
-//! `spaceDim == 0`, and which reproduces upstream bug [§1.47](
-//! ../../../doc/upstream-findings.md): its `gotMin` loop tests
-//! `axis[0]->min` rather than `axis[ai]->min`, so `axis mins: 0 nan` yields a
-//! NaN origin instead of the `NoMin` status that would have left the origin at
-//! zero.
+//! `spaceDim == 0`. Upstream bug [§1.47](../../../doc/upstream-findings.md) —
+//! its `gotMin` loop tests `axis[0]->min` rather than `axis[ai]->min` — is
+//! fixed in this port: each axis's own `min` is checked, so `axis mins: 0
+//! nan` correctly reports the `NoMin` status and leaves the origin at zero.
 //!
 //! # `space` and the conversion to LPS
 //!
@@ -147,8 +146,6 @@
 //!
 //! # Reproduced upstream quirks
 //!
-//! * `kinds: none` assigns to the axis's **centering**, not its kind
-//!   (parseNrrd.c:621-623) — ledger §1.48.
 //! * A `data file: LIST` reads filenames until EOF, taking a blank line as an
 //!   (empty) filename rather than a terminator (parseNrrd.c:1359-1398) —
 //!   ledger §2.83.
@@ -1560,9 +1557,11 @@ fn parse_known_field(
                     continue;
                 }
                 if *token == "none" {
-                    // Upstream bug (ledger §1.48): the `none` arm assigns to
-                    // `.center`, not `.kind` (parseNrrd.c:621-623).
-                    nrrd.axis[i].center = 0;
+                    // Fixed (ledger §1.48): upstream's `none` arm assigns to
+                    // `.center` instead of `.kind` (parseNrrd.c:621-623); this
+                    // port clears `.kind`, matching the `???` arm right above
+                    // it and leaving any `centers:` value untouched.
+                    nrrd.axis[i].kind = 0;
                     continue;
                 }
                 nrrd.axis[i].kind = air_enum_val(KIND_EQV, token);
@@ -2283,15 +2282,16 @@ enum OriginStatus {
 
 /// `nrrdOriginCalculate` (simple.c:229-302) with `defaultCenter = cell`.
 ///
-/// The `gotMin` loop reads `axis[0]->min` on every iteration — upstream bug
-/// §1.47, reproduced. A header with `axis mins: 0 nan` therefore reports
-/// `Okay` and hands ITK a NaN origin.
+/// Upstream's `gotMin` loop reads `axis[0]->min` on every iteration instead of
+/// `axis[ai]->min` (simple.c:274) — bug §1.47, fixed in this port: each axis's
+/// own `min` is tested, matching the `gotMaxOrSpacing` loop directly below it
+/// in upstream, which correctly indexes by `ai`.
 fn origin_calculate(nrrd: &Nrrd, domain: &[usize]) -> OriginStatus {
     let axes: Vec<&Axis> = domain.iter().map(|&a| &nrrd.axis[a]).collect();
     if axes.iter().any(|a| air_exists(a.space_direction[0])) && nrrd.space_dim > 0 {
         return OriginStatus::Bad;
     }
-    if !axes.iter().all(|_| air_exists(axes[0].min)) {
+    if !axes.iter().all(|a| air_exists(a.min)) {
         return OriginStatus::NoMin;
     }
     if !axes
@@ -3107,8 +3107,10 @@ mod tests {
     }
 
     #[test]
-    fn kinds_none_clobbers_centering_not_kind() {
-        // Upstream bug §1.48: `kinds: ... none` writes `.center`.
+    fn kinds_none_clears_kind_and_leaves_centering_alone() {
+        // Fixed §1.48: upstream's `kinds: ... none` arm writes `.center`
+        // instead of `.kind` (parseNrrd.c:621-623). This port clears
+        // `.kind`, matching the `???` arm, and leaves `centerings:` intact.
         let header = b"NRRD0004\n\
                        type: float\n\
                        dimension: 2\n\
@@ -3119,8 +3121,12 @@ mod tests {
                        encoding: raw\n\
                        data file: x.raw\n";
         let parsed = read_header(header).unwrap();
-        assert_eq!(parsed.nrrd.axis[1].kind, 0);
-        assert_eq!(parsed.nrrd.axis[1].center, 0, "centering was clobbered");
+        assert_eq!(parsed.nrrd.axis[1].kind, 0, "none must clear the kind");
+        assert_eq!(
+            parsed.nrrd.axis[1].center, CENTER_CELL,
+            "none must not touch the centering"
+        );
+        assert_eq!(parsed.nrrd.axis[0].kind, KIND_DOMAIN);
         assert_eq!(parsed.nrrd.axis[0].center, CENTER_CELL);
     }
 }

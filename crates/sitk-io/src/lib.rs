@@ -1453,6 +1453,48 @@ mod tests {
         assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §1.51 (write side): upstream's RAS-conversion guard
+    /// (itkNiftiImageIO.cxx:2177-2183) checks only the pixel type, never that
+    /// `numComponents == 3`, so a 2- or 4-component `NIFTI_INTENT_DISPVECT`
+    /// image would get a stride-3 walk over a differently-strided buffer.
+    /// `write` now rejects it instead.
+    #[test]
+    fn nii_write_of_a_non_three_component_dispvect_image_is_rejected() {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 1], 2, data).unwrap();
+        img.set_meta_data("intent_code", "1006"); // NIFTI_INTENT_DISPVECT
+
+        let path = tmp_path("dispvect_2component_write.nii");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::NiftiWriteRejected(m)) if m.contains("3-component")),
+            "{result:?}"
+        );
+    }
+
+    /// Fixed §1.51 (read side): the mirror-image case of the write-side test
+    /// above, for a file whose header was hand-patched to `intent_code =
+    /// NIFTI_INTENT_DISPVECT` over a 2-component vector body — the shape no
+    /// legitimate writer (including this port's own) produces, since it now
+    /// refuses to write one. `read` rejects it rather than applying the
+    /// stride-3 sign flip across voxel boundaries.
+    #[test]
+    fn nii_read_of_a_non_three_component_dispvect_image_is_rejected() {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let img = Image::from_vec_vector::<f32>(&[4, 1], 2, data).unwrap();
+        let path = patched_nii("dispvect_2component_read.nii", &img, |b| {
+            patch_i16(b, 68, 1006); // intent_code = NIFTI_INTENT_DISPVECT
+        });
+
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("3-component")),
+            "{result:?}"
+        );
+    }
+
     /// `ReadImageInformation` derives a vector image's dimension from `dim[4]`,
     /// `dim[3]` and `dim[2]` only (itkNiftiImageIO.cxx:788-805) — `dim[1]` is
     /// never consulted. A 2-D vector image one row tall therefore reads back
@@ -1513,13 +1555,12 @@ mod tests {
         );
     }
 
-    /// `RescaleFunction(buffer, slope, inter, numElts)` is handed the *voxel*
-    /// count, not the component count (itkNiftiImageIO.cxx:513-548), so on a
-    /// complex image only the first `numElts` of the `2 * numElts` interleaved
-    /// floats are rescaled: the first half of the pixels get both parts scaled,
-    /// the second half get neither. Upstream bug, reproduced (ledger §1.50).
+    /// Fixed §1.50: `RescaleFunction(buffer, slope, inter, count)` now passes
+    /// `numElts * GetNumberOfComponents()`, not just `numElts` — the *voxel*
+    /// count — so a complex image's full `2 * numElts` interleaved buffer is
+    /// rescaled, both real and imaginary parts of every voxel alike.
     #[test]
-    fn nii_rescale_of_a_complex_image_only_touches_the_first_half_of_the_buffer() {
+    fn nii_rescale_of_a_complex_image_covers_every_component() {
         let data: Vec<Complex<f32>> = (1..=6)
             .map(|i| Complex::new(i as f32, -(i as f32)))
             .collect();
@@ -1533,9 +1574,9 @@ mod tests {
         assert_eq!(back.pixel_id(), PixelId::ComplexFloat32);
         assert_eq!(
             back.component_slice::<f32>().unwrap(),
-            // components 0..5 scaled by 10, components 6..11 untouched
+            // every component of every voxel scaled by 10
             &[
-                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 4.0, -4.0, 5.0, -5.0, 6.0, -6.0
+                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 40.0, -40.0, 50.0, -50.0, 60.0, -60.0
             ]
         );
     }
@@ -2453,11 +2494,14 @@ mod tests {
         assert_eq!(img.origin(), &[0.0, 0.0]);
     }
 
-    /// Upstream bug §1.47: `nrrdOriginCalculate`'s `gotMin` loop reads
-    /// `axis[0]->min` on every iteration, so a NaN on axis 1 does not produce
-    /// the `NoMin` status it should — the NaN reaches the origin instead.
+    /// Fixed §1.47: upstream `nrrdOriginCalculate`'s `gotMin` loop read
+    /// `axis[0]->min` on every iteration instead of `axis[ai]->min`, so a NaN
+    /// on axis 1 did not produce the `NoMin` status it should have — the NaN
+    /// reached the origin instead. This port checks each axis's own `min`, so
+    /// a NaN on *any* axis reports `NoMin` and the origin — for every axis,
+    /// including the one with a real `min` — is left at zero.
     #[test]
-    fn nrrd_origin_calculate_only_checks_the_first_axis_min() {
+    fn nrrd_axis_mins_missing_on_any_axis_leaves_the_origin_at_zero() {
         let path = tmp_path("nanmin.nrrd");
         std::fs::write(
             &path,
@@ -2474,8 +2518,11 @@ mod tests {
         .unwrap();
         let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(img.origin()[0], 11.0);
-        assert!(img.origin()[1].is_nan(), "upstream leaks the NaN min");
+        assert_eq!(
+            img.origin(),
+            &[0.0, 0.0],
+            "a NaN min on axis 1 must void the whole origin, not just axis 1"
+        );
     }
 
     /// `encoding: ASCII` (whose header spelling is what teem's
@@ -2931,31 +2978,52 @@ mod tests {
         assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6]);
     }
 
-    /// `SwapBytesIfNecessary` has no `INT`/`UINT` arm, so `Write` throws
-    /// `"Pixel Type Unknown"` — *after* the full 256-byte header is on disk
-    /// (§1.52). The half-written file is left behind, exactly as upstream's
-    /// truncating `OpenFileForWriting` plus unwinding `ofstream` destructor
-    /// leaves it.
+    /// Fixed §1.52: `SwapBytesIfNecessary` has no `INT`/`UINT` arm, so upstream's
+    /// `Write` throws `"Pixel Type Unknown"` only *after* the full 256-byte
+    /// header is on disk. This port now checks swappability before writing
+    /// anything at all, so a pre-existing file at the target path is left
+    /// completely untouched.
     #[test]
-    fn gipl_int32_write_leaves_the_header_and_then_fails() {
+    fn gipl_write_of_int32_is_rejected_before_the_file_is_touched() {
         let img = Image::from_vec(&[2, 2], vec![1i32, 2, 3, 4]).unwrap();
         let path = tmp_path("int32.gipl");
+        std::fs::write(&path, b"pre-existing content that must survive").unwrap();
+
         let result = write_image(&img, &path);
-        let written = std::fs::read(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
 
         assert!(
             matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
             "{result:?}"
         );
-        assert_eq!(written.len(), gipl::HEADER_SIZE);
-        assert_eq!(&written[8..10], &32u16.to_be_bytes()); // GIPL_INT was written
+        assert_eq!(bytes, b"pre-existing content that must survive");
+    }
 
-        // And reading such a file fails on the same missing swap arm.
-        let read_back = read_image(&path);
+    /// The read side of the missing `SwapBytesIfNecessary` arm is untouched by
+    /// §1.52's write-side fix: a hand-built `GIPL_INT` file — the shape no
+    /// writer (including this port's own, now) ever produces — still fails to
+    /// read.
+    #[test]
+    fn gipl_read_of_int32_fails_on_the_missing_swap_arm() {
+        let path = tmp_path("int32_read.gipl");
+        let mut bytes = gipl_header(
+            [2, 2, 1, 1],
+            32,
+            [1.0; 4],
+            [0.0; 4],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        for v in [1i32, 2, 3, 4] {
+            bytes.extend_from_slice(&v.to_be_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = read_image(&path);
         std::fs::remove_file(&path).ok();
         assert!(
-            matches!(&read_back, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
-            "{read_back:?}"
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{result:?}"
         );
     }
 
@@ -2977,28 +3045,25 @@ mod tests {
         assert_eq!(written, [0, 2, 0, 2, 0, 1, 0, 1]);
     }
 
-    /// The same partial-header failure as
-    /// `gipl_int32_write_leaves_the_header_and_then_fails`, through
-    /// `.gipl.gz`: `write` never calls `gzclose` before the throw, so upstream's
-    /// buffered `gzwrite`s are flushed only once the exception unwinds and
-    /// `GiplImageIO`'s destructor runs (itkGiplImageIO.cxx:81-95). This port
-    /// models that outcome by gzip-compressing the same partial header bytes.
+    /// Fixed §1.52, `.gipl.gz` counterpart of
+    /// `gipl_write_of_int32_is_rejected_before_the_file_is_touched`: the
+    /// rejection happens before `gzopen` is ever called, so a pre-existing
+    /// `.gipl.gz` at the target path is left completely untouched too.
     #[test]
-    fn gipl_gz_int32_write_leaves_the_header_and_then_fails() {
+    fn gipl_gz_write_of_int32_is_rejected_before_the_file_is_touched() {
         let img = Image::from_vec(&[2, 2], vec![1i32, 2, 3, 4]).unwrap();
         let path = tmp_path("int32.gipl.gz");
+        std::fs::write(&path, b"pre-existing content that must survive").unwrap();
+
         let result = write_image(&img, &path);
-        let compressed = std::fs::read(&path).unwrap();
-        assert_eq!(&compressed[..2], b"\x1f\x8b");
-        let written = crate::compression::gunzip_transparent(&compressed).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert!(
             matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
             "{result:?}"
         );
-        assert_eq!(written.len(), gipl::HEADER_SIZE);
-        assert_eq!(&written[8..10], &32u16.to_be_bytes()); // GIPL_INT was written
+        assert_eq!(bytes, b"pre-existing content that must survive");
     }
 
     /// The `.gipl.gz` counterpart of `gipl_int64_write_leaves_eight_bytes_and_then_fails`.
@@ -4119,15 +4184,17 @@ mod tests {
         assert_eq!(back.scalar_slice::<u8>().unwrap(), &data[..4]);
     }
 
-    /// `WriteSlice` opens the file with `fopen(fileName, "wb")` — which
-    /// truncates immediately — before its component-type switch's `default:`
-    /// throws "PNG supports unsigned char and unsigned short"
-    /// (itkPNGImageIO.cxx:514-553). Ledger §1.59.
+    /// Fixed §1.59: upstream's `WriteSlice` opens the file with
+    /// `fopen(fileName, "wb")` — truncating it immediately — before its
+    /// component-type switch's `default:` throws "PNG supports unsigned char
+    /// and unsigned short" (itkPNGImageIO.cxx:514-553). This port now checks
+    /// the component type before creating (and truncating) the output file,
+    /// so a pre-existing file at the target path is left untouched.
     #[test]
-    fn png_write_of_an_unwritable_component_type_truncates_the_file() {
+    fn png_write_of_an_unwritable_component_type_is_rejected_before_the_file_is_touched() {
         let img = Image::from_vec(&[2, 2], vec![1i16, 2, 3, 4]).unwrap();
         let path = tmp_path("unwritable.png");
-        std::fs::write(&path, b"pre-existing content that should be truncated").unwrap();
+        std::fs::write(&path, b"pre-existing content that must survive").unwrap();
 
         let result = write_image(&img, &path);
         let bytes = std::fs::read(&path).unwrap();
@@ -4138,11 +4205,7 @@ mod tests {
                 if m.contains("PNG supports unsigned char and unsigned short")),
             "{result:?}"
         );
-        assert!(
-            bytes.is_empty(),
-            "expected a truncated file, got {} bytes",
-            bytes.len()
-        );
+        assert_eq!(bytes, b"pre-existing content that must survive");
     }
 
     /// `CanReadFile`'s signature check rejects a `.png`-named file whose
