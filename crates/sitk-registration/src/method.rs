@@ -502,36 +502,58 @@ enum OptimizerKind {
     Exhaustive(ExhaustiveOptimizer),
 }
 
-impl OptimizerKind {
-    /// Whether this optimizer ignores parameter scales and the learning-rate
-    /// estimator. Both L-BFGS variants force identity scales in ITK
-    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the metric
-    /// gradient directly. This concerns *scales* only — the optimizer *weights*
-    /// are applied to these optimizers' gradient separately (ledger §2.117).
-    fn ignores_scales(&self) -> bool {
-        matches!(self, OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_))
-    }
+/// Which control family an optimizer belongs to — the single source of truth
+/// for how, and whether, parameter scales and optimizer weights reach it
+/// (ledger §2.117). [`OptimizerKind::family`]'s match is exhaustive with no
+/// wildcard arm, so a new [`OptimizerKind`] variant fails to compile until it
+/// declares its family here; no future optimizer can silently default into the
+/// weight-into-scales fold and re-open the NaN poisoning that fold caused for
+/// the gradient-free optimizers.
+#[derive(Clone, Copy)]
+enum OptimizerFamily {
+    /// The gradient-descent optimizers: they consume parameter `scales`
+    /// (dividing the gradient by them) and honor the optimizer weights by
+    /// folding each into that array as its reciprocal, `scales[j] / weights[j %
+    /// n]`. A zero weight (upstream's freeze idiom) becomes an infinite divisor
+    /// and `g / ∞ == 0`, exactly the frozen parameter `g * 0 == 0` ITK gives.
+    Gradient,
+    /// Both L-BFGS variants (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`):
+    /// they ignore parameter scales and the learning-rate estimator — ITK forces
+    /// identity scales on them — and drive the metric gradient directly, so the
+    /// weights ride in on the gradient rather than on `scales`.
+    LBfgs,
+    /// The gradient-free optimizers (Amoeba, Powell, (1+1) evolutionary,
+    /// Exhaustive), carrying the SimpleITK name for the rejection diagnostic.
+    /// They apply parameter scales *multiplicatively* (`internal = external ·
+    /// scales`, ITK's `SingleValuedVnlCostFunctionAdaptorv4`) and never form a
+    /// metric gradient, so the weights have no vehicle to ride in on. Folding a
+    /// weight into `scales` would poison it — a zero weight (the documented
+    /// freeze idiom) makes `scales / 0 = +∞`, and the multiplicative application
+    /// then yields `0 · ∞ = NaN`. ITK validates the weight length then silently
+    /// ignores the values; this port rejects explicitly-set weights for them
+    /// rather than expose an inert parameter.
+    GradientFree(&'static str),
+}
 
-    /// The SimpleITK name of this optimizer when it belongs to the gradient-free
-    /// family (Amoeba, Powell, (1+1) evolutionary, Exhaustive), else `None`.
-    ///
-    /// These four apply parameter scales *multiplicatively* (`internal =
-    /// external · scales`, ITK's `SingleValuedVnlCostFunctionAdaptorv4`) and
-    /// never touch the metric gradient, so the optimizer weights have no vehicle
-    /// to ride in on. Folding a weight into `scales` would poison it — a zero
-    /// weight (the documented freeze idiom) makes `scales / 0 = +∞`, and the
-    /// multiplicative application then yields `0 · ∞ = NaN`. ITK validates the
-    /// weight length then silently ignores the values; this port rejects
-    /// explicitly-set weights for them rather than expose an inert parameter
-    /// (ledger §2.117). Membership and the diagnostic name live here together so
-    /// the honor-or-reject split has a single source of truth.
-    fn gradient_free_name(&self) -> Option<&'static str> {
+impl OptimizerKind {
+    /// Places each variant in its [`OptimizerFamily`] — the single source of
+    /// truth for the honor-or-reject-or-gradient weight split (ledger §2.117).
+    /// The match is exhaustive with no wildcard arm on purpose: a new optimizer
+    /// variant will not compile until it declares its family here, which keeps a
+    /// future optimizer from defaulting into the weight-into-scales fold.
+    fn family(&self) -> OptimizerFamily {
         match self {
-            OptimizerKind::Amoeba(_) => Some("Amoeba"),
-            OptimizerKind::Powell(_) => Some("Powell"),
-            OptimizerKind::OnePlusOneEvolutionary(_) => Some("OnePlusOneEvolutionary"),
-            OptimizerKind::Exhaustive(_) => Some("Exhaustive"),
-            _ => None,
+            OptimizerKind::GradientDescent(_)
+            | OptimizerKind::RegularStep(_)
+            | OptimizerKind::LineSearch(_)
+            | OptimizerKind::ConjugateGradientLineSearch(_) => OptimizerFamily::Gradient,
+            OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_) => OptimizerFamily::LBfgs,
+            OptimizerKind::Amoeba(_) => OptimizerFamily::GradientFree("Amoeba"),
+            OptimizerKind::Powell(_) => OptimizerFamily::GradientFree("Powell"),
+            OptimizerKind::OnePlusOneEvolutionary(_) => {
+                OptimizerFamily::GradientFree("OnePlusOneEvolutionary")
+            }
+            OptimizerKind::Exhaustive(_) => OptimizerFamily::GradientFree("Exhaustive"),
         }
     }
 }
@@ -2360,15 +2382,16 @@ impl ImageRegistrationMethod {
             });
         }
 
-        // Honor-or-reject: the gradient family folds the weights into `scales`
-        // and the two L-BFGS variants apply them to the gradient, but the four
-        // gradient-free optimizers can do neither (they apply scales
+        // Honor-or-reject-or-gradient: the family enum is the single source of
+        // truth (ledger §2.117). The gradient family folds the weights into
+        // `scales` and the two L-BFGS variants apply them to the gradient, but
+        // the four gradient-free optimizers can do neither (they apply scales
         // multiplicatively and never form a gradient). ITK validates their
         // length above then silently ignores the values; folding them here would
         // poison the scales (`scales / 0 = +∞`, then `0 · ∞ = NaN`). Reject
-        // explicitly-set weights rather than expose an inert parameter
-        // (ledger §2.117).
-        if let Some(optimizer) = self.optimizer.gradient_free_name() {
+        // explicitly-set weights rather than expose an inert parameter.
+        let family = self.optimizer.family();
+        if let OptimizerFamily::GradientFree(optimizer) = family {
             if !self.optimizer_weights.is_empty() {
                 return Err(RegistrationError::OptimizerWeightsNotApplicable { optimizer });
             }
@@ -2378,7 +2401,7 @@ impl ImageRegistrationMethod {
         // estimator (ITK's LBFGSBOptimizerv4/LBFGS2Optimizerv4 force identity
         // scales), so neither is built for them — they drive the raw metric
         // gradient directly.
-        let ignores_scales = self.optimizer.ignores_scales();
+        let ignores_scales = matches!(family, OptimizerFamily::LBfgs);
 
         // An estimator is needed if scales or the learning rate are estimated.
         // When only the learning rate is, ITK still runs an estimator — the one
@@ -2429,21 +2452,20 @@ impl ImageRegistrationMethod {
         // gradient they descend instead — see `weighted_objective!` below. So the
         // weights are honored by the gradient-descent family (this fold) and the
         // L-BFGS family (via the gradient), while the gradient-free family
-        // rejects them at the validation site above — they can never reach this
-        // fold with non-empty weights, but the `gradient_free_name` guard keeps
-        // the fold from running for them by construction (ledger §2.117).
+        // rejects them at the validation site above. Only the `Gradient` family
+        // folds, and the exhaustive `family` match keeps a future variant from
+        // defaulting into this fold by construction (ledger §2.117).
         let weights = &self.optimizer_weights;
         let apply_weights = !weights_are_identity(weights);
-        let scales: Vec<f64> =
-            if ignores_scales || self.optimizer.gradient_free_name().is_some() || !apply_weights {
-                scales
-            } else {
-                scales
-                    .iter()
-                    .enumerate()
-                    .map(|(j, &s)| s / weights[j % weights.len()])
-                    .collect()
-            };
+        let scales: Vec<f64> = if apply_weights && matches!(family, OptimizerFamily::Gradient) {
+            scales
+                .iter()
+                .enumerate()
+                .map(|(j, &s)| s / weights[j % weights.len()])
+                .collect()
+        } else {
+            scales
+        };
 
         let scaled = |grad: &[f64]| -> Vec<f64> {
             grad.iter()
