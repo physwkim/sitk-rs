@@ -69,7 +69,7 @@
 //! `VectorFloat64`: the samples survive exactly, only the pixel-type label
 //! widens from complex to vector.
 //!
-//! # Compression is unconditional
+//! # Compression is unconditional upstream — gated by `use_compression` here
 //!
 //! `WriteImageInformation` calls `plist.setDeflate(this->GetCompressionLevel())`
 //! with no `GetUseCompression()` guard — its own comment reads "we have implicit
@@ -77,7 +77,14 @@
 //! `[1, GetMaximumCompressionLevel()]` and the constructor sets the maximum to
 //! `9` and the level to `5`, so every HDF5 image ITK writes is deflated at
 //! level 1 or above; `SetUseCompression(false)` cannot turn it off
-//! (ledger §3.48). The chunk is the `N-1` dimensional slab `[1, ...]`.
+//! (ledger §3.48).
+//!
+//! This port makes the flag live: [`write`] applies the deflate filter only
+//! when [`WriteOptions::use_compression`] is set, and
+//! [`WriteOptions::compression_level`] is meaningful only then. The chunk — the
+//! `N-1` dimensional slab `[1, ...]` — is written unconditionally either way,
+//! matching ITK's own unconditional `plist.setChunk`; an uncompressed write is
+//! a chunked dataset with no filter, not a contiguous one.
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -693,7 +700,14 @@ fn read_buffer(dataset: &H5Dataset, component: PixelId) -> Result<PixelBuffer> {
 pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     let dimension = image.dimension();
     let components = image.buffer_stride();
-    let level = options.resolved_level(DEFAULT_COMPRESSION_LEVEL);
+    // §3.48: `use_compression` gates the deflate filter. Upstream deflates
+    // unconditionally (`setDeflate` with no `GetUseCompression()` guard); this
+    // port honours the flag. Chunking stays unconditional, matching ITK's own
+    // `plist.setChunk` — an uncompressed write is still a chunked dataset, just
+    // without the filter. The level is meaningful only when compression is on.
+    let deflate = options
+        .use_compression
+        .then(|| options.resolved_level(DEFAULT_COMPRESSION_LEVEL) as u32);
 
     let file = H5File::create(path)?;
     file.write_vlen_strings("ITKVersion", &[ITK_VERSION])?;
@@ -720,7 +734,7 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     // "set the chunk size to be the N-1 dimension region" — `dims[0] = 1`.
     let mut chunk = dims.clone();
     chunk[0] = 1;
-    write_voxels(&instance, image.buffer(), &dims, &chunk, level)?;
+    write_voxels(&instance, image.buffer(), &dims, &chunk, deflate)?;
 
     let metadata = instance.create_group(META_DATA)?;
     for key in image.meta_data_keys() {
@@ -759,8 +773,9 @@ fn write_directions(group: &H5Group, direction: &[f64], dimension: usize) -> Res
     Ok(())
 }
 
-/// The `VoxelData` dataset: chunked at `[1, ...]` and deflated at `level`,
-/// whatever `GetUseCompression()` says.
+/// The `VoxelData` dataset: chunked at `[1, ...]` always, and deflated at
+/// `deflate` when `Some` — i.e. only when `use_compression` asked for it
+/// (§3.48).
 ///
 /// The buffer is written verbatim. ITK's dataspace is the reverse of the image
 /// size with the component axis appended, which is exactly the order of
@@ -770,18 +785,15 @@ fn write_voxels(
     buffer: &PixelBuffer,
     dims: &[usize],
     chunk: &[usize],
-    level: i32,
+    deflate: Option<u32>,
 ) -> Result<()> {
-    let level = level as u32;
     macro_rules! write {
         ($ty:ty, $values:expr) => {{
-            group
-                .new_dataset::<$ty>()
-                .shape(dims)
-                .chunk(chunk)
-                .deflate(level)
-                .create(VOXEL_DATA)?
-                .write_raw($values)?;
+            let mut builder = group.new_dataset::<$ty>().shape(dims).chunk(chunk);
+            if let Some(level) = deflate {
+                builder = builder.deflate(level);
+            }
+            builder.create(VOXEL_DATA)?.write_raw($values)?;
         }};
     }
     match buffer {
@@ -832,9 +844,9 @@ impl ImageIo for Hdf5ImageIo {
         read(path)
     }
 
-    /// `options.use_compression` is ignored — `WriteImageInformation` deflates
-    /// unconditionally — and `options.compression_level` passes through
-    /// `itkSetClampMacro(CompressionLevel, int, 1, 9)`.
+    /// `options.use_compression` gates the deflate filter (§3.48 — upstream
+    /// deflates unconditionally); when on, `options.compression_level` passes
+    /// through `itkSetClampMacro(CompressionLevel, int, 1, 9)`.
     fn write(&self, image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
         write(image, path, options)
     }
@@ -1050,8 +1062,9 @@ mod tests {
         ));
         assert_eq!(dimension.read_raw::<u64>().unwrap(), [4, 3]);
 
-        // VoxelData: the reverse of the image size, chunked at [1, ...], and
-        // deflated even though `WriteOptions::use_compression` is false.
+        // VoxelData: the reverse of the image size, chunked at [1, ...]. The
+        // default `WriteOptions::use_compression` is false, so no deflate
+        // filter — chunking is unconditional either way (§3.48).
         let voxels = file.dataset("ITKImage/0/VoxelData").unwrap();
         assert_eq!(voxels.shape(), [3, 4]);
         assert_eq!(voxels.chunk_dims(), Some(vec![1, 4]));
@@ -1160,15 +1173,15 @@ mod tests {
         }
     }
 
-    /// `SetCompressionLevel` clamps to `[1, 9]`, and every level reads back the
-    /// same bytes.
+    /// With compression on, `SetCompressionLevel` clamps to `[1, 9]` and every
+    /// level reads back the same bytes.
     #[test]
     fn every_compression_level_round_trips() {
         let image = image_2d(PixelBuffer::Int32((0..12).collect()));
         for level in [-1, 0, 1, 5, 9, 100] {
             let path = tmp_path(&format!("level_{level}.h5"));
             let options = WriteOptions {
-                use_compression: false,
+                use_compression: true,
                 compression_level: level,
             };
             write(&image, &path, &options).unwrap();
@@ -1248,18 +1261,18 @@ mod tests {
         let _ = std::fs::remove_file(&absent);
     }
 
-    /// `plist.setDeflate(GetCompressionLevel())` runs whatever
-    /// `GetUseCompression()` says (ledger §3.48), so an "uncompressed" write is
-    /// still a chunked, deflated dataset.
+    /// §3.48 fixed: `use_compression` gates the deflate filter. The two
+    /// boundary cases of that gate — off and on — are checked side by side on
+    /// the same image. Chunking is unconditional in both; only the filter (and
+    /// so the file size) changes.
     ///
     /// The image is two rows of 64 KiB so that the chunk — the `N-1`
     /// dimensional slab, here one row — is large enough that deflating it
-    /// dominates the per-chunk B-tree and heap overhead: 128 KiB of zeros must
-    /// not land in a 128 KiB file.
+    /// dominates the per-chunk B-tree and heap overhead: with the filter off,
+    /// 128 KiB of zeros must stay in the file; with it on, they must not.
     #[test]
-    fn a_write_without_use_compression_is_still_deflated() {
+    fn use_compression_gates_the_deflate_filter() {
         const RAW_BYTES: usize = 2 * 65536;
-        let path = tmp_path("implicit_deflate.h5");
         let image = Image::from_parts(
             PixelBuffer::UInt8(vec![0; RAW_BYTES]),
             vec![65536, 2],
@@ -1268,29 +1281,54 @@ mod tests {
             vec![1.0, 0.0, 0.0, 1.0],
         )
         .unwrap();
+
+        // Off: chunked, no deflate — the zeros are stored uncompressed.
+        let off = tmp_path("deflate_off.h5");
         write(
             &image,
-            &path,
+            &off,
             &WriteOptions {
                 use_compression: false,
                 compression_level: -1,
             },
         )
         .unwrap();
-
-        let file = H5File::open(&path).unwrap();
+        let file = H5File::open(&off).unwrap();
         let voxels = file.dataset("ITKImage/0/VoxelData").unwrap();
         assert!(voxels.is_chunked());
         assert_eq!(voxels.chunk_dims(), Some(vec![1, 65536]));
         drop(file);
-
-        let bytes = std::fs::metadata(&path).unwrap().len() as usize;
+        let off_bytes = std::fs::metadata(&off).unwrap().len() as usize;
         assert!(
-            bytes < RAW_BYTES / 4,
-            "{RAW_BYTES} bytes of zeros landed in a {bytes}-byte file"
+            off_bytes >= RAW_BYTES,
+            "uncompressed {RAW_BYTES}-byte image landed in a {off_bytes}-byte file"
         );
-        assert_eq!(read(&path).unwrap(), image);
-        let _ = std::fs::remove_file(&path);
+        assert_eq!(read(&off).unwrap(), image);
+        let _ = std::fs::remove_file(&off);
+
+        // On: chunked and deflated — the zeros compress away.
+        let on = tmp_path("deflate_on.h5");
+        write(
+            &image,
+            &on,
+            &WriteOptions {
+                use_compression: true,
+                compression_level: -1,
+            },
+        )
+        .unwrap();
+        let file = H5File::open(&on).unwrap();
+        let voxels = file.dataset("ITKImage/0/VoxelData").unwrap();
+        assert!(voxels.is_chunked());
+        assert_eq!(voxels.chunk_dims(), Some(vec![1, 65536]));
+        drop(file);
+        let on_bytes = std::fs::metadata(&on).unwrap().len() as usize;
+        assert!(
+            on_bytes < RAW_BYTES / 4,
+            "{RAW_BYTES} bytes of zeros landed in a {on_bytes}-byte deflated file"
+        );
+        assert_eq!(read(&on).unwrap(), image);
+        let _ = std::fs::remove_file(&on);
     }
 
     /// `ReadImageInformation` sets `m_NumberOfComponents` but never
