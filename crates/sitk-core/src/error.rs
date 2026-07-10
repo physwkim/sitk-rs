@@ -97,6 +97,12 @@ pub enum Error {
     /// `RemoveLabel` (`itkLabelMap.hxx:110-116`, `:453-459`).
     #[error("label {0} is the label map's background value")]
     LabelIsBackground(i64),
+
+    /// [`LabelMap::push_label_object`](crate::LabelMap::push_label_object) found
+    /// no free label. Upstream's `itkExceptionStringMacro("Can't push the label
+    /// object: the label map is full.")` (`itkLabelMap.hxx:431-434`).
+    #[error("can't push the label object: the label map is full")]
+    LabelMapFull,
 }
 
 /// Convenience alias for core results.

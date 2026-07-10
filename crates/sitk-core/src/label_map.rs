@@ -107,6 +107,25 @@ pub struct LabelObjectLine {
 }
 
 impl LabelObjectLine {
+    /// A run of `length` pixels starting at `index`.
+    ///
+    /// Returns [`Error::UnsupportedLabelMapDimension`] unless
+    /// `1 <= index.len() <= MAX_DIM`, and [`Error::NonPositiveLineLength`]
+    /// unless `length >= 1`. Upstream's `LabelObjectLine(index, length)`
+    /// (`itkLabelObjectLine.h:53`) checks neither.
+    pub fn new(index: &[i64], length: i64) -> Result<Self> {
+        if index.is_empty() || index.len() > MAX_DIM {
+            return Err(Error::UnsupportedLabelMapDimension(index.len()));
+        }
+        if length < 1 {
+            return Err(Error::NonPositiveLineLength(length));
+        }
+        Ok(LabelObjectLine {
+            index: pad_index(index),
+            length,
+        })
+    }
+
     /// The line's start index, zero-padded to [`MAX_DIM`].
     pub fn index(&self) -> [i64; MAX_DIM] {
         self.index
@@ -198,6 +217,18 @@ impl LabelObject {
     /// The label this object carries.
     pub fn label(&self) -> i64 {
         self.label
+    }
+
+    /// `itkLabelObject.h:107-108` — relabel the object.
+    ///
+    /// A [`LabelMap`] never hands out `&mut LabelObject`, so this cannot break
+    /// its `objects[k].label() == k` invariant: an object must be removed from
+    /// the map (or built outside it) before it can be relabelled, and reinserted
+    /// through [`LabelMap::add_label_object`] afterwards. That
+    /// remove-relabel-reinsert dance is exactly what upstream's
+    /// `ChangeLabelLabelMapFilter` and `AttributeRelabelLabelMapFilter` do.
+    pub fn set_label(&mut self, label: i64) {
+        self.label = label;
     }
 
     /// Number of spatial dimensions.
@@ -336,6 +367,11 @@ pub struct LabelMap {
     origin: Vec<f64>,
     direction: Vec<f64>,
     pixel_id: PixelId,
+    /// `(NumericTraits<LabelType>::NonpositiveMin(), ::max())`, taken from
+    /// `pixel_id` at construction. Holding it is what lets
+    /// [`LabelMap::push_label_object`] reproduce upstream's bound checks without
+    /// a guard of its own; `pixel_id` has no setter, so the two cannot drift.
+    label_bounds: (i64, i64),
     background: i64,
     objects: BTreeMap<i64, LabelObject>,
 }
@@ -351,15 +387,16 @@ impl LabelMap {
         if dim == 0 || dim > MAX_DIM {
             return Err(Error::UnsupportedLabelMapDimension(dim));
         }
-        if !pixel_id.is_integer_scalar() {
-            return Err(Error::RequiresIntegerPixelType(pixel_id));
-        }
+        let label_bounds = pixel_id
+            .integer_scalar_bounds()
+            .ok_or(Error::RequiresIntegerPixelType(pixel_id))?;
         Ok(LabelMap {
             size: size.to_vec(),
             spacing: vec![1.0; dim],
             origin: vec![0.0; dim],
             direction: matrix::identity(dim),
             pixel_id,
+            label_bounds,
             background,
             objects: BTreeMap::new(),
         })
@@ -498,6 +535,72 @@ impl LabelMap {
         }
         self.objects.insert(object.label, object);
         Ok(())
+    }
+
+    /// `itkLabelMap.hxx:378-438` — insert `object` under an unused label,
+    /// chosen by upstream's exact cascade.
+    ///
+    /// Reading `last` as the greatest label present, `first` as the smallest,
+    /// `bg` as the background and `(min, max)` as the label type's
+    /// `NumericTraits` bounds:
+    ///
+    /// 1. empty map: `bg == 0 ? 1 : 0`;
+    /// 2. `last != max && last + 1 != bg` → `last + 1`;
+    /// 3. `last != max && last + 1 != max && last + 2 != bg` → `last + 2`;
+    /// 4. `first != min && first - 1 != bg` → `first - 1`;
+    /// 5. otherwise scan upward from `first` for the first gap, skipping `bg`.
+    ///
+    /// Two upstream quirks in step 5 are reproduced, not repaired
+    /// (`itkLabelMap.hxx:414-434`):
+    ///
+    /// - the scan visits one label per *existing* object, so it can run off the
+    ///   end of the container without finding a gap. When that happens upstream
+    ///   never calls `SetLabel`, and the object is inserted under **the label it
+    ///   already carried**;
+    /// - the "label map is full" throw is `if (label == lastLabel)` *after* the
+    ///   loop, which fires only on that one coincidence — not on the general
+    ///   no-gap-found condition. [`Error::LabelMapFull`] fires on exactly the
+    ///   same coincidence.
+    ///
+    /// Steps 2–4 are unreachable for a label type wider than the label span in
+    /// use, which is why the quirks in step 5 are hard to hit at all.
+    pub fn push_label_object(&mut self, mut object: LabelObject) -> Result<()> {
+        let (min, max) = self.label_bounds;
+        let bg = self.background;
+
+        if self.objects.is_empty() {
+            object.set_label(i64::from(bg == 0));
+            return self.add_label_object(object);
+        }
+
+        let first = *self.objects.keys().next().expect("non-empty");
+        let last = *self.objects.keys().next_back().expect("non-empty");
+
+        if last != max && last + 1 != bg {
+            object.set_label(last + 1);
+        } else if last != max && last + 1 != max && last + 2 != bg {
+            object.set_label(last + 2);
+        } else if first != min && first - 1 != bg {
+            object.set_label(first - 1);
+        } else {
+            let mut label = first;
+            let mut found = false;
+            for &key in self.objects.keys() {
+                if label == bg {
+                    label += 1;
+                }
+                if label != key {
+                    object.set_label(label);
+                    found = true;
+                    break;
+                }
+                label += 1;
+            }
+            if !found && label == last {
+                return Err(Error::LabelMapFull);
+            }
+        }
+        self.add_label_object(object)
     }
 
     /// `itkLabelMap.hxx:451-460`.
