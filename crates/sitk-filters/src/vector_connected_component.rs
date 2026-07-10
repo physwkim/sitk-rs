@@ -253,11 +253,35 @@ mod tests {
     /// Two zero vectors are still similar (they are identical), so an all-zero
     /// image collapses to a single component — the fix guards only the mixed
     /// zero/non-zero case, not zero-against-zero.
+    ///
+    /// This threshold=`1.0` case pins nothing about the §2.40 guard on its own:
+    /// zero-vs-zero skips the `a_zero != b_zero` early-return, then takes the
+    /// normal dot-product path (`1 - |dot(0,0)| = 1 <= 1.0`), which merges with
+    /// *or* without the guard. See
+    /// `zero_vectors_stay_separate_below_the_boundary_threshold` for the case
+    /// that actually pins the guard's zero-vs-zero semantics.
     #[test]
     fn zero_vectors_still_merge_with_each_other() {
         let image = vec_img(&[3], 2, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         let out = vector_connected_component(&image, 1.0, false).unwrap();
         assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 1, 1]);
+    }
+
+    /// Pins the §2.40 guard's *zero-vs-zero* semantics: the fix does **not**
+    /// special-case identical zero vectors to always-merge — it only early-
+    /// returns `false` for the mixed zero/non-zero case (`a_zero != b_zero`).
+    /// Zero-vs-zero still flows through the ordinary dot-product predicate,
+    /// giving distance `1 - |dot(0,0)| = 1`, so below the boundary threshold
+    /// `1.0` even two identical zero vectors are dissimilar and stay separate,
+    /// exactly like two orthogonal directioned vectors would. At threshold
+    /// `0.5` the three zero pixels therefore form three components, not one —
+    /// a naive "identical zeros always merge" special case would wrongly yield
+    /// `[1, 1, 1]` here.
+    #[test]
+    fn zero_vectors_stay_separate_below_the_boundary_threshold() {
+        let image = vec_img(&[3], 2, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let out = vector_connected_component(&image, 0.5, false).unwrap();
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 2, 3]);
     }
 
     /// A zero vector wedged between two identical directioned regions no longer
