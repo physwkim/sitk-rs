@@ -84,10 +84,11 @@ impl PixelId {
     /// A pixel occupies `size_in_bytes()` times its image's
     /// [`Image::buffer_stride`](crate::Image::buffer_stride) bytes.
     ///
-    /// This is **not** SimpleITK's `Image::GetSizeOfPixelComponent()`, which
-    /// returns `2 * sizeof(component)` for a complex pixel type — see
-    /// [`Image::size_of_pixel_component`](crate::Image::size_of_pixel_component),
-    /// where that quirk is reproduced.
+    /// SimpleITK's `Image::GetSizeOfPixelComponent()` returns
+    /// `2 * sizeof(component)` for a complex pixel type, contradicting its own
+    /// doc; this port fixed that (§3.20), so
+    /// [`Image::size_of_pixel_component`](crate::Image::size_of_pixel_component)
+    /// agrees with this method for every pixel type.
     pub const fn size_in_bytes(self) -> usize {
         match self {
             PixelId::UInt8 | PixelId::Int8 | PixelId::VectorUInt8 | PixelId::VectorInt8 => 1,

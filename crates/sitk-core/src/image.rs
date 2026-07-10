@@ -1210,22 +1210,18 @@ impl Image {
     /// Bytes per pixel component — SimpleITK's `GetSizeOfPixelComponent()`
     /// (sitkImage.h:253, sitkImage.cxx:162-217).
     ///
-    /// # Upstream quirk: complex reports the whole pixel
+    /// # Divergence from upstream: complex reports the component, not the pixel
     ///
     /// Upstream documents "Returns the `sizeof` the pixel component type", and
     /// for the scalar and vector pixel types it does. For the two complex pixel
     /// types its `switch` returns `2 * sizeof(float)` / `2 * sizeof(double)`
     /// (sitkImage.cxx:206-212) — the size of the whole `std::complex` pixel, not
-    /// of its component. `sitkImageTests.cxx:1166` pins that as intended:
-    /// `EXPECT_EQ(sizeof(std::complex<float>), img.GetSizeOfPixelComponent())`.
-    /// Reproduced. [`PixelId::size_in_bytes`] is the un-quirked component size.
+    /// of its component — and `sitkImageTests.cxx:1166` pins that wrong value.
+    /// This port returns the documented value: `4` for `ComplexFloat32`, `8` for
+    /// `ComplexFloat64`. See §3.20 of `doc/upstream-findings.md`. It is exactly
+    /// [`PixelId::size_in_bytes`].
     pub fn size_of_pixel_component(&self) -> usize {
-        let component = self.pixel_id.size_in_bytes();
-        if self.pixel_id.is_complex() {
-            2 * component
-        } else {
-            component
-        }
+        self.pixel_id.size_in_bytes()
     }
 
     /// The pixel type as a human-readable string — SimpleITK's

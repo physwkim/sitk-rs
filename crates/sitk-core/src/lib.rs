@@ -188,9 +188,10 @@ mod tests {
             (PixelId::ComplexFloat64, PixelId::Float64),
         ] {
             assert_eq!(complex.component_id(), component);
-            // `size_in_bytes` is the component size — unlike SimpleITK's
-            // `GetSizeOfPixelComponent`, which doubles it for a complex pixel;
-            // see `size_of_pixel_component_reports_the_whole_complex_pixel`.
+            // `size_in_bytes` is the component size — as is this port's
+            // `size_of_pixel_component`, unlike SimpleITK's, which doubles it
+            // for a complex pixel; see §3.20 and
+            // `size_of_pixel_component_reports_the_complex_component`.
             assert_eq!(complex.size_in_bytes(), component.size_in_bytes());
             assert!(complex.is_floating_point());
             assert!(complex.is_signed());
@@ -1049,26 +1050,31 @@ mod tests {
     // ---- size_of_pixel_component / pixel_id_type_as_string / Display -------
 
     #[test]
-    fn size_of_pixel_component_reports_the_whole_complex_pixel() {
+    fn size_of_pixel_component_reports_the_complex_component() {
         // sitkImage.cxx:206-212 returns 2*sizeof(component) for the complex
-        // pixel types, contradicting its own doc. sitkImageTests.cxx:1166 pins it.
+        // pixel types, contradicting its own doc; sitkImageTests.cxx:1166 pins
+        // that wrong value. §3.20: this port returns the documented one.
         assert_eq!(
             Image::new(&[2], PixelId::Float32).size_of_pixel_component(),
             4
         );
         assert_eq!(
             Image::new(&[2], PixelId::ComplexFloat32).size_of_pixel_component(),
-            8
+            4
         );
         assert_eq!(
             Image::new(&[2], PixelId::ComplexFloat64).size_of_pixel_component(),
-            16
+            8
         );
         // A vector image reports its component size, whatever the vector length.
         let v = Image::from_vec_vector(&[2], 5, vec![0.0f64; 10]).unwrap();
         assert_eq!(v.size_of_pixel_component(), 8);
-        // ... and `PixelId::size_in_bytes` is the un-quirked component size.
+        // ... and it now agrees with `PixelId::size_in_bytes` everywhere.
         assert_eq!(PixelId::ComplexFloat32.size_in_bytes(), 4);
+        assert_eq!(
+            Image::new(&[2], PixelId::ComplexFloat64).size_of_pixel_component(),
+            PixelId::ComplexFloat64.size_in_bytes()
+        );
     }
 
     #[test]
