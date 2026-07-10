@@ -114,7 +114,9 @@
 use sitk_core::{Image, LabelMap, LabelObject, PixelId};
 
 use crate::error::{FilterError, Result};
-use crate::label_map::label_unique_label_map;
+use crate::label_map::{
+    label_unique_label_map, object_offsets, require_label_pixel_id, require_same_size, strides,
+};
 use crate::label_to_rgb::{build_color_table, vector_image_from_f64};
 use crate::morphology::{StructuringElement, binary_dilate, binary_erode};
 use crate::{numeric_traits_max, quantize_to_pixel_type};
@@ -184,52 +186,10 @@ impl Default for LabelMapContourOverlaySettings {
     }
 }
 
-/// `pixel_types: LabelPixelIDTypeList` (`sitkPixelIDTypeLists.h:160-166`) is
-/// the unsigned integer types only, so a label is never negative.
-fn require_label_pixel_id(map: &LabelMap) -> Result<()> {
-    let id = map.pixel_id();
-    if !id.is_integer_scalar() || id.is_signed() {
-        return Err(FilterError::RequiresUnsignedIntegerPixelType(id));
-    }
-    Ok(())
-}
-
-fn require_same_size(map: &LabelMap, feature: &Image) -> Result<()> {
-    if map.size() != feature.size() {
-        return Err(FilterError::SizeMismatch {
-            a: map.size().to_vec(),
-            b: feature.size().to_vec(),
-        });
-    }
-    Ok(())
-}
-
 /// `itkLabelToRGBFunctor.h:101`'s `m_Colors[p % m_Colors.size()]`, with the
 /// same `(p as i64) as u64` conversion [`crate::label_to_rgb`] documents.
 fn color_index(label: i64, num_colors: usize) -> usize {
     ((label as u64) % num_colors as u64) as usize
-}
-
-fn strides(size: &[usize]) -> Vec<usize> {
-    let mut st = vec![1usize; size.len()];
-    for d in 1..size.len() {
-        st[d] = st[d - 1] * size[d - 1];
-    }
-    st
-}
-
-/// Linear offsets of every pixel of `object`, in raster order, against a map of
-/// stride `st`. Mirrors [`LabelMap::to_label_image`]'s line walk.
-fn object_offsets<'a>(
-    object: &'a LabelObject,
-    st: &'a [usize],
-) -> impl Iterator<Item = usize> + 'a {
-    object.lines().iter().flat_map(move |line| {
-        let idx = line.index();
-        let base: usize = (1..st.len()).map(|d| idx[d] as usize * st[d]).sum();
-        let start = base + idx[0] as usize;
-        start..start + line.length() as usize
-    })
 }
 
 /// `LabelMapToRGBImageFilter`: paint every label object with its palette colour
