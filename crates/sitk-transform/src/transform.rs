@@ -1066,7 +1066,7 @@ impl VersorRigid3DTransform {
     /// matrix distinct from the versor: [`matrix`](Self::matrix) is always
     /// re-derived from the stored versor (as every other mutator on this type
     /// already does), so it can differ from the `matrix` argument by a few
-    /// ULPs of floating-point rounding.
+    /// ULPs of floating-point rounding (ledger §4.38).
     pub fn set_matrix(&mut self, matrix: &[f64]) -> Result<()> {
         assert_eq!(matrix.len(), 9, "matrix must be row-major 3x3");
         const EPS: f64 = 1e-10;

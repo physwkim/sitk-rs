@@ -43,7 +43,8 @@
 //! SimpleITK's member-function factory registers this filter only for 2-D
 //! and 3-D images (`sitkBSplineTransformInitializerFilter.cxx:53-56`); this
 //! port's domain math and `BSplineTransform` are both dimension-generic, so
-//! `execute` has no such cap.
+//! `execute` has no such cap (ledger §4.37, alongside the order restriction
+//! above).
 //!
 //! ```
 //! use sitk_core::Image;

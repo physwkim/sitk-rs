@@ -43,8 +43,8 @@
 //! between them (an individual axis can come out 180°-flipped whenever the
 //! two images' independently-chosen eigenvector signs happen to disagree).
 //! This matches ITK's own documented framing of this filter as an
-//! *initializer* for iterative registration, not an exact aligner. See
-//! ledger §2 for the corresponding entry.
+//! *initializer* for iterative registration, not an exact aligner (ledger
+//! §2.72).
 //!
 //! # Degenerate inputs
 //!
