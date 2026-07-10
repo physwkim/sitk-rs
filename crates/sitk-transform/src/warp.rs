@@ -348,10 +348,14 @@ impl FieldReader<'_> {
             let end = self.size[d] - 1;
             let floor = cindex[d].floor();
             // `floor >= 0.0` is false for NaN too, which then clamps to the
-            // start index. C++'s `Math::Floor<IndexValueType>` of a NaN or of a
-            // value past `IndexValueType`'s range is undefined; clamping in the
-            // float domain, before the cast, is defined and agrees with
-            // upstream on every input upstream defines.
+            // start index. Upstream floors this quantity through
+            // `Math::Floor<IndexValueType>` *before* its own clamp (hxx:198 vs
+            // :200-216), but the operand is the geometry-derived continuous
+            // index of the output point — never a displacement value — so it
+            // is finite on every input upstream defines (a float→int overflow
+            // would need degenerate output/field geometry, not field data).
+            // Clamping in the float domain first is a defensive choice, not a
+            // divergence on any reachable input.
             if floor >= 0.0 {
                 if floor < end as f64 {
                     base[d] = floor as usize;
