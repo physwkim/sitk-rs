@@ -85,16 +85,38 @@
 //! * anything else is a single raw filename, resolved against the header's own
 //!   directory.
 //!
-//! Not yet supported: compressed data (`CompressedData = True`), and MetaIO's
-//! `printf`-pattern slice form (`ElementDataFile = slice%03d.raw 1 20 1`).
+//! # Compressed data
+//!
+//! `CompressedData = True` marks the element data as a **zlib** stream —
+//! `MET_PerformCompression` calls `deflateInit`, which writes an RFC-1950
+//! wrapper (metaUtils.cxx:808). Reading goes through
+//! `MET_PerformUncompression`'s `inflateInit2(&d, 47)`, which auto-detects zlib
+//! *and* gzip, so a gzip payload also reads (metaUtils.cxx:862). See
+//! [`crate::compression`].
+//!
+//! `CompressedDataSize` tells the reader how many bytes to hand to inflate. It
+//! is written whenever it is non-zero (metaObject.cxx:1427-1432), so every
+//! ITK-written compressed MetaImage carries it. When it is *absent*,
+//! `M_ReadElements` guesses the compressed size as the whole file's size and
+//! seeks back to offset `0` to read it (metaImage.cxx:2616-2622) — which for a
+//! `LOCAL` `.mha` feeds the *header text* to inflate, gets `Z_DATA_ERROR`, and
+//! then returns success over a `new`-ed buffer nobody wrote to. That is an
+//! upstream bug (§1.52); this port refuses such a header (§4.64). A detached
+//! `.zraw` has no header in the way, so there the guess is right and this port
+//! guesses too.
+//!
+//! Not yet supported: MetaIO's `printf`-pattern slice form
+//! (`ElementDataFile = slice%03d.raw 1 20 1`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sitk_core::{Image, PixelBuffer, PixelId};
 
+use crate::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, inflate_auto, zlib_compress};
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
+use crate::writer::WriteOptions;
 
 /// Every header field name MetaIO registers for reading, in registration order:
 /// `MetaObject::M_SetupReadFields` (metaObject.cxx:1204-1306) followed by
@@ -279,6 +301,13 @@ fn fmt_vec_f64(v: &[f64]) -> String {
 /// Build the text header. `element_data_file` is `"LOCAL"` for `.mha` or the raw
 /// filename for `.mhd`.
 ///
+/// `compressed_size` is `None` for an uncompressed write and `Some(n)` for a
+/// compressed one, where `n` is the *deflated* byte count. `MetaObject`'s
+/// `M_SetupWriteFields` emits `CompressedData = True` followed by
+/// `CompressedDataSize = n`, and skips the size line when `n` is zero
+/// (metaObject.cxx:1421-1439) — a case this port cannot reach, since deflating
+/// even an empty buffer yields a non-empty zlib stream.
+///
 /// `ElementNumberOfChannels` is [`Image::buffer_stride`], not
 /// [`Image::number_of_components_per_pixel`] — see the module docs for why
 /// those two disagree for a complex image.
@@ -288,7 +317,7 @@ fn fmt_vec_f64(v: &[f64]) -> String {
 /// header field (itkMetaImageIO.cxx:416-470); this port's writer is pinned to
 /// its current bytes, so a read/write round trip drops the dictionary rather
 /// than growing `ITK_InputFilterName` and `Modality` lines it never had.
-fn build_header(img: &Image, element_data_file: &str) -> String {
+fn build_header(img: &Image, element_data_file: &str, compressed_size: Option<u64>) -> String {
     let dim = img.dimension();
     let dim_size = img
         .size()
@@ -296,12 +325,19 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
         .join(" ");
+    // `MET_ULONG_LONG` is printed with `operator<<` on the field's `double`
+    // store, so the size is a plain decimal integer (metaUtils.cxx:1502-1512).
+    let compression_lines = match compressed_size {
+        Some(n) if n > 0 => format!("CompressedData = True\nCompressedDataSize = {n}\n"),
+        Some(_) => "CompressedData = True\n".to_string(),
+        None => "CompressedData = False\n".to_string(),
+    };
     format!(
         "ObjectType = Image\n\
          NDims = {dim}\n\
          BinaryData = True\n\
          BinaryDataByteOrderMSB = False\n\
-         CompressedData = False\n\
+         {compression_lines}\
          TransformMatrix = {matrix}\n\
          Offset = {offset}\n\
          ElementSpacing = {spacing}\n\
@@ -318,7 +354,16 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
 }
 
 /// Write an image as MetaImage. `.mha` embeds the data (`ElementDataFile =
-/// LOCAL`); `.mhd` writes a sibling `.raw` file.
+/// LOCAL`); `.mhd` writes a sibling file, named `.raw` uncompressed and
+/// `.zraw` compressed (`MET_SetFileSuffix`, metaImage.cxx:1586-1593).
+///
+/// With [`WriteOptions::use_compression`] set, `MetaImage::WriteStream` deflates
+/// the whole element buffer *before* the header is laid out
+/// (metaImage.cxx:1668-1690), which is why `CompressedDataSize` can appear in a
+/// header written in one pass. The deflate is `MET_PerformCompression`'s
+/// `deflateInit(&z, level)` — a zlib stream, not gzip — at
+/// `MetaImageIO`'s level of 2 unless the caller names another
+/// (itkMetaImageIO.cxx:62-64, 717-718).
 ///
 /// Every pixel category is written: scalar, vector, and complex alike, since
 /// [`buffer_to_le_bytes`] already serialises the image's full interleaved
@@ -327,28 +372,40 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
 /// `ElementNumberOfChannels`. See the module docs for the read-side
 /// consequence: MetaIO cannot tell a complex image from a same-width vector
 /// one, so a complex image does not read back as complex.
-pub fn write(img: &Image, path: &Path) -> Result<()> {
+pub fn write(img: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     let data = buffer_to_le_bytes(img.buffer());
+    let data = if options.use_compression {
+        zlib_compress(&data, options.resolved_level(ITK_DEFAULT_COMPRESSION_LEVEL))
+    } else {
+        data
+    };
+    let compressed_size = options.use_compression.then_some(data.len() as u64);
+
     let is_mhd = path
         .extension()
         .map(|e| e.eq_ignore_ascii_case("mhd"))
         .unwrap_or(false);
 
     if is_mhd {
+        let suffix = if options.use_compression {
+            ".zraw"
+        } else {
+            ".raw"
+        };
         let raw_name = path
             .file_stem()
             .map(|s| {
                 let mut n = s.to_os_string();
-                n.push(".raw");
+                n.push(suffix);
                 n
             })
             .ok_or_else(|| IoError::InvalidPath(path.to_path_buf()))?;
-        let header = build_header(img, &raw_name.to_string_lossy());
+        let header = build_header(img, &raw_name.to_string_lossy(), compressed_size);
         std::fs::write(path, header)?;
         let raw_path = path.with_file_name(raw_name);
         std::fs::write(raw_path, data)?;
     } else {
-        let header = build_header(img, "LOCAL");
+        let header = build_header(img, "LOCAL", compressed_size);
         let mut bytes = header.into_bytes();
         bytes.extend_from_slice(&data);
         std::fs::write(path, bytes)?;
@@ -366,6 +423,11 @@ struct Header {
     channels: usize,
     big_endian: bool,
     compressed: bool,
+    /// `CompressedDataSize`, `None` when the field is absent. `MET_ULONG_LONG`
+    /// is parsed into a `double` upstream (metaUtils.cxx:1231-1240), so a size
+    /// above 2^53 loses precision there; this port keeps the exact integer
+    /// (§1.52).
+    compressed_data_size: Option<u64>,
     element_data_file: String,
     /// Byte offset in the original buffer where the `ElementDataFile` line
     /// ends: pixel data for `LOCAL`, slice filenames for `LIST`.
@@ -531,6 +593,11 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
     let compressed = last(&fields, "CompressedData")
         .map(met_bool)
         .unwrap_or(false);
+    // `MET_ULONG_LONG` reads with `fp >> value[0]` into a `double`, so a
+    // malformed number leaves the field undefined and `m_CompressedDataSize`
+    // keeps its `0` (metaObject.cxx:1599-1603) — here, `None`.
+    let compressed_data_size =
+        last(&fields, "CompressedDataSize").and_then(|v| v.trim().parse().ok());
 
     let element_data_file = last(&fields, "ElementDataFile")
         .ok_or(IoError::MalformedHeader)?
@@ -545,6 +612,7 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
         channels,
         big_endian,
         compressed,
+        compressed_data_size,
         element_data_file,
         data_offset,
         metadata: build_metadata(&fields),
@@ -617,6 +685,12 @@ fn list_file_image_dim(element_data_file: &str, dims: usize) -> usize {
 /// the freshly `new`-ed buffer uninitialised. That is unreproducible in safe
 /// Rust and indistinguishable from a corrupt file, so a short list is
 /// [`IoError::TruncatedData`] here.
+/// Each slice goes through `M_ReadElements` in its own right
+/// (metaImage.cxx:1375-1382), so a compressed `LIST` inflates each named file
+/// separately. `compressedDataDeterminedFromFile` resets `m_CompressedDataSize`
+/// to `0` after every slice (metaImage.cxx:2634-2637), so an absent
+/// `CompressedDataSize` lets each slice use its own file length, while a
+/// present one is applied to *every* slice alike.
 fn read_list_data(path: &Path, header: &Header, tail: &[u8]) -> Result<Vec<u8>> {
     let dims = header.size.len();
     let file_image_dim = list_file_image_dim(&header.element_data_file, dims);
@@ -630,12 +704,36 @@ fn read_list_data(path: &Path, header: &Header, tail: &[u8]) -> Result<Vec<u8>> 
     for _ in 0..total_files {
         let name = lines.next().ok_or(IoError::TruncatedData)?;
         let slice = std::fs::read(resolve_sibling(path, trim_slice_name(name)))?;
+        if header.compressed {
+            data.extend_from_slice(&uncompress_elements(
+                &slice,
+                header.compressed_data_size,
+                per_file_bytes,
+            )?);
+            continue;
+        }
         if slice.len() < per_file_bytes {
             return Err(IoError::TruncatedData);
         }
         data.extend_from_slice(&slice[..per_file_bytes]);
     }
     Ok(data)
+}
+
+/// `M_ReadElements`' compressed arm (metaImage.cxx:2610-2640): read
+/// `CompressedDataSize` bytes — or, when the header did not say, the whole of
+/// `source` — and inflate them into exactly `want` bytes.
+///
+/// `declared` larger than `source` is [`IoError::TruncatedData`], which is
+/// where `M_ReadElementData`'s `gc != _dataQuantity` check lands upstream
+/// (metaImage.cxx:3583-3588).
+fn uncompress_elements(source: &[u8], declared: Option<u64>, want: usize) -> Result<Vec<u8>> {
+    let size = match declared {
+        Some(n) => usize::try_from(n).map_err(|_| IoError::TruncatedData)?,
+        None => source.len(),
+    };
+    let compressed = source.get(..size).ok_or(IoError::TruncatedData)?;
+    inflate_auto(compressed, want)
 }
 
 /// Read a MetaImage from `.mha` or `.mhd`.
@@ -659,20 +757,36 @@ pub fn read(path: &Path) -> Result<Image> {
     let bytes = std::fs::read(path)?;
     let header = parse_header(&bytes)?;
 
-    if header.compressed {
-        return Err(IoError::Unsupported("compressed MetaImage data".into()));
-    }
-
     let n: usize = header.size.iter().product();
     let byte_len = n * header.channels * header.element_type.size_in_bytes();
 
     let edf = &header.element_data_file;
     let data: Vec<u8> = if edf.eq_ignore_ascii_case("local") {
-        bytes[header.data_offset..].to_vec()
+        let raw = &bytes[header.data_offset..];
+        if header.compressed {
+            // Upstream's "guess the compressed size from the file size" arm
+            // seeks back to offset 0 and inflates the header text (§1.52); a
+            // `LOCAL` header without `CompressedDataSize` is refused here.
+            let size = header.compressed_data_size.ok_or_else(|| {
+                IoError::Unsupported(
+                    "CompressedData = True with no CompressedDataSize in a LOCAL header: \
+                     upstream reads uninitialised memory here (ledger §1.52)"
+                        .into(),
+                )
+            })?;
+            uncompress_elements(raw, Some(size), byte_len)?
+        } else {
+            raw.to_vec()
+        }
     } else if edf.len() >= 4 && &edf[..4] == "LIST" {
         read_list_data(path, &header, &bytes[header.data_offset..])?
     } else {
-        std::fs::read(resolve_sibling(path, edf))?
+        let raw = std::fs::read(resolve_sibling(path, edf))?;
+        if header.compressed {
+            uncompress_elements(&raw, header.compressed_data_size, byte_len)?
+        } else {
+            raw
+        }
     };
 
     if data.len() < byte_len {
@@ -819,7 +933,7 @@ impl ImageIo for MetaImageIo {
         read(path)
     }
 
-    fn write(&self, image: &Image, path: &Path) -> Result<()> {
-        write(image, path)
+    fn write(&self, image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
+        write(image, path, options)
     }
 }

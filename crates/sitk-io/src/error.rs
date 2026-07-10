@@ -86,6 +86,13 @@ pub enum IoError {
     #[error("cannot write NIfTI file: {0}")]
     NiftiWriteRejected(String),
 
+    /// A zlib or gzip stream could not be inflated. Upstream has no such error:
+    /// `MET_PerformUncompression` returns `true` after printing "Uncompress
+    /// failed" (metaUtils.cxx:883), leaving the caller's buffer uninitialised.
+    /// See [`crate::compression`] and ledger §4.64.
+    #[error("corrupt compressed stream: {0}")]
+    CorruptCompressedData(String),
+
     /// The pixel data was shorter than the header's declared size.
     #[error("pixel data is truncated")]
     TruncatedData,

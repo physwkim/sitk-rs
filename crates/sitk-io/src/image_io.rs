@@ -48,6 +48,7 @@ use crate::error::{IoError, Result};
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
+use crate::writer::WriteOptions;
 
 /// Which of [`ImageIo::can_read_file`] / [`ImageIo::can_write_file`] the
 /// registry probe should use. `itk::IOFileModeEnum`
@@ -149,7 +150,12 @@ pub trait ImageIo: Sync {
     fn read(&self, path: &Path) -> Result<Image>;
 
     /// Write `image` to `path`.
-    fn write(&self, image: &Image, path: &Path) -> Result<()>;
+    ///
+    /// `options` carries the `m_UseCompression` / `m_CompressionLevel` an
+    /// `itk::ImageIOBase` would hold as member state; an IO that cannot
+    /// compress ignores both, as `SetUseCompression` is only ever a request
+    /// (sitkImageFileWriter.h:80-85).
+    fn write(&self, image: &Image, path: &Path, options: &WriteOptions) -> Result<()>;
 }
 
 /// `ImageIOBase::HasSupportedReadExtension` / `...WriteExtension`: does `path`

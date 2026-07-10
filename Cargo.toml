@@ -24,3 +24,7 @@ sitk-filters = { path = "crates/sitk-filters", version = "0.0.1" }
 sitk-transform = { path = "crates/sitk-transform", version = "0.0.1" }
 sitk-registration = { path = "crates/sitk-registration", version = "0.0.1" }
 thiserror = "2.0"
+# Pure-Rust zlib/gzip. `default-features = false` + `rust_backend` pins the
+# miniz_oxide implementation and keeps every C-binding backend (`zlib-sys`,
+# `zlib-ng`, `libz-rs`) out of the tree — ledger §5.8, §5.17.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }

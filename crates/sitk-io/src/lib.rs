@@ -10,23 +10,30 @@
 //! [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
 //! also provides (`itk::simple::ReadImage` / `WriteImage`).
 //!
-//! Three uncompressed formats are supported:
+//! Three formats are supported, each in an uncompressed and a compressed form:
 //!
-//! * [`meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw`), ITK's native format.
-//!   Round-trips every scalar and vector pixel type and the full geometry; a
-//!   complex image survives as a two-channel vector image (see that module for
-//!   the upstream quirk).
-//! * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), raw encoding only, which does
-//!   round-trip a complex image because its `kinds` field records the
-//!   distinction.
-//! * [`nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`). Round-trips every scalar
-//!   pixel type, vector images, and complex images as complex. `.nii.gz` is
-//!   recognised and rejected; this workspace has no zlib.
+//! * [`meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw` / `.zraw`), ITK's
+//!   native format. Round-trips every scalar and vector pixel type and the full
+//!   geometry; a complex image survives as a two-channel vector image (see that
+//!   module for the upstream quirk). `CompressedData = True` is read and
+//!   written.
+//! * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), `raw` and `gzip` encodings, both of
+//!   which round-trip a complex image because the `kinds` field records the
+//!   distinction. `bzip2`, `hex` and `zrl` remain unimplemented.
+//! * [`nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`, and the `.gz` spelling of
+//!   each). Round-trips every scalar pixel type, vector images, and complex
+//!   images as complex.
+//!
+//! Compression on write is opt-in through [`ImageFileWriter::set_use_compression`]
+//! or [`write_image_with`] — except for NIfTI, where the `.gz` extension alone
+//! decides, exactly as upstream's `nifti_is_gzfile` does. [`compression`] owns
+//! every zlib and gzip stream the three formats produce or consume.
 //!
 //! Transforms have their own reader and writer, [`read_transform`] and
 //! [`write_transform`], over the Insight legacy text format (`.tfm` / `.txt`);
 //! see [`transform_io`].
 
+pub mod compression;
 pub mod error;
 pub mod image_io;
 pub mod meta_image;
@@ -46,7 +53,7 @@ pub use image_io::{
 pub use reader::ImageFileReader;
 use sitk_core::Image;
 pub use transform_io::{read_transform, write_transform};
-pub use writer::ImageFileWriter;
+pub use writer::{ImageFileWriter, WriteOptions};
 
 /// Read an image, letting the [`registry`] pick the format —
 /// `itk::simple::ReadImage` (sitkImageFileReader.cxx:70-78).
@@ -58,10 +65,34 @@ pub fn read_image<P: AsRef<Path>>(path: P) -> Result<Image> {
 }
 
 /// Write an image, letting the [`registry`] pick the format —
-/// `itk::simple::WriteImage`.
+/// `itk::simple::WriteImage(image, fileName)`.
+///
+/// Upstream's remaining two parameters default to `useCompression = false` and
+/// `compressionLevel = -1` (sitkImageFileWriter.h:221); Rust has no default
+/// arguments, so [`write_image_with`] takes them.
 pub fn write_image<P: AsRef<Path>>(image: &Image, path: P) -> Result<()> {
+    write_image_with(image, path, false, -1)
+}
+
+/// `itk::simple::WriteImage(image, fileName, useCompression, compressionLevel)`.
+///
+/// `use_compression` is a request: a format that cannot compress ignores it,
+/// and NIfTI — which compresses on the `.gz` extension alone — ignores both.
+/// `compression_level` of `-1` leaves each format on its own default (`2` for
+/// MetaImage and NRRD); any other value is clamped to
+/// [`compression::MIN_COMPRESSION_LEVEL`]`..=`[`compression::MAX_COMPRESSION_LEVEL`].
+pub fn write_image_with<P: AsRef<Path>>(
+    image: &Image,
+    path: P,
+    use_compression: bool,
+    compression_level: i32,
+) -> Result<()> {
     let path = path.as_ref();
-    image_io::writer_for(path)?.write(image, path)
+    let options = WriteOptions {
+        use_compression,
+        compression_level,
+    };
+    image_io::writer_for(path)?.write(image, path, &options)
 }
 
 #[cfg(test)]
@@ -1598,29 +1629,22 @@ mod tests {
         assert_eq!(back.scalar_slice::<f32>().unwrap(), &[0.0, 0.0, 1.5]);
     }
 
-    /// This build has no zlib, so a gzipped NIfTI is recognised and refused with
-    /// a message that names what is missing.
+    /// A gzipped NIfTI is claimed by the registry and round-trips. Compression
+    /// follows the `.gz` name, never `WriteOptions` — see
+    /// [`crate::nifti::write`] and `tests/compression.rs` for the rest.
     #[test]
-    fn nii_gz_is_recognised_and_rejected() {
+    fn nii_gz_is_recognised_and_round_trips() {
         let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
         let path = tmp_path("compressed.nii.gz");
 
-        let written = write_image(&img, &path);
-        assert!(
-            matches!(&written, Err(IoError::UnsupportedNiftiFeature(m))
-                if m.contains("zlib") && m.contains("5.8")),
-            "{written:?}"
-        );
+        assert!(create_image_io(&path, FileMode::Write).is_some());
+        write_image(&img, &path).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[..2], b"\x1f\x8b");
 
-        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
         assert!(create_image_io(&path, FileMode::Read).is_some());
-        let read = read_image(&path);
+        let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert!(
-            matches!(&read, Err(IoError::UnsupportedNiftiFeature(m))
-                if m.contains("zlib") && m.contains("5.8")),
-            "{read:?}"
-        );
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4]);
     }
 
     /// `.nia`, the NIfTI ASCII variant, is a valid write target for
@@ -2552,29 +2576,25 @@ mod tests {
         assert_eq!(img.scalar_slice::<i16>().unwrap(), &[0x0102, 0x0304]);
     }
 
-    /// The compressed encodings are recognised and rejected by name, since this
-    /// workspace takes no compression dependency (ledger §5.8).
+    /// `bzip2` is still recognised and rejected by name: this workspace takes a
+    /// zlib dependency but not a bzip2 one (ledger §5.8). `gzip`/`gz` are read
+    /// — see `tests/compression.rs`.
     #[test]
-    fn nrrd_rejects_compressed_encodings() {
-        for (encoding, needle) in [("gzip", "gzip"), ("gz", "gzip"), ("bzip2", "bzip2")] {
-            let path = tmp_path(&format!("compressed_{encoding}.nrrd"));
-            std::fs::write(
-                &path,
-                format!(
-                    "NRRD0004\ntype: unsigned char\ndimension: 1\nsizes: 2\n\
-                     encoding: {encoding}\n\nxx"
-                ),
-            )
-            .unwrap();
-            let err = read_image(&path).unwrap_err();
-            std::fs::remove_file(&path).ok();
-            match err {
-                IoError::UnsupportedNrrdFeature(message) => {
-                    assert!(message.contains(needle), "{message}");
-                    assert!(message.contains("compression"), "{message}");
-                }
-                other => panic!("expected UnsupportedNrrdFeature, got {other:?}"),
+    fn nrrd_rejects_the_bzip2_encoding() {
+        let path = tmp_path("compressed_bzip2.nrrd");
+        std::fs::write(
+            &path,
+            "NRRD0004\ntype: unsigned char\ndimension: 1\nsizes: 2\n\
+             encoding: bzip2\n\nxx",
+        )
+        .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        match err {
+            IoError::UnsupportedNrrdFeature(message) => {
+                assert!(message.contains("bzip2"), "{message}");
             }
+            other => panic!("expected UnsupportedNrrdFeature, got {other:?}"),
         }
     }
 

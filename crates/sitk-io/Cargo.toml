@@ -11,3 +11,4 @@ description = "Image and transform file IO for sitk-rs (MetaImage, Insight legac
 sitk-core.workspace = true
 sitk-transform.workspace = true
 thiserror.workspace = true
+flate2.workspace = true

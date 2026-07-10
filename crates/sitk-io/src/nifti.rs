@@ -92,13 +92,25 @@
 //! first by ITK itself (:806-810), the second by SimpleITK's wrapping layer
 //! (ledger §3.32).
 //!
+//! # Compression
+//!
+//! `.nii.gz`, `.hdr.gz` and `.img.gz` are read and written. Compression is
+//! decided by the file *name* and nothing else: `znzopen(path, mode,
+//! nifti_is_gzfile(path))` (znzlib.c:48-82) gzips iff the name ends in `.gz`,
+//! so `SetUseCompression` and `SetCompressionLevel` are both dead for this
+//! format — writing always deflates at zlib's default level of 6, and writing a
+//! `.nii` never compresses however the writer is configured (ledger §3.33).
+//!
+//! `znzread` on a gz file falls back to a transparent byte copy when the gzip
+//! magic is missing, so a `.nii.gz` holding a plain header reads fine
+//! (ledger §2.94). Conversely a gzip stream named `.nii` is *not* gunzipped.
+//!
+//! One `znzFile` is one gzip stream: a `.nii.gz` is a single stream over
+//! header, extender and pixels, while `.hdr.gz`/`.img.gz` are two independent
+//! streams (nifti1_io.c:5958-5971).
+//!
 //! # What this module does not do
 //!
-//! * `.nii.gz` / `.hdr.gz` / `.img.gz` — recognised (upstream's
-//!   `nifti_find_file_extension` accepts them when the library is built with
-//!   zlib, as ITK's is) and then rejected with
-//!   [`IoError::UnsupportedNiftiFeature`], because this workspace has no
-//!   compression dependency (ledger §4.62, §5.8).
 //! * `.nia` — the NIfTI ASCII single-file variant (`NIFTI_FTYPE_ASCII`)
 //!   (ledger §4.62).
 //! * `NiftiImageIO::Read`'s streaming sub-region path
@@ -119,8 +131,12 @@ use std::path::{Path, PathBuf};
 
 use sitk_core::{Complex, Image, PixelBuffer, PixelId};
 
+use crate::compression::{
+    ZLIB_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gunzip_transparent_prefix, gzip_compress,
+};
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
+use crate::writer::WriteOptions;
 
 // ---------------------------------------------------------------------------
 // nifti1.h constants
@@ -1177,8 +1193,9 @@ fn convert_nhdr2nim(nhdr: &RawHeader, swap: bool, hdr_path: &Path) -> Result<Nif
     // the two names coincide the type is forced to single-file, and a
     // single-file type with distinct names is forced to the pair type.
     let prefix = hdr_path.to_string_lossy().into_owned();
-    let fname = make_hdrname(&prefix, nifti_type);
-    let iname = make_imgname(&prefix, nifti_type);
+    let comp = is_gz(hdr_path);
+    let fname = make_hdrname(&prefix, nifti_type, comp);
+    let iname = make_imgname(&prefix, nifti_type, comp);
     if fname == iname {
         nifti_type = FTYPE_NIFTI1_1;
     } else if nifti_type == FTYPE_NIFTI1_1 {
@@ -1384,9 +1401,19 @@ fn invented_extension(nifti_type: i32, header: bool) -> &'static str {
 /// name would land on a lowercase file. It never gets that far:
 /// `WriteImageInformation` compares the extension case-sensitively and refuses
 /// `IMG.NII` before reaching here (ledger §2.91).
-fn make_name(prefix: &str, nifti_type: i32, header: bool) -> PathBuf {
+///
+/// `comp` is upstream's fourth argument: `comp && (!ext || !strstr(iname, ".gz"))`
+/// appends `.gz` (nifti1_io.c:2984). `nifti_set_filenames` derives it from
+/// `nifti_is_gzfile(prefix)`, so on read it is redundant — the prefix *is* the
+/// found header path, whose `.gz` is already there. On write the prefix is
+/// `nifti_makebasename(FName)`, which has no extension, so `comp` is the only
+/// thing that puts the `.gz` back.
+fn make_name(prefix: &str, nifti_type: i32, header: bool, comp: bool) -> PathBuf {
     let mut iname = prefix.to_string();
-    match find_file_extension(&iname) {
+    // `extgz` is uppercased along with the other four when the extension is;
+    // with no extension it stays lowercase, and upstream's `!ext` short-circuit
+    // means the `strstr` never runs.
+    let ext_gz = match find_file_extension(&iname) {
         Some(ext) => {
             let upper = is_uppercase(ext);
             let (from, to) = if header {
@@ -1398,18 +1425,29 @@ fn make_name(prefix: &str, nifti_type: i32, header: bool) -> PathBuf {
                 let start = iname.len() - ext.len();
                 iname.replace_range(start..start + 4, &to);
             }
+            Some(cased(".gz", upper))
         }
-        None => iname.push_str(invented_extension(nifti_type, header)),
+        None => {
+            iname.push_str(invented_extension(nifti_type, header));
+            None
+        }
+    };
+    if comp {
+        match &ext_gz {
+            Some(gz) if iname.contains(gz.as_str()) => {}
+            Some(gz) => iname.push_str(gz),
+            None => iname.push_str(".gz"),
+        }
     }
     PathBuf::from(iname)
 }
 
-fn make_hdrname(prefix: &str, nifti_type: i32) -> PathBuf {
-    make_name(prefix, nifti_type, true)
+fn make_hdrname(prefix: &str, nifti_type: i32, comp: bool) -> PathBuf {
+    make_name(prefix, nifti_type, true, comp)
 }
 
-fn make_imgname(prefix: &str, nifti_type: i32) -> PathBuf {
-    make_name(prefix, nifti_type, false)
+fn make_imgname(prefix: &str, nifti_type: i32, comp: bool) -> PathBuf {
+    make_name(prefix, nifti_type, false, comp)
 }
 
 /// `nifti_findhdrname` (nifti1_io.c:2746-2842): return `fname` itself if it
@@ -1492,15 +1530,10 @@ fn find_img_name(iname: &Path, nifti_type: i32) -> Option<PathBuf> {
     None
 }
 
+/// `nifti_is_gzfile` (nifti1_io.c:2656-2668): does the name end in `.gz`?
+/// A pure name test — the file's content is never consulted.
 fn is_gz(path: &Path) -> bool {
     path.to_string_lossy().to_ascii_lowercase().ends_with(".gz")
-}
-
-fn gz_rejected(path: &Path) -> IoError {
-    IoError::UnsupportedNiftiFeature(format!(
-        "gzip-compressed NIfTI ({}): this build has no zlib dependency (ledger §5.8)",
-        path.display()
-    ))
 }
 
 /// `is_nifti_file` (nifti1_io.c:3483-3529): `2` for a `.hdr`/`.img` NIfTI pair,
@@ -1509,11 +1542,6 @@ fn is_nifti_file(path: &Path) -> i32 {
     let Some(hdr) = find_hdr_name(path) else {
         return -1;
     };
-    if is_gz(&hdr) {
-        // Upstream gunzips and inspects; we cannot, so claim the file and let
-        // `read` report the missing zlib support.
-        return 1;
-    }
     let Ok(bytes) = read_prefix(&hdr, HEADER_SIZE) else {
         return -1;
     };
@@ -1531,12 +1559,29 @@ fn is_nifti_file(path: &Path) -> i32 {
     -1
 }
 
-fn read_prefix(path: &Path, n: usize) -> std::io::Result<Vec<u8>> {
+/// `znzread` of `n` bytes from `znzopen(path, "rb", nifti_is_gzfile(path))`.
+///
+/// Whether the file is gunzipped is decided by its *name*, never its content —
+/// so a gzip stream called `.nii` is read as raw bytes, and a plain file called
+/// `.nii.gz` is read transparently by zlib's `gz_look` (ledger §2.94).
+fn read_prefix(path: &Path, n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
+    if is_gz(path) {
+        return gunzip_transparent_prefix(&std::fs::read(path)?, n);
+    }
     let file = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(n);
     file.take(n as u64).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// The whole of `path` through the same `znzFile`, for the image data.
+fn read_all(path: &Path) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path)?;
+    if is_gz(path) {
+        return gunzip_transparent(&raw);
+    }
+    Ok(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -1957,9 +2002,6 @@ fn read_info(path: &Path) -> Result<Info> {
             path.display()
         ))
     })?;
-    if is_gz(&hdr_path) {
-        return Err(gz_rejected(&hdr_path));
-    }
     let bytes = read_prefix(&hdr_path, HEADER_SIZE)?;
     let (raw, swap) = RawHeader::parse(&bytes)?;
     let nim = convert_nhdr2nim(&raw, swap, &hdr_path)?;
@@ -2299,12 +2341,9 @@ pub fn read(path: &Path) -> Result<Image> {
 
     let img_path = find_img_name(&nim.iname, nim.nifti_type)
         .ok_or_else(|| IoError::FileNotFound(nim.iname.clone()))?;
-    if is_gz(&img_path) {
-        return Err(gz_rejected(&img_path));
-    }
 
     // `nifti_image_load`: `nvox * nbyper` bytes at `iname_offset`.
-    let raw = std::fs::read(&img_path)?;
+    let raw = read_all(&img_path)?;
     let ntot = (nim.nvox as usize)
         .checked_mul(nim.nbyper)
         .ok_or(IoError::TruncatedData)?;
@@ -2592,6 +2631,10 @@ struct WriteInfo {
     /// `nvox * nbyper`.
     data_bytes: usize,
     convert_ras: bool,
+    /// `IsCompressed` (itkNiftiImageIO.cxx:1173-1174) — the file name ended in
+    /// a lowercase `.gz`, and so `nifti_makehdrname`/`nifti_makeimgname` put it
+    /// back and `znzopen` gzips the stream.
+    is_compressed: bool,
 }
 
 /// `NiftiImageIO::WriteImageInformation` (itkNiftiImageIO.cxx:1136-1502) and
@@ -2634,9 +2677,6 @@ fn write_information(image: &Image, path: &Path) -> Result<WriteInfo> {
             )));
         }
     };
-    if is_compressed {
-        return Err(gz_rejected(path));
-    }
 
     let components = image.buffer_stride();
     let kind = if image.pixel_id().is_complex() {
@@ -2856,6 +2896,7 @@ fn write_information(image: &Image, path: &Path) -> Result<WriteInfo> {
         series,
         data_bytes: nvox * nbyper,
         convert_ras,
+        is_compressed,
     })
 }
 
@@ -2863,6 +2904,16 @@ fn write_information(image: &Image, path: &Path) -> Result<WriteInfo> {
 /// zero extender, then the pixel data at `vox_offset = 352`); `.hdr`/`.img`
 /// write a 352-byte header file and a sibling `.img` holding the pixels from
 /// offset `0`.
+///
+/// A `.gz` on the name gzips each file that gets written — the `.nii.gz` case
+/// is one stream over header, extender and pixels; `.hdr.gz` / `.img.gz` are
+/// two independent streams, because `nifti_image_write_engine` closes the
+/// header's `znzFile` before opening the image's (nifti1_io.c:5958-5971).
+///
+/// [`WriteOptions`] does **not** reach this format. `NiftiImageIO` never
+/// consults `GetUseCompression` — the extension alone decides
+/// (itkNiftiImageIO.cxx:1173) — and never passes a level, so `znzopen(..., "wb")`
+/// always deflates at zlib's default of 6 (ledger §3.33).
 pub fn write(image: &Image, path: &Path) -> Result<()> {
     let info = write_information(image, path)?;
     let kind = if image.pixel_id().is_complex() {
@@ -2901,12 +2952,28 @@ pub fn write(image: &Image, path: &Path) -> Result<()> {
     header_block.extend_from_slice(&header_bytes);
     header_block.extend_from_slice(&[0u8; 4]);
 
+    let comp = info.is_compressed;
+    // One gzip stream per file `znzopen` opens.
+    let maybe_gzip = |bytes: Vec<u8>| {
+        if comp {
+            gzip_compress(&bytes, ZLIB_DEFAULT_COMPRESSION_LEVEL)
+        } else {
+            bytes
+        }
+    };
+
     if info.nifti_type == FTYPE_NIFTI1_1 {
         header_block.extend_from_slice(&data);
-        std::fs::write(make_hdrname(&base, info.nifti_type), header_block)?;
+        std::fs::write(
+            make_hdrname(&base, info.nifti_type, comp),
+            maybe_gzip(header_block),
+        )?;
     } else {
-        std::fs::write(make_hdrname(&base, info.nifti_type), header_block)?;
-        std::fs::write(make_imgname(&base, info.nifti_type), data)?;
+        std::fs::write(
+            make_hdrname(&base, info.nifti_type, comp),
+            maybe_gzip(header_block),
+        )?;
+        std::fs::write(make_imgname(&base, info.nifti_type, comp), maybe_gzip(data))?;
     }
     Ok(())
 }
@@ -2945,9 +3012,7 @@ impl ImageIo for NiftiImageIo {
     }
 
     /// `NiftiImageIO::CanWriteFile` is `nifti_is_complete_filename`
-    /// (itkNiftiImageIO.cxx:217-223) — a pure name test. `.nii.gz` therefore
-    /// answers `true` here and fails inside [`write`], naming the missing zlib
-    /// support.
+    /// (itkNiftiImageIO.cxx:217-223) — a pure name test.
     fn can_write_file(&self, path: &Path) -> bool {
         is_complete_filename(&path.to_string_lossy())
     }
@@ -2960,7 +3025,9 @@ impl ImageIo for NiftiImageIo {
         read(path)
     }
 
-    fn write(&self, image: &Image, path: &Path) -> Result<()> {
+    /// `options` is ignored: NIfTI compresses iff the file name ends in `.gz`,
+    /// and always at zlib's default level. See [`write`].
+    fn write(&self, image: &Image, path: &Path, _options: &WriteOptions) -> Result<()> {
         write(image, path)
     }
 }
