@@ -6,25 +6,15 @@
 //! `DemonsRegistrationFunction` asks of them (`static_cast<double>` on every
 //! read, `CoordinateType = double`).
 
-use sitk_core::{Error, Image, PixelId, matrix};
+use sitk_core::{Image, PixelId};
 
+use super::geometry::Geometry;
 use crate::Result;
 
-/// A scalar image widened to `f64`, with its geometry and the precomputed
-/// inverse of its direction matrix.
-///
-/// The inverse is hoisted out of the per-pixel loops; `Image`'s own
-/// `physical_point_to_continuous_index` inverts on every call and returns a
-/// `Result`, neither of which belongs inside `ComputeUpdate`.
+/// A scalar image widened to `f64`, over its [`Geometry`].
 pub(crate) struct RealImage {
     data: Vec<f64>,
-    size: Vec<usize>,
-    spacing: Vec<f64>,
-    origin: Vec<f64>,
-    /// Row-major `dim x dim`, as `Image::direction`.
-    direction: Vec<f64>,
-    /// Row-major inverse of `direction`.
-    inverse_direction: Vec<f64>,
+    geometry: Geometry,
     strides: Vec<usize>,
     /// The image's own (scalar) pixel type, kept because
     /// `ESMDemonsRegistrationFunction` warps the moving image into an
@@ -36,39 +26,32 @@ pub(crate) struct RealImage {
 impl RealImage {
     /// Widen a scalar image. Errors with `RequiresScalarPixelType` on a vector
     /// image (through `Image::to_f64_vec`'s guard) and with `SingularDirection`
-    /// when the direction cosine matrix cannot be inverted — the same condition
-    /// `TransformPhysicalPointToContinuousIndex` relies on.
+    /// when the direction cosine matrix cannot be inverted.
     pub(crate) fn new(image: &Image) -> Result<Self> {
         let dim = image.dimension();
         let data = image.to_f64_vec()?;
-        let inverse_direction =
-            matrix::invert(image.direction(), dim).ok_or(Error::SingularDirection)?;
         let mut strides = vec![1usize; dim];
         for d in 1..dim {
             strides[d] = strides[d - 1] * image.size()[d - 1];
         }
         Ok(RealImage {
             data,
-            size: image.size().to_vec(),
-            spacing: image.spacing().to_vec(),
-            origin: image.origin().to_vec(),
-            direction: image.direction().to_vec(),
-            inverse_direction,
+            geometry: Geometry::new(image)?,
             strides,
             pixel_id: image.pixel_id(),
         })
     }
 
     pub(crate) fn dimension(&self) -> usize {
-        self.size.len()
+        self.geometry.dimension()
     }
 
     pub(crate) fn spacing(&self) -> &[f64] {
-        &self.spacing
+        &self.geometry.spacing
     }
 
     pub(crate) fn size(&self) -> &[usize] {
-        &self.size
+        &self.geometry.size
     }
 
     pub(crate) fn pixel_id(&self) -> PixelId {
@@ -90,68 +73,16 @@ impl RealImage {
         self.data[offset]
     }
 
-    /// Row `i` of a row-major `dim x dim` matrix.
-    fn row(matrix: &[f64], i: usize, dim: usize) -> &[f64] {
-        &matrix[i * dim..i * dim + dim]
-    }
-
-    /// `ImageBase::TransformIndexToPhysicalPoint`:
-    /// `p = origin + Direction * (spacing ⊙ index)`.
     pub(crate) fn index_to_physical_point(&self, index: &[usize]) -> Vec<f64> {
-        let dim = self.dimension();
-        self.origin
-            .iter()
-            .enumerate()
-            .map(|(i, &origin)| {
-                let rotated: f64 = Self::row(&self.direction, i, dim)
-                    .iter()
-                    .zip(index)
-                    .zip(&self.spacing)
-                    .map(|((&d, &idx), &spacing)| d * idx as f64 * spacing)
-                    .sum();
-                origin + rotated
-            })
-            .collect()
+        self.geometry.index_to_physical_point(index)
     }
 
-    /// `ImageBase::TransformPhysicalPointToContinuousIndex`.
     pub(crate) fn physical_point_to_continuous_index(&self, point: &[f64]) -> Vec<f64> {
-        let dim = self.dimension();
-        let diff: Vec<f64> = point
-            .iter()
-            .zip(&self.origin)
-            .map(|(&p, &o)| p - o)
-            .collect();
-        self.spacing
-            .iter()
-            .enumerate()
-            .map(|(i, &spacing)| {
-                let unrotated: f64 = Self::row(&self.inverse_direction, i, dim)
-                    .iter()
-                    .zip(&diff)
-                    .map(|(&m, &d)| m * d)
-                    .sum();
-                unrotated / spacing
-            })
-            .collect()
+        self.geometry.physical_point_to_continuous_index(point)
     }
 
-    /// `ImageFunction::IsInsideBuffer(PointType)` (itkImageFunction.h:176-184),
-    /// which forwards to the continuous-index overload at line 159-170.
-    ///
-    /// The buffer's continuous bounds are `[start - 0.5, end + 0.5)` per
-    /// `ImageFunction::SetInputImage` (itkImageFunction.hxx:63-64), with `end =
-    /// size - 1`. Note the asymmetry: the lower bound is inclusive and the
-    /// upper is *exclusive*, so a point exactly half a pixel past the last
-    /// pixel centre is outside while its mirror at the first is inside. The
-    /// comparison is written as the negation of a positive test so that a
-    /// `NaN` coordinate reports outside.
     pub(crate) fn is_inside_buffer(&self, point: &[f64]) -> bool {
-        let cindex = self.physical_point_to_continuous_index(point);
-        (0..self.dimension()).all(|d| {
-            let end = self.size[d] as f64 - 1.0;
-            cindex[d] >= -0.5 && cindex[d] < end + 0.5
-        })
+        self.geometry.is_inside_buffer(point)
     }
 
     /// `LinearInterpolateImageFunction::Evaluate(PointType)`.
@@ -205,7 +136,7 @@ impl RealImage {
         for corner in 0..corners {
             for d in 0..dim {
                 neighbor[d] = if corner & (1 << d) != 0 {
-                    (base[d] + 1).min(self.size[d] as i64 - 1)
+                    (base[d] + 1).min(self.geometry.size[d] as i64 - 1)
                 } else {
                     base[d]
                 };
@@ -254,7 +185,7 @@ impl RealImage {
         for d in 0..dim {
             // `index[dim] < start + 1 || index[dim] > start + size - 2`, in
             // signed arithmetic so that `size == 1` yields `-1` for the bound.
-            let last = self.size[d] as i64 - 2;
+            let last = self.geometry.size[d] as i64 - 2;
             if neighbor[d] < 1 || neighbor[d] > last {
                 derivative[d] = 0.0;
                 continue;
@@ -264,7 +195,7 @@ impl RealImage {
             neighbor[d] -= 2;
             let minus = self.at_signed(&neighbor);
             neighbor[d] += 1;
-            derivative[d] = (plus - minus) * 0.5 / self.spacing[d];
+            derivative[d] = (plus - minus) * 0.5 / self.geometry.spacing[d];
         }
 
         derivative
@@ -294,7 +225,7 @@ impl RealImage {
         let mut upper = point.to_vec();
 
         for d in 0..dim {
-            let offset = 0.5 * self.spacing[d];
+            let offset = 0.5 * self.geometry.spacing[d];
 
             lower[d] = point[d] - offset;
             if !self.is_inside_buffer(&lower) {
@@ -338,34 +269,12 @@ impl RealImage {
         self.physical_vector_to_local_vector(&self.central_difference_at_point(point))
     }
 
-    /// `ImageBase::TransformLocalVectorToPhysicalVector`
-    /// (itkImageBase.h:636-654): `out = Direction * in`.
     pub(crate) fn local_vector_to_physical_vector(&self, local: &[f64]) -> Vec<f64> {
-        let dim = self.dimension();
-        (0..dim)
-            .map(|i| {
-                Self::row(&self.direction, i, dim)
-                    .iter()
-                    .zip(local)
-                    .map(|(&d, &l)| d * l)
-                    .sum()
-            })
-            .collect()
+        self.geometry.local_vector_to_physical_vector(local)
     }
 
-    /// `ImageBase::TransformPhysicalVectorToLocalVector`
-    /// (itkImageBase.h:685-702): `out = Direction⁻¹ * in`.
     fn physical_vector_to_local_vector(&self, physical: &[f64]) -> Vec<f64> {
-        let dim = self.dimension();
-        (0..dim)
-            .map(|i| {
-                Self::row(&self.inverse_direction, i, dim)
-                    .iter()
-                    .zip(physical)
-                    .map(|(&m, &p)| m * p)
-                    .sum()
-            })
-            .collect()
+        self.geometry.physical_vector_to_local_vector(physical)
     }
 }
 

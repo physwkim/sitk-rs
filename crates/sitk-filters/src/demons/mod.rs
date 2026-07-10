@@ -111,9 +111,12 @@
 //! it to the update field, as the yaml documents.
 
 mod common;
+mod compose;
+mod diffeomorphic;
 mod esm;
 mod fast_symmetric;
 mod field;
+mod geometry;
 mod image_function;
 mod symmetric;
 
@@ -124,6 +127,7 @@ use common::{halt, initial_field, output_field, per_axis, validate_image_pair};
 use field::{Field, Smoothing, smooth_field};
 use image_function::RealImage;
 
+pub use diffeomorphic::{DiffeomorphicDemonsParams, diffeomorphic_demons_registration};
 pub use esm::EsmGradient;
 pub use fast_symmetric::{
     FastSymmetricForcesDemonsParams, fast_symmetric_forces_demons_registration,
