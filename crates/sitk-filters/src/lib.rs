@@ -1081,6 +1081,21 @@ mod vector_guard {
         assert_requires_scalar(err, PixelId::VectorFloat64);
     }
 
+    /// `patch_based_denoising` read its pixels through `Scalar::buffer_ref` on
+    /// the raw `PixelBuffer`, which succeeds for a vector image because the
+    /// buffer is tagged with the *component* type — the interleaved
+    /// `npixels * ncomponents` elements were then processed against a grid of
+    /// `npixels`. It reads through `Image::scalar_slice` now. The image is
+    /// sized to clear the patch-fits-in-image check, so this pins the guard
+    /// rather than an earlier validation error.
+    #[test]
+    fn patch_based_denoising_rejects_a_vector_image() {
+        let data: Vec<f32> = (0..162).map(|i| i as f32).collect();
+        let img = Image::from_vec_vector(&[9, 9], 2, data).unwrap();
+        let err = crate::patch_based_denoising(&img, &Default::default()).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
     /// `real_pixel_id` preserves vector-ness, so a filter that projects its
     /// output type through it cannot launder a vector input into a scalar
     /// output pixel type.

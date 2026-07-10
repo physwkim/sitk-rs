@@ -1116,8 +1116,7 @@ fn run<T: PatchPixel>(img: &Image, settings: &PatchBasedDenoisingSettings) -> Re
         return Err(FilterError::PatchLargerThanImage { size, diameter });
     }
 
-    let input: &[T] =
-        T::buffer_ref(img.buffer()).expect("dispatch_scalar guarantees the pixel tag matches");
+    let input: &[T] = img.scalar_slice::<T>()?;
     let (image_min, image_max) = min_max(input);
     if image_max <= image_min {
         return Err(FilterError::ConstantImage(image_max.as_f64()));
