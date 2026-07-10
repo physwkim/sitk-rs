@@ -292,7 +292,7 @@ fn mha_local_without_compressed_data_size_is_refused_not_read_as_garbage() {
     match err {
         IoError::Unsupported(message) => {
             assert!(message.contains("CompressedDataSize"), "{message}");
-            assert!(message.contains("1.52"), "{message}");
+            assert!(message.contains("1.56"), "{message}");
         }
         other => panic!("expected Unsupported, got {other:?}"),
     }
