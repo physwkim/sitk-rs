@@ -4110,25 +4110,44 @@ mod tests {
         assert_eq!(back.spacing(), &[0.25, 4.0]);
     }
 
-    /// `VTKImageIO` reads a `TENSORS` file as a six-component
-    /// `SYMMETRICSECONDRANKTENSOR`; SimpleITK's `GetPixelIDFromImageIO` has no arm
-    /// for it and throws `"Unknown PixelType"`. This port's [`Image`] can hold the
-    /// data, so it loads as a 6-component vector image, components in on-disk
-    /// order (VTK does no reordering). Ledger §3.37.
+    /// A VTK `TENSORS` attribute stores the **full 9-component 3×3 matrix** per
+    /// pixel on disk; `VTKImageIO` reads all nine and keeps the six symmetric
+    /// components at row-major indices [0,1,2,4,5,8] — the `[a,b,c,d,e,f]` of
+    /// `ReadTensorBuffer` / `ReadSymmetricTensorBufferAsBinary`
+    /// (itkVTKImageIO.cxx:415-451, 494-525). SimpleITK's `GetPixelIDFromImageIO`
+    /// has no arm for the pixel type and throws `"Unknown PixelType"`, but this
+    /// port's [`Image`] can hold the data, so it loads as a 6-component vector
+    /// image. Ledger §3.37.
+    ///
+    /// The fixture writes the full 3×3 `[a,b,c, b,d,e, c,e,f]` (9 values/pixel,
+    /// 144 bytes for a 2×2 f32 image); the kept result is `[a,b,c,d,e,f]`. The
+    /// old reader, which took the first six on-disk values flat, would return
+    /// `[a,b,c,b,d,e]` and fail this test.
     #[test]
     fn vtk_tensors_load_as_a_six_component_vector_image() {
-        let header = format!(
+        // Pixel p's tensor: a=p*10+1, b=p*10+2, … f=p*10+6.
+        let symmetric = |p: usize| {
+            let base = (p * 10) as f32;
+            let [a, b, c, d, e, f] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0].map(|k: f32| base + k);
+            [a, b, c, b, d, e, c, e, f] // full row-major 3×3
+        };
+        let kept: Vec<f32> = (0..4)
+            .flat_map(|p| (1..=6).map(move |k| (p * 10 + k) as f32))
+            .collect();
+
+        // Binary path: big-endian f32, 9 values/pixel on disk.
+        let bin_header = format!(
             "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
              POINT_DATA 4\nTENSORS tensors float\n"
         );
-        // Big-endian f32: pixel p holds components [p*10+1 .. p*10+6].
         let mut data = Vec::new();
         for p in 0..4 {
-            for c in 1..=6 {
-                data.extend_from_slice(&((p * 10 + c) as f32).to_be_bytes());
+            for v in symmetric(p) {
+                data.extend_from_slice(&v.to_be_bytes());
             }
         }
-        let path = write_vtk("tensors.vtk", &header, &data);
+        assert_eq!(data.len(), 144, "2×2 f32 tensors: 4·9·4 bytes on disk");
+        let path = write_vtk("tensors.vtk", &bin_header, &data);
         let claimed = create_image_io(&path, FileMode::Read).is_some();
         let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -4137,10 +4156,26 @@ mod tests {
         assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
         assert_eq!(back.number_of_components_per_pixel(), 6);
         assert_eq!(back.size(), &[2, 2]);
-        let expected: Vec<f32> = (0..4)
-            .flat_map(|p| (1..=6).map(move |c| (p * 10 + c) as f32))
-            .collect();
-        assert_eq!(back.component_slice::<f32>().unwrap(), expected.as_slice());
+        assert_eq!(back.component_slice::<f32>().unwrap(), kept.as_slice());
+
+        // ASCII path: the same nine values/pixel as whitespace-separated text.
+        let ascii_header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             POINT_DATA 4\nTENSORS tensors float\n"
+        );
+        let mut text = String::new();
+        for p in 0..4 {
+            for v in symmetric(p) {
+                text.push_str(&format!("{v} "));
+            }
+            text.push('\n');
+        }
+        let path = write_vtk("tensors_ascii.vtk", &ascii_header, text.as_bytes());
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.number_of_components_per_pixel(), 6);
+        assert_eq!(back.component_slice::<f32>().unwrap(), kept.as_slice());
     }
 
     /// `CanReadFile` requires `structured_points` on the fourth line, so a
