@@ -9,6 +9,7 @@
 pub mod boundary;
 pub mod error;
 pub mod image;
+pub mod label_map;
 pub mod matrix;
 pub mod neighborhood;
 pub mod pixel;
@@ -19,6 +20,7 @@ pub use boundary::{
 };
 pub use error::{Error, Result};
 pub use image::{Image, PixelBuffer, ScalarView};
+pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
 pub use neighborhood::{Neighborhood, NeighborhoodIterator};
 pub use pixel::{Complex, PixelId, Real, Scalar};
 

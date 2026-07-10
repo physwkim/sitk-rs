@@ -79,7 +79,7 @@ use std::collections::{BTreeMap, HashMap};
 /// A disjoint-set structure over `0..n`, with path compression and union by
 /// rank. Iterative throughout, so it cannot stack-overflow the way a
 /// recursive flood fill over a large image's neighbor graph would.
-struct UnionFind {
+pub(crate) struct UnionFind {
     parent: Vec<usize>,
     rank: Vec<u8>,
 }
@@ -93,7 +93,7 @@ impl UnionFind {
     }
 
     /// The representative of `x`'s set, compressing the path just walked.
-    fn find(&mut self, x: usize) -> usize {
+    pub(crate) fn find(&mut self, x: usize) -> usize {
         let mut root = x;
         while self.parent[root] != root {
             root = self.parent[root];
@@ -175,42 +175,51 @@ fn line_neighbor_offsets(outer_dim: usize, fully_connected: bool) -> Vec<Vec<i64
     offsets
 }
 
-// ---- connected_component -----------------------------------------------
+// ---- the shared scanline connected-components core -----------------------
 
 /// One maximal run of foreground pixels along axis 0.
-struct Run {
-    start: usize,
-    len: usize,
+pub(crate) struct Run {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
     /// 0-based temporary label (== this run's union-find index).
-    label: usize,
+    pub(crate) label: usize,
 }
 
-/// `ConnectedComponentImageFilter`: label the connected components of the
-/// nonzero pixels in `img`. `fully_connected = false` is face connectivity
-/// (4-connected in 2-D, 6-connected in 3-D); `true` is full connectivity
-/// (8-connected in 2-D, 26-connected in 3-D). Output pixel type is `UInt32`;
-/// background stays 0 and object labels are consecutive starting at 1,
-/// assigned in raster-scan order of first appearance.
-pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> {
-    let size = img.size();
+/// The output of `itkScanlineFilterCommon`'s two passes: every scanline's runs,
+/// and the union-find whose classes are the connected components.
+///
+/// Shared by [`connected_component`] and
+/// [`crate::label_map::binary_image_to_label_map`], which are the same ITK
+/// algorithm (`itkConnectedComponentImageFilter` and
+/// `itkBinaryImageToLabelMapFilter` both derive from `ScanlineFilterCommon`)
+/// differing only in how the foreground mask is derived and how the resulting
+/// classes are numbered and materialised.
+pub(crate) struct ScanlineComponents {
+    /// `line_map[line_id]` — the runs of scanline `line_id`, left to right.
+    pub(crate) line_map: Vec<Vec<Run>>,
+    pub(crate) uf: UnionFind,
+    pub(crate) num_runs: usize,
+}
+
+/// `ScanlineFilterCommon`'s pass 1 (`DynamicThreadedGenerateData`) and pass 2
+/// (`ComputeEquivalence`) over a precomputed foreground mask.
+///
+/// Pass 1 run-length encodes every scanline; temporary labels are handed out in
+/// raster order of first appearance (line by line, left to right within a
+/// line), matching `ScanlineFilterCommon::InitUnion`. Pass 2 unions runs on
+/// neighboring lines whose x-extents overlap — exactly, for face connectivity;
+/// within a 1-pixel tolerance, for full connectivity (`itkScanlineFilterCommon.h`'s
+/// `CompareLines`).
+pub(crate) fn scanline_components(
+    is_fg: &[bool],
+    size: &[usize],
+    fully_connected: bool,
+) -> ScanlineComponents {
     let dim = size.len();
     let total: usize = size.iter().product();
-
-    if total == 0 {
-        let mut result = Image::from_vec(size, Vec::<u32>::new())?;
-        result.copy_geometry_from(img);
-        return Ok(result);
-    }
-
     let xsize = size[0];
-    let linecount = total / xsize;
+    let linecount = if total == 0 { 0 } else { total / xsize };
 
-    let vals = img.to_f64_vec()?;
-    let is_fg: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
-
-    // Pass 1: run-length encode every scanline; temporary labels are handed
-    // out in raster order of first appearance (line by line, left to right
-    // within a line), matching `ScanlineFilterCommon::InitUnion`.
     let mut line_map: Vec<Vec<Run>> = Vec::with_capacity(linecount);
     let mut num_runs = 0usize;
     for line in 0..linecount {
@@ -236,9 +245,6 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
         line_map.push(runs);
     }
 
-    // Pass 2: union runs on neighboring lines whose x-extents overlap
-    // (exactly, for face connectivity; within a 1-pixel tolerance, for full
-    // connectivity — see `itkScanlineFilterCommon.h`'s `CompareLines`).
     let mut uf = UnionFind::new(num_runs);
     if dim > 1 {
         let outer_size = &size[1..];
@@ -291,24 +297,80 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
         }
     }
 
-    // Assign consecutive output labels in raster order of first appearance.
-    let mut root_to_output: Vec<Option<u32>> = vec![None; num_runs];
-    let mut next_output = 1u32;
-    for i in 0..num_runs {
-        let root = uf.find(i);
-        if root_to_output[root].is_none() {
-            root_to_output[root] = Some(next_output);
-            next_output += 1;
+    ScanlineComponents {
+        line_map,
+        uf,
+        num_runs,
+    }
+}
+
+/// `ScanlineFilterCommon::CreateConsecutive` (`itkScanlineFilterCommon.h:199-228`):
+/// number the components `0, 1, 2, …` in ascending temporary-label order,
+/// skipping `background` exactly once when the counter reaches it. Returns the
+/// per-root output label (only entries at union-find roots are meaningful) and
+/// the number of components.
+///
+/// Because temporary labels are handed out in raster order of first appearance,
+/// this numbers each component by where its first pixel appears. ITK's own
+/// union-find always points the larger label at the smaller, making its roots
+/// the earliest-appearing member and its `m_UnionFind[i] == i` root test
+/// equivalent to the `find`-based first-seen test used here.
+pub(crate) fn create_consecutive(
+    components: &mut ScanlineComponents,
+    background: i64,
+) -> (Vec<i64>, u64) {
+    let mut root_to_output: Vec<i64> = vec![0; components.num_runs];
+    let mut assigned = vec![false; components.num_runs];
+    let mut consecutive: i64 = 0;
+    let mut count: u64 = 0;
+    for i in 0..components.num_runs {
+        let root = components.uf.find(i);
+        if !assigned[root] {
+            if consecutive == background {
+                consecutive += 1;
+            }
+            root_to_output[root] = consecutive;
+            assigned[root] = true;
+            consecutive += 1;
+            count += 1;
         }
     }
+    (root_to_output, count)
+}
+
+// ---- connected_component -----------------------------------------------
+
+/// `ConnectedComponentImageFilter`: label the connected components of the
+/// nonzero pixels in `img`. `fully_connected = false` is face connectivity
+/// (4-connected in 2-D, 6-connected in 3-D); `true` is full connectivity
+/// (8-connected in 2-D, 26-connected in 3-D). Output pixel type is `UInt32`;
+/// background stays 0 and object labels are consecutive starting at 1,
+/// assigned in raster-scan order of first appearance.
+pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> {
+    let size = img.size();
+    let total: usize = size.iter().product();
+
+    if total == 0 {
+        let mut result = Image::from_vec(size, Vec::<u32>::new())?;
+        result.copy_geometry_from(img);
+        return Ok(result);
+    }
+
+    let xsize = size[0];
+    let vals = img.to_f64_vec()?;
+    let is_fg: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
+
+    let mut components = scanline_components(&is_fg, size, fully_connected);
+    // `CreateConsecutive(0)` skips 0 on its first assignment, so the object
+    // labels run `1..=N` — this filter's documented numbering.
+    let (root_to_output, _) = create_consecutive(&mut components, 0);
 
     let mut out = vec![0u32; total];
-    for (line, runs) in line_map.iter().enumerate() {
+    for (line, runs) in components.line_map.iter().enumerate() {
         let base = line * xsize;
         for run in runs {
-            let root = uf.find(run.label);
-            let label =
-                root_to_output[root].expect("every run's root was assigned an output label");
+            let root = components.uf.find(run.label);
+            let label = root_to_output[root] as u32;
             out[base + run.start..base + run.start + run.len].fill(label);
         }
     }

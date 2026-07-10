@@ -11,7 +11,9 @@
 //!
 //! - `itkLabelImageToLabelMapFilter.hxx` — run-length encodes each scanline
 //!   (a maximal run of equal, non-background pixels along axis 0) into a
-//!   per-label list of lines, in raster order.
+//!   per-label list of lines, in raster order. Ported as
+//!   [`sitk_core::LabelMap::from_label_image`], whose raster ordering is a
+//!   documented postcondition; `compute_perimeter` below depends on it.
 //! - `itkShapeLabelMapFilter.hxx` — `ThreadedProcessLabelObject` computes
 //!   every un-gated attribute in a single pass over those lines;
 //!   `ComputeFeretDiameter`, `ComputePerimeter` and
@@ -76,20 +78,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use sitk_core::Image;
+use sitk_core::{Image, LabelMap, LabelObjectLine};
 
 // `MAX_DIM` is the maximum image dimension this filter supports, sized so that
 // fixed-size arrays can stand in for ITK's `Index`/`Offset`/`Matrix` types.
 use crate::linalg::{MAX_DIM, Mat, symmetric_eigen};
 use crate::{FilterError, Result};
-
-/// A run-length-encoded scanline of one label: `length` consecutive pixels
-/// starting at `index` and running along axis 0.
-#[derive(Clone, Copy, Debug)]
-struct Line {
-    index: [i64; MAX_DIM],
-    length: i64,
-}
 
 /// `itk::ImageRegion` as SimpleITK's `GetBoundingBox` reports it: the
 /// per-axis start index followed by the per-axis extent. SimpleITK flattens
@@ -105,7 +99,7 @@ pub struct BoundingBox {
 /// `itk::ShapeLabelObject`'s oriented bounding box: the tightest box aligned
 /// with the object's principal axes that contains every pixel *including the
 /// pixels' own extent*, not just their centers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrientedBoundingBox {
     /// Edge lengths, in physical units, along each principal axis.
     pub size: Vec<f64>,
@@ -123,7 +117,7 @@ pub struct OrientedBoundingBox {
 }
 
 /// Shape attributes of one label, as `itk::ShapeLabelObject` stores them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapeStatistics {
     /// Number of pixels carrying this label.
     pub number_of_pixels: u64,
@@ -211,7 +205,7 @@ pub fn label_shape_statistics(
     img: &Image,
     settings: &LabelShapeStatisticsSettings,
 ) -> Result<BTreeMap<i64, ShapeStatistics>> {
-    if img.pixel_id().is_floating_point() {
+    if !img.pixel_id().is_integer_scalar() {
         return Err(FilterError::RequiresIntegerPixelType(img.pixel_id()));
     }
     let dim = img.dimension();
@@ -224,37 +218,43 @@ pub fn label_shape_statistics(
     let origin = img.origin();
     let direction = img.direction();
 
-    let labels: Vec<i64> = img
-        .to_f64_vec()?
-        .iter()
-        .map(|&v| v.round() as i64)
-        .collect();
     let background = settings.background_value as i64;
-    let line_sets = extract_lines(&labels, size, background);
+    // `LabelMap::from_label_image` *is* `itkLabelImageToLabelMapFilter`, and it
+    // emits the lines of each label in raster order — `idx[1..]` first, then
+    // `idx[0]` — which `compute_perimeter` relies on.
+    let label_map = LabelMap::from_label_image(img, background)?;
+
+    // `compute_feret_diameter` is the only consumer of the dense label image,
+    // and it is off by default.
+    let labels: Vec<i64> = if settings.compute_feret_diameter {
+        img.to_f64_vec()?
+            .iter()
+            .map(|&v| v.round() as i64)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut out = BTreeMap::new();
-    for (label, lines) in &line_sets {
-        let mut stats = shape_attributes(&lines[..], dim, size, spacing, origin, direction);
+    for object in label_map.label_objects() {
+        let label = object.label();
+        let lines = object.lines();
+        let mut stats = shape_attributes(lines, dim, size, spacing, origin, direction);
 
         if settings.compute_feret_diameter {
             stats.feret_diameter = Some(compute_feret_diameter(
-                &labels,
-                size,
-                dim,
-                spacing,
-                *label,
-                &lines[..],
+                &labels, size, dim, spacing, label, lines,
             ));
         }
         if settings.compute_perimeter {
-            let perimeter = compute_perimeter(&lines[..], &stats.bounding_box, dim, spacing);
+            let perimeter = compute_perimeter(lines, &stats.bounding_box, dim, spacing);
             stats.roundness = Some(stats.equivalent_spherical_perimeter / perimeter);
             stats.perimeter_on_border_ratio = Some(stats.perimeter_on_border / perimeter);
             stats.perimeter = Some(perimeter);
         }
         if settings.compute_oriented_bounding_box {
             stats.oriented_bounding_box = Some(compute_oriented_bounding_box(
-                &lines[..],
+                lines,
                 dim,
                 spacing,
                 origin,
@@ -263,54 +263,9 @@ pub fn label_shape_statistics(
                 &stats.principal_axes,
             ));
         }
-        out.insert(*label, stats);
+        out.insert(label, stats);
     }
     Ok(out)
-}
-
-// ---- run-length encoding --------------------------------------------------
-
-/// `itkLabelImageToLabelMapFilter.hxx`'s `ThreadedGenerateData`, single
-/// threaded: walk the image in raster order, emitting one line per maximal
-/// run of equal non-background pixels along axis 0. The lines of a label
-/// therefore come out ordered by `idx[1..]` first, then by `idx[0]` —
-/// which `compute_perimeter` relies on.
-fn extract_lines(labels: &[i64], size: &[usize], background: i64) -> BTreeMap<i64, Vec<Line>> {
-    let dim = size.len();
-    let nx = size[0];
-    let n_rest: usize = size[1..].iter().product();
-
-    let mut map: BTreeMap<i64, Vec<Line>> = BTreeMap::new();
-    for rest in 0..n_rest {
-        let mut idx = [0i64; MAX_DIM];
-        let mut t = rest;
-        for (d, &sz) in size.iter().enumerate().take(dim).skip(1) {
-            idx[d] = (t % sz) as i64;
-            t /= sz;
-        }
-        let base = rest * nx;
-
-        let mut x = 0usize;
-        while x < nx {
-            let value = labels[base + x];
-            if value == background {
-                x += 1;
-                continue;
-            }
-            let start = x;
-            x += 1;
-            while x < nx && labels[base + x] == value {
-                x += 1;
-            }
-            let mut index = idx;
-            index[0] = start as i64;
-            map.entry(value).or_default().push(Line {
-                index,
-                length: (x - start) as i64,
-            });
-        }
-    }
-    map
 }
 
 // ---- geometry helpers -----------------------------------------------------
@@ -336,7 +291,7 @@ fn continuous_index_to_physical(
 }
 
 /// `Image::TransformIndexToPhysicalPoint`.
-fn index_to_physical(
+pub(crate) fn index_to_physical(
     idx: &[i64; MAX_DIM],
     dim: usize,
     spacing: &[f64],
@@ -396,7 +351,7 @@ fn hyper_sphere_radius_from_volume(dim: i64, volume: f64) -> f64 {
 /// with a 4-ULP tolerance. The ULP distance between `±0.0` and a finite `x`
 /// of the same sign is the magnitude of `x`'s bit pattern, so this is true
 /// only for `x` within four subnormal steps of zero.
-fn is_almost_zero(x: f64) -> bool {
+pub(crate) fn is_almost_zero(x: f64) -> bool {
     x.abs().to_bits() <= 4
 }
 
@@ -404,7 +359,7 @@ fn is_almost_zero(x: f64) -> bool {
 ///
 /// ITK instead builds `RealEigenDecomposition(principalAxes)` and multiplies
 /// the complex eigenvalues; that product *is* the determinant.
-fn determinant(m: &Mat, n: usize) -> f64 {
+pub(crate) fn determinant(m: &Mat, n: usize) -> f64 {
     let mut a = *m;
     let mut det = 1.0;
     for col in 0..n {
@@ -442,7 +397,7 @@ fn determinant(m: &Mat, n: usize) -> f64 {
 /// `ShapeLabelMapFilter::ThreadedProcessLabelObject` up to (but excluding)
 /// the three `ComputeXX`-gated attributes.
 fn shape_attributes(
-    lines: &[Line],
+    lines: &[LabelObjectLine],
     dim: usize,
     size: &[usize],
     spacing: &[f64],
@@ -473,8 +428,8 @@ fn shape_attributes(
     let mut central_moments: Mat = [[0.0; MAX_DIM]; MAX_DIM];
 
     for line in lines {
-        let idx = line.index;
-        let length = line.length;
+        let idx = line.index();
+        let length = line.length();
         let lf = length as f64;
 
         nb_of_pixels += length as u64;
@@ -701,7 +656,7 @@ fn compute_feret_diameter(
     dim: usize,
     spacing: &[f64],
     label: i64,
-    lines: &[Line],
+    lines: &[LabelObjectLine],
 ) -> f64 {
     let offsets = neighborhood_offsets(dim);
 
@@ -714,8 +669,8 @@ fn compute_feret_diameter(
 
     let mut border: Vec<[i64; MAX_DIM]> = Vec::new();
     for line in lines {
-        let mut idx = line.index;
-        for _ in 0..line.length {
+        let mut idx = line.index();
+        for _ in 0..line.length() {
             let on_border = offsets.iter().any(|off| {
                 let mut nidx = [0i64; MAX_DIM];
                 for d in 0..dim {
@@ -799,7 +754,12 @@ fn rest_offsets(rest: usize) -> Vec<[i64; 2]> {
 /// a map from `idx[1..]` to that bucket's lines. ITK pads the image by one
 /// so out-of-bounding-box neighbours read back an empty list; a missing map
 /// key does the same thing here.
-fn compute_perimeter(lines: &[Line], bb: &BoundingBox, dim: usize, spacing: &[f64]) -> f64 {
+fn compute_perimeter(
+    lines: &[LabelObjectLine],
+    bb: &BoundingBox,
+    dim: usize,
+    spacing: &[f64],
+) -> f64 {
     let rest = dim - 1;
 
     let key_of = |idx: &[i64; MAX_DIM]| -> [i64; 2] {
@@ -808,14 +768,14 @@ fn compute_perimeter(lines: &[Line], bb: &BoundingBox, dim: usize, spacing: &[f6
         k
     };
 
-    let mut line_image: HashMap<[i64; 2], Vec<Line>> = HashMap::new();
+    let mut line_image: HashMap<[i64; 2], Vec<LabelObjectLine>> = HashMap::new();
     for line in lines {
         line_image
-            .entry(key_of(&line.index))
+            .entry(key_of(&line.index()))
             .or_default()
             .push(*line);
     }
-    let empty: Vec<Line> = Vec::new();
+    let empty: Vec<LabelObjectLine> = Vec::new();
 
     let offsets = rest_offsets(rest);
     let mut intercepts: HashMap<[i64; MAX_DIM], u64> = HashMap::new();
@@ -856,8 +816,8 @@ fn compute_perimeter(lines: &[Line], bb: &BoundingBox, dim: usize, spacing: &[f6
                 // No line in the neighbor: all the lines in `ls` are on the
                 // contour.
                 for l in ls {
-                    *intercepts.entry(no).or_insert(0) += l.length as u64;
-                    *intercepts.entry(dno).or_insert(0) += (l.length * 2) as u64;
+                    *intercepts.entry(no).or_insert(0) += l.length() as u64;
+                    *intercepts.entry(dno).or_insert(0) += (l.length() * 2) as u64;
                 }
                 continue;
             }
@@ -867,11 +827,11 @@ fn compute_perimeter(lines: &[Line], bb: &BoundingBox, dim: usize, spacing: &[f6
             let mut li = 0usize;
             let mut ni = 0usize;
             let mut n_min = i64::MIN + 1;
-            let mut n_max = ns[0].index[0] - 1;
+            let mut n_max = ns[0].index()[0] - 1;
 
             while li < ls.len() {
-                let l_min = ls[li].index[0];
-                let l_max = l_min + ls[li].length - 1;
+                let l_min = ls[li].index()[0];
+                let l_max = l_min + ls[li].length() - 1;
 
                 let straight = (l_max.min(n_max) - l_min.max(n_min) + 1).max(0);
                 *intercepts.entry(no).or_insert(0) += straight as u64;
@@ -881,10 +841,10 @@ fn compute_perimeter(lines: &[Line], bb: &BoundingBox, dim: usize, spacing: &[f6
                 *intercepts.entry(dno).or_insert(0) += (left + right) as u64;
 
                 if n_max <= l_max {
-                    n_min = ns[ni].index[0] + ns[ni].length;
+                    n_min = ns[ni].index()[0] + ns[ni].length();
                     ni += 1;
                     n_max = if ni < ns.len() {
-                        ns[ni].index[0] - 1
+                        ns[ni].index()[0] - 1
                     } else {
                         i64::MAX - 1
                     };
@@ -959,7 +919,7 @@ fn perimeter_from_intercept_count(
 /// `ShapeLabelMapFilter::ComputeOrientedBoundingBox`, plus
 /// `ShapeLabelObject::GetOrientedBoundingBoxVertices`.
 fn compute_oriented_bounding_box(
-    lines: &[Line],
+    lines: &[LabelObjectLine],
     dim: usize,
     spacing: &[f64],
     origin: &[f64],
@@ -975,7 +935,7 @@ fn compute_oriented_bounding_box(
     let mut min_pa = [f64::INFINITY; MAX_DIM];
     let mut max_pa = [f64::NEG_INFINITY; MAX_DIM];
     for line in lines {
-        let mut idx = line.index;
+        let mut idx = line.index();
         for _ in 0..2 {
             let pt = index_to_physical(&idx, dim, spacing, origin, direction);
             for i in 0..dim {
@@ -986,7 +946,7 @@ fn compute_oriented_bounding_box(
                 min_pa[i] = min_pa[i].min(v);
                 max_pa[i] = max_pa[i].max(v);
             }
-            idx[0] = line.index[0] + line.length - 1;
+            idx[0] = line.index()[0] + line.length() - 1;
         }
     }
 

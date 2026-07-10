@@ -264,6 +264,69 @@ impl PixelId {
         matches!(self.component_id(), PixelId::Float32 | PixelId::Float64)
     }
 
+    /// `true` for the ten scalar integer pixel types — SimpleITK's
+    /// `IntegerPixelIDTypeList` (`sitkPixelIDTypeLists.h:159`), which is what a
+    /// label image's pixel type must be drawn from.
+    ///
+    /// A vector id is *not* an integer scalar even when its components are:
+    /// `dispatch_scalar!` would resolve it to that component type and quietly
+    /// read an interleaved buffer as one value per pixel. Neither is a complex
+    /// id, whose buffer holds two components per pixel.
+    ///
+    /// Written as a whitelist so that a pixel type added later is rejected by
+    /// default rather than admitted by an omission in a negated test.
+    pub const fn is_integer_scalar(self) -> bool {
+        matches!(
+            self,
+            PixelId::UInt8
+                | PixelId::Int8
+                | PixelId::UInt16
+                | PixelId::Int16
+                | PixelId::UInt32
+                | PixelId::Int32
+                | PixelId::UInt64
+                | PixelId::Int64
+        )
+    }
+
+    /// `(NumericTraits<T>::NonpositiveMin(), NumericTraits<T>::max())` for the
+    /// eight integer scalar types, `None` for every other pixel type.
+    ///
+    /// This is the constructor-side guard for [`LabelMap`](crate::LabelMap):
+    /// taking the bounds *is* the proof that the pixel type can back a label
+    /// image, so `LabelMap::push_label_object` can consult them without a
+    /// runtime check of its own.
+    ///
+    /// `UInt64`'s upper bound is clamped to `i64::MAX`. A label is an `i64`
+    /// throughout this port, so a `u64` label above `i64::MAX` is unrepresentable
+    /// before it ever reaches the bound.
+    pub const fn integer_scalar_bounds(self) -> Option<(i64, i64)> {
+        match self {
+            PixelId::UInt8 => Some((0, u8::MAX as i64)),
+            PixelId::Int8 => Some((i8::MIN as i64, i8::MAX as i64)),
+            PixelId::UInt16 => Some((0, u16::MAX as i64)),
+            PixelId::Int16 => Some((i16::MIN as i64, i16::MAX as i64)),
+            PixelId::UInt32 => Some((0, u32::MAX as i64)),
+            PixelId::Int32 => Some((i32::MIN as i64, i32::MAX as i64)),
+            PixelId::UInt64 => Some((0, i64::MAX)),
+            PixelId::Int64 => Some((i64::MIN, i64::MAX)),
+            PixelId::Float32
+            | PixelId::Float64
+            | PixelId::ComplexFloat32
+            | PixelId::ComplexFloat64
+            | PixelId::VectorUInt8
+            | PixelId::VectorInt8
+            | PixelId::VectorUInt16
+            | PixelId::VectorInt16
+            | PixelId::VectorUInt32
+            | PixelId::VectorInt32
+            | PixelId::VectorUInt64
+            | PixelId::VectorInt64
+            | PixelId::VectorFloat32
+            | PixelId::VectorFloat64 => None,
+        }
+    }
+
     /// `true` when this pixel's *components* can represent a negative value:
     /// the signed integer types and the two floating-point types.
     pub const fn is_signed(self) -> bool {

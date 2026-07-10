@@ -638,6 +638,21 @@ pub enum FilterError {
     #[error("Gaussian maximum error must lie strictly inside (0, 1), got {0}")]
     GaussianMaximumErrorOutOfRange(f64),
 
+    /// `MergeLabelMapFilter::MergeWithStrict` (`itkMergeLabelMapFilter.hxx:138-142`)
+    /// throws when an input's label is already present in the output.
+    #[error("label {label} from input {input} is already in use")]
+    MergeLabelInUse { label: i64, input: usize },
+
+    /// `MergeLabelMapFilter::MergeWithStrict` (`itkMergeLabelMapFilter.hxx:145-149`)
+    /// throws when an input's label equals the output background value.
+    #[error("label {label} from input {input} is output background value")]
+    MergeLabelIsBackground { label: i64, input: usize },
+
+    /// `MergeLabelMapFilter` was called with no inputs. `ProcessObject` refuses
+    /// to run without input 0.
+    #[error("this filter requires at least one input label map")]
+    EmptyLabelMapList,
+
     /// `DICOMOrientImageFilter::ImageDimension` is `static_assert`ed to `3`
     /// (`itkDICOMOrientImageFilter.h:142`), and `DICOMOrientImageFilter.yaml`'s
     /// `custom_register` only instantiates the SimpleITK wrapper for 3-D

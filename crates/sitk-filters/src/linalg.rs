@@ -5,7 +5,11 @@
 /// The widest matrix [`symmetric_eigen`]'s callers need: ITK's
 /// `SymmetricSecondRankTensor` and `ShapeLabelObject` are both at most
 /// 3-dimensional.
-pub(crate) const MAX_DIM: usize = 3;
+///
+/// Aliased to [`sitk_core::MAX_DIM`] rather than redeclared, because
+/// `label_shape.rs` indexes [`sitk_core::LabelObjectLine`]'s start index with
+/// it: one definition, so the two can never drift apart.
+pub(crate) use sitk_core::MAX_DIM;
 
 pub(crate) type Mat = [[f64; MAX_DIM]; MAX_DIM];
 
