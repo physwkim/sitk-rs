@@ -46,6 +46,7 @@ use sitk_core::{Image, PixelId};
 
 use crate::error::{IoError, Result};
 use crate::meta_image::MetaImageIo;
+use crate::nifti::NiftiImageIo;
 
 /// Which of [`ImageIo::can_read_file`] / [`ImageIo::can_write_file`] the
 /// registry probe should use. `itk::IOFileModeEnum`
@@ -167,14 +168,22 @@ pub fn has_supported_extension(path: &Path, extensions: &[&str], ignore_case: bo
 }
 
 static META_IMAGE_IO: MetaImageIo = MetaImageIo;
+static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
 /// `ObjectFactoryBase::CreateAllInstance("itkImageIOBase")`'s result, which
 /// both `CreateImageIO` and `GetRegisteredImageIOs` iterate. Probe order is
 /// this order, so an earlier entry wins a tie.
+///
+/// [`MetaImageIo`] and [`NiftiImageIo`] advertise disjoint extension sets, so
+/// their relative order decides nothing for a named file. It does matter in
+/// phase 2 of [`create_image_io`], where an extension-less path is offered to
+/// every IO in turn: `MetaImageIo::can_read_file` re-checks the extension and
+/// declines, and `NiftiImageIo::can_read_file` then resolves the file through
+/// `nifti_findhdrname` and may claim it.
 pub fn registry() -> &'static [&'static dyn ImageIo] {
-    const IOS: &[&dyn ImageIo] = &[&META_IMAGE_IO];
+    const IOS: &[&dyn ImageIo] = &[&META_IMAGE_IO, &NIFTI_IMAGE_IO];
     IOS
 }
 
