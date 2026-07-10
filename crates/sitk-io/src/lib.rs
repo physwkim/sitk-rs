@@ -3446,25 +3446,45 @@ mod tests {
         assert_eq!(gipl::GIPL_MAGIC_NUMBER2, 719_555_000);
     }
 
-    /// `Write` never consults `m_NumberOfComponents` for the header but
-    /// `GetImageSizeInBytes()` does, so a 3-component image writes a scalar
-    /// `image_type` and three times the described bytes. Reading it back gives a
-    /// scalar image holding the first `numPixels` components (§2.96).
+    /// Upstream's `Write` never consults `m_NumberOfComponents` for the header
+    /// but `GetImageSizeInBytes()` does, so a 3-component image would write a
+    /// scalar `image_type` and three times the described bytes, reading back as
+    /// a scalar holding the first `numPixels` components — silent component
+    /// loss. GIPL is a scalar-only format, so this port rejects the write and
+    /// leaves the target untouched (§2.96).
     #[test]
-    fn gipl_vector_image_writes_a_scalar_header_and_reads_back_scalar() {
+    fn gipl_vector_image_write_is_rejected() {
         let data: Vec<u8> = (0..12).collect();
         let img = Image::from_vec_vector::<u8>(&[2, 2], 3, data).unwrap();
         let path = tmp_path("vector.gipl");
-        write_image(&img, &path).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let back = read_image(&path).unwrap();
+        let result = write_image(&img, &path);
+        let existed = path.exists();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 12);
-        assert_eq!(&bytes[8..10], &8u16.to_be_bytes()); // GIPL_U_CHAR, not a vector
-        assert_eq!(back.pixel_id(), PixelId::UInt8);
-        assert_eq!(back.size(), &[2, 2, 1]);
-        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3]);
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m))
+                if m.contains("scalar-only") && m.contains("3-component")),
+            "{result:?}"
+        );
+        assert!(!existed, "the target file must be left untouched");
+    }
+
+    /// A complex image corrupts the same way — two components per pixel over a
+    /// scalar `image_type` — so it is rejected for the same reason (§2.96).
+    #[test]
+    fn gipl_complex_image_write_is_rejected() {
+        let data: Vec<Complex<f32>> = (0..4)
+            .map(|i| Complex::new(i as f32, i as f32 + 0.5))
+            .collect();
+        let img = Image::from_vec_complex::<f32>(&[2, 2], data).unwrap();
+        let path = tmp_path("complex.gipl");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("scalar-only")),
+            "{result:?}"
+        );
     }
 
     /// Upstream's `success = !m_Ifstream.bad()` accepts a short read and leaves
