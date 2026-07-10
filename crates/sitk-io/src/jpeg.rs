@@ -37,31 +37,37 @@
 //! §3.50. [`write`] calls `encoder.set_progressive(true)` unconditionally;
 //! [`read`] always applies [`cmyk_to_rgb`] to a 4-component source.
 //!
-//! # CMYK → RGB: right for plain CMYK, wrong for YCCK
+//! # CMYK → RGB: fixed in this port (upstream is right for plain CMYK, wrong for YCCK)
 //!
-//! `Read`'s CMYK branch treats all four raw channels from libjpeg as already
-//! *inverted* (`stored = 255 - true`) and recovers RGB as `C·K/255` (and
-//! likewise for M, Y), discarding K — "the Gimp approach," per upstream's own
-//! comment (itkJPEGImageIO.cxx:244-251). That formula is correct only when
-//! the source really is plain CMYK (no Adobe colour transform): libjpeg-turbo's
-//! `null_convert` leaves such data untouched, still inverted, all four
-//! channels (jdcolor.c). A **YCCK**-encoded CMYK JPEG — the common case for
-//! Photoshop exports — takes a different path: `ycck_cmyk_convert`
-//! (jdcolor.c:544-583) already un-inverts C/M/Y while leaving K inverted
-//! (`:566-575` build un-inverted C/M/Y from a YCbCr-style transform, `:578`
-//! copies K through as-is). Upstream's read formula does not know which case
-//! it is in and applies the same "everything is inverted" arithmetic
-//! regardless — a real bug for YCCK sources (ledger §1.65).
+//! Upstream's `Read` CMYK branch treats all four raw channels from libjpeg as
+//! already *inverted* (`stored = 255 - true`) and recovers RGB as `C·K/255`
+//! (and likewise for M, Y), discarding K — "the Gimp approach," per upstream's
+//! own comment (itkJPEGImageIO.cxx:244-251). That formula is correct only
+//! when the source really is plain CMYK (no Adobe colour transform):
+//! libjpeg-turbo's `null_convert` leaves such data untouched, still inverted,
+//! all four channels (jdcolor.c). A **YCCK**-encoded CMYK JPEG — the common
+//! case for Photoshop exports — takes a different path: `ycck_cmyk_convert`
+//! (jdcolor.c:544-583) recovers *un-inverted* C/M/Y from the YCbCr-style
+//! transform while leaving K's raw byte untouched (`:574-578`; §1.65 works
+//! the algebra through libjpeg-turbo's matching `cmyk_ycck_convert` encoder
+//! to show the decode result is un-inverted C/M/Y against inverted K).
+//! Upstream's read formula does not know which case it is in and applies the
+//! same "everything is inverted" arithmetic regardless — silently wrong RGB
+//! for a YCCK source. Filed as B77 of #6575.
 //!
-//! `jpeg-decoder`'s [`PixelFormat::CMYK32`] output is not documented to match
-//! either branch exactly, and this port has no way to distinguish a plain-CMYK
-//! source from a YCCK one after the fact (`jpeg_decoder::Decoder` reports
-//! `ColorTransform` only via a private path this crate does not reach). So
-//! [`read`] applies ITK's literal formula to whatever bytes `jpeg-decoder`
-//! hands back, which reproduces upstream's plain-CMYK behaviour and diverges
-//! from its YCCK behaviour exactly as upstream's own bug does one way but not
-//! the other — see ledger §4.93 for the precise statement of what this port
-//! guarantees and does not.
+//! `jpeg_decoder::Decoder` does not have this problem: it reads the JPEG's
+//! own Adobe APP14 colour-transform marker itself (`AdobeColorTransform`,
+//! `decoder.rs`) and dispatches to a plain-CMYK or YCCK deconversion
+//! *before* [`read`] ever sees a byte, so [`PixelFormat::CMYK32`] is always
+//! the same *uninverted* (`true`) CMYK convention regardless of which of the
+//! two encodings produced the file — verified by round-tripping both
+//! `jpeg_encoder::ColorType::Cmyk` and `::CmykAsYcck` through
+//! `jpeg_decoder::Decoder` and confirming they recover the same original
+//! bytes (this crate's test module, `cmyk_and_ycck_sources_of_the_same_color_read_back_to_the_same_rgb`).
+//! [`cmyk_to_rgb`] restores the inversion ITK's formula
+//! expects — `invC = 255 - C`, etc. — before applying the same `invC·invK/255`
+//! arithmetic, which is then correct uniformly for both source encodings.
+//! Ledger §1.65, §4.93.
 //!
 //! # Spacing: JFIF density, hand-parsed
 //!
@@ -128,8 +134,8 @@
 //!
 //! # Not implemented
 //!
-//! * **Byte-exact CMYK/YCCK/density-bug reproduction.** See the sections
-//!   above; ledger §4.93, §4.95.
+//! * **Byte-exact density-bug reproduction.** See the "density *write* bug"
+//!   section above; ledger §4.95.
 //! * **A mid-scanline decode error returns a partially filled buffer.**
 //!   `Read`'s scanline loop catches a libjpeg longjmp with `itkWarningMacro`
 //!   and a silent `return` (itkJPEGImageIO.cxx:226-235, 265-273), leaving
@@ -366,17 +372,23 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
     })
 }
 
-/// `Read`'s CMYK branch (itkJPEGImageIO.cxx:220-262): treat all four raw
-/// channels as inverted and recover R, G, B as `channel · K / 255`,
-/// discarding K. See the module doc's note on the inversion-asymmetry bug
-/// this formula reproduces only for a plain-CMYK source.
+/// `Read`'s CMYK branch (itkJPEGImageIO.cxx:220-262): recover R, G, B as
+/// `invC · invK / 255` (and likewise for M, Y), discarding K — the "Gimp
+/// approach," applied to `jpeg-decoder`'s already-normalized
+/// [`PixelFormat::CMYK32`] output. See the module doc's "CMYK → RGB" section
+/// (ledger §1.65) for why inverting first, rather than multiplying the raw
+/// channels directly as upstream does, is what makes this formula correct
+/// for both a plain-CMYK and a YCCK source.
 fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(cmyk.len() / 4 * 3);
     for px in cmyk.chunks_exact(4) {
-        let k = f32::from(px[3]);
-        rgb.push((f32::from(px[0]) * k / 255.0) as u8);
-        rgb.push((f32::from(px[1]) * k / 255.0) as u8);
-        rgb.push((f32::from(px[2]) * k / 255.0) as u8);
+        let inv_k = 255.0 - f32::from(px[3]);
+        let inv_c = 255.0 - f32::from(px[0]);
+        let inv_m = 255.0 - f32::from(px[1]);
+        let inv_y = 255.0 - f32::from(px[2]);
+        rgb.push((inv_c * inv_k / 255.0) as u8);
+        rgb.push((inv_m * inv_k / 255.0) as u8);
+        rgb.push((inv_y * inv_k / 255.0) as u8);
     }
     rgb
 }
@@ -627,18 +639,22 @@ mod tests {
     }
 
     #[test]
-    fn cmyk_to_rgb_applies_the_gimp_formula() {
-        // K = 255 (fully "inverted-black"): channel * 255 / 255 = channel.
+    fn cmyk_to_rgb_inverts_before_applying_the_gimp_formula() {
+        // K = 255 (true full black ink): invK = 0, so every channel is
+        // forced to 0 regardless of C/M/Y — full black.
         let out = cmyk_to_rgb(&[10, 20, 30, 255]);
-        assert_eq!(out, vec![10, 20, 30]);
-
-        // K = 0: every channel collapses to 0.
-        let out = cmyk_to_rgb(&[10, 20, 30, 0]);
         assert_eq!(out, vec![0, 0, 0]);
 
-        // K = 128: channel * 128 / 255, truncated.
+        // K = 0 (no black ink): invK = 255, so invC·255/255 = invC exactly
+        // — the inverted C/M/Y pass through unchanged.
+        let out = cmyk_to_rgb(&[10, 20, 30, 0]);
+        assert_eq!(out, vec![245, 235, 225]);
+
+        // K = 128: invC=0, invM=155, invY=255, invK=127.
+        // R = 0*127/255 = 0; G = 155*127/255 = 19685/255 = 77 (truncated);
+        // B = 255*127/255 = 127.
         let out = cmyk_to_rgb(&[255, 100, 0, 128]);
-        assert_eq!(out, vec![128, 50, 0]);
+        assert_eq!(out, vec![0, 77, 127]);
     }
 
     #[test]
@@ -932,24 +948,26 @@ mod tests {
         assert!(matches!(err, IoError::JpegDecode(_)), "{err:?}");
     }
 
-    /// A best-effort CMYK round-trip: `jpeg_encoder::ColorType::Cmyk` is used
-    /// only as a **test fixture builder** — production `write` never emits
-    /// CMYK (module doc, ledger §3.50 / §4.94 — a 4-component write is
-    /// refused). This pins that a CMYK-*source* JPEG decodes through
-    /// [`cmyk_to_rgb`] into a 3-component image of the right shape.
+    /// `jpeg_encoder::ColorType::Cmyk` is used only as a **test fixture
+    /// builder** — production `write` never emits CMYK (module doc, ledger
+    /// §3.50 / §4.94 — a 4-component write is refused). A uniform-colour
+    /// image round-trips losslessly through JPEG's DCT (no AC energy in any
+    /// block), so the decoded RGB is checked for the exact hand-computed
+    /// value, not just shape: C=10, M=200, Y=50, K=0 (true, un-inverted —
+    /// `jpeg_encoder`'s `CmykImage` inverts internally before writing) gives
+    /// invC=245, invM=55, invY=205, invK=255, so R=245·255/255=245,
+    /// G=55·255/255=55, B=205·255/255=205 (ledger §1.65).
     #[test]
-    fn cmyk_source_reads_back_as_three_component_rgb() {
-        let width = 6;
-        let height = 4;
-        // C, M, Y, K taken directly (not pre-inverted): jpeg_encoder's Cmyk
-        // input is plain, un-inverted CMYK.
-        let data: Vec<u8> = (0..(width * height * 4))
-            .map(|i| ((i * 29) % 256) as u8)
+    fn cmyk_source_reads_back_as_the_inverted_gimp_formula_rgb() {
+        let width = 16;
+        let height = 16;
+        let data: Vec<u8> = std::iter::repeat_n([10u8, 200, 50, 0], width * height)
+            .flatten()
             .collect();
 
         let path = temp_path("sitk_io_jpeg_cmyk_fixture.jpg");
         let file = std::fs::File::create(&path).unwrap();
-        let encoder = JpegEncoder::new(file, 90);
+        let encoder = JpegEncoder::new(file, 100);
         encoder
             .encode(&data, width as u16, height as u16, ColorType::Cmyk)
             .unwrap();
@@ -960,5 +978,59 @@ mod tests {
         assert_eq!(read_back.pixel_id(), PixelId::VectorUInt8);
         assert_eq!(read_back.size(), &[width, height]);
         assert_eq!(read_back.number_of_components_per_pixel(), 3);
+        let pixels = match read_back.buffer() {
+            PixelBuffer::UInt8(v) => v.as_slice(),
+            other => panic!("expected UInt8, got {other:?}"),
+        };
+        for px in pixels.chunks_exact(3) {
+            assert_eq!(px, [245, 55, 205]);
+        }
+    }
+
+    /// The bug this row fixes: upstream applies the same "everything is
+    /// inverted" formula to raw libjpeg bytes regardless of whether the
+    /// source was plain CMYK or YCCK, which is only correct for the former
+    /// (module doc's "CMYK → RGB" section). `jpeg_decoder::Decoder` resolves
+    /// the ambiguity itself before this crate ever sees a byte, so encoding
+    /// the *same* true-CMYK pixel via `ColorType::Cmyk` and
+    /// `ColorType::CmykAsYcck` must read back to the *same* RGB — proving the
+    /// YCCK path is no longer silently wrong.
+    #[test]
+    fn cmyk_and_ycck_sources_of_the_same_color_read_back_to_the_same_rgb() {
+        let width = 16;
+        let height = 16;
+        let data: Vec<u8> = std::iter::repeat_n([10u8, 200, 50, 0], width * height)
+            .flatten()
+            .collect();
+
+        let cmyk_path = temp_path("sitk_io_jpeg_cmyk_vs_ycck_cmyk.jpg");
+        let file = std::fs::File::create(&cmyk_path).unwrap();
+        JpegEncoder::new(file, 100)
+            .encode(&data, width as u16, height as u16, ColorType::Cmyk)
+            .unwrap();
+
+        let ycck_path = temp_path("sitk_io_jpeg_cmyk_vs_ycck_ycck.jpg");
+        let file = std::fs::File::create(&ycck_path).unwrap();
+        JpegEncoder::new(file, 100)
+            .encode(&data, width as u16, height as u16, ColorType::CmykAsYcck)
+            .unwrap();
+
+        let cmyk_read_back = read(&cmyk_path).unwrap();
+        let ycck_read_back = read(&ycck_path).unwrap();
+        std::fs::remove_file(&cmyk_path).ok();
+        std::fs::remove_file(&ycck_path).ok();
+
+        let cmyk_pixels = match cmyk_read_back.buffer() {
+            PixelBuffer::UInt8(v) => v.as_slice(),
+            other => panic!("expected UInt8, got {other:?}"),
+        };
+        let ycck_pixels = match ycck_read_back.buffer() {
+            PixelBuffer::UInt8(v) => v.as_slice(),
+            other => panic!("expected UInt8, got {other:?}"),
+        };
+        assert_eq!(cmyk_pixels, ycck_pixels);
+        for px in cmyk_pixels.chunks_exact(3) {
+            assert_eq!(px, [245, 55, 205]);
+        }
     }
 }
