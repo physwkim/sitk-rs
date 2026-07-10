@@ -1316,6 +1316,7 @@ mod tests {
             &WriteOptions {
                 use_compression: true,
                 compression_level: -1,
+                compressor: None,
             },
         )
         .unwrap();
