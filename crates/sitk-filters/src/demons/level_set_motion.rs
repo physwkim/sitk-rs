@@ -72,26 +72,29 @@
 //! `m_MovingImageSmoothingFilter` is a
 //! `SmoothingRecursiveGaussianImageFilter<MovingImageType>`
 //! (itkLevelSetMotionRegistrationFunction.h:116) with `NormalizeAcrossScale`
-//! off, so its **output pixel type is the moving image's** — smoothing a `u8`
-//! moving image quantises the smoothed one back to `u8` before its gradient is
-//! taken. [`crate::recursive_gaussian`] reproduces that, and its short-axis
-//! requirement: an axis of fewer than four pixels is
-//! [`FilterError::AxisTooShortForRecursion`], as
-//! `RecursiveSeparableImageFilter` throws.
+//! off, so upstream its **output pixel type is the moving image's** — smoothing
+//! a `u8` moving image quantised the smoothed one back to `u8` before its
+//! gradient was taken. **Fixed here (§2.49):** the recursive Gaussian is taken
+//! in full `f64` precision and held in a `Float64` image, so the gradient sees
+//! the true smoothed values rather than an integer-rounded copy. The smoother
+//! still inherits `RecursiveSeparableImageFilter`'s short-axis requirement — an
+//! axis of fewer than four pixels is [`FilterError::AxisTooShortForRecursion`],
+//! as `RecursiveSeparableImageFilter` throws.
 //!
 //! ITK filters the last index axis first and the rest in order
 //! (itkSmoothingRecursiveGaussianImageFilter.hxx:38-48), while
 //! `recursive_gaussian` filters axis `0` first. Separable linear filters
 //! commute, so the two agree up to floating-point association.
 
-use sitk_core::Image;
+use sitk_core::{Image, PixelId};
 
 use super::DemonsResult;
 use super::common::{halt, initial_field, output_field, per_axis, validate_image_pair};
 use super::field::{Field, Smoothing, smooth_field};
 use super::image_function::RealImage;
 use crate::Result;
-use crate::recursive_gaussian::recursive_gaussian;
+use crate::image_from_f64;
+use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64};
 
 /// The yaml's parameter surface (`LevelSetMotionRegistrationFilter.yaml`).
 /// [`Default`] carries the yaml defaults.
@@ -370,10 +373,22 @@ pub fn level_set_motion_registration(
     // first `InitializeIteration`, and caches it thereafter; neither the moving
     // image nor sigma changes between iterations, so hoisting it out of the loop
     // is the same computation.
-    let smoothed = recursive_gaussian(
+    //
+    // §2.49 fix: smooth in full `f64` precision, not the moving image's own
+    // pixel type. ITK types the smoother as
+    // `SmoothingRecursiveGaussianImageFilter<MovingImageType>`, whose output
+    // pixel type is the moving image's, so an integer moving image had its
+    // smoothed copy quantised back to that integer type *before* the gradient
+    // was taken — silently corrupting the gradient the level-set motion rides.
+    // Taking the recursive Gaussian in `f64` and holding the result in a
+    // `Float64` image feeds the true smoothed values to the gradient.
+    let smoothed_values = recursive_gaussian_f64(
         moving,
         &vec![params.gradient_smoothing_standard_deviations; dim],
+        &vec![GaussianOrder::ZeroOrder; dim],
+        false,
     )?;
+    let smoothed = image_from_f64(PixelId::Float64, moving.size(), moving, &smoothed_values)?;
     let smooth_moving_real = RealImage::new(&smoothed)?;
 
     let displacement_smoothing = Smoothing {
