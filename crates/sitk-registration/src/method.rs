@@ -60,8 +60,8 @@
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{
-    AffineTransform, BSplineTransform, CompositeTransform, Interpolator, ParametricTransform,
-    ResampleImageFilter, Transform, TransformBase, TranslationTransform,
+    AffineTransform, BSplineTransform, Interpolator, ParametricTransform, ResampleImageFilter,
+    Transform, TransformBase, TranslationTransform,
 };
 
 use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
@@ -1434,15 +1434,18 @@ impl ImageRegistrationMethod {
     /// Upstream, `inPlace` decides whether `itk::ImageRegistrationMethodv4`
     /// *grafts* the initial transform as its output — so the optimizer mutates
     /// that very ITK object — or `Clone()`s it and optimizes the copy
-    /// (`itkImageRegistrationMethodv4.hxx:733-758`). Two things follow, and both
-    /// are what this port reproduces:
+    /// (`itkImageRegistrationMethodv4.hxx:733-758`). What this port reproduces is
+    /// the observable effect on the stored transform; the returned transform is
+    /// always the same concrete kind that was set:
     ///
     /// - **`true`**: after `Execute`, the method's stored initial transform holds
     ///   the optimized parameters, and `Execute` returns *it* — same concrete
     ///   transform kind as was set.
     /// - **`false`**: the stored initial transform is untouched, and `Execute`
-    ///   returns a [`CompositeTransform`] wrapping a copy of the optimized
-    ///   transform (ledger §3.34).
+    ///   returns the optimized transform as that same concrete kind. Upstream
+    ///   instead wraps it in a single-entry
+    ///   [`CompositeTransform`](sitk_transform::CompositeTransform), which this
+    ///   port does not reproduce (ledger §3.34).
     ///
     /// Upstream's `inPlace = true` *additionally* aliases the caller's own
     /// `Transform` object, because C++ `Transform`s share one refcounted ITK
@@ -1915,16 +1918,19 @@ impl ImageRegistrationMethod {
     /// [`set_initial_transform`](Self::set_initial_transform) — SimpleITK
     /// `Execute(fixed, moving)` (`sitkImageRegistrationMethod.cxx:763-990`).
     ///
-    /// The in-place flag decides what comes back and what happens to the stored
-    /// transform (`:961-989`):
+    /// The in-place flag decides only what happens to the *stored* transform
+    /// (`:961-989`); the returned transform is always the same concrete kind the
+    /// caller configured:
     ///
     /// - **in-place** (the default): the stored transform is updated to the
     ///   optimum and returned, keeping its concrete kind.
     /// - **not in-place**: the stored transform keeps its starting values, and
-    ///   the optimum is returned as a [`CompositeTransform`] holding a single
-    ///   sub-transform. Upstream wraps it because `sitk::Transform` has no
-    ///   constructor from an arbitrary ITK transform — its own source calls this
-    ///   out as a TODO (ledger §3.34).
+    ///   the optimum is returned as that same concrete kind. Upstream instead
+    ///   wraps it in a single-entry
+    ///   [`CompositeTransform`](sitk_transform::CompositeTransform) because
+    ///   `sitk::Transform` has no constructor from an arbitrary ITK transform —
+    ///   its own source calls this out as a TODO — which this port has no need to
+    ///   reproduce (ledger §3.34).
     ///
     /// When the initial transform was set by
     /// [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
@@ -1978,20 +1984,17 @@ impl ImageRegistrationMethod {
             Ok(())
         })?;
 
+        // In place: write the optimum back to the stored transform. Not in
+        // place: leave the stored transform at its starting value. Either way the
+        // optimum comes back as the same concrete transform kind the caller
+        // configured — upstream wraps the not-in-place result in a single-entry
+        // CompositeTransform only because `sitk::Transform` has no constructor
+        // from an arbitrary ITK transform (its own source flags this as a TODO),
+        // which this port has no need to reproduce (ledger §3.34).
         if self.initial_transform_in_place {
             self.initial_transform = Some(result.transform.clone());
-            return Ok(result);
         }
-
-        let mut composite = CompositeTransform::new(result.transform.dimension());
-        composite.add_transform(result.transform)?;
-        Ok(RegistrationResult {
-            transform: composite.into(),
-            metric_value: result.metric_value,
-            iterations: result.iterations,
-            stop_reason: result.stop_reason,
-            valid_points: result.valid_points,
-        })
+        Ok(result)
     }
 
     /// Evaluate the configured metric once, at the configured transforms, with
@@ -2918,10 +2921,11 @@ mod initial_transform_tests {
     }
 
     /// Not in place: the stored transform keeps its starting values, and the
-    /// optimum comes back wrapped in a single-entry `CompositeTransform`
+    /// optimum comes back as the same concrete transform kind the caller set —
+    /// not wrapped in a single-entry `CompositeTransform` the way upstream does
     /// (ledger §3.34).
     #[test]
-    fn not_in_place_execute_leaves_the_stored_transform_and_returns_a_composite() {
+    fn not_in_place_execute_leaves_the_stored_transform_and_returns_the_concrete_kind() {
         let (fixed, moving) = in_place_fixture();
         let mut reg = ImageRegistrationMethod::new();
         tuned(&mut reg);
@@ -2930,15 +2934,14 @@ mod initial_transform_tests {
 
         let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
 
-        let sub = match &result.transform {
-            Transform::Composite(c) => {
-                assert_eq!(c.number_of_transforms(), 1);
-                c.nth_transform(0).unwrap()
-            }
-            other => panic!("expected a composite, got {other:?}"),
-        };
-        assert!(matches!(sub, Transform::Translation(_)));
-        let optimum = sub.parameters();
+        // The optimum is a Translation — the concrete kind that was set — with no
+        // composite wrapper.
+        assert!(
+            matches!(result.transform, Transform::Translation(_)),
+            "expected a Translation, got {:?}",
+            result.transform
+        );
+        let optimum = result.transform.parameters();
         assert!((optimum[0] - 3.0).abs() < 1e-2 && (optimum[1] + 2.0).abs() < 1e-2);
 
         // The stored transform never moved.
