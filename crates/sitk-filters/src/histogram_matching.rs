@@ -21,10 +21,12 @@ fn min_max_mean(vals: &[f64]) -> (f64, f64, f64) {
 }
 
 /// `itk::Math::NotAlmostEquals(d, 0.0)`, specialized to a comparison against
-/// exactly zero: `itkMath.h`'s `FloatAlmostEqual` combines a ULP check with
-/// an absolute-difference check (`maxAbsoluteDifference` defaulting to
-/// `4 * min positive normal`, negligible here), and against a literal `0.0`
-/// comparand the ULP branch never fires, so the comparison collapses to
+/// exactly zero: `itkMath.h`'s `FloatAlmostEqual` combines a ULP check with an
+/// absolute-difference check whose `maxAbsoluteDifference` defaults to
+/// `0.1 * NumericTraits<T>::epsilon()` (`itkMath.h:334-335`, `~2.22e-17` for
+/// `double`). That near-zero absolute path is tested *first* (`itkMath.h:339-343`)
+/// and, against a literal `0.0` comparand, is the dominant term — the ULP arm
+/// (default `maxUlps = 4`) never fires — so the comparison collapses to
 /// `|d| <= 0.1 * epsilon`. Every denominator this module tests is either a
 /// real quantile gap or structurally exactly `0.0`, so this tight threshold
 /// is enough to tell them apart.
