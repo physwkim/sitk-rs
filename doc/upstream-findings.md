@@ -391,7 +391,13 @@ What actually remains unported:
   `ImageRegistrationMethod` are already ported.
 - **Facade (`crates/sitk`)**: docs rewritten and `LabelMap`/`LabelObject`/
   `LabelObjectLine`/the transform classes hoisted to the crate root
-  2026-07-10. No `Resample`/`ReadTransform` free functions still — the erased
-  `Transform` value type they need landed wave-18, so hoisting `Transform`/
-  `read_transform`/`write_transform` and adding the free functions is now
-  unblocked, documented as a gap in the facade's own module doc.
+  2026-07-10. Wave-18 closed the remaining transform gap: the erased
+  `Transform` enum, `TransformBase`, and the sixteen concrete transform types
+  were already hoisted to the crate root as part of that same rewrite;
+  `read_transform`/`write_transform` are now re-exported at the crate root
+  too, and a top-level `resample` free function was added
+  (`crates/sitk/src/lib.rs`) — it needed no new dispatch plumbing in
+  `sitk-transform` since `Transform` already implements `TransformBase` and
+  `ResampleImageFilter::execute` is generic over that trait. No top-level
+  `Warp` free function yet (`transform::WarpImageFilter` is class-based
+  only) — out of scope for this pass.
