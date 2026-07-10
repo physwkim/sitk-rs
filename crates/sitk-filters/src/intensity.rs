@@ -294,9 +294,34 @@ pub fn shift_scale(
 /// a zero sum onto a nonzero constant, so the normalization is genuinely
 /// impossible; this port returns [`FilterError::ZeroSumNormalization`] rather
 /// than emitting a silently wrong type-max image. The condition `divisor ==
-/// 0.0` holds exactly in this case (`0 / c == 0` only for a finite nonzero
-/// `c`; `0 / 0` is `NaN`, handled by the `constant == 0` case below).
-/// Tracked in the upstream-findings ledger, §2.69.
+/// 0.0` holds in exactly two ways: a zero sum against a finite nonzero
+/// `constant` (`0 / c == 0`; `0 / 0` is `NaN`, handled by the `constant == 0`
+/// case below), **and** a finite nonzero sum against an *infinite* `constant`
+/// (`sum / ±inf == ±0.0`, and `-0.0 == 0.0` in IEEE, so both signs land here).
+/// The latter is equally impossible — no finite scale makes a finite sum equal
+/// an infinite target — and is rejected identically as
+/// [`FilterError::ZeroSumNormalization`]. Tracked in the upstream-findings
+/// ledger, §2.69.
+///
+/// **Guard width — the port rejects only an *exact* zero divisor, not ITK's
+/// whole almost-zero window.** `Div`'s degenerate branch fires on
+/// `itk::Math::NotAlmostEquals(B, 0)` being false, i.e. whenever the divisor
+/// `B` is within `AlmostEquals`'s tolerance of zero: `|B| <= 0.1 · eps` or `B`
+/// within 4 ULPs of `0` (`itkMath.h`'s `FloatAlmostEqual` defaults). `B` is
+/// the `RealType` divisor, and `NumericTraits<T>::RealType` is `double` for
+/// every basic input pixel type, so that window is `|B| <= ~2.22e-17`. It is
+/// **reachable** on legitimate input — a single tiny pixel (sum `1e-18`,
+/// `constant = 1`) or a difference image whose values nearly cancel to a tiny
+/// rounding residual both land a nonzero divisor inside it. Upstream clamps
+/// *every* pixel of such an image to `NumericTraits<TOutput>::max()` regardless
+/// of the numerator, discarding the (finite, well-defined) normalization; this
+/// port instead performs the ordinary finite division (`sum/constant` is a
+/// perfectly good nonzero scale — e.g. the `1e-18` single pixel normalizes to
+/// `1.0`, sum restored to `constant`). Only an *exactly* zero divisor is
+/// genuinely un-normalizable and rejected. This extends the same
+/// correctness-over-mirroring choice already made at the exact-zero point
+/// across ITK's entire subnormal-divisor window, rather than reproducing its
+/// degenerate type-max there.
 ///
 /// Setting `constant = 0.0` on a *nonzero*-sum image is a different case:
 /// `divisor = sum / 0.0` is `±infinity`, not "almost zero", so `Div` takes
@@ -920,6 +945,44 @@ mod tests {
         let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
         let out = normalize_to_constant(&a, 0.0).unwrap();
         assert_eq!(out.scalar_slice::<f64>().unwrap(), &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normalize_to_constant_tiny_nonzero_sum_normalizes_instead_of_itk_type_max() {
+        // sum = 1e-18, constant = 1 -> divisor = 1e-18, a nonzero divisor
+        // inside ITK's AlmostEquals(B, 0) window (|B| <= ~2.22e-17). Upstream's
+        // Div functor would clamp every pixel to NumericTraits<T>::max()
+        // (f64::MAX) regardless of the numerator; this port does the ordinary
+        // finite division, so the tiny pixel normalizes to 1.0 and the sum is
+        // restored to `constant` -- the guard rejects only an *exact* zero
+        // divisor, not this whole subnormal window (module doc, §2.69).
+        let a = img_f64(&[2, 1], vec![1e-18, 0.0]);
+        let out = normalize_to_constant(&a, 1.0).unwrap();
+        let got = out.scalar_slice::<f64>().unwrap();
+        assert_eq!(got, &[1.0, 0.0]);
+        assert!(got.iter().all(|&v| v != f64::MAX));
+        assert_eq!(got.iter().sum::<f64>(), 1.0);
+    }
+
+    #[test]
+    fn normalize_to_constant_infinite_constant_on_a_finite_sum_is_rejected() {
+        // A finite nonzero sum against an infinite constant: divisor =
+        // sum/±inf = ±0.0, and -0.0 == 0.0, so both signs hit the exact-zero
+        // guard. No finite scale makes a finite sum equal an infinite target,
+        // so it is rejected identically to the zero-sum case (module doc).
+        let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]); // sum = 6
+        assert_eq!(
+            normalize_to_constant(&a, f64::INFINITY).unwrap_err(),
+            FilterError::ZeroSumNormalization {
+                constant: f64::INFINITY
+            }
+        );
+        assert_eq!(
+            normalize_to_constant(&a, f64::NEG_INFINITY).unwrap_err(),
+            FilterError::ZeroSumNormalization {
+                constant: f64::NEG_INFINITY
+            }
+        );
     }
 
     #[test]

@@ -45,7 +45,12 @@
 //!   `n̂ = (sinθ cosφ, sinθ sinφ, cosθ)`, so the intended angle is unambiguous:
 //!   this port computes `theta = acos(gradient[2] / r)`. `phi` needs no fix —
 //!   it is `atan(gradient[1] / gradient[0])`, and the length-`r` factor cancels
-//!   in the ratio.
+//!   in the ratio. One note on the singular-`phi` branch: the `.hxx` overrides
+//!   `phi` to `π/2` when `Math::AlmostEquals(gradient[0], PixelType{})` (a
+//!   ~4-ULP / `0.1·eps` window around zero), whereas this port tests
+//!   `gradient[0] == 0.0` exactly; the two decide differently only for a
+//!   denormal (subnormal-magnitude nonzero) `gradient[0]`, so this is a
+//!   pre-existing, numerically-inconsequential divergence and the code stays.
 //!
 //! * **§1.8 — the derivative scaling.** `MinMaxCurvatureFlowFunction::
 //!   SetStencilRadius` widens the *finite difference function's* radius to
