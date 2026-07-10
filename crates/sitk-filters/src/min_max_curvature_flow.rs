@@ -31,6 +31,22 @@
 //! `.hxx` returns early and neither the threshold nor the ball average is
 //! computed; this port keeps that short-circuit.
 //!
+//! Upstream bugs corrected here rather than reproduced:
+//!
+//! * **§1.7 — the 3-D `ComputeThreshold` polar angle.** The `.hxx` rescales the
+//!   gradient to length `r` (which the 2-D overload needs, since it uses the
+//!   rescaled components directly as lattice offsets) and *then* computes
+//!   `theta = acos(gradient[2])`. `gradient[2]` is `r · n_z` at that point, not
+//!   the direction cosine `n_z`, so for `r >= 2` the polar angle is wrong; it
+//!   would leave `acos`'s domain entirely were it not for the adjacent clamp of
+//!   `gradient[2]` into `[-1, 1]`, which instead collapses every gradient with
+//!   `|n_z| > 1/r` onto the pole `theta == 0`. The four sample points are
+//!   `r · ∂n̂/∂θ` and `r · (1/sinθ) · ∂n̂/∂φ` for the *unit* gradient
+//!   `n̂ = (sinθ cosφ, sinθ sinφ, cosθ)`, so the intended angle is unambiguous:
+//!   this port computes `theta = acos(gradient[2] / r)`. `phi` needs no fix —
+//!   it is `atan(gradient[1] / gradient[0])`, and the length-`r` factor cancels
+//!   in the ratio.
+//!
 //! Faithfully reproduced upstream quirks, each of them observable:
 //!
 //! * **`SetStencilRadius` clamps to `>= 1`.** `m_StencilRadius = (value > 1) ?
@@ -49,18 +65,13 @@
 //!   than plain [`crate::denoise::curvature_flow`]'s on the same image. The two
 //!   agree exactly at `stencil_radius == 1`.
 //!
-//! * **`ComputeThreshold` is dimension-dispatched, and only its 2-D form is a
-//!   true perpendicular sample.** For `ImageDimension == 2` the `.hxx` rotates
-//!   the gradient by ±90° and reads the two rounded lattice points at distance
-//!   `r`. For `ImageDimension == 3` it builds four points from spherical
-//!   angles, but computes `theta = acos(gradient[2])` on the gradient *after*
-//!   it has been rescaled to length `r` rather than to length `1` — so for
-//!   `r >= 2` the polar angle is wrong (and would leave `acos`'s domain
-//!   entirely were it not for the `gradient[2]` clamp to `[-1, 1]` immediately
-//!   above it). Ported as written. For every other dimension the `DispatchBase`
-//!   overload brute-force scans the whole neighborhood and averages the pixels
-//!   whose offset has norm `>= r` and whose cosine with the gradient is
-//!   `< 0.262` in absolute value.
+//! * **`ComputeThreshold` is dimension-dispatched.** For `ImageDimension == 2`
+//!   the `.hxx` rotates the gradient by ±90° and reads the two rounded lattice
+//!   points at distance `r`. For `ImageDimension == 3` it builds four points at
+//!   distance `r` from the spherical angles `(theta, phi)` of the gradient.
+//!   For every other dimension the `DispatchBase` overload brute-force scans
+//!   the whole neighborhood and averages the pixels whose offset has norm
+//!   `>= r` and whose cosine with the gradient is `< 0.262` in absolute value.
 //!
 //! * **A zero gradient makes the threshold `0`, not the center pixel.** All
 //!   three `ComputeThreshold` overloads return `PixelType{}` when the gradient
@@ -249,11 +260,11 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 /// four points on the circle of radius `radius` that the `.hxx` *intends* to be
 /// perpendicular to the gradient, averaged.
 ///
-/// Two upstream quirks are preserved. `gradient` has been rescaled to length
-/// `radius`, yet `theta` is `acos(gradient[2])` — correct only for
-/// `radius == 1`. And because `|gradient[2]|` can then exceed `1`, the `.hxx`
-/// clamps it into `[-1, 1]` first, which silently collapses any gradient with
-/// `|n_z| > 1/radius` onto `theta == 0` (a purely axial pole).
+/// **§1.7 fixed here.** `gradient` is rescaled to length `radius` (the 2-D
+/// overload needs that length for its rotated endpoints), but the polar angle
+/// is the angle of the *unit* gradient, so `theta` is `acos(gradient[2] /
+/// radius)`, not upstream's `acos(gradient[2])`. The clamp into `[-1, 1]` is
+/// kept as a pure rounding guard — the quotient is in range by construction.
 fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 3, coeff);
     let mut grad_magnitude: f64 = gradient.iter().map(|g| g * g).sum();
@@ -265,7 +276,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
         *g /= grad_magnitude;
     }
 
-    let theta = gradient[2].clamp(-1.0, 1.0).acos();
+    let theta = (gradient[2] / radius as f64).clamp(-1.0, 1.0).acos();
     // `Math::AlmostEquals(gradient[0], PixelType{})` is a 4-ULP window around
     // zero, which for a zero reference means exact zero (or a denormal).
     let phi = if gradient[0] == 0.0 {
@@ -592,16 +603,34 @@ mod tests {
         assert_eq!(compute_threshold_3d(&nb3, 2, &[1.0, 1.0, 1.0]), 0.0);
     }
 
+    /// §1.7 fix: `theta` is the polar angle of the **unit** gradient, so the
+    /// four sample points really are perpendicular to it.
+    ///
+    /// `I(x,y,z) = x² + z` on a 5×5×5 grid, `coeff = 1`, `r = 2`. At `(2,2,2)`:
+    ///   `g = (0.5·(9−1), 0.5·(4−4), 0.5·(6−4)) = (4, 0, 1)`, `|g| = √17`.
+    /// The `.hxx` divides by `|g|/r`, leaving `g = (4,0,1)·2/√17 =
+    /// (1.9402850, 0, 0.4850713)` — length exactly `r = 2`.
+    ///
+    /// Corrected: `n_z = 0.4850713 / 2 = 0.24253563`, so
+    /// `theta = acos(0.24253563) = 1.3258177` rad, `cosθ = 0.24253563`,
+    /// `sinθ = √(1 − 0.0588235) = 0.97014250`. `phi = atan(0/1.94) = 0`, so
+    /// `cosφ = 1`, `sinφ = 0`. Check: `(sinθcosφ, sinθsinφ, cosθ) =
+    /// (0.9701425, 0, 0.2425356) = (4,0,1)/√17` — the unit gradient. ✓
+    ///
+    /// With `r·sinθ = 1.9402850` and `r·cosθ·cosφ = 0.48507125`, and
+    /// `Math::Round(x) = floor(x + 0.5)`:
+    ///   - P1 `(round(2+0.48507), round(2+0), round(2−1.94029))` = `(2,2,0)` → `I = 4+0 = 4`
+    ///   - P2 `(round(2−0), round(2+2), 2)` = `(2,4,2)` → `I = 4+2 = 6`
+    ///   - P3 `(round(2−0.48507), round(2−0), round(2+1.94029))` = `(2,2,4)` → `I = 4+4 = 8`
+    ///   - P4 `(round(2+0), round(2−2), 2)` = `(2,0,2)` → `I = 4+2 = 6`
+    ///
+    /// Average `(4+6+8+6)/4 = 6.0`.
+    ///
+    /// Upstream instead feeds `0.4850713` straight into `acos`, giving
+    /// `theta = 1.0642064` rad; its points are `(3,2,0)=9`, `(2,4,2)=6`,
+    /// `(1,2,4)=5`, `(2,0,2)=6` → `6.5`, asserted absent below.
     #[test]
-    fn threshold_3d_reproduces_the_unnormalized_acos_quirk() {
-        // I(x,y,z) = x^2 + z on a 5x5x5 grid. At (2,2,2) the raw gradient is
-        // (4, 0, 1); rescaled to length r=2 it is (1.940285, 0, 0.485071).
-        // ITK feeds that z-component straight into acos, giving
-        // theta = 1.06421 rad instead of the correct acos(0.485071/2) =
-        // 1.32582 rad. The four sampled lattice points come out
-        // (3,2,0)=9, (2,4,2)=6, (1,2,4)=5, (2,0,2)=6 -> 6.5.
-        // With the correctly normalized theta they would be
-        // (2,2,0)=4, (2,4,2)=6, (2,2,4)=8, (2,0,2)=6 -> 6.0.
+    fn threshold_3d_polar_angle_uses_the_unit_gradient() {
         let mut data = vec![0.0f64; 125];
         for z in 0..5 {
             for y in 0..5 {
@@ -612,21 +641,36 @@ mod tests {
         }
         let img = Image::from_vec(&[5, 5, 5], data).unwrap();
         let nb = neighborhood_at(&img, 2, &[2, 2, 2]);
-        assert!((compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]) - 6.5).abs() < 1e-9);
+        let t = compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]);
+        assert!((t - 6.0).abs() < 1e-9, "got {t}");
+        assert!((t - 6.5).abs() > 0.4, "upstream's unnormalized acos value");
     }
 
+    /// §1.7 fix, pole case: a gradient along `+z` alone gives `n_z = 1` exactly,
+    /// hence `theta = 0`, and the four points are the in-plane ring at `z = r`.
+    /// (Upstream reached `theta == 0` here too, but only because its clamp of
+    /// `gradient[2] = r` into `[-1, 1]` rescued `acos` from a NaN.)
+    ///
+    /// `I(x,y,z) = z² + (x−2)⁴` on 5×5×5, `r = 2`. At `(2,2,2)`:
+    ///   `g_x = 0.5·((3−2)⁴ − (1−2)⁴) = 0.5·(1−1) = 0`
+    ///   `g_y = 0`, `g_z = 0.5·(3² − 1²) = 4`.
+    /// So `|g| = 4`, rescaled `g = (0, 0, 2)`, `n_z = 2/2 = 1`, `theta = 0`,
+    /// `cosθ = 1`, `sinθ = 0`. `gradient[0] == 0` so `phi = π/2`: `sinφ = 1`,
+    /// `cosφ = 0`. Then `r·sinθ = 0`, `r·cosθ·cosφ = 0`, `r·cosθ·sinφ = 2`,
+    /// `r·sinφ = 2`, `r·cosφ = 0`, giving
+    ///   P1 `(2,4,2)`, P2 `(0,2,2)`, P3 `(2,0,2)`, P4 `(4,2,2)`.
+    /// Every point has `z = 2`, which is what pins `theta == 0`; the `(x−2)⁴`
+    /// term makes the ring's four values distinguishable rather than uniform:
+    /// `I(2,4,2) = 4`, `I(0,2,2) = 4+16 = 20`, `I(2,0,2) = 4`,
+    /// `I(4,2,2) = 4+16 = 20`. Average `(4+20+4+20)/4 = 12.0`.
     #[test]
-    fn threshold_3d_clamp_keeps_acos_in_domain_for_a_polar_gradient() {
-        // I(x,y,z) = z^2: at (2,2,2) the gradient rescaled to length r=2 is
-        // (0, 0, 2). Without the `.hxx`'s clamp of gradient[2] into [-1,1],
-        // acos(2) is NaN and the rounded coordinates are garbage. With it,
-        // theta = 0 and the four points are the in-plane ring at z = 2, all
-        // holding I = 4.
+    fn threshold_3d_polar_gradient_samples_the_ring_in_the_center_plane() {
         let mut data = vec![0.0f64; 125];
         for z in 0..5 {
             for y in 0..5 {
                 for x in 0..5 {
-                    data[x + 5 * y + 25 * z] = (z * z) as f64;
+                    let dx = x as i64 - 2;
+                    data[x + 5 * y + 25 * z] = (z * z) as f64 + (dx * dx * dx * dx) as f64;
                 }
             }
         }
@@ -634,15 +678,16 @@ mod tests {
         let nb = neighborhood_at(&img, 2, &[2, 2, 2]);
         let t = compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]);
         assert!(t.is_finite());
-        assert!((t - 4.0).abs() < 1e-9);
+        assert!((t - 12.0).abs() < 1e-9, "got {t}");
     }
 
+    /// `r == 1` is the one radius at which upstream's `acos(gradient[2])` was
+    /// already fed a true direction cosine, so the §1.7 fix must leave it
+    /// unchanged. `I(x,y,z) = z` on 3×3×3: `g = (0, 0, 0.5)`, `|g| = 0.5`,
+    /// rescaled to length `1` it is `(0,0,1)`; `n_z = 1/1 = 1`, `theta = 0`.
+    /// The four points are the x/y ring at `z = 1`, all holding `I = 1`.
     #[test]
-    fn threshold_3d_matches_the_2d_style_perpendicular_at_radius_one() {
-        // r == 1 is the only radius at which acos(gradient[2]) is fed a true
-        // direction cosine. I(x,y,z) = z: gradient (0,0,0.5) -> (0,0,1),
-        // theta = 0, and the four points are the x/y ring at z = 1 (center
-        // plane), all holding I = 1.
+    fn threshold_3d_at_radius_one_is_unchanged_by_the_polar_angle_fix() {
         let mut data = vec![0.0f64; 27];
         for z in 0..3 {
             for y in 0..3 {
@@ -654,6 +699,42 @@ mod tests {
         let img = Image::from_vec(&[3, 3, 3], data).unwrap();
         let nb = neighborhood_at(&img, 1, &[1, 1, 1]);
         assert!((compute_threshold_3d(&nb, 1, &[1.0, 1.0, 1.0]) - 1.0).abs() < 1e-9);
+    }
+
+    /// §1.7 fix, invariant form: for an arbitrary (non-axial, non-polar)
+    /// gradient the four *unrounded* sample points must be perpendicular to the
+    /// gradient and at distance `r` from the center. This is what upstream's
+    /// unnormalized `theta` broke and what no single hand-computed average can
+    /// pin on its own.
+    ///
+    /// Recompute the offsets exactly as `compute_threshold_3d` does, from the
+    /// same gradient, and check `offset · g == 0` and `|offset| == r`.
+    #[test]
+    fn threshold_3d_sample_offsets_are_perpendicular_to_the_gradient() {
+        let r = 3.0f64;
+        // An arbitrary gradient with all three components distinct and nonzero.
+        let raw = [2.0f64, -5.0, 3.0];
+        let norm = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+        // The `.hxx` rescales to length r before the angles are taken.
+        let g: Vec<f64> = raw.iter().map(|v| v * r / norm).collect();
+
+        let theta = (g[2] / r).clamp(-1.0, 1.0).acos();
+        let phi = (g[1] / g[0]).atan();
+        let (ct, st) = (theta.cos(), theta.sin());
+        let (cp, sp) = (phi.cos(), phi.sin());
+
+        let offsets = [
+            [r * ct * cp, r * ct * sp, -r * st],
+            [-r * sp, r * cp, 0.0],
+            [-r * ct * cp, -r * ct * sp, r * st],
+            [r * sp, -r * cp, 0.0],
+        ];
+        for off in offsets {
+            let dot = off[0] * raw[0] + off[1] * raw[1] + off[2] * raw[2];
+            assert!(dot.abs() < 1e-9, "offset {off:?} not perpendicular: {dot}");
+            let len = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt();
+            assert!((len - r).abs() < 1e-9, "offset {off:?} has length {len}");
+        }
     }
 
     // ---- pixel type gate (RealPixelIDTypeList) ----
