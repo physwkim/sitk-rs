@@ -1,4 +1,4 @@
 /target
 
 # caucus local session state (worktrees, panel logs, round reports)
-.caucus/sessions/
+.caucus/
