@@ -52,11 +52,18 @@
 //! a voxel undecided exactly when the global maximum is non-unique.
 //!
 //! When `label_for_undecided_pixels` is unset the label is `max_label + 1`.
-//! Both the default and a caller-supplied value are `static_cast` to the
+//! Upstream `static_cast`s both the default and a caller-supplied value to the
 //! output pixel type (`pixeltype: Output` in the yaml), which **wraps**: for a
 //! `UInt8` input using all 256 label values, `max_label + 1 == 256` becomes
-//! `0`, and ITK only emits a warning ("No new label for undecided pixels,
-//! using zero"). That wraparound is reproduced.
+//! `0`, so every undecided voxel is silently relabelled as the real label `0`
+//! while ITK only emits a warning ("No new label for undecided pixels, using
+//! zero"). **Fixed here (upstream bug §1.15):** an undecided label that does
+//! not fit the output pixel type is refused with
+//! [`FilterError::UndecidedLabelNotRepresentable`] rather than wrapped onto a
+//! label that means something else. [`multi_label_staple`] performs the same
+//! check, for its own undecided label *and* for the one its internal voting
+//! pass needs (`itkMultiLabelSTAPLEImageFilter.hxx:224` has the identical
+//! `static_cast`, without even the warning).
 //!
 //! `.hxx` guards the vote with `NumericTraits<InputPixelType>::IsNonnegative`;
 //! SimpleITK restricts this filter to the unsigned integer pixel types, where
@@ -147,18 +154,28 @@ fn require_unsigned_integer(img: &Image) -> Result<()> {
     }
 }
 
-/// `static_cast<OutputPixelType>(v)` for the unsigned pixel types: C++ narrows
-/// modulo `2^bits` rather than saturating, which is what makes
-/// `LabelVotingImageFilter`'s "undecided label overflows to zero" case work.
-fn wrap_to_unsigned(id: PixelId, v: u64) -> u64 {
-    match id {
-        PixelId::UInt8 => v & 0xff,
-        PixelId::UInt16 => v & 0xffff,
-        PixelId::UInt32 => v & 0xffff_ffff,
-        // `UInt64` is identity; the other tags are rejected by
+/// The undecided-pixel label must be representable in the output pixel type,
+/// or it is not a label at all: upstream `static_cast`s it, and C++ narrows
+/// modulo `2^bits`, so `max_label + 1 == 256` becomes the perfectly valid
+/// label `0` for a `UInt8` image. Fixed here (upstream bug §1.15) by refusing
+/// the conversion rather than wrapping it onto a real label.
+fn checked_undecided_label(id: PixelId, label: u64) -> Result<u64> {
+    let maximum = match id {
+        PixelId::UInt8 => u64::from(u8::MAX),
+        PixelId::UInt16 => u64::from(u16::MAX),
+        PixelId::UInt32 => u64::from(u32::MAX),
+        // `UInt64` holds every `u64`; the other tags are rejected by
         // `require_unsigned_integer` before reaching here.
-        _ => v,
+        _ => u64::MAX,
+    };
+    if label > maximum {
+        return Err(FilterError::UndecidedLabelNotRepresentable {
+            label,
+            pixel_id: id,
+            maximum,
+        });
     }
+    Ok(label)
 }
 
 /// Read every input's buffer as `u64` label values.
@@ -356,8 +373,9 @@ fn voting_labels(inputs: &[Vec<u64>], total_label_count: usize, undecided: u64) 
 ///
 /// `label_for_undecided_pixels` is SimpleITK's `LabelForUndecidedPixels`,
 /// whose `u64::MAX` sentinel default ("leave unset") is spelled `None` here;
-/// unset means `max_label + 1`. Either way the value is `static_cast` to the
-/// output pixel type and can wrap — see the module docs.
+/// unset means `max_label + 1`. Either way the value must fit the output pixel
+/// type, or the call errors rather than wrapping onto a real label — see the
+/// module docs.
 pub fn label_voting(images: &[&Image], label_for_undecided_pixels: Option<u64>) -> Result<Image> {
     require_inputs(images)?;
     let pixel_id = images[0].pixel_id();
@@ -365,10 +383,10 @@ pub fn label_voting(images: &[&Image], label_for_undecided_pixels: Option<u64>) 
 
     let inputs = label_buffers(images)?;
     let total_label_count = maximum_input_value(&inputs) as usize + 1;
-    let undecided = wrap_to_unsigned(
+    let undecided = checked_undecided_label(
         pixel_id,
         label_for_undecided_pixels.unwrap_or(total_label_count as u64),
-    );
+    )?;
 
     let out = voting_labels(&inputs, total_label_count, undecided);
     let vals: Vec<f64> = out.iter().map(|&v| v as f64).collect();
@@ -422,10 +440,10 @@ pub fn multi_label_staple(
     let inputs = label_buffers(images)?;
     let n_labels = maximum_input_value(&inputs) as usize + 1;
     let n_pixels = inputs[0].len();
-    let undecided = wrap_to_unsigned(
+    let undecided = checked_undecided_label(
         pixel_id,
         label_for_undecided_pixels.unwrap_or(n_labels as u64),
-    );
+    )?;
 
     // `AllocateConfusionMatrixArray`: `(n_labels + 1) x n_labels`, one spare
     // "reject" row, flat and row-major.
@@ -435,7 +453,7 @@ pub fn multi_label_staple(
     // `InitializeConfusionMatrixArrayFromVoting`: a fresh `LabelVotingImageFilter`
     // over the same inputs, with *its* own default undecided label rather than
     // this filter's.
-    let voting_undecided = wrap_to_unsigned(pixel_id, n_labels as u64);
+    let voting_undecided = checked_undecided_label(pixel_id, n_labels as u64)?;
     let vote = voting_labels(&inputs, n_labels, voting_undecided);
     for (matrix, input) in confusion.iter_mut().zip(&inputs) {
         for (&observed, &fused) in input.iter().zip(&vote) {
@@ -833,21 +851,51 @@ mod tests {
     }
 
     #[test]
-    fn label_voting_uint8_undecided_label_wraps_to_zero() {
-        // max label 255 => total_label_count 256, which does not fit a `u8`:
-        // ITK's `static_cast<unsigned char>(256)` is 0, and it only warns.
+    fn label_voting_rejects_an_undecided_label_that_does_not_fit_the_output_type() {
+        // max label 255 => total_label_count 256, which does not fit a `u8`.
+        // ITK's `static_cast<unsigned char>(256)` is 0, so voxel 0 (a 1-1 tie
+        // between labels 0 and 255) would come back labelled 0 — an actual
+        // label, indistinguishable from an agreed vote for 0. Refuse instead.
         let a = img(&[2], vec![255u8, 7]);
         let b = img(&[2], vec![0u8, 7]);
-        let out = label_voting(&[&a, &b], None).unwrap();
-        // Voxel 0 ties 0-vs-255 -> undecided -> 0. Voxel 1 agrees on 7.
-        assert_eq!(out.to_f64_vec().unwrap(), vec![0.0, 7.0]);
-        assert_eq!(out.pixel_id(), PixelId::UInt8);
+        assert_eq!(
+            label_voting(&[&a, &b], None),
+            Err(FilterError::UndecidedLabelNotRepresentable {
+                label: 256,
+                pixel_id: PixelId::UInt8,
+                maximum: 255,
+            })
+        );
 
         // The same labels in a `u16` image have room for the 256 label.
         let a = img(&[2], vec![255u16, 7]);
         let b = img(&[2], vec![0u16, 7]);
         let out = label_voting(&[&a, &b], None).unwrap();
         assert_eq!(out.to_f64_vec().unwrap(), vec![256.0, 7.0]);
+
+        // 255 labels (max label 254) still fit: 255 is representable, and the
+        // guard is `>`, not `>=`.
+        let a = img(&[2], vec![254u8, 7]);
+        let b = img(&[2], vec![0u8, 7]);
+        let out = label_voting(&[&a, &b], None).unwrap();
+        assert_eq!(out.to_f64_vec().unwrap(), vec![255.0, 7.0]);
+        assert_eq!(out.pixel_id(), PixelId::UInt8);
+    }
+
+    #[test]
+    fn label_voting_rejects_an_explicit_undecided_label_that_does_not_fit() {
+        // A caller-supplied label goes through the same `static_cast` upstream:
+        // 300 & 0xff == 44, another perfectly ordinary label.
+        let a = img(&[1], vec![1u8]);
+        let b = img(&[1], vec![2u8]);
+        assert_eq!(
+            label_voting(&[&a, &b], Some(300)),
+            Err(FilterError::UndecidedLabelNotRepresentable {
+                label: 300,
+                pixel_id: PixelId::UInt8,
+                maximum: 255,
+            })
+        );
     }
 
     #[test]
@@ -1030,12 +1078,35 @@ mod tests {
     }
 
     #[test]
-    fn multi_label_staple_undecided_label_wraps_to_zero_for_uint8() {
-        // total_label_count = 256 does not fit a `u8`, so the undecided label
-        // wraps to 0 just as in `label_voting`.
+    fn multi_label_staple_rejects_an_undecided_label_that_does_not_fit_uint8() {
+        // total_label_count = 256 does not fit a `u8`, so upstream's undecided
+        // label wraps to 0 just as in `label_voting`.
         let a = img(&[2], vec![0u8, 255]);
+        assert_eq!(
+            multi_label_staple(&[&a], None, 1e-5, Some(0), Some(&[0.0; 256])),
+            Err(FilterError::UndecidedLabelNotRepresentable {
+                label: 256,
+                pixel_id: PixelId::UInt8,
+                maximum: 255,
+            })
+        );
+
+        // The internal voting pass needs `max_label + 1` as *its* undecided
+        // label too, so an in-range caller label does not rescue the call.
+        assert_eq!(
+            multi_label_staple(&[&a], Some(7), 1e-5, Some(0), Some(&[0.0; 256])),
+            Err(FilterError::UndecidedLabelNotRepresentable {
+                label: 256,
+                pixel_id: PixelId::UInt8,
+                maximum: 255,
+            })
+        );
+
+        // In a `u16` image the 256 label fits, and the all-zero priors send
+        // both voxels to it.
+        let a = img(&[2], vec![0u16, 255]);
         let r = multi_label_staple(&[&a], None, 1e-5, Some(0), Some(&[0.0; 256])).unwrap();
-        assert_eq!(r.image.to_f64_vec().unwrap(), vec![0.0, 0.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![256.0, 256.0]);
         assert_eq!(r.total_label_count, 256);
     }
 

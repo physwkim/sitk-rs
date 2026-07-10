@@ -231,6 +231,23 @@ pub enum FilterError {
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
     InvalidPriorProbabilities { got: usize, expected: usize },
 
+    /// [`crate::label_voting`] / [`crate::multi_label_staple`]: the label that
+    /// marks an undecided voxel does not fit the output pixel type. Upstream
+    /// `static_cast`s it (`itkLabelVotingImageFilter.hxx:78`,
+    /// `itkMultiLabelSTAPLEImageFilter.hxx:224`), so the default `max_label +
+    /// 1 == 256` wraps to `0` for a `UInt8` image and silently relabels every
+    /// undecided voxel as label zero; ITK only warns. This port refuses
+    /// instead — see upstream-findings §1.15.
+    #[error(
+        "the undecided-pixel label {label} does not fit the output pixel type {pixel_id:?} \
+         (maximum {maximum})"
+    )]
+    UndecidedLabelNotRepresentable {
+        label: u64,
+        pixel_id: PixelId,
+        maximum: u64,
+    },
+
     /// A filter whose SimpleITK yaml declares `pixel_types: RealPixelIDTypeList`
     /// (`GradientAnisotropicDiffusionImageFilter`,
     /// `CurvatureAnisotropicDiffusionImageFilter`) was given a non-floating-point
