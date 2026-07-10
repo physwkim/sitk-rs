@@ -53,6 +53,7 @@ pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
 pub mod deconvolution;
+pub mod demons;
 pub mod denoise;
 pub mod distance;
 pub mod edge;
@@ -138,6 +139,7 @@ pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{
     ConvolutionBoundaryCondition, OutputRegionMode, convolution, fft_convolution,
 };
+pub use demons::{DemonsParams, DemonsResult, demons_registration};
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
     discrete_gaussian_derivative, mean, median,
