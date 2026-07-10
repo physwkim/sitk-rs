@@ -50,10 +50,12 @@
 //!
 //! SimpleITK exposes the flag on the inverse filter only
 //! (`HalfHermitianToRealInverseFFTImageFilter.yaml`; the forward yaml's
-//! `members` is empty), so a SimpleITK caller must remember the parity itself.
-//! This port mirrors that: [`half_hermitian_to_real_inverse_fft`] takes
-//! `actual_x_dimension_is_odd` and there is no way to read it off the forward
-//! filter's output. Ledger §3.39.
+//! `members` is empty), so a SimpleITK caller must remember the parity itself
+//! and the `false` default silently round-trips a 13-wide input to 12 wide.
+//! This port does not reproduce that: [`real_to_half_hermitian_forward_fft`]
+//! returns the flag ITK's forward filter already computes, and
+//! [`half_hermitian_to_real_inverse_fft`] requires it — pass the one through to
+//! the other and the round trip cannot lose the width. Ledger §3.39.
 //!
 //! # Precision
 //!
@@ -241,15 +243,19 @@ fn crop_leading_axis(data: &[Complex], full: &[usize], keep: usize) -> Vec<Compl
 /// output is `N₀/2 + 1` wide.
 ///
 /// The dropped columns are the conjugate reflection of the kept ones, so
-/// nothing is lost *except* the parity of `N₀` — see the module docs, and pass
-/// that parity to [`half_hermitian_to_real_inverse_fft`].
+/// nothing is lost *except* the parity of `N₀`. That parity is returned
+/// alongside the spectrum — it is ITK's `GetActualXDimensionIsOdd()`
+/// (`itkRealToHalfHermitianForwardFFTImageFilter.hxx:70`) — and is what
+/// [`half_hermitian_to_real_inverse_fft`] must be given to invert the spectrum
+/// back to the original width. See the module docs and ledger §3.39.
 ///
 /// `Float32` in gives `ComplexFloat32` out, `Float64` gives `ComplexFloat64`.
-pub fn real_to_half_hermitian_forward_fft(img: &Image) -> Result<Image> {
-    dispatch_real(img, |img, id| match id {
+pub fn real_to_half_hermitian_forward_fft(img: &Image) -> Result<(Image, bool)> {
+    let out = dispatch_real(img, |img, id| match id {
         PixelId::Float32 => real_to_half_hermitian_typed::<f32>(img),
         _ => real_to_half_hermitian_typed::<f64>(img),
-    })
+    })?;
+    Ok((out, img.size()[0] % 2 != 0))
 }
 
 // ---- HalfHermitianToRealInverseFFTImageFilter ------------------------------
@@ -317,10 +323,11 @@ fn half_hermitian_to_real_typed<T: Real>(img: &Image, odd: bool) -> Result<Image
 /// (`itkPocketFFTHalfHermitianToRealInverseFFTImageFilter.hxx:27-67`): invert a
 /// half-Hermitian spectrum back to a real image.
 ///
-/// `actual_x_dimension_is_odd` is SimpleITK's `SetActualXDimensionIsOdd`
-/// (default `false`), and it alone decides whether the `M`-wide input came from
-/// a `2M − 2` or a `2M − 1` wide real image. Get it wrong and you get a
-/// differently sized, differently valued image — no error.
+/// `actual_x_dimension_is_odd` is SimpleITK's `SetActualXDimensionIsOdd`, and
+/// it alone decides whether the `M`-wide input came from a `2M − 2` or a
+/// `2M − 1` wide real image. Unlike upstream it has no `false` default here:
+/// pass the flag [`real_to_half_hermitian_forward_fft`] returned. Get it wrong
+/// and you get a differently sized, differently valued image — no error.
 ///
 /// `ComplexFloat32` in gives `Float32` out; `ComplexFloat64` gives `Float64`.
 ///
@@ -453,7 +460,7 @@ mod tests {
     #[test]
     fn half_hermitian_filters_keep_the_same_pixel_type_mapping() {
         let img = Image::from_vec(&[4], vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
-        let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+        let (half, _) = real_to_half_hermitian_forward_fft(&img).unwrap();
         assert_eq!(half.pixel_id(), PixelId::ComplexFloat32);
         assert_eq!(
             half_hermitian_to_real_inverse_fft(&half, false)
@@ -579,9 +586,9 @@ mod tests {
             vec![12, 5],
             vec![97, 3, 2],
         ] {
-            let odd = size[0] % 2 != 0;
             let img = ramp(&size);
-            let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+            let (half, odd) = real_to_half_hermitian_forward_fft(&img).unwrap();
+            assert_eq!(odd, size[0] % 2 != 0, "size={size:?}");
             assert_eq!(half.size()[0], size[0] / 2 + 1, "size={size:?}");
             assert_eq!(&half.size()[1..], &size[1..], "size={size:?}");
 
@@ -602,7 +609,7 @@ mod tests {
         for size in [vec![12usize, 5], vec![13, 4], vec![97]] {
             let img = ramp(&size);
             let full = complex_values(&forward_fft(&img).unwrap());
-            let half_img = real_to_half_hermitian_forward_fft(&img).unwrap();
+            let (half_img, _) = real_to_half_hermitian_forward_fft(&img).unwrap();
             let half = complex_values(&half_img);
             let keep = half_img.size()[0];
             let lines = full.len() / size[0];
@@ -622,8 +629,8 @@ mod tests {
         for size in [vec![12usize], vec![13], vec![100, 3]] {
             let img = ramp(&size);
             let from_full = inverse_fft(&forward_fft(&img).unwrap()).unwrap();
-            let half = real_to_half_hermitian_forward_fft(&img).unwrap();
-            let from_half = half_hermitian_to_real_inverse_fft(&half, size[0] % 2 != 0).unwrap();
+            let (half, odd) = real_to_half_hermitian_forward_fft(&img).unwrap();
+            let from_half = half_hermitian_to_real_inverse_fft(&half, odd).unwrap();
             assert_close(
                 &real_values(&from_full),
                 &real_values(&from_half),
@@ -633,21 +640,38 @@ mod tests {
         }
     }
 
-    /// The parity flag alone decides the width: the same 7-column input inverts
-    /// to a 12-wide or a 13-wide image, and neither is an error.
+    /// The parity flag alone decides the width — a 7-column spectrum inverts to
+    /// a 12-wide or a 13-wide image, and neither is an error — so the forward
+    /// transform hands back the flag that restores the input width. §3.39.
     #[test]
-    fn actual_x_dimension_is_odd_selects_between_two_output_widths() {
-        let img = ramp(&[13]);
-        let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+    fn the_forward_transform_returns_the_parity_that_restores_the_width() {
+        // 13 columns in, ⌊13/2⌋+1 = 7 out, and the flag says "odd".
+        let odd_img = ramp(&[13]);
+        let (half, odd) = real_to_half_hermitian_forward_fft(&odd_img).unwrap();
         assert_eq!(half.size(), &[7]);
+        assert!(odd);
         assert_eq!(
-            half_hermitian_to_real_inverse_fft(&half, true)
+            half_hermitian_to_real_inverse_fft(&half, odd)
                 .unwrap()
                 .size(),
             &[13]
         );
+        // Upstream's `false` default silently narrows that same spectrum to 12.
         assert_eq!(
             half_hermitian_to_real_inverse_fft(&half, false)
+                .unwrap()
+                .size(),
+            &[12]
+        );
+
+        // 12 columns in, ⌊12/2⌋+1 = 7 out — the same width — and the flag
+        // distinguishes the two cases.
+        let even_img = ramp(&[12]);
+        let (half, odd) = real_to_half_hermitian_forward_fft(&even_img).unwrap();
+        assert_eq!(half.size(), &[7]);
+        assert!(!odd);
+        assert_eq!(
+            half_hermitian_to_real_inverse_fft(&half, odd)
                 .unwrap()
                 .size(),
             &[12]
@@ -660,7 +684,7 @@ mod tests {
     #[test]
     fn dc_and_nyquist_imaginary_parts_are_ignored() {
         let img = ramp(&[8]);
-        let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+        let (half, _) = real_to_half_hermitian_forward_fft(&img).unwrap();
         let clean = real_values(&half_hermitian_to_real_inverse_fft(&half, false).unwrap());
 
         let mut poisoned = half.clone();
@@ -678,7 +702,7 @@ mod tests {
     #[test]
     fn an_odd_width_drops_only_the_dc_imaginary_part() {
         let img = ramp(&[7]);
-        let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+        let (half, _) = real_to_half_hermitian_forward_fft(&img).unwrap();
         let clean = real_values(&half_hermitian_to_real_inverse_fft(&half, true).unwrap());
 
         let mut poisoned = half.clone();
@@ -723,7 +747,7 @@ mod tests {
         assert_eq!(spectrum.origin(), img.origin());
         assert_eq!(spectrum.direction(), img.direction());
 
-        let half = real_to_half_hermitian_forward_fft(&img).unwrap();
+        let (half, _) = real_to_half_hermitian_forward_fft(&img).unwrap();
         assert_eq!(half.spacing(), img.spacing());
         assert_eq!(half.origin(), img.origin());
     }
