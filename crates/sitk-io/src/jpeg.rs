@@ -17,6 +17,12 @@
 //! constructor sets the default quality to 95 (itkJPEGImageIO.cxx:300).
 //! Ledger §3.49.
 //!
+//! Because that ITK alias is a *single* field, this port has nothing to
+//! disambiguate: it exposes one knob, [`WriteOptions::compression_level`],
+//! which [`resolved_quality`] interprets as the JPEG quality. There is no
+//! separate `Quality` option, so the alias collapses to one field with one
+//! meaning — verified 2026-07-11, no code change (ledger §3.49).
+//!
 //! `m_UseCompression = false` is set in the same constructor (`:299`) and
 //! never referenced again anywhere in `itkJPEGImageIO.cxx` — dead code.
 //! `Write` calls `jpeg_set_quality` unconditionally; there is no branch that
