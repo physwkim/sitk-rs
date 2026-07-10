@@ -177,19 +177,24 @@
 //! compression". `InternalWrite` then picks `COMPRESSION_NONE` unless
 //! `m_UseCompression` is on, in which case it maps `m_Compression` to
 //! `LZW` / `PACKBITS` / `JPEG` / `DEFLATE` / `ADOBE_DEFLATE`
-//! (`:692-722`). Selecting one of those needs `SetCompressor("LZW")` etc., and
-//! this crate does not expose `SetCompressor` (ledger §6) — so
-//! [`WriteOptions::use_compression`] toggles exactly between
+//! (`:692-722`). Selecting one of those needs `SetCompressor("LZW")` etc.
+//! SimpleITK's own `ImageFileWriter` *does* expose that selector
+//! (`sitkImageFileWriter.h:123`, forwarded at `sitkImageFileWriter.cxx:237-240`),
+//! so every TIFF compressor is reachable there; this crate does not expose it
+//! (ledger §6) — so [`WriteOptions::use_compression`] toggles exactly between
 //! `COMPRESSION_NONE` and `COMPRESSION_PACKBITS`, and `m_Compression` never
-//! leaves its constructed default. Ledger §3.51.
+//! leaves its constructed default. The restriction is this port's, not
+//! SimpleITK's. Ledger §3.51.
 //!
 //! `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality` is
 //! `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor seeds
 //! it with `75` (`:213`). It reaches libtiff only through
 //! `TIFFSetField(tif, TIFFTAG_JPEGQUALITY, ...)` inside
-//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). With
-//! the JPEG compressor unreachable, [`WriteOptions::compression_level`] is dead
-//! on this format. It is also the only `ImageIOBase` in this crate that leaves
+//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). Because
+//! *this crate* selects no compressor, [`WriteOptions::compression_level`] is
+//! dead here — but through SimpleITK, `SetCompressor("JPEG")` plus
+//! `UseCompressionOn()` makes the level live as the JPEG quality.
+//! It is also the only `ImageIOBase` in this crate that leaves
 //! `m_MaximumCompressionLevel` at its `100` default rather than lowering it to
 //! `9` (itkImageIOBase.h:830). Ledger §3.52.
 //!
