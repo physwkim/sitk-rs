@@ -133,15 +133,6 @@
 //!   different spacings drive the two halves of one iteration with different
 //!   metrics.
 //!
-//! * **`laplacian_term` subtracts a curvature that may not have been computed.**
-//!   `ComputeUpdate` declares `ScalarValueType curvature{}` and only assigns it
-//!   inside `if ((dh != 0.) && (m_CurvatureWeight != 0))`. The reinitialisation
-//!   smoothing term is `(ComputeLaplacian(gd) - curvature) * reinit_weight`,
-//!   evaluated in a *separate* `if`. With `curvature_weight == 0` (or `dh == 0`)
-//!   the subtrahend is the zero initialiser, so the smoothing term degenerates
-//!   from `Laplacian(phi) - div(grad phi / |grad phi|)` to the bare Laplacian.
-//!   This is reproduced.
-//!
 //! * **The advection term is dead.** `m_AdvectionWeight` is zero-initialised,
 //!   nothing in the Chan–Vese chain sets it, and SimpleITK exposes no setter, so
 //!   `ComputeUpdate`'s advection branch never runs and
@@ -175,6 +166,16 @@
 //! entire arithmetic are `float`. This port computes in `f64` throughout, as the
 //! rest of the crate does, and narrows only at the output image. Results agree
 //! to `f32` round-off.
+//!
+//! The reinitialisation smoothing term is `Δφ − div(∇φ/|∇φ|)` unconditionally.
+//! Upstream's `ComputeUpdate` declares `ScalarValueType curvature{}` and only
+//! assigns it inside `if ((dh != 0.) && (m_CurvatureWeight != 0))`, yet the
+//! smoothing term `(ComputeLaplacian(gd) - curvature) * reinit_weight` subtracts
+//! it in a *separate* `if (m_ReinitializationSmoothingWeight != 0)`. With
+//! `curvature_weight == 0` (or `dh == 0`) upstream's subtrahend is the zero
+//! initialiser, so the smoothing term degenerates to the bare Laplacian
+//! `Δφ`. This port computes the curvature whenever either term is live, so the
+//! smoothing term always subtracts the real `div(∇φ/|∇φ|)`.
 
 use sitk_core::{Image, PixelId};
 
@@ -609,23 +610,32 @@ impl DifferenceFunction<'_> {
 
         let dh = self.domain.evaluate_derivative(-input_value);
 
-        // `curvature` is left at its zero initialiser when this branch is
-        // skipped, and `laplacian_term` below still subtracts it. See the
-        // module docs.
-        let mut curvature = 0.0;
-        let mut curvature_term = 0.0;
-        if dh != 0.0 && params.curvature_weight != 0.0 {
-            curvature = compute_curvature(gd);
-            // CurvatureSpeed() is the inherited constant 1.
-            curvature_term = params.curvature_weight * curvature * dh;
-        }
+        // The mean curvature `div(∇φ/|∇φ|)` is needed by the curvature term
+        // (scaled by `curvature_weight·dh`) and, independently, by the
+        // reinitialisation smoothing term `Δφ − div(∇φ/|∇φ|)`. Compute it once
+        // whenever either term is live so the smoothing term always subtracts
+        // the real curvature rather than a zero initialiser. See the module docs.
+        let curvature_active = dh != 0.0 && params.curvature_weight != 0.0;
+        let smoothing_active = params.reinitialization_smoothing_weight != 0.0;
+        let curvature = if curvature_active || smoothing_active {
+            compute_curvature(gd)
+        } else {
+            0.0
+        };
 
-        let mut laplacian_term = 0.0;
-        if params.reinitialization_smoothing_weight != 0.0 {
-            // LaplacianSmoothingSpeed() is the inherited constant 1.
-            laplacian_term =
-                (compute_laplacian(gd) - curvature) * params.reinitialization_smoothing_weight;
-        }
+        // CurvatureSpeed() is the inherited constant 1.
+        let curvature_term = if curvature_active {
+            params.curvature_weight * curvature * dh
+        } else {
+            0.0
+        };
+
+        // LaplacianSmoothingSpeed() is the inherited constant 1.
+        let laplacian_term = if smoothing_active {
+            (compute_laplacian(gd) - curvature) * params.reinitialization_smoothing_weight
+        } else {
+            0.0
+        };
 
         let global_term = if dh != 0.0 {
             dh * compute_global_term(params, &self.constants, self.feature[p])
@@ -1053,32 +1063,38 @@ mod tests {
     }
 
     #[test]
-    fn smoothing_term_subtracts_zero_when_the_curvature_branch_is_skipped() {
-        // The upstream quirk: `curvature` keeps its zero initialiser when
-        // m_CurvatureWeight == 0, so the smoothing term is the bare Laplacian
-        // (4 here) rather than Laplacian - curvature.
+    fn smoothing_term_subtracts_curvature_even_when_curvature_weight_is_zero() {
+        // The smoothing term is Δφ − div(∇φ/|∇φ|) unconditionally: with
+        // curvature_weight == 0 the curvature term drops out but the smoothing
+        // term still subtracts the real curvature (5√2/4), not a zero.
+        //   laplacian at (1,1) = 4, curvature = 5√2/4, curvature_term = 0,
+        //   laplacian_term = 4 − 5√2/4, global = −56·dh.
         let params = ChanAndVeseParams {
             curvature_weight: 0.0,
             reinitialization_smoothing_weight: 1.0,
             ..Default::default()
         };
-        let expected = 4.0 - 56.0 * DH;
+        let curvature = 5.0 * SQRT_2 / 4.0;
+        let expected = (4.0 - curvature) - 56.0 * DH;
         let got = update_at(&[1, 1], &params, &[1.0, 1.0]);
         assert!((got - expected).abs() < 1e-12, "{got} vs {expected}");
     }
 
     #[test]
-    fn smoothing_term_subtracts_zero_when_dh_is_zero() {
-        // Same quirk through the other half of the guard: the unregularized
-        // step gives dh == 0 at phi == -1, so curvature is never computed and
-        // the update is the bare Laplacian, with no global term at all.
+    fn smoothing_term_subtracts_curvature_even_when_dh_is_zero() {
+        // The other half of the old guard: the unregularised Heaviside gives
+        // dh == 0 at phi == −1, dropping the curvature term and the global term.
+        // The smoothing term still subtracts the real curvature (5√2/4):
+        //   laplacian_term = 4 − 5√2/4, everything else 0.
         let params = ChanAndVeseParams {
             heaviside_step_function: HeavisideStepFunction::Heaviside,
             reinitialization_smoothing_weight: 1.0,
             ..Default::default()
         };
+        let curvature = 5.0 * SQRT_2 / 4.0;
+        let expected = 4.0 - curvature;
         let got = update_at(&[1, 1], &params, &[1.0, 1.0]);
-        assert!((got - 4.0).abs() < 1e-12, "{got}");
+        assert!((got - expected).abs() < 1e-12, "{got} vs {expected}");
     }
 
     #[test]
