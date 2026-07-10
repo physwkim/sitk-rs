@@ -488,6 +488,32 @@ impl Image {
         Self::assemble(buffer, pixel_id, 1, size, spacing, origin, direction)
     }
 
+    /// Assemble a vector image from parts: an interleaved component buffer
+    /// plus an explicit `components_per_pixel`, validating that geometry
+    /// lengths agree with the buffer size. The vector counterpart of
+    /// [`Image::from_parts`], which always assumes one component per pixel;
+    /// used by IO formats that carry the component count as a separate
+    /// on-disk field (MetaImage's `ElementNumberOfChannels`).
+    pub fn from_parts_vector(
+        buffer: PixelBuffer,
+        components_per_pixel: usize,
+        size: Vec<usize>,
+        spacing: Vec<f64>,
+        origin: Vec<f64>,
+        direction: Vec<f64>,
+    ) -> Result<Self> {
+        let pixel_id = buffer.component_id().vector_id();
+        Self::assemble(
+            buffer,
+            pixel_id,
+            components_per_pixel,
+            size,
+            spacing,
+            origin,
+            direction,
+        )
+    }
+
     /// Interleave `images` — one scalar image per component — into a vector
     /// image. This is `itk::ComposeImageFilter`'s primitive.
     ///

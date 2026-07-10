@@ -2,11 +2,36 @@
 //!
 //! MetaImage is ITK's native uncompressed format: a plain-text `Key = Value`
 //! header followed by (or referencing) a raw binary pixel dump. It round-trips
-//! every scalar pixel type, arbitrary dimension, and the full spacing / origin /
-//! direction geometry, which makes it the right Phase-0 format for exercising the
-//! whole core model without pulling in an external image crate.
+//! every scalar, vector, and complex pixel type, arbitrary dimension, and the
+//! full spacing / origin / direction geometry, which makes it the right
+//! Phase-0 format for exercising the whole core model without pulling in an
+//! external image crate.
 //!
-//! Not yet supported: compressed data, multi-channel (vector) pixels.
+//! # Channels: scalar, vector, and complex
+//!
+//! MetaIO's on-disk channel count, `ElementNumberOfChannels`, is
+//! [`Image::buffer_stride`] — `1` for scalar, `2` for complex, the vector
+//! length for a vector image — not SimpleITK's
+//! `GetNumberOfComponentsPerPixel()` (which is `1` for a complex image). This
+//! matches upstream exactly: `itk::Image<T>::GetNumberOfComponentsPerPixel()`
+//! is `NumericTraits<T>::GetLength()`, `2` for `std::complex<T>`
+//! (itkNumericTraits.h:1958-1967), and `MetaImageIO::Write` passes that count
+//! straight through to `ElementNumberOfChannels` (itkMetaImageIO.cxx:551,665;
+//! metaImage.cxx:2341-2346).
+//!
+//! MetaIO has no complex element type, though: on read,
+//! `MetaImageIO::ReadImageInformation` forces `IOPixelEnum::VECTOR` whenever
+//! `ElementNumberOfChannels() > 1`, regardless of what wrote the file
+//! (itkMetaImageIO.cxx:241-244), and SimpleITK's reader only takes the
+//! scalar/complex branch when `NumberOfComponents == 1`
+//! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write`]
+//! reads back — in real ITK/SimpleITK as much as in [`read`] here — as a
+//! same-sized **vector** image: `PixelId::ComplexFloat32` round-trips to
+//! `PixelId::VectorFloat32`, not back to itself. The interleaved `re, im`
+//! bytes are preserved; the "this was complex" bit is not, because MetaIO
+//! never recorded it.
+//!
+//! Not yet supported: compressed data.
 
 use std::path::{Path, PathBuf};
 
@@ -124,6 +149,10 @@ fn fmt_vec_f64(v: &[f64]) -> String {
 
 /// Build the text header. `element_data_file` is `"LOCAL"` for `.mha` or the raw
 /// filename for `.mhd`.
+///
+/// `ElementNumberOfChannels` is [`Image::buffer_stride`], not
+/// [`Image::number_of_components_per_pixel`] — see the module docs for why
+/// those two disagree for a complex image.
 fn build_header(img: &Image, element_data_file: &str) -> String {
     let dim = img.dimension();
     let dim_size = img
@@ -142,12 +171,13 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
          Offset = {offset}\n\
          ElementSpacing = {spacing}\n\
          DimSize = {dim_size}\n\
-         ElementNumberOfChannels = 1\n\
+         ElementNumberOfChannels = {channels}\n\
          ElementType = {etype}\n\
          ElementDataFile = {element_data_file}\n",
         matrix = fmt_vec_f64(img.direction()),
         offset = fmt_vec_f64(img.origin()),
         spacing = fmt_vec_f64(img.spacing()),
+        channels = img.buffer_stride(),
         etype = element_type(img.pixel_id()),
     )
 }
@@ -155,20 +185,14 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
 /// Write an image as MetaImage. `.mha` embeds the data (`ElementDataFile =
 /// LOCAL`); `.mhd` writes a sibling `.raw` file.
 ///
-/// Only scalar images are written: [`build_header`] hard-codes
-/// `ElementNumberOfChannels = 1`, so the file would claim one component per
-/// pixel while carrying `buffer_stride()` of them — `n` for a vector image, `2`
-/// for a complex one (MetaIO has no complex element type at all). This is the
-/// write-side counterpart of [`read`]'s `header.channels != 1` check, and the
-/// test is a whitelist on `PixelId::is_scalar` for the same reason
-/// `Image::require_scalar` is.
+/// Every pixel category is written: scalar, vector, and complex alike, since
+/// [`buffer_to_le_bytes`] already serialises the image's full interleaved
+/// buffer (`number_of_pixels * buffer_stride` components) regardless of
+/// category, and [`build_header`] now writes that same `buffer_stride` as
+/// `ElementNumberOfChannels`. See the module docs for the read-side
+/// consequence: MetaIO cannot tell a complex image from a same-width vector
+/// one, so a complex image does not read back as complex.
 pub fn write(img: &Image, path: &Path) -> Result<()> {
-    if !img.pixel_id().is_scalar() {
-        return Err(IoError::Unsupported(format!(
-            "{:?}: MetaImage writes one component per pixel",
-            img.pixel_id()
-        )));
-    }
     let data = buffer_to_le_bytes(img.buffer());
     let is_mhd = path
         .extension()
@@ -317,6 +341,18 @@ fn identity(n: usize) -> Vec<f64> {
 }
 
 /// Read a MetaImage from `.mha` or `.mhd`.
+///
+/// `header.channels` (`ElementNumberOfChannels`, `1` when the key is absent)
+/// maps back to a [`PixelId`] the same way `MetaImageIO::ReadImageInformation`
+/// does: one channel stays the plain scalar `ElementType`; more than one
+/// channel always becomes that type's **vector** variant, never complex
+/// (itkMetaImageIO.cxx:241-244) — see the module docs for the round-trip
+/// consequence this has for a complex image.
+///
+/// `0` channels is rejected: [`Image::from_parts_vector`] refuses zero
+/// components per pixel ([`sitk_core::Error::InvalidComponentCount`]), and a
+/// channel count the file's actual data is too short for is rejected as
+/// [`IoError::TruncatedData`].
 pub fn read(path: &Path) -> Result<Image> {
     let bytes = std::fs::read(path)?;
     let header = parse_header(&bytes)?;
@@ -324,12 +360,9 @@ pub fn read(path: &Path) -> Result<Image> {
     if header.compressed {
         return Err(IoError::Unsupported("compressed MetaImage data".into()));
     }
-    if header.channels != 1 {
-        return Err(IoError::Unsupported("multi-channel (vector) pixels".into()));
-    }
 
     let n: usize = header.size.iter().product();
-    let byte_len = n * header.element_type.size_in_bytes();
+    let byte_len = n * header.channels * header.element_type.size_in_bytes();
 
     let data: Vec<u8> = if header.element_data_file.eq_ignore_ascii_case("local") {
         bytes[header.data_offset..].to_vec()
@@ -346,12 +379,23 @@ pub fn read(path: &Path) -> Result<Image> {
     }
     let buffer = buffer_from_bytes(header.element_type, &data[..byte_len], header.big_endian)?;
 
-    Image::from_parts(
-        buffer,
-        header.size,
-        header.spacing,
-        header.origin,
-        header.direction,
-    )
+    if header.channels == 1 {
+        Image::from_parts(
+            buffer,
+            header.size,
+            header.spacing,
+            header.origin,
+            header.direction,
+        )
+    } else {
+        Image::from_parts_vector(
+            buffer,
+            header.channels,
+            header.size,
+            header.spacing,
+            header.origin,
+            header.direction,
+        )
+    }
     .map_err(IoError::Core)
 }
