@@ -55,6 +55,37 @@ pub enum IoError {
     #[error("unsupported NRRD feature: {0}")]
     UnsupportedNrrdFeature(String),
 
+    /// A NIfTI-1 header could not be parsed, or is internally inconsistent.
+    /// `nifti_convert_nhdr2nim` rejects `bad dim[0]`, `bad sizeof_hdr`,
+    /// `bad dim[1]` and `bad datatype` (nifti1_io.c:3654-3752); ITK itself
+    /// rejects a file with no orthonormal direction cosines
+    /// (itkNiftiImageIO.cxx:1847).
+    #[error("malformed NIfTI header: {0}")]
+    MalformedNiftiHeader(String),
+
+    /// A NIfTI-1 `datatype` value ITK's `ReadImageInformation` leaves as
+    /// `UNKNOWNCOMPONENTTYPE` (itkNiftiImageIO.cxx:924) — `DT_FLOAT128`,
+    /// `DT_COMPLEX256`, or an unassigned code.
+    #[error("unsupported NIfTI datatype: {0}")]
+    UnsupportedNiftiDatatype(i16),
+
+    /// A NIfTI-1 feature this port does not implement, or that SimpleITK's
+    /// wrapping layer cannot represent.
+    #[error("unsupported NIfTI feature: {0}")]
+    UnsupportedNiftiFeature(String),
+
+    /// A value in the meta-data dictionary is not usable in the NIfTI-1 header
+    /// field it feeds — `itk::StringToInt32` on `qform_code`, or an over-long
+    /// `aux_file` / `ITK_FileNotes`.
+    #[error("invalid NIfTI meta-data: {0}")]
+    InvalidNiftiMetaData(String),
+
+    /// `NiftiImageIO::WriteImageInformation` refused the image or the file
+    /// name — an axis longer than `SHRT_MAX`, an unusable extension, or a
+    /// vector image of more than four dimensions.
+    #[error("cannot write NIfTI file: {0}")]
+    NiftiWriteRejected(String),
+
     /// The pixel data was shorter than the header's declared size.
     #[error("pixel data is truncated")]
     TruncatedData,

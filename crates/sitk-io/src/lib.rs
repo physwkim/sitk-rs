@@ -3,22 +3,25 @@
 //! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
 //! [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
 //! handles a path, exactly as SimpleITK's readers and writers ask
-//! `itk::ImageIOFactory`. Adding NIfTI, PNG or DICOM later is a new module plus
+//! `itk::ImageIOFactory`. Adding PNG or DICOM later is a new module plus
 //! one registry entry — no dispatch to extend. See [`image_io`] for the probe
 //! order.
 //!
 //! [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
 //! also provides (`itk::simple::ReadImage` / `WriteImage`).
 //!
-//! Phase 0 supports two uncompressed formats:
+//! Three uncompressed formats are supported:
 //!
-//! * [`meta_image`] — MetaImage (`.mha` / `.mhd`), ITK's native format, which
-//!   round-trips every scalar and vector pixel type and the full geometry (see
-//!   its docs for the channel-count caveat that flattens a complex image into
-//!   a vector one);
+//! * [`meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw`), ITK's native format.
+//!   Round-trips every scalar and vector pixel type and the full geometry; a
+//!   complex image survives as a two-channel vector image (see that module for
+//!   the upstream quirk).
 //! * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), raw encoding only, which does
 //!   round-trip a complex image because its `kinds` field records the
 //!   distinction.
+//! * [`nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`). Round-trips every scalar
+//!   pixel type, vector images, and complex images as complex. `.nii.gz` is
+//!   recognised and rejected; this workspace has no zlib.
 //!
 //! Transforms have their own reader and writer, [`read_transform`] and
 //! [`write_transform`], over the Insight legacy text format (`.tfm` / `.txt`);
@@ -27,6 +30,7 @@
 pub mod error;
 pub mod image_io;
 pub mod meta_image;
+pub mod nifti;
 pub mod nrrd;
 pub mod reader;
 pub mod transform_io;
@@ -382,8 +386,11 @@ mod tests {
     /// `ImageFileWriter::GetRegisteredImageIOs` lists `GetNameOfClass`, not
     /// extensions (sitkImageIOUtilities.cxx:59-77).
     #[test]
-    fn registry_lists_the_meta_image_io_by_class_name() {
-        assert_eq!(registered_image_ios(), vec!["MetaImageIO", "NrrdImageIO"]);
+    fn registry_lists_each_image_io_by_class_name() {
+        assert_eq!(
+            registered_image_ios(),
+            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
+        );
         assert_eq!(
             image_io_by_name("MetaImageIO").unwrap().name(),
             "MetaImageIO"
@@ -392,9 +399,13 @@ mod tests {
             image_io_by_name("NrrdImageIO").unwrap().name(),
             "NrrdImageIO"
         );
+        assert_eq!(
+            image_io_by_name("NiftiImageIO").unwrap().name(),
+            "NiftiImageIO"
+        );
         assert!(matches!(
-            image_io_by_name("NiftiImageIO"),
-            Err(IoError::UnknownImageIo(name)) if name == "NiftiImageIO"
+            image_io_by_name("PNGImageIO"),
+            Err(IoError::UnknownImageIo(name)) if name == "PNGImageIO"
         ));
     }
 
@@ -493,14 +504,31 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(written.starts_with(b"ObjectType = Image\n"));
 
+        // A registered IO that cannot make sense of the name still runs, and
+        // fails on its own terms: `nifti_find_file_extension` finds no NIfTI
+        // extension in `named_io.foo`.
         writer.set_image_io(Some("NiftiImageIO"));
+        assert!(matches!(
+            writer.execute(&img),
+            Err(IoError::NiftiWriteRejected(_))
+        ));
+
+        // NRRD, like MetaImage, writes under whatever name it is handed: the
+        // attached-header form has no extension requirement of its own.
+        writer.set_image_io(Some("NrrdImageIO"));
+        writer.execute(&img).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(written.starts_with(b"NRRD"));
+
+        writer.set_image_io(Some("PNGImageIO"));
         assert!(matches!(
             writer.execute(&img),
             Err(IoError::UnknownImageIo(_))
         ));
         assert_eq!(
             writer.registered_image_ios(),
-            vec!["MetaImageIO", "NrrdImageIO"]
+            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
         );
     }
 
@@ -1004,6 +1032,913 @@ mod tests {
             matches!(result, Err(IoError::SingularCollapsedDirection)),
             "{result:?}"
         );
+    }
+
+    // ---- NIfTI-1 ----------------------------------------------------------
+
+    fn patch_i16(bytes: &mut [u8], off: usize, v: i16) {
+        bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
+    fn patch_f32(bytes: &mut [u8], off: usize, v: f32) {
+        bytes[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Write `img` as `name`, read the file back as bytes, apply `patch`, and
+    /// write it out again — the way to build a NIfTI fixture whose header this
+    /// crate's writer would never emit.
+    fn patched_nii(
+        name: &str,
+        img: &Image,
+        patch: impl FnOnce(&mut Vec<u8>),
+    ) -> std::path::PathBuf {
+        let path = tmp_path(name);
+        write_image(img, &path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        patch(&mut bytes);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn nii_roundtrip_all_scalar_types() {
+        macro_rules! case {
+            ($ty:ty, $name:expr) => {{
+                let data: Vec<$ty> = (0..8u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&[4, 2], data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+            }};
+        }
+        case!(u8, "u8.nii");
+        case!(i8, "i8.nii");
+        case!(u16, "u16.nii");
+        case!(i16, "i16.nii");
+        case!(u32, "u32.nii");
+        case!(i32, "i32.nii");
+        case!(u64, "u64.nii");
+        case!(i64, "i64.nii");
+        case!(f32, "f32.nii");
+        case!(f64, "f64.nii");
+    }
+
+    #[test]
+    fn nii_roundtrip_all_scalar_types_3d() {
+        macro_rules! case {
+            ($ty:ty, $name:expr) => {{
+                let data: Vec<$ty> = (0..24u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.size(), &[4, 3, 2], $name);
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+            }};
+        }
+        case!(u8, "u8_3d.nii");
+        case!(i8, "i8_3d.nii");
+        case!(u16, "u16_3d.nii");
+        case!(i16, "i16_3d.nii");
+        case!(u32, "u32_3d.nii");
+        case!(i32, "i32_3d.nii");
+        case!(u64, "u64_3d.nii");
+        case!(i64, "i64_3d.nii");
+        case!(f32, "f32_3d.nii");
+        case!(f64, "f64_3d.nii");
+    }
+
+    /// The LPS↔RAS involution: the writer negates rows 0 and 1 of the direction
+    /// and the origin, the reader negates them back. `origin[2]` is *not*
+    /// negated on either side (itkNiftiImageIO.cxx:1858, :2044).
+    #[test]
+    fn nii_roundtrip_preserves_direction_and_origin_through_the_lps_ras_flip() {
+        let data: Vec<i16> = (0..24).map(|i| i as i16 - 5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+        img.set_direction(&[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+
+        let path = tmp_path("geometry.nii");
+        write_image(&img, &path).unwrap();
+
+        // The RAS+ srow the file actually carries: rows 0 and 1 negated, row 2
+        // as-is, each column scaled by its spacing.
+        let bytes = std::fs::read(&path).unwrap();
+        let srow = |row: usize, col: usize| {
+            f32::from_le_bytes(
+                bytes[280 + 16 * row + 4 * col..284 + 16 * row + 4 * col]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!([srow(0, 0), srow(0, 1), srow(0, 2)], [0.0, 1.25, 0.0]);
+        assert_eq!([srow(1, 0), srow(1, 1), srow(1, 2)], [-0.5, 0.0, 0.0]);
+        assert_eq!([srow(2, 0), srow(2, 1), srow(2, 2)], [0.0, 0.0, 3.0]);
+        assert_eq!([srow(0, 3), srow(1, 3), srow(2, 3)], [2.0, -4.0, 7.5]);
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.size(), img.size());
+        assert_eq!(back.pixel_id(), PixelId::Int16);
+        assert_eq!(back.spacing(), img.spacing());
+        assert_eq!(back.origin(), img.origin());
+        assert_eq!(back.direction(), img.direction());
+        assert_eq!(back.scalar_slice::<i16>().unwrap(), data.as_slice());
+    }
+
+    /// The whole 348-byte header of a 3x2 `Float32` image, spacing `(0.5, 2)`,
+    /// origin `(-2, 4)`, identity direction. `dim[0] = 2` and every unused
+    /// `dim[i]` is `1`; `pixdim[0]` is `qfac`; `vox_offset` is `348 + 4`;
+    /// `xyzt_units` is `NIFTI_UNITS_MM | NIFTI_UNITS_SEC`; both xform codes are
+    /// `NIFTI_XFORM_SCANNER_ANAT`, which
+    /// `SetNIfTIOrientationFromImageIO` writes unconditionally (:2077-2078).
+    #[test]
+    fn nii_header_is_byte_pinned() {
+        let mut img = Image::from_vec(&[3, 2], vec![0.0f32; 6]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0]).unwrap();
+
+        let path = tmp_path("pinned.nii");
+        write_image(&img, &path).unwrap();
+        let file = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let mut want = [0u8; 348];
+        want[0..4].copy_from_slice(&348i32.to_le_bytes());
+        want[38] = b'r';
+        for (i, d) in [2i16, 3, 2, 1, 1, 1, 1, 1].iter().enumerate() {
+            want[40 + 2 * i..42 + 2 * i].copy_from_slice(&d.to_le_bytes());
+        }
+        want[70..72].copy_from_slice(&16i16.to_le_bytes()); // datatype = NIFTI_TYPE_FLOAT32
+        want[72..74].copy_from_slice(&32i16.to_le_bytes()); // bitpix
+        for (i, p) in [1.0f32, 0.5, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+            .iter()
+            .enumerate()
+        {
+            want[76 + 4 * i..80 + 4 * i].copy_from_slice(&p.to_le_bytes());
+        }
+        want[108..112].copy_from_slice(&352.0f32.to_le_bytes()); // vox_offset
+        want[112..116].copy_from_slice(&1.0f32.to_le_bytes()); // scl_slope
+        want[116..120].copy_from_slice(&0.0f32.to_le_bytes()); // scl_inter
+        want[123] = 10; // xyzt_units = MM | SEC
+        want[252..254].copy_from_slice(&1i16.to_le_bytes()); // qform_code
+        want[254..256].copy_from_slice(&1i16.to_le_bytes()); // sform_code
+        want[256..260].copy_from_slice(&0.0f32.to_le_bytes()); // quatern_b
+        want[260..264].copy_from_slice(&0.0f32.to_le_bytes()); // quatern_c
+        want[264..268].copy_from_slice(&1.0f32.to_le_bytes()); // quatern_d
+        want[268..272].copy_from_slice(&2.0f32.to_le_bytes()); // qoffset_x
+        want[272..276].copy_from_slice(&(-4.0f32).to_le_bytes()); // qoffset_y
+        want[276..280].copy_from_slice(&0.0f32.to_le_bytes()); // qoffset_z
+        for (i, v) in [-0.5f32, 0.0, 0.0, 2.0].iter().enumerate() {
+            want[280 + 4 * i..284 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in [0.0f32, -2.0, 0.0, -4.0].iter().enumerate() {
+            want[296 + 4 * i..300 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, v) in [0.0f32, 0.0, 1.0, 0.0].iter().enumerate() {
+            want[312 + 4 * i..316 + 4 * i].copy_from_slice(&v.to_le_bytes());
+        }
+        want[344..348].copy_from_slice(b"n+1\0");
+
+        assert_eq!(&file[..348], &want[..]);
+        // The four-byte zero extender `nifti_write_extensions` emits when
+        // `num_ext == 0` and `skip_blank_ext == 0` (nifti1_io.c:6062-6072).
+        assert_eq!(&file[348..352], &[0, 0, 0, 0]);
+        assert_eq!(file.len(), 352 + 6 * 4);
+    }
+
+    /// A `.hdr` writes a 352-byte header file (header plus extender) and a
+    /// sibling `.img` whose pixels start at offset zero; the magic is `ni1`.
+    /// Either name reads the pair back — `nifti_findhdrname` walks from an
+    /// `.img` to its `.hdr` (nifti1_io.c:2779-2801).
+    #[test]
+    fn hdr_img_pair_roundtrips_from_either_name() {
+        let data: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+        let img = Image::from_vec(&[3, 2], data.clone()).unwrap();
+        let hdr = tmp_path("pair.hdr");
+        write_image(&img, &hdr).unwrap();
+
+        let raw = std::fs::read(&hdr).unwrap();
+        assert_eq!(raw.len(), 352);
+        assert_eq!(&raw[344..348], b"ni1\0");
+        assert_eq!(f32::from_le_bytes(raw[108..112].try_into().unwrap()), 0.0);
+
+        let img_file = tmp_path("pair.img");
+        assert_eq!(std::fs::read(&img_file).unwrap().len(), 24);
+
+        for name in [&hdr, &img_file] {
+            let back = read_image(name).unwrap();
+            assert_eq!(back.size(), &[3, 2]);
+            assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+        }
+        std::fs::remove_file(&hdr).ok();
+        std::fs::remove_file(&img_file).ok();
+    }
+
+    /// Unlike MetaImage, NIfTI has complex datatypes, and `NiftiImageIO` reports
+    /// `numberOfComponents == 2` alongside `IOPixelEnum::COMPLEX` — the exact
+    /// shape `GetPixelIDFromImageIO` needs to hand back a complex pixel ID
+    /// (sitkImageReaderBase.cxx:216-236). So a complex image survives the round
+    /// trip as complex.
+    #[test]
+    fn nii_roundtrip_complex_stays_complex() {
+        let data32: Vec<Complex<f32>> = (0..6)
+            .map(|i| Complex::new(i as f32 * 1.5, -(i as f32) - 0.5))
+            .collect();
+        let mut img = Image::from_vec_complex::<f32>(&[3, 2], data32).unwrap();
+        img.set_spacing(&[1.5, 0.5]).unwrap();
+        img.set_origin(&[2.0, -3.0]).unwrap();
+        img.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+
+        let path = tmp_path("complex_f32.nii");
+        write_image(&img, &path).unwrap();
+        assert_eq!(
+            i16::from_le_bytes(std::fs::read(&path).unwrap()[70..72].try_into().unwrap()),
+            32, // NIFTI_TYPE_COMPLEX64
+        );
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::ComplexFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 1);
+        assert_eq!(back.spacing(), img.spacing());
+        assert_eq!(back.origin(), img.origin());
+        assert_eq!(back.direction(), img.direction());
+        assert_eq!(
+            back.component_slice::<f32>().unwrap(),
+            img.component_slice::<f32>().unwrap()
+        );
+
+        let data64: Vec<Complex<f64>> = (0..6)
+            .map(|i| Complex::new(i as f64 * 1.5, -(i as f64) - 0.5))
+            .collect();
+        let img = Image::from_vec_complex::<f64>(&[3, 2], data64).unwrap();
+        let path = tmp_path("complex_f64.nii");
+        write_image(&img, &path).unwrap();
+        assert_eq!(
+            i16::from_le_bytes(std::fs::read(&path).unwrap()[70..72].try_into().unwrap()),
+            1792, // NIFTI_TYPE_COMPLEX128
+        );
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::ComplexFloat64);
+        assert_eq!(
+            back.component_slice::<f64>().unwrap(),
+            img.component_slice::<f64>().unwrap()
+        );
+    }
+
+    /// A vector image is `dim[0] = 5`, `dim[5] = numComponents`,
+    /// `intent_code = NIFTI_INTENT_VECTOR`, and the components are the *slowest*
+    /// axis on disk — the transpose of ITK's interleaved buffer
+    /// (itkNiftiImageIO.cxx:2151-2175).
+    #[test]
+    fn nii_roundtrip_vector_float32_stores_components_slowest() {
+        let data: Vec<f32> = (0..36).map(|i| i as f32 * 0.25 - 4.0).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 3], 3, data.clone()).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[-1.0, 3.0]).unwrap();
+        img.set_direction(&[0.0, 1.0, -1.0, 0.0]).unwrap();
+
+        let path = tmp_path("vector_f32.nii");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(i16::from_le_bytes(bytes[40..42].try_into().unwrap()), 5);
+        assert_eq!(i16::from_le_bytes(bytes[50..52].try_into().unwrap()), 3);
+        assert_eq!(i16::from_le_bytes(bytes[68..70].try_into().unwrap()), 1007);
+        // On disk, component 0 of every voxel comes first.
+        let on_disk: Vec<f32> = bytes[352..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let d = &data;
+        let expect: Vec<f32> = (0..3)
+            .flat_map(|c| (0..12).map(move |v| d[v * 3 + c]))
+            .collect();
+        assert_eq!(on_disk, expect);
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.size(), img.size());
+        assert_eq!(back.spacing(), img.spacing());
+        assert_eq!(back.origin(), img.origin());
+        assert_eq!(back.direction(), img.direction());
+        assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    /// `m_ConvertRASDisplacementVectors` defaults to `true`
+    /// (itkNiftiImageIO.h:289), so a `NIFTI_INTENT_DISPVECT` image is stored in
+    /// RAS+: the `x` and `y` component planes are negated on write
+    /// (`ConvertRASToFromLPS_XYZTC`, :279-289) and again on read
+    /// (`ConvertRASToFromLPS_CXYZT`, :263-274). The pixels survive; the bytes
+    /// on disk do not match a plain `NIFTI_INTENT_VECTOR` file.
+    #[test]
+    fn nii_dispvect_negates_the_x_and_y_component_planes_on_disk() {
+        let data: Vec<f32> = (1..=36).map(|i| i as f32).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 3], 3, data.clone()).unwrap();
+        img.set_meta_data("intent_code", "1006");
+
+        let path = tmp_path("dispvect.nii");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(i16::from_le_bytes(bytes[68..70].try_into().unwrap()), 1006);
+
+        let on_disk: Vec<f32> = bytes[352..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        // Planes 0 and 1 (24 of the 36 components) are negated; plane 2 is not.
+        let d = &data;
+        let expect: Vec<f32> = (0..3)
+            .flat_map(|c| {
+                (0..12).map(move |v| {
+                    let x = d[v * 3 + c];
+                    if c < 2 { -x } else { x }
+                })
+            })
+            .collect();
+        assert_eq!(on_disk, expect);
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    /// `ReadImageInformation` derives a vector image's dimension from `dim[4]`,
+    /// `dim[3]` and `dim[2]` only (itkNiftiImageIO.cxx:788-805) — `dim[1]` is
+    /// never consulted. A 2-D vector image one row tall therefore reads back
+    /// 1-D. Upstream quirk, pinned (ledger §2.89).
+    #[test]
+    fn nii_vector_image_one_row_tall_reads_back_as_one_dimensional() {
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let img = Image::from_vec_vector::<f32>(&[4, 1], 3, data.clone()).unwrap();
+        let path = tmp_path("flat_vector.nii");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.dimension(), 2);
+        assert_eq!(back.dimension(), 1);
+        assert_eq!(back.size(), &[4]);
+        assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    /// The "HACK ALERT KW" loop (itkNiftiImageIO.cxx:820-824) trims trailing
+    /// unit dimensions of a *scalar* image while the index stays above three, so
+    /// a 4-D volume with one time point reads back 3-D.
+    #[test]
+    fn nii_scalar_4d_with_one_time_point_reads_back_as_three_dimensional() {
+        let data: Vec<u8> = (0..8).collect();
+        let img = Image::from_vec(&[2, 2, 2, 1], data.clone()).unwrap();
+        let path = tmp_path("collapse_t.nii");
+        write_image(&img, &path).unwrap();
+        assert_eq!(
+            i16::from_le_bytes(std::fs::read(&path).unwrap()[40..42].try_into().unwrap()),
+            4,
+        );
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 3);
+        assert_eq!(back.size(), &[2, 2, 2]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// `scl_slope`/`scl_inter` rescaling promotes an integer on-disk type to
+    /// `float` (itkNiftiImageIO.cxx:1005-1016) and applies `v * slope + inter`.
+    #[test]
+    fn nii_rescale_promotes_an_integer_datatype_to_float32() {
+        let data: Vec<i16> = (0..6).map(|i| i as i16).collect();
+        let img = Image::from_vec(&[3, 2], data.clone()).unwrap();
+        let path = patched_nii("rescale_i16.nii", &img, |b| {
+            patch_f32(b, 112, 2.0); // scl_slope
+            patch_f32(b, 116, 1.0); // scl_inter
+        });
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(
+            back.scalar_slice::<f32>().unwrap(),
+            &[1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+        );
+    }
+
+    /// `RescaleFunction(buffer, slope, inter, numElts)` is handed the *voxel*
+    /// count, not the component count (itkNiftiImageIO.cxx:513-548), so on a
+    /// complex image only the first `numElts` of the `2 * numElts` interleaved
+    /// floats are rescaled: the first half of the pixels get both parts scaled,
+    /// the second half get neither. Upstream bug, reproduced (ledger §1.50).
+    #[test]
+    fn nii_rescale_of_a_complex_image_only_touches_the_first_half_of_the_buffer() {
+        let data: Vec<Complex<f32>> = (1..=6)
+            .map(|i| Complex::new(i as f32, -(i as f32)))
+            .collect();
+        let img = Image::from_vec_complex::<f32>(&[3, 2], data).unwrap();
+        let path = patched_nii("rescale_complex.nii", &img, |b| {
+            patch_f32(b, 112, 10.0); // scl_slope
+        });
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::ComplexFloat32);
+        assert_eq!(
+            back.component_slice::<f32>().unwrap(),
+            // components 0..5 scaled by 10, components 6..11 untouched
+            &[
+                10.0, -10.0, 20.0, -20.0, 30.0, -30.0, 4.0, -4.0, 5.0, -5.0, 6.0, -6.0
+            ]
+        );
+    }
+
+    /// `DT_RGB24` loads as `IOPixelEnum::RGB` with three `unsigned char`
+    /// components (itkNiftiImageIO.cxx:906-910), which SimpleITK maps onto a
+    /// vector pixel ID (sitkImageReaderBase.cxx:220-231). RGB is interleaved on
+    /// disk, so it takes the memcpy branch, not the de-interleave.
+    #[test]
+    fn nii_rgb24_reads_as_a_three_component_vector_image() {
+        let img = Image::from_vec(&[3, 2], vec![0u8; 6]).unwrap();
+        let path = patched_nii("rgb24.nii", &img, |b| {
+            patch_i16(b, 70, 128); // datatype = NIFTI_TYPE_RGB24
+            patch_i16(b, 72, 24); // bitpix
+            b.truncate(352);
+            b.extend((0..18u8).map(|i| i + 1));
+        });
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(
+            back.component_slice::<u8>().unwrap(),
+            &(1..=18u8).collect::<Vec<_>>()[..]
+        );
+    }
+
+    /// `NIFTI_TYPE_FLOAT128` and `NIFTI_TYPE_COMPLEX256` fall through
+    /// `ReadImageInformation`'s datatype switch to `default: break`
+    /// (itkNiftiImageIO.cxx:924), leaving `UNKNOWNCOMPONENTTYPE`.
+    #[test]
+    fn nii_rejects_datatypes_itk_leaves_unknown() {
+        let img = Image::from_vec(&[3, 2], vec![0.0f32; 6]).unwrap();
+        for (datatype, name) in [(1536i16, "f128.nii"), (2048, "c256.nii")] {
+            let path = patched_nii(name, &img, |b| patch_i16(b, 70, datatype));
+            let result = read_image(&path);
+            std::fs::remove_file(&path).ok();
+            assert!(
+                matches!(result, Err(IoError::UnsupportedNiftiDatatype(d)) if d == datatype),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// `nifti_convert_nhdr2nim` rejects `DT_UNKNOWN` and `DT_BINARY` outright
+    /// (nifti1_io.c:3653-3658), and a non-positive `dim[1]` (:3691-3695).
+    #[test]
+    fn nii_rejects_a_malformed_header() {
+        let img = Image::from_vec(&[3, 2], vec![0.0f32; 6]).unwrap();
+
+        let path = patched_nii("bad_datatype.nii", &img, |b| patch_i16(b, 70, 1));
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::MalformedNiftiHeader(m)) if m == "bad datatype"),
+            "{result:?}"
+        );
+
+        let path = patched_nii("bad_dim1.nii", &img, |b| patch_i16(b, 42, 0));
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::MalformedNiftiHeader(m)) if m == "bad dim[1]"),
+            "{result:?}"
+        );
+    }
+
+    /// `need_nhdr_swap` reads `dim[0]`: out of `1..=7` in the host's order but
+    /// in range byte-swapped means the whole file is foreign-endian
+    /// (nifti1_io.c:4143-4176), and `nifti_read_buffer` then swaps the pixels by
+    /// the datatype's `swapsize` (:5030-5034).
+    #[test]
+    fn nii_big_endian_file_reads_on_a_little_endian_host() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32 * 0.5 - 3.0).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+
+        // Every numeric field of `nifti_1_header`, as (offset, width).
+        let mut fields: Vec<(usize, usize)> = vec![(0, 4), (32, 4), (36, 2)];
+        fields.extend((0..8).map(|i| (40 + 2 * i, 2)));
+        fields.extend([
+            (56, 4),
+            (60, 4),
+            (64, 4),
+            (68, 2),
+            (70, 2),
+            (72, 2),
+            (74, 2),
+        ]);
+        fields.extend((0..8).map(|i| (76 + 4 * i, 4)));
+        fields.extend([
+            (108, 4),
+            (112, 4),
+            (116, 4),
+            (120, 2),
+            (124, 4),
+            (128, 4),
+            (132, 4),
+            (136, 4),
+            (140, 4),
+            (144, 4),
+            (252, 2),
+            (254, 2),
+        ]);
+        fields.extend((0..6).map(|i| (256 + 4 * i, 4)));
+        fields.extend((0..12).map(|i| (280 + 4 * i, 4)));
+
+        let path = patched_nii("big_endian.nii", &img, |b| {
+            for (off, width) in fields {
+                b[off..off + width].reverse();
+            }
+            for chunk in b[352..].chunks_exact_mut(4) {
+                chunk.reverse();
+            }
+        });
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.size(), &[4, 3, 2]);
+        assert_eq!(back.spacing(), &[0.5, 1.25, 3.0]);
+        assert_eq!(back.origin(), &[-2.0, 4.0, 7.5]);
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    /// `nifti_read_buffer`'s `#ifdef isfinite` block (nifti1_io.c:5036-5070) is
+    /// live on glibc, which defines `isfinite` as a macro: every non-finite
+    /// float read from disk becomes zero. Platform-dependent upstream behaviour,
+    /// pinned for Linux (ledger §2.90).
+    #[test]
+    fn nii_non_finite_pixels_are_zeroed_on_read() {
+        let img = Image::from_vec(&[3, 1], vec![f32::NAN, f32::INFINITY, 1.5]).unwrap();
+        let path = tmp_path("nonfinite.nii");
+        write_image(&img, &path).unwrap();
+        // The writer stores them verbatim; only the reader sanitises.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(f32::from_le_bytes(bytes[352..356].try_into().unwrap()).is_nan());
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), &[0.0, 0.0, 1.5]);
+    }
+
+    /// This build has no zlib, so a gzipped NIfTI is recognised and refused with
+    /// a message that names what is missing.
+    #[test]
+    fn nii_gz_is_recognised_and_rejected() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("compressed.nii.gz");
+
+        let written = write_image(&img, &path);
+        assert!(
+            matches!(&written, Err(IoError::UnsupportedNiftiFeature(m))
+                if m.contains("zlib") && m.contains("5.8")),
+            "{written:?}"
+        );
+
+        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
+        assert!(create_image_io(&path, FileMode::Read).is_some());
+        let read = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&read, Err(IoError::UnsupportedNiftiFeature(m))
+                if m.contains("zlib") && m.contains("5.8")),
+            "{read:?}"
+        );
+    }
+
+    /// `.nia`, the NIfTI ASCII variant, is a valid write target for
+    /// `nifti_is_complete_filename` — and then `WriteImageInformation` picks
+    /// `NIFTI_FTYPE_ASCII`, which this port does not implement.
+    #[test]
+    fn nia_is_claimed_for_writing_and_then_refused() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("ascii.nia");
+        assert!(create_image_io(&path, FileMode::Write).is_some());
+        let result = write_image(&img, &path);
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains(".nia")),
+            "{result:?}"
+        );
+    }
+
+    /// `NiftiImageIO::CanReadFile` resolves the *header* file through
+    /// `nifti_findhdrname` before it looks at any content
+    /// (itkNiftiImageIO.cxx:604), so a path with no extension at all is claimed
+    /// when the matching `.nii` exists. That is `CreateImageIO`'s phase 2 doing
+    /// real work — the opposite of `MetaImageIo`, which re-checks the extension
+    /// itself and declines.
+    #[test]
+    fn nifti_claims_an_extensionless_path_in_phase_two() {
+        let stem = tmp_path("stemonly");
+        let nii = tmp_path("stemonly.nii");
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        write_image(&img, &nii).unwrap();
+
+        assert!(create_image_io(&stem, FileMode::Read).is_some());
+        let back = read_image(&stem).unwrap();
+        std::fs::remove_file(&nii).ok();
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4]);
+    }
+
+    /// `ReadImageInformation` never touches the pixel tail.
+    #[test]
+    fn nii_read_image_information_does_not_load_pixels() {
+        let img = Image::from_vec(&[3, 2], vec![0.0f32; 6]).unwrap();
+        let path = patched_nii("info_only.nii", &img, |b| {
+            patch_i16(b, 42, 20000); // dim[1]
+            patch_i16(b, 44, 20000); // dim[2]
+            b.truncate(352);
+        });
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap().clone();
+        let loaded = reader.execute();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::Float32);
+        assert_eq!(info.dimension, 2);
+        assert_eq!(info.number_of_components, 1);
+        assert_eq!(info.size, vec![20000, 20000]);
+        assert!(matches!(loaded, Err(IoError::TruncatedData)), "{loaded:?}");
+    }
+
+    /// `ReadImageInformation` encapsulates `ITK_InputFilterName` at
+    /// itkNiftiImageIO.cxx:1102 and `SetImageIOMetadataFromNIfTI` then calls
+    /// `thisDic.Clear()` at :630 — so a NIfTI image never carries the key that
+    /// every MetaImage does. Upstream quirk, pinned (ledger §2.86).
+    #[test]
+    fn nii_dictionary_has_no_itk_input_filter_name() {
+        let mut img = Image::from_vec(&[3, 2], vec![0.0f32; 6]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        let path = tmp_path("dict.nii");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.meta_data("ITK_InputFilterName"), None);
+        assert_eq!(back.meta_data("nifti_type"), Some("1"));
+        assert_eq!(back.meta_data("datatype"), Some("16"));
+        assert_eq!(back.meta_data("bitpix"), Some("32"));
+        assert_eq!(back.meta_data("vox_offset"), Some("352"));
+        assert_eq!(back.meta_data("xyzt_units"), Some("10"));
+        assert_eq!(back.meta_data("scl_slope"), Some("1"));
+        assert_eq!(back.meta_data("qform_code"), Some("1"));
+        assert_eq!(
+            back.meta_data("qform_code_name"),
+            Some("NIFTI_XFORM_SCANNER_ANAT")
+        );
+        assert_eq!(back.meta_data("ITK_sform_corrected"), Some("NO"));
+        assert_eq!(back.meta_data("pixdim[1]"), Some("0.5"));
+        // `srow_x[3]` is `-(origin[0] as f32)` and `origin[0]` is `0.0`, so the
+        // field genuinely holds `-0.0`; double-conversion's `ToShortest` — and
+        // Rust's `Display` — both render that as `-0`.
+        assert_eq!(back.meta_data("srow_x"), Some("-0.5 0 0 -0"));
+    }
+
+    /// `aux_file` and `ITK_FileNotes` feed fixed-width header fields and are
+    /// rejected when they overflow (itkNiftiImageIO.cxx:1478, :1493); a
+    /// non-numeric `qform_code` is rejected by `itk::StringToInt32` even though
+    /// the value it produces is then thrown away at :2077.
+    #[test]
+    fn nii_write_rejects_unusable_dictionary_values() {
+        let base = Image::from_vec(&[2, 2], vec![0.0f32; 4]).unwrap();
+
+        let mut img = base.clone();
+        img.set_meta_data("aux_file", &"x".repeat(24));
+        let result = write_image(&img, tmp_path("aux.nii"));
+        assert!(
+            matches!(&result, Err(IoError::InvalidNiftiMetaData(m)) if m.contains("aux_file")),
+            "{result:?}"
+        );
+
+        let mut img = base.clone();
+        img.set_meta_data("ITK_FileNotes", &"x".repeat(80));
+        let result = write_image(&img, tmp_path("notes.nii"));
+        assert!(
+            matches!(&result, Err(IoError::InvalidNiftiMetaData(m)) if m.contains("ITK_FileNotes")),
+            "{result:?}"
+        );
+
+        let mut img = base.clone();
+        img.set_meta_data("qform_code", "not a number");
+        let result = write_image(&img, tmp_path("qform.nii"));
+        assert!(
+            matches!(&result, Err(IoError::InvalidNiftiMetaData(m)) if m.contains("qform_code")),
+            "{result:?}"
+        );
+    }
+
+    /// `descrip` and `aux_file` round-trip; `ITK_FileNotes` is `descrip` under
+    /// another name (itkNiftiImageIO.cxx:751, :1112).
+    #[test]
+    fn nii_descrip_and_aux_file_roundtrip() {
+        let mut img = Image::from_vec(&[2, 2], vec![0.0f32; 4]).unwrap();
+        img.set_meta_data("ITK_FileNotes", "acquired on a rainy Tuesday");
+        img.set_meta_data("aux_file", "sidecar.txt");
+
+        let path = tmp_path("notes_roundtrip.nii");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            back.meta_data("descrip"),
+            Some("acquired on a rainy Tuesday")
+        );
+        assert_eq!(
+            back.meta_data("ITK_FileNotes"),
+            Some("acquired on a rainy Tuesday")
+        );
+        assert_eq!(back.meta_data("aux_file"), Some("sidecar.txt"));
+    }
+
+    /// An Analyze-7.5 header — `sizeof_hdr == 348`, no NIfTI magic — is read
+    /// with identity direction and zero origin: `nifti_convert_nhdr2nim` forces
+    /// both xform codes to `NIFTI_XFORM_UNKNOWN` for a non-NIfTI header
+    /// (nifti1_io.c:3773, :3843), and `SetImageIOOrientationFromNIfTI` then
+    /// returns early (itkNiftiImageIO.cxx:1591-1610) because the compiled-in
+    /// `Analyze75Flavor` is `AnalyzeITK4Warning`. `scl_slope` is not copied out
+    /// of a non-NIfTI header either (:3861-3878), so no rescale happens whatever
+    /// the bytes at offset 112 say.
+    ///
+    /// The reported `nifti_type` still comes out `1`, not `0`:
+    /// `nifti_set_type_from_names` sees one file doing both jobs and coerces the
+    /// type to `NIFTI_FTYPE_NIFTI1_1` regardless of the missing magic
+    /// (nifti1_io.c:3452-3454). Upstream quirk, pinned (ledger §2.92).
+    #[test]
+    fn analyze75_single_file_reads_with_identity_geometry_and_a_coerced_nifti_type() {
+        let mut img = Image::from_vec(&[3, 2], vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0]).unwrap();
+        let path = patched_nii("analyze.nii", &img, |b| {
+            b[344..348].copy_from_slice(&[0, 0, 0, 0]); // drop the magic
+            patch_f32(b, 112, 8.0); // scl_slope, which a non-NIfTI header ignores
+        });
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.spacing(), &[0.5, 2.0]);
+        assert_eq!(back.origin(), &[0.0, 0.0]);
+        assert_eq!(back.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            back.scalar_slice::<f32>().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        assert_eq!(back.meta_data("nifti_type"), Some("1"));
+        assert_eq!(back.meta_data("scl_slope"), Some("0"));
+        assert_eq!(back.meta_data("qform_code"), Some("0"));
+        assert_eq!(back.meta_data("sform_code"), Some("0"));
+    }
+
+    /// A magic-less `.hdr`/`.img` pair keeps `nifti_type == NIFTI_FTYPE_ANALYZE`,
+    /// because `nifti_set_type_from_names` only coerces when the two names are
+    /// the same.
+    #[test]
+    fn analyze75_two_file_pair_keeps_nifti_type_zero() {
+        let img = Image::from_vec(&[3, 2], vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let hdr = tmp_path("analyze_pair.hdr");
+        write_image(&img, &hdr).unwrap();
+        let mut bytes = std::fs::read(&hdr).unwrap();
+        bytes[344..348].copy_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(&hdr, bytes).unwrap();
+
+        let back = read_image(&hdr).unwrap();
+        std::fs::remove_file(&hdr).ok();
+        std::fs::remove_file(tmp_path("analyze_pair.img")).ok();
+
+        assert_eq!(back.meta_data("nifti_type"), Some("0"));
+        assert_eq!(back.origin(), &[0.0, 0.0]);
+        assert_eq!(back.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            back.scalar_slice::<f32>().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    /// A `NIFTI_INTENT_SYMMATRIX` file loads as
+    /// `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`, which
+    /// `GetPixelIDFromImageIO` has no branch for: it falls to the final `else`
+    /// and throws "Unknown PixelType" (sitkImageReaderBase.cxx:238). SimpleITK
+    /// simply cannot open such a file (ledger §3.32).
+    #[test]
+    fn nii_symmatrix_is_unreadable_through_the_simpleitk_pixel_id_mapping() {
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 3, vec![0.0; 12]).unwrap();
+        let path = patched_nii("symmatrix.nii", &img, |b| patch_i16(b, 68, 1005));
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("SYMMATRIX")),
+            "{result:?}"
+        );
+    }
+
+    /// `NIFTI_INTENT_GENMATRIX` is rejected by ITK itself
+    /// (itkNiftiImageIO.cxx:806-810).
+    #[test]
+    fn nii_genmatrix_is_rejected() {
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 4, vec![0.0; 16]).unwrap();
+        let path = patched_nii("genmatrix.nii", &img, |b| patch_i16(b, 68, 1004));
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("GENMATRIX")),
+            "{result:?}"
+        );
+    }
+
+    /// An axis longer than `SHRT_MAX` cannot be expressed in `dim[i]`, and
+    /// `WriteImageInformation` says so before it allocates anything
+    /// (itkNiftiImageIO.cxx:1143-1150).
+    #[test]
+    fn nii_write_rejects_an_axis_longer_than_shrt_max() {
+        let img = Image::new(&[32768, 1], PixelId::UInt8);
+        let result = write_image(&img, tmp_path("too_wide.nii"));
+        assert!(
+            matches!(&result, Err(IoError::NiftiWriteRejected(m)) if m.contains("32767")),
+            "{result:?}"
+        );
+    }
+
+    /// A vector image of more than four dimensions has no room for `dim[5]`
+    /// (itkNiftiImageIO.cxx:1279-1283).
+    #[test]
+    fn nii_write_rejects_a_five_dimensional_vector_image() {
+        let img = Image::from_vec_vector::<u8>(&[2, 2, 2, 2, 2], 3, vec![0u8; 96]).unwrap();
+        let result = write_image(&img, tmp_path("vector_5d.nii"));
+        assert!(
+            matches!(&result, Err(IoError::NiftiWriteRejected(m)) if m.contains("Dimension=5")),
+            "{result:?}"
+        );
+    }
+
+    /// `Read` casts the on-disk integers into a buffer sized `numElts *
+    /// sizeof(float)` and then copies `numElts * numComponents * sizeof(float)`
+    /// bytes out of it (itkNiftiImageIO.cxx:386, :447). For a rescaled vector
+    /// image that is a heap overflow — there is no defined upstream behaviour to
+    /// reproduce, so the read is refused (ledger §1.49, §4.59).
+    #[test]
+    fn nii_rescaled_integer_vector_image_is_refused_rather_than_overflowing() {
+        let img = Image::from_vec_vector::<i16>(&[2, 2], 3, (0..12).collect()).unwrap();
+        let path = patched_nii("rescale_vector.nii", &img, |b| {
+            patch_f32(b, 112, 2.0); // scl_slope
+        });
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("heap overflow")),
+            "{result:?}"
+        );
+    }
+
+    /// `nifti_find_file_extension` accepts an all-uppercase extension
+    /// (`allow_upper_fext` defaults to `1`, nifti1_io.c:2607-2618) but not a
+    /// mixed one — it lowercases nothing, it compares against both spellings.
+    ///
+    /// So `CanWriteFile` — which is exactly `nifti_is_complete_filename` — says
+    /// yes to `IMG.NII`, the registry hands the file to the NIfTI writer, and
+    /// `WriteImageInformation` then compares the extension against `".nii"`
+    /// with `operator==` (itkNiftiImageIO.cxx:1175-1201) and falls through to
+    /// `itkExceptionMacro("Bad Nifti file name: ...")`. An uppercase extension
+    /// is writable in the factory's judgement and unwritable in the writer's.
+    /// Pinned, not fixed (ledger §2.91).
+    #[test]
+    fn uppercase_nii_is_claimed_for_writing_and_then_refused() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+
+        let shouty = tmp_path("shouty.NII");
+        let result = write_image(&img, &shouty);
+        assert!(
+            matches!(&result, Err(IoError::NiftiWriteRejected(m)) if m.starts_with("Bad Nifti file name:")),
+            "{result:?}"
+        );
+        assert!(!shouty.exists());
+        assert!(!tmp_path("shouty.nii").exists());
+
+        // A mixed-case extension is not an extension at all, so no IO claims it.
+        let mixed = tmp_path("mixed.Nii");
+        assert!(matches!(
+            write_image(&img, &mixed),
+            Err(IoError::NoWriterFound(_))
+        ));
     }
 
     /// Extraction is component-aware: a vector image keeps its channels.
