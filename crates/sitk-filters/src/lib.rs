@@ -49,6 +49,7 @@ pub mod change_label;
 pub mod clamp;
 pub mod coherence_enhancing_diffusion;
 pub mod colliding_fronts;
+pub mod complex;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
