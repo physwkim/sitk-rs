@@ -109,6 +109,7 @@ pub mod threshold;
 pub mod threshold_maximum_connected_components;
 pub mod toboggan;
 pub mod vector;
+pub mod vector_connected_component;
 pub mod watershed;
 pub mod watershed_classic;
 
@@ -264,6 +265,7 @@ pub use threshold_maximum_connected_components::{
 };
 pub use toboggan::toboggan;
 pub use vector::{compose, vector_index_selection_cast, vector_magnitude};
+pub use vector_connected_component::vector_connected_component;
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 pub use watershed_classic::{
     IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
