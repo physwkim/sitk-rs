@@ -13,7 +13,8 @@
 //!   forced default of `CropImageFilter`)
 //! - `itkPadImageFilterBase.h` / `.hxx`, `itkPadImageFilter.h` / `.hxx`,
 //!   `itkConstantPadImageFilter.h`, `itkMirrorPadImageFilter.h`,
-//!   `itkWrapPadImageFilter.h` ([`constant_pad`], [`mirror_pad`], [`wrap_pad`])
+//!   `itkWrapPadImageFilter.h`, `itkZeroFluxNeumannPadImageFilter.h`
+//!   ([`constant_pad`], [`mirror_pad`], [`wrap_pad`], [`zero_flux_neumann_pad`])
 //! - `itkFlipImageFilter.h` / `.hxx` ([`flip`])
 //! - `itkPermuteAxesImageFilter.h` / `.hxx` ([`permute_axes`])
 
@@ -21,7 +22,8 @@ use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, MirrorBoundaryCondition,
-    PeriodicBoundaryCondition, PixelId, Scalar, ScalarView, dispatch_scalar, matrix,
+    PeriodicBoundaryCondition, PixelId, Scalar, ScalarView, ZeroFluxNeumannBoundaryCondition,
+    dispatch_scalar, matrix,
 };
 
 /// First-index-fastest strides for a size vector.
@@ -362,6 +364,44 @@ pub fn wrap_pad(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> 
     require_dim(upper.len(), dim)?;
     let (out_size, out_origin) = pad_geometry(img, lower, upper);
     let mut out = dispatch_scalar!(img.pixel_id(), wrap_pad_typed, img, lower, &out_size)?;
+    out.set_spacing(img.spacing())?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(img.direction())?;
+    Ok(out)
+}
+
+fn zero_flux_neumann_pad_typed<T: Scalar>(
+    img: &Image,
+    lower: &[usize],
+    out_size: &[usize],
+) -> Result<Image> {
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &ZeroFluxNeumannBoundaryCondition,
+    );
+    Ok(Image::from_vec(out_size, vals)?)
+}
+
+/// `ZeroFluxNeumannPadImageFilter` (`itkZeroFluxNeumannPadImageFilter.h`):
+/// grow the image by `lower`/`upper` pixels per axis, filling new pixels by
+/// clamping each out-of-bounds index to the nearest edge pixel per axis
+/// independently ([`sitk_core::ZeroFluxNeumannBoundaryCondition`]) -- unlike
+/// [`mirror_pad`]/[`wrap_pad`], every padded pixel repeats its nearest edge
+/// value rather than reflecting or wrapping.
+pub fn zero_flux_neumann_pad(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+    let (out_size, out_origin) = pad_geometry(img, lower, upper);
+    let mut out = dispatch_scalar!(
+        img.pixel_id(),
+        zero_flux_neumann_pad_typed,
+        img,
+        lower,
+        &out_size
+    )?;
     out.set_spacing(img.spacing())?;
     out.set_origin(&out_origin)?;
     out.set_direction(img.direction())?;
@@ -737,6 +777,56 @@ mod tests {
             out.to_f64_vec().unwrap(),
             vec![12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0]
         );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_clamps_to_the_nearest_edge_pixel() {
+        let img = Image::from_vec(&[4, 1], vec![10.0f64, 11.0, 12.0, 13.0]).unwrap();
+        let out = zero_flux_neumann_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(out.size(), &[8, 1]);
+        // index -1,-2 both clamp to 0; index 4,5 both clamp to 3.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![10.0, 10.0, 10.0, 11.0, 12.0, 13.0, 13.0, 13.0]
+        );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_matches_the_yaml_doc_example() {
+        // itkZeroFluxNeumannPadImageFilter.h:38-53 / the yaml's own
+        // detaileddescription: padding a 5x3 corner by lower=[2,2],
+        // upper=[0,0] replicates each edge value outward, including the
+        // top-left corner value into the whole padded corner block.
+        let img = Image::from_vec(
+            &[5, 3],
+            vec![
+                1.0f64, 2.0, 3.0, 4.0, 5.0, //
+                3.0, 3.0, 5.0, 5.0, 6.0, //
+                4.0, 4.0, 6.0, 7.0, 8.0,
+            ],
+        )
+        .unwrap();
+        let out = zero_flux_neumann_pad(&img, &[2, 2], &[0, 0]).unwrap();
+        assert_eq!(out.size(), &[7, 5]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 6.0, //
+                4.0, 4.0, 4.0, 4.0, 6.0, 7.0, 8.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_of_size_zero_is_identity() {
+        let img = Image::from_vec(&[3, 2], (0..6).map(|v| v as f64).collect()).unwrap();
+        let out = zero_flux_neumann_pad(&img, &[0, 0], &[0, 0]).unwrap();
+        assert_eq!(out.size(), img.size());
+        assert_eq!(out.origin(), img.origin());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     // ---- flip ----

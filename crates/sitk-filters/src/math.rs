@@ -405,6 +405,27 @@ pub fn divide_floor_in_place(a: Image, b: &Image) -> Result<Image> {
     two_image_f64_in_place(a, b, &|x, y| (x / y).floor())
 }
 
+/// `PowImageFilter` (`itkPowImageFilter.h`'s `Pow` functor): pixel-wise
+/// `pow(RealType1(a), RealType2(b))`, output pixel type is `a`'s own type
+/// (the functor's default template parameters: `TInput2 = TInput1`,
+/// `TOutput = TInput1`, and the yaml has no `output_image_type` override).
+///
+/// Unlike every other filter in this module, this is an *exact* match to the
+/// C++, not a precision simplification: `NumericTraits<T>::RealType` is
+/// `double` for every basic pixel type, including `float`
+/// (`itkNumericTraits.h`'s `NumericTraits<float>::RealType = double`), so ITK
+/// itself always calls `std::pow(double, double)` here regardless of `a`/`b`'s
+/// concrete input types -- exactly what [`two_image_f64`] does by promoting
+/// both operands to `f64`.
+pub fn pow(a: &Image, b: &Image) -> Result<Image> {
+    two_image_f64(a, b, |x, y| x.powf(y))
+}
+
+/// In-place variant of [`pow`]: reuses `a`'s buffer.
+pub fn pow_in_place(a: Image, b: &Image) -> Result<Image> {
+    two_image_f64_in_place(a, b, &|x, y| x.powf(y))
+}
+
 /// Output pixel-type mapping used by [`divide_real`]: stays `Float32` for a
 /// `Float32` input, promotes everything else to `Float64`. **Diverges from
 /// ITK**: the yaml's `output_pixel_type` is `NumericTraits<T>::RealType`,
@@ -880,6 +901,66 @@ mod tests {
         let b = Image::from_vec(&[2, 1], vec![2i32, 2]).unwrap();
         let allocated = divide_floor(&a, &b).unwrap();
         let in_place = divide_floor_in_place(a, &b).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    // ---- pow ----
+
+    #[test]
+    fn pow_basic_integer_output() {
+        let a = Image::from_vec(&[3, 1], vec![2i32, 3, 5]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![10i32, 2, 0]).unwrap();
+        // pow(2,10)=1024; pow(3,2)=9; pow(5,0)=1.
+        assert_eq!(
+            pow(&a, &b).unwrap().scalar_slice::<i32>().unwrap(),
+            &[1024, 9, 1]
+        );
+    }
+
+    #[test]
+    fn pow_keeps_a_own_pixel_type_as_output() {
+        let a = Image::from_vec(&[1, 1], vec![2.0f32]).unwrap();
+        let b = Image::from_vec(&[1, 1], vec![0.5f32]).unwrap();
+        let out = pow(&a, &b).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::Float32);
+        assert_eq!(
+            out.scalar_slice::<f32>().unwrap(),
+            &[std::f32::consts::SQRT_2]
+        );
+    }
+
+    #[test]
+    fn pow_overflow_saturates_on_integer_output() {
+        // 2^10 = 1024, does not fit in u8; Scalar::from_f64 saturates to 255.
+        let a = img_u8(&[1, 1], vec![2]);
+        let b = img_u8(&[1, 1], vec![10]);
+        assert_eq!(pow(&a, &b).unwrap().scalar_slice::<u8>().unwrap(), &[255]);
+    }
+
+    #[test]
+    fn pow_negative_base_fractional_exponent_is_nan_on_float_output() {
+        // std::pow(-1.0, 0.5) is NaN (no real result); f64::powf matches.
+        let a = Image::from_vec(&[1, 1], vec![-1.0f64]).unwrap();
+        let b = Image::from_vec(&[1, 1], vec![0.5f64]).unwrap();
+        assert!(pow(&a, &b).unwrap().scalar_slice::<f64>().unwrap()[0].is_nan());
+    }
+
+    #[test]
+    fn pow_zero_to_the_zero_is_one() {
+        // std::pow(0.0, 0.0) == 1.0 under IEC 60559 (and f64::powf matches);
+        // not a special case ITK guards against, just a real edge worth
+        // pinning since it looks like it should be 0.
+        let a = img_u8(&[1, 1], vec![0]);
+        let b = img_u8(&[1, 1], vec![0]);
+        assert_eq!(pow(&a, &b).unwrap().scalar_slice::<u8>().unwrap(), &[1]);
+    }
+
+    #[test]
+    fn pow_in_place_matches_allocating() {
+        let a = Image::from_vec(&[3, 1], vec![2i32, 3, 5]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![10i32, 2, 0]).unwrap();
+        let allocated = pow(&a, &b).unwrap();
+        let in_place = pow_in_place(a, &b).unwrap();
         assert_eq!(allocated, in_place);
     }
 
