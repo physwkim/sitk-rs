@@ -46,6 +46,7 @@ use sitk_core::{Image, PixelId};
 
 use crate::error::{IoError, Result};
 use crate::gipl::GiplImageIo;
+use crate::image_hdf5::Hdf5ImageIo;
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
@@ -181,6 +182,7 @@ static NRRD_IMAGE_IO: NrrdImageIo = NrrdImageIo;
 static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
 static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
+static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -202,8 +204,13 @@ static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 /// own `CheckExtension` gate makes it claim `.gipl` and `.gipl.gz` and nothing
 /// else.
 ///
+/// [`Hdf5ImageIo`] advertises eight extensions of its own, but its
+/// `can_read_file` ignores them entirely and probes for an `/ITKImage` link, so
+/// phase 2 lets it claim an HDF5 image under any name at all.
+///
 /// [`VtkImageIo`]: crate::vtk::VtkImageIo
 /// [`GiplImageIo`]: crate::gipl::GiplImageIo
+/// [`Hdf5ImageIo`]: crate::image_hdf5::Hdf5ImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
         &META_IMAGE_IO,
@@ -211,6 +218,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &NIFTI_IMAGE_IO,
         &GIPL_IMAGE_IO,
         &VTK_IMAGE_IO,
+        &HDF5_IMAGE_IO,
     ];
     IOS
 }
