@@ -28,12 +28,14 @@
 //! see [`transform_io`].
 
 pub mod error;
+pub mod gipl;
 pub mod image_io;
 pub mod meta_image;
 pub mod nifti;
 pub mod nrrd;
 pub mod reader;
 pub mod transform_io;
+pub mod vtk;
 pub mod writer;
 
 use std::path::Path;
@@ -389,7 +391,13 @@ mod tests {
     fn registry_lists_each_image_io_by_class_name() {
         assert_eq!(
             registered_image_ios(),
-            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
+            vec![
+                "MetaImageIO",
+                "NrrdImageIO",
+                "NiftiImageIO",
+                "GiplImageIO",
+                "VTKImageIO"
+            ]
         );
         assert_eq!(
             image_io_by_name("MetaImageIO").unwrap().name(),
@@ -403,6 +411,11 @@ mod tests {
             image_io_by_name("NiftiImageIO").unwrap().name(),
             "NiftiImageIO"
         );
+        assert_eq!(
+            image_io_by_name("GiplImageIO").unwrap().name(),
+            "GiplImageIO"
+        );
+        assert_eq!(image_io_by_name("VTKImageIO").unwrap().name(), "VTKImageIO");
         assert!(matches!(
             image_io_by_name("PNGImageIO"),
             Err(IoError::UnknownImageIo(name)) if name == "PNGImageIO"
@@ -528,7 +541,13 @@ mod tests {
         ));
         assert_eq!(
             writer.registered_image_ios(),
-            vec!["MetaImageIO", "NrrdImageIO", "NiftiImageIO"]
+            vec![
+                "MetaImageIO",
+                "NrrdImageIO",
+                "NiftiImageIO",
+                "GiplImageIO",
+                "VTKImageIO"
+            ]
         );
     }
 
@@ -2701,6 +2720,1062 @@ mod tests {
     fn nrrd_extension_alone_does_not_claim_a_file_for_reading() {
         let path = tmp_path("not_really.nrrd");
         std::fs::write(&path, b"this is a text file, not a NRRD\n").unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+    }
+
+    // ======================================================================
+    // GIPL — itk::GiplImageIO
+    // ======================================================================
+
+    /// Hand-author the 256-byte header `ReadImageInformation` walks, so a test
+    /// can move one field at a time.
+    fn gipl_header(
+        dims: [u16; 4],
+        image_type: u16,
+        pixdim: [f32; 4],
+        origin: [f64; 4],
+        magic: u32,
+    ) -> Vec<u8> {
+        let mut h = Vec::with_capacity(256);
+        for d in dims {
+            h.extend_from_slice(&d.to_be_bytes());
+        }
+        h.extend_from_slice(&image_type.to_be_bytes());
+        for p in pixdim {
+            h.extend_from_slice(&p.to_be_bytes());
+        }
+        h.resize(h.len() + 80, 0); // line1
+        h.resize(h.len() + 98, 0); // matrix, flag1, flag2, min, max
+        for o in origin {
+            h.extend_from_slice(&o.to_be_bytes());
+        }
+        h.resize(h.len() + 16, 0); // pixval_offset, pixval_cal, user_def1, user_def2
+        h.extend_from_slice(&magic.to_be_bytes());
+        assert_eq!(h.len(), gipl::HEADER_SIZE);
+        h
+    }
+
+    /// Every byte `GiplImageIO::Write` emits before the pixel data
+    /// (itkGiplImageIO.cxx:684-991): four big-endian `dims` with the unused
+    /// axes padded to `1`, `image_type`, four `pixdim` floats padded to `1.0`,
+    /// the fixed `"No Patient Information"` text, 98 zero bytes covering the
+    /// discarded `matrix`/`flag1`/`flag2`/`min`/`max`, four `origin` doubles,
+    /// 16 more zero bytes, and `GIPL_MAGIC_NUMBER` at offset 252.
+    #[test]
+    fn gipl_header_pins_bytes_for_a_3d_image() {
+        let data: Vec<i16> = (0..24).map(|i| i as i16 - 5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+
+        let path = tmp_path("pin.gipl");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let mut expected = gipl_header(
+            [4, 3, 2, 1],
+            15, // GIPL_SHORT
+            [0.5, 1.25, 3.0, 1.0],
+            [-2.0, 4.0, 7.5, 0.0],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        expected[26..26 + 22].copy_from_slice(b"No Patient Information");
+
+        assert_eq!(&bytes[..gipl::HEADER_SIZE], &expected[..]);
+        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 24 * 2);
+        assert_eq!(&bytes[252..256], &[0xef, 0xff, 0xe9, 0xb0]);
+        // The pixel data is big-endian: -5 is 0xfffb.
+        assert_eq!(&bytes[256..258], &[0xff, 0xfb]);
+    }
+
+    /// The six component types `SwapBytesIfNecessary` has an arm for, at 2-D
+    /// and 3-D. A 2-D image comes back **3-D** — `Write` pads `dims` with `1`
+    /// and `ReadImageInformation` counts every non-zero slot below index 3
+    /// (§2.94) — but the pixel values are exact.
+    #[test]
+    fn gipl_roundtrip_every_supported_scalar_type_2d_and_3d() {
+        macro_rules! case {
+            ($ty:ty, $size:expr, $expected_size:expr, $name:expr) => {{
+                let count: usize = $size.iter().product();
+                let data: Vec<$ty> = (0..count as u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&$size, data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+                assert_eq!(back.size(), &$expected_size[..], $name);
+            }};
+        }
+        macro_rules! both {
+            ($ty:ty, $stem:expr) => {{
+                case!($ty, [4usize, 2], [4usize, 2, 1], concat!($stem, "_2d.gipl"));
+                case!(
+                    $ty,
+                    [4usize, 2, 3],
+                    [4usize, 2, 3],
+                    concat!($stem, "_3d.gipl")
+                );
+            }};
+        }
+        both!(u8, "gipl_u8");
+        both!(i8, "gipl_i8");
+        both!(u16, "gipl_u16");
+        both!(i16, "gipl_i16");
+        both!(f32, "gipl_f32");
+        both!(f64, "gipl_f64");
+    }
+
+    /// Spacing and origin survive; the direction matrix does not exist in the
+    /// format and reads back as the identity.
+    #[test]
+    fn gipl_roundtrip_preserves_spacing_and_origin_and_drops_direction() {
+        let data: Vec<f32> = (0..24).map(|i| i as f32 * 0.5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+        img.set_direction(&[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+
+        let path = tmp_path("geom.gipl");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.size(), &[4, 3, 2]);
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.spacing(), &[0.5, 1.25, 3.0]);
+        assert_eq!(back.origin(), &[-2.0, 4.0, 7.5]);
+        assert_eq!(
+            back.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+        // `pixdim` is `float`, so a spacing that is not exactly representable in
+        // f32 does not survive; these three are.
+        assert!(back.meta_data_keys().is_empty());
+    }
+
+    /// The unit third axis a 2-D write invents carries spacing `1.0` and origin
+    /// `0.0` — `Write`'s `else` arms (itkGiplImageIO.cxx:807, :910).
+    #[test]
+    fn gipl_two_dimensional_image_reads_back_as_three_dimensional() {
+        let mut img = Image::from_vec(&[3, 2], vec![1u8, 2, 3, 4, 5, 6]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[1.0, -1.0]).unwrap();
+
+        let path = tmp_path("two_d.gipl");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 3);
+        assert_eq!(back.size(), &[3, 2, 1]);
+        assert_eq!(back.spacing(), &[0.5, 2.0, 1.0]);
+        assert_eq!(back.origin(), &[1.0, -1.0, 0.0]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// `SwapBytesIfNecessary` has no `INT`/`UINT` arm, so `Write` throws
+    /// `"Pixel Type Unknown"` — *after* the full 256-byte header is on disk
+    /// (§1.52). The half-written file is left behind, exactly as upstream's
+    /// truncating `OpenFileForWriting` plus unwinding `ofstream` destructor
+    /// leaves it.
+    #[test]
+    fn gipl_int32_write_leaves_the_header_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i32, 2, 3, 4]).unwrap();
+        let path = tmp_path("int32.gipl");
+        let result = write_image(&img, &path);
+        let written = std::fs::read(&path).unwrap();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{result:?}"
+        );
+        assert_eq!(written.len(), gipl::HEADER_SIZE);
+        assert_eq!(&written[8..10], &32u16.to_be_bytes()); // GIPL_INT was written
+
+        // And reading such a file fails on the same missing swap arm.
+        let read_back = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&read_back, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{read_back:?}"
+        );
+    }
+
+    /// A 64-bit integer has no `image_type` at all, and `Write`'s own switch
+    /// throws `"Invalid type"` after only the four `dims` values are out
+    /// (itkGiplImageIO.cxx:759-761) — an 8-byte file.
+    #[test]
+    fn gipl_int64_write_leaves_eight_bytes_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i64, 2, 3, 4]).unwrap();
+        let path = tmp_path("int64.gipl");
+        let result = write_image(&img, &path);
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Invalid type")),
+            "{result:?}"
+        );
+        assert_eq!(written, [0, 2, 0, 2, 0, 1, 0, 1]);
+    }
+
+    /// `CheckExtension` claims `.gipl.gz` for reading and writing; upstream then
+    /// reaches for zlib. This workspace has none (§5.8), so both fail naming it.
+    #[test]
+    fn gipl_gz_is_claimed_and_then_refused_for_the_missing_zlib() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("compressed.gipl.gz");
+
+        assert!(create_image_io(&path, FileMode::Write).is_some());
+        let result = write_image(&img, &path);
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
+            "{result:?}"
+        );
+        assert!(!path.exists(), "write must not create the file");
+
+        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
+        assert!(create_image_io(&path, FileMode::Read).is_some());
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
+            "{result:?}"
+        );
+    }
+
+    /// `numberofdimension` is a population count over the first three `dims`
+    /// slots, not the length of their leading non-zero run, while
+    /// `m_Dimensions[i] = dims[i]` copies the *first* `NDims` slots
+    /// (itkGiplImageIO.cxx:294-312). `[4, 0, 5, 1]` therefore yields a 2-D image
+    /// sized `[4, 0]` — the `5` is counted and then never read. §2.94.
+    #[test]
+    fn gipl_dimension_count_is_a_population_count_not_a_leading_run() {
+        let path = tmp_path("popcount.gipl");
+        let header = gipl_header(
+            [4, 0, 5, 1],
+            8, // GIPL_U_CHAR
+            [2.0, 3.0, 4.0, 1.0],
+            [10.0, 20.0, 30.0, 0.0],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 2);
+        assert_eq!(back.size(), &[4, 0]);
+        assert_eq!(back.spacing(), &[2.0, 3.0]);
+        assert_eq!(back.origin(), &[10.0, 20.0]);
+        assert_eq!(back.number_of_pixels(), 0);
+    }
+
+    /// `CanReadFile` accepts either magic number, at offset 252
+    /// (itkGiplImageIO.cxx:135). `ReadImageInformation` re-reads the same four
+    /// bytes and never compares them (§2.93), so the second variant reads fine.
+    #[test]
+    fn gipl_both_magic_numbers_are_accepted_and_a_wrong_one_is_not() {
+        for (magic, label) in [
+            (gipl::GIPL_MAGIC_NUMBER, "magic1.gipl"),
+            (gipl::GIPL_MAGIC_NUMBER2, "magic2.gipl"),
+        ] {
+            let path = tmp_path(label);
+            let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], magic);
+            bytes.extend_from_slice(&[7, 8, 9, 10]);
+            std::fs::write(&path, &bytes).unwrap();
+            let back = read_image(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(
+                back.scalar_slice::<u8>().unwrap(),
+                &[7, 8, 9, 10],
+                "{label}"
+            );
+        }
+
+        let path = tmp_path("badmagic.gipl");
+        let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], 0xdead_beef);
+        bytes.extend_from_slice(&[7, 8, 9, 10]);
+        std::fs::write(&path, &bytes).unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `GIPL_MAGIC_NUMBER2` is 719555000 and `GIPL_MAGIC_NUMBER` 4026526128.
+    #[test]
+    fn gipl_magic_numbers_have_their_documented_decimal_values() {
+        assert_eq!(gipl::GIPL_MAGIC_NUMBER, 4_026_526_128);
+        assert_eq!(gipl::GIPL_MAGIC_NUMBER2, 719_555_000);
+    }
+
+    /// `Write` never consults `m_NumberOfComponents` for the header but
+    /// `GetImageSizeInBytes()` does, so a 3-component image writes a scalar
+    /// `image_type` and three times the described bytes. Reading it back gives a
+    /// scalar image holding the first `numPixels` components (§2.96).
+    #[test]
+    fn gipl_vector_image_writes_a_scalar_header_and_reads_back_scalar() {
+        let data: Vec<u8> = (0..12).collect();
+        let img = Image::from_vec_vector::<u8>(&[2, 2], 3, data).unwrap();
+        let path = tmp_path("vector.gipl");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 12);
+        assert_eq!(&bytes[8..10], &8u16.to_be_bytes()); // GIPL_U_CHAR, not a vector
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.size(), &[2, 2, 1]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3]);
+    }
+
+    /// Upstream's `success = !m_Ifstream.bad()` accepts a short read and leaves
+    /// the buffer tail uninitialised (§1.53); this port refuses it (§4.69).
+    #[test]
+    fn gipl_truncated_pixel_data_is_an_error() {
+        let path = tmp_path("short.gipl");
+        let mut bytes = gipl_header([4, 4, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[1, 2, 3]); // 16 pixels declared, 3 present
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// A header shorter than 256 bytes leaves upstream's `pixdim` / `origin`
+    /// locals indeterminate; refused here (§4.73).
+    #[test]
+    fn gipl_short_header_is_an_error() {
+        let path = tmp_path("stub.gipl");
+        let header = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        std::fs::write(&path, &header[..200]).unwrap();
+        // `can_read_file` cannot reach offset 252 either.
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = gipl::read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// `read_image_information` touches only the header. This one declares
+    /// 65535³ voxels of `double` and carries none of them.
+    #[test]
+    fn gipl_read_image_information_does_not_load_pixels() {
+        let path = tmp_path("huge.gipl");
+        let header = gipl_header(
+            [65535, 65535, 65535, 1],
+            65, // GIPL_DOUBLE
+            [1.0; 4],
+            [0.0; 4],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::Float64);
+        assert_eq!(info.dimension, 3);
+        assert_eq!(info.number_of_components, 1);
+        assert_eq!(info.size, vec![65535, 65535, 65535]);
+        assert!(info.metadata.is_empty());
+    }
+
+    /// An `image_type` outside the table leaves `m_ComponentType` unknown and
+    /// SimpleITK's `ExecuteInternalReadScalar` reaches its `"Logic error!"`.
+    #[test]
+    fn gipl_unknown_image_type_is_rejected() {
+        let path = tmp_path("weird_type.gipl");
+        let header = gipl_header(
+            [2, 2, 1, 1],
+            200,
+            [1.0; 4],
+            [0.0; 4],
+            gipl::GIPL_MAGIC_NUMBER,
+        );
+        std::fs::write(&path, &header).unwrap();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("image_type 200")),
+            "{result:?}"
+        );
+    }
+
+    /// `GIPL_BINARY` (1) reads as `UCHAR`, like `GIPL_U_CHAR` (8)
+    /// (itkGiplImageIO.cxx:333-341).
+    #[test]
+    fn gipl_binary_image_type_reads_as_uint8() {
+        let path = tmp_path("binary_type.gipl");
+        let mut bytes = gipl_header([2, 1, 1, 1], 1, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[0, 1]);
+        std::fs::write(&path, &bytes).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1]);
+    }
+
+    // ======================================================================
+    // VTK — itk::VTKImageIO
+    // ======================================================================
+
+    fn write_vtk(name: &str, header: &str, data: &[u8]) -> std::path::PathBuf {
+        let path = tmp_path(name);
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(data);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    const VTK_PREAMBLE: &str = "# vtk DataFile Version 3.0\n\
+         VTK File Generated by Insight Segmentation and Registration Toolkit (ITK)\n";
+
+    /// Every byte `WriteImageInformation` emits (itkVTKImageIO.cxx:653-709),
+    /// trailing spaces and `%.16e` exponents included.
+    #[test]
+    fn vtk_header_pins_bytes_for_a_3d_scalar_image() {
+        let mut img = Image::from_vec(&[4, 3, 2], (0..24).map(|i| i as f32).collect()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+
+        let path = tmp_path("pin_scalar.vtk");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let expected = format!(
+            "{VTK_PREAMBLE}\
+             BINARY\n\
+             DATASET STRUCTURED_POINTS\n\
+             DIMENSIONS 4 3 2 \n\
+             SPACING 5.0000000000000000e-01 1.2500000000000000e+00 3.0000000000000000e+00 \n\
+             ORIGIN -2.0000000000000000e+00 4.0000000000000000e+00 7.5000000000000000e+00 \n\
+             POINT_DATA 24\n\
+             SCALARS scalars float 1\n\
+             LOOKUP_TABLE default\n"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(bytes.len(), expected.len() + 24 * 4);
+        // Big-endian data: 1.0f32 is 0x3f800000.
+        assert_eq!(
+            &bytes[expected.len() + 4..expected.len() + 8],
+            &[0x3f, 0x80, 0, 0]
+        );
+    }
+
+    /// A 2-D image is padded to three `DIMENSIONS` / `SPACING` / `ORIGIN` slots
+    /// with `1`, `1.0`, `0.0` — and the reader collapses it back, so a 2-D
+    /// image round-trips as 2-D (unlike GIPL, §2.94).
+    #[test]
+    fn vtk_header_pins_bytes_for_a_2d_image_and_the_padding_collapses_back() {
+        let mut img = Image::from_vec(&[3, 2], vec![1u8, 2, 3, 4, 5, 6]).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[1.0, -1.0]).unwrap();
+
+        let path = tmp_path("pin_2d.vtk");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let expected = format!(
+            "{VTK_PREAMBLE}\
+             BINARY\n\
+             DATASET STRUCTURED_POINTS\n\
+             DIMENSIONS 3 2 1 \n\
+             SPACING 5.0000000000000000e-01 2.0000000000000000e+00 1.0000000000000000e+00 \n\
+             ORIGIN 1.0000000000000000e+00 -1.0000000000000000e+00 0.0000000000000000e+00 \n\
+             POINT_DATA 6\n\
+             SCALARS scalars unsigned_char 1\n\
+             LOOKUP_TABLE default\n"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(bytes.len(), expected.len() + 6);
+
+        assert_eq!(back.dimension(), 2);
+        assert_eq!(back.size(), &[3, 2]);
+        assert_eq!(back.spacing(), &[0.5, 2.0]);
+        assert_eq!(back.origin(), &[1.0, -1.0]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// A three-component vector image takes the `VECTORS` branch, which carries
+    /// no component count and no `LOOKUP_TABLE` line.
+    #[test]
+    fn vtk_header_pins_bytes_for_a_vector_image() {
+        let img =
+            Image::from_vec_vector::<f32>(&[2, 2], 3, (0..12).map(|i| i as f32).collect()).unwrap();
+        let path = tmp_path("pin_vector.vtk");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let expected = format!(
+            "{VTK_PREAMBLE}\
+             BINARY\n\
+             DATASET STRUCTURED_POINTS\n\
+             DIMENSIONS 2 2 1 \n\
+             SPACING 1.0000000000000000e+00 1.0000000000000000e+00 1.0000000000000000e+00 \n\
+             ORIGIN 0.0000000000000000e+00 0.0000000000000000e+00 0.0000000000000000e+00 \n\
+             POINT_DATA 4\n\
+             VECTORS vectors float\n"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(bytes.len(), expected.len() + 12 * 4);
+    }
+
+    #[test]
+    fn vtk_roundtrip_all_scalar_types_2d_and_3d() {
+        macro_rules! case {
+            ($ty:ty, $size:expr, $name:expr) => {{
+                let count: usize = $size.iter().product();
+                let data: Vec<$ty> = (0..count as u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&$size, data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+                assert_eq!(back.size(), &$size[..], $name);
+            }};
+        }
+        macro_rules! both {
+            ($ty:ty, $stem:expr) => {{
+                case!($ty, [4usize, 2], concat!($stem, "_2d.vtk"));
+                case!($ty, [4usize, 2, 3], concat!($stem, "_3d.vtk"));
+            }};
+        }
+        both!(u8, "vtk_u8");
+        both!(i8, "vtk_i8");
+        both!(u16, "vtk_u16");
+        both!(i16, "vtk_i16");
+        both!(u32, "vtk_u32");
+        both!(i32, "vtk_i32");
+        both!(u64, "vtk_u64");
+        both!(i64, "vtk_i64");
+        both!(f32, "vtk_f32");
+        both!(f64, "vtk_f64");
+    }
+
+    #[test]
+    fn vtk_roundtrip_vector_float32_preserves_geometry() {
+        let data: Vec<f32> = (0..36).map(|i| i as f32 * 0.25 - 4.0).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 3], 3, data.clone()).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[-1.0, 3.0]).unwrap();
+
+        let path = tmp_path("vector_f32.vtk");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.spacing(), &[0.5, 2.0]);
+        assert_eq!(back.origin(), &[-1.0, 3.0]);
+        assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    /// VTK has no complex type, so a complex image writes `SCALARS scalars
+    /// float 2` and reads back as a two-component vector — the same loss
+    /// MetaImage has (§2.103).
+    #[test]
+    fn vtk_complex_roundtrips_as_a_two_component_vector() {
+        let data = vec![
+            Complex::new(1.0f32, 2.0),
+            Complex::new(-3.0, 4.5),
+            Complex::new(0.0, -1.0),
+            Complex::new(7.25, 0.0),
+        ];
+        let img = Image::from_vec_complex(&[2, 2], data).unwrap();
+        let path = tmp_path("complex.vtk");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(String::from_utf8_lossy(&bytes).contains("SCALARS scalars float 2\n"));
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(
+            back.component_slice::<f32>().unwrap(),
+            &[1.0, 2.0, -3.0, 4.5, 0.0, -1.0, 7.25, 0.0]
+        );
+    }
+
+    /// A one-component vector image writes `SCALARS scalars float 1`, whose
+    /// reader arm is `numComp == 1 → SCALAR` (§2.103).
+    #[test]
+    fn vtk_one_component_vector_image_reads_back_as_scalar() {
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 1, vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let path = tmp_path("one_comp.vtk");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// `int64_t` is `long` under LP64, so `MapPixelType` reports `LONG` and
+    /// `GetComponentTypeAsString` prints `long` — not `vtktypeint64`, which is
+    /// what a host where `int64_t` is `long long` would write (§4.72). Both
+    /// spellings read back to `Int64`.
+    #[test]
+    fn vtk_int64_writes_as_long_and_both_spellings_read_back() {
+        let img = Image::from_vec(&[2, 1], vec![-1i64, i64::MAX]).unwrap();
+        let path = tmp_path("i64.vtk");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(String::from_utf8_lossy(&bytes).contains("SCALARS scalars long 1\n"));
+        assert_eq!(back.scalar_slice::<i64>().unwrap(), &[-1, i64::MAX]);
+
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\n\
+             DIMENSIONS 2 1 1 \nPOINT_DATA 2\n\
+             SCALARS scalars vtktypeint64 1\nLOOKUP_TABLE default\n"
+        );
+        let mut data = (-1i64).to_be_bytes().to_vec();
+        data.extend_from_slice(&i64::MAX.to_be_bytes());
+        let path = write_vtk("vtktypeint64.vtk", &header, &data);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::Int64);
+        assert_eq!(back.scalar_slice::<i64>().unwrap(), &[-1, i64::MAX]);
+    }
+
+    /// `DIMENSIONS x y 1` is 2-D and `DIMENSIONS x 1 z` is 3-D: the surviving
+    /// rule is `dims[2] <= 1`, and the `dims[1]` test above it is dead (§2.100).
+    #[test]
+    fn vtk_only_the_third_dimension_decides_two_versus_three_d() {
+        let header = |dims: &str, n: usize| {
+            format!(
+                "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS {dims} \n\
+                 POINT_DATA {n}\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+            )
+        };
+
+        let path = write_vtk("dims_z1.vtk", &header("4 3 1", 12), &[0u8; 12]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.size(), &[4, 3]);
+
+        let path = write_vtk("dims_y1.vtk", &header("4 1 3", 12), &[0u8; 12]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.size(), &[4, 1, 3]);
+    }
+
+    /// ASCII data is whitespace-separated decimal, extracted through
+    /// `NumericTraits::PrintType` — `int` for the 8-bit types, so `300` lands as
+    /// `44` and `-1` as `255`.
+    #[test]
+    fn vtk_ascii_unsigned_char_data_is_decimal_integers_cast_to_the_pixel_type() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 1 1 \n\
+             POINT_DATA 4\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("ascii_uchar.vtk", &header, b"0 300 -1 255\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 44, 255, 255]);
+    }
+
+    /// ASCII float data, with spacing and origin taken from the header.
+    #[test]
+    fn vtk_ascii_float_data_is_read_with_geometry() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             SPACING 0.5 2 1\nORIGIN -1 3 0\nPOINT_DATA 4\n\
+             SCALARS scalars float 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("ascii_float.vtk", &header, b"1.5 -2.25 3e2 0\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.spacing(), &[0.5, 2.0]);
+        assert_eq!(back.origin(), &[-1.0, 3.0]);
+        assert_eq!(
+            back.scalar_slice::<f32>().unwrap(),
+            &[1.5, -2.25, 300.0, 0.0]
+        );
+    }
+
+    /// `NumericTraits<unsigned short>::PrintType` is `unsigned short` itself, and
+    /// `num_get` extracts a negative literal into the unsigned representation:
+    /// `-1` is `65535` and the stream stays good, while `-70000` overflows to
+    /// `65535` and latches `failbit`, taking the rest of the buffer with it
+    /// (§2.105, §2.107).
+    #[test]
+    fn vtk_ascii_negative_literal_for_an_unsigned_type_wraps_instead_of_failing() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 1 1 \n\
+             POINT_DATA 4\nSCALARS scalars unsigned_short 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("ascii_ushort.vtk", &header, b"-1 -65535 7 8\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<u16>().unwrap(), &[65535, 1, 7, 8]);
+
+        let path = write_vtk("ascii_ushort_of.vtk", &header, b"1 -70000 7 8\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            back.scalar_slice::<u16>().unwrap(),
+            &[1, 65535, 65535, 65535]
+        );
+    }
+
+    /// `ImageIOBase::ReadBuffer` declares `PrintType temp;` outside the loop, so
+    /// once `failbit` latches every remaining component keeps the failing
+    /// extraction's value: `0` when the data ran out, the saturated limit when
+    /// it overflowed (§2.107).
+    #[test]
+    fn vtk_ascii_latches_the_failing_extraction_value_into_every_later_component() {
+        let header = |ty: &str| {
+            format!(
+                "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 1 1 \n\
+                 POINT_DATA 4\nSCALARS scalars {ty} 1\nLOOKUP_TABLE default\n"
+            )
+        };
+
+        // Data runs out after two values: the rest are zero, not an error.
+        let path = write_vtk("ascii_short.vtk", &header("int"), b"10 20\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<i32>().unwrap(), &[10, 20, 0, 0]);
+
+        // An out-of-range value saturates `temp` and every later component
+        // inherits the saturated value, not zero.
+        let path = write_vtk("ascii_overflow.vtk", &header("short"), b"5 99999 7 8\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            back.scalar_slice::<i16>().unwrap(),
+            &[5, i16::MAX, i16::MAX, i16::MAX]
+        );
+
+        // A non-numeric field fails with `temp = 0`.
+        let path = write_vtk("ascii_junk.vtk", &header("int"), b"1 2 x 4\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<i32>().unwrap(), &[1, 2, 0, 0]);
+    }
+
+    /// The `LOOKUP_TABLE` line is optional: the reader peeks one line and rewinds
+    /// when it is not one (itkVTKImageIO.cxx:331-339).
+    #[test]
+    fn vtk_scalars_without_a_lookup_table_line_starts_the_data_immediately() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 3 1 1 \n\
+             POINT_DATA 3\nSCALARS scalars int 1\n"
+        );
+        let path = write_vtk("no_lookup.vtk", &header, b"7 8 9\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<i32>().unwrap(), &[7, 8, 9]);
+    }
+
+    /// `COLOR_SCALARS n` never consults the file's component type: `BINARY`
+    /// means `UCHAR` and `ASCII` means `FLOAT`. `n == 3` is `RGB`, which
+    /// SimpleITK loads as a `VectorUInt8` (itkVTKImageIO.cxx:277-308).
+    #[test]
+    fn vtk_color_scalars_binary_reads_as_three_component_uint8() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 1 1 \n\
+             POINT_DATA 2\nCOLOR_SCALARS color_scalars 3\n"
+        );
+        let path = write_vtk("color3.vtk", &header, &[1u8, 2, 3, 4, 5, 6]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.component_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    /// `COLOR_SCALARS ... 1` is `SCALAR` with one component, and an `ASCII` file
+    /// reads it as `float` — the arm that ignores the declared type most visibly.
+    #[test]
+    fn vtk_color_scalars_ascii_reads_as_float() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 1 1 \n\
+             POINT_DATA 2\nCOLOR_SCALARS color_scalars 1\n"
+        );
+        let path = write_vtk("color1.vtk", &header, b"0.25 0.75\n");
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::Float32);
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), &[0.25, 0.75]);
+    }
+
+    /// `COLOR_SCALARS ... 4` is `RGBA`; a count outside `{1, 3, 4}` falls into
+    /// the `VECTOR` arm. There is no range check (§2.104).
+    #[test]
+    fn vtk_color_scalars_component_count_is_unclamped() {
+        let header = |n: usize, pixels: usize| {
+            format!(
+                "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS {pixels} 1 1 \n\
+                 POINT_DATA {pixels}\nCOLOR_SCALARS color_scalars {n}\n"
+            )
+        };
+        let path = write_vtk("color4.vtk", &header(4, 1), &[1u8, 2, 3, 4]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.number_of_components_per_pixel(), 4);
+
+        let path = write_vtk("color7.vtk", &header(7, 1), &[1u8, 2, 3, 4, 5, 6, 7]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 7);
+    }
+
+    /// The attribute dispatch is a substring test in a fixed order, so a
+    /// `SCALARS` array *named* `vector_field` is parsed as a `VECTORS` line:
+    /// three components, the third token as the type, no `LOOKUP_TABLE` peek
+    /// (§2.101).
+    #[test]
+    fn vtk_scalars_named_vector_field_is_parsed_as_a_vectors_line() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 1 1 \n\
+             POINT_DATA 2\nSCALARS vector_field float 1\n"
+        );
+        let mut data = Vec::new();
+        for v in 0..6u32 {
+            data.extend_from_slice(&(v as f32).to_be_bytes());
+        }
+        let path = write_vtk("named_vector.vtk", &header, &data);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+    }
+
+    /// `aspect_ratio` is `spacing`'s legacy spelling and takes the same arm.
+    #[test]
+    fn vtk_aspect_ratio_is_read_as_spacing() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             ASPECT_RATIO 0.25 4 1\nPOINT_DATA 4\n\
+             SCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("aspect.vtk", &header, &[1u8, 2, 3, 4]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.spacing(), &[0.25, 4.0]);
+    }
+
+    /// `VTKImageIO` reads a `TENSORS` file; SimpleITK's `GetPixelIDFromImageIO`
+    /// has no `SYMMETRICSECONDRANKTENSOR` arm and throws `"Unknown PixelType"`
+    /// (§3.37).
+    #[test]
+    fn vtk_tensors_are_unreadable_through_the_simpleitk_pixel_id_mapping() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 1 1 1 \n\
+             POINT_DATA 1\nTENSORS tensors float\n"
+        );
+        let path = write_vtk("tensors.vtk", &header, &[0u8; 36]);
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(claimed, "CanReadFile only tests the DATASET line");
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedVtkFeature(m)) if m.contains("Unknown PixelType")),
+            "{result:?}"
+        );
+    }
+
+    /// `CanReadFile` requires `structured_points` on the fourth line, so a
+    /// `STRUCTURED_GRID` dataset is claimed by nobody; reaching the reader
+    /// directly gives `InternalReadImageInformation`'s own message.
+    #[test]
+    fn vtk_rejects_other_dataset_types() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_GRID\nDIMENSIONS 2 2 1 \n\
+             POINT_DATA 4\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("grid.vtk", &header, &[1u8, 2, 3, 4]);
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let via_registry = read_image(&path);
+        let direct = vtk::read(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(via_registry, Err(IoError::NoReaderFound(_))),
+            "{via_registry:?}"
+        );
+        assert!(
+            matches!(&direct, Err(IoError::MalformedVtkHeader(m)) if m == "Not structured points, can't read"),
+            "{direct:?}"
+        );
+    }
+
+    /// A third line that is neither `ASCII` nor `BINARY` is `"Unrecognized
+    /// type"`; note `CanReadFile` never looks at it, so the file is still
+    /// claimed and then fails in the reader.
+    #[test]
+    fn vtk_unrecognized_file_type_line_is_an_error_only_in_the_reader() {
+        let header = format!(
+            "{VTK_PREAMBLE}HEXADECIMAL\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 1 1 \n\
+             POINT_DATA 2\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("hex.vtk", &header, &[1u8, 2]);
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(claimed);
+        assert!(
+            matches!(&result, Err(IoError::MalformedVtkHeader(m)) if m == "Unrecognized type"),
+            "{result:?}"
+        );
+    }
+
+    /// Upstream lets `GetNextLine`'s "Premature EOF" escape `CanReadFile`, so
+    /// `CreateImageIO` throws on a `.vtk` shorter than four lines. Here it is
+    /// simply not claimed (§4.71).
+    #[test]
+    fn vtk_can_read_file_does_not_throw_on_a_short_file() {
+        let path = tmp_path("stub.vtk");
+        std::fs::write(&path, b"# vtk DataFile Version 3.0\ntitle\n").unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `GetNextLine`'s guard is `count > 5`, so five consecutive empty lines are
+    /// tolerated and the sixth throws — one more than the message claims
+    /// (§2.98).
+    #[test]
+    fn vtk_five_empty_lines_are_tolerated_and_six_are_not() {
+        let body = |blanks: usize| {
+            format!(
+                "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 1 1 \n{}\
+                 POINT_DATA 2\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n",
+                "\n".repeat(blanks)
+            )
+        };
+        let path = write_vtk("blank5.vtk", &body(5), &[1u8, 2]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2]);
+
+        let path = write_vtk("blank6.vtk", &body(6), &[1u8, 2]);
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::MalformedVtkHeader(m)) if m.contains("empty lines")),
+            "{result:?}"
+        );
+    }
+
+    /// `getline` sets `eofbit` even when it delivered the line's characters, so
+    /// a header line with no terminating newline is a "Premature EOF" (§2.99).
+    /// Here the `LOOKUP_TABLE` peek is the line that falls off the end.
+    #[test]
+    fn vtk_a_final_line_without_a_newline_is_a_premature_eof() {
+        let header = format!(
+            "{VTK_PREAMBLE}ASCII\nDATASET STRUCTURED_POINTS\nDIMENSIONS 3 1 1 \n\
+             POINT_DATA 3\nSCALARS scalars int 1\n"
+        );
+        let path = write_vtk("no_newline.vtk", &header, b"7 8 9");
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::MalformedVtkHeader(m)) if m == "Premature EOF in reading a line"),
+            "{result:?}"
+        );
+    }
+
+    /// `Read` discards `ReadBufferAsBinary`'s `bool` and leaves the tail of its
+    /// buffer uninitialised (§1.54); refused here (§4.69).
+    #[test]
+    fn vtk_truncated_binary_data_is_an_error() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 4 1 \n\
+             POINT_DATA 16\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("short_data.vtk", &header, &[1u8, 2, 3]);
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// An under-filled `DIMENSIONS` line reads indeterminate `unsigned int`s
+    /// upstream (§1.55); refused here (§4.70).
+    #[test]
+    fn vtk_under_filled_dimensions_line_is_an_error() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 4 \n\
+             POINT_DATA 4\nSCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("bad_dims.vtk", &header, &[1u8, 2, 3, 4]);
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::MalformedVtkHeader(m)) if m.contains("three values")),
+            "{result:?}"
+        );
+    }
+
+    /// An under-filled `SPACING` line keeps the `1.0` defaults
+    /// `InternalReadImageInformation` seeded (§4.70).
+    #[test]
+    fn vtk_under_filled_spacing_line_keeps_the_defaults() {
+        let header = format!(
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             SPACING 0.25\nPOINT_DATA 4\n\
+             SCALARS scalars unsigned_char 1\nLOOKUP_TABLE default\n"
+        );
+        let path = write_vtk("short_spacing.vtk", &header, &[1u8, 2, 3, 4]);
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.spacing(), &[0.25, 1.0]);
+    }
+
+    /// `WriteImageInformation` refuses anything but 1, 2 or 3 dimensions
+    /// (itkVTKImageIO.cxx:647-651).
+    #[test]
+    fn vtk_write_rejects_four_dimensional_images() {
+        let img = Image::new(&[2, 2, 2, 2], PixelId::UInt8);
+        let path = tmp_path("four_d.vtk");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedVtkFeature(m)) if m.contains("1, 2 or 3-dimensional")),
+            "{result:?}"
+        );
+    }
+
+    /// A `.vtk` extension is necessary but not sufficient: `CanReadFile` also
+    /// wants `structured_points`.
+    #[test]
+    fn vtk_extension_alone_does_not_claim_a_file_for_reading() {
+        let path = tmp_path("not_really.vtk");
+        std::fs::write(&path, b"this is a text file, not a VTK image\n").unwrap();
         let claimed = create_image_io(&path, FileMode::Read).is_some();
         std::fs::remove_file(&path).ok();
         assert!(!claimed);
