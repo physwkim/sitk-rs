@@ -274,9 +274,10 @@ pub(crate) struct UpwindInput<'a> {
     /// [`MarchResult::gradient`] stays empty.
     pub(crate) generate_gradient: bool,
     /// `m_TargetPoints`, in container order. `None` marks an entry outside the
-    /// buffered region: ITK keeps such nodes in the container (so they count
-    /// towards `m_TargetPoints->Size()`) but their index never equals an
-    /// accepted one, so they are never reached.
+    /// buffered region: its index never equals an accepted one, so it is never
+    /// reached. Upstream still counts such a node (and duplicate entries)
+    /// towards `m_TargetPoints->Size()`, which is the §1.24 defect; this port
+    /// terminates on the number of *distinct in-bounds* targets instead.
     pub(crate) targets: &'a [Option<usize>],
     pub(crate) target_mode: TargetCondition,
     /// `m_NumberOfTargets`, read only by [`TargetCondition::SomeTargets`].
@@ -325,13 +326,23 @@ pub(crate) fn march_flat(input: MarchInput<'_>, trial: &[(usize, f64)]) -> Resul
     let dim = input.size.len();
 
     let generate_gradient = input.upwind.as_ref().is_some_and(|u| u.generate_gradient);
-    let upwind = input.upwind.map(|u| UpwindState {
-        generate_gradient: u.generate_gradient,
-        targets: u.targets.to_vec(),
-        mode: u.target_mode,
-        number_of_targets: u.number_of_targets,
-        target_offset: u.target_offset,
-        reached: 0,
+    let upwind = input.upwind.map(|u| {
+        // §1.24: the number of *distinct in-bounds* target indices — the count
+        // of targets that can actually be reached, one accepted index each.
+        // Duplicate entries and out-of-image (`None`) entries are excluded, so
+        // they can no longer make `AllTargets`/`SomeTargets` unreachable.
+        let mut distinct: Vec<usize> = u.targets.iter().flatten().copied().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        UpwindState {
+            generate_gradient: u.generate_gradient,
+            targets: u.targets.to_vec(),
+            mode: u.target_mode,
+            number_of_targets: u.number_of_targets,
+            distinct_targets: distinct.len(),
+            target_offset: u.target_offset,
+            reached: 0,
+        }
     });
 
     let mut solver = FastMarching {
@@ -376,10 +387,16 @@ struct UpwindState {
     targets: Vec<Option<usize>>,
     mode: TargetCondition,
     number_of_targets: usize,
+    /// The number of distinct in-bounds target indices (§1.24). The
+    /// termination denominator for `AllTargets`, and the clamp for
+    /// `SomeTargets`, so that duplicate or out-of-image entries cannot make
+    /// either mode unreachable.
+    distinct_targets: usize,
     target_offset: f64,
     /// `m_ReachedTargetPoints->Size()`. Only the *count* is tracked: nothing
     /// downstream of `UpdateNeighbors` reads the nodes themselves, and
-    /// SimpleITK exposes no `GetReachedTargetPoints`.
+    /// SimpleITK exposes no `GetReachedTargetPoints`. Each distinct target
+    /// index that is accepted contributes exactly one.
     reached: usize,
 }
 
@@ -560,8 +577,14 @@ impl FastMarching {
         }
         let target_reached = match upwind.mode {
             TargetCondition::OneTarget => matched,
-            TargetCondition::SomeTargets => upwind.reached == upwind.number_of_targets,
-            TargetCondition::AllTargets => upwind.reached == upwind.targets.len(),
+            // §1.24: compare against distinct reachable targets, not raw
+            // container size. `number_of_targets` is SimpleITK's `min(n, len)`
+            // (which counts duplicates); clamping it to the distinct count keeps
+            // it reachable. `AllTargets` uses the distinct count directly.
+            TargetCondition::SomeTargets => {
+                upwind.reached == upwind.number_of_targets.min(upwind.distinct_targets)
+            }
+            TargetCondition::AllTargets => upwind.reached == upwind.distinct_targets,
             TargetCondition::NoTargets => unreachable!("returned above"),
         };
 
@@ -895,6 +918,61 @@ mod tests {
         assert_eq!(
             fast_marching(&speed, &[vec![1, 1, 1]], &[], 0.0, 1.0).err(),
             Some(FilterError::InvalidNormalizationFactor(0.0))
+        );
+    }
+
+    /// §1.24: `AllTargets` terminates on the number of *distinct* targets, not
+    /// the raw container size, so a duplicate entry no longer makes it
+    /// unreachable. `AllTargets` is only reachable through this internal seam
+    /// (`colliding_fronts` uses it), so it is pinned here at the `march_flat`
+    /// level.
+    ///
+    /// 9×1 line, unit speed/spacing, seed at `x = 4`. Targets `[x=3, x=3, x=5]`
+    /// — `x=3` duplicated — so `distinct = {3, 5}`, two indices. `x=3` and `x=5`
+    /// are both one pixel from the seed, reached at `T = 1`; the second of them
+    /// lifts the distinct-reached count to `2 == distinct`, which fires
+    /// `AllTargets` and drops the stopping value to `1 + offset(1) = 2`. Pixels
+    /// with `T <= 2` (`x=2..x=6`) go alive, and each writes its neighbour's
+    /// trial value, so `x=1`/`x=7` (`T = 3`) hold their computed trial value
+    /// when the pop of `x=1` at `T = 3 > 2` breaks the loop (`stopping_value`
+    /// truncates but does not clear already-written trials). `x=0`/`x=8` are
+    /// never written because `x=1`/`x=7` never go alive:
+    ///
+    ///     [large, 3, 2, 1, 0, 1, 2, 3, large]
+    ///
+    /// Buggy upstream compares the reached count against `targets.len() == 3`,
+    /// which the two distinct reached targets can never reach, so the front
+    /// would march the whole line to `[4, 3, 2, 1, 0, 1, 2, 3, 4]` — the
+    /// observable difference is `x=0`/`x=8`, `large` here vs `4` upstream.
+    #[test]
+    fn all_targets_terminates_on_distinct_targets_despite_a_duplicate() {
+        let speed = speed_f64(&[9, 1], 1.0);
+        let large = large_value(PixelId::Float64);
+        let targets = [Some(3usize), Some(3), Some(5)];
+        let result = march_flat(
+            MarchInput {
+                size: speed.size(),
+                spacing: speed.spacing(),
+                speed: &speed.to_f64_vec().unwrap(),
+                narrow_to_f32: false,
+                normalization_factor: 1.0,
+                stopping_value: large,
+                collect_points: false,
+                upwind: Some(UpwindInput {
+                    generate_gradient: false,
+                    targets: &targets,
+                    target_mode: TargetCondition::AllTargets,
+                    number_of_targets: 0,
+                    target_offset: 1.0,
+                }),
+            },
+            &[(4usize, 0.0)],
+        )
+        .unwrap();
+
+        assert_close(
+            &result.values,
+            &[large, 3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, large],
         );
     }
 }

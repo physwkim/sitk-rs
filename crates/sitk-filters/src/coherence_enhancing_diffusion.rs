@@ -51,17 +51,42 @@
 //! the row sum of the same accumulation, so every row of the operator sums to
 //! zero and a constant image is a fixed point exactly.
 //!
-//! # Faithfully-reproduced upstream behaviors, rather than "fixed"
+//! # Upstream bugs corrected here rather than reproduced
 //!
-//! - **`feature_scale` smooths along axis 0 only.**
+//! - **§1.22 — `feature_scale` smoothed along axis 0 only.**
 //!   `StructureTensorImageFilter::GenerateData` smooths the outer-product image
 //!   with `itk::RecursiveGaussianImageFilter`, which is the *single-direction*
-//!   `RecursiveSeparableImageFilter` (its `m_Direction` defaults to `0` and the
-//!   filter never sets it), not the all-axes
-//!   `SmoothingRecursiveGaussianImageFilter`. So `K_ρ` in the structure-tensor
-//!   definition is applied along the first image axis and no other. This port
-//!   reproduces that. (`noise_scale`'s `K_σ` *is* isotropic: it goes through
-//!   `GradientRecursiveGaussianImageFilter`, which does smooth every axis.)
+//!   `RecursiveSeparableImageFilter` — its `m_Direction` defaults to `0` and
+//!   `GenerateData` calls only `SetSigma`, never `SetDirection`
+//!   (`itkStructureTensorImageFilter.hxx:125-128`). So upstream's `K_ρ` is
+//!   applied along the first image axis and no other, which is not a Gaussian
+//!   kernel in the structure-tensor definition `S := K_ρ * (∇u_σ ⊗ ∇u_σ)` and
+//!   makes every output of the filter depend on how the axes happen to be
+//!   ordered. This port applies `K_ρ` isotropically, with `feature_scale` as
+//!   the sigma on every axis — the separable form of the all-axes
+//!   `SmoothingRecursiveGaussianImageFilter` upstream evidently meant, and what
+//!   `noise_scale`'s `K_σ` already does via
+//!   `GradientRecursiveGaussianImageFilter`.
+//!
+//! - **§1.23 — `RescaleForUnitMaximumTrace` divided by zero on a constant
+//!   image.** `Adimensionize` turns on `RescaleForUnitMaximumTrace`, whose
+//!   scaling is `1 / max(trace S)`. The trace `K_ρ * |∇u_σ|²` is a smoothed sum
+//!   of squares, so it is `>= 0` and is `0` exactly when the image is constant
+//!   (`S ≡ 0`). Upstream computes the reciprocal unconditionally, so a constant
+//!   image gives `1/0 = +∞` and turns every tensor into `0·∞ = NaN`; the `NaN`s
+//!   reach the diagonal coefficients, where ITK's `MinimumMaximumImageCalculator`
+//!   (max seeded at `NonpositiveMin()`, kept under `value > max`, which `NaN`
+//!   always loses) returns `-DBL_MAX`, so the step count goes negative through a
+//!   C++-undefined `(int)` cast of a non-finite double and the Euler loop runs
+//!   zero times — the input survives only by accident. This port guards the
+//!   division: when `max(trace S) <= 0` there is no structure to normalize, so
+//!   the (zero) tensors are left unscaled. A constant image then diffuses with a
+//!   finite isotropic tensor and is preserved exactly because it is a genuine
+//!   fixed point of `div(D∇u)` (every operator row sums to zero), not because a
+//!   `NaN` zeroed the step count.
+//!
+//! # Faithfully-reproduced upstream behaviors, rather than "fixed"
+//!
 //! - **SimpleITK's yaml doc has the CED/EED formulas swapped** relative to the
 //!   code: the "Coherence Enhancing Diffusion" heading carries the EED formula
 //!   `g(μᵢ − μ_min)` with `g(s) = 1 − (1−α)·exp(−(λ/s)^m)` and vice versa. The
@@ -70,16 +95,6 @@
 //!   swapped. The code is authoritative and is what this port follows:
 //!   [`Enhancement::Ced`] uses `g_CED(μ_max − μᵢ)` and [`Enhancement::Eed`]
 //!   uses `g_EED(μᵢ − μ_min)`. See [`Enhancement`] for each formula.
-//! - **`Adimensionize` on a constant image divides by zero.** It turns on
-//!   `RescaleForUnitMaximumTrace`, whose scaling is `1 / max(trace S)`; a
-//!   constant image has `S ≡ 0`, so the scaling is `+∞` and every tensor
-//!   becomes `0 · ∞ = NaN`. The `NaN`s then propagate to the diagonal
-//!   coefficients, where ITK's `MinimumMaximumImageCalculator` — which seeds
-//!   its maximum with `NonpositiveMin()` and keeps it under `value > max`,
-//!   a comparison `NaN` always loses — returns `-DBL_MAX`. The resulting step
-//!   count is negative, the Euler loop runs zero times, and the input is
-//!   returned unchanged. This port reproduces the whole chain, so a constant
-//!   image is still a fixed point; see `constant_image_is_returned_unchanged`.
 //! - **Selling's algorithm gives up silently after 200 flips**, printing to
 //!   `std::cerr` and continuing with a possibly non-obtuse superbase (which
 //!   can yield a negative stencil weight). This port also continues, without
@@ -173,8 +188,8 @@ pub struct CoherenceEnhancingDiffusionSettings {
     /// units. Isotropic (all axes).
     pub noise_scale: f64,
     /// `ρ`: the Gaussian scale at which the gradient outer product is
-    /// averaged, in physical units. **Applied along axis 0 only**, reproducing
-    /// ITK's use of the single-direction `RecursiveGaussianImageFilter`.
+    /// averaged, in physical units. Isotropic (all axes) — see §1.22 in the
+    /// module doc, where upstream applies it along axis 0 alone.
     pub feature_scale: f64,
     /// Exponent `m` of the transfer functions. See [`Enhancement`].
     pub exponent: f64,
@@ -438,8 +453,8 @@ fn itk_maximum(values: impl Iterator<Item = f64>) -> f64 {
 /// `StructureTensorImageFilter::GenerateData` for a scalar image:
 /// `K_ρ * (∇u_σ ⊗ ∇u_σ)`, optionally rescaled for unit maximum trace.
 ///
-/// `K_σ` is isotropic (`GradientRecursiveGaussianImageFilter`); `K_ρ` runs
-/// along axis 0 only (`RecursiveGaussianImageFilter`, `m_Direction == 0`).
+/// Both `K_σ` (`GradientRecursiveGaussianImageFilter`) and `K_ρ` are isotropic.
+/// Upstream's `K_ρ` runs along axis 0 only; see §1.22 in the module doc.
 fn structure_tensor(
     data: &[f64],
     size: &[usize],
@@ -484,10 +499,12 @@ fn structure_tensor(
         }
     }
 
-    // `K_rho`, along axis 0 only. Componentwise, as
-    // `RecursiveGaussianImageFilter<TensorImageType>` is.
-    let mut rho = vec![0.0; dim];
-    rho[0] = feature_scale;
+    // `K_rho`, isotropic over every axis (§1.22: upstream reaches for the
+    // single-direction `RecursiveGaussianImageFilter` and never calls
+    // `SetDirection`, so its `m_Direction == 0` applies `K_rho` along axis 0
+    // alone). Componentwise, as `RecursiveGaussianImageFilter<TensorImageType>`
+    // is.
+    let rho = vec![feature_scale; dim];
     for i in 0..dim {
         for j in i..dim {
             let comp: Vec<f64> = tensors.iter().map(|t| t[i][j]).collect();
@@ -501,11 +518,20 @@ fn structure_tensor(
 
     if rescale_for_unit_maximum_trace {
         let max_trace = itk_maximum(tensors.iter().map(|t| (0..dim).map(|i| t[i][i]).sum()));
-        let scaling = 1.0 / max_trace;
-        for t in tensors.iter_mut() {
-            for row in t.iter_mut().take(dim) {
-                for cell in row.iter_mut().take(dim) {
-                    *cell *= scaling;
+        // §1.23: the structure-tensor trace is `K_ρ * |∇u_σ|²`, a smoothed sum
+        // of squares, so it is `>= 0` and is `0` exactly when the image is
+        // constant (`S ≡ 0`). Upstream computes `1 / max_trace` unconditionally,
+        // so a constant image gives `1/0 = +∞` and turns every `0·∞` into `NaN`,
+        // which then drives the step count negative and the input survives only
+        // by accident. There is nothing to normalize when there is no structure:
+        // leave the (zero) tensors unscaled.
+        if max_trace > 0.0 {
+            let scaling = 1.0 / max_trace;
+            for t in tensors.iter_mut() {
+                for row in t.iter_mut().take(dim) {
+                    for cell in row.iter_mut().take(dim) {
+                        *cell *= scaling;
+                    }
                 }
             }
         }
@@ -691,8 +717,9 @@ fn linear_diffusion(
 
     // `int n = ceil(m_DiffusionTime / delta)`. C++ leaves the cast of a
     // non-finite or out-of-range double to `int` undefined; Rust defines it as
-    // a saturating cast (NaN -> 0), which is what lets the degenerate
-    // Adimensionize-on-a-constant-image path fall through to zero steps.
+    // a saturating cast (NaN -> 0). With §1.23 fixed the constant-image tensors
+    // are finite, so `delta` is finite and positive here; the saturating cast
+    // remains a defensive backstop, not the constant-image mechanism it was.
     let mut n = (max_time / delta).ceil() as i64;
     let effective_time;
     if n > max_steps {
@@ -1088,12 +1115,12 @@ mod tests {
 
     /// A ramp `u(x, y) = x`. `∇u = (1, 0)`, so `S = [[1, 0], [0, 0]]`.
     ///
-    /// The grid is 64 wide because `K_ρ` smooths *along x* (the upstream
-    /// axis-0-only quirk) and so drags the two boundary columns' bad
-    /// derivative estimates toward the centre; 64 puts the centre 16 `ρ` away
-    /// and the residual under 1e-9. See
-    /// `the_feature_scale_smooths_along_axis_zero_only`, which pins the same
-    /// contamination on a narrow grid.
+    /// The grid is 64 wide because the (now isotropic, §1.22) `K_ρ` drags the
+    /// two boundary columns' bad x-derivative estimates toward the centre along
+    /// x; 64 puts the centre 16 `ρ` away and the residual under 1e-9. `S_00`
+    /// is constant along y, so the y-axis smoothing adds nothing and 16 rows
+    /// suffice there. See `the_feature_scale_smooths_every_axis_isotropically`,
+    /// which pins the isotropy directly.
     #[test]
     fn structure_tensor_of_a_ramp_is_the_hand_computed_outer_product() {
         let (nx, ny) = (64, 16);
@@ -1114,9 +1141,10 @@ mod tests {
 
     #[test]
     fn structure_tensor_of_a_ramp_along_y_is_the_transposed_outer_product() {
-        // Only 32 wide: `K_ρ` smooths along x, where `S_11` is constant, so
-        // no boundary error is dragged in and the centre is exact.
-        let (nx, ny) = (32, 32);
+        // The exact transpose of the x-ramp test: `S_11` now varies along y and
+        // (isotropic §1.22 `K_ρ`) is smeared from the y-boundary, so the grid is
+        // 64 *tall* to put the centre 16 `ρ` from it, mirroring the x case.
+        let (nx, ny) = (16, 64);
         let data: Vec<f64> = (0..nx * ny).map(|p| (p / nx) as f64).collect();
         let t = structure_tensor(
             &data,
@@ -1129,7 +1157,9 @@ mod tests {
         )
         .unwrap();
         let center = (ny / 2) * nx + nx / 2;
-        assert_mat_close(&t[center], &mat2(0.0, 0.0, 1.0), 2, 1e-12);
+        // Same 1e-8 residual as the x-ramp: the two are transposes and `K_ρ` is
+        // isotropic, so the boundary contamination is identical.
+        assert_mat_close(&t[center], &mat2(0.0, 0.0, 1.0), 2, 1e-8);
     }
 
     #[test]
@@ -1170,27 +1200,27 @@ mod tests {
         assert!((max_trace - 1.0).abs() < 1e-12, "{max_trace}");
     }
 
+    /// §1.22 fix: `K_ρ` is isotropic, so the whole structure-tensor pipeline
+    /// commutes with transposing the image.
+    ///
+    /// Take a square 16×16 ramp along x, `u(x,y) = x`, and its exact transpose,
+    /// `v(x,y) = y`. Both have a single nonzero structure-tensor component
+    /// (`S_00` and `S_11` respectively) equal to `1` in the interior and wrong
+    /// in the two boundary lines, where the replicating recursion cannot see
+    /// the ramp continue. With unit isotropic spacing, identity direction and
+    /// isotropic `σ`/`ρ`, transposing the input transposes `S`, so at the
+    /// (self-transpose) centre pixel `S^u_00` and `S^v_11` must be **equal**:
+    ///
+    ///     S^v_11(x, y) = S^u_00(y, x),  and the centre has x == y.
+    ///
+    /// Both therefore carry the same boundary contamination — the `1.4e-3` that
+    /// `K_ρ` drags inward from eight pixels away. Upstream's axis-0-only `K_ρ`
+    /// smeared `S^u_00` (which varies along x, the smoothed axis) but left
+    /// `S^v_11` (which varies along y) at the bare `3.3e-9` error of an
+    /// unsmoothed recursive derivative — an asymmetry of five orders of
+    /// magnitude between an image and its own transpose.
     #[test]
-    fn the_feature_scale_smooths_along_axis_zero_only() {
-        // Upstream quirk: `K_rho` goes through the single-direction
-        // `RecursiveGaussianImageFilter` (`m_Direction == 0`), so it smooths
-        // along axis 0 and no other.
-        //
-        // Take a 16-wide ramp along x and its exact transpose, a ramp along y.
-        // Both have one nonzero structure-tensor component, equal to 1 in the
-        // interior and wrong in the two boundary lines, where the replicating
-        // recursion cannot see the ramp continue.
-        //
-        //   * The x-ramp's `S_00` varies along x, the axis `K_rho` smooths, so
-        //     the boundary error is dragged inward: at the centre it is off by
-        //     1.4e-3.
-        //   * The y-ramp's `S_11` varies along y, which `K_rho` never touches,
-        //     so at the centre it retains the bare 3.3e-9 error of a recursive
-        //     first derivative eight pixels from a replicating boundary.
-        //
-        // An isotropic `K_rho` would contaminate both alike and the two errors
-        // would match. Instead they differ by five orders of magnitude, and
-        // that asymmetry *is* the quirk.
+    fn the_feature_scale_smooths_every_axis_isotropically() {
         let n = 16;
         let dx: Vec<f64> = (0..n * n).map(|p| (p % n) as f64).collect();
         let dy: Vec<f64> = (0..n * n).map(|p| (p / n) as f64).collect();
@@ -1200,33 +1230,28 @@ mod tests {
         let ty = structure_tensor(&dy, &[n, n], &sp, &dir, 0.5, 2.0, false).unwrap();
         let c = (n / 2) * n + n / 2;
 
-        let smeared = (tx[c][0][0] - 1.0).abs();
-        let untouched = (ty[c][1][1] - 1.0).abs();
+        let x_err = (tx[c][0][0] - 1.0).abs();
+        let y_err = (ty[c][1][1] - 1.0).abs();
         assert!(
-            smeared > 1e-3,
-            "x-ramp should be smeared by K_rho: {smeared}"
+            (tx[c][0][0] - ty[c][1][1]).abs() < 1e-14,
+            "K_rho is not isotropic: S^u_00 = {}, S^v_11 = {}",
+            tx[c][0][0],
+            ty[c][1][1]
         );
-        assert!(
-            untouched < 1e-8,
-            "y-ramp must be untouched by K_rho: {untouched}"
-        );
-        assert!(
-            smeared > 1e5 * untouched,
-            "K_rho looks isotropic: {smeared} vs {untouched}"
-        );
+        // Both are smeared alike, and both really are smeared: upstream left
+        // the y-ramp's error below 1e-8.
+        assert!(x_err > 1e-3, "x-ramp should be smeared by K_rho: {x_err}");
+        assert!(y_err > 1e-3, "y-ramp should be smeared by K_rho: {y_err}");
 
-        // Concretely: the y-ramp's `S_11` is the *unsmoothed* squared gradient,
-        // recovered to rounding by the axis-0 pass over a signal constant in x.
-        let g = recursive_gaussian_with_order(
-            &scalar_image(&[n, n], &sp, dy.clone()).unwrap(),
-            &[0.5, 0.5],
-            &[GaussianOrder::ZeroOrder, GaussianOrder::FirstOrder],
-            false,
-        )
-        .unwrap()
-        .to_f64_vec()
-        .unwrap();
-        assert!((ty[c][1][1] - g[c] * g[c]).abs() < 1e-15);
+        // The transpose symmetry holds over the whole image, not just the
+        // centre: S^v_11(x, y) == S^u_00(y, x) at every pixel.
+        for y in 0..n {
+            for x in 0..n {
+                let a = tx[x + n * y][0][0];
+                let b = ty[y + n * x][1][1];
+                assert!((a - b).abs() < 1e-14, "({x},{y}): {a} != {b}");
+            }
+        }
     }
 
     // ---- the assembled operator ----
@@ -1365,14 +1390,39 @@ mod tests {
         Image::from_vec(size, data).unwrap()
     }
 
+    /// §1.23 fix: with `Adimensionize` on, a constant image no longer hits the
+    /// `1/0 -> NaN` path. `RescaleForUnitMaximumTrace` sees `max(trace S) == 0`
+    /// and skips the rescale, so the tensors stay finite (`S ≈ 0`), CED maps the
+    /// zero eigenvalues to an isotropic `α·I`, and the constant is preserved
+    /// because it is a genuine fixed point of `div(D∇u)` — the Euler loop now
+    /// runs with a finite, positive step instead of being zeroed by a `NaN`.
+    ///
+    /// Adimensionize-on vs -off must therefore give the *same* result on a
+    /// constant image, which the NaN accident used to hide.
     #[test]
-    fn constant_image_is_returned_unchanged() {
-        // Adimensionize on a constant image is the 1/0 -> NaN path documented
-        // above; it must still be a fixed point.
+    fn constant_image_is_a_genuine_diffusion_fixed_point_with_adimensionize() {
         let img = f64_image(&[12, 12], vec![7.0; 144]);
-        let out = coherence_enhancing_diffusion(&img, &Default::default()).unwrap();
-        for v in out.to_f64_vec().unwrap() {
-            assert_eq!(v, 7.0);
+        let out_on = coherence_enhancing_diffusion(&img, &Default::default()).unwrap();
+        let s_off = CoherenceEnhancingDiffusionSettings {
+            adimensionize: false,
+            ..Default::default()
+        };
+        let out_off = coherence_enhancing_diffusion(&img, &s_off).unwrap();
+
+        for v in out_on.to_f64_vec().unwrap() {
+            // No NaN, and the constant is held to solver rounding (row sums are
+            // zero, so div(D∇u) of a constant is zero).
+            assert!(v.is_finite(), "constant image produced a non-finite value");
+            assert!((v - 7.0).abs() < 1e-12, "{v}");
+        }
+        // Adimensionize no longer changes the answer on a structureless image.
+        for (a, b) in out_on
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .zip(out_off.to_f64_vec().unwrap())
+        {
+            assert_eq!(*a, b, "adimensionize diverged from non-adimensionize");
         }
     }
 

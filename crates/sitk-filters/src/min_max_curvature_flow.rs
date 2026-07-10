@@ -31,6 +31,40 @@
 //! `.hxx` returns early and neither the threshold nor the ball average is
 //! computed; this port keeps that short-circuit.
 //!
+//! Upstream bugs corrected here rather than reproduced:
+//!
+//! * **§1.7 — the 3-D `ComputeThreshold` polar angle.** The `.hxx` rescales the
+//!   gradient to length `r` (which the 2-D overload needs, since it uses the
+//!   rescaled components directly as lattice offsets) and *then* computes
+//!   `theta = acos(gradient[2])`. `gradient[2]` is `r · n_z` at that point, not
+//!   the direction cosine `n_z`, so for `r >= 2` the polar angle is wrong; it
+//!   would leave `acos`'s domain entirely were it not for the adjacent clamp of
+//!   `gradient[2]` into `[-1, 1]`, which instead collapses every gradient with
+//!   `|n_z| > 1/r` onto the pole `theta == 0`. The four sample points are
+//!   `r · ∂n̂/∂θ` and `r · (1/sinθ) · ∂n̂/∂φ` for the *unit* gradient
+//!   `n̂ = (sinθ cosφ, sinθ sinφ, cosθ)`, so the intended angle is unambiguous:
+//!   this port computes `theta = acos(gradient[2] / r)`. `phi` needs no fix —
+//!   it is `atan(gradient[1] / gradient[0])`, and the length-`r` factor cancels
+//!   in the ratio.
+//!
+//! * **§1.8 — the derivative scaling.** `MinMaxCurvatureFlowFunction::
+//!   SetStencilRadius` widens the *finite difference function's* radius to
+//!   `stencil_radius` in every axis, because the ball mask and the threshold
+//!   sampling need that much neighborhood. `FiniteDifferenceFunction::
+//!   ComputeNeighborhoodScales` then returns `ScaleCoefficients[d] /
+//!   m_Radius[d]`, i.e. it assumes the derivatives are sampled `m_Radius[d]`
+//!   pixels out. They are not: the inherited `CurvatureFlowFunction::
+//!   ComputeUpdate` samples only the immediate `±1` neighbors. The update is
+//!   quadratic in the scales, so upstream's `κ|∇I|` comes out
+//!   `stencil_radius²` times smaller than plain
+//!   [`crate::denoise::curvature_flow`]'s on the same image — exact only at
+//!   `stencil_radius == 1`. This port uses `ScaleCoefficients[d]` for the
+//!   derivatives, so the ungated update equals plain curvature flow's at every
+//!   radius, which is what "min/max curvature flow" means: the curvature flow
+//!   update, gated to one sign. `ComputeThreshold` is unaffected — all three
+//!   overloads already read the raw `ScaleCoefficients`, never the
+//!   neighborhood scales.
+//!
 //! Faithfully reproduced upstream quirks, each of them observable:
 //!
 //! * **`SetStencilRadius` clamps to `>= 1`.** `m_StencilRadius = (value > 1) ?
@@ -38,29 +72,13 @@
 //!   `if (m_StencilRadius == 0)` early-outs inside the 2-D/3-D
 //!   `ComputeThreshold` specializations are unreachable dead code (not ported).
 //!
-//! * **The derivative stencil is scaled by `1/stencil_radius`.**
-//!   `MinMaxCurvatureFlowFunction::SetStencilRadius` widens the *finite
-//!   difference function's* radius to `stencil_radius` in every axis, and
-//!   `FiniteDifferenceFunction::ComputeNeighborhoodScales` returns
-//!   `ScaleCoefficients[d] / m_Radius[d]`. `ComputeUpdate` nonetheless samples
-//!   only the immediate `±1` neighbors. So the derivatives are computed as if
-//!   the grid spacing were `stencil_radius · spacing[d]`, and the update — which
-//!   is quadratic in the scales — comes out `stencil_radius²` times smaller
-//!   than plain [`crate::denoise::curvature_flow`]'s on the same image. The two
-//!   agree exactly at `stencil_radius == 1`.
-//!
-//! * **`ComputeThreshold` is dimension-dispatched, and only its 2-D form is a
-//!   true perpendicular sample.** For `ImageDimension == 2` the `.hxx` rotates
-//!   the gradient by ±90° and reads the two rounded lattice points at distance
-//!   `r`. For `ImageDimension == 3` it builds four points from spherical
-//!   angles, but computes `theta = acos(gradient[2])` on the gradient *after*
-//!   it has been rescaled to length `r` rather than to length `1` — so for
-//!   `r >= 2` the polar angle is wrong (and would leave `acos`'s domain
-//!   entirely were it not for the `gradient[2]` clamp to `[-1, 1]` immediately
-//!   above it). Ported as written. For every other dimension the `DispatchBase`
-//!   overload brute-force scans the whole neighborhood and averages the pixels
-//!   whose offset has norm `>= r` and whose cosine with the gradient is
-//!   `< 0.262` in absolute value.
+//! * **`ComputeThreshold` is dimension-dispatched.** For `ImageDimension == 2`
+//!   the `.hxx` rotates the gradient by ±90° and reads the two rounded lattice
+//!   points at distance `r`. For `ImageDimension == 3` it builds four points at
+//!   distance `r` from the spherical angles `(theta, phi)` of the gradient.
+//!   For every other dimension the `DispatchBase` overload brute-force scans
+//!   the whole neighborhood and averages the pixels whose offset has norm
+//!   `>= r` and whose cosine with the gradient is `< 0.262` in absolute value.
 //!
 //! * **A zero gradient makes the threshold `0`, not the center pixel.** All
 //!   three `ComputeThreshold` overloads return `PixelType{}` when the gradient
@@ -76,11 +94,11 @@
 //! * **`time_step` is range-checked.** ITK's `CurvatureFlowFunction::
 //!   ComputeGlobalTimeStep` returns the caller's step unexamined. This crate's
 //!   [`crate::denoise::curvature_flow`] already rejects steps outside
-//!   `[0, 1 / (2·Σ_d scale[d]²)]` with [`FilterError::UnstableTimeStep`]; the
-//!   same bound is enforced here, computed from *these* filters' scales
-//!   (`ScaleCoefficients[d] / stencil_radius`), which loosens it by
-//!   `stencil_radius²`. The one-sided gate only ever damps the scheme, so a
-//!   step accepted here is at least as stable as for plain curvature flow.
+//!   `[0, 1 / (2·Σ_d ScaleCoefficients[d]²)]` with
+//!   [`FilterError::UnstableTimeStep`]; the same bound is enforced here. With
+//!   §1.8 fixed the derivative scales no longer depend on `stencil_radius`, so
+//!   the bound is exactly plain curvature flow's — and the one-sided gate only
+//!   ever damps the scheme, so a step accepted here is at least as stable.
 //!
 //! * **Everything is computed in `f64`.** ITK accumulates the threshold, the
 //!   ball average and the stencil mask in `PixelType` (`float` for a
@@ -249,11 +267,11 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 /// four points on the circle of radius `radius` that the `.hxx` *intends* to be
 /// perpendicular to the gradient, averaged.
 ///
-/// Two upstream quirks are preserved. `gradient` has been rescaled to length
-/// `radius`, yet `theta` is `acos(gradient[2])` — correct only for
-/// `radius == 1`. And because `|gradient[2]|` can then exceed `1`, the `.hxx`
-/// clamps it into `[-1, 1]` first, which silently collapses any gradient with
-/// `|n_z| > 1/radius` onto `theta == 0` (a purely axial pole).
+/// **§1.7 fixed here.** `gradient` is rescaled to length `radius` (the 2-D
+/// overload needs that length for its rotated endpoints), but the polar angle
+/// is the angle of the *unit* gradient, so `theta` is `acos(gradient[2] /
+/// radius)`, not upstream's `acos(gradient[2])`. The clamp into `[-1, 1]` is
+/// kept as a pure rounding guard — the quotient is in range by construction.
 fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 3, coeff);
     let mut grad_magnitude: f64 = gradient.iter().map(|g| g * g).sum();
@@ -265,7 +283,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
         *g /= grad_magnitude;
     }
 
-    let theta = gradient[2].clamp(-1.0, 1.0).acos();
+    let theta = (gradient[2] / radius as f64).clamp(-1.0, 1.0).acos();
     // `Math::AlmostEquals(gradient[0], PixelType{})` is a 4-ULP window around
     // zero, which for a zero reference means exact zero (or a denormal).
     let phi = if gradient[0] == 0.0 {
@@ -344,17 +362,19 @@ fn min_max_flow(
     // `SetStencilRadius`: `m_StencilRadius = (value > 1) ? value : 1`.
     let stencil_radius = stencil_radius.max(1);
 
-    // `FiniteDifferenceImageFilter::InitializeIteration`'s ScaleCoefficients ...
+    // `FiniteDifferenceImageFilter::InitializeIteration`'s ScaleCoefficients.
+    // These are also the derivative scales: `curvature_flow_update` samples the
+    // `±1` neighbors, so the finite-difference step is one pixel regardless of
+    // `stencil_radius`. Upstream instead reaches for `ComputeNeighborhoodScales`,
+    // whose `ScaleCoefficients[d] / m_Radius[d]` divides by `stencil_radius` —
+    // that is §1.8, fixed here (see the module doc).
     let coeff: Vec<f64> = img
         .spacing()
         .iter()
         .map(|&s| if use_image_spacing { 1.0 / s } else { 1.0 })
         .collect();
-    // ... and `ComputeNeighborhoodScales`'s `ScaleCoefficients[d] / m_Radius[d]`,
-    // where `m_Radius[d] == stencil_radius` for these two filters.
-    let scale: Vec<f64> = coeff.iter().map(|c| c / stencil_radius as f64).collect();
 
-    let max_stable = 1.0 / (2.0 * scale.iter().map(|s| s * s).sum::<f64>());
+    let max_stable = 1.0 / (2.0 * coeff.iter().map(|s| s * s).sum::<f64>());
     if !(0.0..=max_stable).contains(&time_step) {
         return Err(FilterError::UnstableTimeStep {
             time_step,
@@ -376,7 +396,7 @@ fn min_max_flow(
             ZeroFluxNeumannBoundaryCondition,
         )?;
         for ((_, nb), v) in iter.zip(buf.iter_mut()) {
-            let update = curvature_flow_update(&nb, dim, &scale);
+            let update = curvature_flow_update(&nb, dim, &coeff);
             if update == 0.0 {
                 continue;
             }
@@ -592,16 +612,34 @@ mod tests {
         assert_eq!(compute_threshold_3d(&nb3, 2, &[1.0, 1.0, 1.0]), 0.0);
     }
 
+    /// §1.7 fix: `theta` is the polar angle of the **unit** gradient, so the
+    /// four sample points really are perpendicular to it.
+    ///
+    /// `I(x,y,z) = x² + z` on a 5×5×5 grid, `coeff = 1`, `r = 2`. At `(2,2,2)`:
+    ///   `g = (0.5·(9−1), 0.5·(4−4), 0.5·(6−4)) = (4, 0, 1)`, `|g| = √17`.
+    /// The `.hxx` divides by `|g|/r`, leaving `g = (4,0,1)·2/√17 =
+    /// (1.9402850, 0, 0.4850713)` — length exactly `r = 2`.
+    ///
+    /// Corrected: `n_z = 0.4850713 / 2 = 0.24253563`, so
+    /// `theta = acos(0.24253563) = 1.3258177` rad, `cosθ = 0.24253563`,
+    /// `sinθ = √(1 − 0.0588235) = 0.97014250`. `phi = atan(0/1.94) = 0`, so
+    /// `cosφ = 1`, `sinφ = 0`. Check: `(sinθcosφ, sinθsinφ, cosθ) =
+    /// (0.9701425, 0, 0.2425356) = (4,0,1)/√17` — the unit gradient. ✓
+    ///
+    /// With `r·sinθ = 1.9402850` and `r·cosθ·cosφ = 0.48507125`, and
+    /// `Math::Round(x) = floor(x + 0.5)`:
+    ///   - P1 `(round(2+0.48507), round(2+0), round(2−1.94029))` = `(2,2,0)` → `I = 4+0 = 4`
+    ///   - P2 `(round(2−0), round(2+2), 2)` = `(2,4,2)` → `I = 4+2 = 6`
+    ///   - P3 `(round(2−0.48507), round(2−0), round(2+1.94029))` = `(2,2,4)` → `I = 4+4 = 8`
+    ///   - P4 `(round(2+0), round(2−2), 2)` = `(2,0,2)` → `I = 4+2 = 6`
+    ///
+    /// Average `(4+6+8+6)/4 = 6.0`.
+    ///
+    /// Upstream instead feeds `0.4850713` straight into `acos`, giving
+    /// `theta = 1.0642064` rad; its points are `(3,2,0)=9`, `(2,4,2)=6`,
+    /// `(1,2,4)=5`, `(2,0,2)=6` → `6.5`, asserted absent below.
     #[test]
-    fn threshold_3d_reproduces_the_unnormalized_acos_quirk() {
-        // I(x,y,z) = x^2 + z on a 5x5x5 grid. At (2,2,2) the raw gradient is
-        // (4, 0, 1); rescaled to length r=2 it is (1.940285, 0, 0.485071).
-        // ITK feeds that z-component straight into acos, giving
-        // theta = 1.06421 rad instead of the correct acos(0.485071/2) =
-        // 1.32582 rad. The four sampled lattice points come out
-        // (3,2,0)=9, (2,4,2)=6, (1,2,4)=5, (2,0,2)=6 -> 6.5.
-        // With the correctly normalized theta they would be
-        // (2,2,0)=4, (2,4,2)=6, (2,2,4)=8, (2,0,2)=6 -> 6.0.
+    fn threshold_3d_polar_angle_uses_the_unit_gradient() {
         let mut data = vec![0.0f64; 125];
         for z in 0..5 {
             for y in 0..5 {
@@ -612,21 +650,36 @@ mod tests {
         }
         let img = Image::from_vec(&[5, 5, 5], data).unwrap();
         let nb = neighborhood_at(&img, 2, &[2, 2, 2]);
-        assert!((compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]) - 6.5).abs() < 1e-9);
+        let t = compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]);
+        assert!((t - 6.0).abs() < 1e-9, "got {t}");
+        assert!((t - 6.5).abs() > 0.4, "upstream's unnormalized acos value");
     }
 
+    /// §1.7 fix, pole case: a gradient along `+z` alone gives `n_z = 1` exactly,
+    /// hence `theta = 0`, and the four points are the in-plane ring at `z = r`.
+    /// (Upstream reached `theta == 0` here too, but only because its clamp of
+    /// `gradient[2] = r` into `[-1, 1]` rescued `acos` from a NaN.)
+    ///
+    /// `I(x,y,z) = z² + (x−2)⁴` on 5×5×5, `r = 2`. At `(2,2,2)`:
+    ///   `g_x = 0.5·((3−2)⁴ − (1−2)⁴) = 0.5·(1−1) = 0`
+    ///   `g_y = 0`, `g_z = 0.5·(3² − 1²) = 4`.
+    /// So `|g| = 4`, rescaled `g = (0, 0, 2)`, `n_z = 2/2 = 1`, `theta = 0`,
+    /// `cosθ = 1`, `sinθ = 0`. `gradient[0] == 0` so `phi = π/2`: `sinφ = 1`,
+    /// `cosφ = 0`. Then `r·sinθ = 0`, `r·cosθ·cosφ = 0`, `r·cosθ·sinφ = 2`,
+    /// `r·sinφ = 2`, `r·cosφ = 0`, giving
+    ///   P1 `(2,4,2)`, P2 `(0,2,2)`, P3 `(2,0,2)`, P4 `(4,2,2)`.
+    /// Every point has `z = 2`, which is what pins `theta == 0`; the `(x−2)⁴`
+    /// term makes the ring's four values distinguishable rather than uniform:
+    /// `I(2,4,2) = 4`, `I(0,2,2) = 4+16 = 20`, `I(2,0,2) = 4`,
+    /// `I(4,2,2) = 4+16 = 20`. Average `(4+20+4+20)/4 = 12.0`.
     #[test]
-    fn threshold_3d_clamp_keeps_acos_in_domain_for_a_polar_gradient() {
-        // I(x,y,z) = z^2: at (2,2,2) the gradient rescaled to length r=2 is
-        // (0, 0, 2). Without the `.hxx`'s clamp of gradient[2] into [-1,1],
-        // acos(2) is NaN and the rounded coordinates are garbage. With it,
-        // theta = 0 and the four points are the in-plane ring at z = 2, all
-        // holding I = 4.
+    fn threshold_3d_polar_gradient_samples_the_ring_in_the_center_plane() {
         let mut data = vec![0.0f64; 125];
         for z in 0..5 {
             for y in 0..5 {
                 for x in 0..5 {
-                    data[x + 5 * y + 25 * z] = (z * z) as f64;
+                    let dx = x as i64 - 2;
+                    data[x + 5 * y + 25 * z] = (z * z) as f64 + (dx * dx * dx * dx) as f64;
                 }
             }
         }
@@ -634,15 +687,16 @@ mod tests {
         let nb = neighborhood_at(&img, 2, &[2, 2, 2]);
         let t = compute_threshold_3d(&nb, 2, &[1.0, 1.0, 1.0]);
         assert!(t.is_finite());
-        assert!((t - 4.0).abs() < 1e-9);
+        assert!((t - 12.0).abs() < 1e-9, "got {t}");
     }
 
+    /// `r == 1` is the one radius at which upstream's `acos(gradient[2])` was
+    /// already fed a true direction cosine, so the §1.7 fix must leave it
+    /// unchanged. `I(x,y,z) = z` on 3×3×3: `g = (0, 0, 0.5)`, `|g| = 0.5`,
+    /// rescaled to length `1` it is `(0,0,1)`; `n_z = 1/1 = 1`, `theta = 0`.
+    /// The four points are the x/y ring at `z = 1`, all holding `I = 1`.
     #[test]
-    fn threshold_3d_matches_the_2d_style_perpendicular_at_radius_one() {
-        // r == 1 is the only radius at which acos(gradient[2]) is fed a true
-        // direction cosine. I(x,y,z) = z: gradient (0,0,0.5) -> (0,0,1),
-        // theta = 0, and the four points are the x/y ring at z = 1 (center
-        // plane), all holding I = 1.
+    fn threshold_3d_at_radius_one_is_unchanged_by_the_polar_angle_fix() {
         let mut data = vec![0.0f64; 27];
         for z in 0..3 {
             for y in 0..3 {
@@ -654,6 +708,42 @@ mod tests {
         let img = Image::from_vec(&[3, 3, 3], data).unwrap();
         let nb = neighborhood_at(&img, 1, &[1, 1, 1]);
         assert!((compute_threshold_3d(&nb, 1, &[1.0, 1.0, 1.0]) - 1.0).abs() < 1e-9);
+    }
+
+    /// §1.7 fix, invariant form: for an arbitrary (non-axial, non-polar)
+    /// gradient the four *unrounded* sample points must be perpendicular to the
+    /// gradient and at distance `r` from the center. This is what upstream's
+    /// unnormalized `theta` broke and what no single hand-computed average can
+    /// pin on its own.
+    ///
+    /// Recompute the offsets exactly as `compute_threshold_3d` does, from the
+    /// same gradient, and check `offset · g == 0` and `|offset| == r`.
+    #[test]
+    fn threshold_3d_sample_offsets_are_perpendicular_to_the_gradient() {
+        let r = 3.0f64;
+        // An arbitrary gradient with all three components distinct and nonzero.
+        let raw = [2.0f64, -5.0, 3.0];
+        let norm = (raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]).sqrt();
+        // The `.hxx` rescales to length r before the angles are taken.
+        let g: Vec<f64> = raw.iter().map(|v| v * r / norm).collect();
+
+        let theta = (g[2] / r).clamp(-1.0, 1.0).acos();
+        let phi = (g[1] / g[0]).atan();
+        let (ct, st) = (theta.cos(), theta.sin());
+        let (cp, sp) = (phi.cos(), phi.sin());
+
+        let offsets = [
+            [r * ct * cp, r * ct * sp, -r * st],
+            [-r * sp, r * cp, 0.0],
+            [-r * ct * cp, -r * ct * sp, r * st],
+            [r * sp, -r * cp, 0.0],
+        ];
+        for off in offsets {
+            let dot = off[0] * raw[0] + off[1] * raw[1] + off[2] * raw[2];
+            assert!(dot.abs() < 1e-9, "offset {off:?} not perpendicular: {dot}");
+            let len = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt();
+            assert!((len - r).abs() < 1e-9, "offset {off:?} has length {len}");
+        }
     }
 
     // ---- pixel type gate (RealPixelIDTypeList) ----
@@ -695,27 +785,30 @@ mod tests {
 
     // ---- time_step guard ----
 
+    /// §1.8 fix: the derivative scales are the raw `ScaleCoefficients`, so the
+    /// stability bound `1 / (2·Σ_d scale[d]²)` no longer depends on
+    /// `stencil_radius`. 2-D, unit spacing: `Σ_d scale[d]² = 1 + 1 = 2`, so
+    /// `max_stable = 1/4 = 0.25` at *every* radius — plain curvature flow's
+    /// bound. (Upstream's radius-scaled scales gave `0.25·r²`, i.e. `1.0` at
+    /// `r = 2`, so `time_step = 0.3` was accepted there and is rejected here.)
     #[test]
-    fn unstable_time_step_is_rejected_with_the_stencil_scaled_bound() {
+    fn unstable_time_step_is_rejected_with_the_plain_curvature_flow_bound() {
         let img = Image::from_vec(&[5, 5], vec![1.0f64; 25]).unwrap();
-        // 2D, unit spacing, r=2: scale = 0.5 => max_stable = 1/(2*0.5) = 1.0.
-        let err = min_max_curvature_flow(&img, 1, 1.5, 2, true).unwrap_err();
-        match err {
-            FilterError::UnstableTimeStep {
-                time_step,
-                max_stable,
-            } => {
-                assert_eq!(time_step, 1.5);
-                assert!((max_stable - 1.0).abs() < EPS);
+        for radius in [1usize, 2, 3] {
+            match min_max_curvature_flow(&img, 1, 0.3, radius, true).unwrap_err() {
+                FilterError::UnstableTimeStep {
+                    time_step,
+                    max_stable,
+                } => {
+                    assert_eq!(time_step, 0.3);
+                    assert!((max_stable - 0.25).abs() < EPS, "radius {radius}");
+                }
+                other => panic!("expected UnstableTimeStep, got {other:?}"),
             }
-            other => panic!("expected UnstableTimeStep, got {other:?}"),
         }
-        // r=1 collapses onto plain curvature flow's bound of 0.25.
-        match min_max_curvature_flow(&img, 1, 0.3, 1, true).unwrap_err() {
-            FilterError::UnstableTimeStep { max_stable, .. } => {
-                assert!((max_stable - 0.25).abs() < EPS);
-            }
-            other => panic!("expected UnstableTimeStep, got {other:?}"),
+        // 0.25 itself is accepted (the bound is inclusive) at every radius.
+        for radius in [1usize, 2, 3] {
+            assert!(min_max_curvature_flow(&img, 1, 0.25, radius, true).is_ok());
         }
     }
 
@@ -843,17 +936,31 @@ mod tests {
 
     // ---- the gate ----
 
+    /// §1.8 fix: the derivative scales are `ScaleCoefficients[d]` (here `1.0`,
+    /// since `use_image_spacing == false`), *not* `ScaleCoefficients[d] / r`.
+    ///
+    /// Hand-derived at the block corner `(2,2)`, `scale = (1, 1)`. Reading
+    /// `block_2x2`: `I(2,2) = I(3,2) = I(2,3) = I(3,3) = 1`, everything else 0.
+    ///   `f_x = 0.5·(I(3,2) − I(1,2)) = 0.5·(1 − 0) = 0.5`, likewise `f_y = 0.5`
+    ///   `s_x = I(3,2) − 2·I(2,2) + I(1,2) = 1 − 2 + 0 = −1`, likewise `s_y = −1`
+    ///   `c_xy = 0.25·(I(1,1) − I(1,3) − I(3,1) + I(3,3)) = 0.25·(0−0−0+1) = 0.25`
+    ///   `magnitudeSqr = 0.25 + 0.25 = 0.5`
+    ///   `update = (s_y·f_x² + s_x·f_y² − 2·f_x·f_y·c_xy) / magnitudeSqr`
+    ///          `= (−0.25 − 0.25 − 0.125) / 0.5 = −1.25`
+    ///
+    /// Upstream's radius-scaled `scale = 0.5` gives `f = (0.25, 0.25)`,
+    /// `s = (−0.25, −0.25)`, `c = 0.0625`, `magnitudeSqr = 0.125`, hence
+    /// `update = −0.0390625 / 0.125 = −0.3125` — smaller by exactly `r² = 4`.
+    ///
+    /// The gate is unchanged by the fix: the ball average is `4/13 > 0`, and
+    /// the perpendicular threshold reads the two background pixels at `(1,3)`
+    /// and `(3,1)` → `0`, so `avg >= threshold` selects `min(update, 0)` and
+    /// the negative update survives. By symmetry all four block pixels move by
+    /// the same amount; every other pixel has `update == 0` (at an axis
+    /// neighbour like `(1,2)` only `f_x` and `s_x` are nonzero, so both terms
+    /// vanish; at a diagonal neighbour both first derivatives vanish).
     #[test]
     fn min_max_shrinks_a_two_by_two_block_and_leaves_the_background_alone() {
-        // Hand-derived at (2,2) with scale = coeff/r = 0.5:
-        //   firstderiv = (0.25, 0.25), secderiv = (-0.25, -0.25),
-        //   crossderiv = 0.0625, magnitudeSqr = 0.125
-        //   update = (-0.25·0.0625)·2 - 2·0.25·0.25·0.0625 = -0.0390625
-        //   update / magnitudeSqr = -0.3125
-        // The ball average is 4/13 > 0 and the perpendicular threshold reads
-        // the two background pixels at (1,3) and (3,1) -> 0, so the min-gate
-        // keeps the negative update. By symmetry all four block pixels move by
-        // the same amount; every other pixel has `update == 0`.
         let img = block_2x2();
         let time_step = 0.1;
         let out = min_max_curvature_flow(&img, 1, time_step, 2, false)
@@ -864,15 +971,54 @@ mod tests {
         let mut expected = img.to_f64_vec().unwrap();
         for y in 2..4 {
             for x in 2..4 {
-                expected[x + 6 * y] = 1.0 + time_step * -0.3125;
+                // 1.0 + 0.1 * (-1.25) = 0.875
+                expected[x + 6 * y] = 0.875;
             }
         }
         assert_close(&out, &expected);
     }
 
+    /// §1.8 fix, stated as the invariant it restores: the ungated update *is*
+    /// plain curvature flow's, at every `stencil_radius`. Forcing the gate open
+    /// with an extreme `binary_min_max_curvature_flow` threshold must therefore
+    /// reproduce `curvature_flow`'s one-sided image identically for `r = 1`,
+    /// `2` and `3`. Upstream's radius-scaled derivatives made the `r = 2` and
+    /// `r = 3` results `4×` and `9×` smaller than the `r = 1` one.
+    ///
+    /// `threshold = -1e30` is below every ball average, so `avg < threshold` is
+    /// false everywhere and the max-gate applies uniformly.
+    #[test]
+    fn the_ungated_update_is_radius_independent_and_equals_plain_curvature_flow() {
+        let data: Vec<f64> = (0..49).map(|i| ((i * 7 + i / 7 * 3) % 5) as f64).collect();
+        let img = Image::from_vec(&[7, 7], data.clone()).unwrap();
+        let time_step = 0.1;
+
+        let plain = curvature_flow(&img, 1, time_step, true)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let expect_max: Vec<f64> = data
+            .iter()
+            .zip(&plain)
+            .map(|(&i, &p)| i + (p - i).max(0.0))
+            .collect();
+        // The test only means something if the plain flow actually moved.
+        assert!(data.iter().zip(&plain).any(|(&i, &p)| (p - i).abs() > 1e-6));
+
+        for radius in [1usize, 2, 3] {
+            let out = binary_min_max_curvature_flow(&img, 1, time_step, radius, -1e30, true)
+                .unwrap()
+                .to_f64_vec()
+                .unwrap();
+            assert_close(&out, &expect_max);
+        }
+    }
+
     #[test]
     fn binary_threshold_straddling_the_ball_average_flips_the_gate() {
         // The ball average at each of the four block pixels is 4/13 = 0.3077.
+        // The update there is -1.25 (derived in
+        // `min_max_shrinks_a_two_by_two_block_and_leaves_the_background_alone`).
         let img = block_2x2();
         let time_step = 0.1;
 
@@ -885,7 +1031,8 @@ mod tests {
         let mut expected = img.to_f64_vec().unwrap();
         for y in 2..4 {
             for x in 2..4 {
-                expected[x + 6 * y] = 1.0 + time_step * -0.3125;
+                // 1.0 + 0.1 * (-1.25) = 0.875
+                expected[x + 6 * y] = 0.875;
             }
         }
         assert_close(&below, &expected);
@@ -901,10 +1048,12 @@ mod tests {
 
     #[test]
     fn binary_threshold_extremes_reduce_to_one_sided_curvature_flow() {
-        // At stencil_radius == 1 the neighborhood scales equal the scale
-        // coefficients, so the ungated update is bit-for-bit
-        // `curvature_flow`'s. A threshold above every ball average forces the
-        // min-gate everywhere; one below every ball average forces the max-gate.
+        // The ungated update is bit-for-bit `curvature_flow`'s (§1.8), so an
+        // extreme threshold reduces this filter to one-sided curvature flow.
+        // A threshold above every ball average forces the min-gate everywhere;
+        // one below every ball average forces the max-gate. Radius-independence
+        // of the update is pinned separately by
+        // `the_ungated_update_is_radius_independent_and_equals_plain_curvature_flow`.
         let data: Vec<f64> = (0..49).map(|i| ((i * 7 + i / 7 * 3) % 5) as f64).collect();
         let img = Image::from_vec(&[7, 7], data.clone()).unwrap();
         let time_step = 0.1;
@@ -942,24 +1091,64 @@ mod tests {
 
     // ---- stencil radius bounds ----
 
+    /// `SetStencilRadius`'s `(value > 1) ? value : 1` clamp, plus a guard that
+    /// the test is not vacuous — radius 2 really does give a different answer.
+    ///
+    /// With §1.8 fixed the *update* is radius-independent, so the radii can only
+    /// differ through the **gate** (the ball average and, for the min/max
+    /// variant, the perpendicular threshold). `block_2x2` no longer separates
+    /// them, so this uses an image built to make the gate flip. 7×7, all zero
+    /// except `I(3,3) = 0.5`, `I(4,3) = 1`, `I(3,1) = I(3,5) = 1`.
+    ///
+    /// Update at the center `(3,3)`, `scale = (1,1)`:
+    ///   `f_x = 0.5·(I(4,3) − I(2,3)) = 0.5`, `f_y = 0.5·(I(3,4) − I(3,2)) = 0`
+    ///   `s_x = 1 − 2·0.5 + 0 = 0`, `s_y = 0 − 2·0.5 + 0 = −1`
+    ///   `c_xy = 0.25·(I(2,2) − I(2,4) − I(4,2) + I(4,4)) = 0`
+    ///   `magnitudeSqr = 0.25`
+    ///   `update = (s_y·f_x² + s_x·f_y² − 0) / 0.25 = −0.25 / 0.25 = −1`
+    ///
+    /// Gate at `r = 1`: ball = the 5-point cross,
+    /// `avg = (0.5 + 0 + 1 + 0 + 0)/5 = 0.3`. The gradient `(0.5, 0)` rescaled
+    /// to length 1 is `(1, 0)`, so the two perpendicular points are `(3,4)` and
+    /// `(3,2)`, both 0 → `threshold = 0`. `avg >= threshold` → `min(−1, 0) = −1`.
+    ///
+    /// Gate at `r = 2`: ball = the 13-point disc; the members it covers with a
+    /// nonzero value are `(3,3) = 0.5` at `(0,0)`, `(4,3) = 1` at `(1,0)`, and
+    /// `(3,1) = (3,5) = 1` at `(0,∓2)` — so `avg = 3.5/13 = 0.2692`. The
+    /// gradient rescaled to length 2 is `(2, 0)`, so the perpendicular points
+    /// are `(3,5)` and `(3,1)`, both 1 → `threshold = 1`. Now
+    /// `avg < threshold` → `max(−1, 0) = 0`.
+    ///
+    /// With `time_step = 0.2` and one iteration: `I(3,3)` becomes
+    /// `0.5 + 0.2·(−1) = 0.3` at radius 1, and stays `0.5` at radius 2.
     #[test]
     fn stencil_radius_zero_is_clamped_to_one() {
-        let img = block_2x2();
-        let zero = min_max_curvature_flow(&img, 2, 0.2, 0, false)
+        let at = |x: usize, y: usize| x + 7 * y;
+        let mut data = vec![0.0f64; 49];
+        data[at(3, 3)] = 0.5;
+        data[at(4, 3)] = 1.0;
+        data[at(3, 1)] = 1.0;
+        data[at(3, 5)] = 1.0;
+        let img = Image::from_vec(&[7, 7], data).unwrap();
+
+        let zero = min_max_curvature_flow(&img, 1, 0.2, 0, false)
             .unwrap()
             .to_f64_vec()
             .unwrap();
-        let one = min_max_curvature_flow(&img, 2, 0.2, 1, false)
+        let one = min_max_curvature_flow(&img, 1, 0.2, 1, false)
             .unwrap()
             .to_f64_vec()
             .unwrap();
         assert_close(&zero, &one);
-        // and it is *not* the radius-2 answer.
-        let two = min_max_curvature_flow(&img, 2, 0.2, 2, false)
+
+        let two = min_max_curvature_flow(&img, 1, 0.2, 2, false)
             .unwrap()
             .to_f64_vec()
             .unwrap();
-        assert!(zero.iter().zip(&two).any(|(a, b)| (a - b).abs() > 1e-9));
+
+        // Hand-derived center pixel, the site of the gate flip.
+        assert!((one[at(3, 3)] - 0.3).abs() < 1e-9, "{}", one[at(3, 3)]);
+        assert!((two[at(3, 3)] - 0.5).abs() < 1e-9, "{}", two[at(3, 3)]);
     }
 
     #[test]
@@ -980,9 +1169,9 @@ mod tests {
 
     #[test]
     fn isotropic_spacing_scales_the_update_by_the_inverse_square() {
-        // scale[d] = 1/(spacing[d]·r). Doubling an isotropic spacing halves
-        // every scale, and the update is quadratic in them, so the applied
-        // delta is quartered. The gate is unaffected: rescaling the gradient
+        // scale[d] = 1/spacing[d] (§1.8: no `/r` factor). Doubling an isotropic
+        // spacing halves every scale, and the update is quadratic in them, so
+        // the applied delta is quartered. The gate is unaffected: rescaling the gradient
         // uniformly changes neither its direction (so `ComputeThreshold` picks
         // the same lattice points) nor the ball average.
         let img_unit = block_2x2();
