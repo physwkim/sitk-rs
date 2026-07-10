@@ -1,4 +1,6 @@
 use super::*;
+use crate::FilterError;
+use sitk_core::PixelId;
 
 /// A 5x1 `Float64` image. `dim == 2`, so the normalizer is `(1² + 1²)/2 == 1`
 /// and every y-derivative is a boundary zero (the y axis has extent 1).

@@ -1,4 +1,4 @@
-//! `DemonsRegistrationFilter`: PDE deformable registration by Thirion's demons.
+//! PDE deformable registration: Thirion's demons and its variants.
 //!
 //! Ported from ITK's `Modules/Registration/PDEDeformable`:
 //!
@@ -11,6 +11,12 @@
 //! | per-iteration hooks | `itkDemonsRegistrationFilter.hxx` (`InitializeIteration`, `ApplyUpdate`) |
 //! | the PDE | `itkDemonsRegistrationFunction.hxx` (`ComputeUpdate`, `InitializeIteration`, `ReleaseGlobalDataPointer`) |
 //! | this module's public surface | `DemonsRegistrationFilter.yaml` |
+//!
+//! [`fast_symmetric_forces_demons_registration`] is the same solver over
+//! `ESMDemonsRegistrationFunction`. Every filter in the family reports the same
+//! three measurements, so they share [`DemonsResult`].
+//!
+//! The rest of this page describes [`demons_registration`] itself.
 //!
 //! # Inputs and output
 //!
@@ -102,14 +108,23 @@
 //! is dead from SimpleITK's side. This port takes a per-axis vector and applies
 //! it to the update field, as the yaml documents.
 
+mod common;
+mod esm;
+mod fast_symmetric;
 mod field;
 mod image_function;
 
-use sitk_core::{Image, PixelId};
+use sitk_core::Image;
 
-use crate::{FilterError, Result};
+use crate::Result;
+use common::{halt, initial_field, output_field, per_axis, validate_image_pair};
 use field::{Field, Smoothing, smooth_field};
 use image_function::RealImage;
+
+pub use esm::EsmGradient;
+pub use fast_symmetric::{
+    FastSymmetricForcesDemonsParams, fast_symmetric_forces_demons_registration,
+};
 
 /// The yaml's parameter surface. [`Default`] carries the yaml defaults.
 #[derive(Clone, Debug, PartialEq)]
@@ -172,7 +187,8 @@ impl Default for DemonsParams {
     }
 }
 
-/// The displacement field together with the measurements SimpleITK reports.
+/// The displacement field together with the three measurements every filter in
+/// the family reports.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DemonsResult {
     /// `GetOutput()`: a `VectorFloat64` image with one component per dimension.
@@ -299,20 +315,6 @@ impl<'a> DemonsFunction<'a> {
     }
 }
 
-/// Take the first `dim` entries of a `dim_vec` parameter, as
-/// `sitkSTLVectorToITK` does (sitkTemplateFunctions.h:97-112): it throws when
-/// the vector is shorter than the image dimension and silently truncates when
-/// it is longer.
-fn per_axis(values: &[f64], dim: usize) -> Result<Vec<f64>> {
-    if values.len() < dim {
-        return Err(FilterError::DimensionLength {
-            expected: dim,
-            got: values.len(),
-        });
-    }
-    Ok(values[..dim].to_vec())
-}
-
 /// `DemonsRegistrationFilter`: register `moving` onto `fixed` by Thirion's
 /// demons, returning the displacement field.
 ///
@@ -331,24 +333,7 @@ pub fn demons_registration(
     initial_displacement_field: Option<&Image>,
     params: &DemonsParams,
 ) -> Result<DemonsResult> {
-    if fixed.pixel_id() != moving.pixel_id() {
-        return Err(FilterError::TypeMismatch {
-            a: fixed.pixel_id(),
-            b: moving.pixel_id(),
-        });
-    }
-    if fixed.dimension() != moving.dimension() {
-        return Err(FilterError::ImageDimensionMismatch {
-            a: fixed.dimension(),
-            b: moving.dimension(),
-        });
-    }
-    // `GaussianOperator::SetMaximumError` (itkGaussianOperator.h:86-95).
-    if !(params.maximum_error > 0.0 && params.maximum_error < 1.0) {
-        return Err(FilterError::GaussianMaximumErrorOutOfRange(
-            params.maximum_error,
-        ));
-    }
+    validate_image_pair(fixed, moving, params.maximum_error)?;
 
     let dim = fixed.dimension();
     // `RealImage::new` runs `Image::to_f64_vec`, whose scalar guard rejects a
@@ -367,35 +352,7 @@ pub fn demons_registration(
         maximum_kernel_width: params.maximum_kernel_width,
     };
 
-    // `PDEDeformableRegistrationFilter::CopyInputToOutput`: copy the initial
-    // field if one is set, else fill with zeros.
-    let mut field = match initial_displacement_field {
-        Some(initial) => {
-            if initial.pixel_id() != PixelId::VectorFloat64 {
-                return Err(FilterError::TypeMismatch {
-                    a: PixelId::VectorFloat64,
-                    b: initial.pixel_id(),
-                });
-            }
-            if initial.number_of_components_per_pixel() != dim {
-                return Err(FilterError::DimensionLength {
-                    expected: dim,
-                    got: initial.number_of_components_per_pixel(),
-                });
-            }
-            if initial.size() != fixed.size() {
-                return Err(FilterError::SizeMismatch {
-                    a: initial.size().to_vec(),
-                    b: fixed.size().to_vec(),
-                });
-            }
-            Field {
-                data: initial.component_slice::<f64>()?.to_vec(),
-                size: fixed.size().to_vec(),
-            }
-        }
-        None => Field::zeros(fixed.size()),
-    };
+    let mut field = initial_field(fixed, initial_displacement_field)?;
 
     let mut function = DemonsFunction::new(&fixed_real, &moving_real, params);
     let mut update = Field::zeros(fixed.size());
@@ -407,7 +364,12 @@ pub fn demons_registration(
     let mut rms_change = 0.0f64;
 
     // `FiniteDifferenceImageFilter::GenerateData`'s `while (!this->Halt())`.
-    while !halt(elapsed_iterations, rms_change, params) {
+    while !halt(
+        elapsed_iterations,
+        rms_change,
+        params.number_of_iterations,
+        params.maximum_rms_error,
+    ) {
         // `PDEDeformableRegistrationFilter::InitializeIteration` →
         // `FiniteDifferenceImageFilter::InitializeIteration` → the function's.
         function.initialize_iteration();
@@ -444,31 +406,12 @@ pub fn demons_registration(
         elapsed_iterations += 1;
     }
 
-    let mut displacement_field = Image::from_vec_vector(fixed.size(), dim, field.data)?;
-    // `PDEDeformableRegistrationFilter::GenerateOutputInformation` copies the
-    // output's information from the initial field when set, else from the fixed
-    // image.
-    displacement_field.copy_geometry_from(initial_displacement_field.unwrap_or(fixed));
-
     Ok(DemonsResult {
-        displacement_field,
+        displacement_field: output_field(fixed, initial_displacement_field, field)?,
         elapsed_iterations,
         rms_change,
         metric: function.metric,
     })
-}
-
-/// `PDEDeformableRegistrationFilter::Halt` (which only adds the unreachable
-/// `StopRegistration` flag) over `FiniteDifferenceImageFilter::Halt`
-/// (itkFiniteDifferenceImageFilter.hxx:208-233).
-fn halt(elapsed: u32, rms_change: f64, params: &DemonsParams) -> bool {
-    if elapsed >= params.number_of_iterations {
-        return true;
-    }
-    if elapsed == 0 {
-        return false;
-    }
-    params.maximum_rms_error > rms_change
 }
 
 #[cfg(test)]

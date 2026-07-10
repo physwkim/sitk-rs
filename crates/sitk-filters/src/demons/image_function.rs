@@ -6,7 +6,7 @@
 //! `DemonsRegistrationFunction` asks of them (`static_cast<double>` on every
 //! read, `CoordinateType = double`).
 
-use sitk_core::{Error, Image, matrix};
+use sitk_core::{Error, Image, PixelId, matrix};
 
 use crate::Result;
 
@@ -26,6 +26,11 @@ pub(crate) struct RealImage {
     /// Row-major inverse of `direction`.
     inverse_direction: Vec<f64>,
     strides: Vec<usize>,
+    /// The image's own (scalar) pixel type, kept because
+    /// `ESMDemonsRegistrationFunction` warps the moving image into an
+    /// `itk::Image<MovingPixelType>` and both quantises to, and sentinels on,
+    /// that type.
+    pixel_id: PixelId,
 }
 
 impl RealImage {
@@ -50,6 +55,7 @@ impl RealImage {
             direction: image.direction().to_vec(),
             inverse_direction,
             strides,
+            pixel_id: image.pixel_id(),
         })
     }
 
@@ -59,6 +65,14 @@ impl RealImage {
 
     pub(crate) fn spacing(&self) -> &[f64] {
         &self.spacing
+    }
+
+    pub(crate) fn size(&self) -> &[usize] {
+        &self.size
+    }
+
+    pub(crate) fn pixel_id(&self) -> PixelId {
+        self.pixel_id
     }
 
     /// The pixel at an in-bounds multi-index.
@@ -223,6 +237,16 @@ impl RealImage {
     /// `1` is therefore zero everywhere. The index-space derivative is then
     /// rotated into physical space by the direction matrix.
     pub(crate) fn central_difference_at_index(&self, index: &[usize]) -> Vec<f64> {
+        self.local_vector_to_physical_vector(&self.central_difference_at_index_local(index))
+    }
+
+    /// `CentralDifferenceImageFunction::EvaluateAtIndex` with
+    /// `UseImageDirectionOff()`, which leaves the derivative in index space —
+    /// the setting `ESMDemonsRegistrationFunction` uses for both of its gradient
+    /// calculators (itkESMDemonsRegistrationFunction.hxx:50, :53) because it
+    /// rotates the summed gradient once, at the end, by the *fixed* image's
+    /// direction.
+    pub(crate) fn central_difference_at_index_local(&self, index: &[usize]) -> Vec<f64> {
         let dim = self.dimension();
         let mut derivative = vec![0.0f64; dim];
         let mut neighbor: Vec<i64> = index.iter().map(|&i| i as i64).collect();
@@ -243,7 +267,7 @@ impl RealImage {
             derivative[d] = (plus - minus) * 0.5 / self.spacing[d];
         }
 
-        self.local_vector_to_physical_vector(&derivative)
+        derivative
     }
 
     /// `CentralDifferenceImageFunction::Evaluate(PointType)`, the scalar
@@ -303,9 +327,20 @@ impl RealImage {
         derivative
     }
 
+    /// `CentralDifferenceImageFunction::Evaluate(PointType)` with
+    /// `UseImageDirectionOff()`: the physical-space derivative is rotated back
+    /// into index space by the inverse direction
+    /// (itkCentralDifferenceImageFunction.hxx:311-316). This is what
+    /// `ESMDemonsRegistrationFunction`'s `MappedMoving` gradient evaluates on
+    /// the *moving* image before the *fixed* image's direction is applied to the
+    /// result.
+    pub(crate) fn central_difference_at_point_local(&self, point: &[f64]) -> Vec<f64> {
+        self.physical_vector_to_local_vector(&self.central_difference_at_point(point))
+    }
+
     /// `ImageBase::TransformLocalVectorToPhysicalVector`
     /// (itkImageBase.h:636-654): `out = Direction * in`.
-    fn local_vector_to_physical_vector(&self, local: &[f64]) -> Vec<f64> {
+    pub(crate) fn local_vector_to_physical_vector(&self, local: &[f64]) -> Vec<f64> {
         let dim = self.dimension();
         (0..dim)
             .map(|i| {
@@ -313,6 +348,21 @@ impl RealImage {
                     .iter()
                     .zip(local)
                     .map(|(&d, &l)| d * l)
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// `ImageBase::TransformPhysicalVectorToLocalVector`
+    /// (itkImageBase.h:685-702): `out = Direction⁻¹ * in`.
+    fn physical_vector_to_local_vector(&self, physical: &[f64]) -> Vec<f64> {
+        let dim = self.dimension();
+        (0..dim)
+            .map(|i| {
+                Self::row(&self.inverse_direction, i, dim)
+                    .iter()
+                    .zip(physical)
+                    .map(|(&m, &p)| m * p)
                     .sum()
             })
             .collect()
@@ -483,6 +533,33 @@ mod tests {
         let c = img.physical_point_to_continuous_index(&p);
         assert!((c[0] - 1.0).abs() < 1e-12);
         assert!((c[1] - 2.0).abs() < 1e-12);
+    }
+
+    /// `UseImageDirectionOff()` leaves `EvaluateAtIndex`'s derivative in index
+    /// space, so the same image that rotates to `(-3, 1)` reports `(1, 3)`.
+    #[test]
+    fn central_difference_at_index_local_skips_the_direction_matrix() {
+        let mut image = Image::from_vec(&[3, 3], (0..9).map(f64::from).collect()).unwrap();
+        image.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let img = RealImage::new(&image).unwrap();
+        assert_eq!(
+            img.central_difference_at_index_local(&[1, 1]),
+            vec![1.0, 3.0]
+        );
+    }
+
+    /// `UseImageDirectionOff()` on the point overload rotates the physical
+    /// derivative back by `Direction⁻¹`, recovering the index-space derivative.
+    #[test]
+    fn central_difference_at_point_local_undoes_the_direction_matrix() {
+        let mut image = Image::from_vec(&[3, 3], (0..9).map(f64::from).collect()).unwrap();
+        // physical x = -index y, physical y = index x; the pixel centre of
+        // index (1, 1) is then at physical (-1, 1).
+        image.set_direction(&[0.0, -1.0, 1.0, 0.0]).unwrap();
+        let img = RealImage::new(&image).unwrap();
+        let g = img.central_difference_at_point_local(&[-1.0, 1.0]);
+        assert!((g[0] - 1.0).abs() < 1e-12, "{g:?}");
+        assert!((g[1] - 3.0).abs() < 1e-12, "{g:?}");
     }
 
     #[test]
