@@ -40,6 +40,26 @@ pub enum RegistrationError {
     #[error("metric sampling percentage length {got} != number of levels {expected}")]
     SamplingPercentageLength { got: usize, expected: usize },
 
+    /// One of the four `set_virtual_domain` vectors has the wrong length.
+    /// `size` sets the dimension; `origin` and `spacing` must match it and
+    /// `direction` must be its square (SimpleITK `SetVirtualDomain`, which
+    /// raises "Expected virtualOrigin to be of length N!" and siblings).
+    #[error("virtual domain {field} length {got} != {expected}")]
+    VirtualDomainLength {
+        field: &'static str,
+        got: usize,
+        expected: usize,
+    },
+
+    /// [`execute_with_initial_transform`] was called without a prior
+    /// [`set_initial_transform`].
+    ///
+    /// [`execute_with_initial_transform`]:
+    /// crate::ImageRegistrationMethod::execute_with_initial_transform
+    /// [`set_initial_transform`]: crate::ImageRegistrationMethod::set_initial_transform
+    #[error("no initial transform was set")]
+    NoInitialTransform,
+
     /// Wrapped core error (e.g. constructing the output image).
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
