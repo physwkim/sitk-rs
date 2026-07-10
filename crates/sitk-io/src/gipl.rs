@@ -107,27 +107,53 @@
 //! suffix test for `.gipl` and `.gipl.gz` that also sets `m_IsCompressed`.
 //! Ledger §2.97.
 //!
-//! `.gipl.gz` is handled upstream by a `gzFile`. This workspace has no zlib
-//! (ledger §5.8), so [`read`], [`read_information`] and [`write`] refuse it with
-//! [`IoError::UnsupportedGiplFeature`] at exactly the point upstream would have
-//! called `gzopen`. [`GiplImageIo::can_read_file`] claims a `.gipl.gz` on its
-//! name alone — upstream verifies the magic number *through* the gzip stream,
-//! which is precisely what is unavailable — so that the failure is reported as
-//! the missing zlib rather than as "no reader found". Ledger §4.68.
+//! `.gipl.gz` is handled upstream by a `gzFile`: `CanReadFile` seeks through it
+//! to the magic number (`:143-174`), `ReadImageInformation`/`Read` walk it
+//! field by field with `gzread` (`:251-585`, `:210-243`), and `Write` walks it
+//! with `gzwrite` (`:669-1044`). This port reuses [`crate::compression`]'s gzip
+//! door instead of a `gzFile`: [`read`] and [`read_information`] decompress
+//! with `gunzip_transparent`/`gunzip_transparent_prefix` before parsing exactly
+//! as the uncompressed path does, and [`write`] compresses the same bytes the
+//! uncompressed path would have written with `gzip_compress`. Ledger §4.68,
+//! closed.
+//!
+//! Two upstream quirks carry through the gzip door rather than being blocked
+//! by it. First, zlib's `gz_look` — reached through the plain `gzopen` both
+//! `CanReadFile` and `Write` call, with no level argument — falls back to a
+//! transparent byte-for-byte copy when the gzip magic is absent, exactly as it
+//! does for NRRD and NIfTI (ledger §2.113). A `.gipl.gz` holding a plain
+//! uncompressed GIPL file therefore reads it verbatim, magic number and all;
+//! extended to GIPL at ledger §2.114. Second, because
+//! `gzopen(m_FileName.c_str(), "wb")` (`:671`) never appends a
+//! compression-level digit — unlike NrrdIO's `nrrd__GzOpen(file, "w<level>")`
+//! — `Write` always compresses at zlib's `Z_DEFAULT_COMPRESSION` (6), ignoring
+//! `m_CompressionLevel` entirely, and compression follows the file name alone
+//! rather than `m_UseCompression`. Same precedent as NIfTI, §3.40; extended to
+//! GIPL at ledger §3.41.
 //!
 //! # Truncated data
 //!
-//! `Read` tests `!m_Ifstream.bad()` for success (`:226`), but a short `read`
-//! sets `failbit`/`eofbit`, never `badbit` — so upstream returns success with
-//! the tail of ITK's freshly-allocated buffer left uninitialised. That is C++ UB
-//! and unreachable in safe Rust: [`read`] returns [`IoError::TruncatedData`].
-//! Ledger §1.53 / §4.69.
+//! `Read` tests `!m_Ifstream.bad()` for success on the uncompressed path
+//! (`:226`), but a short `read` sets `failbit`/`eofbit`, never `badbit` — so
+//! upstream returns success with the tail of ITK's freshly-allocated buffer
+//! left uninitialised. On the compressed path the check is even weaker:
+//! `success = p != nullptr` (`:219-223`) tests the *output buffer pointer*,
+//! which is never null, so a `gzread` that under-fills the buffer — a
+//! truncated or corrupt `.gipl.gz` — is unconditionally reported as success.
+//! Ledger §1.58. Both are C++ UB and unreachable in safe Rust: [`read`]
+//! returns [`IoError::TruncatedData`] for a short decompressed stream and
+//! propagates [`IoError::CorruptCompressedData`] from a gzip stream that will
+//! not inflate at all. Ledger §1.53/§4.69, extended to the compressed path at
+//! §4.76.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use sitk_core::{Image, PixelBuffer, PixelId};
 
+use crate::compression::{
+    ZLIB_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gunzip_transparent_prefix, gzip_compress,
+};
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
 use crate::writer::WriteOptions;
@@ -178,13 +204,6 @@ fn check_extension(path: &Path) -> Option<bool> {
 /// uncompressed GIPL.
 fn is_compressed(path: &Path) -> bool {
     check_extension(path) == Some(true)
-}
-
-fn zlib_unavailable(what: &str) -> IoError {
-    IoError::UnsupportedGiplFeature(format!(
-        "{what}: gzip-compressed GIPL needs zlib, which this workspace does not \
-         depend on (upstream calls gzopen here; see doc/upstream-findings.md §5.8)"
-    ))
 }
 
 /// `image_type` → component type (itkGiplImageIO.cxx:331-360). An unrecognized
@@ -386,10 +405,12 @@ fn identity(n: usize) -> Vec<f64> {
 /// The direction matrix is the identity: GIPL has no orientation field the
 /// reader keeps (`flag1` is read and discarded).
 pub fn read(path: &Path) -> Result<Image> {
-    if is_compressed(path) {
-        return Err(zlib_unavailable("read"));
-    }
-    let bytes = std::fs::read(path)?;
+    let raw = std::fs::read(path)?;
+    let bytes = if is_compressed(path) {
+        gunzip_transparent(&raw)?
+    } else {
+        raw
+    };
     let header = parse_header(&bytes)?;
 
     // `Read` reads `GetImageSizeInBytes()` bytes and *then* swaps, so the
@@ -421,15 +442,17 @@ pub fn read(path: &Path) -> Result<Image> {
 /// nothing into `m_MetaDataDictionary` — not even the `ITK_InputFilterName`
 /// `MetaImageIO` installs.
 pub fn read_information(path: &Path) -> Result<ImageInformation> {
-    use std::io::Read;
+    let head = if is_compressed(path) {
+        gunzip_transparent_prefix(&std::fs::read(path)?, HEADER_SIZE)?
+    } else {
+        use std::io::Read;
 
-    if is_compressed(path) {
-        return Err(zlib_unavailable("read"));
-    }
-    let mut head = Vec::new();
-    std::fs::File::open(path)?
-        .take(HEADER_SIZE as u64)
-        .read_to_end(&mut head)?;
+        let mut head = Vec::new();
+        std::fs::File::open(path)?
+            .take(HEADER_SIZE as u64)
+            .read_to_end(&mut head)?;
+        head
+    };
     let header = parse_header(&head)?;
     let dimension = header.size.len();
 
@@ -456,12 +479,17 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
 /// * a `UInt32`/`Int32` image leaves the full **256-byte header**, then
 ///   `"Pixel Type Unknown"` from `SwapBytesIfNecessary` (`:1010`/`:1024`).
 ///
+/// For a `.gipl.gz` target the same partial bytes are what upstream's `gzFile`
+/// ends up holding too: `Write` never calls `gzclose` before either throw, so
+/// zlib's small internal write buffer is only flushed — and the gzip trailer
+/// written — once the exception unwinds and `GiplImageIO`'s destructor runs
+/// (`:81-95`). This port models that outcome directly: every exit point
+/// gzip-compresses the same `out` buffer the uncompressed path writes verbatim.
+///
 /// `WriteImageInformation` is a no-op upstream ("not possible to write a Gipl
 /// file", `:655-659`); the header is emitted by `Write` alone.
 pub fn write(img: &Image, path: &Path) -> Result<()> {
-    if is_compressed(path) {
-        return Err(zlib_unavailable("write"));
-    }
+    let compressed = is_compressed(path);
     let n = img.dimension();
     let size = img.size();
     let mut out = Vec::with_capacity(HEADER_SIZE);
@@ -475,7 +503,7 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
 
     let component = img.buffer().component_id();
     let Some(image_type) = image_type_code(component) else {
-        std::fs::write(path, &out)?;
+        write_bytes(path, &out, compressed)?;
         return Err(IoError::UnsupportedGiplFeature(format!(
             "Invalid type: {} (GiplImageIO::Write has no image_type for it; \
              the file keeps the 8 dims bytes already written)",
@@ -511,14 +539,26 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
     debug_assert_eq!(out.len(), HEADER_SIZE);
 
     if !is_swappable(component) {
-        std::fs::write(path, &out)?;
+        write_bytes(path, &out, compressed)?;
         return Err(pixel_type_unknown(component));
     }
 
     // `GetImageSizeInBytes()` counts every component, so a vector or complex
     // image writes more bytes than its scalar `image_type` describes (§2.96).
     out.extend_from_slice(&buffer_to_be_bytes(img.buffer()));
-    std::fs::write(path, &out)?;
+    write_bytes(path, &out, compressed)?;
+    Ok(())
+}
+
+/// The uncompressed bytes verbatim, or gzip-compressed at zlib's
+/// `Z_DEFAULT_COMPRESSION` (6) — the level `gzopen(path, "wb")` uses, since
+/// `Write` never passes one (`:671`). Ledger §3.41.
+fn write_bytes(path: &Path, data: &[u8], compressed: bool) -> Result<()> {
+    if compressed {
+        std::fs::write(path, gzip_compress(data, ZLIB_DEFAULT_COMPRESSION_LEVEL))?;
+    } else {
+        std::fs::write(path, data)?;
+    }
     Ok(())
 }
 
@@ -544,17 +584,29 @@ impl ImageIo for GiplImageIo {
     }
 
     /// `CanReadFile` (itkGiplImageIO.cxx:97-175): the extension, then the magic
-    /// number at offset 252.
-    ///
-    /// A `.gipl.gz` needs zlib to reach its magic number, so this port claims it
-    /// on the name alone and lets [`read`] name the missing dependency. Ledger
-    /// §4.68.
+    /// number at offset 252 — read directly for `.gipl`, and through
+    /// `gzopen`/`gzseek`/`gzread` for `.gipl.gz`. zlib's `gz_look` transparent
+    /// fallback (ledger §2.113, extended to GIPL at §2.114) means a `.gipl.gz`
+    /// holding plain, non-gzip bytes has its magic checked against those bytes
+    /// directly, exactly as `.gipl` does.
     fn can_read_file(&self, path: &Path) -> bool {
         use std::io::{Read, Seek, SeekFrom};
 
         match check_extension(path) {
             None => false,
-            Some(true) => path.is_file(),
+            Some(true) => {
+                let Ok(raw) = std::fs::read(path) else {
+                    return false;
+                };
+                let Ok(head) = gunzip_transparent_prefix(&raw, HEADER_SIZE) else {
+                    return false;
+                };
+                if head.len() < HEADER_SIZE {
+                    return false;
+                }
+                let magic = u32::from_be_bytes(head[252..256].try_into().expect("4 bytes"));
+                magic == GIPL_MAGIC_NUMBER || magic == GIPL_MAGIC_NUMBER2
+            }
             Some(false) => {
                 let Ok(mut file) = std::fs::File::open(path) else {
                     return false;
@@ -573,7 +625,7 @@ impl ImageIo for GiplImageIo {
     }
 
     /// `CanWriteFile` is `CheckExtension` alone (itkGiplImageIO.cxx:177-196), so
-    /// `.gipl.gz` is claimed for writing and then refused inside [`write`].
+    /// `.gipl.gz` is claimed for writing and [`write`] compresses it.
     fn can_write_file(&self, path: &Path) -> bool {
         check_extension(path).is_some()
     }
@@ -587,7 +639,11 @@ impl ImageIo for GiplImageIo {
     }
 
     /// `options` is ignored: `GiplImageIO` compresses iff the file name ends
-    /// in `.gipl.gz` (itkGiplImageIO.cxx:249-256), never from `m_UseCompression`.
+    /// in `.gipl.gz` (itkGiplImageIO.cxx:249-256), never from `m_UseCompression`
+    /// — and never from the compression *level* either, since
+    /// `gzopen(m_FileName.c_str(), "wb")` (`:671`) names none. Every `.gipl.gz`
+    /// compresses at zlib's default level 6. Same precedent as NIfTI, ledger
+    /// §3.40, extended to GIPL at §3.41.
     fn write(&self, image: &Image, path: &Path, _options: &WriteOptions) -> Result<()> {
         write(image, path)
     }
