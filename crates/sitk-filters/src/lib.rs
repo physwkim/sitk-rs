@@ -131,7 +131,8 @@ pub use anisotropic_diffusion::{
 };
 pub use attribute_morphology::{area_closing, area_opening};
 pub use binary_morphology::{
-    binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
+    VotingBinaryHoleFillingResult, binary_fillhole, binary_grind_peak, binary_median,
+    binary_thinning, voting_binary, voting_binary_hole_filling,
     voting_binary_iterative_hole_filling,
 };
 pub use bspline_decomposition::{bspline_decomposition, bspline_spline_poles};
