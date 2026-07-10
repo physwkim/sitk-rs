@@ -58,8 +58,18 @@
 //!
 //! ITK's fourth mode, `AllTargets`, is unreachable from this API — the clamp
 //! makes `SomeTargets` with `n >= target_points.len()` behave identically
-//! anyway, since each in-bounds target is accepted at most once.
+//! anyway, since each distinct in-bounds target is accepted at most once.
 //! [`crate::colliding_fronts`] drives `AllTargets` through the internal seam.
+//!
+//! **§1.24 (fixed here):** `SomeTargets`/`AllTargets` terminate on the number
+//! of *distinct in-bounds* targets, not the raw container size. Upstream inserts
+//! at most one reached node per accepted index but compares that count against
+//! `m_TargetPoints->Size()` (`AllTargets`) or the user's `m_NumberOfTargets`
+//! (`SomeTargets`), both of which count duplicate and out-of-image entries — so
+//! a target list with a repeated index (which SimpleITK's `min(n, len)` clamp
+//! can then let `n` exceed the distinct count) makes termination unreachable and
+//! the front marches the whole image. This port counts distinct reachable
+//! targets, so the requested stop is honoured regardless of duplicates.
 //!
 //! Every mode but `NoTargets` requires at least one target point
 //! (`VerifyTargetReachedModeConditions`); an empty list is
@@ -84,9 +94,10 @@
 //!   target accepted before the march stops overwrites `m_TargetValue`.
 //!
 //! Target points are never bounds-filtered upstream: an out-of-image target
-//! node stays in the container (so it counts towards the size `AllTargets`
-//! compares against) and simply never matches an accepted index. Trial points
-//! *are* dropped when out of bounds, by the base class's `Initialize()`.
+//! node stays in the container and simply never matches an accepted index. It no
+//! longer counts towards the termination denominator here (§1.24), so under
+//! `OneTarget` an out-of-image sole target still never stops the front. Trial
+//! points *are* dropped when out of bounds, by the base class's `Initialize()`.
 //!
 //! ## Seed values
 //!
@@ -498,6 +509,54 @@ mod tests {
         let (some, some_value) = near_targets(2);
         assert_close(&some, &marched);
         assert_eq!(some_value, 2.0);
+    }
+
+    /// §1.24: `SomeTargets` terminates on the number of *distinct in-bounds*
+    /// targets, so a duplicate target entry no longer inflates the count past
+    /// what the march can reach.
+    ///
+    /// 9×1 line, unit speed, seed at `x = 4`. Targets `[x=3, x=3]` — the same
+    /// index twice — with `number_of_targets = 2`. SimpleITK's `min(n, len)`
+    /// maps this to `SomeTargets` with `m_NumberOfTargets = min(2, 2) = 2`, but
+    /// only one distinct index (`x=3`) can be reached, so `m_ReachedTargetPoints`
+    /// tops out at 1. Upstream's `reached == 2` never holds and the front marches
+    /// the whole line, ending `m_TargetValue` at the last Eikonal value (4).
+    ///
+    /// The fix clamps the threshold to the distinct count `min(2, 1) = 1`, so
+    /// `x=3` (reached at `T = 1`) fires the stop and drops the stopping value to
+    /// `1 + offset(1) = 2`. Pixels with `T <= 2` (`x=2..x=6`) go alive and write
+    /// their neighbours' trial values, so `x=1`/`x=7` (`T = 3`) hold their
+    /// computed trial value when the pop of `x=1` at `T = 3 > 2` breaks the loop
+    /// (`stopping_value` truncates but does not clear already-written trials);
+    /// `x=0`/`x=8` stay `large` because `x=1`/`x=7` never go alive:
+    ///
+    ///     [large, 3, 2, 1, 0, 1, 2, 3, large]
+    ///
+    /// Buggy upstream (`reached == 2` unreachable) would march the whole line to
+    /// `[4, 3, 2, 1, 0, 1, 2, 3, 4]`. `m_TargetValue` keeps advancing while the
+    /// count stays met (no further distinct target is accepted), so it ends at
+    /// the last accepted value, 2.
+    #[test]
+    fn some_targets_terminates_on_distinct_targets_despite_a_duplicate() {
+        let large = large_value(PixelId::Float64);
+        let out = fast_marching_upwind_gradient(
+            &speed_f64(&[9, 1], 1.0),
+            &[vec![4, 0]],
+            &[],
+            &[vec![3, 0], vec![3, 0]],
+            &FastMarchingUpwindGradientSettings {
+                number_of_targets: 2,
+                target_offset: 1.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[large, 3.0, 2.0, 1.0, 0.0, 1.0, 2.0, 3.0, large],
+        );
+        assert_eq!(out.target_value, 2.0);
     }
 
     /// With no targets, `m_TargetValue` is the last (largest) Eikonal value.
