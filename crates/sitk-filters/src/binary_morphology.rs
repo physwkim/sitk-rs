@@ -69,9 +69,9 @@
 //!   nor `background_value` does *not* pass through: the `.hxx` only ever
 //!   counts foreground matches and always writes one of the two output
 //!   values (`DynamicThreadedGenerateData`'s `if (count > medianPosition) ...
-//!   else ...` has no third branch), so such a pixel becomes
-//!   `background_value` (it contributes nothing to `count`, so `count` can
-//!   only fail the majority test).
+//!   else ...` has no third branch). The center's own value only costs one
+//!   potential foreground vote — with a foreground-majority neighborhood
+//!   such a pixel still becomes `foreground_value`.
 //! - [`binary_thinning`] — `itkBinaryThinningImageFilter.h`/`.hxx`: the
 //!   Gonzalez–Woods sequential thinning algorithm. ITK only wraps this filter
 //!   for 2-D images (`itkBinaryThinningImageFilter.wrap`'s
