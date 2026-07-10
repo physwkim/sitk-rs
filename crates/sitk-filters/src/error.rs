@@ -606,6 +606,16 @@ pub enum FilterError {
     #[error("sample variance must be nonnegative, got {0}")]
     InvalidSampleVariance(f64),
 
+    /// SimpleITK's `GetImageFromVectorImage` (`sitkImageConvert.hxx:38-42`)
+    /// throws "Expected number of elements in vector image to be the same as
+    /// the dimension!" -- every `ITKDisplacementField` filter reinterprets its
+    /// `itk::VectorImage<T, N>` input as an `itk::Image<itk::Vector<T, N>, N>`,
+    /// which is only sound when the run-time component count equals `N`.
+    #[error(
+        "a displacement field needs one component per dimension: got {components} components for a {dimension}-D image"
+    )]
+    DisplacementFieldComponentMismatch { components: usize, dimension: usize },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
