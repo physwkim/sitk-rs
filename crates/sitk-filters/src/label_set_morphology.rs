@@ -91,19 +91,25 @@
 //!    (`.hxx:329`) exists precisely to avoid it. Pinned by
 //!    [`tests::spacing_mode_radius_one_is_an_identity`].
 //!
-//! 3. **`firstval` and "the first pass" are not the same axis.** `firstval` is
-//!    the first *nonzero radius* (`.hxx:339-347`), but the first axis actually
-//!    processed is the first with `scale[d] > 0` (`.hxx:364-375` and
-//!    `itkLabelSetDilateImageFilter.hxx:196`). In the non-spacing branch every
-//!    `scale[d]` is `>= 1`, so axis `0` always runs — even when `r[0] == 0`.
-//!    Consequences, both reproduced here:
+//! 3. **`firstval` and "the first pass" were not the same axis — fixed here
+//!    (§2.57(b)).** `firstval` is the first *nonzero radius* (`.hxx:339-347`),
+//!    but upstream processes the first axis with `scale[d] > 0` (`.hxx:364-375`
+//!    and `itkLabelSetDilateImageFilter.hxx:102`). In the non-spacing branch
+//!    every `scale[d]` is `>= 1`, so axis `0` always ran — even when
+//!    `r[0] == 0`. That silently misapplied the `Radius` parameter:
 //!    - Dilation with `Radius = (0, k)` and `UseImageSpacing = false` still
-//!      dilates one voxel along axis 0, because that axis runs the first pass
+//!      dilated one voxel along axis 0, because that axis ran the first pass
 //!      with `sigma = scale[0] = 1` and `magnitude = 0.5`.
-//!    - Erosion with the same settings caps the distance image at `sigma = 1`
-//!      while the last pass compares against `BaseSigma = 0.5*k^2 + 1 > 1`, so
-//!      **the output is entirely background** for any `k >= 1`. Pinned by
-//!      [`tests::erode_zero_leading_radius_without_spacing_blanks_the_output`].
+//!    - Erosion with the same settings capped the distance image at `sigma = 1`
+//!      while the last pass compared against `BaseSigma = 0.5*k^2 + 1 > 1`, so
+//!      **the output was entirely background** for any `k >= 1`.
+//!
+//!    This port gates each axis's run on `radius[axis] != 0` (the same
+//!    predicate `firstval` keys off), so a zero-radius axis is skipped and the
+//!    first axis processed *is* `firstval`. In spacing mode `scale[d] > 0`
+//!    already coincides with `radius[d] != 0`, so that path is unchanged. Pinned
+//!    by [`tests::dilate_zero_leading_radius_dilates_the_named_axis_only`] and
+//!    [`tests::erode_zero_leading_radius_erodes_the_named_axis_only`].
 //!
 //! 4. **Erosion can leave the output image uninitialized.** The label output is
 //!    written only when `lastpass` is true (`itkLabelSetUtils.h:345`, `:572`),
@@ -128,12 +134,15 @@
 //!    `labBuf[j2]`, which is `0` there. Reproduced anyway, so the distance
 //!    image matches upstream byte for byte.
 //!
-//! 6. **Run detection compares labels as `float`.** `RealType val = labBuf[idx]`
-//!    (`.h:297`, `:516`) narrows the label to `float` before
-//!    `val != labBuf[idxend]` promotes each subsequent label back to `float`.
-//!    Two distinct labels that round to the same `float` — e.g. `16777216` and
-//!    `16777217` for `Int32` — merge into one run and erode as a single
-//!    object. Reproduced by [`same_run`].
+//! 6. **Run detection compared labels as `float` — fixed here (§2.57(d)).**
+//!    Upstream's `RealType val = labBuf[idx]` (`.h:297`, `:516`) narrows the
+//!    label to `float` before `val != labBuf[idxend]` promotes each subsequent
+//!    label back to `float`, so two distinct labels that round to the same
+//!    `float` — e.g. `16777216` and `16777217` for `Int32` — merged into one
+//!    run and eroded as a single object instead of separating. [`same_run`]
+//!    compares in the `f64` label domain the rest of the filter uses, so
+//!    distinct integer labels stay distinct. Pinned by
+//!    [`tests::f64_label_comparison_separates_adjacent_int32_labels`].
 //!
 //! 7. **`DoLineDilateFirstPass`'s right pass reads the *original* labels at
 //!    the contact point** (`labBuf[lastcontact]`, `.h:108`), not the labels the
@@ -159,11 +168,15 @@ use crate::image_from_f64;
 use crate::logic::require_integer_pixel_type;
 use sitk_core::Image;
 
-/// `RealType val = labBuf[idx]; ... val != labBuf[idxend]` — the run-detection
-/// comparison of `itkLabelSetUtils.h:297,304` and `:516,523`, in `f32`.
-/// See upstream finding 6.
+/// Whether two label values belong to the same run (`val != labBuf[idxend]` at
+/// `itkLabelSetUtils.h:297,304` and `:516,523`). **Fixed here (§2.57(d)):**
+/// compared in the `f64` label domain the rest of the filter uses, not narrowed
+/// to `f32` first. Upstream's `RealType val = labBuf[idx]` narrows the label to
+/// `float`, so two distinct `Int32` labels that share a `float` representation
+/// — e.g. `16777216` and `16777217` — merged into one run and eroded as a
+/// single object instead of separating.
 fn same_run(a: f64, b: f64) -> bool {
-    a as f32 == b as f32
+    a == b
 }
 
 /// `DoLineErodeFirstPass` (`itkLabelSetUtils.h:29-55`), over one run.
@@ -418,12 +431,20 @@ fn label_set_morph(
     let mut first_pass_done = false;
 
     for axis in 0..dim {
-        // `.hxx:368` / `itkLabelSetDilateImageFilter.hxx:196` — a *positive*
-        // test, not `<= 0`. When every radius is 0 in spacing mode,
-        // `scale[firstval]` is 0 and the normalization above leaves the later
-        // axes at `0.0 / 0.0 = NaN`, which fails `> 0` (and would pass a
-        // negated `<= 0`).
-        if scale[axis] > 0.0 {
+        // §2.57(b) fix: an axis is processed iff its *radius* is nonzero, not
+        // iff its *scale* is positive. Upstream gates on
+        // `m_Scale[d] > 0` (`itkLabelSetDilateImageFilter.hxx:102`,
+        // `itkLabelSetErodeImageFilter.hxx`), but in the non-spacing branch
+        // `scale[d] = 0.5*r^2 + 1 >= 1` for every axis, so a zero-radius axis
+        // still ran the first pass and dilated/eroded along it — dilation grew
+        // axis 0 for `Radius = (0, k)`, and erosion capped the distance image at
+        // the wrong `sigma` and blanked the whole output. `firstval` already
+        // keys off `radius[d] != 0` (`.hxx:184-192`), so gating the run on the
+        // same predicate makes the first axis processed *be* `firstval`, as the
+        // elliptical-support normalization assumes. In spacing mode
+        // `scale[d] > 0` already coincides with `radius[d] != 0`, so that path
+        // is unchanged.
+        if radius[axis] != 0 {
             let sigma = scale[axis] as f32;
             let iscale = if use_image_spacing {
                 spacing[axis] as f32
@@ -763,20 +784,48 @@ mod tests {
         );
     }
 
-    /// Upstream finding 3, dilation half: `Radius = (0, 2)` without spacing
-    /// still dilates one voxel along axis 0, because `scale[0] = 1 > 0` makes
-    /// axis 0 the "first pass" even though its radius is zero.
+    /// §2.57(b) fix, dilation half: `Radius = (0, 2)` dilates axis 1 only and
+    /// leaves axis 0 untouched, in *both* spacing modes. Upstream's non-spacing
+    /// branch gave `scale[0] = 0.5·0² + 1 = 1 > 0`, so axis 0 ran the first pass
+    /// and wrongly grew the label one voxel along it; gating the run on
+    /// `radius[0] != 0` skips axis 0 as the parameter asks.
+    ///
+    /// A single label `7` at `(i, j) = (1, 2)` of a `3 × 5` image. Without
+    /// spacing the `+1` margin admits `k² < 6` (`k ≤ 2`), so the whole `j`
+    /// column at `i = 1` fills; with spacing the open ball admits `k² < 4`
+    /// (`k ≤ 1`), so only `j ∈ {1, 2, 3}` fill. Columns `i = 0` and `i = 2` stay
+    /// background either way — axis 0 is never processed.
     #[test]
-    fn dilate_zero_leading_radius_without_spacing_still_grows_axis_zero() {
-        let a = img(&[5, 1], vec![0, 0, 7, 0, 0]);
+    fn dilate_zero_leading_radius_dilates_the_named_axis_only() {
+        // index = j*3 + i; label 7 at i=1, j=2 -> index 7.
+        let mut data = vec![0; 15];
+        data[7] = 7;
+        let a = img(&[3, 5], data);
+
+        #[rustfmt::skip]
+        let no_spacing = vec![
+            0, 7, 0,
+            0, 7, 0,
+            0, 7, 0,
+            0, 7, 0,
+            0, 7, 0,
+        ];
         assert_eq!(
             labels_of(&label_set_dilate(&a, &[0, 2], false).unwrap()),
-            [0, 7, 7, 7, 0]
+            no_spacing
         );
-        // With spacing on, `scale[0] == 0` and axis 0 is genuinely skipped.
+
+        #[rustfmt::skip]
+        let with_spacing = vec![
+            0, 0, 0,
+            0, 7, 0,
+            0, 7, 0,
+            0, 7, 0,
+            0, 0, 0,
+        ];
         assert_eq!(
             labels_of(&label_set_dilate(&a, &[0, 2], true).unwrap()),
-            [0, 0, 7, 0, 0]
+            with_spacing
         );
     }
 
@@ -817,33 +866,50 @@ mod tests {
         );
     }
 
-    /// Upstream finding 3, erosion half: with `Radius = (0, 2)` and no image
-    /// spacing, axis 0 runs the first pass and caps the distance image at
-    /// `sigma = scale[0] = 1`, while the last pass compares against
-    /// `BaseSigma = 0.5*4 + 1 = 3`. Nothing can equal it: the output is
-    /// entirely background.
+    /// §2.57(b) fix, erosion half: `Radius = (0, 2)` erodes axis 1 only and
+    /// leaves axis 0 untouched. Upstream's non-spacing branch ran axis 0 as the
+    /// first pass (`scale[0] = 1 > 0`), capping the distance image at
+    /// `sigma = 1` while the last pass compared against `BaseSigma = 3` — so the
+    /// whole output blanked to background. Gating the run on `radius[0] != 0`
+    /// makes axis 1 both the first and last pass, eroding along it correctly.
+    ///
+    /// A `3 × 7` image whose every `j`-line (fixed `i`) is the stripe
+    /// `[0,1,1,1,1,1,0]`. Eroding that 5-run along axis 1: without spacing the
+    /// `+1`-margin first pass leaves only its centre `j = 3`; with spacing the
+    /// open ball leaves the middle three `j ∈ {2, 3, 4}`. All three `i` columns
+    /// survive identically — axis 0 is never eroded.
     #[test]
-    fn erode_zero_leading_radius_without_spacing_blanks_the_output() {
-        #[rustfmt::skip]
-        let a = img(&[3, 7], vec![
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-            1, 1, 1,
-        ]);
+    fn erode_zero_leading_radius_erodes_the_named_axis_only() {
+        // index = j*3 + i; stripe [0,1,1,1,1,1,0] along j, on every i column.
+        let stripe = [0, 1, 1, 1, 1, 1, 0];
+        let mut data = vec![0; 21];
+        for (j, &v) in stripe.iter().enumerate() {
+            for i in 0..3 {
+                data[j * 3 + i] = v;
+            }
+        }
+        let a = img(&[3, 7], data);
+
+        // Non-spacing: only j = 3 survives on each column.
+        let mut no_spacing = vec![0; 21];
+        for i in 0..3 {
+            no_spacing[3 * 3 + i] = 1;
+        }
         assert_eq!(
             labels_of(&label_set_erode(&a, &[0, 2], false).unwrap()),
-            vec![0; 21]
+            no_spacing
         );
-        // With spacing on, axis 0 is skipped outright and axis 1 is both the
-        // first and the last pass, so `sigma == BaseSigma` and the border rule
-        // keeps every pixel of this all-foreground image.
+
+        // Spacing: the middle three j ∈ {2, 3, 4} survive on each column.
+        let mut with_spacing = vec![0; 21];
+        for j in 2..=4 {
+            for i in 0..3 {
+                with_spacing[j * 3 + i] = 1;
+            }
+        }
         assert_eq!(
             labels_of(&label_set_erode(&a, &[0, 2], true).unwrap()),
-            vec![1; 21]
+            with_spacing
         );
     }
 
@@ -874,25 +940,28 @@ mod tests {
         );
     }
 
-    /// Upstream finding 6: run detection narrows labels to `float`, so
-    /// `16777216` and `16777217` (adjacent `Int32` values that share a `f32`
-    /// representation) form a single run and erode as one object instead of
-    /// separating.
+    /// §2.57(d) fix: run detection compares labels in the `f64` label domain,
+    /// so `16777216` and `16777217` — adjacent `Int32` values that share one
+    /// `f32` representation — are recognised as two distinct labels and separate
+    /// under erosion, exactly as any other pair of touching labels does.
+    /// Upstream narrowed the labels to `float` first, merging them into a single
+    /// run that never found its own interface.
     #[test]
-    fn f32_label_collision_merges_two_runs() {
+    fn f64_label_comparison_separates_adjacent_int32_labels() {
         const A: i32 = 16_777_216;
         const B: i32 = 16_777_217;
+        // The two labels are distinct only in f64, not f32.
         assert_eq!(A as f32, B as f32);
+        assert_ne!(A as f64, B as f64);
 
-        // One six-long run spanning the whole line: both ends touch the image
-        // border, so nothing erodes and the interface is never found.
-        let merged = img(&[6, 1], vec![A, A, A, B, B, B]);
+        // Two touching runs now separate like any other label pair.
+        let touching = img(&[6, 1], vec![A, A, A, B, B, B]);
         assert_eq!(
-            labels_of(&label_set_erode(&merged, &[2, 2], true).unwrap()),
-            [A, A, A, B, B, B]
+            labels_of(&label_set_erode(&touching, &[2, 2], true).unwrap()),
+            [A, A, 0, 0, B, B]
         );
 
-        // Two labels that do *not* collide separate as usual.
+        // The f32-safe pair behaves identically, as a control.
         let distinct = img(&[6, 1], vec![1, 1, 1, 2, 2, 2]);
         assert_eq!(
             labels_of(&label_set_erode(&distinct, &[2, 2], true).unwrap()),
