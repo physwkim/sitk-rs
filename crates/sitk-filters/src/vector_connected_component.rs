@@ -53,11 +53,16 @@
 //! absorbs adjacent directioned regions on realistic input (a gradient- or
 //! displacement-direction field is zero wherever the field is flat). **This
 //! port fixes that (§2.40):** a zero vector has no direction, so it is
-//! dissimilar to a directioned neighbor. Two zero vectors are still similar
-//! (they are identical, so an all-zero image stays one component); only the
-//! mixed zero/non-zero case changes. The unnormalized dot product and the
-//! antiparallel-similarity are documented, deliberate upstream behavior and
-//! are kept.
+//! dissimilar to a directioned neighbor. The fix guards *only* the mixed
+//! zero/non-zero case; zero-vs-zero is left to the ordinary predicate, whose
+//! distance `1 - |dot(0, 0)| = 1` merges the two exactly when `threshold >= 1`
+//! — as at the yaml default `1.0`, where an all-zero image stays one component
+//! — but not below it: at `threshold = 0.5` even identical zero vectors
+//! separate, like orthogonal directioned vectors would. It is that
+//! `distance == 1 <= threshold` test, not the two vectors' identity, that
+//! merges them; only the mixed zero/non-zero case changes behavior versus
+//! upstream. The unnormalized dot product and the antiparallel-similarity are
+//! documented, deliberate upstream behavior and are kept.
 //!
 //! `VectorConnectedComponentImageFilter.yaml`'s `pixel_types` is
 //! `RealVectorPixelIDTypeList`, and `itkConceptMacro(InputValyeTypeIsFloatingCheck, ...)`
@@ -100,9 +105,13 @@ fn similar<T: Scalar>(a: &[T], b: &[T], threshold: T) -> bool {
     // `1 - |dot(0, b)| = 1` joins any neighbor at the wrapped default
     // `DistanceThreshold = 1` — a flat (zero) region then silently bridges or
     // absorbs adjacent directioned regions on realistic input (a gradient- or
-    // displacement-direction field is zero wherever the field is flat). Two
-    // zero vectors are still similar (they are identical, so an all-zero image
-    // stays a single component); only the mixed zero/non-zero case changes.
+    // displacement-direction field is zero wherever the field is flat). Zero-
+    // vs-zero is NOT special-cased to merge: the guard rejects only the mixed
+    // case, so two zero vectors flow through the ordinary predicate (distance
+    // `1 - |dot(0,0)| = 1`) and merge only when `threshold >= 1` (the yaml
+    // default `1.0` -> an all-zero image is one component; at `0.5` the zeros
+    // separate). Identity is not what merges them, `distance == 1 <= threshold`
+    // is. Only the mixed zero/non-zero case changes behavior versus upstream.
     let a_zero = a.iter().all(|&x| x.as_f64() == 0.0);
     let b_zero = b.iter().all(|&x| x.as_f64() == 0.0);
     if a_zero != b_zero {
