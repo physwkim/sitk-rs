@@ -45,7 +45,7 @@
 //! `int16` `VoxelData` reads back as `Int16` (ledger §2.130), and a file with
 //! no `VoxelType` dataset at all reads fine.
 //!
-//! # SimpleITK cannot read a non-scalar HDF5 image
+//! # SimpleITK cannot read a non-scalar HDF5 image — fixed in this port
 //!
 //! `ReadImageInformation` never calls `SetPixelType`, so `m_PixelType` keeps
 //! its `IOPixelEnum::SCALAR` default (`itkImageIOBase.h:801`) even when it has
@@ -54,9 +54,20 @@
 //! `numberOfComponents == 1`, finds `SCALAR` in none of the vector pixel types,
 //! and throws `"Unknown PixelType: ..."` (`sitkImageReaderBase.cxx:215-238`).
 //! So a vector or complex image *writes* through SimpleITK and can never be
-//! read back by it (ledger §3.47). This port reproduces that: [`write`] takes
-//! any pixel type, [`read`] raises [`IoError::UnknownPixelType`] for a
-//! `VoxelData` with a trailing component axis.
+//! read back by it — the one missing `SetPixelType(VECTOR)` call (ledger §3.47,
+//! §5.25).
+//!
+//! This port closes that at source: [`write`] still takes any pixel type, and
+//! [`read`] reconstructs the vector image the trailing component axis records.
+//! A `VoxelData` of rank `dimension + 1` reads back as the vector pixel type
+//! whose components are `VoxelData`'s own datatype ([`PixelId::vector_id`]),
+//! exactly what `SetPixelType(VECTOR)` would have produced. The interleaved
+//! on-disk buffer is already in SimpleITK's own vector-buffer order, so a
+//! vector image round-trips byte-for-byte. A **complex** image reaches the
+//! `ImageIO` as two `float` components per voxel and carries no complex marker
+//! in the file, so it reads back as a two-component `VectorFloat32` /
+//! `VectorFloat64`: the samples survive exactly, only the pixel-type label
+//! widens from complex to vector.
 //!
 //! # Compression is unconditional
 //!
@@ -148,30 +159,6 @@ fn component_to_string(component: PixelId) -> &'static str {
     }
 }
 
-/// `ImageIOBase::GetComponentTypeAsString` paired with the numeric value of
-/// `IOComponentEnum` (`itkCommonEnums.h:79-95`, `itkImageIOBase.cxx:399-429`),
-/// which is what `"Unknown PixelType: unsigned_char(1)"` interpolates.
-///
-/// `PredTypeToComponentType` tests `NATIVE_ULONG` / `NATIVE_LONG` before
-/// `NATIVE_LLONG` / `NATIVE_ULLONG` (`:150-165`) and `H5Tequal` cannot tell the
-/// two apart on LP64, so an 8-byte integer is always reported as
-/// `long` / `unsigned_long`.
-fn component_type_as_string(component: PixelId) -> &'static str {
-    match component {
-        PixelId::UInt8 => "unsigned_char(1)",
-        PixelId::Int8 => "char(2)",
-        PixelId::UInt16 => "unsigned_short(3)",
-        PixelId::Int16 => "short(4)",
-        PixelId::UInt32 => "unsigned_int(5)",
-        PixelId::Int32 => "int(6)",
-        PixelId::UInt64 => "unsigned_long(7)",
-        PixelId::Int64 => "long(8)",
-        PixelId::Float32 => "float(11)",
-        PixelId::Float64 => "double(12)",
-        other => unreachable!("{other:?} is not a component type"),
-    }
-}
-
 /// `PredTypeToComponentType` (`itkHDF5ImageIO.cxx:119-175`), which compares the
 /// stored datatype against each `H5::PredType::NATIVE_*` in turn and raises
 /// `"unsupported HDF5 data type with id ..."` when none matches.
@@ -235,16 +222,27 @@ fn datatype_to_component(datatype: &DatatypeMessage, what: &str) -> Result<Pixel
     }
 }
 
-/// `ImageReaderBase::GetPixelIDFromImageIO` (`sitkImageReaderBase.cxx:200-241`)
-/// against what `HDF5ImageIO::ReadImageInformation` leaves behind: a component
-/// type, a component count, and an untouched `SCALAR` pixel type.
-fn pixel_id_from_image_io(component: PixelId, number_of_components: usize) -> Result<PixelId> {
+/// The pixel type of an HDF5 image, from the component type and count that
+/// `HDF5ImageIO::ReadImageInformation` leaves behind.
+///
+/// Upstream never calls `SetPixelType`, so `m_PixelType` keeps its `SCALAR`
+/// default even for a multi-component `VoxelData`, and
+/// `ImageReaderBase::GetPixelIDFromImageIO` then throws `"Unknown PixelType"`
+/// for any count above 1 (`sitkImageReaderBase.cxx:200-241`, ledger §3.47).
+/// This port closes that at source: a trailing component axis reads back as
+/// the corresponding *vector* pixel type — the one `SetPixelType(VECTOR)`
+/// would have selected. A single component stays scalar.
+///
+/// The HDF5 file records no complex marker, so a complex image (two `float`
+/// components per voxel to the `ImageIO`) reads back as a two-component
+/// `VectorFloat32`/`VectorFloat64`: the samples are preserved exactly, only
+/// the pixel-type label widens from complex to vector.
+fn pixel_id_from_image_io(component: PixelId, number_of_components: usize) -> PixelId {
     if number_of_components == 1 {
-        return Ok(component);
+        component
+    } else {
+        component.vector_id()
     }
-    Err(IoError::UnknownPixelType(
-        component_type_as_string(component).to_string(),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -617,7 +615,7 @@ fn join_g(values: impl Iterator<Item = f64>) -> String {
 pub fn read_information(path: &Path) -> Result<ImageInformation> {
     let file = H5File::open(path)?;
     let header = read_header(&file)?;
-    let pixel_id = pixel_id_from_image_io(header.component, header.number_of_components)?;
+    let pixel_id = pixel_id_from_image_io(header.component, header.number_of_components);
     Ok(ImageInformation {
         pixel_id,
         dimension: header.dimension(),
@@ -636,17 +634,31 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
 pub fn read(path: &Path) -> Result<Image> {
     let file = H5File::open(path)?;
     let header = read_header(&file)?;
-    pixel_id_from_image_io(header.component, header.number_of_components)?;
+    let pixel_id = pixel_id_from_image_io(header.component, header.number_of_components);
 
     let dataset = file.dataset(&instance_dataset(VOXEL_DATA))?;
     let buffer = read_buffer(&dataset, header.component)?;
-    let mut image = Image::from_parts(
-        buffer,
-        header.size,
-        header.spacing,
-        header.origin,
-        header.direction,
-    )?;
+    let mut image = if pixel_id.is_vector() {
+        // The interleaved `VoxelData` — `[..reverse(size), components]`
+        // row-major, component fastest — is exactly SimpleITK's own vector
+        // buffer order, so the raw bytes go straight in.
+        Image::from_parts_vector(
+            buffer,
+            header.number_of_components,
+            header.size,
+            header.spacing,
+            header.origin,
+            header.direction,
+        )?
+    } else {
+        Image::from_parts(
+            buffer,
+            header.size,
+            header.spacing,
+            header.origin,
+            header.direction,
+        )?
+    };
     for (key, value) in &header.metadata {
         image.set_meta_data(key, value);
     }
@@ -1282,10 +1294,11 @@ mod tests {
     }
 
     /// `ReadImageInformation` sets `m_NumberOfComponents` but never
-    /// `m_PixelType`, so `GetPixelIDFromImageIO` falls through to its final
-    /// `else` (ledger §3.47). The image writes; SimpleITK can never read it.
+    /// `m_PixelType` (ledger §3.47/§5.25): SimpleITK can never read the file it
+    /// writes. This port infers the vector pixel type from the trailing
+    /// component axis, so a vector image round-trips byte-for-byte.
     #[test]
-    fn a_vector_image_writes_but_cannot_be_read_back() {
+    fn a_vector_image_round_trips_through_the_component_axis() {
         let path = tmp_path("vector.h5");
         let image = Image::from_parts_vector(
             PixelBuffer::UInt8((0..36).map(|i| i as u8).collect()),
@@ -1311,26 +1324,32 @@ mod tests {
         );
         drop(file);
 
-        // The `Dimension` dataset still names only the image axes.
-        assert!(
-            matches!(&read(&path), Err(IoError::UnknownPixelType(m)) if m == "unsigned_char(1)"),
-            "{:?}",
-            read(&path)
-        );
-        assert!(matches!(
-            read_information(&path),
-            Err(IoError::UnknownPixelType(_))
-        ));
+        // The whole image comes back — pixel type, component count, buffer.
+        let read_back = read(&path).unwrap();
+        assert_eq!(read_back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(read_back.number_of_components_per_pixel(), 3);
+        assert_eq!(read_back, image);
+
+        let information = read_information(&path).unwrap();
+        assert_eq!(information.pixel_id, PixelId::VectorUInt8);
+        assert_eq!(information.number_of_components, 3);
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A complex image is two `float` components per voxel to the `ImageIO`,
-    /// so it hits the same wall.
+    /// A complex image reaches the `ImageIO` as two `float` components per
+    /// voxel and the file records no complex marker, so it reads back as a
+    /// two-component `VectorFloat32`: the samples are preserved exactly, only
+    /// the pixel-type label widens from complex to vector (ledger §3.47/§5.25).
     #[test]
-    fn a_complex_image_writes_but_cannot_be_read_back() {
+    fn a_complex_image_reads_back_as_a_two_component_float_vector() {
         let path = tmp_path("complex.h5");
         let mut image = Image::new(&[4, 3], PixelId::ComplexFloat32);
         image.set_spacing(&[1.0, 1.0]).unwrap();
+        // Distinct samples so a dropped or reordered component cannot pass.
+        let real: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let imag: Vec<f32> = (0..12).map(|i| -(i as f32) - 0.5).collect();
+        let interleaved: Vec<f32> = real.iter().zip(&imag).flat_map(|(&r, &i)| [r, i]).collect();
+        *image.buffer_mut() = PixelBuffer::Float32(interleaved.clone());
         write(&image, &path, &WriteOptions::default()).unwrap();
 
         let file = H5File::open(&path).unwrap();
@@ -1347,10 +1366,15 @@ mod tests {
         );
         drop(file);
 
-        assert!(matches!(
-            read(&path),
-            Err(IoError::UnknownPixelType(m)) if m == "float(11)"
-        ));
+        let read_back = read(&path).unwrap();
+        assert_eq!(read_back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(read_back.number_of_components_per_pixel(), 2);
+        assert_eq!(read_back.size(), &[4, 3]);
+        assert_eq!(read_back.buffer(), &PixelBuffer::Float32(interleaved));
+
+        let information = read_information(&path).unwrap();
+        assert_eq!(information.pixel_id, PixelId::VectorFloat32);
+        assert_eq!(information.number_of_components, 2);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1871,25 +1895,23 @@ mod tests {
         ));
     }
 
-    /// `ComponentToString` and `GetComponentTypeAsString` for the ten types
-    /// SimpleITK reaches. An 8-byte integer is `LONG` / `ULONG`, never
-    /// `LONGLONG` / `ULONGLONG`.
+    /// `ComponentToString` for the ten types SimpleITK reaches. An 8-byte
+    /// integer is `LONG` / `ULONG`, never `LONGLONG` / `ULONGLONG`.
     #[test]
     fn the_component_type_names_match_itk() {
-        for (id, voxel_type, as_string) in [
-            (PixelId::UInt8, "UCHAR", "unsigned_char(1)"),
-            (PixelId::Int8, "CHAR", "char(2)"),
-            (PixelId::UInt16, "USHORT", "unsigned_short(3)"),
-            (PixelId::Int16, "SHORT", "short(4)"),
-            (PixelId::UInt32, "UINT", "unsigned_int(5)"),
-            (PixelId::Int32, "INT", "int(6)"),
-            (PixelId::UInt64, "ULONG", "unsigned_long(7)"),
-            (PixelId::Int64, "LONG", "long(8)"),
-            (PixelId::Float32, "FLOAT", "float(11)"),
-            (PixelId::Float64, "DOUBLE", "double(12)"),
+        for (id, voxel_type) in [
+            (PixelId::UInt8, "UCHAR"),
+            (PixelId::Int8, "CHAR"),
+            (PixelId::UInt16, "USHORT"),
+            (PixelId::Int16, "SHORT"),
+            (PixelId::UInt32, "UINT"),
+            (PixelId::Int32, "INT"),
+            (PixelId::UInt64, "ULONG"),
+            (PixelId::Int64, "LONG"),
+            (PixelId::Float32, "FLOAT"),
+            (PixelId::Float64, "DOUBLE"),
         ] {
             assert_eq!(component_to_string(id), voxel_type);
-            assert_eq!(component_type_as_string(id), as_string);
         }
     }
 
