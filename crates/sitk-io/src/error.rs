@@ -45,6 +45,16 @@ pub enum IoError {
     #[error("unsupported MetaImage feature: {0}")]
     Unsupported(String),
 
+    /// A NRRD header could not be parsed. Carries the message NrrdIO's `biff`
+    /// stack would have produced.
+    #[error("malformed NRRD header: {0}")]
+    MalformedNrrdHeader(String),
+
+    /// A NRRD feature this port does not implement — a compressed encoding, a
+    /// `block` element type, or a `data file:` form with no reader here.
+    #[error("unsupported NRRD feature: {0}")]
+    UnsupportedNrrdFeature(String),
+
     /// The pixel data was shorter than the header's declared size.
     #[error("pixel data is truncated")]
     TruncatedData,

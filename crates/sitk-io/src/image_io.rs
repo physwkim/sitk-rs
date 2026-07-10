@@ -46,6 +46,7 @@ use sitk_core::{Image, PixelId};
 
 use crate::error::{IoError, Result};
 use crate::meta_image::MetaImageIo;
+use crate::nrrd::NrrdImageIo;
 
 /// Which of [`ImageIo::can_read_file`] / [`ImageIo::can_write_file`] the
 /// registry probe should use. `itk::IOFileModeEnum`
@@ -167,6 +168,7 @@ pub fn has_supported_extension(path: &Path, extensions: &[&str], ignore_case: bo
 }
 
 static META_IMAGE_IO: MetaImageIo = MetaImageIo;
+static NRRD_IMAGE_IO: NrrdImageIo = NrrdImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -174,7 +176,7 @@ static META_IMAGE_IO: MetaImageIo = MetaImageIo;
 /// both `CreateImageIO` and `GetRegisteredImageIOs` iterate. Probe order is
 /// this order, so an earlier entry wins a tie.
 pub fn registry() -> &'static [&'static dyn ImageIo] {
-    const IOS: &[&dyn ImageIo] = &[&META_IMAGE_IO];
+    const IOS: &[&dyn ImageIo] = &[&META_IMAGE_IO, &NRRD_IMAGE_IO];
     IOS
 }
 

@@ -3,17 +3,22 @@
 //! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
 //! [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
 //! handles a path, exactly as SimpleITK's readers and writers ask
-//! `itk::ImageIOFactory`. Adding NIfTI, NRRD, PNG or DICOM later is a new
-//! module plus one registry entry — no dispatch to extend. See [`image_io`] for
-//! the probe order and [`meta_image`] for the only implementor so far.
+//! `itk::ImageIOFactory`. Adding NIfTI, PNG or DICOM later is a new module plus
+//! one registry entry — no dispatch to extend. See [`image_io`] for the probe
+//! order.
 //!
 //! [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
 //! also provides (`itk::simple::ReadImage` / `WriteImage`).
 //!
-//! Phase 0 supports MetaImage (`.mha` / `.mhd`), ITK's native uncompressed
-//! format, which round-trips every scalar, vector, and complex pixel type and
-//! the full geometry (see [`meta_image`] for the channel-count caveat that
-//! applies to complex images).
+//! Phase 0 supports two uncompressed formats:
+//!
+//! * [`meta_image`] — MetaImage (`.mha` / `.mhd`), ITK's native format, which
+//!   round-trips every scalar and vector pixel type and the full geometry (see
+//!   its docs for the channel-count caveat that flattens a complex image into
+//!   a vector one);
+//! * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), raw encoding only, which does
+//!   round-trip a complex image because its `kinds` field records the
+//!   distinction.
 //!
 //! Transforms have their own reader and writer, [`read_transform`] and
 //! [`write_transform`], over the Insight legacy text format (`.tfm` / `.txt`);
@@ -22,6 +27,7 @@
 pub mod error;
 pub mod image_io;
 pub mod meta_image;
+pub mod nrrd;
 pub mod reader;
 pub mod transform_io;
 pub mod writer;
@@ -377,10 +383,14 @@ mod tests {
     /// extensions (sitkImageIOUtilities.cxx:59-77).
     #[test]
     fn registry_lists_the_meta_image_io_by_class_name() {
-        assert_eq!(registered_image_ios(), vec!["MetaImageIO"]);
+        assert_eq!(registered_image_ios(), vec!["MetaImageIO", "NrrdImageIO"]);
         assert_eq!(
             image_io_by_name("MetaImageIO").unwrap().name(),
             "MetaImageIO"
+        );
+        assert_eq!(
+            image_io_by_name("NrrdImageIO").unwrap().name(),
+            "NrrdImageIO"
         );
         assert!(matches!(
             image_io_by_name("NiftiImageIO"),
@@ -488,7 +498,10 @@ mod tests {
             writer.execute(&img),
             Err(IoError::UnknownImageIo(_))
         ));
-        assert_eq!(writer.registered_image_ios(), vec!["MetaImageIO"]);
+        assert_eq!(
+            writer.registered_image_ios(),
+            vec!["MetaImageIO", "NrrdImageIO"]
+        );
     }
 
     // ---- ReadImageInformation --------------------------------------------
@@ -1014,5 +1027,747 @@ mod tests {
             out.component_slice::<u8>().unwrap(),
             &[12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25, 26]
         );
+    }
+
+    // ---- NRRD ------------------------------------------------------------
+
+    /// The header bytes of `NrrdImageIO::Write` for a 3-D scalar image, pinned.
+    ///
+    /// Field order is teem's `nrrdField` enum order, which is what
+    /// `formatNRRD_write` loops over; the two comment lines come from
+    /// `nrrd__FormatURLLine0/1` (formatNRRD.c:149-150); the magic is `NRRD0004`
+    /// because `nrrd__FormatNRRD_whichVersion` bumps to 4 as soon as `space`
+    /// is set, which ITK always does. `endian:` appears only because the
+    /// element size exceeds one byte (`nrrd__FieldInteresting`, write.c).
+    #[test]
+    fn nrrd_header_pins_bytes_for_a_scalar_image() {
+        let mut img = Image::from_vec(&[4, 3, 2], (0..24).map(|i| i as f32).collect()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+
+        let path = tmp_path("pin_scalar.nrrd");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let expected = "NRRD0004\n\
+                        # Complete NRRD file format specification at:\n\
+                        # http://teem.sourceforge.net/nrrd/format.html\n\
+                        type: float\n\
+                        dimension: 3\n\
+                        space: left-posterior-superior\n\
+                        sizes: 4 3 2\n\
+                        space directions: (0.5,0,0) (0,1.25,0) (0,0,3)\n\
+                        kinds: domain domain domain\n\
+                        endian: little\n\
+                        encoding: raw\n\
+                        space origin: (-2,4,7.5)\n\n";
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(bytes.len(), expected.len() + 24 * 4);
+    }
+
+    /// A vector image gets a leading `vector` axis, `sizes` grows by one, its
+    /// space direction is `none`, and the space becomes a bare `space
+    /// dimension: 2` because ITK only names LPS at three domain axes
+    /// (itkNrrdImageIO.cxx:1362-1365). `endian:` is absent: `unsigned char`
+    /// has element size one.
+    #[test]
+    fn nrrd_header_pins_bytes_for_a_vector_image() {
+        let img = Image::from_vec_vector::<u8>(&[3, 2], 3, (0..18).collect()).unwrap();
+        let path = tmp_path("pin_vector.nrrd");
+        write_image(&img, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let expected = "NRRD0004\n\
+                        # Complete NRRD file format specification at:\n\
+                        # http://teem.sourceforge.net/nrrd/format.html\n\
+                        type: unsigned char\n\
+                        dimension: 3\n\
+                        space dimension: 2\n\
+                        sizes: 3 3 2\n\
+                        space directions: none (1,0) (0,1)\n\
+                        kinds: vector domain domain\n\
+                        encoding: raw\n\
+                        space origin: (0,0)\n\n";
+        assert_eq!(&bytes[..expected.len()], expected.as_bytes());
+        assert_eq!(bytes.len(), expected.len() + 18);
+    }
+
+    #[test]
+    fn nrrd_roundtrip_preserves_buffer_and_geometry() {
+        let data: Vec<i16> = (0..24).map(|i| i as i16 - 5).collect();
+        let mut img = Image::from_vec(&[4, 3, 2], data.clone()).unwrap();
+        img.set_spacing(&[0.5, 1.25, 3.0]).unwrap();
+        img.set_origin(&[-2.0, 4.0, 7.5]).unwrap();
+        img.set_direction(&[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+
+        let path = tmp_path("roundtrip.nrrd");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.size(), img.size());
+        assert_eq!(back.pixel_id(), PixelId::Int16);
+        assert_eq!(back.spacing(), img.spacing());
+        assert_eq!(back.origin(), img.origin());
+        assert_eq!(back.direction(), img.direction());
+        assert_eq!(back.scalar_slice::<i16>().unwrap(), data.as_slice());
+        assert_eq!(without_metadata(back), img);
+    }
+
+    #[test]
+    fn nrrd_roundtrip_all_scalar_types_2d_and_3d() {
+        macro_rules! case {
+            ($ty:ty, $size:expr, $name:expr) => {{
+                let count: usize = $size.iter().product();
+                let data: Vec<$ty> = (0..count as u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&$size, data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+                assert_eq!(back.size(), &$size[..], $name);
+            }};
+        }
+        macro_rules! both {
+            ($ty:ty, $stem:expr) => {{
+                case!($ty, [4usize, 2], concat!($stem, "_2d.nrrd"));
+                case!($ty, [4usize, 2, 3], concat!($stem, "_3d.nrrd"));
+            }};
+        }
+        both!(u8, "u8");
+        both!(i8, "i8");
+        both!(u16, "u16");
+        both!(i16, "i16");
+        both!(u32, "u32");
+        both!(i32, "i32");
+        both!(u64, "u64");
+        both!(i64, "i64");
+        both!(f32, "f32");
+        both!(f64, "f64");
+    }
+
+    #[test]
+    fn nrrd_roundtrip_vector_float32() {
+        let data: Vec<f32> = (0..36).map(|i| i as f32 * 0.25 - 4.0).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 3], 3, data.clone()).unwrap();
+        img.set_spacing(&[0.5, 2.0]).unwrap();
+        img.set_origin(&[-1.0, 3.0]).unwrap();
+        img.set_direction(&[0.0, 1.0, -1.0, 0.0]).unwrap();
+
+        let path = tmp_path("vector_f32.nrrd");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
+        assert_eq!(without_metadata(back), img);
+    }
+
+    /// Unlike MetaImage, NRRD records the complex-ness in `kinds`, so
+    /// `ComplexFloat32` round-trips to itself: `nrrdKindComplex` maps to
+    /// `IOPixelEnum::COMPLEX` (itkNrrdImageIO.cxx:750-753), which
+    /// `GetPixelIDFromImageIO`'s third branch turns back into the complex pixel
+    /// id (sitkImageReaderBase.cxx:234-238).
+    #[test]
+    fn nrrd_roundtrips_complex_as_complex() {
+        macro_rules! case {
+            ($ty:ty, $id:expr, $name:expr) => {{
+                let data: Vec<Complex<$ty>> = (0..6)
+                    .map(|i| Complex::new(i as $ty, -(i as $ty) * 0.5))
+                    .collect();
+                let mut img = Image::from_vec_complex::<$ty>(&[3, 2], data.clone()).unwrap();
+                img.set_spacing(&[0.5, 2.0]).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                let raw = std::fs::read(&path).unwrap();
+                let end = raw.windows(2).position(|w| w == b"\n\n").unwrap();
+                let header = String::from_utf8_lossy(&raw[..end]).to_string();
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+
+                assert!(header.contains("kinds: complex domain domain"), "{header}");
+                assert_eq!(back.pixel_id(), $id, $name);
+                assert_eq!(back.number_of_components_per_pixel(), 1, $name);
+                assert_eq!(without_metadata(back), img, $name);
+            }};
+        }
+        case!(f32, PixelId::ComplexFloat32, "complex32.nrrd");
+        case!(f64, PixelId::ComplexFloat64, "complex64.nrrd");
+    }
+
+    /// `nrrdSave` turns a `.nhdr` filename into a detached header naming
+    /// `<stem>.<encoding suffix>`, always header-relative. The header has no
+    /// blank-line terminator, because there is no attached data to separate.
+    #[test]
+    fn nhdr_writes_separate_raw_and_reads_back() {
+        let data: Vec<f32> = (0..6).map(|i| i as f32 * 0.5).collect();
+        let img = Image::from_vec(&[3, 2], data.clone()).unwrap();
+        let path = tmp_path("pair.nhdr");
+        let raw = path.with_file_name(format!("sitk_io_test_{}_pair.raw", std::process::id()));
+
+        write_image(&img, &path).unwrap();
+        let header = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.exists());
+        assert!(
+            header.ends_with(
+                "data file: sitk_io_test_{pid}_pair.raw\n"
+                    .replace("{pid}", &std::process::id().to_string())
+                    .as_str()
+            ),
+            "{header}"
+        );
+        assert_eq!(std::fs::read(&raw).unwrap().len(), 24);
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&raw).ok();
+        assert_eq!(back.scalar_slice::<f32>().unwrap(), data.as_slice());
+        assert_eq!(without_metadata(back), img);
+    }
+
+    /// `nrrdSpacingCalculate`'s `Direction` status: the spacing is the norm of
+    /// the space-direction vector and the direction column is that vector
+    /// normalised (axis.c:946-949, itkNrrdImageIO.cxx:807-818).
+    #[test]
+    fn nrrd_space_directions_decompose_into_spacing_and_direction() {
+        // Two orthonormal columns rotated 3-4-5, scaled by 2 and 10.
+        let path = tmp_path("skew.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 2\n\
+              space dimension: 2\n\
+              sizes: 2 2\n\
+              space directions: (1.2,1.6) (-8,6)\n\
+              kinds: domain domain\n\
+              encoding: raw\n\
+              space origin: (3,-4)\n\
+              \n\
+              \x01\x02\x03\x04",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.spacing(), &[2.0, 10.0]);
+        assert_eq!(img.direction(), &[0.6, -0.8, 0.8, 0.6]);
+        assert_eq!(img.origin(), &[3.0, -4.0]);
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4]);
+    }
+
+    /// `space: right-anterior-superior` flips the first two axis directions and
+    /// the first two origin coefficients, and the dictionary reports the space
+    /// as `left-posterior-superior` because the conversion happened
+    /// (itkNrrdImageIO.cxx:767-786, 1022-1029).
+    #[test]
+    fn nrrd_ras_space_is_converted_to_lps() {
+        let path = tmp_path("ras.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 3\n\
+              space: right-anterior-superior\n\
+              sizes: 1 1 1\n\
+              space directions: (2,0,0) (0,3,0) (0,0,4)\n\
+              kinds: domain domain domain\n\
+              encoding: raw\n\
+              space origin: (10,20,30)\n\
+              \n\
+              \x07",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.spacing(), &[2.0, 3.0, 4.0]);
+        assert_eq!(
+            img.direction(),
+            &[-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(img.origin(), &[-10.0, -20.0, 30.0]);
+        assert_eq!(img.meta_data("NRRD_space"), Some("left-posterior-superior"));
+    }
+
+    /// `scanner-xyz` has no well-defined LPS conversion, so
+    /// `ReadImageInformation`'s `switch` falls to `default:` and the direction
+    /// vectors survive unconverted — the space is *not* rejected. Ledger §2.82.
+    #[test]
+    fn nrrd_scanner_xyz_space_is_left_unconverted() {
+        let path = tmp_path("scanner.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 3\n\
+              space: scanner-xyz\n\
+              sizes: 1 1 1\n\
+              space directions: (1,0,0) (0,1,0) (0,0,1)\n\
+              kinds: domain domain domain\n\
+              encoding: raw\n\
+              space origin: (10,20,30)\n\
+              \n\
+              \x07",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.origin(), &[10.0, 20.0, 30.0]);
+        assert_eq!(img.meta_data("NRRD_space"), Some("scanner-xyz"));
+    }
+
+    /// `kinds: domain domain vector` puts the pixel axis last, so
+    /// `GetAxisOrderForFileReading` reports `needPermutation` and `Read`
+    /// permutes it to axis 0 (itkNrrdImageIO.cxx:1146-1170).
+    #[test]
+    fn nrrd_permutes_a_trailing_pixel_axis_to_the_front() {
+        // sizes 2 2 3: axis 0 fastest, so the on-disk order is
+        // (x, y, component). Component c of pixel (x,y) is at x + 2*y + 4*c.
+        let mut data = Vec::new();
+        for c in 0..3u8 {
+            for y in 0..2u8 {
+                for x in 0..2u8 {
+                    data.push(100 * c + 10 * y + x);
+                }
+            }
+        }
+        let path = tmp_path("permute.nrrd");
+        let mut bytes = b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 3\n\
+              space dimension: 2\n\
+              sizes: 2 2 3\n\
+              space directions: (1,0) (0,1) none\n\
+              kinds: domain domain vector\n\
+              encoding: raw\n\
+              space origin: (0,0)\n\n"
+            .to_vec();
+        bytes.extend_from_slice(&data);
+        std::fs::write(&path, bytes).unwrap();
+
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(img.size(), &[2, 2]);
+        assert_eq!(img.number_of_components_per_pixel(), 3);
+        // Interleaved: pixel (0,0) is [0, 100, 200], pixel (1,0) is [1, 101, 201].
+        assert_eq!(
+            img.component_slice::<u8>().unwrap(),
+            &[0, 100, 200, 1, 101, 201, 10, 110, 210, 11, 111, 211]
+        );
+        assert_eq!(img.meta_data("NRRD_pixel_original_axis"), Some("2"));
+    }
+
+    /// `kinds: list domain domain` has no non-list range axis, so
+    /// `UseAnyRangeAxisAsPixel` takes the list axis as the pixel component axis
+    /// and the image is a vector image, not a 3-D scalar one
+    /// (itkNrrdImageIO.cxx:78-82, 731-736).
+    #[test]
+    fn nrrd_leading_list_axis_becomes_the_pixel_axis() {
+        let path = tmp_path("list_kind.nrrd");
+        let mut bytes = b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 3\n\
+              space dimension: 2\n\
+              sizes: 2 2 2\n\
+              space directions: none (1,0) (0,1)\n\
+              kinds: list domain domain\n\
+              encoding: raw\n\
+              space origin: (0,0)\n\n"
+            .to_vec();
+        bytes.extend_from_slice(&(0..8u8).collect::<Vec<_>>());
+        std::fs::write(&path, bytes).unwrap();
+
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(img.size(), &[2, 2]);
+        assert_eq!(img.number_of_components_per_pixel(), 2);
+    }
+
+    /// With no `space directions`, `nrrdSpacingCalculate` reports
+    /// `ScalarNoSpace` for `spacings` and `nrrdOriginCalculate` derives the
+    /// origin from `axis mins` (cell-centered by default, so half a sample in).
+    /// `axis mins` / `axis maxs` never touch the spacing.
+    #[test]
+    fn nrrd_spacings_and_axis_mins_set_spacing_and_origin_separately() {
+        let path = tmp_path("mins.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0001\n\
+              type: unsigned char\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              spacings: 2 4\n\
+              axis mins: 10 20\n\
+              encoding: raw\n\
+              \n\
+              \x01\x02\x03\x04",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.spacing(), &[2.0, 4.0]);
+        assert_eq!(img.origin(), &[11.0, 22.0]);
+    }
+
+    /// Without `axis mins` the origin status is `NoMin` and ITK leaves the
+    /// origin at zero (itkNrrdImageIO.cxx:905-912).
+    #[test]
+    fn nrrd_no_axis_mins_leaves_the_origin_at_zero() {
+        let path = tmp_path("nomins.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0001\n\
+              type: unsigned char\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              spacings: 2 4\n\
+              encoding: raw\n\
+              \n\
+              \x01\x02\x03\x04",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.origin(), &[0.0, 0.0]);
+    }
+
+    /// Upstream bug §1.47: `nrrdOriginCalculate`'s `gotMin` loop reads
+    /// `axis[0]->min` on every iteration, so a NaN on axis 1 does not produce
+    /// the `NoMin` status it should — the NaN reaches the origin instead.
+    #[test]
+    fn nrrd_origin_calculate_only_checks_the_first_axis_min() {
+        let path = tmp_path("nanmin.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0001\n\
+              type: unsigned char\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              spacings: 2 4\n\
+              axis mins: 10 nan\n\
+              encoding: raw\n\
+              \n\
+              \x01\x02\x03\x04",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.origin()[0], 11.0);
+        assert!(img.origin()[1].is_nan(), "upstream leaks the NaN min");
+    }
+
+    /// `encoding: ASCII` (whose header spelling is what teem's
+    /// `nrrdEncodingAscii->name` says) is read but never written by ITK.
+    /// Values are whitespace-separated and narrow integer types go through
+    /// `sscanf("%d")` into an `int` before being C-cast down.
+    #[test]
+    fn nrrd_reads_ascii_encoding() {
+        let path = tmp_path("ascii.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: short\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              encoding: ASCII\n\
+              \n\
+              -1 2\n3 -4\n",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[-1, 2, 3, -4]);
+    }
+
+    /// `formatNRRD_read` runs `nrrdLineSkip` then `nrrd__ByteSkipSkip` for every
+    /// non-compression encoding (formatNRRD.c:577-605), so a positive
+    /// `byte skip` advances into the ascii text just as it does into raw bytes.
+    #[test]
+    fn nrrd_ascii_honours_a_positive_byte_skip() {
+        let path = tmp_path("ascii_byteskip.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: short\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              encoding: ascii\n\
+              byte skip: 6\n\
+              \n\
+              XXXXXX-1 2\n3 -4\n",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[-1, 2, 3, -4]);
+    }
+
+    /// `nrrd__ByteSkipSkip` refuses a backwards byte skip for any encoding but
+    /// raw (read.c:320-327).
+    #[test]
+    fn nrrd_ascii_rejects_a_negative_byte_skip() {
+        let path = tmp_path("ascii_backskip.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: short\n\
+              dimension: 2\n\
+              sizes: 2 2\n\
+              encoding: ascii\n\
+              byte skip: -1\n\
+              \n\
+              -1 2\n3 -4\n",
+        )
+        .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(err, IoError::MalformedNrrdHeader(ref m) if m.contains("backwards byte skip")),
+            "{err}"
+        );
+    }
+
+    /// `data file: LIST` names one file per line after the field; the file
+    /// count must equal the product of the sizes at and above `dataFileDim`
+    /// (`nrrdIoDataFNCheck`).
+    #[test]
+    fn nrrd_reads_a_data_file_list() {
+        let path = tmp_path("list.nhdr");
+        let a = path.with_file_name(format!("sitk_io_test_{}_list_a.raw", std::process::id()));
+        let b = path.with_file_name(format!("sitk_io_test_{}_list_b.raw", std::process::id()));
+        std::fs::write(&a, [1u8, 2, 3, 4]).unwrap();
+        std::fs::write(&b, [5u8, 6, 7, 8]).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "NRRD0004\n\
+                 type: unsigned char\n\
+                 dimension: 3\n\
+                 sizes: 2 2 2\n\
+                 encoding: raw\n\
+                 data file: LIST\n\
+                 sitk_io_test_{pid}_list_a.raw\n\
+                 sitk_io_test_{pid}_list_b.raw\n",
+                pid = std::process::id()
+            ),
+        )
+        .unwrap();
+
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+        assert_eq!(img.size(), &[2, 2, 2]);
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// `line skip` consumes whole lines from the front of the data, then
+    /// `byte skip` moves forward from there (read.c).
+    #[test]
+    fn nrrd_honours_line_skip_and_byte_skip() {
+        let path = tmp_path("skips.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 1\n\
+              sizes: 3\n\
+              line skip: 1\n\
+              byte skip: 2\n\
+              encoding: raw\n\
+              \n\
+              junk line\nXX\x0a\x14\x1e",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[10, 20, 30]);
+    }
+
+    /// Big-endian raw data is byte-swapped after reading (`nrrdSwapEndian`).
+    #[test]
+    fn nrrd_big_endian_raw_is_swapped() {
+        let path = tmp_path("bigend.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: short\n\
+              dimension: 1\n\
+              sizes: 2\n\
+              endian: big\n\
+              encoding: raw\n\
+              \n\
+              \x01\x02\x03\x04",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[0x0102, 0x0304]);
+    }
+
+    /// The compressed encodings are recognised and rejected by name, since this
+    /// workspace takes no compression dependency (ledger §5.8).
+    #[test]
+    fn nrrd_rejects_compressed_encodings() {
+        for (encoding, needle) in [("gzip", "gzip"), ("gz", "gzip"), ("bzip2", "bzip2")] {
+            let path = tmp_path(&format!("compressed_{encoding}.nrrd"));
+            std::fs::write(
+                &path,
+                format!(
+                    "NRRD0004\ntype: unsigned char\ndimension: 1\nsizes: 2\n\
+                     encoding: {encoding}\n\nxx"
+                ),
+            )
+            .unwrap();
+            let err = read_image(&path).unwrap_err();
+            std::fs::remove_file(&path).ok();
+            match err {
+                IoError::UnsupportedNrrdFeature(message) => {
+                    assert!(message.contains(needle), "{message}");
+                    assert!(message.contains("compression"), "{message}");
+                }
+                other => panic!("expected UnsupportedNrrdFeature, got {other:?}"),
+            }
+        }
+    }
+
+    /// `ReadImageInformation` raises "Cannot currently handle nrrdTypeBlock"
+    /// (itkNrrdImageIO.cxx:617-620).
+    #[test]
+    fn nrrd_rejects_the_block_type() {
+        let path = tmp_path("block.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: block\nblock size: 4\ndimension: 1\nsizes: 2\n\
+              endian: little\nencoding: raw\n\nxxxxxxxx",
+        )
+        .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(
+            err,
+            IoError::UnsupportedNrrdFeature(ref m) if m.contains("nrrdTypeBlock")
+        ));
+    }
+
+    /// A `3D-symmetric-matrix` pixel axis is `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`,
+    /// which falls off the end of `GetPixelIDFromImageIO`'s if-ladder. Ledger §3.31.
+    #[test]
+    fn nrrd_rejects_a_symmetric_matrix_pixel_axis() {
+        let path = tmp_path("tensor.nrrd");
+        let mut bytes = b"NRRD0004\n\
+              type: float\n\
+              dimension: 2\n\
+              sizes: 6 2\n\
+              kinds: 3D-symmetric-matrix domain\n\
+              endian: little\n\
+              encoding: raw\n\n"
+            .to_vec();
+        bytes.extend_from_slice(&[0u8; 48]);
+        std::fs::write(&path, bytes).unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(
+            err,
+            IoError::UnsupportedNrrdFeature(ref m) if m.contains("Unknown PixelType")
+        ));
+    }
+
+    /// `nrrd__HeaderCheck` refuses a multi-byte raw type with no `endian`
+    /// field (simple.c).
+    #[test]
+    fn nrrd_requires_endian_for_multibyte_raw() {
+        let path = tmp_path("noendian.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: short\ndimension: 1\nsizes: 2\nencoding: raw\n\n\x01\x02\x03\x04",
+        )
+        .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(err, IoError::MalformedNrrdHeader(_)), "{err:?}");
+    }
+
+    /// Key/value lines survive into the dictionary, `airUnescape`d, and a
+    /// duplicate non-comment field is an error (formatNRRD.c:475-478).
+    #[test]
+    fn nrrd_key_value_pairs_and_duplicate_fields() {
+        let path = tmp_path("kvp.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: unsigned char\ndimension: 1\nsizes: 2\nencoding: raw\n\
+              patient:=Doe\\nJane\n\nxx",
+        )
+        .unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.meta_data("patient"), Some("Doe\nJane"));
+
+        let path = tmp_path("dup.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\ntype: unsigned char\ntype: short\ndimension: 1\nsizes: 2\n\
+              encoding: raw\n\nxx",
+        )
+        .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(
+            err,
+            IoError::MalformedNrrdHeader(ref m) if m.contains("already set field")
+        ));
+    }
+
+    /// `read_information` parses the header and never touches the pixels: this
+    /// `.nhdr` names a data file that does not exist.
+    #[test]
+    fn nrrd_read_information_does_not_need_the_data_file() {
+        let path = tmp_path("info.nhdr");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: double\n\
+              dimension: 3\n\
+              space: left-posterior-superior\n\
+              sizes: 100000 100000 1000\n\
+              space directions: (1,0,0) (0,1,0) (0,0,1)\n\
+              kinds: domain domain domain\n\
+              endian: little\n\
+              encoding: raw\n\
+              space origin: (0,0,0)\n\
+              data file: absent.raw\n",
+        )
+        .unwrap();
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::Float64);
+        assert_eq!(info.size, vec![100_000, 100_000, 1000]);
+        assert_eq!(info.spacing, vec![1.0, 1.0, 1.0]);
+    }
+
+    /// `can_read_file` needs both a supported extension and the `NRRD` magic;
+    /// a `.nrrd` file that is not a NRRD is claimed by nobody.
+    #[test]
+    fn nrrd_extension_alone_does_not_claim_a_file_for_reading() {
+        let path = tmp_path("not_really.nrrd");
+        std::fs::write(&path, b"this is a text file, not a NRRD\n").unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
     }
 }
