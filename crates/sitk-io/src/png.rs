@@ -80,15 +80,16 @@
 //! `foo.PNG` is claimed (both `.png` and `.PNG` are registered extensions,
 //! `:281-287`) but `foo.PnG` is not. Ledger §2.124.
 //!
-//! # Writing a 3-D (or higher) image writes only its first slice
+//! # Writing a 3-D (or higher) image is refused
 //!
 //! `WriteSlice` takes `height` from `GetDimensions(1)` alone —
 //! `(m_NumberOfDimensions > 1) ? GetDimensions(1) : 1` (`:605`) — and never
 //! consults any axis beyond that. `png_write_image` therefore reads exactly
 //! `height` rows starting at the buffer's first byte; a 3-D image's second and
-//! later slices are simply never addressed, with no error. Ledger §2.125;
-//! [`write`] reproduces it structurally (see next section) rather than
-//! special-casing the dimension.
+//! later slices are simply never addressed, with no error upstream. PNG has no
+//! container for a third axis, so a 3-D source could never round-trip back
+//! out of the file it produces; [`write`] refuses it instead of reproducing
+//! the silent data loss. **Fixed §2.125** — see [`IoError::PngWriteRejected`].
 //!
 //! # A >4-component vector image writes deterministic garbage
 //!
@@ -102,14 +103,10 @@
 //! `(numComp - 4)` components' worth of bytes untouched and unwritten. No
 //! error. Ledger §2.126.
 //!
-//! [`write`] reproduces both quirks above with one routine,
+//! [`write`] reproduces that truncation through
 //! [`rows_for_declared_channels`]: it is handed the whole flat buffer, the
 //! *actual* per-row byte stride, and the *declared* one, and copies only the
-//! declared-length prefix of each of `height` actual-length rows starting at
-//! byte 0. A 3-D image's `height` is `size[1]` alone, so slices at `size[2..]`
-//! are simply never reached by the row loop — the same "take the first
-//! `height` actual-stride rows" rule that truncates a >4-component row also
-//! truncates the image to its first Z-slice; neither needs its own branch.
+//! declared-length prefix of each of `height` actual-length rows.
 //!
 //! # Not implemented
 //!
@@ -366,6 +363,21 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
             component.as_str()
         )));
     };
+    // Fixed §2.125: `WriteSlice` takes `height` from `GetDimensions(1)` alone
+    // and never consults any axis beyond it, so a 3-D (or higher) image's
+    // second and later slices are silently never written
+    // (itkPNGImageIO.cxx:605). PNG has no container for a third axis, so a
+    // 3-D image cannot round-trip through it; refuse instead of silently
+    // dropping every slice past the first.
+    if image.dimension() > 2 {
+        return Err(IoError::PngWriteRejected(format!(
+            "a PNG file has only two axes; WriteSlice takes height from \
+             GetDimensions(1) alone and never writes any later slice, with no \
+             error (itkPNGImageIO.cxx:605) — doc/upstream-findings.md §2.125; \
+             not {}-dimensional",
+            image.dimension()
+        )));
+    }
 
     let file = std::fs::File::create(path)?;
 
@@ -555,8 +567,11 @@ mod tests {
 
     #[test]
     fn rows_for_declared_channels_stops_after_the_requested_height() {
-        // Three "slices" of one row each; only the first slice's row is kept,
-        // reproducing the first-slice-only write quirk (§2.125).
+        // The helper still takes an explicit row count independently of the
+        // buffer's length — exercised here directly, since `write` (fixed
+        // §2.125) now rejects any 3-D-or-higher image before this helper ever
+        // sees one, so a `height` shorter than the buffer no longer arises
+        // through the public API.
         let all: Vec<u8> = (0..9).collect();
         let out = rows_for_declared_channels(&all, 1, 1, 3, 3, 1);
         assert_eq!(out, vec![0, 1, 2]);

@@ -129,6 +129,14 @@ pub enum IoError {
     #[error("unsupported PNG feature: {0}")]
     UnsupportedPngFeature(String),
 
+    /// A PNG write this port refuses outright rather than silently emitting a
+    /// lossy file: a non-2-dimensional image, which upstream's `WriteSlice`
+    /// writes only the first Z-slice of with no error (itkPNGImageIO.cxx:605,
+    /// ledger §2.125). PNG has no container for a third axis, so such a file
+    /// could never round-trip.
+    #[error("cannot write PNG file: {0}")]
+    PngWriteRejected(String),
+
     /// A PNG file failed to decode — a bad signature the `png` crate itself
     /// caught, a truncated/corrupt IDAT stream, or a malformed chunk. Upstream
     /// has no single equivalent: libpng's error callback longjmps out of

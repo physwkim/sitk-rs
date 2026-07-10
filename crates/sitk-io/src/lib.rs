@@ -4168,20 +4168,23 @@ mod tests {
     }
 
     /// `WriteSlice` takes `height` from `GetDimensions(1)` alone
-    /// (itkPNGImageIO.cxx:605) and never consults any axis beyond it, so a
-    /// 3-D image's second and later slices are never written. Ledger §2.125.
+    /// (itkPNGImageIO.cxx:605) and never consults any axis beyond it, so
+    /// upstream silently writes only a 3-D image's first Z-slice. PNG has no
+    /// container for a third axis, so that file could never round-trip back
+    /// to 3-D; **fixed §2.125** — this port refuses the write instead, and
+    /// leaves no file behind, matching `jpeg_write_of_a_three_dimensional_image_is_rejected`.
     #[test]
-    fn png_write_of_a_three_dimensional_image_writes_only_the_first_slice() {
-        let data: Vec<u8> = (0..12u32).map(|i| i as u8).collect(); // size [2, 2, 3]
-        let img = Image::from_vec(&[2, 2, 3], data.clone()).unwrap();
+    fn png_write_of_a_three_dimensional_image_is_rejected() {
+        let img = Image::from_vec(&[2, 2, 3], vec![0u8; 12]).unwrap();
         let path = tmp_path("three_d.png");
-        write_image(&img, &path).unwrap();
-        let back = read_image(&path).unwrap();
-        std::fs::remove_file(&path).ok();
 
-        assert_eq!(back.dimension(), 2);
-        assert_eq!(back.size(), &[2, 2]);
-        assert_eq!(back.scalar_slice::<u8>().unwrap(), &data[..4]);
+        let result = write_image(&img, &path);
+
+        assert!(
+            matches!(&result, Err(IoError::PngWriteRejected(m)) if m.contains("§2.125")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
     }
 
     /// Fixed §1.59: upstream's `WriteSlice` opens the file with
