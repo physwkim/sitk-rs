@@ -30,9 +30,9 @@
 //! every zlib and gzip stream the three formats produce or consume.
 //!
 //! Transforms have their own reader and writer, [`read_transform`] and
-//! [`write_transform`], over two formats: the Insight legacy text format
-//! (`.tfm` / `.txt`, see [`transform_io`]) and HDF5 (`.h5` / `.hdf5`, see
-//! [`transform_hdf5`]).
+//! [`write_transform`], over three formats: the Insight legacy text format
+//! (`.tfm` / `.txt`, see [`transform_io`]), HDF5 (`.h5` / `.hdf5`, see
+//! [`transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`transform_matlab`]).
 
 pub mod compression;
 pub mod error;
@@ -48,6 +48,7 @@ pub mod reader;
 pub mod tiff;
 pub mod transform_hdf5;
 pub mod transform_io;
+pub mod transform_matlab;
 pub mod vtk;
 pub mod writer;
 
