@@ -88,11 +88,6 @@
 //!   `int64` it wraps in the pixel type. [`PatchPixel::sub_f64`] and
 //!   [`PatchPixel::mul_f64`] reproduce this per type rather than computing in
 //!   `f64` throughout.
-//! - `POISSON`'s step size is
-//!   `std::min(outVal, static_cast<PixelValueType>(0.99999)) + 0.00001`, and
-//!   `static_cast<PixelValueType>(0.99999)` is **0** for every integer pixel
-//!   type — so on an integer image the Poisson fidelity step collapses to
-//!   `1e-5` regardless of the pixel value. See [`PatchPixel::POISSON_CLAMP`].
 //! - `NoiseSigma` is consumed by the `RICIAN` model only. `GAUSSIAN` and
 //!   `POISSON` never read it, so setting it changes nothing for them.
 //! - `probJointEntropyFirstDerivative` and `...SecondDerivative` each get
@@ -106,6 +101,13 @@
 //!
 //! - `static_cast<PixelType>(result)` on an out-of-range `double` is undefined
 //!   behaviour in C++. [`sitk_core::Scalar::from_f64`] saturates instead.
+//! - `POISSON`'s step size is
+//!   `std::min(outVal, static_cast<PixelValueType>(0.99999)) + 0.00001`.
+//!   Upstream casts `0.99999` to the pixel type *before* the `min`, so
+//!   `static_cast<PixelValueType>(0.99999)` is **0** for every integer pixel
+//!   type and the step collapses to `1e-5` regardless of the pixel value.
+//!   [`poisson_step_size`] takes the `min` in real arithmetic, so an integer
+//!   pixel of value `v ≥ 1` gets the intended saturated step `0.99999 + 0.00001`.
 //! - `GaussianRandomSpatialNeighborSubsampler::GetIntegerVariate` casts a
 //!   possibly-negative `std::floor(randVar)` to `unsigned int` (undefined
 //!   behaviour) and relies on the wrapped value failing the `> upperBound`
@@ -253,9 +255,6 @@ const MAX_SIGMA_UPDATE_ITERATIONS: usize = 20;
 /// result back. Implemented per type so that C++'s integer promotion — exact
 /// for types narrower than `int`, wrapping for the rest — is reproduced.
 trait PatchPixel: Scalar {
-    /// `static_cast<PixelValueType>(0.99999)`, `POISSON`'s step-size clamp.
-    const POISSON_CLAMP: Self;
-
     /// `static_cast<double>(a - b)` with `a`, `b` of the pixel type.
     fn sub_f64(a: Self, b: Self) -> f64;
 
@@ -270,7 +269,6 @@ trait PatchPixel: Scalar {
 macro_rules! impl_patch_pixel_promotes_to_int {
     ($($t:ty),+ $(,)?) => {$(
         impl PatchPixel for $t {
-            const POISSON_CLAMP: Self = 0;
             fn sub_f64(a: Self, b: Self) -> f64 {
                 (i32::from(a) - i32::from(b)) as f64
             }
@@ -288,7 +286,6 @@ impl_patch_pixel_promotes_to_int!(u8, i8, u16, i16);
 macro_rules! impl_patch_pixel_wrapping {
     ($($t:ty),+ $(,)?) => {$(
         impl PatchPixel for $t {
-            const POISSON_CLAMP: Self = 0;
             fn sub_f64(a: Self, b: Self) -> f64 {
                 a.wrapping_sub(b) as f64
             }
@@ -301,7 +298,6 @@ macro_rules! impl_patch_pixel_wrapping {
 impl_patch_pixel_wrapping!(u32, i32, u64, i64);
 
 impl PatchPixel for f32 {
-    const POISSON_CLAMP: Self = 0.99999;
     fn sub_f64(a: Self, b: Self) -> f64 {
         f64::from(a - b)
     }
@@ -311,13 +307,25 @@ impl PatchPixel for f32 {
 }
 
 impl PatchPixel for f64 {
-    const POISSON_CLAMP: Self = 0.99999;
     fn sub_f64(a: Self, b: Self) -> f64 {
         a - b
     }
     fn mul_f64(a: Self, b: Self) -> f64 {
         a * b
     }
+}
+
+/// `POISSON`'s step-size clamp, `std::min(outVal, 0.99999) + 0.00001`, taken in
+/// real arithmetic. Upstream computes `std::min(outVal,
+/// static_cast<PixelValueType>(0.99999))`, casting `0.99999` to the pixel type
+/// before the `min`; for every integer pixel type that cast truncates to `0`,
+/// so the clamp is `min(outVal, 0) == 0` for all non-negative `outVal` and the
+/// step collapses to `1e-5` no matter how bright the pixel is. Clamping the
+/// literal `0.99999` in `f64` gives the intended saturated step `1e-5 + 0.99999`
+/// for any `outVal ≥ 0.99999`, so an integer pixel of value `v ≥ 1` now steps by
+/// the same amount a float pixel of value `1.0` would.
+fn poisson_step_size(output: f64) -> f64 {
+    output.min(0.99999) + 0.00001
 }
 
 // ---- geometry helpers ------------------------------------------------------
@@ -1040,12 +1048,7 @@ impl<T: PatchPixel> Denoiser<'_, T> {
             }
             NoiseModel::Poisson => {
                 let gradient = T::sub_f64(input, output) / (output.as_f64() + 0.00001);
-                let clamped = if output < T::POISSON_CLAMP {
-                    output
-                } else {
-                    T::POISSON_CLAMP
-                };
-                let step = clamped.as_f64() + 0.00001;
+                let step = poisson_step_size(output.as_f64());
                 (result + weight * (step * gradient)).max(0.00001)
             }
         }
@@ -1759,20 +1762,28 @@ mod tests {
         assert_eq!(values(&a), values(&b));
     }
 
-    /// `static_cast<PixelValueType>(0.99999)` is `0` for every integer pixel
-    /// type, so `POISSON`'s step size collapses to `0.00001` there.
+    /// `POISSON`'s step size clamps `min(outVal, 0.99999)` in real arithmetic,
+    /// so it no longer depends on the pixel type. Upstream cast `0.99999` to the
+    /// pixel type first, which is `0` for every integer type and forced the step
+    /// to the `1e-5` floor regardless of the pixel value; the fix lets an integer
+    /// pixel reach the same saturated step a float pixel of the same value would.
     #[test]
-    fn poisson_step_clamp_is_zero_for_every_integer_pixel_type() {
-        assert_eq!(<u8 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<i8 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<u16 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<i16 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<u32 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<i32 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<u64 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<i64 as PatchPixel>::POISSON_CLAMP, 0);
-        assert_eq!(<f32 as PatchPixel>::POISSON_CLAMP, 0.99999);
-        assert_eq!(<f64 as PatchPixel>::POISSON_CLAMP, 0.99999);
+    fn poisson_step_size_clamps_the_literal_in_real_arithmetic() {
+        // Saturated branch: any outVal ≥ 0.99999 clamps to 0.99999, so the step
+        // is 0.99999 + 0.00001. A pixel of value 1, 5 or 255 — integer or float
+        // — all step by this same amount. Upstream's cast denied integer pixels
+        // this branch entirely (their step was stuck at 0.00001).
+        let saturated = 0.99999_f64 + 0.00001;
+        assert_eq!(poisson_step_size(1.0), saturated);
+        assert_eq!(poisson_step_size(5.0), saturated);
+        assert_eq!(poisson_step_size(255.0), saturated);
+        assert_ne!(poisson_step_size(5.0), 0.00001);
+
+        // A truly dark pixel (outVal == 0) keeps the 1e-5 floor: min(0, …) == 0.
+        assert_eq!(poisson_step_size(0.0), 0.00001);
+
+        // A fractional float pixel below the clamp passes through unsaturated.
+        assert_eq!(poisson_step_size(0.5), 0.5 + 0.00001);
     }
 
     /// `b - a` is evaluated in the pixel type. `u8` promotes to `int`, so the
