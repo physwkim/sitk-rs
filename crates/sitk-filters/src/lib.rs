@@ -80,6 +80,7 @@ pub mod label;
 pub mod label_fusion;
 pub mod label_intensity;
 pub mod label_map;
+pub mod label_map_overlay;
 pub mod label_shape;
 pub mod label_to_rgb;
 pub mod level_set;

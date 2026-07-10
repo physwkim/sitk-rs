@@ -73,7 +73,7 @@ use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 /// `itkLabelToRGBFunctor.h`'s default-constructor palette (lines 70-76): 30
 /// raw `(r, g, b)` bytes, before `AddColor`'s `NumericTraits<ValueType>::max()`
 /// scaling.
-const DEFAULT_LABEL_COLORS: [[u8; 3]; 30] = [
+pub(crate) const DEFAULT_LABEL_COLORS: [[u8; 3]; 30] = [
     [255, 0, 0],
     [0, 205, 0],
     [0, 0, 255],
@@ -112,7 +112,7 @@ const DEFAULT_LABEL_COLORS: [[u8; 3]; 30] = [
 /// (`ResetColors()`, no merge) with `colormap.len() / 3` colors, silently
 /// dropping an incomplete trailing remainder. See the module docs' upstream
 /// finding #2 for why this diverges from the literal (UB) C++.
-fn build_color_table(colormap: &[u8]) -> Vec<[u8; 3]> {
+pub(crate) fn build_color_table(colormap: &[u8]) -> Vec<[u8; 3]> {
     if colormap.len() / 3 == 0 {
         return DEFAULT_LABEL_COLORS.to_vec();
     }
@@ -225,7 +225,7 @@ fn build_vector_from_f64<T: Scalar>(
 /// The vector-image counterpart of `crate::image_from_f64`: narrows `vals`
 /// (`components_per_pixel` interleaved `f64`s per pixel) to `component_id`'s
 /// native type and builds a vector image, copying `geom`'s geometry.
-fn vector_image_from_f64(
+pub(crate) fn vector_image_from_f64(
     component_id: PixelId,
     size: &[usize],
     components_per_pixel: usize,
