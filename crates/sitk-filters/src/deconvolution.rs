@@ -36,7 +36,22 @@
 //! inverse transform's imaginary part is zero up to round-off and taking `.re`
 //! is exact.
 //!
-//! # Two ITK quirks worth knowing
+//! # Fixed upstream bug
+//!
+//! **The iterative filters now honor `OutputRegionMode`.**
+//! `IterativeDeconvolutionImageFilter::GenerateData` overwrites the output's
+//! requested, buffered and largest-possible regions with the *input's* before
+//! `PadInput` and `CropOutput` ever read them
+//! (itkIterativeDeconvolutionImageFilter.hxx:110-116), discarding the `VALID`
+//! region `ConvolutionImageFilterBase::GenerateOutputInformation` had
+//! installed — even though `PadInput` and `CropOutput` are the very same
+//! `FFTConvolutionImageFilter` methods the one-shot spectral filters use
+//! correctly. This port never modeled that region-clobbering step: each
+//! iterative filter's `output_region_mode` reaches [`plan`] exactly as the
+//! spectral filters' does, so `VALID` narrows the padded working domain (and
+//! therefore every iteration) to the kernel-radius margin, then crops to it.
+//!
+//! # One ITK quirk worth knowing
 //!
 //! **`KernelZeroMagnitudeThreshold` is compared against different quantities.**
 //! [`inverse_deconvolution`] rejects a frequency when `|H| < ε`, but
@@ -52,15 +67,6 @@
 //! exposes `KernelZeroMagnitudeThreshold` on `InverseDeconvolutionImageFilter`
 //! only; Wiener and Tikhonov inherit the base class's `1.0e-4` and cannot
 //! change it, so [`KERNEL_ZERO_MAGNITUDE_THRESHOLD`] is a constant here.
-//!
-//! **The iterative filters ignore `OutputRegionMode`.**
-//! `IterativeDeconvolutionImageFilter::GenerateData` overwrites the output's
-//! requested, buffered and largest-possible regions with the *input's* before
-//! `PadInput` and `CropOutput` ever read them
-//! (itkIterativeDeconvolutionImageFilter.hxx:110-116), discarding the `VALID`
-//! region `ConvolutionImageFilterBase::GenerateOutputInformation` had
-//! installed. The parameter is on their SimpleITK yamls all the same, so it is
-//! on these functions too — and, faithfully, it does nothing.
 
 use sitk_core::Image;
 
@@ -336,6 +342,12 @@ pub fn tikhonov_deconvolution(
 /// `number_of_iterations` times over the padded real estimate, then crop
 /// (`Finish`, ibid. 69-79).
 ///
+/// `Initialize`'s `PadInput` and `Finish`'s `CropOutput` are the same
+/// `FFTConvolutionImageFilter` methods the spectral filters use, driven by the
+/// same `output_region_mode`-derived region (see the module docs), so `VALID`
+/// shrinks the padded working domain and the final crop exactly as it does for
+/// [`spectral_deconvolution`].
+///
 /// `number_of_iterations == 0` therefore returns the input unchanged, cropped
 /// out of its own padding.
 fn iterative_deconvolution(
@@ -344,11 +356,10 @@ fn iterative_deconvolution(
     number_of_iterations: u32,
     normalize: bool,
     boundary_condition: ConvolutionBoundaryCondition,
+    output_region_mode: OutputRegionMode,
     mut iteration: impl FnMut(&Prepared, Vec<f64>) -> Vec<f64>,
 ) -> Result<Image> {
-    // `OutputRegionMode` cannot reach here: `GenerateData` resets the output
-    // region to the input's before `PadInput` reads it (see the module docs).
-    let plan = plan(image, kernel, normalize, OutputRegionMode::Same)?;
+    let plan = plan(image, kernel, normalize, output_region_mode)?;
     if plan.out_size.contains(&0) {
         return empty_output(image, &plan.out_size);
     }
@@ -405,8 +416,9 @@ fn project_to_nonnegative(estimate: &mut [f64]) {
 /// negative — see [`projected_landweber_deconvolution`] for the constrained
 /// variant.
 ///
-/// `output_region_mode` is accepted for parity with the SimpleITK yaml and
-/// ignored, as ITK ignores it; the output always covers the whole input.
+/// `output_region_mode` shrinks the output — and the padded working domain
+/// every iteration runs in — to [`OutputRegionMode::Valid`]'s kernel-radius
+/// margin, exactly as it does for the one-shot filters; see the module docs.
 ///
 /// Ported from itkLandweberDeconvolutionImageFilter.hxx.
 pub fn landweber_deconvolution(
@@ -418,8 +430,6 @@ pub fn landweber_deconvolution(
     boundary_condition: ConvolutionBoundaryCondition,
     output_region_mode: OutputRegionMode,
 ) -> Result<Image> {
-    let _ = output_region_mode;
-
     // `Initialize` transforms the padded input once and reuses it every
     // iteration (itkLandweberDeconvolutionImageFilter.hxx:48).
     let mut input_spectrum = Vec::new();
@@ -429,6 +439,7 @@ pub fn landweber_deconvolution(
         number_of_iterations,
         normalize,
         boundary_condition,
+        output_region_mode,
         |prepared, estimate| {
             if input_spectrum.is_empty() {
                 input_spectrum = forward(&prepared.padded.values, &prepared.padded.size);
@@ -446,8 +457,9 @@ pub fn landweber_deconvolution(
 /// the next iteration starts from — running one iteration then clamping is not
 /// the same thing.
 ///
-/// `output_region_mode` is accepted for parity with the SimpleITK yaml and
-/// ignored, as ITK ignores it; the output always covers the whole input.
+/// `output_region_mode` shrinks the output — and the padded working domain
+/// every iteration runs in — to [`OutputRegionMode::Valid`]'s kernel-radius
+/// margin, exactly as it does for the one-shot filters; see the module docs.
 ///
 /// Ported from itkProjectedLandweberDeconvolutionImageFilter.hxx via its
 /// `ProjectedIterativeDeconvolutionImageFilter` mix-in.
@@ -460,8 +472,6 @@ pub fn projected_landweber_deconvolution(
     boundary_condition: ConvolutionBoundaryCondition,
     output_region_mode: OutputRegionMode,
 ) -> Result<Image> {
-    let _ = output_region_mode;
-
     let mut input_spectrum = Vec::new();
     iterative_deconvolution(
         image,
@@ -469,6 +479,7 @@ pub fn projected_landweber_deconvolution(
         number_of_iterations,
         normalize,
         boundary_condition,
+        output_region_mode,
         |prepared, estimate| {
             if input_spectrum.is_empty() {
                 input_spectrum = forward(&prepared.padded.values, &prepared.padded.size);
@@ -495,8 +506,9 @@ pub fn projected_landweber_deconvolution(
 /// (itkArithmeticOpsFunctors.h:181-189). Note that this is a *signed*
 /// comparison, so a negative re-blurred estimate also zeroes the quotient.
 ///
-/// `output_region_mode` is accepted for parity with the SimpleITK yaml and
-/// ignored, as ITK ignores it; the output always covers the whole input.
+/// `output_region_mode` shrinks the output — and the padded working domain
+/// every iteration runs in — to [`OutputRegionMode::Valid`]'s kernel-radius
+/// margin, exactly as it does for the one-shot filters; see the module docs.
 ///
 /// Ported from itkRichardsonLucyDeconvolutionImageFilter.hxx.
 pub fn richardson_lucy_deconvolution(
@@ -507,14 +519,13 @@ pub fn richardson_lucy_deconvolution(
     boundary_condition: ConvolutionBoundaryCondition,
     output_region_mode: OutputRegionMode,
 ) -> Result<Image> {
-    let _ = output_region_mode;
-
     iterative_deconvolution(
         image,
         kernel,
         number_of_iterations,
         normalize,
         boundary_condition,
+        output_region_mode,
         |prepared, estimate| {
             let size = &prepared.padded.size;
 
@@ -1135,31 +1146,52 @@ mod tests {
     }
 
     #[test]
-    fn the_iterative_filters_ignore_the_output_region_mode() {
-        // `IterativeDeconvolutionImageFilter::GenerateData` overwrites the
-        // output region with the input's before anything reads it, so `VALID`
-        // is indistinguishable from `SAME` — see the module docs.
+    fn the_iterative_filters_honor_the_output_region_mode() {
+        // `PadInput`/`CropOutput` are the same shared methods the spectral
+        // filters use, driven by the same `output_region_mode` — see the
+        // module docs. `smooth_kernel`'s radius is 1, so `VALID` shrinks the
+        // 8-pixel `compact_signal` down to `8 - 3 + 1 == 6`.
         let image = compact_signal();
         let kernel = smooth_kernel();
 
         for mode in [Same, Valid] {
+            let want: &[usize] = match mode {
+                Same => &[8],
+                Valid => &[6],
+            };
+
             let landweber =
                 landweber_deconvolution(&image, &kernel, 0.1, 3, true, ZeroPad, mode).unwrap();
-            assert_eq!(landweber.size(), image.size());
+            assert_eq!(landweber.size(), want, "landweber, {mode:?}");
 
             let projected =
                 projected_landweber_deconvolution(&image, &kernel, 0.1, 3, true, ZeroPad, mode)
                     .unwrap();
-            assert_eq!(projected.size(), image.size());
+            assert_eq!(projected.size(), want, "projected landweber, {mode:?}");
 
             let rl =
                 richardson_lucy_deconvolution(&image, &kernel, 3, true, ZeroPad, mode).unwrap();
-            assert_eq!(rl.size(), image.size());
+            assert_eq!(rl.size(), want, "richardson-lucy, {mode:?}");
         }
+    }
 
-        let same = landweber_deconvolution(&image, &kernel, 0.1, 3, true, ZeroPad, Same).unwrap();
-        let valid = landweber_deconvolution(&image, &kernel, 0.1, 3, true, ZeroPad, Valid).unwrap();
-        assert_eq!(values(&valid), values(&same));
+    #[test]
+    fn valid_mode_recovers_the_original_inside_the_kernel_radius_margin() {
+        // `smooth_kernel`'s radius-1 `VALID` window for the 8-pixel
+        // `compact_signal` is index 1, size 6 — `original[1..7]`. Landweber
+        // converges to the least-squares solution there just as it does for
+        // the whole signal under `SAME` (`landweber_and_richardson_lucy_approach_the_original`);
+        // `VALID`'s padded domain needs no boundary-condition-invented margin
+        // at all here, since the window's own kernel-radius margin already
+        // reaches the ends of the real image.
+        let original = compact_signal();
+        let kernel = smooth_kernel();
+        let blurred = blur(&original, &kernel);
+
+        let out =
+            landweber_deconvolution(&blurred, &kernel, 1.0, 400, true, ZeroPad, Valid).unwrap();
+        assert_eq!(out.size(), &[6]);
+        assert_close(&values(&out), &values(&original)[1..7], 1e-6);
     }
 
     // ---- boundary condition and normalize ----------------------------------

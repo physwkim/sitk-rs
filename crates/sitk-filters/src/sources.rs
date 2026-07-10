@@ -346,27 +346,30 @@ fn gaussian_kernel(x: f64) -> f64 {
 /// constant `1`. The final pixel is `scale` times the product of each axis's
 /// 1-D response at that pixel's own index along the axis.
 ///
-/// Two upstream quirks are reproduced exactly here, both consequences of
-/// `BeforeThreadedGenerateData` computing each axis's response along a
-/// single `ImageLinearIteratorWithIndex` line with every *other* index held
-/// at the region's start index (always `0` in this crate's `Image` model):
+/// `BeforeThreadedGenerateData` computes each axis's response along a single
+/// `ImageLinearIteratorWithIndex` line with every *other* index held at the
+/// region's start index (always `0` in this crate's `Image` model), i.e.
+/// `TransformIndexToPhysicalPoint`'s `origin[i] + sum_k direction[i][k] *
+/// spacing[k] * index[k]` reduces, on that line, to `origin[i] +
+/// direction[i][i] * spacing[i] * index[i]`. Upstream's own `m_PixelArrays`
+/// doc comment calls this "an internal variable to speed up the calculation
+/// of pixel values" (`itkGridImageSource.h:141`) — a deliberate separable-axis
+/// optimization this port keeps:
 ///
-/// - **`Origin` does not affect the grid pattern.** The `.hxx` computes
-///   `point[i] - origin[i] - ...`, and `point[i]` (from
-///   `TransformIndexToPhysicalPoint` with every other index at `0`) is itself
-///   `origin[i] + direction[i][i]*spacing[i]*index[i]` — so `origin[i]`
-///   cancels algebraically. This port computes the already-cancelled form
-///   (`direction[i][i]*spacing[i]*index[i] - ...`) rather than transcribing
-///   the literal subtraction, avoiding needless floating-point cancellation
-///   error for a large `origin`; the two are mathematically identical.
-///   `origin` still becomes the output image's own origin metadata, it just
-///   never influences *where the grid lines fall*.
-/// - **Only `direction`'s diagonal feeds the pattern**, not its full row:
-///   with every other index at `0`, `TransformIndexToPhysicalPoint`'s
-///   `sum_k direction[i][k]*spacing[k]*index[k]` reduces to its `k == i`
-///   term. An off-diagonal direction entry is faithfully inert here — again
-///   because `BeforeThreadedGenerateData` itself only ever walks that one
-///   line, not because this port dropped a term it should have used.
+/// - **`Origin` shifts the grid pattern in physical space**, matching the
+///   line's true physical point `origin[i] + direction[i][i] * spacing[i] *
+///   index[i]` (fixing upstream's own bug: its `.hxx` re-subtracts
+///   `origin[i]` right back out of that same point before comparing it
+///   against the grid spacing, which cancels `origin[i]` algebraically and
+///   leaves the pattern pinned to index `0` regardless of where the image
+///   actually sits in physical space).
+/// - **`Direction` must be diagonal.** A non-diagonal `direction` would need
+///   `point[i]` to depend on every index component, not just `index[i]` —
+///   incompatible with a per-axis `pixels[i][index[i]]` lookup table by
+///   construction, not a bug this port can patch without discarding
+///   upstream's own optimization. [`FilterError::NonDiagonalGridDirection`]
+///   rejects it instead of silently producing an axis-aligned pattern for a
+///   caller's rotated or sheared request.
 ///
 /// The kernel is always `GaussianKernelFunction`, matching the constructor's
 /// hardcoded choice (`itkGridImageSource.hxx`; the class documents itself as
@@ -376,8 +379,10 @@ fn gaussian_kernel(x: f64) -> f64 {
 /// the ported formula rather than because it changes the result.
 ///
 /// Errors if `sigma`/`grid_spacing`/`grid_offset`/`which_dimensions`/
-/// `geometry.origin`/`geometry.spacing` don't have one entry per dimension
-/// of `size`, or `geometry.direction` is non-empty and not exactly `dim*dim`.
+/// `geometry.origin`/`geometry.spacing` don't have one entry per dimension of
+/// `size`, if `geometry.direction` is non-empty and not exactly `dim*dim`, or
+/// if `geometry.direction` has a nonzero off-diagonal entry
+/// ([`FilterError::NonDiagonalGridDirection`]).
 pub fn grid_source(
     pixel_id: PixelId,
     size: &[usize],
@@ -391,8 +396,16 @@ pub fn grid_source(
     require_dim(settings.which_dimensions.len(), dim)?;
 
     let geo = geometry_image(size, geometry)?;
+    let origin = geo.origin().to_vec();
     let spacing = geo.spacing().to_vec();
     let direction = geo.direction().to_vec();
+    for i in 0..dim {
+        for k in 0..dim {
+            if i != k && direction[i * dim + k] != 0.0 {
+                return Err(FilterError::NonDiagonalGridDirection);
+            }
+        }
+    }
 
     let mut axis_pixels: Vec<Vec<f64>> = Vec::with_capacity(dim);
     for i in 0..dim {
@@ -407,7 +420,7 @@ pub fn grid_source(
 
         let mut pixels = vec![0.0f64; size[i]];
         for (idx, slot) in pixels.iter_mut().enumerate() {
-            let point_i = direction_diag * spacing[i] * idx as f64;
+            let point_i = origin[i] + direction_diag * spacing[i] * idx as f64;
             let mut val = 0.0;
             for j in 0..number_of_gaussians {
                 let num = point_i - (j as f64 - 2.0) * settings.grid_spacing[i] - offset;
@@ -864,32 +877,35 @@ mod tests {
     }
 
     #[test]
-    fn grid_origin_does_not_affect_pattern_only_metadata() {
+    fn grid_origin_shifts_the_pattern_in_physical_space() {
+        // Fixed upstream bug: `point_i` now includes `origin[i]`, and
+        // `num = point_i - (j-2)*grid_spacing - offset` treats `origin` and
+        // `-grid_offset` identically, so `origin == 2` reproduces
+        // `grid_offset_shifts_trough_positions`'s shift exactly: troughs move
+        // from {0, 4} to {2, 6}, and the old trough positions land on the
+        // same `1 - 2*exp(-8)` off-peak value hand-derived in
+        // `grid_hand_derived_troughs_and_off_peak_1d`.
         let settings = grid_1d_settings(0.0);
-        let near_origin = SourceGeometry {
-            origin: vec![0.0],
+        let shifted_origin = SourceGeometry {
+            origin: vec![2.0],
             spacing: vec![1.0],
             direction: vec![1.0],
         };
-        let far_origin = SourceGeometry {
-            origin: vec![500.0],
-            spacing: vec![1.0],
-            direction: vec![1.0],
-        };
-        let a = grid_source(PixelId::Float64, &[8], &settings, &near_origin).unwrap();
-        let b = grid_source(PixelId::Float64, &[8], &settings, &far_origin).unwrap();
-        // Bit-for-bit identical pixel pattern...
-        assert_eq!(
-            a.scalar_slice::<f64>().unwrap(),
-            b.scalar_slice::<f64>().unwrap()
-        );
-        // ...even though the requested origin still lands in the metadata.
-        assert_eq!(a.origin(), &[0.0]);
-        assert_eq!(b.origin(), &[500.0]);
+        let img = grid_source(PixelId::Float64, &[8], &settings, &shifted_origin).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+
+        assert!(v[2].abs() < 1e-9, "trough at 2: {}", v[2]);
+        assert!(v[6].abs() < 1e-9, "trough at 6: {}", v[6]);
+        let expected_off_peak = 1.0 - 2.0 * (-8.0f64).exp();
+        assert!((v[0] - expected_off_peak).abs() < 1e-4);
+        assert!((v[4] - expected_off_peak).abs() < 1e-4);
+
+        // The requested origin still lands in the output's own metadata too.
+        assert_eq!(img.origin(), &[2.0]);
     }
 
     #[test]
-    fn grid_direction_only_diagonal_feeds_the_pattern() {
+    fn grid_direction_diagonal_changes_the_pattern() {
         let settings = GridSourceSettings {
             sigma: vec![0.5, 0.5],
             grid_spacing: vec![4.0, 4.0],
@@ -897,32 +913,58 @@ mod tests {
             which_dimensions: vec![true, true],
             scale: 1.0,
         };
-        let identity = identity_geometry(2);
-        // Off-diagonal-only shear: diagonal entries unchanged (1, 1), only
-        // the off-diagonal term differs from identity.
-        let sheared = SourceGeometry {
-            origin: vec![0.0, 0.0],
-            spacing: vec![1.0, 1.0],
-            direction: vec![1.0, 0.5, 0.0, 1.0],
-        };
-        let a = grid_source(PixelId::Float64, &[8, 8], &settings, &identity).unwrap();
-        let b = grid_source(PixelId::Float64, &[8, 8], &settings, &sheared).unwrap();
-        assert_eq!(
-            a.scalar_slice::<f64>().unwrap(),
-            b.scalar_slice::<f64>().unwrap()
-        );
-
-        // Changing the diagonal itself, by contrast, does change the
-        // pattern: doubling axis 0's diagonal entry doubles its effective
-        // position, so index 2 (previously off-peak) becomes a trough.
+        // Doubling axis 0's diagonal entry doubles its effective position,
+        // so index 2 (previously off-peak) becomes a trough.
         let doubled_diag = SourceGeometry {
             origin: vec![0.0, 0.0],
             spacing: vec![1.0, 1.0],
             direction: vec![2.0, 0.0, 0.0, 1.0],
         };
-        let c = grid_source(PixelId::Float64, &[8, 8], &settings, &doubled_diag).unwrap();
-        let cv = c.scalar_slice::<f64>().unwrap();
-        assert!(cv[c.linear_index(&[2, 0])].abs() < 1e-9);
+        let img = grid_source(PixelId::Float64, &[8, 8], &settings, &doubled_diag).unwrap();
+        let v = img.scalar_slice::<f64>().unwrap();
+        assert!(v[img.linear_index(&[2, 0])].abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_rejects_a_non_diagonal_direction() {
+        // `BeforeThreadedGenerateData` walks only the region's start-index
+        // line per axis (see the function docs), which can only stand in for
+        // the true physical point when `direction` is diagonal — this port's
+        // separable per-axis algorithm cannot honor an off-diagonal entry, so
+        // it rejects one outright instead of silently producing an
+        // axis-aligned pattern.
+        let settings = GridSourceSettings {
+            sigma: vec![0.5, 0.5],
+            grid_spacing: vec![4.0, 4.0],
+            grid_offset: vec![0.0, 0.0],
+            which_dimensions: vec![true, true],
+            scale: 1.0,
+        };
+
+        // Nonzero above the diagonal...
+        let sheared = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![1.0, 0.5, 0.0, 1.0],
+        };
+        assert_eq!(
+            grid_source(PixelId::Float64, &[8, 8], &settings, &sheared),
+            Err(FilterError::NonDiagonalGridDirection)
+        );
+
+        // ...and below it, are both rejected.
+        let lower_sheared = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![1.0, 0.0, 0.5, 1.0],
+        };
+        assert_eq!(
+            grid_source(PixelId::Float64, &[8, 8], &settings, &lower_sheared),
+            Err(FilterError::NonDiagonalGridDirection)
+        );
+
+        // A diagonal direction is still accepted.
+        assert!(grid_source(PixelId::Float64, &[8, 8], &settings, &identity_geometry(2)).is_ok());
     }
 
     #[test]
@@ -930,7 +972,9 @@ mod tests {
         let geometry = SourceGeometry {
             origin: vec![3.0, -1.0],
             spacing: vec![2.0, 0.5],
-            direction: vec![0.0, 1.0, -1.0, 0.0],
+            // Diagonal but not the identity, to prove `direction` itself
+            // (not just `origin`/`spacing`) reaches the output's metadata.
+            direction: vec![1.0, 0.0, 0.0, -1.0],
         };
         let settings = GridSourceSettings {
             sigma: vec![0.5, 0.5],

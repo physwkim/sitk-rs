@@ -44,8 +44,8 @@
 //! verbatim from their respective ITK sources, so the two filters
 //! deliberately disagree on this boundary case.
 //!
-//! **Upstream quirk, reproduced as-is:** `FastApproximateRankImageFilter::SetRank`
-//! only forwards the rank to the first `ImageDimension - 1` of its
+//! **Fixed upstream bug:** `FastApproximateRankImageFilter::SetRank` only
+//! forwarded the rank to the first `ImageDimension - 1` of its
 //! `ImageDimension` per-axis filters:
 //!
 //! ```cpp
@@ -53,14 +53,15 @@
 //!   this->m_Filters[i]->SetRank(m_Rank);
 //! ```
 //!
-//! The last axis's filter (index `ImageDimension - 1`) is never reached by
-//! this loop, so it keeps `RankImageFilter`'s own built-in default rank of
-//! `0.5` forever — **the last axis is always median-filtered, no matter what
-//! `rank` the caller requests.** For a 1-D image the loop body never
-//! executes at all (`0 < ImageDimension - 1 == 0` is false), so the *only*
-//! axis is always the median regardless of `rank`. [`fast_approximate_rank`]
-//! reproduces this exactly: `rank` is applied to every axis except the last,
-//! and `0.5` is applied to the last axis, unconditionally.
+//! so the last axis's filter (index `ImageDimension - 1`) was never reached
+//! by this loop and kept `RankImageFilter`'s own built-in default rank of
+//! `0.5` forever — the last axis was always median-filtered, no matter what
+//! `rank` the caller requested (and for a 1-D image the loop body never
+//! executed at all, so the *only* axis was always the median). Fixed by
+//! upstream PR InsightSoftwareConsortium/ITK#6580 (2026-07-10), which widens
+//! the loop bound to `ImageDimension`: every axis's filter now receives the
+//! same `rank`. [`fast_approximate_rank`] applies `rank` uniformly to every
+//! axis, matching the fix.
 //!
 //! [`rank`] is `RankImageFilter` itself, ported directly rather than through
 //! the separable approximation: every output pixel is the order statistic of
@@ -133,14 +134,12 @@ fn fast_approximate_rank_typed<T: Scalar>(
     radius: &[usize],
     rank: f32,
 ) -> Result<Image> {
-    let dim = img.dimension();
     let size = img.size().to_vec();
     let strides_ = strides(&size);
     let mut buf: Vec<T> = img.scalar_slice::<T>()?.to_vec();
 
     for (axis, &r) in radius.iter().enumerate() {
-        let axis_rank = if axis == dim - 1 { 0.5 } else { rank };
-        buf = rank_pass(&buf, &size, &strides_, axis, r, axis_rank);
+        buf = rank_pass(&buf, &size, &strides_, axis, r, rank);
     }
 
     let mut result = Image::from_vec(&size, buf)?;
@@ -150,9 +149,8 @@ fn fast_approximate_rank_typed<T: Scalar>(
 
 /// `FastApproximateRankImageFilter`: a separable rank filter. `rank` is
 /// clamped to `[0, 1]` (`0.5` = median, `0.0` = minimum, `1.0` = maximum) and
-/// applied as a 1-D pass per axis in ascending axis order — **except the
-/// last axis, which is always median-filtered regardless of `rank`** (see
-/// the module doc's "upstream quirk" section).
+/// applied as a 1-D pass per axis, in ascending axis order, uniformly across
+/// every axis (see the module doc's "Fixed upstream bug" section).
 ///
 /// Errors if `radius.len() != img.dimension()`.
 pub fn fast_approximate_rank(img: &Image, radius: &[usize], rank: f64) -> Result<Image> {
@@ -188,11 +186,13 @@ mod tests {
     #[test]
     fn fast_approximate_rank_odd_window_median_matches_plain_median() {
         // 1-D, interior pixel: n = 3, k = floor(0.5*2) = 1 -> the true
-        // middle value, same as an ordinary median.
+        // middle value, same as an ordinary median. rank = 0.5 is passed
+        // explicitly (see `fast_approximate_rank_1d_honors_the_requested_rank`
+        // for proof that a 1-D image's only axis actually receives whatever
+        // rank the caller passes, now that the upstream last-axis bug is
+        // fixed).
         let img = Image::from_vec(&[5], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
-        // dim == 1, so the only axis is always forced to rank 0.5 regardless
-        // of the 1.0 passed here -- this also exercises that quirk.
-        let out = fast_approximate_rank(&img, &[1], 1.0)
+        let out = fast_approximate_rank(&img, &[1], 0.5)
             .unwrap()
             .to_f64_vec()
             .unwrap();
@@ -201,11 +201,11 @@ mod tests {
 
     #[test]
     fn fast_approximate_rank_even_boundary_window_picks_lower_value_not_upper() {
-        // 1-D, left edge pixel: window crops to n = 2 values [10, 20].
-        // k = floor(0.5*(2-1)) = 0 -> the LOWER of the pair (10), not the
-        // upper one `median()`'s len/2 convention would pick.
+        // 1-D, left edge pixel, median rank: window crops to n = 2 values
+        // [10, 20]. k = floor(0.5*(2-1)) = 0 -> the LOWER of the pair (10),
+        // not the upper one `median()`'s len/2 convention would pick.
         let img = Image::from_vec(&[5], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
-        let out = fast_approximate_rank(&img, &[1], 1.0)
+        let out = fast_approximate_rank(&img, &[1], 0.5)
             .unwrap()
             .to_f64_vec()
             .unwrap();
@@ -214,32 +214,59 @@ mod tests {
         assert_eq!(out[4], 40.0);
     }
 
+    /// Fixed upstream bug (module doc, ITK#6580): a 1-D image's only axis is
+    /// `ImageDimension - 1 == 0`, so upstream's `i < ImageDimension - 1`
+    /// loop bound never ran at all and the axis kept `RankImageFilter`'s
+    /// built-in default rank of `0.5` regardless of what the caller passed.
+    /// `rank = 1.0` (max) proves the caller's own rank now reaches the
+    /// axis: at the interior pixel the window is `[20, 30, 40]`, and the
+    /// true maximum (40) is not the median (30) the old forced-0.5 default
+    /// would have produced.
     #[test]
-    fn fast_approximate_rank_last_axis_ignores_rank_2d() {
-        // 3x3 grid, x fastest:
-        //   1 2 3
-        //   4 5 6
-        //   7 8 9
-        // radius = [1, 1], rank = 1.0 (max). Axis 0 (x) is not the last axis
-        // so it uses rank=1.0 (max); axis 1 (y, the last axis) is forced to
-        // 0.5 regardless of the 1.0 requested.
+    fn fast_approximate_rank_1d_honors_the_requested_rank() {
+        let img = Image::from_vec(&[5], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
+        let out = fast_approximate_rank(&img, &[1], 1.0)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        assert_eq!(out[2], 40.0);
+    }
+
+    /// Fixed upstream bug (module doc, ITK#6580): `rank` now applies
+    /// uniformly to every axis, including the last one, rather than the
+    /// last axis being forced to the median regardless of `rank`.
+    ///
+    /// 3x3 grid, x fastest:
+    ///   1 2 3
+    ///   4 5 6
+    ///   7 8 9
+    /// radius = [1, 1], rank = 1.0 (max) on both axes.
+    ///
+    /// Axis 0 (x) pass, per-row cropped max:
+    ///   row y=0 [1,2,3] -> [2,3,3]
+    ///   row y=1 [4,5,6] -> [5,6,6]
+    ///   row y=2 [7,8,9] -> [8,9,9]
+    /// Axis 1 (y) pass, per-column cropped max, on the axis-0 result:
+    ///   col x=0 [2,5,8] -> [5,8,8]
+    ///   col x=1 [3,6,9] -> [6,9,9]
+    ///   col x=2 [3,6,9] -> [6,9,9]
+    #[test]
+    fn fast_approximate_rank_applies_rank_uniformly_to_every_axis_2d() {
         let img =
             Image::from_vec(&[3, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap();
         let out = fast_approximate_rank(&img, &[1, 1], 1.0)
             .unwrap()
             .to_f64_vec()
             .unwrap();
-        // If axis 1 also used rank=1.0 (max), row y=2 would stay [7,8,9]-derived
-        // maxima and every column's top would dominate. Instead the forced
-        // median on axis 1 pulls rows 1 and 2 to the same values.
-        assert_eq!(out, vec![2.0, 3.0, 3.0, 5.0, 6.0, 6.0, 5.0, 6.0, 6.0]);
+        assert_eq!(out, vec![5.0, 6.0, 6.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0]);
     }
 
     #[test]
     fn fast_approximate_rank_rank_one_is_the_true_maximum() {
-        // dim=2 with size[1]=1 isolates axis 0 (user rank) from axis 1 (the
-        // last axis, forced 0.5 but trivial on a length-1 axis). radius=2
-        // gives each position its own clipped window:
+        // dim=2 with size[1]=1 isolates axis 0's behavior: axis 1 also
+        // receives `rank` now, but is trivial on a length-1 axis (window
+        // size 1 always selects that single value regardless of rank).
+        // radius=2 gives each position its own clipped window:
         //   x=0: [10,20,30]      max=30
         //   x=1: [10,20,30,40]   max=40
         //   x=2: [10,20,30,40,50] max=50

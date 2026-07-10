@@ -40,45 +40,50 @@
 //!    reverse sweep order -- a parent always sweeps later than its
 //!    children, so a single backward pass suffices.
 //!
-//! ## Upstream quirk: the last raster pixel is exempt from the sort
+//! ## Fixed upstream bug: the last raster pixel was exempt from the sort
 //!
-//! `GenerateData()` calls `std::stable_sort(&m_SortPixels[0],
-//! &m_SortPixels[buffsize - 1], ...)`: the *exclusive* end iterator is
+//! `GenerateData()` called `std::stable_sort(&m_SortPixels[0],
+//! &m_SortPixels[buffsize - 1], ...)`: the *exclusive* end iterator was
 //! `&m_SortPixels[buffsize - 1]`, one slot short of
 //! `&m_SortPixels[buffsize]`. Since `m_SortPixels` is identity-initialized
-//! (`m_SortPixels[pos] = pos`) before the sort, this off-by-one leaves array
-//! slot `buffsize - 1` completely untouched: it always holds flat index
-//! `buffsize - 1` (the image's last pixel in raster order) and is therefore
-//! **always swept last, regardless of that pixel's actual value.**
+//! (`m_SortPixels[pos] = pos`) before the sort, this off-by-one left array
+//! slot `buffsize - 1` completely untouched: it always held flat index
+//! `buffsize - 1` (the image's last pixel in raster order) and was
+//! therefore **always swept last, regardless of that pixel's actual
+//! value.**
 //!
-//! This is not merely a reordering effect: `FindRoot` treats "never
+//! This was not merely a reordering effect: `FindRoot` treats "never
 //! visited" (`m_Parent[x] == INACTIVE == -1`) and "a genuine root"
 //! (`m_Parent[x] == ACTIVE == -2`) identically -- both are simply `< 0`. If
-//! some other pixel is swept earlier and, following the normal sweep rule,
-//! unions against flat index `buffsize - 1` *before that pixel's own turn*,
-//! `FindRoot` silently treats the not-yet-visited pixel as an
+//! some other pixel was swept earlier and, following the normal sweep rule,
+//! unioned against flat index `buffsize - 1` *before that pixel's own
+//! turn*, `FindRoot` silently treated the not-yet-visited pixel as an
 //! already-resolved root with its sentinel `AuxData` of `-1`, which
 //! satisfies `Criterion`'s `AuxData[r] < Lambda` for essentially any
-//! positive `Lambda` and gets merged in -- corrupting the absorbing
+//! positive `Lambda` and got merged in -- corrupting the absorbing
 //! component's accumulated attribute by `-1`. The premature parent link
-//! itself is silently overwritten once flat index `buffsize - 1` finally
-//! reaches its own turn (`MakeSet` unconditionally resets it to `ACTIVE`),
+//! itself was silently overwritten once flat index `buffsize - 1` finally
+//! reached its own turn (`MakeSet` unconditionally resets it to `ACTIVE`),
 //! but the corruption already applied to the *other* component's
-//! `AuxData` is not undone. Because that corrupted delta is a fixed offset
-//! unrelated to any real pixel value, it can flip a `Criterion` decision
+//! `AuxData` was not undone. Because that corrupted delta is a fixed offset
+//! unrelated to any real pixel value, it could flip a `Criterion` decision
 //! that would otherwise land exactly on the `Lambda` boundary, changing
 //! which components survive (see this module's tests for a fully
 //! hand-verified case: an isolated single-pixel peak sitting at the last
-//! flat index survives `area_opening` even though the same peak elsewhere
-//! in the same image would be correctly removed).
+//! flat index used to survive `area_opening` even though the same peak
+//! elsewhere in the same image is correctly removed).
 //!
-//! This port reproduces the bug exactly rather than fixing it: the sort
-//! only ever permutes `vals.len() - 1` elements, always leaving the last
-//! flat index's sweep slot fixed, and `parent`/`aux_data` use the same
-//! `-1` ("never visited") / non-negative ("has a parent") encoding as
-//! upstream, so `find_root` on a not-yet-swept pixel returns the same
-//! not-yet-valid answer ITK does -- no special-casing was needed to
-//! reproduce it faithfully.
+//! Fix PR InsightSoftwareConsortium/ITK#6581 (item B19 of #6575) widens the
+//! sort to cover the full buffer: `std::stable_sort(m_SortPixels.get(),
+//! m_SortPixels.get() + buffsize, ...)`. This port matches that fix by
+//! sorting the whole `sort_pixels` array rather than `[..total - 1]`. Once
+//! every pixel is sorted by value, the sweep's own invariant -- a neighbor
+//! is only looked up via `find_root` once `kind.compare` (or the tie-break)
+//! proves it sorts no later than the current pixel, which is exactly when
+//! it has already been swept -- holds for *every* flat index, so
+//! `find_root` never observes an `INACTIVE` (`-1`) node in practice; the
+//! `parent[x] < 0` conflation in [`find_root`] is dead code once the sort is
+//! correct, not a latent defect of its own.
 //!
 //! `UseImageSpacing` scales each pixel's starting attribute contribution by
 //! the product of [`Image::spacing`], matching `psize = Π spacing[i]`; when
@@ -120,8 +125,9 @@ fn make_set(x: usize, attribute_value_per_pixel: f64, parent: &mut [i64], aux_da
 
 /// `FindRoot`, iterative with full path compression. `parent[x] < 0` covers
 /// both `INACTIVE` (`-1`, never swept) and `ACTIVE` (`-2`, a genuine root) --
-/// upstream's `FindRoot` does not distinguish them either, which is exactly
-/// what the module docs' upstream quirk relies on.
+/// upstream's `FindRoot` does not distinguish them either, but with the
+/// sort fixed (see the module docs) the sweep never calls this on an
+/// `INACTIVE` node, so the conflation is unreachable in practice.
 fn find_root(parent: &mut [i64], x: usize) -> usize {
     let mut root = x;
     while parent[root] >= 0 {
@@ -138,7 +144,7 @@ fn find_root(parent: &mut [i64], x: usize) -> usize {
 
 /// `MakeSet`/`FindRoot`/`Criterion`/`Union` and the resolving pass, run over
 /// `vals` in flat raster order. See the module docs for the upstream
-/// off-by-one this reproduces on purpose.
+/// off-by-one this fixes.
 fn attribute_morphology(
     vals: &[f64],
     size: &[usize],
@@ -153,7 +159,7 @@ fn attribute_morphology(
     }
 
     let mut sort_pixels: Vec<usize> = (0..total).collect();
-    sort_pixels[..total - 1].sort_by(|&a, &b| {
+    sort_pixels.sort_by(|&a, &b| {
         if kind.compare(vals[a], vals[b]) {
             Ordering::Less
         } else if kind.compare(vals[b], vals[a]) {
@@ -375,23 +381,18 @@ mod tests {
         );
     }
 
-    /// Upstream quirk (see module docs): `std::stable_sort`'s exclusive end
-    /// iterator is one slot short, so the last raster pixel is always swept
-    /// last regardless of its value. An isolated area-1 peak placed at the
-    /// image's last flat index is swept only after its lone neighbor has
-    /// already (incorrectly) unioned against it as an unvisited node with a
-    /// sentinel attribute of `-1`, which satisfies `Criterion` and gets
-    /// merged in, corrupting the neighbor's accumulated attribute. The
-    /// premature parent link is overwritten once the peak's own `MakeSet`
-    /// runs, so the peak itself survives as a permanent root -- i.e. this
-    /// port must reproduce the peak *surviving* `Lambda = 2`, even though
-    /// its true area (1) is below threshold and the identical peak swept
-    /// in the middle of an array (previous test) is correctly removed.
+    /// Fixed upstream bug (see module docs, ledger §1.19): the sort now
+    /// covers the whole `sort_pixels` array, so the last raster pixel is
+    /// swept in its correct value order like every other pixel. An isolated
+    /// area-1 peak placed at the image's last flat index therefore merges
+    /// into its background neighbor at that neighbor's own turn, exactly as
+    /// the identical peak swept in the middle of an array does (previous
+    /// test) -- both are removed by `Lambda = 2`.
     #[test]
-    fn area_opening_last_raster_pixel_is_exempt_from_the_sort() {
+    fn area_opening_removes_a_small_peak_at_the_last_raster_pixel_too() {
         let image = img_i32(&[3, 1], vec![0, 0, 5]);
         let out = area_opening(&image, 2.0, false, false).unwrap();
-        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[0, 0, 5]);
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[0, 0, 0]);
     }
 
     // ---- area_closing ----

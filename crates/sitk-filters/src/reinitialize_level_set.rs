@@ -25,16 +25,24 @@
 //! distance to the `level_set_value` isocontour, not that distance re-offset by
 //! `level_set_value`.
 //!
-//! # Upstream behaviour reproduced here
+//! # Fixed upstream bug
 //!
-//! * **A pixel that lies exactly on the level set neutralises its neighbours.**
-//!   `CalculateDistance` short-circuits a pixel whose shifted value is exactly
-//!   zero into the *inside* list at distance `0`, and its sign tests on
-//!   neighbours are strict (`neighValue > 0` / `neighValue < 0`), so a zero
-//!   neighbour is not a sign change. A level set whose zero contour lands
-//!   exactly on grid pixels therefore contributes no outside points at all, the
-//!   outward march has no seeds, and every pixel above the level set keeps the
-//!   marcher's `m_LargeValue` (`NumericTraits<PixelType>::max() / 2`).
+//! * **A pixel that lies exactly on the level set no longer neutralises its
+//!   neighbours.** `CalculateDistance` still short-circuits a pixel whose
+//!   shifted value is exactly zero into the *inside* list at distance `0` —
+//!   that much is correct, and consistent with the `inside = (center <= 0)`
+//!   convention used everywhere else. Upstream's bug was in the *neighbour*
+//!   sign test, which was strict (`neighValue > 0` / `neighValue < 0`): a
+//!   neighbour sitting exactly on the contour is geometrically a crossing no
+//!   matter which side the center is on (`d = center / (center - 0) * spacing
+//!   == center`, always in range), so this port's sign test is non-strict
+//!   (`neighValue >= 0` / `neighValue <= 0`) and accepts it. A level set whose
+//!   zero contour lands exactly on grid pixels now seeds the march from every
+//!   pixel adjacent to the contour, recovering the exact distance instead of
+//!   starving the outward march and leaving the whole outside at the
+//!   marcher's `m_LargeValue`.
+//!
+//! # Upstream behaviour reproduced here
 //!
 //! * **A pixel with no sign change anywhere joins neither list.** Its
 //!   accumulator stays zero, `CalculateDistance` returns early, and the pixel is
@@ -102,9 +110,9 @@ fn type_max(id: PixelId) -> f64 {
 /// The output has the input's pixel type and geometry. `RealPixelIDTypeList`:
 /// the input must be [`PixelId::Float32`] or [`PixelId::Float64`].
 ///
-/// See the [module docs](self) for the pipeline and for the upstream quirks
-/// reproduced here — in particular, an isocontour that passes exactly through
-/// grid pixels leaves the whole outside at the marcher's large value.
+/// See the [module docs](self) for the pipeline, for the upstream bug fixed
+/// here (an isocontour that passes exactly through grid pixels no longer
+/// starves the outward march), and for the upstream quirks still reproduced.
 pub fn reinitialize_level_set(
     image: &Image,
     level_set_value: f64,
@@ -254,7 +262,7 @@ fn locate(
                     to_f32,
                 );
 
-                if (neighbor_value > 0.0 && inside) || (neighbor_value < 0.0 && !inside) {
+                if (neighbor_value >= 0.0 && inside) || (neighbor_value <= 0.0 && !inside) {
                     // Both the numerator and the denominator carry the center's
                     // sign, so the interpolated distance is positive.
                     let distance = center / (center - neighbor_value) * spacing[j];
@@ -445,7 +453,7 @@ mod tests {
     /// on the contour — `(2m+1)^2 + (2n+1)^2 == 256` has no solution, since a
     /// sum of two odd squares is `2 mod 4`. The observed worst deviation is
     /// `0.1414`; see
-    /// [`exact_zeros_on_the_contour_degrade_their_own_neighbourhood`] for what
+    /// [`exact_zeros_on_the_contour_recover_their_neighbours_exactly`] for what
     /// happens when a pixel *does* land on it.
     #[test]
     fn a_circle_is_near_identity_inside_the_band() {
@@ -458,34 +466,51 @@ mod tests {
 
     /// The same circle centred on a pixel puts four pixels exactly on the
     /// contour, one per axis. `CalculateDistance` files each as an inside point
-    /// at distance `0`, and its strict sign tests then deny a sign change to
-    /// every neighbour that straddles it — so the outside seeds thin out around
-    /// the four axis points and the outward march arrives late there.
+    /// at distance `0`, and its non-strict sign test now accepts that `0` as a
+    /// crossing for every neighbour straddling it, at `d = center /
+    /// (center - 0) * 1 == center` — i.e. exactly the true distance, since each
+    /// of those neighbours sits one grid step from the axis point. All twelve
+    /// pixels adjacent to (and including) the four axis points recover their
+    /// true distance bit-for-bit.
     ///
-    /// The worst deviation jumps from `0.1414` to `0.7699`, and it sits at
-    /// `(16, 7)`: one pixel outside the contour's topmost point `(16, 8)`.
+    /// The worst deviation near the contour drops from `0.7699` (the old
+    /// starved value at `(16, 7)`) to `0.1581`, at `(11, 9)` — a generic
+    /// first-order upwind discretisation artefact unrelated to any exact-zero
+    /// pixel, in the same magnitude class as
+    /// [`a_circle_is_near_identity_inside_the_band`]'s `0.1414` baseline for a
+    /// contour with no exact zeros at all.
     #[test]
-    fn exact_zeros_on_the_contour_degrade_their_own_neighbourhood() {
+    fn exact_zeros_on_the_contour_recover_their_neighbours_exactly() {
         let n = 33usize;
         let data = circle(n, 16.0, 8.0);
         assert_eq!(data.iter().filter(|&&v| v == 0.0).count(), 4);
 
         let worst = worst_deviation_near_the_contour(n, &data);
         assert!(
-            (0.76..0.78).contains(&worst),
+            (0.15..0.17).contains(&worst),
             "worst deviation near the contour: {worst}"
         );
 
-        // The true distance at (16, 7) is 1. Its own neighbours seed nothing, so
-        // the front reaches it only around the sides, through (15, 7) and
-        // (17, 7) at 1.0629 and (16, 8) at 1.0629 — a two-axis solve landing at
-        // `(sqrt(2) + 2 * 1.0629) / 2 == 1.77`.
-        let out = reinit(&Image::from_vec(&[n, n], data).unwrap(), 0.0);
-        assert!(
-            (1.76..1.78).contains(&out[16 + n * 7]),
-            "{}",
-            out[16 + n * 7]
-        );
+        // The four axis points and their immediate neighbours recover their
+        // true distance exactly.
+        let out = reinit(&Image::from_vec(&[n, n], data.clone()).unwrap(), 0.0);
+        for &(x, y) in &[
+            (24usize, 16usize),
+            (23, 16),
+            (25, 16),
+            (8, 16),
+            (7, 16),
+            (9, 16),
+            (16, 24),
+            (16, 23),
+            (16, 25),
+            (16, 8),
+            (16, 7),
+            (16, 9),
+        ] {
+            let i = x + n * y;
+            assert_eq!(out[i], data[i], "pixel ({x}, {y})");
+        }
     }
 
     // ---- Narrow banding ------------------------------------------------------
@@ -545,32 +570,31 @@ mod tests {
         );
     }
 
-    // ---- Upstream quirks ------------------------------------------------------
+    // ---- Contour-on-grid handling ----------------------------------------------
 
     /// A contour landing exactly on grid pixels: `CalculateDistance` files the
-    /// zero pixel as *inside* at distance `0`, and its strict sign tests refuse
-    /// the zero as a sign change for either neighbour. `OutsidePoints` ends up
-    /// empty, the outward march has no seeds, and every pixel above the level
-    /// set keeps the marcher's large value.
+    /// zero pixel as *inside* at distance `0`. Its non-strict sign test now
+    /// accepts that zero as a sign change for the outside neighbour too, so
+    /// `x = 4` (`center = 1`) seeds the outward march at
+    /// `d = 1 / (1 - 0) * 1 = 1`, and marching outward from there at unit speed
+    /// recovers the exact distance for the rest of the ramp.
     #[test]
-    fn a_contour_on_the_grid_starves_the_outward_march() {
+    fn a_contour_on_the_grid_recovers_the_exact_outward_distance() {
         let out = reinit(&ramp(7, 3.0), 0.0);
-        let large = large_value(PixelId::Float64);
 
         assert_close(&out[0..4], &[-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(&out[4..7], &[large; 3]);
+        assert_close(&out[4..7], &[1.0, 2.0, 3.0]);
     }
 
-    /// The same starvation seen from the `level_set_value` side: shifting the
-    /// contour onto a pixel reproduces it.
+    /// The same recovery seen from the `level_set_value` side: shifting the
+    /// contour onto a pixel reproduces the same shifted ramp.
     #[test]
-    fn a_level_set_value_that_lands_on_a_pixel_starves_the_march_too() {
+    fn a_level_set_value_that_lands_on_a_pixel_recovers_the_exact_distance_too() {
         let out = reinit(&ramp(7, 2.5), 0.5);
-        let large = large_value(PixelId::Float64);
 
         // phi - 0.5 = [-3, -2, -1, 0, 1, 2, 3]
         assert_close(&out[0..4], &[-3.0, -2.0, -1.0, 0.0]);
-        assert_eq!(&out[4..7], &[large; 3]);
+        assert_close(&out[4..7], &[1.0, 2.0, 3.0]);
     }
 
     /// A level set with no sign change anywhere seeds neither march, so both
@@ -603,15 +627,15 @@ mod tests {
             &[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
         );
 
-        // The starved-march value is the `float` large value, not the `double`
-        // one, and the narrow-band pre-fill is `float`'s maximum.
-        let on_grid =
-            Image::from_vec(&[7, 1], (0..7).map(|x| x as f32 - 3.0).collect::<Vec<_>>()).unwrap();
-        let starved = reinitialize_level_set(&on_grid, 0.0, false, 12.0, 12.0)
+        // A level set with no sign change seeds no march on either side, so it
+        // keeps the large value — the `float` one, not the `double` one — and
+        // the narrow-band pre-fill (below) is `float`'s maximum.
+        let no_crossing = Image::from_vec(&[4, 1], vec![3.0f32; 4]).unwrap();
+        let starved = reinitialize_level_set(&no_crossing, 0.0, false, 12.0, 12.0)
             .unwrap()
             .to_f64_vec()
             .unwrap();
-        assert_eq!(starved[6], large_value(PixelId::Float32));
+        assert_eq!(starved, vec![large_value(PixelId::Float32); 4]);
 
         let banded = reinitialize_level_set(&image, 0.0, true, 12.0, 0.0)
             .unwrap()

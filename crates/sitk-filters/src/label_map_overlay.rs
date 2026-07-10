@@ -64,33 +64,40 @@
 //!
 //! ## Upstream findings
 //!
-//! 1. **`SLICE_CONTOUR`'s slice-kernel radius is built with the wrong loop
-//!    variable.** `itkLabelMapContourOverlayImageFilter.hxx:156-163` reads
+//! 1. **Fixed upstream bug: `SLICE_CONTOUR`'s slice-kernel radius was built
+//!    with the wrong loop variable.**
+//!    `itkLabelMapContourOverlayImageFilter.hxx:156-163` reads
 //!    ```c++
 //!    for (unsigned int i = 0, j = 0; i < ImageDimension; ++i)
 //!      if (j != static_cast<unsigned int>(m_SliceDimension) && (j < (ImageDimension - 1)))
 //!        { srad[j] = m_ContourThickness[i]; ++j; }
 //!    ```
-//!    The guard tests the *output* index `j` against `m_SliceDimension` where it
-//!    plainly means the *input* index `i` — `j` is the write cursor into the
+//!    The guard tested the *output* index `j` against `m_SliceDimension` where
+//!    it plainly means the *input* index `i` — `j` is the write cursor into the
 //!    `(D-1)`-dimensional radius. Consequences, with `srad` value-initialized to
-//!    zeros (`.hxx:155`): for `m_SliceDimension == 0` the condition is false on
-//!    the very first iteration and `j` never advances, so `srad` stays all-zero
-//!    and `Ball(0)` erosion is the identity — the subtraction yields an empty
-//!    image and *no contour at all*. For `m_SliceDimension == 1` in 3-D,
-//!    `srad = (thickness[0], 0)` instead of `(thickness[0], thickness[2])`. Only
-//!    `m_SliceDimension == ImageDimension - 1`, ITK's own default
-//!    (`.hxx:43`), happens to give the right answer. Reproduced verbatim; pinned
-//!    by `slice_contour_with_slice_dimension_zero_paints_nothing` and
-//!    `slice_contour_borrows_the_wrong_thickness_axis`.
-//! 2. **Through SimpleITK, `SLICE_CONTOUR` can never draw anything.**
-//!    `LabelMapContourOverlayImageFilter.yaml`'s `SliceDimension` default is
-//!    `0u`, not ITK's `ImageDimension - 1`, and the generated code always calls
-//!    the setter. Combined with finding 1, every SimpleITK `SLICE_CONTOUR` run
-//!    at the default `SliceDimension` produces an all-zero contour map and an
-//!    output image identical to the plain grey feature image. The yaml's own
+//!    zeros (`.hxx:155`): for `m_SliceDimension == 0` the condition was false on
+//!    the very first iteration and `j` never advanced, so `srad` stayed
+//!    all-zero and `Ball(0)` erosion was the identity — the subtraction yielded
+//!    an empty image and *no contour at all*. For `m_SliceDimension == 1` in
+//!    3-D, `srad = (thickness[0], 0)` instead of `(thickness[0],
+//!    thickness[2])`. Only `m_SliceDimension == ImageDimension - 1`, ITK's own
+//!    default (`.hxx:43`), happened to give the right answer by coincidence.
+//!    This port now guards on the read index `i` instead, so every slice
+//!    dimension uses the correct per-axis thickness; pinned by
+//!    `slice_contour_with_slice_dimension_zero_erodes_within_each_column` and
+//!    `slice_contour_erosion_radius_uses_the_correct_thickness_axis`. Filed as
+//!    B41 of #6575.
+//! 2. **`LabelMapContourOverlayImageFilter.yaml`'s `SliceDimension` default
+//!    still diverges from ITK.** Its default is `0u`, not ITK's
+//!    `ImageDimension - 1`, and the generated code always calls the setter, so
+//!    every SimpleITK `SLICE_CONTOUR` run that does not pass `SliceDimension`
+//!    explicitly slices along axis 0 rather than the last axis. Now that
+//!    finding 1 is fixed, this no longer produces an all-zero contour map —
+//!    axis 0 erodes correctly too — but the slicing axis (and so the contour's
+//!    orientation) still does not match ITK's default. The yaml's own
 //!    `detaileddescriptionSet` says "defaults to image dimension - 1".
-//!    [`LabelMapContourOverlaySettings::default`] follows the yaml, not ITK.
+//!    [`LabelMapContourOverlaySettings::default`] follows the yaml, not ITK;
+//!    see ledger §3.18.
 //! 3. **`DilationRadius`'s yaml default contradicts its yaml documentation.**
 //!    `LabelMapContourOverlayImageFilter.yaml` sets `default:
 //!    std::vector<unsigned int>(3, 1)` while its `detaileddescriptionSet` says
@@ -451,13 +458,16 @@ fn subtract(a: &Image, b: &Image) -> Result<Image> {
     Ok(Image::from_vec(a.size(), out)?)
 }
 
-/// `itkLabelMapContourOverlayImageFilter.hxx:154-163`, reproduced with its
-/// `j != m_SliceDimension` guard — see the module docs' upstream finding 1.
+/// `itkLabelMapContourOverlayImageFilter.hxx:154-163`, fixed to guard on the
+/// read cursor `i` against `m_SliceDimension` rather than the write cursor
+/// `j` — see the module docs' upstream finding 1. Every axis but
+/// `slice_dimension` contributes its own thickness to the `(D-1)`-dimensional
+/// erosion radius, in axis order.
 fn slice_erode_radius(thickness: &[usize], slice_dimension: usize, dim: usize) -> Vec<usize> {
     let mut srad = vec![0usize; dim - 1];
     let mut j = 0usize;
-    for &t in thickness.iter().take(dim) {
-        if j != slice_dimension && j < dim - 1 {
+    for (i, &t) in thickness.iter().take(dim).enumerate() {
+        if i != slice_dimension {
             srad[j] = t;
             j += 1;
         }
@@ -791,37 +801,44 @@ mod tests {
         assert_eq!(rgb_at(&out, 0, 0), [100, 100, 100]);
     }
 
-    /// Upstream finding 1 / 2: `j != m_SliceDimension` on the first iteration
-    /// with `m_SliceDimension == 0` blocks the loop forever, leaving a zero
-    /// radius, an identity erosion and an empty difference.
+    /// Fixed upstream bug (module doc finding 1, ledger §1.41): the guard now
+    /// tests the read cursor `i` against `m_SliceDimension`, so
+    /// `slice_dimension == 0` no longer starves `srad` to an all-zero,
+    /// identity-erosion radius. 2-D, slice_dimension = 0: each column is
+    /// eroded on its own, so a 3-pixel-tall, 3-column square keeps its top
+    /// and bottom rows only -- the transpose of
+    /// `slice_contour_at_the_last_axis_erodes_within_each_row`.
     #[test]
-    fn slice_contour_with_slice_dimension_zero_paints_nothing() {
-        assert_eq!(slice_erode_radius(&[1, 1], 0, 2), vec![0]);
-        assert_eq!(slice_erode_radius(&[1, 1, 1], 0, 3), vec![0, 0]);
+    fn slice_contour_with_slice_dimension_zero_erodes_within_each_column() {
+        assert_eq!(slice_erode_radius(&[1, 1], 0, 2), vec![1]);
+        assert_eq!(slice_erode_radius(&[1, 1, 1], 0, 3), vec![1, 1]);
 
         let map = map_of(&[5, 5], &[(1, &[([1, 1], 3), ([1, 2], 3), ([1, 3], 3)])]);
-        let feature = Image::from_vec(&[5, 5], vec![42u8; 25]).unwrap();
+        let feature = Image::new(&[5, 5], PixelId::UInt8);
         let settings = LabelMapContourOverlaySettings {
             contour_type: ContourOverlayType::SliceContour,
             dilation_radius: vec![0, 0],
+            contour_thickness: vec![1, 1],
             slice_dimension: 0,
             opacity: 1.0,
             ..Default::default()
         };
         let out = label_map_contour_overlay(&map, &feature, &settings).unwrap();
-        for y in 0..5 {
-            for x in 0..5 {
-                assert_eq!(rgb_at(&out, x, y), [42, 42, 42], "at ({x}, {y})");
-            }
+        let c = DEFAULT_LABEL_COLORS[1];
+        for x in 1..4 {
+            assert_eq!(rgb_at(&out, x, 1), c, "at ({x}, 1)");
+            assert_eq!(rgb_at(&out, x, 2), [0, 0, 0], "at ({x}, 2)");
+            assert_eq!(rgb_at(&out, x, 3), c, "at ({x}, 3)");
         }
     }
 
-    /// Upstream finding 1: in 3-D the second slice radius should come from
-    /// `thickness[2]`; the `j`-guard makes it `0`.
+    /// Fixed upstream bug (module doc finding 1, ledger §1.41): in 3-D the
+    /// second slice radius now comes from `thickness[2]`, not `0`.
     #[test]
-    fn slice_contour_borrows_the_wrong_thickness_axis() {
-        assert_eq!(slice_erode_radius(&[2, 3, 4], 1, 3), vec![2, 0]);
-        // Only ITK's own default `SliceDimension == D - 1` is right.
+    fn slice_contour_erosion_radius_uses_the_correct_thickness_axis() {
+        assert_eq!(slice_erode_radius(&[2, 3, 4], 1, 3), vec![2, 4]);
+        // ITK's own default `SliceDimension == D - 1` was already correct,
+        // and stays correct after the fix.
         assert_eq!(slice_erode_radius(&[2, 3, 4], 2, 3), vec![2, 3]);
     }
 

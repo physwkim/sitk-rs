@@ -29,12 +29,24 @@
 //! `max()` defaults (`0`/`255`) always, reducing the general
 //! `d * v + minimumRGBComponentValue` formula to plain `255.0 * v`.
 //!
-//! ## Upstream findings
+//! ## Fixed upstream bug: float extrema handling (ledger §1.38)
 //!
-//! 1. **The `UseInputImageExtremaForScaling = true` scan's `maximumValue` seed
-//!    is `NumericTraits<T>::min()`, which for a floating-point `T` is the
-//!    smallest *positive* normalized value, not the most negative one.**
-//!    `itkScalarToRGBColormapImageFilter.hxx:74-88`:
+//! Both branches below shared the same root cause -- `itkScalarToRGBColormapImageFilter.hxx:74-88`
+//! and `itkColormapFunction.h:78-83` seeded a running maximum, or a
+//! "no scaling" default maximum-input-value pairing, with plain
+//! `NumericTraits<T>::min()`, which for a floating-point `T` is the smallest
+//! *positive* normalized value, not the most negative one. ITK itself
+//! provides the correct trait member for exactly this "seed a running
+//! maximum" idiom -- `NumericTraits<T>::NonpositiveMin()`
+//! (`std::numeric_limits<T>::lowest()`, the true most-negative representable
+//! value for floating types, and identical to `min()` for every integer
+//! type) -- and uses it in exactly this role elsewhere, e.g.
+//! `MinimumMaximumImageCalculator::Compute` (`itkMinimumMaximumImageCalculator.hxx:37,89`).
+//! This port now uses [`crate::numeric_traits_nonpositive_min`] everywhere
+//! the old, buggy `NumericTraits<T>::min()` seed appeared.
+//!
+//! 1. **The `UseInputImageExtremaForScaling = true` scan's `maximumValue`
+//!    seed.** `itkScalarToRGBColormapImageFilter.hxx:74-88`:
 //!    ```text
 //!    InputImagePixelType minimumValue = NumericTraits<InputImagePixelType>::max();
 //!    InputImagePixelType maximumValue = NumericTraits<InputImagePixelType>::min();
@@ -44,37 +56,33 @@
 //!    }
 //!    ```
 //!    For an all-non-positive `Float32`/`Float64` input image (every pixel
-//!    `<= 0`), `value > maximumValue` never succeeds (no non-positive value
-//!    exceeds a tiny positive seed), so `maximumValue` never leaves its
-//!    `FLT_MIN`/`DBL_MIN` seed -- the scan silently reports a near-zero
+//!    `<= 0`), `value > maximumValue` never succeeded against the old
+//!    `FLT_MIN`/`DBL_MIN` seed -- the scan silently reported a near-zero
 //!    maximum instead of the image's actual (negative) maximum, shrinking
 //!    the effective rescale range and pushing every pixel's `value` higher
-//!    than it should be (e.g. an image of `[-10, -5, -1]` rescales `-1` to
-//!    `0.9`, not the `1.0` a correct scan would give -- pinned by
-//!    [`tests::float_all_non_positive_image_leaves_the_scan_maximum_at_the_tiny_positive_seed`]).
-//!    This port reproduces the scan verbatim (see [`input_extrema`]) rather
-//!    than fixing it, per this crate's porting policy.
+//!    than it should be (e.g. an image of `[-10, -5, -1]` used to rescale
+//!    `-1` to `0.9` instead of the correct `1.0`). With the
+//!    `NonpositiveMin()` seed [`input_extrema`]'s scan now finds the true
+//!    negative maximum in every case; pinned by
+//!    [`tests::float_all_non_positive_image_scan_finds_the_true_negative_maximum`].
 //!
-//! 2. **`UseInputImageExtremaForScaling = false` does not fall back to the
-//!    input type's full native range for floating-point `T`, for the same
-//!    reason.** `itkColormapFunction.h:78-83`'s constructor seeds
+//! 2. **`UseInputImageExtremaForScaling = false`'s fallback range.**
+//!    `itkColormapFunction.h:78-83`'s constructor seeds
 //!    `m_MinimumInputValue = NumericTraits<TScalar>::min()` and
 //!    `m_MaximumInputValue = NumericTraits<TScalar>::max()`. For every
-//!    integer `TScalar` this *is* the full native range (`min()` has no
-//!    override), but for `Float32`/`Float64` it pairs the smallest positive
-//!    normalized value with the true maximum, giving a rescale denominator
-//!    of `d ≈ FLT_MAX`/`DBL_MAX` -- so any pixel of ordinary magnitude maps
-//!    to `value ≈ 0`, collapsing almost the entire realistic input range to
-//!    a single output color instead of spanning it (pinned by
-//!    [`tests::extrema_scaling_disabled_on_a_float_image_collapses_ordinary_values_toward_zero`]).
-//!
-//! Both findings share the same root cause --
-//! `NumericTraits<float/double>::min()` meaning "smallest positive", not
-//! "most negative" -- surfacing in two independent branches of this one
-//! filter.
+//!    integer `TScalar` this already was the full native range (`min()` has
+//!    no override), but for `Float32`/`Float64` it used to pair the smallest
+//!    positive normalized value with the true maximum, giving a rescale
+//!    denominator of `d ≈ FLT_MAX`/`DBL_MAX` -- so any pixel of ordinary
+//!    magnitude mapped to `value ≈ 0`, collapsing almost the entire
+//!    realistic input range to a single output color instead of spanning
+//!    it. With the `NonpositiveMin()` seed, `Float32`/`Float64` now get the
+//!    same true full-native-range fallback integer types always had (`d ≈
+//!    2·FLT_MAX`/`2·DBL_MAX`); pinned by
+//!    [`tests::extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range`].
 
 use crate::error::Result;
-use crate::{numeric_traits_max, numeric_traits_min};
+use crate::{numeric_traits_max, numeric_traits_nonpositive_min};
 use sitk_core::{Image, PixelId};
 
 /// `itk::Function::*ColormapFunction`'s `RGBColormapFilterEnum`
@@ -176,18 +184,19 @@ fn rescale_rgb_component(v: f64) -> u8 {
 
 /// The `UseInputImageExtremaForScaling` branch of
 /// `BeforeThreadedGenerateData`/`ColormapFunction`'s constructor -- see the
-/// module docs' upstream findings 1 and 2 for the floating-point quirks
-/// both branches carry.
+/// module docs' upstream findings 1 and 2, now fixed by seeding every
+/// running/default maximum with [`numeric_traits_nonpositive_min`] instead
+/// of the plain-`min()` footgun.
 fn input_extrema(
     id: PixelId,
     vals: &[f64],
     use_input_image_extrema_for_scaling: bool,
 ) -> (f64, f64) {
     if !use_input_image_extrema_for_scaling {
-        return (numeric_traits_min(id), numeric_traits_max(id));
+        return (numeric_traits_nonpositive_min(id), numeric_traits_max(id));
     }
     let mut min_v = numeric_traits_max(id);
-    let mut max_v = numeric_traits_min(id);
+    let mut max_v = numeric_traits_nonpositive_min(id);
     for &v in vals {
         if v < min_v {
             min_v = v;
@@ -330,27 +339,36 @@ mod tests {
         assert_eq!(out.component_slice::<u8>().unwrap(), &[127, 127, 127]);
     }
 
+    /// Fixed upstream bug (module docs finding 1, ledger §1.38): the maximum
+    /// seed is now `NonpositiveMin()` (`f32::MIN`), so the scan correctly
+    /// finds min=-10.0, max=-1.0, d=9.0 -- not the old tiny-positive seed
+    /// that left max stuck near 0 and d==10.0. -1.0 rescales to the true
+    /// 1.0, not the old bug's 0.9.
     #[test]
-    fn float_all_non_positive_image_leaves_the_scan_maximum_at_the_tiny_positive_seed() {
-        // Upstream finding 1: min correctly scans to -10.0, but the maximum
-        // seed (f32::MIN_POSITIVE) is never exceeded by any non-positive
-        // value, so d == 10.0 (not the -1.0 - (-10.0) == 9.0 a correct scan
-        // would give). -1.0 rescales to 0.9, not 1.0.
+    fn float_all_non_positive_image_scan_finds_the_true_negative_maximum() {
         let img = Image::from_vec(&[3, 1], vec![-10.0f32, -5.0, -1.0]).unwrap();
         let out = scalar_to_rgb_colormap(&img, Colormap::Grey, true).unwrap();
         assert_eq!(
             out.component_slice::<u8>().unwrap(),
-            &[0, 0, 0, 127, 127, 127, 229, 229, 229]
+            &[0, 0, 0, 141, 141, 141, 255, 255, 255]
         );
     }
 
+    /// Fixed upstream bug (module docs finding 2, ledger §1.38): min is now
+    /// `NonpositiveMin()` (`f32::MIN`), paired with `f32::MAX`, giving the
+    /// true symmetric full native range (`d == 2 * f32::MAX`). Every
+    /// ordinary-magnitude value lands within a few ULPs of the range's
+    /// midpoint (`value == 0.5` to f64 precision, since `v` is
+    /// astronomically small relative to `f32::MAX`), matching the full
+    /// native range integer inputs already got.
     #[test]
-    fn extrema_scaling_disabled_on_a_float_image_collapses_ordinary_values_toward_zero() {
-        // Upstream finding 2: min=f32::MIN_POSITIVE, max=f32::MAX, so
-        // d ~= f32::MAX; any ordinary-magnitude value rescales to ~0.
+    fn extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range() {
         let img = Image::from_vec(&[2, 1], vec![1.0f32, 100.0]).unwrap();
         let out = scalar_to_rgb_colormap(&img, Colormap::Grey, false).unwrap();
-        assert_eq!(out.component_slice::<u8>().unwrap(), &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            out.component_slice::<u8>().unwrap(),
+            &[127, 127, 127, 127, 127, 127]
+        );
     }
 
     #[test]
