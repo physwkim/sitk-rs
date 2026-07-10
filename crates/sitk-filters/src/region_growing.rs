@@ -107,11 +107,112 @@
 //! — both exist only to absorb floating-point rounding noise around exact
 //! zero, and the sums/variances here never approach magnitudes where the
 //! two tolerances would disagree.
+//!
+//! ## `vector_confidence_connected`
+//!
+//! Ports `itk::VectorConfidenceConnectedImageFilter`
+//! (`itkVectorConfidenceConnectedImageFilter.h` / `.hxx`) — the vector
+//! analogue of `confidence_connected`: a *mean vector* and *covariance
+//! matrix* (size `number_of_components_per_pixel`) over the seed
+//! neighborhood replace the scalar mean/variance, and inclusion is
+//! `mahalanobis_distance(pixel, mean, covariance) <= threshold`
+//! (`itkMahalanobisDistanceThresholdImageFunction` /
+//! `itkMahalanobisDistanceMembershipFunction`) rather than an interval test.
+//!
+//! `NumericTraits<ComponentPixelType>::RealType` — the precision the
+//! reference accumulates in — is `double` for every ITK scalar component
+//! type except `long double` (`itkNumericTraits.h`'s per-type
+//! specializations), so unlike [`vector_magnitude`](crate::vector_magnitude)
+//! (whose norm narrows to `f32` for an `f32` component), this port widens
+//! every component type to `f64` unconditionally, matching the reference's
+//! own precision exactly rather than approximating it.
+//!
+//! The initial mean/covariance are the *average of each in-bounds seed's
+//! own* `initial_neighborhood_radius`-sized box statistics
+//! (`VectorMeanImageFunction` / `CovarianceImageFunction`, both
+//! zero-flux-Neumann at the edge, `itkVectorMeanImageFunction.hxx:51-84`,
+//! `itkCovarianceImageFunction.hxx:58-95`) — not a single pooled computation
+//! over the union of every seed's window. A seed outside the image
+//! contributes nothing; `seed_cnt == 0` (every seed out of bounds, including
+//! an empty seed list) returns the zero image immediately
+//! (`itkVectorConfidenceConnectedImageFilter.hxx:179-184`) with
+//! [`VectorConfidenceConnectedResult::mean`] /
+//! [`VectorConfidenceConnectedResult::covariance`] left *empty* — the
+//! reference's own `SetMean`/`SetCovariance` (which allocate the
+//! measurement caches to `dimension`) are never reached in that branch, so
+//! `GetMean()`/`GetCovariance()` stay at their default-constructed
+//! zero-length state.
+//!
+//! `multiplier` is bumped, once, to the largest Mahalanobis distance among
+//! the in-bounds seeds themselves if that exceeds it (`.hxx:209-222`, "a
+//! pragmatic fix, but a questionable practice"), then fixed as the
+//! threshold for every flood — it is never revisited inside the iteration
+//! loop, only `mean`/`covariance` are. Each iteration recomputes `mean`
+//! /`covariance` as the *population* covariance (divisor `num`, not
+//! `num - 1`) pooled over every pixel in the currently segmented mask
+//! (`.hxx:258-302`) — a genuine change from the initial per-seed-window
+//! average. This port recomputes directly from the already-known mask
+//! rather than retracing a second flood over the output image, for the same
+//! reason given under `confidence_connected` above.
+//!
+//! ### Singular covariance
+//!
+//! `MahalanobisDistanceMembershipFunction::SetCovariance`
+//! (`itkMahalanobisDistanceMembershipFunction.hxx:94-124`) computes the
+//! covariance's determinant magnitude and, if it is at or below `1.0e-6`
+//! ("1e-6 is an arbitrary value!!!", the source's own comment) — as a
+//! perfectly constant seed neighborhood gives exactly, determinant zero —
+//! substitutes `Identity * aLargeDouble` for the *inverse* covariance
+//! (`aLargeDouble = f64::MAX.powf(1.0/3.0) / dimension`) rather than
+//! erroring or producing NaN. The exposed `Covariance` measurement is
+//! unaffected: `SetCovariance` caches the *raw* covariance it was given
+//! (`.hxx:52`) before ever computing the inverse, so a singular covariance
+//! still reports as the literal (e.g. zero) matrix that produced it, not the
+//! substitute. [`determinant_magnitude`](sitk_core::matrix::determinant_magnitude)
+//! is always non-negative by construction (`.abs()` at the end), matching
+//! the fact that `vnl_matrix_inverse::determinant_magnitude` (a product of
+//! non-negative singular values) can never trigger the reference's adjacent
+//! `det < 0` exception branch — that branch is unreachable in the reference
+//! itself and is not reproduced here.
+//!
+//! This port's own inverse ([`sitk_core::matrix::invert`], Gauss-Jordan with
+//! a `1e-12` pivot threshold) is only attempted once the determinant-
+//! magnitude gate already passed; if it were to still report `None` on an
+//! ill-conditioned-but-technically-nonsingular matrix (the reference's SVD-
+//! based inverse is more numerically robust than Gauss-Jordan and would not
+//! necessarily agree here), this port falls back to the identical
+//! `Identity * aLargeDouble` substitute rather than a separate error path —
+//! a documented divergence, not expected to trigger for any well-conditioned
+//! covariance.
+//!
+//! ### An emergent NaN quirk (undocumented upstream)
+//!
+//! If a later iteration's mask becomes empty — every seed itself was
+//! excluded by the *previous* round's re-estimated statistics, since the
+//! multiplier is never re-bumped after the first flood — `num == 0` makes
+//! every `mean`/`covariance` entry an IEEE-754 `0.0 / 0.0 = NaN`
+//! (`.hxx:289-292`, well-defined float division, not undefined behavior, so
+//! this port reproduces it verbatim rather than special-casing `num == 0`).
+//! The all-`NaN` covariance's determinant-magnitude comparison
+//! (`NaN > 1.0e-6`) is `false` under IEEE-754, so the singular-covariance
+//! branch fires and substitutes a finite `Identity * aLargeDouble` inverse —
+//! but `mean` is still `NaN`, so every subsequent Mahalanobis evaluation
+//! produces a `NaN` squared distance. `EvaluateDistanceAtIndex`'s own
+//! `mahalanobisDistanceSquared > 0.0 ? sqrt(...) : 0.0` guard
+//! (`itkMahalanobisDistanceThresholdImageFunction.hxx:113`) then treats that
+//! `NaN` as "not greater than zero" and clamps the *distance* to exactly
+//! `0.0` — which then compares `<=` any positive threshold as `true`,
+//! meaning every pixel in the image passes the inclusion test and the next
+//! flood covers everything reachable from the seeds. No special-casing is
+//! needed to reproduce this: Rust's `f64` comparisons against `NaN` are
+//! IEEE-754, identical to C++'s, so writing the same `sq > 0.0` guard
+//! reproduces the same emergent behavior for free.
 
 use crate::error::{FilterError, Result};
 use crate::morphology::bounds_for;
 use sitk_core::{
-    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition, dispatch_scalar,
+    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
+    dispatch_scalar, matrix,
 };
 use std::collections::VecDeque;
 
@@ -779,6 +880,290 @@ pub fn isolated_connected(
     )
 }
 
+// ---- vector_confidence_connected ---------------------------------------
+
+/// `MahalanobisDistanceMembershipFunction::SetCovariance`'s own "1e-6 is an
+/// arbitrary value!!!" comment (`itkMahalanobisDistanceMembershipFunction.hxx:106`).
+const SINGULAR_COVARIANCE_THRESHOLD: f64 = 1.0e-6;
+
+/// Result of [`vector_confidence_connected`], mirroring
+/// `VectorConfidenceConnectedImageFilter`'s `GetMean()` / `GetCovariance()`
+/// measurement outputs alongside the segmented image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorConfidenceConnectedResult {
+    pub image: Image,
+    /// Mean vector, one entry per component. Empty when every seed was out
+    /// of bounds — see the module doc's `vector_confidence_connected`
+    /// section.
+    pub mean: Vec<f64>,
+    /// Row-major `n x n` covariance matrix (`n` = components per pixel).
+    /// Empty under the same condition as `mean`. This is always the *raw*
+    /// covariance, even when it is singular — never the internal
+    /// `Identity * aLargeDouble` substitute used for the inverse.
+    pub covariance: Vec<f64>,
+}
+
+/// The mean vector and (population) covariance matrix of the
+/// `radius`-sized box around `center`, zero-flux-Neumann clamped at the
+/// image edge — `VectorMeanImageFunction::EvaluateAtIndex` /
+/// `CovarianceImageFunction::EvaluateAtIndex`
+/// (`itkVectorMeanImageFunction.hxx:51-84`,
+/// `itkCovarianceImageFunction.hxx:58-95`), which share the same window and
+/// (per the module doc) compute an identical mean, so this computes it once.
+fn window_mean_and_covariance(
+    components: &[f64],
+    center: &[usize],
+    size: &[usize],
+    radius: &[usize],
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let dim = size.len();
+    let mut mean = vec![0f64; n];
+    let mut second_moment = vec![0f64; n * n];
+    let mut offset: Vec<i64> = radius.iter().map(|&r| -(r as i64)).collect();
+    let total: usize = radius.iter().map(|&r| 2 * r + 1).product();
+
+    for _ in 0..total {
+        let mut pixel_offset = 0usize;
+        let mut stride = 1usize;
+        for d in 0..dim {
+            let v = (center[d] as i64 + offset[d]).clamp(0, size[d] as i64 - 1) as usize;
+            pixel_offset += v * stride;
+            stride *= size[d];
+        }
+        let base = pixel_offset * n;
+        for i in 0..n {
+            let vi = components[base + i];
+            mean[i] += vi;
+            second_moment[i * n + i] += vi * vi;
+            for j in (i + 1)..n {
+                let vj = components[base + j];
+                let product = vi * vj;
+                second_moment[i * n + j] += product;
+                second_moment[j * n + i] += product;
+            }
+        }
+        for d in 0..dim {
+            offset[d] += 1;
+            if offset[d] > radius[d] as i64 {
+                offset[d] = -(radius[d] as i64);
+            } else {
+                break;
+            }
+        }
+    }
+
+    let total_f = total as f64;
+    for m in mean.iter_mut() {
+        *m /= total_f;
+    }
+    let mut covariance = second_moment;
+    for i in 0..n {
+        for j in 0..n {
+            covariance[i * n + j] = covariance[i * n + j] / total_f - mean[i] * mean[j];
+        }
+    }
+    (mean, covariance)
+}
+
+/// The Mahalanobis membership function's inverse covariance
+/// (`MahalanobisDistanceMembershipFunction::SetCovariance`,
+/// `itkMahalanobisDistanceMembershipFunction.hxx:94-124`): the ordinary
+/// matrix inverse once `covariance`'s determinant magnitude clears
+/// [`SINGULAR_COVARIANCE_THRESHOLD`], else `Identity * aLargeDouble` — see
+/// the module doc's "Singular covariance" section for why a `None` from
+/// [`matrix::invert`] in the nonsingular branch also falls back here.
+fn mahalanobis_inverse(covariance: &[f64], n: usize) -> Vec<f64> {
+    let det_mag = matrix::determinant_magnitude(covariance, n);
+    if det_mag > SINGULAR_COVARIANCE_THRESHOLD {
+        if let Some(inv) = matrix::invert(covariance, n) {
+            return inv;
+        }
+    }
+    let a_large_double = f64::MAX.powf(1.0 / 3.0) / n as f64;
+    let mut inv = matrix::identity(n);
+    for v in inv.iter_mut() {
+        *v *= a_large_double;
+    }
+    inv
+}
+
+/// `MahalanobisDistanceThresholdImageFunction::EvaluateDistanceAtIndex`: the
+/// (non-squared) Mahalanobis distance, clamped to `0.0` rather than `NaN`
+/// or a negative `sqrt` domain error when the squared form comes out at or
+/// below zero (`itkMahalanobisDistanceThresholdImageFunction.hxx:106-114`).
+fn mahalanobis_distance(x: &[f64], mean: &[f64], inv_covariance: &[f64], n: usize) -> f64 {
+    let diff: Vec<f64> = (0..n).map(|i| x[i] - mean[i]).collect();
+    let weighted = matrix::mat_vec(inv_covariance, &diff, n);
+    let squared: f64 = (0..n).map(|i| weighted[i] * diff[i]).sum();
+    if squared > 0.0 { squared.sqrt() } else { 0.0 }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vector_confidence_connected_typed<T: Scalar>(
+    img: &Image,
+    seeds: &[Vec<i64>],
+    number_of_iterations: u32,
+    multiplier: f64,
+    initial_neighborhood_radius: usize,
+    replace_value: u8,
+) -> Result<VectorConfidenceConnectedResult> {
+    let dim = img.dimension();
+    validate_seed_dims(seeds, dim)?;
+    let size = img.size();
+    let total = img.number_of_pixels();
+    let n = img.number_of_components_per_pixel();
+    let components: Vec<f64> = img
+        .component_slice::<T>()?
+        .iter()
+        .map(|&c| c.as_f64())
+        .collect();
+
+    let in_bounds_seeds: Vec<Vec<usize>> = seeds
+        .iter()
+        .filter_map(|s| in_bounds_index(s, size))
+        .collect();
+    if in_bounds_seeds.is_empty() {
+        let image = mask_to_image(size, img, &vec![false; total], replace_value)?;
+        return Ok(VectorConfidenceConnectedResult {
+            image,
+            mean: Vec::new(),
+            covariance: Vec::new(),
+        });
+    }
+
+    // Average of each in-bounds seed's own `initial_neighborhood_radius`-box
+    // statistics — not one pooled computation over every seed's window.
+    let radius_vec = vec![initial_neighborhood_radius; dim];
+    let mut mean = vec![0f64; n];
+    let mut covariance = vec![0f64; n * n];
+    for seed in &in_bounds_seeds {
+        let (seed_mean, seed_cov) =
+            window_mean_and_covariance(&components, seed, size, &radius_vec, n);
+        for i in 0..n {
+            mean[i] += seed_mean[i];
+            for j in 0..n {
+                covariance[i * n + j] += seed_cov[i * n + j];
+            }
+        }
+    }
+    let seed_cnt = in_bounds_seeds.len() as f64;
+    for m in mean.iter_mut() {
+        *m /= seed_cnt;
+    }
+    for c in covariance.iter_mut() {
+        *c /= seed_cnt;
+    }
+
+    let mut inv_covariance = mahalanobis_inverse(&covariance, n);
+
+    // One-time-only bump: never revisited once the iteration loop starts.
+    let mut threshold = multiplier;
+    for seed in &in_bounds_seeds {
+        let base = img.linear_index(seed) * n;
+        let x = &components[base..base + n];
+        let distance = mahalanobis_distance(x, &mean, &inv_covariance, n);
+        if distance > threshold {
+            threshold = distance;
+        }
+    }
+
+    // `FloodFilledImageFunctionConditionalIterator` (unshaped): always face
+    // connectivity, like the other three filters in this module.
+    let offsets = neighbor_offsets(dim, false);
+    let included = |idx: &[usize], mean: &[f64], inv_covariance: &[f64]| -> bool {
+        let base = img.linear_index(idx) * n;
+        let x = &components[base..base + n];
+        mahalanobis_distance(x, mean, inv_covariance, n) <= threshold
+    };
+    let mut mask = flood_fill(img, seeds, &offsets, |idx| {
+        included(idx, &mean, &inv_covariance)
+    });
+
+    for _ in 0..number_of_iterations {
+        // Recompute directly from the already-known segmented mask, for the
+        // same reason `confidence_connected` does above.
+        let mut sum = vec![0f64; n];
+        let mut second_moment = vec![0f64; n * n];
+        let mut num = 0f64;
+        for (pos, &is_included) in mask.iter().enumerate() {
+            if !is_included {
+                continue;
+            }
+            let base = pos * n;
+            for i in 0..n {
+                let vi = components[base + i];
+                sum[i] += vi;
+                second_moment[i * n + i] += vi * vi;
+                for j in (i + 1)..n {
+                    let vj = components[base + j];
+                    let product = vi * vj;
+                    second_moment[i * n + j] += product;
+                    second_moment[j * n + i] += product;
+                }
+            }
+            num += 1.0;
+        }
+        // `num == 0` divides `0.0 / 0.0`, an IEEE-754 `NaN` — see the module
+        // doc's NaN-quirk section for why that is left unguarded.
+        for i in 0..n {
+            mean[i] = sum[i] / num;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                covariance[i * n + j] = second_moment[i * n + j] / num - mean[i] * mean[j];
+            }
+        }
+        inv_covariance = mahalanobis_inverse(&covariance, n);
+        mask = flood_fill(img, seeds, &offsets, |idx| {
+            included(idx, &mean, &inv_covariance)
+        });
+    }
+
+    let image = mask_to_image(size, img, &mask, replace_value)?;
+    Ok(VectorConfidenceConnectedResult {
+        image,
+        mean,
+        covariance,
+    })
+}
+
+/// `VectorConfidenceConnectedImageFilter`: the vector analogue of
+/// [`confidence_connected`] — grows a region from `seeds` using a mean
+/// *vector* and covariance *matrix* over the seed neighborhood, admitting a
+/// candidate pixel when its Mahalanobis distance to that mean/covariance is
+/// `<= ` the (possibly seed-bumped) `multiplier`, re-estimating both from
+/// the segmented region for `number_of_iterations` rounds. See the module
+/// doc's `vector_confidence_connected` section for the exact algorithm and
+/// its quirks. Errors with [`sitk_core::Error::RequiresVectorPixelType`] on
+/// a scalar image (`pixel_types: VectorPixelIDTypeList` — unlike
+/// [`crate::vector_connected_component`], not restricted to real-valued
+/// components). Output pixel type is `UInt8`, matching SimpleITK's
+/// `VectorConfidenceConnectedImageFilter.yaml`.
+#[allow(clippy::too_many_arguments)]
+pub fn vector_confidence_connected(
+    img: &Image,
+    seeds: &[Vec<i64>],
+    number_of_iterations: u32,
+    multiplier: f64,
+    initial_neighborhood_radius: usize,
+    replace_value: u8,
+) -> Result<VectorConfidenceConnectedResult> {
+    if !img.pixel_id().is_vector() {
+        return Err(sitk_core::Error::RequiresVectorPixelType(img.pixel_id()).into());
+    }
+    dispatch_scalar!(
+        img.pixel_id(),
+        vector_confidence_connected_typed,
+        img,
+        seeds,
+        number_of_iterations,
+        multiplier,
+        initial_neighborhood_radius,
+        replace_value
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1395,136 @@ mod tests {
         assert_eq!(mask[5], 1);
         assert_eq!(mask[0], 0);
         assert_eq!(result.isolated_value, 11.0);
+    }
+
+    // ---- vector_confidence_connected --------------------------------------
+
+    fn vector_img_1d(values: &[[f64; 2]]) -> Image {
+        let mut data = Vec::with_capacity(values.len() * 2);
+        for v in values {
+            data.extend_from_slice(v);
+        }
+        Image::from_vec_vector(&[values.len()], 2, data).unwrap()
+    }
+
+    #[test]
+    fn vector_confidence_connected_known_mean_covariance_and_mask() {
+        // 1-D, 2-component vector image. The seed's radius-1 window
+        // (indices 1..=3) has mean (9, 10) and covariance [[6, 6], [6, 24]]
+        // -- hand computed; every division here is an exact integer, so no
+        // floating-point tolerance is needed. Both immediate neighbors sit
+        // at Mahalanobis distance sqrt(2) from that mean/covariance,
+        // comfortably under multiplier 2.0; the (100, 100) outliers at
+        // both ends sit enormously farther away.
+        let img = vector_img_1d(&[
+            [100.0, 100.0],
+            [6.0, 10.0],
+            [9.0, 4.0],
+            [12.0, 16.0],
+            [100.0, 100.0],
+        ]);
+        let result = vector_confidence_connected(&img, &[vec![2]], 0, 2.0, 1, 1).unwrap();
+        assert_eq!(result.mean, vec![9.0, 10.0]);
+        assert_eq!(result.covariance, vec![6.0, 6.0, 6.0, 24.0]);
+        assert_eq!(result.image.scalar_slice::<u8>().unwrap(), &[0, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn vector_confidence_connected_singular_covariance_falls_back_to_identity() {
+        // A perfectly constant 3-pixel seed window (all (7, 7)) gives
+        // exactly zero covariance -- singular -- so the internal inverse
+        // substitutes `Identity * a_large_double`
+        // (itkMahalanobisDistanceMembershipFunction.hxx:116-124) rather
+        // than erroring or producing NaN. The exposed `covariance`
+        // measurement still reports the raw (zero) matrix, not the
+        // substitute. The adjacent pixel that differs at all is
+        // astronomically far under that substitute and stays excluded.
+        let img = vector_img_1d(&[[7.0, 7.0], [7.0, 7.0], [7.0, 7.0], [8.0, 8.0]]);
+        let result = vector_confidence_connected(&img, &[vec![1]], 0, 2.5, 1, 1).unwrap();
+        assert_eq!(result.mean, vec![7.0, 7.0]);
+        assert_eq!(result.covariance, vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(result.image.scalar_slice::<u8>().unwrap(), &[1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn vector_confidence_connected_multiplier_is_bumped_to_always_include_the_seed() {
+        // Even an absurdly small multiplier cannot exclude the seed pixel
+        // itself: the filter bumps the threshold, once, to the seed's own
+        // Mahalanobis distance if that exceeds the caller's multiplier
+        // (itkVectorConfidenceConnectedImageFilter.hxx:209-222, "a
+        // pragmatic fix, but a questionable practice").
+        let img = vector_img_1d(&[[6.0, 10.0], [9.0, 4.0], [12.0, 16.0]]);
+        let result = vector_confidence_connected(&img, &[vec![1]], 0, 1e-9, 1, 1).unwrap();
+        assert_eq!(result.image.scalar_slice::<u8>().unwrap()[1], 1);
+    }
+
+    #[test]
+    fn vector_confidence_connected_iteration_reproduces_the_pooled_covariance() {
+        // With one seed whose radius-1 window is exactly the 3 pixels that
+        // end up segmented, iteration 1's pooled-covariance-over-the-mask
+        // recompute is fed the identical 3 data points as the initial
+        // per-seed-window average, so it reproduces the exact same
+        // mean/covariance (and hence mask) via a different code path --
+        // cross-checking that both covariance computations agree.
+        let img = vector_img_1d(&[
+            [100.0, 100.0],
+            [6.0, 10.0],
+            [9.0, 4.0],
+            [12.0, 16.0],
+            [100.0, 100.0],
+        ]);
+        let zero_iterations = vector_confidence_connected(&img, &[vec![2]], 0, 2.0, 1, 1).unwrap();
+        let one_iteration = vector_confidence_connected(&img, &[vec![2]], 1, 2.0, 1, 1).unwrap();
+        assert_eq!(one_iteration.mean, zero_iterations.mean);
+        assert_eq!(one_iteration.covariance, zero_iterations.covariance);
+        assert_eq!(
+            one_iteration.image.scalar_slice::<u8>().unwrap(),
+            zero_iterations.image.scalar_slice::<u8>().unwrap()
+        );
+    }
+
+    #[test]
+    fn vector_confidence_connected_empty_seeds_yields_empty_measurements_and_zero_image() {
+        // `SetMean`/`SetCovariance` are never reached when every seed is
+        // out of bounds (itkVectorConfidenceConnectedImageFilter.hxx:
+        // 179-184), so `Mean`/`Covariance` stay at their default-
+        // constructed empty state rather than a zero-filled vector/matrix.
+        let img = vector_img_1d(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+        let result = vector_confidence_connected(&img, &[], 2, 2.5, 1, 1).unwrap();
+        assert!(result.mean.is_empty());
+        assert!(result.covariance.is_empty());
+        assert_eq!(result.image.scalar_slice::<u8>().unwrap(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn vector_confidence_connected_out_of_bounds_seed_yields_empty_measurements() {
+        let img = vector_img_1d(&[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+        let result = vector_confidence_connected(&img, &[vec![99]], 2, 2.5, 1, 1).unwrap();
+        assert!(result.mean.is_empty());
+        assert!(result.covariance.is_empty());
+        assert_eq!(result.image.scalar_slice::<u8>().unwrap(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn vector_confidence_connected_seed_dimension_mismatch_errors() {
+        let img = Image::from_vec_vector(&[3, 1], 2, vec![0.0f64; 6]).unwrap();
+        let err = vector_confidence_connected(&img, &[vec![1]], 2, 2.5, 1, 1).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    #[test]
+    fn vector_confidence_connected_rejects_a_scalar_image() {
+        let img = Image::from_vec(&[3], vec![1.0f64, 2.0, 3.0]).unwrap();
+        let err = vector_confidence_connected(&img, &[vec![1]], 2, 2.5, 1, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            FilterError::Core(sitk_core::Error::RequiresVectorPixelType(PixelId::Float64))
+        ));
     }
 }

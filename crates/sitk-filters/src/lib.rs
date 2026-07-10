@@ -236,8 +236,8 @@ pub use reconstruction::{
 };
 pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
 pub use region_growing::{
-    IsolatedConnectedResult, confidence_connected, connected_threshold, isolated_connected,
-    neighborhood_connected,
+    IsolatedConnectedResult, VectorConfidenceConnectedResult, confidence_connected,
+    connected_threshold, isolated_connected, neighborhood_connected, vector_confidence_connected,
 };
 pub use regional_extrema::{
     ValuedRegionalExtremaResult, regional_maxima, regional_minima, valued_regional_maxima,
