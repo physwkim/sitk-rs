@@ -62,6 +62,77 @@ pub enum Interpolator {
     BlackmanWindowedSinc,
 }
 
+/// An input image widened to `f64` and prepared for repeated sampling with one
+/// fixed [`Interpolator`].
+///
+/// This is the shared body of ITK's `InterpolateImageFunction::SetInputImage` +
+/// `Evaluate` pair: the per-image work (widening, striding, and — for
+/// [`Interpolator::BSpline`] — the global coefficient decomposition, which
+/// mixes whole lines through an IIR recursion and so cannot be done per voxel)
+/// happens once in [`InterpolatedImage::new`], and every voxel then goes
+/// through [`InterpolatedImage::sample`]. [`ResampleImageFilter`] and
+/// [`WarpImageFilter`](crate::WarpImageFilter) differ only in how they arrive
+/// at the continuous index they sample at.
+///
+/// Sampling a continuous index outside the input buffer yields `None`, which is
+/// ITK's `Interpolator::IsInsideBuffer(point)` guard: each caller substitutes
+/// its own out-of-domain pixel (`DefaultPixelValue`, `EdgePaddingValue`).
+pub(crate) struct InterpolatedImage {
+    interpolator: Interpolator,
+    buf: Vec<f64>,
+    size: Vec<usize>,
+    strides: Vec<usize>,
+    bspline_coeffs: Option<Vec<f64>>,
+}
+
+impl InterpolatedImage {
+    /// Widen `image` (which must be scalar — [`Image::to_f64_vec`] is the
+    /// guard) and precompute whatever `interpolator` needs per image.
+    pub(crate) fn new(image: &Image, interpolator: Interpolator) -> Result<Self> {
+        let buf = image.to_f64_vec()?;
+        let size = image.size().to_vec();
+        let strides = strides(&size);
+        let bspline_coeffs = matches!(interpolator, Interpolator::BSpline)
+            .then(|| bspline_coefficients(&buf, &size, &strides));
+        Ok(Self {
+            interpolator,
+            buf,
+            size,
+            strides,
+            bspline_coeffs,
+        })
+    }
+
+    /// Sample at a continuous index, or `None` when it lies outside the buffer.
+    pub(crate) fn sample(&self, cindex: &[f64]) -> Option<f64> {
+        let (buf, size, strides) = (&self.buf, &self.size, &self.strides);
+        let sinc = |window| {
+            windowed_sinc_value_and_gradient(buf, size, strides, cindex, window).map(|(v, _)| v)
+        };
+        match self.interpolator {
+            Interpolator::NearestNeighbor => nearest_at(buf, size, strides, cindex),
+            Interpolator::Linear => linear_at(buf, size, strides, cindex),
+            Interpolator::BSpline => bspline_value_and_gradient(
+                self.bspline_coeffs
+                    .as_ref()
+                    .expect("computed in `new` for BSpline"),
+                size,
+                strides,
+                cindex,
+            )
+            .map(|(v, _)| v),
+            Interpolator::Gaussian => {
+                gaussian_value_and_gradient(buf, size, strides, cindex).map(|(v, _)| v)
+            }
+            Interpolator::HammingWindowedSinc => sinc(SincWindow::Hamming),
+            Interpolator::CosineWindowedSinc => sinc(SincWindow::Cosine),
+            Interpolator::WelchWindowedSinc => sinc(SincWindow::Welch),
+            Interpolator::LanczosWindowedSinc => sinc(SincWindow::Lanczos),
+            Interpolator::BlackmanWindowedSinc => sinc(SincWindow::Blackman),
+        }
+    }
+}
+
 /// `itk::ResampleImageFilter`: build an output grid and sample the input through
 /// a [`Transform`].
 ///
@@ -187,14 +258,7 @@ impl ResampleImageFilter {
             .ok_or(TransformError::SingularDirection)?;
         let in_origin = input.origin().to_vec();
 
-        let in_buf = input.to_f64_vec()?;
-        let in_size = input.size().to_vec();
-        let in_strides = strides(&in_size);
-        // Coefficient decomposition is global (mixes the whole line via the
-        // IIR recursion), so it is computed once up front rather than per
-        // output voxel.
-        let bspline_coeffs = matches!(self.interpolator, Interpolator::BSpline)
-            .then(|| bspline_coefficients(&in_buf, &in_size, &in_strides));
+        let sampler = InterpolatedImage::new(input, self.interpolator)?;
 
         let n_out: usize = out_size.iter().product();
         let mut out_vals = vec![0.0f64; n_out];
@@ -206,73 +270,7 @@ impl ResampleImageFilter {
             let diff: Vec<f64> = (0..dim).map(|d| mapped[d] - in_origin[d]).collect();
             let cindex = matrix::mat_vec(&in_phys_to_index, &diff, dim);
 
-            *out_val = match self.interpolator {
-                Interpolator::NearestNeighbor => {
-                    nearest_at(&in_buf, &in_size, &in_strides, &cindex)
-                        .unwrap_or(self.default_value)
-                }
-                Interpolator::Linear => {
-                    linear_at(&in_buf, &in_size, &in_strides, &cindex).unwrap_or(self.default_value)
-                }
-                Interpolator::BSpline => bspline_value_and_gradient(
-                    bspline_coeffs.as_ref().expect("computed above for BSpline"),
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-                Interpolator::Gaussian => {
-                    gaussian_value_and_gradient(&in_buf, &in_size, &in_strides, &cindex)
-                        .map(|(v, _)| v)
-                        .unwrap_or(self.default_value)
-                }
-                Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
-                    &in_buf,
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                    SincWindow::Hamming,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-                Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
-                    &in_buf,
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                    SincWindow::Cosine,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-                Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
-                    &in_buf,
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                    SincWindow::Welch,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-                Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
-                    &in_buf,
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                    SincWindow::Lanczos,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-                Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
-                    &in_buf,
-                    &in_size,
-                    &in_strides,
-                    &cindex,
-                    SincWindow::Blackman,
-                )
-                .map(|(v, _)| v)
-                .unwrap_or(self.default_value),
-            };
+            *out_val = sampler.sample(&cindex).unwrap_or(self.default_value);
 
             increment(&mut index, &out_size);
         }
@@ -292,7 +290,11 @@ impl ResampleImageFilter {
     }
 }
 
-fn build_output(id: PixelId, size: &[usize], vals: Vec<f64>) -> Result<Image> {
+/// Cast an `f64` result buffer, one value per pixel, to a scalar image of pixel
+/// type `id`. Shared with [`WarpImageFilter`](crate::WarpImageFilter), whose
+/// output is `static_cast<PixelType>` of an interpolated `double` in exactly
+/// the same way.
+pub(crate) fn build_output(id: PixelId, size: &[usize], vals: Vec<f64>) -> Result<Image> {
     use sitk_core::{Scalar, dispatch_scalar};
     fn make<T: Scalar>(size: &[usize], vals: &[f64]) -> sitk_core::Result<Image> {
         let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
@@ -303,7 +305,7 @@ fn build_output(id: PixelId, size: &[usize], vals: Vec<f64>) -> Result<Image> {
 
 /// Increment a multi-index in place (first index fastest). Wraps silently on
 /// the final overflow, which the caller never reads.
-fn increment(index: &mut [usize], size: &[usize]) {
+pub(crate) fn increment(index: &mut [usize], size: &[usize]) {
     for d in 0..index.len() {
         index[d] += 1;
         if index[d] < size[d] {

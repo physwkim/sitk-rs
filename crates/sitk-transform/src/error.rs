@@ -50,6 +50,15 @@ pub enum TransformError {
     )]
     UnsupportedDisplacementFieldPixelType(PixelId),
 
+    /// `WarpImageFilter::VerifyInputInformation` (itkWarpImageFilter.hxx:103-108)
+    /// throws "Expected number of components of displacement field to match
+    /// image dimensions!" when the field's pixels are not `ImageDimension`
+    /// components long.
+    #[error(
+        "displacement field has {got} components per pixel; expected {expected} (the image dimension)"
+    )]
+    DisplacementFieldComponentMismatch { expected: usize, got: usize },
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

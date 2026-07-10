@@ -13,6 +13,7 @@ use sitk_core::{Image, PixelId};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{affine_apply, index_to_physical_matrix};
+use crate::resample::increment;
 use crate::transform::Transform;
 
 /// `TransformToDisplacementFieldFilter`: `displacement(p) = T(p) − p` sampled
@@ -221,18 +222,6 @@ impl TransformToDisplacementFieldFilter {
             }
             increment(&mut higher, &size[1..]);
         }
-    }
-}
-
-/// Increment a multi-index in place (first index fastest). Wraps silently on
-/// the final overflow, which the caller never reads.
-fn increment(index: &mut [usize], size: &[usize]) {
-    for d in 0..index.len() {
-        index[d] += 1;
-        if index[d] < size[d] {
-            return;
-        }
-        index[d] = 0;
     }
 }
 
