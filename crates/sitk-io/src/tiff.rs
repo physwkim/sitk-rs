@@ -80,7 +80,7 @@
 //! round-tripping back through a non-invertible `1.0 - v`, a concern that
 //! does not arise when the corrected value is kept rather than undone).
 //!
-//! # A multi-sample `MINISBLACK` image reads its first half-row, twice over
+//! # A multi-sample `MINISBLACK` image reads its first half-row, twice over — this port reads every sample
 //!
 //! `GetFormat` maps `MINISBLACK` to `GRAYSCALE` before ever looking at
 //! `SamplesPerPixel`, so `ReadImageInformation` sets `NumberOfComponents` to 1
@@ -91,8 +91,19 @@
 //! of its first `width / 2` pixels. No error, no warning — `CanRead()` is
 //! perfectly happy with it, and the declared-but-never-defined
 //! `ReadTwoSamplesPerPixelImage` (itkTIFFImageIO.h:228-229) has no body in the
-//! `.cxx` at all. Ledger §2.140; [`page_rows`] reproduces it by taking the
-//! first `width * inc` samples of each `width * samples_per_pixel` row.
+//! `.cxx` at all. Ledger §2.140.
+//!
+//! Dropping every sample past the first is silent data loss, not a shape to
+//! reproduce: this crate's [`PixelId`] has no restriction against a
+//! multi-component grayscale image, so **fixed §2.140** — [`layout_for`] now
+//! sets `number_of_components` to the page's true `SamplesPerPixel` for
+//! `GRAYSCALE` too, exactly as it already did for `RGB`, and the file reads
+//! back as a vector image with every sample intact. This also makes
+//! [`page_rows`]'s two stride parameters always equal — `layout.number_of_components`
+//! and `page.samples_per_pixel` are the same count on every path once
+//! `read_current_page`'s per-page geometry check (§1.67) has passed — so
+//! [`page_rows`] takes a single `components` count and copies each row
+//! verbatim rather than truncating it.
 //!
 //! # Multi-page TIFF → 3-D volume, and two ways upstream walks off the buffer
 //!
@@ -535,7 +546,15 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
     // 5 has no name and cannot be decoded, and one whose count *is* named must
     // still agree, or the crate would silently drop the samples upstream keeps.
     let number_of_components = match format {
-        Format::Grayscale => 1,
+        // Fixed §2.140: upstream's `GetFormat` maps `MINISBLACK`/`MINISWHITE`
+        // to `GRAYSCALE` before ever consulting `SamplesPerPixel`, so a
+        // multi-sample grayscale page reads back as 1 component — dropping
+        // every sample past the first, silently. The `tiff` crate's own
+        // `colortype()` decodes a multi-sample `BlackIsZero`/`WhiteIsZero`
+        // page as `Multiband { num_samples: SamplesPerPixel, .. }`
+        // (decoder/image.rs:460-471) — every sample, verbatim — so the true
+        // count is simply the page's own `SamplesPerPixel`.
+        Format::Grayscale => usize::from(page0.samples_per_pixel),
         Format::Rgb => {
             let color: ColorType = decoder.colortype().map_err(|source| {
                 IoError::UnsupportedTiffFeature(format!(
@@ -629,30 +648,29 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
     })
 }
 
-/// Pull `height` rows of `width * inc` components out of a page decoded as
-/// `width * samples_per_pixel` components per row, placing row `r` at `r` for
-/// `ORIENTATION_TOPLEFT` and at `height - 1 - r` for `ORIENTATION_BOTLEFT`
-/// (itkTIFFImageIO.cxx:1381-1395).
+/// Pull `height` rows of `width * components` samples out of a decoded page,
+/// placing row `r` at `r` for `ORIENTATION_TOPLEFT` and at `height - 1 - r`
+/// for `ORIENTATION_BOTLEFT` (itkTIFFImageIO.cxx:1381-1395).
 ///
-/// The `inc < samples_per_pixel` case is `GRAYSCALE` over a multi-sample file:
-/// `PutGrayscale` copies `width` components off a longer scanline, so the row
-/// ends up holding the interleaved samples of its first `width / spp` pixels
-/// (§2.140).
+/// Fixed §2.140: this used to take the source and destination stride
+/// separately, because upstream's `GRAYSCALE` arm keeps only the first
+/// component of a multi-sample scanline. Now that [`layout_for`] reports the
+/// page's true `SamplesPerPixel` for `GRAYSCALE` too, `read_current_page`'s
+/// per-page geometry check (§1.67) guarantees the two strides are always
+/// equal, so there is only one `components` count and every sample is kept.
 fn page_rows<T: Copy>(
     decoded: &[T],
     out: &mut [T],
     width: usize,
     height: usize,
-    samples_per_pixel: usize,
-    inc: usize,
+    components: usize,
     top_left: bool,
 ) {
-    let src_stride = width * samples_per_pixel;
-    let dst_stride = width * inc;
+    let stride = width * components;
     for row in 0..height {
-        let src = &decoded[row * src_stride..row * src_stride + dst_stride];
+        let src = &decoded[row * stride..(row + 1) * stride];
         let dst_row = if top_left { row } else { height - 1 - row };
-        out[dst_row * dst_stride..(dst_row + 1) * dst_stride].copy_from_slice(src);
+        out[dst_row * stride..(dst_row + 1) * stride].copy_from_slice(src);
     }
 }
 
@@ -667,7 +685,6 @@ macro_rules! place_page {
                     $ctx.1,
                     $ctx.2,
                     $ctx.3,
-                    $ctx.4,
                 );
                 true
             }
@@ -727,10 +744,9 @@ fn read_current_page(
 
     let width = page.width as usize;
     let height = page.height as usize;
-    let samples_per_pixel = usize::from(page.samples_per_pixel);
-    let inc = layout.number_of_components;
+    let components = layout.number_of_components;
     let top_left = page.orientation == ORIENTATION_TOPLEFT;
-    let page_len = width * height * inc;
+    let page_len = width * height * components;
 
     if pixel_offset
         .checked_add(page_len)
@@ -747,7 +763,7 @@ fn read_current_page(
 
     let decoded = decoded_to_buffer(decoder.read_image()?, layout.component)?;
 
-    let ctx = (width, height, samples_per_pixel, inc, top_left);
+    let ctx = (width, height, components, top_left);
     let placed = place_page!(decoded, out, UInt8, pixel_offset, page_len, ctx)
         || place_page!(decoded, out, Int8, pixel_offset, page_len, ctx)
         || place_page!(decoded, out, UInt16, pixel_offset, page_len, ctx)
@@ -1397,25 +1413,29 @@ mod tests {
         }
     }
 
-    /// `GetFormat` calls a two-sample `MINISBLACK` page `GRAYSCALE`, so
-    /// `NumberOfComponents` is 1 and `PutGrayscale` copies `width` components
-    /// off a `2 * width` scanline — the interleaved samples of the row's first
-    /// `width / 2` pixels. Ledger §2.140.
+    /// `GetFormat` calls a two-sample `MINISBLACK` page `GRAYSCALE` before ever
+    /// consulting `SamplesPerPixel`, so upstream's `NumberOfComponents` is 1
+    /// and `PutGrayscale` copies `width` components off a `2 * width`
+    /// scanline — the interleaved samples of the row's first `width / 2`
+    /// pixels, dropping the rest. Ledger §2.140. **Fixed** — every sample is
+    /// silent data loss otherwise, not a shape to reproduce; this port reads
+    /// the page as a 2-component vector image instead.
     #[test]
-    fn two_sample_grayscale_keeps_the_first_half_of_each_row() {
+    fn two_sample_grayscale_reads_as_a_two_component_vector_image() {
         // Two rows of two pixels, two samples each: [g,a, g,a].
         let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         let bytes = build_tiff(vec![Page {
             entries: base_entries(2, 2, 8, 2, 1),
-            pixels,
+            pixels: pixels.clone(),
         }]);
         let path = write_fixture("sitk_io_tiff_gray_alpha.tif", &bytes);
         let image = read(&path).expect("two-sample grayscale reads");
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(image.pixel_id(), PixelId::UInt8);
+        assert_eq!(image.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(image.number_of_components_per_pixel(), 2);
         assert_eq!(image.size(), &[2, 2]);
-        assert_eq!(image.buffer(), &PixelBuffer::UInt8(vec![1, 2, 5, 6]));
+        assert_eq!(image.buffer(), &PixelBuffer::UInt8(pixels));
     }
 
     /// `ORIENTATION_BOTLEFT` sends scanline `row` to `height - 1 - row`
@@ -1666,15 +1686,14 @@ mod tests {
         assert_eq!(25.4 / f64::from(recovered), 1.000_000_015_018_493_3);
     }
 
-    /// `PutGrayscale` copies `width` components off a `width * spp` scanline,
-    /// so a two-sample grey image keeps only the interleaved samples of its
-    /// first `width / 2` pixels (§2.140).
+    /// Fixed §2.140: `page_rows` no longer takes a separate declared
+    /// component count to truncate against — every row is copied whole.
     #[test]
-    fn page_rows_truncates_a_multi_sample_grayscale_row() {
+    fn page_rows_copies_every_sample_of_each_row() {
         let decoded: Vec<u8> = (0..8).collect();
-        let mut out = vec![0u8; 4];
-        page_rows(&decoded, &mut out, 2, 2, 2, 1, true);
-        assert_eq!(out, vec![0, 1, 4, 5]);
+        let mut out = vec![0u8; 8];
+        page_rows(&decoded, &mut out, 2, 2, 2, true);
+        assert_eq!(out, decoded);
     }
 
     /// `ORIENTATION_BOTLEFT` places scanline `row` at `height - 1 - row`
@@ -1683,7 +1702,7 @@ mod tests {
     fn page_rows_flips_a_bottom_left_image() {
         let decoded: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
         let mut out = vec![0u8; 6];
-        page_rows(&decoded, &mut out, 3, 2, 1, 1, false);
+        page_rows(&decoded, &mut out, 3, 2, 1, false);
         assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
     }
 }
