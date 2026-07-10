@@ -1,6 +1,6 @@
 //! `itk::TransformToDisplacementFieldFilter`
 //! (`Modules/Filtering/DisplacementField/include/itkTransformToDisplacementFieldFilter.h(.hxx)`):
-//! sample a [`Transform`] onto a grid, storing at each grid point the
+//! sample a [`TransformBase`] onto a grid, storing at each grid point the
 //! displacement `T(p) − p` that carries that point's physical position `p` to
 //! its transformed position.
 //!
@@ -14,7 +14,7 @@ use sitk_core::{Image, PixelId};
 use crate::error::{Result, TransformError};
 use crate::interpolator::{affine_apply, index_to_physical_matrix};
 use crate::resample::increment;
-use crate::transform::Transform;
+use crate::transform::TransformBase;
 
 /// `TransformToDisplacementFieldFilter`: `displacement(p) = T(p) − p` sampled
 /// on an explicit output grid.
@@ -118,7 +118,7 @@ impl TransformToDisplacementFieldFilter {
     /// exact rather than an approximation; ITK takes it for speed and for
     /// scan-line-consistent rounding. This port reproduces both branches so the
     /// floating-point results match, not merely the mathematics.
-    pub fn execute<T: Transform>(&self, transform: &T) -> Result<Image> {
+    pub fn execute<T: TransformBase>(&self, transform: &T) -> Result<Image> {
         let dim = transform.dimension();
 
         if !matches!(
@@ -233,7 +233,7 @@ mod tests {
         AffineTransform, Euler2DTransform, ParametricTransform, TranslationTransform,
     };
 
-    fn field_2d(f: &TransformToDisplacementFieldFilter, t: &impl Transform) -> Vec<f64> {
+    fn field_2d(f: &TransformToDisplacementFieldFilter, t: &impl TransformBase) -> Vec<f64> {
         f.execute(t).unwrap().components_to_f64_vec()
     }
 

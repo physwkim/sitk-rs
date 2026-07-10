@@ -90,6 +90,48 @@ pub enum IoError {
     /// A core image error surfaced during assembly.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
+
+    /// A transform rejected the parameters read from a transform file, or a
+    /// composite rejected a sub-transform of another dimension.
+    #[error(transparent)]
+    Transform(#[from] sitk_transform::TransformError),
+
+    /// The path's extension is not one an Insight legacy transform reader
+    /// handles (`TxtTransformIO::CanReadFile` accepts only `.txt` and `.tfm`);
+    /// `TransformFileReader::Update` then throws `"Could not create Transform IO
+    /// object for reading file ..."` (itkTransformFileReader.cxx:83).
+    #[error("could not create Transform IO object for reading file {0}")]
+    NoTransformReaderFound(PathBuf),
+
+    /// As [`IoError::NoTransformReaderFound`], for writing
+    /// (itkTransformFileWriter.hxx: `"Can't Create IO object for file ..."`).
+    #[error("could not create Transform IO object for writing file {0}")]
+    NoTransformWriterFound(PathBuf),
+
+    /// The transform file parsed but yielded no transform.
+    /// `TransformFileReader::Update` throws `"failed to read file: ..."`
+    /// (itkTransformFileReader.cxx:113-118), and `itk::simple::ReadTransform`
+    /// throws `"there appears to be not transform in the file!"`
+    /// (sitkTransform.cxx:676-680).
+    #[error("read transform file {0}, but there appears to be no transform in the file")]
+    NoTransformInFile(PathBuf),
+
+    /// An `#Insight Transform File` line broke the format —
+    /// e.g. `"Tags must be delimited by :"` (itkTxtTransformIO.cxx:152).
+    #[error("malformed transform file: {0}")]
+    MalformedTransformFile(String),
+
+    /// A `Transform:` line named a transform this crate cannot construct.
+    /// `TransformIOBase::CreateTransform` throws `"Unregistered transform type:
+    /// ..."`.
+    #[error("unregistered transform type: {0}")]
+    UnknownTransformType(String),
+
+    /// The transform read is neither 2D nor 3D. `itk::simple::ReadTransform`
+    /// throws `"Unable to transform with InputSpaceDimension: ..."`
+    /// (sitkTransform.cxx:718-722).
+    #[error("unable to read a transform of dimension {0}: only 2D and 3D are supported")]
+    UnsupportedTransformDimension(usize),
 }
 
 /// Convenience alias for IO results.

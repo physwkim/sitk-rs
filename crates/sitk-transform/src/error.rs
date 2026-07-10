@@ -67,6 +67,36 @@ pub enum TransformError {
     #[error("matrix is not a proper rotation (must be orthonormal with determinant >= 0)")]
     NotARotationMatrix,
 
+    /// [`ParametricTransform::set_fixed_parameters`] was handed an array this
+    /// transform cannot accept. ITK's `SetFixedParameters` overrides throw an
+    /// `itkExceptionMacro` in the same situation
+    /// (`itkMatrixOffsetTransformBase.hxx:458-465`,
+    /// `itkEuler3DTransform.hxx:131-139`).
+    ///
+    /// [`ParametricTransform::set_fixed_parameters`]: crate::ParametricTransform::set_fixed_parameters
+    #[error("invalid fixed parameters: got {got} value(s), expected {expected}")]
+    InvalidFixedParameters { got: usize, expected: String },
+
+    /// The erased [`Transform::set_parameters`] was handed an array whose length
+    /// is not [`Transform::number_of_parameters`]. The concrete transforms panic
+    /// in this situation, as they always have; only the erased surface — which
+    /// mirrors a SimpleITK call that throws — reports it as an error.
+    ///
+    /// [`Transform::set_parameters`]: crate::Transform::set_parameters
+    /// [`Transform::number_of_parameters`]: crate::Transform::number_of_parameters
+    #[error("invalid parameters: got {got} value(s), expected {expected}")]
+    InvalidParameters { got: usize, expected: usize },
+
+    /// [`Transform::inverse`] was called on a transform that has no inverse,
+    /// either because the transform class does not define one or because this
+    /// instance's linear map is singular. Mirrors `itk::simple::Transform::
+    /// GetInverse`, which throws when `SetInverse` fails
+    /// (`sitkTransform.cxx:542-552`).
+    ///
+    /// [`Transform::inverse`]: crate::Transform::inverse
+    #[error("transform has no inverse: {0}")]
+    NoInverse(&'static str),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

@@ -1022,7 +1022,7 @@ mod tests {
         // got wrong for a non-displacement-field transform: it treated "no
         // owning parameter block" as "drop the sample" instead of "drop only
         // its derivative contribution".
-        use sitk_transform::{BSplineTransform, ParametricTransform, Transform};
+        use sitk_transform::{BSplineTransform, ParametricTransform, TransformBase};
 
         let (w, h, sigma) = (32usize, 32usize, 5.0);
         let fixed = gaussian(w, h, 16.0, 16.0, sigma, 1.0);

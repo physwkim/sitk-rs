@@ -1,4 +1,4 @@
-//! Image file IO for sitk-rs.
+//! Image and transform file IO for sitk-rs.
 //!
 //! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
 //! [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
@@ -14,11 +14,16 @@
 //! format, which round-trips every scalar, vector, and complex pixel type and
 //! the full geometry (see [`meta_image`] for the channel-count caveat that
 //! applies to complex images).
+//!
+//! Transforms have their own reader and writer, [`read_transform`] and
+//! [`write_transform`], over the Insight legacy text format (`.tfm` / `.txt`);
+//! see [`transform_io`].
 
 pub mod error;
 pub mod image_io;
 pub mod meta_image;
 pub mod reader;
+pub mod transform_io;
 pub mod writer;
 
 use std::path::Path;
@@ -30,6 +35,7 @@ pub use image_io::{
 };
 pub use reader::ImageFileReader;
 use sitk_core::Image;
+pub use transform_io::{read_transform, write_transform};
 pub use writer::ImageFileWriter;
 
 /// Read an image, letting the [`registry`] pick the format —

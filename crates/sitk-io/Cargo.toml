@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Image file IO for sitk-rs (MetaImage)"
+description = "Image and transform file IO for sitk-rs (MetaImage, Insight legacy transforms)"
 
 [dependencies]
 sitk-core.workspace = true
+sitk-transform.workspace = true
 thiserror.workspace = true

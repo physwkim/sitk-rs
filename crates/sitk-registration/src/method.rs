@@ -2194,7 +2194,7 @@ mod tests {
         // This exercises the whole deformable path — B-spline weights, the
         // per-control-point Jacobian, physical-shift scales over ~100
         // parameters, and the optimiser over the full coefficient vector.
-        use sitk_transform::{BSplineTransform, Transform};
+        use sitk_transform::{BSplineTransform, TransformBase};
 
         let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
         let (cx, cy) = (20.0f64, 20.0f64);
@@ -2291,7 +2291,7 @@ mod tests {
         // the fixed blob centre onto the moving one while mutual information
         // improves over the identity. A BSpline is !HasLocalSupport in ITK, so
         // this runs through the metric's ordinary global-support derivative path.
-        use sitk_transform::{BSplineTransform, Transform};
+        use sitk_transform::{BSplineTransform, TransformBase};
 
         let (w, h, sigma, amp) = (40usize, 40usize, 6.0, 1.0);
         let (cx, cy) = (20.0f64, 20.0f64);
@@ -2351,7 +2351,7 @@ mod tests {
         // residual), dropping the metric far below the identity baseline; on the
         // blob's steep flank, where the gradient carries signal, the recovered
         // displacement approaches the true translation.
-        use sitk_transform::{DisplacementFieldTransform, Transform};
+        use sitk_transform::{DisplacementFieldTransform, TransformBase};
 
         let (w, h, sigma, amp) = (20usize, 20usize, 4.0, 1.0);
         let (cx, cy) = (10.0f64, 10.0f64);
@@ -2721,7 +2721,7 @@ mod tests {
         // distinct radii break all rotational symmetry, so every angle is
         // observable. Rotation preserves the isotropic blob width, so the moving
         // blobs keep sigma (no scale correction, unlike a similarity).
-        use sitk_transform::{Euler3DTransform, Transform};
+        use sitk_transform::{Euler3DTransform, TransformBase};
         let n = 20usize;
         let c = [10.0f64, 10.0, 10.0];
         let sigma = 2.0;
@@ -2777,7 +2777,7 @@ mod tests {
         // Same three-blob volume as the Euler3D test, but the ground-truth
         // rotation is a versor; the optimal VersorRigid3D recovers its right part
         // and translation. Rotation preserves the isotropic blob width.
-        use sitk_transform::{Transform, VersorRigid3DTransform};
+        use sitk_transform::{TransformBase, VersorRigid3DTransform};
         let n = 20usize;
         let c = [10.0f64, 10.0, 10.0];
         let sigma = 2.0;
@@ -3298,7 +3298,7 @@ mod tests {
 
     #[test]
     fn demons_recovers_a_translation_with_a_displacement_field() {
-        use sitk_transform::{DisplacementFieldTransform, Transform};
+        use sitk_transform::{DisplacementFieldTransform, TransformBase};
 
         let (w, h, sigma, amp) = (20usize, 20usize, 4.0, 1.0);
         let (cx, cy) = (10.0f64, 10.0f64);

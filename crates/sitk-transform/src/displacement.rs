@@ -56,16 +56,20 @@ use sitk_core::Image;
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{is_inside, physical_to_index_matrix, strides};
-use crate::transform::{ParametricTransform, Transform};
+use crate::transform::{ParametricTransform, TransformBase};
 
 /// A dense displacement-field transform. See the [module docs](self).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DisplacementFieldTransform {
     dim: usize,
     /// Field grid size, per axis.
     size: Vec<usize>,
     /// Physical origin of pixel `(0,…,0)`.
     origin: Vec<f64>,
+    /// Physical spacing between adjacent field pixels, per axis.
+    spacing: Vec<f64>,
+    /// Orientation of the field grid, row-major `dim × dim`.
+    direction: Vec<f64>,
     /// `diag(1/spacing) · direction⁻¹`, row-major `dim × dim`: maps a physical
     /// displacement from `origin` to a continuous field index.
     phys_to_index: Vec<f64>,
@@ -105,6 +109,8 @@ impl DisplacementFieldTransform {
             dim,
             size: size.to_vec(),
             origin: origin.to_vec(),
+            spacing: spacing.to_vec(),
+            direction: direction.to_vec(),
             phys_to_index,
             strides: strides(size),
             num_pixels,
@@ -128,6 +134,21 @@ impl DisplacementFieldTransform {
     /// Field grid size, per axis.
     pub fn size(&self) -> &[usize] {
         &self.size
+    }
+
+    /// Physical origin of pixel `(0,…,0)`.
+    pub fn origin(&self) -> &[f64] {
+        &self.origin
+    }
+
+    /// Physical spacing between adjacent field pixels, per axis.
+    pub fn spacing(&self) -> &[f64] {
+        &self.spacing
+    }
+
+    /// Orientation of the field grid, row-major `dim × dim`.
+    pub fn direction(&self) -> &[f64] {
+        &self.direction
     }
 
     /// Number of grid pixels (`Π size`).
@@ -177,7 +198,7 @@ impl DisplacementFieldTransform {
     }
 }
 
-impl Transform for DisplacementFieldTransform {
+impl TransformBase for DisplacementFieldTransform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         let dim = self.dim;
         let cindex = self.continuous_index(point);
@@ -220,6 +241,49 @@ impl ParametricTransform for DisplacementFieldTransform {
             "displacement-field parameter vector length mismatch"
         );
         self.field.copy_from_slice(params);
+    }
+
+    /// `[size, origin, spacing, direction]` — `dim · (dim + 3)` values, the
+    /// grid geometry of the displacement field
+    /// (`itk::DisplacementFieldTransform::SetFixedParameters`).
+    fn fixed_parameters(&self) -> Vec<f64> {
+        let dim = self.dim;
+        let mut fp = Vec::with_capacity(dim * (dim + 3));
+        fp.extend(self.size.iter().map(|&s| s as f64));
+        fp.extend_from_slice(&self.origin);
+        fp.extend_from_slice(&self.spacing);
+        fp.extend_from_slice(&self.direction);
+        fp
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.dim * (self.dim + 3)
+    }
+
+    /// Rebuilds the field grid from `params` and zeroes the field — ITK
+    /// allocates a fresh displacement image from the fixed parameters, so the
+    /// caller must set the parameters afterwards to restore the field.
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        let dim = self.dim;
+        let expected = dim * (dim + 3);
+        if params.len() != expected {
+            return Err(TransformError::InvalidFixedParameters {
+                got: params.len(),
+                expected: format!("{expected} (field size, origin, spacing, direction)"),
+            });
+        }
+        let size: Vec<usize> = params[..dim]
+            .iter()
+            .map(|&s| if s >= 1.0 { s as usize } else { 0 })
+            .collect();
+        *self = Self::new(
+            dim,
+            &size,
+            &params[dim..2 * dim],
+            &params[2 * dim..3 * dim],
+            &params[3 * dim..],
+        )?;
+        Ok(())
     }
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
@@ -280,6 +344,46 @@ impl ParametricTransform for DisplacementFieldTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_parameters_are_the_field_grid_geometry() {
+        let t = DisplacementFieldTransform::new(
+            2,
+            &[3, 4],
+            &[1.0, 2.0],
+            &[0.5, 0.25],
+            &identity_dir(2),
+        )
+        .unwrap();
+        assert_eq!(
+            t.fixed_parameters(),
+            vec![3.0, 4.0, 1.0, 2.0, 0.5, 0.25, 1.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(t.number_of_fixed_parameters(), 2 * (2 + 3));
+    }
+
+    #[test]
+    fn set_fixed_parameters_rebuilds_the_field_and_zeroes_it() {
+        let mut t =
+            DisplacementFieldTransform::new(2, &[2, 2], &[0.0, 0.0], &[1.0, 1.0], &identity_dir(2))
+                .unwrap();
+        t.set_parameters(&vec![7.0; t.number_of_parameters()]);
+
+        let target = DisplacementFieldTransform::new(
+            2,
+            &[3, 4],
+            &[1.0, 2.0],
+            &[0.5, 0.25],
+            &identity_dir(2),
+        )
+        .unwrap();
+        t.set_fixed_parameters(&target.fixed_parameters()).unwrap();
+
+        assert_eq!(t, target);
+        assert!(t.parameters().iter().all(|&v| v == 0.0));
+
+        assert!(t.set_fixed_parameters(&[1.0, 2.0, 3.0]).is_err());
+    }
 
     fn identity_dir(dim: usize) -> Vec<f64> {
         let mut d = vec![0.0; dim * dim];

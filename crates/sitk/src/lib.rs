@@ -58,6 +58,6 @@ pub use sitk_transform::{
     AffineTransform, BSplineTransform, CenteredTransform, ComposeScaleSkewVersor3DTransform,
     CompositeTransform, DisplacementFieldTransform, Euler2DTransform, Euler3DTransform,
     ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform, ScaleTransform,
-    ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform, Transform,
-    TranslationTransform, VersorRigid3DTransform, VersorTransform,
+    ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform, Transform, TransformBase,
+    TransformKind, TranslationTransform, VersorRigid3DTransform, VersorTransform,
 };

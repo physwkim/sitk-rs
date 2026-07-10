@@ -159,7 +159,7 @@ fn center_of_gravity(img: &Image, which: &'static str) -> Result<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::{AffineTransform, Euler2DTransform, Transform};
+    use sitk_transform::{AffineTransform, Euler2DTransform, TransformBase};
 
     /// A `w×h` image whose only nonzero pixel is a unit mass at index `(x, y)`.
     fn point_mass(w: usize, h: usize, x: usize, y: usize) -> Image {
