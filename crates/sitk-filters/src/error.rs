@@ -226,6 +226,21 @@ pub enum FilterError {
     #[error("this filter requires a signed pixel type, got {0:?}")]
     RequiresSignedPixelType(PixelId),
 
+    /// `LabelOverlayImageFilter` scales its palette by the base image's own
+    /// `NumericTraits<ValueType>::max()` (`itkLabelToRGBFunctor.h:112-116`).
+    /// For a floating-point base that is `f32::MAX` / `f64::MAX`, which swamps
+    /// the base pixel in the blend by hundreds of orders of magnitude and makes
+    /// the overlay meaningless. Any float scaling rule (fixed 0-255,
+    /// data-driven max) would be invented semantics with no unique answer, so
+    /// this port refuses instead of emitting the swamped garbage. Integer bases
+    /// are unaffected. See the upstream-findings ledger, §2.54.
+    #[error(
+        "label_overlay's palette is scaled by the base image's NumericTraits::max(), \
+         which is meaningless against a floating-point base (got {0:?}); cast or \
+         rescale the base image to an integer pixel type first"
+    )]
+    FloatingPointBaseLabelOverlay(PixelId),
+
     /// `MultiLabelSTAPLEImageFilter::InitializePriorProbabilities` throws when
     /// the caller-supplied prior array is shorter than the number of labels.
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
