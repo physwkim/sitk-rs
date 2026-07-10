@@ -353,17 +353,21 @@ fn rows_for_declared_channels(
 /// both emitted by `Write`/`WriteSlice` here in one pass, as they are
 /// upstream.
 pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
-    let file = std::fs::File::create(path)?;
-
+    // Fixed §1.59: upstream's `PNGFileWrapper` opens the target with
+    // `fopen(fname, "wb")` — truncating it immediately — before its
+    // component-type switch discovers the type is unwritable and throws
+    // (itkPNGImageIO.cxx:514, :541-552). Check the component type before
+    // creating (and truncating) the output file at all.
     let component = image.buffer().component_id();
     let Some(bit_depth) = component_bit_depth(component) else {
         return Err(IoError::UnsupportedPngFeature(format!(
             "PNG supports unsigned char and unsigned short, not {} \
-             (itkPNGImageIO.cxx:550; the target file is left truncated to zero \
-             bytes by fopen(\"wb\") — doc/upstream-findings.md §1.59)",
+             (itkPNGImageIO.cxx:550)",
             component.as_str()
         )));
     };
+
+    let file = std::fs::File::create(path)?;
 
     let width = image.size()[0];
     let height = if image.dimension() > 1 {

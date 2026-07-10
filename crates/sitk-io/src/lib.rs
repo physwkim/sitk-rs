@@ -4182,15 +4182,17 @@ mod tests {
         assert_eq!(back.scalar_slice::<u8>().unwrap(), &data[..4]);
     }
 
-    /// `WriteSlice` opens the file with `fopen(fileName, "wb")` — which
-    /// truncates immediately — before its component-type switch's `default:`
-    /// throws "PNG supports unsigned char and unsigned short"
-    /// (itkPNGImageIO.cxx:514-553). Ledger §1.59.
+    /// Fixed §1.59: upstream's `WriteSlice` opens the file with
+    /// `fopen(fileName, "wb")` — truncating it immediately — before its
+    /// component-type switch's `default:` throws "PNG supports unsigned char
+    /// and unsigned short" (itkPNGImageIO.cxx:514-553). This port now checks
+    /// the component type before creating (and truncating) the output file,
+    /// so a pre-existing file at the target path is left untouched.
     #[test]
-    fn png_write_of_an_unwritable_component_type_truncates_the_file() {
+    fn png_write_of_an_unwritable_component_type_is_rejected_before_the_file_is_touched() {
         let img = Image::from_vec(&[2, 2], vec![1i16, 2, 3, 4]).unwrap();
         let path = tmp_path("unwritable.png");
-        std::fs::write(&path, b"pre-existing content that should be truncated").unwrap();
+        std::fs::write(&path, b"pre-existing content that must survive").unwrap();
 
         let result = write_image(&img, &path);
         let bytes = std::fs::read(&path).unwrap();
@@ -4201,11 +4203,7 @@ mod tests {
                 if m.contains("PNG supports unsigned char and unsigned short")),
             "{result:?}"
         );
-        assert!(
-            bytes.is_empty(),
-            "expected a truncated file, got {} bytes",
-            bytes.len()
-        );
+        assert_eq!(bytes, b"pre-existing content that must survive");
     }
 
     /// `CanReadFile`'s signature check rejects a `.png`-named file whose
