@@ -4030,24 +4030,37 @@ mod tests {
         assert_eq!(back.spacing(), &[0.25, 4.0]);
     }
 
-    /// `VTKImageIO` reads a `TENSORS` file; SimpleITK's `GetPixelIDFromImageIO`
-    /// has no `SYMMETRICSECONDRANKTENSOR` arm and throws `"Unknown PixelType"`
-    /// (§3.37).
+    /// `VTKImageIO` reads a `TENSORS` file as a six-component
+    /// `SYMMETRICSECONDRANKTENSOR`; SimpleITK's `GetPixelIDFromImageIO` has no arm
+    /// for it and throws `"Unknown PixelType"`. This port's [`Image`] can hold the
+    /// data, so it loads as a 6-component vector image, components in on-disk
+    /// order (VTK does no reordering). Ledger §3.37.
     #[test]
-    fn vtk_tensors_are_unreadable_through_the_simpleitk_pixel_id_mapping() {
+    fn vtk_tensors_load_as_a_six_component_vector_image() {
         let header = format!(
-            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 1 1 1 \n\
-             POINT_DATA 1\nTENSORS tensors float\n"
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             POINT_DATA 4\nTENSORS tensors float\n"
         );
-        let path = write_vtk("tensors.vtk", &header, &[0u8; 36]);
+        // Big-endian f32: pixel p holds components [p*10+1 .. p*10+6].
+        let mut data = Vec::new();
+        for p in 0..4 {
+            for c in 1..=6 {
+                data.extend_from_slice(&((p * 10 + c) as f32).to_be_bytes());
+            }
+        }
+        let path = write_vtk("tensors.vtk", &header, &data);
         let claimed = create_image_io(&path, FileMode::Read).is_some();
-        let result = read_image(&path);
+        let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
+
         assert!(claimed, "CanReadFile only tests the DATASET line");
-        assert!(
-            matches!(&result, Err(IoError::UnsupportedVtkFeature(m)) if m.contains("Unknown PixelType")),
-            "{result:?}"
-        );
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 6);
+        assert_eq!(back.size(), &[2, 2]);
+        let expected: Vec<f32> = (0..4)
+            .flat_map(|p| (1..=6).map(move |c| (p * 10 + c) as f32))
+            .collect();
+        assert_eq!(back.component_slice::<f32>().unwrap(), expected.as_slice());
     }
 
     /// `CanReadFile` requires `structured_points` on the fourth line, so a

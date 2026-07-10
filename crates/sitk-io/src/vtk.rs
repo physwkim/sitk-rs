@@ -78,10 +78,13 @@
 //! checked earlier!` comment on the `SCALARS` write branch (`:703-706`). Ledger
 //! §2.104.
 //!
-//! A `TENSORS` file is readable by ITK and **not** by SimpleITK:
+//! A `TENSORS` file is readable by ITK but not by SimpleITK:
 //! `GetPixelIDFromImageIO` has no `SYMMETRICSECONDRANKTENSOR` arm and ends in
-//! `"Unknown PixelType"` (sitkImageReaderBase.cxx:213-240). [`read`] raises
-//! [`IoError::UnsupportedVtkFeature`] there. Ledger §3.37.
+//! `"Unknown PixelType"` (sitkImageReaderBase.cxx:213-240). This port
+//! **implements** the read (ledger §3.37): a `TENSORS` attribute loads as a
+//! 6-component vector image — the six components
+//! `InternalReadImageInformation` sets (`itkVTKImageIO.cxx:341-351`), in on-disk
+//! order, since VTK (unlike NIfTI) applies no component reordering.
 //!
 //! # What a SimpleITK image writes as
 //!
@@ -310,16 +313,16 @@ impl Header {
             return Ok(self.component);
         }
         match self.pixel_type {
-            VtkPixelType::Vector | VtkPixelType::Rgb | VtkPixelType::Rgba => {
-                Ok(self.component.vector_id())
-            }
-            VtkPixelType::SymmetricSecondRankTensor => Err(IoError::UnsupportedVtkFeature(
-                "Unknown PixelType: SimpleITK's GetPixelIDFromImageIO has no \
-                 SYMMETRICSECONDRANKTENSOR arm, so a TENSORS file that \
-                 VTKImageIO reads is unreadable through SimpleITK \
-                 (doc/upstream-findings.md §3.37)"
-                    .to_string(),
-            )),
+            // SimpleITK's `GetPixelIDFromImageIO` has no `SYMMETRICSECONDRANKTENSOR`
+            // arm, so a `TENSORS` file that `VTKImageIO` reads fine is unreadable
+            // through SimpleITK ("Unknown PixelType"). This port's `Image` can hold
+            // the data, so the tensor loads as a 6-component vector image — the six
+            // components `InternalReadImageInformation` sets, in on-disk order
+            // (VTK, unlike NIfTI, does not reorder them). Ledger §3.37.
+            VtkPixelType::Vector
+            | VtkPixelType::Rgb
+            | VtkPixelType::Rgba
+            | VtkPixelType::SymmetricSecondRankTensor => Ok(self.component.vector_id()),
             // `Scalar` with a component count other than one is unreachable:
             // both arms that set `Scalar` also set `numComp = 1`.
             VtkPixelType::Scalar => Ok(self.component),
