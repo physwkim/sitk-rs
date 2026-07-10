@@ -19,6 +19,7 @@
 //!
 //! [`transform_point`]: TransformBase::transform_point
 
+use crate::erased::Transform;
 use crate::error::{Result, TransformError};
 use crate::transform::{ParametricTransform, TransformBase};
 
@@ -65,10 +66,11 @@ use crate::transform::{ParametricTransform, TransformBase};
 /// `jacobian_wrt_parameters` already returns a full (mostly-zero) dense
 /// Jacobian — just without the memory savings ITK's local-parameter-offset
 /// scheme provides.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompositeTransform {
     dimension: usize,
     /// Added order: `transforms[0]` is `T0`, applied *last*.
-    transforms: Vec<Box<dyn ParametricTransform>>,
+    transforms: Vec<Transform>,
 }
 
 impl CompositeTransform {
@@ -89,7 +91,12 @@ impl CompositeTransform {
     /// *innermost* (first-applied) transform for `transform_point` — see the
     /// module docs. Panics if `transform.dimension()` disagrees with this
     /// composite's dimension.
-    pub fn add_transform(&mut self, transform: Box<dyn ParametricTransform>) {
+    ///
+    /// Takes an erased [`Transform`], as `itk::simple::CompositeTransform::
+    /// AddTransform(const Transform &)` does — so the queue can be walked back
+    /// out by concrete type, which is what writing a composite transform file
+    /// requires.
+    pub fn add_transform(&mut self, transform: Transform) {
         assert_eq!(
             transform.dimension(),
             self.dimension,
@@ -98,9 +105,35 @@ impl CompositeTransform {
         self.transforms.push(transform);
     }
 
+    /// The sub-transforms in add order — `itk::CompositeTransform::GetTransformQueue()`,
+    /// front to back.
+    pub fn transforms(&self) -> &[Transform] {
+        &self.transforms
+    }
+
+    /// The `n`-th sub-transform in add order (`GetNthTransform`), or `None` when
+    /// `n` is out of range.
+    pub fn nth_transform(&self, n: usize) -> Option<&Transform> {
+        self.transforms.get(n)
+    }
+
     /// Number of sub-transforms in the queue.
     pub fn number_of_transforms(&self) -> usize {
         self.transforms.len()
+    }
+
+    /// The inverse composite: every sub-transform inverted, and the queue
+    /// reversed — `itk::CompositeTransform::GetInverse`
+    /// (`itkCompositeTransform.hxx:406-436`) walks the queue front to back and
+    /// `PushFrontTransform`s each inverse. Errors as soon as any sub-transform
+    /// has no inverse, exactly where ITK's `GetInverse` clears the queue and
+    /// returns `false`.
+    pub fn inverse(&self) -> Result<Self> {
+        let mut inverse = Self::new(self.dimension);
+        for t in &self.transforms {
+            inverse.transforms.insert(0, t.inverse()?);
+        }
+        Ok(inverse)
     }
 }
 
@@ -288,9 +321,46 @@ impl ParametricTransform for CompositeTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bspline::BSplineTransform;
+    use crate::erased::TransformKind;
     use crate::transform::{
         AffineTransform, Euler2DTransform, ScaleTransform, TranslationTransform,
     };
+
+    #[test]
+    fn inverse_reverses_the_queue_and_inverts_each_sub_transform() {
+        let mut c = CompositeTransform::new(2);
+        c.add_transform(TranslationTransform::new(vec![5.0, -1.0]).into());
+        c.add_transform(Euler2DTransform::new(0.7, [1.0, 2.0], [3.0, 4.0]).into());
+
+        let inv = c.inverse().unwrap();
+        assert_eq!(inv.number_of_transforms(), 2);
+        // PushFrontTransform order: the inverted rotation is now first-added.
+        assert_eq!(inv.nth_transform(0).unwrap().kind(), TransformKind::Euler);
+        assert_eq!(
+            inv.nth_transform(1).unwrap().kind(),
+            TransformKind::Translation
+        );
+
+        for p in [[0.0, 0.0], [2.0, 3.0], [-7.5, 11.0]] {
+            let back = inv.transform_point(&c.transform_point(&p));
+            for d in 0..2 {
+                assert!((back[d] - p[d]).abs() < 1e-9, "{back:?} vs {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_fails_when_any_sub_transform_has_none() {
+        let mut c = CompositeTransform::new(2);
+        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into());
+        c.add_transform(
+            BSplineTransform::new(2, &[0.0, 0.0], &[4.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[2, 2])
+                .unwrap()
+                .into(),
+        );
+        assert!(matches!(c.inverse(), Err(TransformError::NoInverse(_))));
+    }
 
     #[test]
     fn identity_of_empty_composite() {
@@ -302,16 +372,16 @@ mod tests {
     #[test]
     fn two_translations_sum() {
         let mut c = CompositeTransform::new(2);
-        c.add_transform(Box::new(TranslationTransform::new(vec![1.0, 2.0])));
-        c.add_transform(Box::new(TranslationTransform::new(vec![3.0, 4.0])));
+        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into());
+        c.add_transform(TranslationTransform::new(vec![3.0, 4.0]).into());
         assert_eq!(c.transform_point(&[0.0, 0.0]), vec![4.0, 6.0]);
     }
 
     #[test]
     fn parameters_concatenate_in_reverse_add_order() {
         let mut c = CompositeTransform::new(2);
-        c.add_transform(Box::new(TranslationTransform::new(vec![1.0, 2.0])));
-        c.add_transform(Box::new(ScaleTransform::identity(2)));
+        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into());
+        c.add_transform(ScaleTransform::identity(2).into());
         assert_eq!(c.number_of_parameters(), 4);
         let params = c.parameters();
         // Last-added (Scale) is read first, then first-added (Translation) —
@@ -327,12 +397,8 @@ mod tests {
         let angle = std::f64::consts::FRAC_PI_2;
         let translation = vec![5.0, -1.0];
         let mut c = CompositeTransform::new(2);
-        c.add_transform(Box::new(TranslationTransform::new(translation.clone())));
-        c.add_transform(Box::new(Euler2DTransform::new(
-            angle,
-            [0.0, 0.0],
-            [0.0, 0.0],
-        )));
+        c.add_transform(TranslationTransform::new(translation.clone()).into());
+        c.add_transform(Euler2DTransform::new(angle, [0.0, 0.0], [0.0, 0.0]).into());
 
         let p = [2.0, 3.0];
         let y = c.transform_point(&p);
@@ -351,7 +417,7 @@ mod tests {
     fn dimension_mismatch_panics() {
         let mut c = CompositeTransform::new(3);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            c.add_transform(Box::new(TranslationTransform::new(vec![1.0, 2.0])));
+            c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into());
         }));
         assert!(result.is_err());
     }
@@ -361,18 +427,17 @@ mod tests {
         // Off-center, non-trivial parameters on every sub-transform: exercises
         // the chain-rule left-multiplication through two "earlier" blocks.
         let mut c = CompositeTransform::new(2);
-        c.add_transform(Box::new(AffineTransform::new(
-            2,
-            vec![1.2, 0.3, -0.1, 0.9],
-            vec![0.5, -0.7],
-            vec![1.0, 2.0],
-        )));
-        c.add_transform(Box::new(TranslationTransform::new(vec![2.0, -3.0])));
-        c.add_transform(Box::new(Euler2DTransform::new(
-            0.4,
-            [1.5, -0.5],
-            [0.2, 0.3],
-        )));
+        c.add_transform(
+            AffineTransform::new(
+                2,
+                vec![1.2, 0.3, -0.1, 0.9],
+                vec![0.5, -0.7],
+                vec![1.0, 2.0],
+            )
+            .into(),
+        );
+        c.add_transform(TranslationTransform::new(vec![2.0, -3.0]).into());
+        c.add_transform(Euler2DTransform::new(0.4, [1.5, -0.5], [0.2, 0.3]).into());
 
         let point = [7.0, -2.0];
         let jac = c.jacobian_wrt_parameters(&point);
@@ -407,16 +472,9 @@ mod tests {
     #[test]
     fn position_jacobian_matches_finite_difference() {
         let mut c = CompositeTransform::new(2);
-        c.add_transform(Box::new(TranslationTransform::new(vec![0.3, -0.8])));
-        c.add_transform(Box::new(Euler2DTransform::new(
-            0.37,
-            [0.5, -0.4],
-            [0.4, 0.9],
-        )));
-        c.add_transform(Box::new(ScaleTransform::new(
-            vec![1.3, 0.7],
-            vec![0.4, 0.9],
-        )));
+        c.add_transform(TranslationTransform::new(vec![0.3, -0.8]).into());
+        c.add_transform(Euler2DTransform::new(0.37, [0.5, -0.4], [0.4, 0.9]).into());
+        c.add_transform(ScaleTransform::new(vec![1.3, 0.7], vec![0.4, 0.9]).into());
 
         let point = [1.7f64, -0.6];
         let analytic = c.jacobian_wrt_position(&point);

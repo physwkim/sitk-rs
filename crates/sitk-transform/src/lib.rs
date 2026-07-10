@@ -8,6 +8,7 @@
 pub mod bspline;
 pub mod composite;
 pub mod displacement;
+pub mod erased;
 pub mod error;
 pub mod interpolator;
 pub mod resample;
@@ -19,6 +20,7 @@ pub mod warp;
 pub use bspline::BSplineTransform;
 pub use composite::CompositeTransform;
 pub use displacement::DisplacementFieldTransform;
+pub use erased::{Transform, TransformKind};
 pub use error::{Result, TransformError};
 pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform::{
