@@ -252,7 +252,7 @@ pub use slice::slice;
 pub use smoothing::smooth_gaussian;
 pub use sources::{
     GaborSourceSettings, GaussianSourceSettings, GridSourceSettings, SourceGeometry, gabor_source,
-    gaussian_source, grid_source,
+    gaussian_source, grid_source, physical_point_source,
 };
 pub use threshold::{
     huang_threshold, intermodes_threshold, isodata_threshold, kittler_illingworth_threshold,

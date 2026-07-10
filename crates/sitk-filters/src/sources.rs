@@ -1,14 +1,14 @@
 //! Image-source generators: filters with no input image, ported from
 //! `Modules/Filtering/ImageSources/include/itkGaussianImageSource.h`/`.hxx`
 //! ([`gaussian_source`]), `itkGaborImageSource.h`/`.hxx` ([`gabor_source`]),
-//! and `itkGridImageSource.h`/`.hxx` ([`grid_source`]).
+//! `itkGridImageSource.h`/`.hxx` ([`grid_source`]), and
+//! `itkPhysicalPointImageSource.h`/`.hxx` ([`physical_point_source`]).
 //!
-//! `PhysicalPointImageSource` (`PhysicalPointImageSource.yaml`) is **not**
-//! ported: its `pixel_types` is `VectorPixelIDTypeList` and its default
-//! output pixel type is `sitkVectorFloat32` — it produces a vector image with
-//! one component per dimension. This crate's [`Image`]/`PixelBuffer` model is
-//! scalar-only (ten scalar variants, see `sitk_core::pixel::PixelId`), so
-//! there is no representation for a multi-component pixel to port it onto.
+//! [`physical_point_source`] is the odd one out: it produces a *vector* image
+//! (one component per dimension, one component's value per axis) rather than
+//! a scalar one, so it is the only source in this module that dispatches on a
+//! `Vector*` [`PixelId`] and builds through [`Image::from_vec_vector`] instead
+//! of [`Image::from_vec`].
 //!
 //! Every source in this module shares the same physical-space placement
 //! surface ([`SourceGeometry`]): `size` fixes the output dimension and pixel
@@ -435,6 +435,62 @@ pub fn grid_source(
     }
 
     let mut out = dispatch_scalar!(pixel_id, build_typed_image, size, &vals)?;
+    out.copy_geometry_from(&geo);
+    Ok(out)
+}
+
+// ---- physical_point_source ----------------------------------------------
+
+fn build_vector_typed_image<T: Scalar>(
+    size: &[usize],
+    components: usize,
+    vals: &[f64],
+) -> Result<Image> {
+    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
+    Ok(Image::from_vec_vector(size, components, out)?)
+}
+
+/// `PhysicalPointImageSource`: a vector image whose pixel at `index` holds the
+/// physical point of `index`, one component per dimension
+/// (`itkPhysicalPointImageSource.hxx::DynamicThreadedGenerateData`):
+///
+/// `pixel(index)[d] = static_cast<ValueType>(TransformIndexToPhysicalPoint(index)[d])`
+///
+/// i.e. exactly [`Image::continuous_index_to_physical_point`], narrowed to the
+/// output's component type with truncating semantics ([`Scalar::from_f64`]).
+///
+/// `GenerateOutputInformation` (itkPhysicalPointImageSource.hxx:40-43) always
+/// forces the component count to the image dimension, overriding whatever a
+/// caller might otherwise have asked for — there is no way to request a
+/// different component count, so this port has no such parameter either.
+///
+/// `pixel_id` must be a vector pixel type (`PhysicalPointImageSource.yaml`'s
+/// `pixel_types: VectorPixelIDTypeList`); errors with
+/// [`sitk_core::Error::RequiresVectorPixelType`] otherwise.
+///
+/// Errors under the same geometry conditions as [`gaussian_source`].
+pub fn physical_point_source(
+    pixel_id: PixelId,
+    size: &[usize],
+    geometry: &SourceGeometry,
+) -> Result<Image> {
+    if !pixel_id.is_vector() {
+        return Err(sitk_core::Error::RequiresVectorPixelType(pixel_id).into());
+    }
+    let dim = size.len();
+    let geo = geometry_image(size, geometry)?;
+
+    let axis_strides = strides(size);
+    let count: usize = size.iter().product();
+    let mut vals = vec![0.0f64; count * dim];
+    for (o, slot) in vals.chunks_exact_mut(dim).enumerate() {
+        let idx_f: Vec<f64> = (0..dim)
+            .map(|d| ((o / axis_strides[d]) % size[d]) as f64)
+            .collect();
+        slot.copy_from_slice(&geo.continuous_index_to_physical_point(&idx_f));
+    }
+
+    let mut out = dispatch_scalar!(pixel_id, build_vector_typed_image, size, dim, &vals)?;
     out.copy_geometry_from(&geo);
     Ok(out)
 }
@@ -905,5 +961,102 @@ mod tests {
                 got: 1
             })
         );
+    }
+
+    // ---- physical_point_source ----
+
+    #[test]
+    fn physical_point_identity_geometry_matches_index() {
+        let img =
+            physical_point_source(PixelId::VectorFloat64, &[2, 2], &identity_geometry(2)).unwrap();
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat64);
+        assert_eq!(img.number_of_components_per_pixel(), 2);
+        for i in 0..2usize {
+            for j in 0..2usize {
+                assert_eq!(
+                    img.get_vector::<f64>(&[i, j]).unwrap(),
+                    &[i as f64, j as f64]
+                );
+            }
+        }
+    }
+
+    /// Hand-derived on a 2x2 grid with a 90-degree rotation direction matrix:
+    /// `point = Direction * (spacing ⊙ index)` since origin is zero and
+    /// spacing is one, so `Direction * [i, j]^T`. With
+    /// `Direction = [[0,-1],[1,0]]` (row-major, a 90-degree rotation),
+    /// `point(i,j) = (-j, i)`.
+    #[test]
+    fn physical_point_2x2_grid_under_direction_rotation() {
+        let geometry = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![0.0, -1.0, 1.0, 0.0],
+        };
+        let img = physical_point_source(PixelId::VectorFloat64, &[2, 2], &geometry).unwrap();
+        assert_eq!(img.get_vector::<f64>(&[0, 0]).unwrap(), &[0.0, 0.0]);
+        assert_eq!(img.get_vector::<f64>(&[1, 0]).unwrap(), &[0.0, 1.0]);
+        assert_eq!(img.get_vector::<f64>(&[0, 1]).unwrap(), &[-1.0, 0.0]);
+        assert_eq!(img.get_vector::<f64>(&[1, 1]).unwrap(), &[-1.0, 1.0]);
+    }
+
+    #[test]
+    fn physical_point_nonzero_origin_and_spacing_are_applied() {
+        let geometry = SourceGeometry {
+            origin: vec![3.0, -1.0],
+            spacing: vec![2.0, 0.5],
+            direction: matrix::identity(2),
+        };
+        let img = physical_point_source(PixelId::VectorFloat64, &[2, 2], &geometry).unwrap();
+        // point(i,j) = origin + spacing ⊙ (i,j) under the identity direction.
+        assert_eq!(img.get_vector::<f64>(&[0, 0]).unwrap(), &[3.0, -1.0]);
+        assert_eq!(img.get_vector::<f64>(&[1, 1]).unwrap(), &[5.0, -0.5]);
+        assert_eq!(img.origin(), geometry.origin.as_slice());
+        assert_eq!(img.spacing(), geometry.spacing.as_slice());
+    }
+
+    #[test]
+    fn physical_point_components_per_pixel_is_always_the_dimension() {
+        let img = physical_point_source(
+            PixelId::VectorFloat32,
+            &[3, 2, 4],
+            &SourceGeometry::default(),
+        )
+        .unwrap();
+        assert_eq!(img.number_of_components_per_pixel(), 3);
+        assert_eq!(img.dimension(), 3);
+    }
+
+    #[test]
+    fn physical_point_integer_pixel_type_truncates_not_rounds() {
+        // static_cast<int32>(2.9) truncates to 2, it does not round to 3.
+        let geometry = SourceGeometry {
+            origin: vec![2.9, 2.9],
+            spacing: vec![1.0, 1.0],
+            direction: matrix::identity(2),
+        };
+        let img = physical_point_source(PixelId::VectorInt32, &[1, 1], &geometry).unwrap();
+        assert_eq!(img.get_vector::<i32>(&[0, 0]).unwrap(), &[2, 2]);
+    }
+
+    #[test]
+    fn physical_point_rejects_a_scalar_pixel_type() {
+        assert!(matches!(
+            physical_point_source(PixelId::Float64, &[2, 2], &identity_geometry(2)).unwrap_err(),
+            FilterError::Core(sitk_core::Error::RequiresVectorPixelType(PixelId::Float64))
+        ));
+    }
+
+    #[test]
+    fn physical_point_bad_direction_length_errors() {
+        let geometry = SourceGeometry {
+            origin: vec![0.0, 0.0],
+            spacing: vec![1.0, 1.0],
+            direction: vec![1.0, 0.0, 0.0], // 3 entries, needs 4 for 2-D.
+        };
+        assert!(matches!(
+            physical_point_source(PixelId::VectorFloat64, &[2, 2], &geometry),
+            Err(FilterError::Core(_))
+        ));
     }
 }
