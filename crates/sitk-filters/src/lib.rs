@@ -196,7 +196,7 @@ pub use label_shape::{
     BoundingBox, LabelShapeStatisticsSettings, OrientedBoundingBox, ShapeStatistics,
     label_shape_statistics,
 };
-pub use label_to_rgb::label_to_rgb;
+pub use label_to_rgb::{label_overlay, label_to_rgb};
 pub use level_set::{
     CannyLevelSetResult, LevelSetResult, anti_alias_binary, canny_segmentation_level_set,
     geodesic_active_contour_level_set, laplacian_segmentation_level_set, shape_detection_level_set,

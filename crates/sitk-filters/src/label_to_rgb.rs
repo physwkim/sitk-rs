@@ -1,12 +1,23 @@
-//! `LabelToRGBImageFilter`, ported from
-//! `Modules/Filtering/ImageFusion/include/`'s `itkLabelToRGBFunctor.h` and
-//! `itkLabelToRGBImageFilter.h`/`.hxx`, plus SimpleITK's shared colormap
+//! `LabelToRGBImageFilter` and `LabelOverlayImageFilter`, ported from
+//! `Modules/Filtering/ImageFusion/include/`'s `itkLabelToRGBFunctor.h`,
+//! `itkLabelToRGBImageFilter.h`/`.hxx`, `itkLabelOverlayFunctor.h` and
+//! `itkLabelOverlayImageFilter.h`/`.hxx`, plus SimpleITK's shared colormap
 //! parsing (`sitkLabelFunctorUtils.hxx`'s `SetLabelFunctorFromColormap`).
 //!
-//! [`build_color_table`] and [`label_color_indices`] are also shared by
-//! `LabelOverlayImageFilter` (`crate::label_overlay`), which uses the same
-//! default palette and background/index lookup but blends into a base image
-//! instead of filling a fixed `uint8_t` output.
+//! [`build_color_table`] and [`label_color_indices`] are shared by both
+//! filters, which differ only in output pixel type and per-pixel
+//! combination:
+//!
+//! - [`label_to_rgb`]'s output ValueType is always `uint8_t`
+//!   (`LabelToRGBImageFilter.yaml`'s `output_image_type: itk::VectorImage<
+//!   uint8_t, ...>`), so `AddColor`'s `byte / 255 * NumericTraits<uint8_t>::max()`
+//!   scaling is the identity (`max() == 255`) and the raw palette bytes are
+//!   used directly.
+//! - [`label_overlay`]'s output ValueType is the *base image's own* pixel
+//!   type (`LabelOverlayImageFilter.yaml`'s `output_image_type: itk::VectorImage<
+//!   typename InputImageType::PixelType, ...>`), so the same palette is
+//!   rescaled to `NumericTraits<ValueType>::max()` per output type -- a
+//!   `Float64` base image gets colors scaled into `[0, f64::MAX]`, not `[0, 255]`.
 //!
 //! ## Upstream findings
 //!
@@ -41,9 +52,23 @@
 //!    [`build_color_table`] implements the *documented* behavior (via
 //!    `chunks_exact(3)`, which drops an incomplete trailing remainder), a
 //!    diverge-for-C++-UB case per this crate's porting policy.
+//!
+//! 3. **`LabelOverlayImageFilter`'s color table is rescaled by the *base
+//!    image's* `NumericTraits<ValueType>::max()`, not a fixed `255`.**
+//!    `itkLabelToRGBFunctor.h:112-116`'s `AddColor` scales every palette byte
+//!    by `NumericTraits<ValueType>::max()`, and `LabelOverlayFunctor`'s
+//!    internal `m_RGBFunctor` (`itkLabelOverlayFunctor.h:137`) is instantiated
+//!    with `ValueType` = the *base* image's own pixel component type
+//!    (`LabelOverlayImageFilter.yaml`'s `output_image_type`), not `uint8_t`.
+//!    So overlaying a label image onto a `Float64` base image scales the
+//!    palette into `[0, f64::MAX]`, and onto an `Int16` base image into
+//!    `[0, 32767]` -- a real, faithfully-ported ITK behavior that produces
+//!    enormous or asymmetric color magnitudes for non-`uint8_t` base images,
+//!    easy to mistake for a bug when porting.
 
 use crate::error::{FilterError, Result};
-use sitk_core::{Image, PixelId, Scalar};
+use crate::quantize_to_pixel_type;
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
 /// `itkLabelToRGBFunctor.h`'s default-constructor palette (lines 70-76): 30
 /// raw `(r, g, b)` bytes, before `AddColor`'s `NumericTraits<ValueType>::max()`
@@ -172,6 +197,132 @@ pub fn label_to_rgb(label_img: &Image, background_value: f64, colormap: &[u8]) -
     Ok(out)
 }
 
+/// `NumericTraits<T>::max()` (`itkNumericTraits.h`'s
+/// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`, `std::numeric_limits<T>::max()` for
+/// every basic type with no ITK override -- unlike `min()`, which floating
+/// types override to the smallest *positive* normalized value).
+fn numeric_traits_max(id: PixelId) -> f64 {
+    match id.component_id() {
+        PixelId::UInt8 => u8::MAX as f64,
+        PixelId::Int8 => i8::MAX as f64,
+        PixelId::UInt16 => u16::MAX as f64,
+        PixelId::Int16 => i16::MAX as f64,
+        PixelId::UInt32 => u32::MAX as f64,
+        PixelId::Int32 => i32::MAX as f64,
+        PixelId::UInt64 => u64::MAX as f64,
+        PixelId::Int64 => i64::MAX as f64,
+        PixelId::Float32 => f32::MAX as f64,
+        PixelId::Float64 => f64::MAX,
+        _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
+    }
+}
+
+/// Unlike [`crate::require_same_shape`], `image` and `label_image` may
+/// legitimately differ in pixel type (`LabelOverlayImageFilter.yaml`'s
+/// `pixel_types`/`pixel_types2`), so only their size is checked here.
+fn require_same_size(a: &Image, b: &Image) -> Result<()> {
+    if a.size() != b.size() {
+        return Err(FilterError::SizeMismatch {
+            a: a.size().to_vec(),
+            b: b.size().to_vec(),
+        });
+    }
+    Ok(())
+}
+
+fn build_vector_from_f64<T: Scalar>(
+    size: &[usize],
+    components_per_pixel: usize,
+    geom: &Image,
+    vals: &[f64],
+) -> Result<Image> {
+    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
+    let mut img = Image::from_vec_vector(size, components_per_pixel, out)?;
+    img.copy_geometry_from(geom);
+    Ok(img)
+}
+
+/// The vector-image counterpart of `crate::image_from_f64`: narrows `vals`
+/// (`components_per_pixel` interleaved `f64`s per pixel) to `component_id`'s
+/// native type and builds a vector image, copying `geom`'s geometry.
+fn vector_image_from_f64(
+    component_id: PixelId,
+    size: &[usize],
+    components_per_pixel: usize,
+    geom: &Image,
+    vals: &[f64],
+) -> Result<Image> {
+    dispatch_scalar!(
+        component_id,
+        build_vector_from_f64,
+        size,
+        components_per_pixel,
+        geom,
+        vals
+    )
+}
+
+/// `LabelOverlayImageFilter`: blend the (default or custom) color palette,
+/// looked up by `label_image`, over `image` at `opacity` (default `0.5`).
+/// Background labels (`background_value`, default `0.0`) pass `image`'s own
+/// value through unchanged on all 3 channels (`itkLabelOverlayFunctor.h:63-71`).
+///
+/// `image` and `label_image` need only agree on size, not pixel type -- the
+/// output's component type follows `image`'s, not `label_image`'s.
+///
+/// Per non-background pixel, `itkLabelOverlayFunctor.h:74-82` computes:
+/// `rgbPixel[c] = static_cast<ValueType>(opaque[c] * opacity + p1 * (1 -
+/// opacity))`, where `opaque` is the palette color already scaled to
+/// `NumericTraits<ValueType>::max()` and narrowed to `ValueType` *once* when
+/// the color table is built (`AddColor`, `itkLabelToRGBFunctor.h:104-118`),
+/// not per pixel -- so `opaque[c]` can itself lose precision (e.g. truncating
+/// a scaled byte to an integer `ValueType`) before it's promoted back to
+/// `double` for the blend. This port reproduces that two-step rounding via
+/// [`quantize_to_pixel_type`] when building `scaled_colors`.
+pub fn label_overlay(
+    image: &Image,
+    label_image: &Image,
+    opacity: f64,
+    background_value: f64,
+    colormap: &[u8],
+) -> Result<Image> {
+    require_same_size(image, label_image)?;
+
+    let base_id = image.pixel_id();
+    let base_vals = image.to_f64_vec()?;
+    let value_max = numeric_traits_max(base_id);
+
+    let colors = build_color_table(colormap);
+    let scaled_colors: Vec<[f64; 3]> = colors
+        .iter()
+        .map(|c| {
+            std::array::from_fn(|i| {
+                quantize_to_pixel_type(base_id, c[i] as f64 / 255.0 * value_max)
+            })
+        })
+        .collect();
+
+    let indices = label_color_indices(label_image, background_value, colors.len())?;
+
+    let mut flat = Vec::with_capacity(base_vals.len() * 3);
+    for (&p1, idx) in base_vals.iter().zip(&indices) {
+        match idx {
+            None => flat.extend_from_slice(&[p1, p1, p1]),
+            Some(i) => {
+                let p1_blend = p1 * (1.0 - opacity);
+                let sc = scaled_colors[*i];
+                flat.extend_from_slice(&[
+                    sc[0] * opacity + p1_blend,
+                    sc[1] * opacity + p1_blend,
+                    sc[2] * opacity + p1_blend,
+                ]);
+            }
+        }
+    }
+
+    vector_image_from_f64(base_id, image.size(), 3, image, &flat)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +411,69 @@ mod tests {
         let out = label_to_rgb(&img, 0.0, &[]).unwrap();
         assert_eq!(out.spacing(), img.spacing());
         assert_eq!(out.size(), &[2, 1]);
+    }
+
+    // ---- label_overlay ----
+
+    #[test]
+    fn label_overlay_background_passes_through_the_base_value_unchanged() {
+        let base = Image::from_vec(&[1, 1], vec![42u8]).unwrap();
+        let label = label_img_u8(&[1, 1], vec![0]);
+        let out = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap();
+        assert_eq!(out.component_slice::<u8>().unwrap(), &[42, 42, 42]);
+    }
+
+    #[test]
+    fn label_overlay_blends_with_default_opacity_on_a_u8_base_image() {
+        // u8 base image: NumericTraits<uint8_t>::max() == 255, so AddColor's
+        // scaling is the identity and palette[1] == (0, 205, 0) directly.
+        // p1 = 100, opacity = 0.5: p1_blend = 50; static_cast truncates
+        // toward zero: [50, floor(205*0.5+50), 50] == [50, 152, 50].
+        let base = Image::from_vec(&[1, 1], vec![100u8]).unwrap();
+        let label = label_img_u8(&[1, 1], vec![1]);
+        let out = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap();
+        assert_eq!(out.component_slice::<u8>().unwrap(), &[50, 152, 50]);
+    }
+
+    #[test]
+    fn label_overlay_scales_the_palette_by_the_base_images_own_numeric_max() {
+        // u16 base image: NumericTraits<uint16_t>::max() == 65535, not 255.
+        // palette[1] == (0, 205, 0); scaled green = trunc(205/255*65535) ==
+        // 52685. p1 = 1000, opacity = 0.5: p1_blend = 500;
+        // green = trunc(52685*0.5 + 500) == 26842; red/blue = 500.
+        let base = Image::from_vec(&[1, 1], vec![1000u16]).unwrap();
+        let label = label_img_u8(&[1, 1], vec![1]);
+        let out = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap();
+        assert_eq!(out.component_slice::<u16>().unwrap(), &[500, 26842, 500]);
+    }
+
+    #[test]
+    fn label_overlay_rejects_mismatched_sizes() {
+        let base = Image::from_vec(&[2, 1], vec![1u8, 2]).unwrap();
+        let label = label_img_u8(&[1, 1], vec![0]);
+        let err = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap_err();
+        assert!(matches!(err, FilterError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn label_overlay_rejects_a_floating_point_label_image() {
+        let base = Image::from_vec(&[1, 1], vec![1u8]).unwrap();
+        let label = Image::from_vec(&[1, 1], vec![1.0f64]).unwrap();
+        let err = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap_err();
+        assert!(matches!(
+            err,
+            FilterError::RequiresIntegerPixelType(PixelId::Float64)
+        ));
+    }
+
+    #[test]
+    fn label_overlay_allows_differing_pixel_types_between_base_and_label() {
+        // Base image (Float32) and label image (UInt8) may legitimately
+        // differ in pixel type -- only their size must agree.
+        let base = Image::from_vec(&[1, 1], vec![10.0f32]).unwrap();
+        let label = label_img_u8(&[1, 1], vec![0]);
+        let out = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.component_slice::<f32>().unwrap(), &[10.0, 10.0, 10.0]);
     }
 }
