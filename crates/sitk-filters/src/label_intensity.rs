@@ -70,25 +70,23 @@
 //!   spacing it exceeds it by `1/12` in every eigenvalue. Both are reproduced as
 //!   written; pinned by
 //!   `a_uniformly_weighted_object_exceeds_the_shape_moments_by_the_pixels_own`.
-//! - **the weighted principal moments are not clamped, and the ratios are not
-//!   sign-checked.** `ShapeLabelMapFilter` clamps each eigenvalue with
-//!   `std::max(pm(i), 0.0)` — commented "near-zero negative eigenvalues from
-//!   numerical precision cause FPE in `std::pow`" (`itkShapeLabelMapFilter.hxx:315`)
-//!   — and takes each square root only `if (ratio > 0.0)`
-//!   (`itkShapeLabelMapFilter.hxx:344-361`). The statistics filter does neither
-//!   (`.hxx:231-237`, `:261-267`). A negative moment — reachable with a signed
-//!   or float feature image, where the "mass" `sum` can be negative and the
-//!   division by it flips the sign of the covariance — therefore makes
-//!   `weighted_elongation` / `weighted_flatness` `NaN` where the shape filter
-//!   would report `0`. That is defined IEEE behaviour, and it is reproduced.
-//! - **`weighted_flatness` and `weighted_elongation` share one guard.** Both are
-//!   gated on `principalMoments[0]` being non-zero (`.hxx:261-267`), where
-//!   `ShapeLabelMapFilter` gates `flatness` on `principalMoments[0]` and
-//!   `elongation` separately on `principalMoments[dim-2]`
-//!   (`itkShapeLabelMapFilter.hxx:344`/`:353`). So a `principalMoments[0]` of
-//!   zero suppresses `weighted_elongation` to `0` here even when
-//!   `principalMoments[dim-2]` is positive and the shape filter reports a real
-//!   elongation. Reproduced.
+//! - **the weighted principal moments are clamped and the ratios are
+//!   sign-checked (Fixed in this port).** Upstream `StatisticsLabelMapFilter`
+//!   neither clamps the eigenvalues nor checks the ratio's sign (`.hxx:231-237`,
+//!   `:261-267`), so a signed or float feature image — where the "mass" `sum`
+//!   can be negative and the division by it flips the sign of the covariance,
+//!   making it indefinite — leaves `weighted_elongation` / `weighted_flatness`
+//!   `NaN`. This port mirrors `ShapeLabelMapFilter` instead: each eigenvalue is
+//!   clamped with `.max(0.0)` (`itkShapeLabelMapFilter.hxx:315`) and each square
+//!   root is taken only when its ratio is positive
+//!   (`itkShapeLabelMapFilter.hxx:344-361`), so both ratios stay finite (`0` for
+//!   a non-positive-definite object).
+//! - **`weighted_flatness` and `weighted_elongation` are guarded separately
+//!   (Fixed in this port).** Upstream gates both on `principalMoments[0]` being
+//!   non-zero (`.hxx:261-267`); this port gates `flatness` on
+//!   `principalMoments[0]` and `elongation` separately on
+//!   `principalMoments[dim-2]` (`itkShapeLabelMapFilter.hxx:344`/`:353`), so a
+//!   zero `principalMoments[0]` no longer suppresses a real `weighted_elongation`.
 //! - `if constexpr (ImageDimension < 2) { elongation = 1; flatness = 1; }`
 //!   (`.hxx:256-260`) is unreachable through SimpleITK, which instantiates 2-D
 //!   and 3-D only; [`label_shape_statistics`] rejects any other dimension
@@ -437,7 +435,14 @@ impl StatisticsPass<'_> {
             }
 
             let (eigenvalues, eigenvectors) = symmetric_eigen(&central_moments, dim);
-            principal_moments[..dim].copy_from_slice(&eigenvalues[..dim]);
+            // Clamp each eigenvalue to >= 0, as `ShapeLabelMapFilter` does
+            // (`itkShapeLabelMapFilter.hxx:315`). A signed or floating-point
+            // feature image can make the weighted covariance indefinite; a
+            // negative eigenvalue is meaningless as a second-order moment and
+            // would drive the ratios below to `sqrt` of a negative (NaN).
+            for (dst, &ev) in principal_moments[..dim].iter_mut().zip(&eigenvalues[..dim]) {
+                *dst = ev.max(0.0);
+            }
             for i in 0..dim {
                 for j in 0..dim {
                     principal_axes[i][j] = eigenvectors[j][i];
@@ -448,9 +453,20 @@ impl StatisticsPass<'_> {
                 *v *= det;
             }
 
+            // Guard flatness on `pm[0]` and elongation on `pm[dim-2]`
+            // separately, and take each root only when its ratio is positive,
+            // as `ShapeLabelMapFilter` does (`itkShapeLabelMapFilter.hxx:344-361`).
             if !is_almost_zero(principal_moments[0]) {
-                elongation = (principal_moments[dim - 1] / principal_moments[dim - 2]).sqrt();
-                flatness = (principal_moments[1] / principal_moments[0]).sqrt();
+                let ratio = principal_moments[1] / principal_moments[0];
+                if ratio > 0.0 {
+                    flatness = ratio.sqrt();
+                }
+            }
+            if !is_almost_zero(principal_moments[dim - 2]) {
+                let ratio = principal_moments[dim - 1] / principal_moments[dim - 2];
+                if ratio > 0.0 {
+                    elongation = ratio.sqrt();
+                }
             }
         } else {
             center_of_gravity = [0.0; MAX_DIM];
@@ -838,13 +854,15 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_sign_feature_image_gives_negative_moments_and_nan_ratios() {
-        // A 1x3 row weighted 3, -1, -1: sum = 1, cog_x = -3, so the x central
+    fn a_mixed_sign_feature_image_clamps_the_moments_and_keeps_the_ratios_finite() {
+        // A 1x3 row weighted 3, -1, -1: sum = 1, cog_x = -3, so the raw x central
         // moment is -5 - 9 = -14 before the +spacing^2/12 term and the y one is
-        // 0 + 1/12. The eigenvalues straddle zero. `StatisticsLabelMapFilter`
-        // neither clamps them (`itkShapeLabelMapFilter.hxx:315` does) nor checks
-        // the ratio's sign (`itkShapeLabelMapFilter.hxx:344-361` does), so both
-        // ratios are negative and both square roots are NaN (`.hxx:261-267`).
+        // 0 + 1/12. The eigenvalues straddle zero: sorted ascending they are
+        // {-14 + 1/12, 1/12}. This port clamps each to >= 0 as
+        // `ShapeLabelMapFilter` does (`itkShapeLabelMapFilter.hxx:315`), so the
+        // stored moments are {0, 1/12}, and it takes each ratio's root only when
+        // the ratio is positive (`.hxx:344-361`), so both ratios stay finite
+        // instead of the upstream NaN.
         let out = stats(
             &[1, 1, 1],
             vec![3.0, -1.0, -1.0],
@@ -855,11 +873,13 @@ mod tests {
         assert_eq!(s.sum, 1.0);
         assert_eq!(s.center_of_gravity, vec![-3.0, 0.0]);
         let pm = &s.weighted_principal_moments;
-        assert!((pm[0] - (-14.0 + 1.0 / 12.0)).abs() < 1e-9, "{pm:?}");
+        assert_eq!(pm[0], 0.0, "{pm:?}");
         assert!((pm[1] - 1.0 / 12.0).abs() < 1e-9, "{pm:?}");
-        assert!(s.weighted_elongation.is_nan());
-        assert!(s.weighted_flatness.is_nan());
-        // The shape filter, on the same object, clamps and stays finite.
+        // pm[0] is clamped to zero, so both ratios' guards suppress the root: the
+        // results are a finite 0, not NaN.
+        assert_eq!(s.weighted_elongation, 0.0);
+        assert_eq!(s.weighted_flatness, 0.0);
+        // The shape filter, on the same object, clamps and stays finite too.
         assert_eq!(s.shape.principal_moments[0], 0.0);
         assert!(s.shape.elongation.is_finite());
     }

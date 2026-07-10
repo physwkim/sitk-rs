@@ -689,30 +689,56 @@ fn an_axis_shorter_than_four_pixels_is_an_error() {
     );
 }
 
-/// `SmoothingRecursiveGaussianImageFilter`'s output pixel type is the *moving*
-/// image's, so an integer moving image has its smoothed copy quantised before
-/// its gradient is taken. The V `50·|x - 2|` stays far enough apart to survive
-/// rounding, so the normalised update is still `∓1`.
+/// §2.49 fix: an integer moving image is smoothed in full `f64` precision, so
+/// its gradient is *not* corrupted by an intermediate quantisation back to the
+/// moving pixel type. The regression pin runs an asymmetric ramp
+/// `moving(x) = [0, 2, 5, 9, 14]` as `UInt8` and again as the same integer
+/// values in `Float64`; the two must give the **identical** displacement field.
+///
+/// The ramp's interior pixels `x = 1, 2, 3` all move `+x` (a monotone profile,
+/// so minmod's forward/backward differences share a sign) with *distinct*
+/// gradient magnitudes, so the L1 time-step normalisation leaves each a
+/// different fractional displacement `g / (g + alpha)` — a quantity that
+/// depends on the true smoothed `g`. Rounding the smoothed copy back to `u8`
+/// (the upstream behaviour) shifts those `g`s and so the fractional
+/// displacements, breaking the equality. Smoothing in `f64` makes the `u8` run
+/// reproduce the `f64` run exactly.
 #[test]
-fn an_integer_moving_image_has_its_smoothed_copy_quantised() {
-    let profile = |i: usize| ((i % N) as i32 - 2).unsigned_abs() as u8 * 50;
-    let moving = Image::from_vec(&[N, N], (0..N * N).map(profile).collect::<Vec<u8>>()).unwrap();
-    let fixed = Image::from_vec(
+fn an_integer_moving_image_is_smoothed_without_quantisation() {
+    let ramp = [0u8, 2, 5, 9, 14];
+    let profile = |i: usize| ramp[i % N];
+
+    let moving_u8 = Image::from_vec(&[N, N], (0..N * N).map(profile).collect::<Vec<u8>>()).unwrap();
+    let fixed_u8 = Image::from_vec(
         &[N, N],
         (0..N * N).map(|i| profile(i) + 1).collect::<Vec<u8>>(),
     )
     .unwrap();
+    let moving_f64 = grid(|x, _| ramp[x] as f64);
+    let fixed_f64 = grid(|x, _| ramp[x] as f64 + 1.0);
 
-    let result = level_set_motion_registration(&fixed, &moving, None, &once()).unwrap();
+    let from_u8 = level_set_motion_registration(&fixed_u8, &moving_u8, None, &once()).unwrap();
+    let from_f64 = level_set_motion_registration(&fixed_f64, &moving_f64, None, &once()).unwrap();
+
     assert_eq!(
-        result.displacement_field.pixel_id(),
+        from_u8.displacement_field.pixel_id(),
         sitk_core::PixelId::VectorFloat64
     );
+    // Smoothing in f64 makes the integer run reproduce the float run exactly.
     assert_close(
-        &components(&result.displacement_field, 0),
-        &every_row([0.0, -1.0, 0.0, 1.0, 0.0]),
+        &components(&from_u8.displacement_field, 0),
+        &components(&from_f64.displacement_field, 0),
     );
-    assert!((result.metric - 1.0).abs() < 1e-12);
+
+    // The interior really is in the g-sensitive regime: the three moving pixels
+    // carry three *different* fractional displacements (only the steepest is a
+    // full 1), so the equality above is a genuine test of the smoothed gradient,
+    // not of a value that survives rounding.
+    let x = components(&from_u8.displacement_field, 0);
+    let interior = [x[1], x[2], x[3]];
+    assert!(interior.iter().all(|&v| v > 0.0 && v <= 1.0));
+    assert!((interior[0] - interior[1]).abs() > 1e-6);
+    assert!((interior[1] - interior[2]).abs() > 1e-6);
 }
 
 /// A 3-D smoke test: the V runs along `x` and the other two axes are flat, so

@@ -149,11 +149,17 @@ fn bare_image_from_f64(target: PixelId, size: &[usize], vals: &[f64]) -> Result<
 /// always Submatrix, `CropImageFilter`'s forced default
 /// (`SetDirectionCollapseToSubmatrix`).
 ///
-/// A collapsed axis's own offset does not shift the output origin: ITK's
-/// `GenerateOutputInformation` builds the output origin only from the
-/// *retained* axes' spacing/direction submatrix and index, so a non-diagonal
-/// direction cosine coupling a collapsed axis to a retained one is dropped —
-/// this is ITK's actual (if surprising) behavior, reproduced here bit-for-bit.
+/// The output origin is the true physical location of the slice's start
+/// index (**Fixed in this port**). ITK's `GenerateOutputInformation` builds
+/// the output origin only from the *retained* axes' spacing/direction
+/// submatrix and index, so a collapsed axis's own index and any direction
+/// cosine coupling it to a retained physical component are dropped — on an
+/// oblique volume every slice then reports slice 0's in-plane origin, so the
+/// slices no longer stack at their true world positions. This port instead
+/// takes the retained physical components of the full N-D
+/// `TransformIndexToPhysicalPoint(index)`, so slice `k` lands where it
+/// physically is. (For a diagonal direction this coincides with ITK's result,
+/// since no collapsed axis couples into a retained component.)
 ///
 /// Errors if a retained axis's `[index, index + size)` exceeds the input size,
 /// if a collapsed axis's `index` is out of bounds, if every axis collapses
@@ -187,17 +193,14 @@ pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
     let out_dim = retained.len();
 
     let in_spacing = img.spacing();
-    let in_origin = img.origin();
     let in_direction = img.direction();
 
     let mut out_size = vec![0usize; out_dim];
     let mut out_spacing = vec![0.0f64; out_dim];
-    let mut retained_origin = vec![0.0f64; out_dim];
     let mut out_direction = vec![0.0f64; out_dim * out_dim];
     for (a, &d) in retained.iter().enumerate() {
         out_size[a] = size[d];
         out_spacing[a] = in_spacing[d];
-        retained_origin[a] = in_origin[d];
         for (b, &e) in retained.iter().enumerate() {
             out_direction[a * out_dim + b] = in_direction[d * dim + e];
         }
@@ -207,16 +210,16 @@ pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
         return Err(FilterError::SingularCollapsedDirection);
     }
 
-    // FixNonZeroIndex, restricted to the retained axes' own submatrix
-    // geometry (see the doc comment above on the collapsed-axis quirk).
-    let retained_index: Vec<f64> = retained.iter().map(|&d| index[d] as f64).collect();
-    let scaled: Vec<f64> = (0..out_dim)
-        .map(|a| retained_index[a] * out_spacing[a])
-        .collect();
-    let rotated = matrix::mat_vec(&out_direction, &scaled, out_dim);
-    let out_origin: Vec<f64> = (0..out_dim)
-        .map(|a| retained_origin[a] + rotated[a])
-        .collect();
+    // FixNonZeroIndex: the output origin is the physical location of the
+    // slice's start index in the input image (see the doc comment above). ITK
+    // builds it from the retained submatrix alone, so a collapsed axis's index
+    // and the direction cosines coupling it into a retained physical component
+    // are dropped; this port instead takes the retained physical components of
+    // the full N-D `TransformIndexToPhysicalPoint(index)`, so an oblique
+    // volume's slice k lands at its true world position.
+    let index_f: Vec<f64> = index.iter().map(|&i| i as f64).collect();
+    let phys = img.continuous_index_to_physical_point(&index_f);
+    let out_origin: Vec<f64> = retained.iter().map(|&d| phys[d]).collect();
 
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
@@ -678,8 +681,10 @@ mod tests {
         let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
         assert_eq!(out.dimension(), 2);
         assert_eq!(out.size(), &[3, 3]);
-        // Identity direction with no cross terms: x,y origin unaffected by
-        // the collapsed z offset (ITK drops that contribution entirely).
+        // Diagonal direction: the collapsed z axis does not couple into the
+        // x/y physical components, so the true physical point of index
+        // [0,0,1] still has x=5, y=5 (only its z advances, which the 2-D
+        // output cannot carry). The oblique case below is where the fix bites.
         assert_eq!(out.origin(), &[5.0, 5.0]);
         assert_eq!(out.spacing(), &[1.0, 1.0]);
         assert_eq!(
@@ -688,6 +693,50 @@ mod tests {
                 100.0, 101.0, 102.0, 110.0, 111.0, 112.0, 120.0, 121.0, 122.0
             ]
         );
+    }
+
+    #[test]
+    fn extract_collapsed_oblique_axis_shifts_the_retained_origin() {
+        // 3x3x3 volume, direction = rotation about y by 30 degrees, so the z
+        // axis (column 2 = [sin30, 0, cos30]) couples into physical x. Extract
+        // the z=1 slice (collapsing z). The true physical point of index
+        // [0,0,1] is origin + D * (spacing (.) index) = [sin30 * 2, 0, cos30 *
+        // 2] = [1.0, 0.0, 1.732...]; its retained (x,y) components give the
+        // output origin [1.0, 0.0]. ITK, building the origin from the retained
+        // submatrix alone, would drop the z coupling and report slice 0's
+        // origin [0.0, 0.0]; this port reports the true world position.
+        let mut data = vec![0.0f64; 27];
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    data[z * 9 + y * 3 + x] = (x + 10 * y + 100 * z) as f64;
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[3, 3, 3], data).unwrap();
+        img.set_spacing(&[1.0, 1.0, 2.0]).unwrap();
+        img.set_origin(&[0.0, 0.0, 0.0]).unwrap();
+        let theta = std::f64::consts::FRAC_PI_6;
+        let (c, s) = (theta.cos(), theta.sin());
+        img.set_direction(&[
+            c, 0.0, s, //
+            0.0, 1.0, 0.0, //
+            -s, 0.0, c,
+        ])
+        .unwrap();
+        let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
+        assert_eq!(out.dimension(), 2);
+        assert_eq!(out.size(), &[3, 3]);
+        let origin = out.origin();
+        assert!((origin[0] - 1.0).abs() < 1e-12, "{origin:?}");
+        assert!((origin[1] - 0.0).abs() < 1e-12, "{origin:?}");
+        // The retained (x,y) direction submatrix is diagonal: [[cos, 0],[0,1]].
+        let dir = out.direction();
+        assert!((dir[0] - c).abs() < 1e-12, "{dir:?}");
+        assert_eq!(dir[1], 0.0);
+        assert_eq!(dir[2], 0.0);
+        assert_eq!(dir[3], 1.0);
+        assert_eq!(out.spacing(), &[1.0, 1.0]);
     }
 
     #[test]

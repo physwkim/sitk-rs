@@ -16,8 +16,10 @@
 //! - [`label_overlay`]'s output ValueType is the *base image's own* pixel
 //!   type (`LabelOverlayImageFilter.yaml`'s `output_image_type: itk::VectorImage<
 //!   typename InputImageType::PixelType, ...>`), so the same palette is
-//!   rescaled to `NumericTraits<ValueType>::max()` per output type -- a
-//!   `Float64` base image gets colors scaled into `[0, f64::MAX]`, not `[0, 255]`.
+//!   rescaled to `NumericTraits<ValueType>::max()` per output type -- for an
+//!   `Int16` base into `[0, 32767]`, matching ITK. A *floating-point* base
+//!   would scale into `[0, f64::MAX]` and swamp the base pixel in the blend;
+//!   this port rejects that instead (see finding 3).
 //!
 //! ## Upstream findings
 //!
@@ -54,17 +56,24 @@
 //!    diverge-for-C++-UB case per this crate's porting policy.
 //!
 //! 3. **`LabelOverlayImageFilter`'s color table is rescaled by the *base
-//!    image's* `NumericTraits<ValueType>::max()`, not a fixed `255`.**
+//!    image's* `NumericTraits<ValueType>::max()`, not a fixed `255`;
+//!    a floating-point base is rejected (Fixed in this port).**
 //!    `itkLabelToRGBFunctor.h:112-116`'s `AddColor` scales every palette byte
 //!    by `NumericTraits<ValueType>::max()`, and `LabelOverlayFunctor`'s
 //!    internal `m_RGBFunctor` (`itkLabelOverlayFunctor.h:137`) is instantiated
 //!    with `ValueType` = the *base* image's own pixel component type
 //!    (`LabelOverlayImageFilter.yaml`'s `output_image_type`), not `uint8_t`.
-//!    So overlaying a label image onto a `Float64` base image scales the
-//!    palette into `[0, f64::MAX]`, and onto an `Int16` base image into
-//!    `[0, 32767]` -- a real, faithfully-ported ITK behavior that produces
-//!    enormous or asymmetric color magnitudes for non-`uint8_t` base images,
-//!    easy to mistake for a bug when porting.
+//!    For every **integer** base this is reproduced faithfully -- an `Int16`
+//!    base scales the palette into `[0, 32767]`, a `UInt16` base into
+//!    `[0, 65535]`. But a **floating-point** base scales into `[0, f64::MAX]`,
+//!    which swamps the base pixel in the blend `opaque*opacity + p1*(1-opacity)`
+//!    by hundreds of orders of magnitude and makes the overlay meaningless.
+//!    That is silent wrongness on realistic well-formed input, so this port
+//!    rejects a floating-point base with
+//!    [`FilterError::FloatingPointBaseLabelOverlay`] rather than emitting the
+//!    swamped garbage. Any float scaling rule (fixed `0-255`, data-driven max)
+//!    would be invented semantics with no unique answer, so typed refusal is
+//!    the honest resolution. Ledger §2.54.
 
 use crate::error::{FilterError, Result};
 use crate::quantize_to_pixel_type;
@@ -269,6 +278,14 @@ pub fn label_overlay(
     require_same_size(image, label_image)?;
 
     let base_id = image.pixel_id();
+    // §2.54: the palette is scaled by the base image's own
+    // NumericTraits<ValueType>::max(). For a floating-point base that is
+    // f32/f64 MAX, which swamps the base pixel in the blend and produces a
+    // meaningless overlay. Refuse rather than emit the swamped garbage; any
+    // float scaling rule would be invented semantics with no unique answer.
+    if base_id.is_floating_point() {
+        return Err(FilterError::FloatingPointBaseLabelOverlay(base_id));
+    }
     let base_vals = image.to_f64_vec()?;
     let value_max = crate::numeric_traits_max(base_id);
 
@@ -447,13 +464,35 @@ mod tests {
     }
 
     #[test]
-    fn label_overlay_allows_differing_pixel_types_between_base_and_label() {
-        // Base image (Float32) and label image (UInt8) may legitimately
-        // differ in pixel type -- only their size must agree.
-        let base = Image::from_vec(&[1, 1], vec![10.0f32]).unwrap();
+    fn label_overlay_allows_differing_integer_pixel_types_between_base_and_label() {
+        // Base image (Int16) and label image (UInt8) may legitimately differ
+        // in pixel type -- only their size must agree, and an integer base is
+        // accepted.
+        let base = Image::from_vec(&[1, 1], vec![10i16]).unwrap();
         let label = label_img_u8(&[1, 1], vec![0]);
         let out = label_overlay(&base, &label, 0.5, 0.0, &[]).unwrap();
-        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
-        assert_eq!(out.component_slice::<f32>().unwrap(), &[10.0, 10.0, 10.0]);
+        assert_eq!(out.pixel_id(), PixelId::VectorInt16);
+        assert_eq!(out.component_slice::<i16>().unwrap(), &[10, 10, 10]);
+    }
+
+    #[test]
+    fn label_overlay_rejects_a_floating_point_base_image() {
+        // §2.54: the palette is scaled by the base's NumericTraits::max(),
+        // which is f32/f64 MAX for a floating-point base -- meaningless in the
+        // blend. Both float bases are refused with the dedicated typed error,
+        // whichever label a pixel carries.
+        let label = label_img_u8(&[1, 1], vec![1]);
+
+        let base32 = Image::from_vec(&[1, 1], vec![10.0f32]).unwrap();
+        assert_eq!(
+            label_overlay(&base32, &label, 0.5, 0.0, &[]).unwrap_err(),
+            FilterError::FloatingPointBaseLabelOverlay(PixelId::Float32)
+        );
+
+        let base64 = Image::from_vec(&[1, 1], vec![10.0f64]).unwrap();
+        assert_eq!(
+            label_overlay(&base64, &label, 0.5, 0.0, &[]).unwrap_err(),
+            FilterError::FloatingPointBaseLabelOverlay(PixelId::Float64)
+        );
     }
 }

@@ -10,8 +10,8 @@
 //!   (this crate's [`crate::statistics`] is already verified against
 //!   `itkStatisticsImageFilter.hxx`'s sample variance, divisor `n - 1`, which
 //!   `normalize`/`normalize_to_constant` reuse for mean/sigma/sum), and
-//!   `itkArithmeticOpsFunctors.h`'s `Div` functor (the zero-divisor rule
-//!   `normalize_to_constant` reproduces).
+//!   `itkArithmeticOpsFunctors.h`'s `Div` functor (whose zero-divisor rule
+//!   `normalize_to_constant` rejects rather than reproduces — see its doc).
 //! - `Modules/Numerics/Statistics/include/itkImageToHistogramFilter.h(.hxx)`,
 //!   `itkHistogram.h(.hxx)`, `itkScalarImageToHistogramGenerator.hxx`,
 //!   `itkSampleToHistogramFilter.hxx`
@@ -282,27 +282,21 @@ pub fn shift_scale(
 /// `Float32 -> Float32` divergence from ITK's true `RealType` rule, ledger
 /// §5.6).
 ///
-/// **Divisor-is-zero quirk, reproduced exactly**: `DivideImageFilter`'s `Div`
-/// functor (`itkArithmeticOpsFunctors.h:142-151`) special-cases a
+/// **Divisor-is-zero: rejected in this port (Fixed)**: `DivideImageFilter`'s
+/// `Div` functor (`itkArithmeticOpsFunctors.h:142-151`) special-cases a
 /// (near-)zero divisor to `NumericTraits<TOutput>::max()` — the type's
-/// largest finite value — *regardless of the numerator's sign or magnitude*;
-/// the `TOutput` argument to `NumericTraits<TOutput>::max(...)` is an
-/// unused overload parameter for scalar types (only meaningful for
-/// `VariableLengthVector`), so this is unconditionally the type maximum, not
-/// `NonpositiveMin()` for a negative numerator and not `0` for a zero
-/// numerator. `divisor == sum / constant` is the *same* value for every
-/// pixel, so this branch triggers on the whole image at once whenever the
-/// image's pixel sum is exactly zero (e.g. a zero-mean or all-zero image)
-/// with a finite nonzero `constant` — a real, easily-reached edge case, not
-/// a corner requiring an astronomical constant. This is handled by an
-/// explicit `divisor == 0.0` check rather than relying on plain `f64`
-/// division + saturating narrow: unlike [`crate::math::divide_floor`] (where
-/// `A / 0.0` naturally narrows to the same `NumericTraits::max`/`NonpositiveMin`
-/// upstream substitutes for an infinite `floor` result), a *negative*
-/// numerator over a zero divisor here would naturally narrow to
-/// `NonpositiveMin()`, and a *zero* numerator to `NaN` narrowing to `0` —
-/// both would silently diverge from upstream's unconditional `max()` without
-/// this explicit branch. Tracked in the upstream-findings ledger, §2.69.
+/// largest finite value — *regardless of the numerator's sign or magnitude*.
+/// `divisor == sum / constant` is the *same* value for every pixel, so
+/// upstream silently drives the *whole* output image to the type maximum
+/// whenever the image's pixel sum is exactly zero (e.g. a zero-mean or
+/// all-zero image) with a finite nonzero `constant` — a real, easily-reached
+/// edge case (a difference image that sums to zero, say). No finite scale maps
+/// a zero sum onto a nonzero constant, so the normalization is genuinely
+/// impossible; this port returns [`FilterError::ZeroSumNormalization`] rather
+/// than emitting a silently wrong type-max image. The condition `divisor ==
+/// 0.0` holds exactly in this case (`0 / c == 0` only for a finite nonzero
+/// `c`; `0 / 0` is `NaN`, handled by the `constant == 0` case below).
+/// Tracked in the upstream-findings ledger, §2.69.
 ///
 /// Setting `constant = 0.0` on a *nonzero*-sum image is a different case:
 /// `divisor = sum / 0.0` is `±infinity`, not "almost zero", so `Div` takes
@@ -315,19 +309,15 @@ pub fn normalize_to_constant(img: &Image, constant: f64) -> Result<Image> {
     let stats = crate::statistics(img)?;
     let output_id = crate::real_pixel_id(img.pixel_id());
     let divisor = stats.sum / constant;
-    let (max_value, _) = crate::morphology::bounds_for(output_id);
 
-    let vals: Vec<f64> = img
-        .to_f64_vec()?
-        .iter()
-        .map(|&x| {
-            if divisor == 0.0 {
-                max_value
-            } else {
-                x / divisor
-            }
-        })
-        .collect();
+    // `divisor == 0.0` happens exactly when the image sum is zero and the
+    // target `constant` is a nonzero finite value: no finite scale maps a
+    // zero sum onto a nonzero constant, so the normalization is impossible.
+    if divisor == 0.0 {
+        return Err(FilterError::ZeroSumNormalization { constant });
+    }
+
+    let vals: Vec<f64> = img.to_f64_vec()?.iter().map(|&x| x / divisor).collect();
 
     crate::image_from_f64(output_id, img.size(), img, &vals)
 }
@@ -914,13 +904,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_to_constant_zero_sum_forces_every_pixel_to_the_type_maximum() {
-        // sum == 0 -> divisor == 0 -> Div's NumericTraits<TOutput>::max()
-        // branch, unconditionally, for every pixel regardless of its own
-        // sign (see the doc comment on normalize_to_constant).
+    fn normalize_to_constant_rejects_a_zero_sum_image_for_a_nonzero_constant() {
+        // sum == 0 -> divisor == 0: no finite scale maps a zero sum onto the
+        // nonzero constant, so normalization is impossible. Upstream silently
+        // fills every pixel with NumericTraits<T>::max(); this port rejects.
         let a = img_f64(&[2, 1], vec![-3.0, 3.0]);
-        let out = normalize_to_constant(&a, 1.0).unwrap();
-        assert_eq!(out.scalar_slice::<f64>().unwrap(), &[f64::MAX, f64::MAX]);
+        let err = normalize_to_constant(&a, 1.0).unwrap_err();
+        assert_eq!(err, FilterError::ZeroSumNormalization { constant: 1.0 });
     }
 
     #[test]

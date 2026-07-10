@@ -226,6 +226,21 @@ pub enum FilterError {
     #[error("this filter requires a signed pixel type, got {0:?}")]
     RequiresSignedPixelType(PixelId),
 
+    /// `LabelOverlayImageFilter` scales its palette by the base image's own
+    /// `NumericTraits<ValueType>::max()` (`itkLabelToRGBFunctor.h:112-116`).
+    /// For a floating-point base that is `f32::MAX` / `f64::MAX`, which swamps
+    /// the base pixel in the blend by hundreds of orders of magnitude and makes
+    /// the overlay meaningless. Any float scaling rule (fixed 0-255,
+    /// data-driven max) would be invented semantics with no unique answer, so
+    /// this port refuses instead of emitting the swamped garbage. Integer bases
+    /// are unaffected. See the upstream-findings ledger, §2.54.
+    #[error(
+        "label_overlay's palette is scaled by the base image's NumericTraits::max(), \
+         which is meaningless against a floating-point base (got {0:?}); cast or \
+         rescale the base image to an integer pixel type first"
+    )]
+    FloatingPointBaseLabelOverlay(PixelId),
+
     /// `MultiLabelSTAPLEImageFilter::InitializePriorProbabilities` throws when
     /// the caller-supplied prior array is shorter than the number of labels.
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
@@ -385,6 +400,17 @@ pub enum FilterError {
     /// would replace every coefficient with `NumericTraits<RealType>::max()`.
     #[error("normalize requires a convolution kernel whose pixels sum to a non-zero value")]
     ZeroKernelSum,
+
+    /// `NormalizeToConstantImageFilter` scales every pixel by
+    /// `divisor = GetSum() / Constant` (itkNormalizeToConstantImageFilter.hxx:71-73).
+    /// When the image sum is zero and the target `Constant` is a nonzero finite
+    /// value, no finite scale maps the sum onto the constant, so the
+    /// normalization is impossible. Upstream's `Div` functor silently fills the
+    /// whole image with `NumericTraits<T>::max()`; this port rejects instead.
+    #[error(
+        "normalize_to_constant cannot scale a zero-sum image to the nonzero constant {constant}"
+    )]
+    ZeroSumNormalization { constant: f64 },
 
     /// `CheckerBoardImageFilter::GenerateData` computes `factors[d] =
     /// size[d] / checker_pattern[d]` (integer division) and later divides an
