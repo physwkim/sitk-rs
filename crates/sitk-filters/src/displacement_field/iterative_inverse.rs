@@ -21,23 +21,29 @@
 //!    axis in turn, keeping the single probe that most reduces
 //!    `‖x + u(x) − y‖`. A probe outside the buffer is skipped, not scored.
 //!
-//! 3. **Step halving** (`hxx:139-142`). `step` starts at the input's spacing and
-//!    halves at the *start* of any sweep that follows a sweep which moved
-//!    nothing. It is never reset.
+//! 3. **Step halving** (`hxx:139-142`). Each axis's `step` starts at that axis's
+//!    spacing (see the divergence below) and halves at the *start* of any sweep
+//!    that follows a sweep which moved nothing. It is never reset.
 //!
 //! 4. **Stopping** (`hxx:199-202`). After each sweep, `smallestError <
 //!    StopValue` breaks. The default `StopValue` is `0.0`, and the error is a
 //!    norm, so the default never stops the loop early — a zero error is not
 //!    *less than* zero.
 //!
-//! # Faithfully reproduced upstream behaviors
+//! # Fixed in this port
 //!
-//! - **`step` is the *first* axis's spacing, on every axis.** `const double
-//!   spacing = inputPtr->GetSpacing()[0];` (`hxx:89`) is the only spacing the
-//!   filter reads, and `mappedPoint[k] += step` (`hxx:146`) walks physical axis
-//!   `k` by it. On an anisotropic field the search step is therefore wrong on
-//!   every axis but the first. See
-//!   `the_probe_step_is_the_first_axis_spacing_on_every_axis`.
+//! - **The probe step is each axis's own spacing (fixed here, upstream bug
+//!   §2.34).** Upstream reads `const double spacing = inputPtr->GetSpacing()[0];`
+//!   (`hxx:89`) — the *first* axis's spacing — and walks every physical axis by
+//!   it (`mappedPoint[k] += step`, `hxx:146`), so on an anisotropic field the
+//!   coordinate-descent step is wrong on every axis but the first: axis `k` is
+//!   probed at a physical distance unrelated to its own sampling. This port
+//!   keeps one step per axis, initialized to `spacing[k]`, so each axis is
+//!   probed at its own scale. The steps still halve together on a stalled sweep,
+//!   so the halving schedule is unchanged. See
+//!   `the_probe_step_uses_each_axiss_own_spacing`.
+//!
+//! # Faithfully reproduced upstream behaviors
 //!
 //! - **`smallestError` is reset per pixel (fixed here, upstream bug §1.32).**
 //!   Upstream declares `double smallestError = 0;` (`hxx:96`) *outside* the
@@ -145,9 +151,6 @@ pub fn iterative_inverse_displacement_field(
     let mut values = warp_negated_field_by_itself(&forward);
 
     if settings.number_of_iterations > 0 {
-        // `const double spacing = inputPtr->GetSpacing()[0];` (`hxx:89`).
-        let spacing = forward.spacing[0];
-
         for pixel in 0..forward.number_of_pixels() {
             let original = forward.index_to_point(&forward.multi_index(pixel));
             let displacement = &values[pixel * dim..(pixel + 1) * dim];
@@ -167,15 +170,22 @@ pub fn iterative_inverse_displacement_field(
             }
 
             let mut still_same_point = false;
-            let mut step = spacing;
+            // One probe step per axis, each initialized to that axis's own
+            // spacing (see the module doc: upstream reads only `spacing[0]` and
+            // walks every axis by it; this port steps axis `k` by `spacing[k]`).
+            // All steps halve together whenever a sweep moved nothing, so the
+            // step-halving schedule is unchanged.
+            let mut step = forward.spacing.clone();
 
             for _ in 0..settings.number_of_iterations {
                 if still_same_point {
-                    step /= 2.0;
+                    for s in step.iter_mut() {
+                        *s /= 2.0;
+                    }
                 }
 
                 for k in 0..dim {
-                    for signed in [step, -2.0 * step] {
+                    for signed in [step[k], -2.0 * step[k]] {
                         mapped[k] += signed;
                         if let Some(error) = residual(&forward, &mapped, &original)
                             && error < smallest_error
@@ -185,7 +195,7 @@ pub fn iterative_inverse_displacement_field(
                         }
                     }
                     // `mappedPoint[k] += step;` (`hxx:186`) restores the axis.
-                    mapped[k] += step;
+                    mapped[k] += step[k];
                 }
 
                 still_same_point = true;
@@ -356,7 +366,9 @@ mod tests {
         assert_close(&got[..1], &[0.25]);
     }
 
-    /// `step = inputPtr->GetSpacing()[0]` (`hxx:89`), in physical units.
+    /// The probe step on axis 0 is axis 0's spacing (`hxx:89`), in physical
+    /// units. On a 1-D field the §2.34 fix is a no-op — there is only one axis
+    /// and its own spacing is what upstream already read.
     ///
     /// `u = [4, 0, 0]` on a lattice of spacing `2`, so the points are `0, 2, 4`.
     /// Pixel 0's guess is zero (its preimage is outside), giving residual
@@ -368,7 +380,7 @@ mod tests {
     /// probe `x = 1`, where the interpolated `u = 2` and the residual is `3`,
     /// also an improvement, and the answer would differ.
     #[test]
-    fn the_probe_step_is_the_first_axis_spacing_in_physical_units() {
+    fn the_probe_step_is_the_axis_spacing_in_physical_units() {
         let out = iterative_inverse_displacement_field(
             &field_1d(&[4.0, 0.0, 0.0], 2.0),
             &IterativeInverseDisplacementFieldSettings::default(),
@@ -377,18 +389,27 @@ mod tests {
         assert_close(&components(&out)[..1], &[2.0]);
     }
 
-    /// The same `step` is used on *every* axis, even one whose spacing differs.
+    /// Each axis is probed by its *own* spacing (fixed here, §2.34); upstream
+    /// stepped every axis by `spacing[0]`.
     ///
     /// A 2×3 field of spacing `(2, 1)` with `u(i, j) = (0, v_j)`,
     /// `v = [3, 3, 0]`. Pixel `(0, 0)` starts at the origin with residual
-    /// `‖(0, 3)‖ = 3`. Its axis-1 probe steps by `spacing[0] = 2`, not by
-    /// `spacing[1] = 1`, landing on `(0, 2)` where `u = (0, 0)` and the residual
-    /// is `2`. Nothing later beats it, so the output is `(0, 2)`.
+    /// `‖(0, 3)‖ = 3`. With the fix its axis-1 probe steps by `spacing[1] = 1`:
+    /// `(0, 1)` gives `u = (0, 3)`, residual `4` (worse), and `(0, −1)` is
+    /// outside, so the first sweep moves nothing. The steps then halve to
+    /// `(1, 0.5)`; the axis-1 probe `(0, −0.5)` sits in the half-pixel skirt
+    /// where `u` is held at `(0, 3)`, residual `2.5 < 3`, so the point moves
+    /// there. From `(0, −0.5)` no further probe (halving `0.25`, `0.125`, …)
+    /// improves — the `+j` neighbour is worse and `−j` is outside — so the
+    /// coordinate descent settles at the reachable local minimum `(0, −0.5)`,
+    /// the genuine best point in the buffer's skirt along axis 1. Output
+    /// `(0, −0.5) − (0, 0) = (0, −0.5)`.
     ///
-    /// Stepping by `spacing[1] = 1` would land on `(0, 1)`, where `u = (0, 3)`
-    /// and the residual is `4` — no improvement — and the output would differ.
+    /// Under the upstream bug axis 1 stepped by `spacing[0] = 2`, jumping the
+    /// first sweep straight to `(0, 2)` — where `u = (0, 0)`, residual `2`, and
+    /// nothing later beats it — for a different output of `(0, 2)`.
     #[test]
-    fn the_probe_step_is_the_first_axis_spacing_on_every_axis() {
+    fn the_probe_step_uses_each_axiss_own_spacing() {
         let v = [3.0, 3.0, 0.0];
         let mut data = Vec::new();
         for &value in &v {
@@ -405,7 +426,7 @@ mod tests {
             &IterativeInverseDisplacementFieldSettings::default(),
         )
         .unwrap();
-        assert_close(&components(&out)[..2], &[0.0, 2.0]);
+        assert_close(&components(&out)[..2], &[0.0, -0.5]);
     }
 
     /// A `StopValue` above the residual breaks out of the sweep loop (`hxx:199`).
