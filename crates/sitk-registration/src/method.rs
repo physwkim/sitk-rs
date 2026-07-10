@@ -26,10 +26,43 @@
 //! a line-search quasi-Newton method that ignores parameter scales and drives the
 //! raw metric gradient, with optional per-parameter bounds). More sampling
 //! strategies come later.
+//!
+//! # The virtual domain and the three transforms
+//!
+//! The metric does not compare the two images directly. It samples a **virtual
+//! reference domain** — a grid, unrelated to either image, set by
+//! [`set_virtual_domain`] / [`set_virtual_domain_from_image`] and defaulting to
+//! the fixed image's own grid — and at each virtual point `x` it compares
+//!
+//! ```text
+//! F( fixed_initial(x) )   against   M( moving_initial( optimized(x) ) )
+//! ```
+//!
+//! Only `optimized` — the transform set by [`set_initial_transform`] — has its
+//! parameters driven by the optimizer. The other two are fixed context:
+//! `moving_initial` ([`set_moving_initial_transform`]) is the alignment an
+//! earlier registration stage already found, and `fixed_initial`
+//! ([`set_fixed_initial_transform`]) relocates the fixed image's sample points.
+//! Because the two sit on opposite sides of the comparison, the same
+//! displacement applied to each moves the optimum in opposite directions.
+//!
+//! [`metric_evaluate`] runs that comparison once, with no optimizer and no
+//! pyramid, and returns the metric value —
+//! `itk::simple::ImageRegistrationMethod::MetricEvaluate`.
+//!
+//! [`set_virtual_domain`]: ImageRegistrationMethod::set_virtual_domain
+//! [`set_virtual_domain_from_image`]: ImageRegistrationMethod::set_virtual_domain_from_image
+//! [`set_initial_transform`]: ImageRegistrationMethod::set_initial_transform
+//! [`set_moving_initial_transform`]: ImageRegistrationMethod::set_moving_initial_transform
+//! [`set_fixed_initial_transform`]: ImageRegistrationMethod::set_fixed_initial_transform
+//! [`metric_evaluate`]: ImageRegistrationMethod::metric_evaluate
 
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
-use sitk_transform::{AffineTransform, Interpolator, ParametricTransform, ResampleImageFilter};
+use sitk_transform::{
+    AffineTransform, CompositeTransform, Interpolator, ParametricTransform, ResampleImageFilter,
+    Transform, TransformBase, TranslationTransform,
+};
 
 use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
 use crate::correlation::CorrelationMetric;
@@ -131,6 +164,183 @@ enum ActiveMetric {
     Demons(DemonsMetric),
 }
 
+/// The transform the metric actually maps a virtual-domain point through to
+/// reach the **moving** image: the optimized transform followed by the
+/// moving-initial transform.
+///
+/// `itk::ImageRegistrationMethodv4::InitializeRegistrationAtEachLevel` builds
+/// `m_CompositeTransform` by adding the moving-initial transform and *then* the
+/// output (optimized) transform (`itkImageRegistrationMethodv4.hxx:349,360`),
+/// hands it to the metric with `SetMovingTransform`
+/// (`:524`), and calls `SetOnlyMostRecentTransformToOptimizeOn` (`:438`).
+/// `itk::CompositeTransform::TransformPoint` applies its queue **in reverse add
+/// order** (`itkCompositeTransform.hxx:60-71`), so the mapped moving point is
+///
+/// ```text
+/// moving_point = moving_initial( optimized( virtual_point ) )
+/// ```
+///
+/// and `SetOnlyMostRecentTransformToOptimizeOn` means only `optimized`'s
+/// parameters are exposed to the optimizer. `SimpleITK`'s `MetricEvaluate`
+/// assembles the identical queue by hand (`sitkImageRegistrationMethod.cxx:
+/// 1057-1088`). The fixed image is *not* reached through this chain: it is
+/// sampled at `fixed_initial(virtual_point)` instead, which this port applies
+/// when it resamples the fixed image onto the virtual grid — see
+/// [`ImageRegistrationMethod::prepare_level`].
+///
+/// `moving_initial == None` is upstream's identity case: both
+/// `ExecuteInternal` and `EvaluateInternal` skip a transform whose class name is
+/// `"IdentityTransform"` rather than composing it (ledger §3.33).
+struct Composed<'a, T: ParametricTransform + ?Sized> {
+    optimized: &'a mut T,
+    moving_initial: Option<&'a Transform>,
+}
+
+impl<T: ParametricTransform + ?Sized> TransformBase for Composed<'_, T> {
+    fn transform_point(&self, point: &[f64]) -> Vec<f64> {
+        let p = self.optimized.transform_point(point);
+        match self.moving_initial {
+            Some(g) => g.transform_point(&p),
+            None => p,
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.optimized.dimension()
+    }
+
+    fn is_linear(&self) -> bool {
+        self.optimized.is_linear() && self.moving_initial.is_none_or(|g| g.is_linear())
+    }
+
+    fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
+        let jf = self.optimized.jacobian_wrt_position(point);
+        match self.moving_initial {
+            None => jf,
+            Some(g) => {
+                let jg = g.jacobian_wrt_position(&self.optimized.transform_point(point));
+                mat_mul(&jg, &jf, self.dimension())
+            }
+        }
+    }
+}
+
+impl<T: ParametricTransform + ?Sized> ParametricTransform for Composed<'_, T> {
+    fn number_of_parameters(&self) -> usize {
+        self.optimized.number_of_parameters()
+    }
+
+    fn parameters(&self) -> Vec<f64> {
+        self.optimized.parameters()
+    }
+
+    fn set_parameters(&mut self, params: &[f64]) {
+        self.optimized.set_parameters(params);
+    }
+
+    fn fixed_parameters(&self) -> Vec<f64> {
+        self.optimized.fixed_parameters()
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.optimized.number_of_fixed_parameters()
+    }
+
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> sitk_transform::Result<()> {
+        self.optimized.set_fixed_parameters(params)
+    }
+
+    fn has_local_support(&self) -> bool {
+        self.optimized.has_local_support()
+    }
+
+    fn number_of_local_parameters(&self) -> usize {
+        self.optimized.number_of_local_parameters()
+    }
+
+    /// `∂ moving_initial(optimized(x)) / ∂p = J_g(optimized(x)) · J_f(x, p)`,
+    /// the chain rule `itk::CompositeTransform::ComputeJacobianWithRespectToParameters`
+    /// applies to every block but the last-applied one.
+    fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
+        let jf = self.optimized.jacobian_wrt_parameters(point);
+        match self.moving_initial {
+            None => jf,
+            Some(g) => {
+                let dim = self.dimension();
+                let jg = g.jacobian_wrt_position(&self.optimized.transform_point(point));
+                mat_mul_rect(&jg, &jf, dim, self.number_of_parameters())
+            }
+        }
+    }
+
+    /// The sparse Jacobian's columns are `∂T/∂p_k` — each a `dim`-vector — so
+    /// the same left-multiplication by `J_g` that
+    /// [`jacobian_wrt_parameters`](Self::jacobian_wrt_parameters) applies to the
+    /// dense array applies column-wise here.
+    fn sparse_jacobian_wrt_parameters(&self, point: &[f64]) -> Option<Vec<(usize, Vec<f64>)>> {
+        let sparse = self.optimized.sparse_jacobian_wrt_parameters(point)?;
+        let g = match self.moving_initial {
+            None => return Some(sparse),
+            Some(g) => g,
+        };
+        let dim = self.dimension();
+        let jg = g.jacobian_wrt_position(&self.optimized.transform_point(point));
+        Some(
+            sparse
+                .into_iter()
+                .map(|(k, col)| {
+                    let mapped = (0..dim)
+                        .map(|r| (0..dim).map(|c| jg[r * dim + c] * col[c]).sum())
+                        .collect();
+                    (k, mapped)
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A `Float64` image carrying `values` on `reference`'s grid.
+fn with_geometry_of(reference: &Image, values: Vec<f64>) -> Result<Image> {
+    let mut image = Image::from_vec(reference.size(), values)?;
+    image.set_origin(reference.origin())?;
+    image.set_spacing(reference.spacing())?;
+    image.set_direction(reference.direction())?;
+    Ok(image)
+}
+
+/// The pointwise AND of two binary masks on one grid, `None` when neither is
+/// present. A voxel survives only if it is nonzero in every mask given.
+fn intersect_masks(a: Option<Image>, b: Option<Image>) -> Result<Option<Image>> {
+    let (a, b) = match (a, b) {
+        (None, None) => return Ok(None),
+        (Some(only), None) | (None, Some(only)) => return Ok(Some(only)),
+        (Some(a), Some(b)) => (a, b),
+    };
+    let (av, bv) = (a.to_f64_vec()?, b.to_f64_vec()?);
+    let both = av
+        .iter()
+        .zip(bv.iter())
+        .map(|(&x, &y)| f64::from(x != 0.0 && y != 0.0))
+        .collect();
+    Ok(Some(with_geometry_of(&a, both)?))
+}
+
+/// `a · b` for two row-major `n × n` matrices.
+fn mat_mul(a: &[f64], b: &[f64], n: usize) -> Vec<f64> {
+    mat_mul_rect(a, b, n, n)
+}
+
+/// `a · b` where `a` is row-major `n × n` and `b` is row-major `n × cols`.
+fn mat_mul_rect(a: &[f64], b: &[f64], n: usize, cols: usize) -> Vec<f64> {
+    let mut out = vec![0.0; n * cols];
+    for r in 0..n {
+        for c in 0..cols {
+            out[r * cols + c] = (0..n).map(|k| a[r * n + k] * b[k * cols + c]).sum();
+        }
+    }
+    out
+}
+
 /// The registration objective handed to the line-search optimizers: set the
 /// transform's parameters, then ask the metric.
 ///
@@ -140,7 +350,7 @@ enum ActiveMetric {
 /// those probes; a closure has no value-only kernel, so each probe would pay
 /// for a derivative it never reads.
 struct MetricObjective<'a, T: ParametricTransform> {
-    transform: &'a mut T,
+    transform: Composed<'a, T>,
     metric: &'a ActiveMetric,
     backend: &'a dyn MetricBackend,
 }
@@ -148,13 +358,13 @@ struct MetricObjective<'a, T: ParametricTransform> {
 impl<T: ParametricTransform> Objective for MetricObjective<'_, T> {
     fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
         self.transform.set_parameters(p);
-        let m = self.metric.evaluate(&*self.transform, self.backend);
+        let m = self.metric.evaluate(&self.transform, self.backend);
         (m.value, m.derivative)
     }
 
     fn value(&mut self, p: &[f64]) -> f64 {
         self.transform.set_parameters(p);
-        self.metric.value(&*self.transform, self.backend)
+        self.metric.value(&self.transform, self.backend)
     }
 }
 
@@ -323,6 +533,39 @@ impl LbfgsbConfig {
 const CONVERGENCE_WINDOW_SIZE: usize = 10;
 const MINIMUM_CONVERGENCE_VALUE: f64 = 1e-6;
 
+/// The geometry of the **virtual reference domain** the metric samples in —
+/// SimpleITK `SetVirtualDomain(size, origin, spacing, direction)` /
+/// `SetVirtualDomainFromImage(image)`, stored on the method and pushed onto the
+/// metric by `SetupMetric` (`sitkImageRegistrationMethod.cxx:1122-1135`).
+///
+/// Every metric sample point is a voxel center of this grid; the fixed image is
+/// read at `fixed_initial(point)` and the moving image at
+/// `moving_initial(optimized(point))`. When it is unset, ITK falls back to the
+/// fixed image's own grid (`itkImageRegistrationMethodv4.hxx:388-392`), which is
+/// why a virtual domain equal to the fixed image's geometry is a no-op.
+#[derive(Clone, Debug, PartialEq)]
+struct VirtualDomain {
+    size: Vec<usize>,
+    origin: Vec<f64>,
+    spacing: Vec<f64>,
+    direction: Vec<f64>,
+}
+
+impl VirtualDomain {
+    /// An all-zero image carrying this geometry, used purely as a grid: the
+    /// per-level shrink and the fixed-image resampling both take their output
+    /// geometry from it. ITK does the same, allocating `m_VirtualDomainImage`
+    /// and never reading its pixels (`itkImageRegistrationMethodv4.hxx:394-397`).
+    fn grid(&self) -> Result<Image> {
+        let n = self.size.iter().product();
+        let mut image = Image::from_vec(&self.size, vec![0.0f64; n])?;
+        image.set_origin(&self.origin)?;
+        image.set_spacing(&self.spacing)?;
+        image.set_direction(&self.direction)?;
+        Ok(image)
+    }
+}
+
 /// The optimized transform plus diagnostics from a registration run.
 #[derive(Clone, Debug)]
 pub struct RegistrationResult<T> {
@@ -373,6 +616,23 @@ pub struct ImageRegistrationMethod {
     /// Whether `smoothing_sigmas_per_level` are in physical units (ITK's
     /// default, `true`) or in voxels of the fixed image.
     smoothing_sigmas_in_physical_units: bool,
+    /// The transform the optimizer drives, set by
+    /// [`set_initial_transform`](ImageRegistrationMethod::set_initial_transform)
+    /// and read by
+    /// [`execute_with_initial_transform`](ImageRegistrationMethod::execute_with_initial_transform)
+    /// and [`metric_evaluate`](ImageRegistrationMethod::metric_evaluate).
+    /// `None` means upstream's default-constructed identity.
+    initial_transform: Option<Transform>,
+    /// SimpleITK `m_InitialTransformInPlace` (default `true`).
+    initial_transform_in_place: bool,
+    /// Applied *after* the optimized transform on the way to the moving image.
+    /// `None` = identity. See [`Composed`].
+    moving_initial_transform: Option<Transform>,
+    /// Applied to a virtual-domain point on the way to the fixed image.
+    /// `None` = identity.
+    fixed_initial_transform: Option<Transform>,
+    /// The virtual reference domain. `None` = the fixed image's own grid.
+    virtual_domain: Option<VirtualDomain>,
 }
 
 impl Default for ImageRegistrationMethod {
@@ -392,6 +652,11 @@ impl Default for ImageRegistrationMethod {
             shrink_factors_per_level: Vec::new(),
             smoothing_sigmas_per_level: Vec::new(),
             smoothing_sigmas_in_physical_units: true,
+            initial_transform: None,
+            initial_transform_in_place: true,
+            moving_initial_transform: None,
+            fixed_initial_transform: None,
+            virtual_domain: None,
         }
     }
 }
@@ -992,6 +1257,203 @@ impl ImageRegistrationMethod {
         self
     }
 
+    /// Set the transform the optimizer drives — SimpleITK
+    /// `SetInitialTransform(const Transform &)`
+    /// (`sitkImageRegistrationMethod.cxx:115-122`), which stores a deep copy
+    /// (`MakeUnique`) and turns the in-place flag **on**.
+    ///
+    /// [`execute_with_initial_transform`](Self::execute_with_initial_transform)
+    /// then optimizes it and returns it as the same concrete transform kind, and
+    /// [`initial_transform`](Self::initial_transform) reflects the optimum. Use
+    /// [`set_initial_transform_in_place`](Self::set_initial_transform_in_place)
+    /// with `false` to leave the stored transform at its starting value and
+    /// receive the optimum as a fresh composite instead.
+    ///
+    /// Note that this **re-enables** the in-place flag: calling it after a
+    /// `set_initial_transform_in_place(t, false)` silently restores in-place
+    /// optimization, exactly as upstream's single-argument overload does
+    /// (ledger §3.36).
+    pub fn set_initial_transform(&mut self, transform: Transform) -> &mut Self {
+        self.initial_transform = Some(transform);
+        self.initial_transform_in_place = true;
+        self
+    }
+
+    /// Set the transform the optimizer drives and choose whether the optimizer
+    /// writes through to it — SimpleITK `SetInitialTransform(Transform &, bool
+    /// inPlace)` (`sitkImageRegistrationMethod.cxx:136-155`).
+    ///
+    /// Upstream, `inPlace` decides whether `itk::ImageRegistrationMethodv4`
+    /// *grafts* the initial transform as its output — so the optimizer mutates
+    /// that very ITK object — or `Clone()`s it and optimizes the copy
+    /// (`itkImageRegistrationMethodv4.hxx:733-758`). Two things follow, and both
+    /// are what this port reproduces:
+    ///
+    /// - **`true`**: after `Execute`, the method's stored initial transform holds
+    ///   the optimized parameters, and `Execute` returns *it* — same concrete
+    ///   transform kind as was set.
+    /// - **`false`**: the stored initial transform is untouched, and `Execute`
+    ///   returns a [`CompositeTransform`] wrapping a copy of the optimized
+    ///   transform (ledger §3.34).
+    ///
+    /// Upstream's `inPlace = true` *additionally* aliases the caller's own
+    /// `Transform` object, because C++ `Transform`s share one refcounted ITK
+    /// pointer; a Rust `Transform` is a value, so that aliasing has no
+    /// counterpart here (ledger §4.64). Everything observable through the
+    /// method — the stored transform and the returned one — matches upstream.
+    pub fn set_initial_transform_in_place(
+        &mut self,
+        transform: Transform,
+        in_place: bool,
+    ) -> &mut Self {
+        self.initial_transform = Some(transform);
+        self.initial_transform_in_place = in_place;
+        self
+    }
+
+    /// The stored initial transform, or `None` if none was set. After an
+    /// in-place [`execute_with_initial_transform`](Self::execute_with_initial_transform)
+    /// this holds the optimized parameters; after a not-in-place one it still
+    /// holds the starting values.
+    pub fn initial_transform(&self) -> Option<&Transform> {
+        self.initial_transform.as_ref()
+    }
+
+    /// Whether the optimizer writes through to the stored initial transform
+    /// (SimpleITK `GetInitialTransformInPlace`). Defaults to `true`.
+    pub fn initial_transform_in_place(&self) -> bool {
+        self.initial_transform_in_place
+    }
+
+    /// Set the transform applied to the moving image **after** the optimized one
+    /// — SimpleITK `SetMovingInitialTransform`, ITK
+    /// `ImageRegistrationMethodv4::SetMovingInitialTransform`.
+    ///
+    /// The metric samples the moving image at
+    /// `moving_initial(optimized(virtual_point))` (see [`Composed`] for the
+    /// source lines that fix this order), so a moving-initial transform is the
+    /// alignment already achieved by an earlier stage: the optimizer starts from
+    /// where it left off without folding that stage into its own parameters.
+    ///
+    /// It is *not* optimized — only the initial transform's parameters are.
+    pub fn set_moving_initial_transform(&mut self, transform: Transform) -> &mut Self {
+        self.moving_initial_transform = Some(transform);
+        self
+    }
+
+    /// Set the transform applied to a virtual-domain point on the way to the
+    /// **fixed** image — SimpleITK `SetFixedInitialTransform`, ITK
+    /// `ImageRegistrationMethodv4::SetFixedInitialTransform`, which reaches the
+    /// metric as `SetFixedTransform` (`itkImageRegistrationMethodv4.hxx:516`)
+    /// and is applied by `ImageToImageMetricv4::TransformAndEvaluateFixedPoint`
+    /// (`itkImageToImageMetricv4.h:831-847`).
+    ///
+    /// The fixed and moving initial transforms sit on **opposite sides** of the
+    /// comparison — the metric compares `F(fixed_initial(x))` against
+    /// `M(moving_initial(optimized(x)))` — so setting each to the same
+    /// translation displaces the two images' sample points in the same
+    /// direction, and the optimum of `optimized` moves the opposite way for one
+    /// versus the other.
+    pub fn set_fixed_initial_transform(&mut self, transform: Transform) -> &mut Self {
+        self.fixed_initial_transform = Some(transform);
+        self
+    }
+
+    /// Set the virtual reference domain the metric samples in — SimpleITK
+    /// `SetVirtualDomain` (`sitkImageRegistrationMethod.cxx:157-184`).
+    ///
+    /// `size` fixes the dimension `d`; `origin` and `spacing` must have length
+    /// `d` and `direction` length `d²` (row-major). Sample points are this
+    /// grid's voxel centers, independent of both images' grids. Unset (the
+    /// default), the domain is the fixed image's own grid.
+    ///
+    /// Errors with [`RegistrationError::VirtualDomainLength`] on a length
+    /// mismatch, exactly where SimpleITK raises "Expected virtualOrigin to be of
+    /// length N!".
+    pub fn set_virtual_domain(
+        &mut self,
+        size: Vec<usize>,
+        origin: Vec<f64>,
+        spacing: Vec<f64>,
+        direction: Vec<f64>,
+    ) -> Result<&mut Self> {
+        let dim = size.len();
+        let check = |field, got, expected| {
+            if got == expected {
+                Ok(())
+            } else {
+                Err(RegistrationError::VirtualDomainLength {
+                    field,
+                    got,
+                    expected,
+                })
+            }
+        };
+        check("origin", origin.len(), dim)?;
+        check("spacing", spacing.len(), dim)?;
+        check("direction", direction.len(), dim * dim)?;
+
+        self.virtual_domain = Some(VirtualDomain {
+            size,
+            origin,
+            spacing,
+            direction,
+        });
+        Ok(self)
+    }
+
+    /// Take the virtual reference domain's geometry from `image` — SimpleITK
+    /// `SetVirtualDomainFromImage` (`sitkImageRegistrationMethod.cxx:186-193`),
+    /// which copies its size, origin, spacing and direction and ignores its
+    /// pixels.
+    pub fn set_virtual_domain_from_image(&mut self, image: &Image) -> &mut Self {
+        self.virtual_domain = Some(VirtualDomain {
+            size: image.size().to_vec(),
+            origin: image.origin().to_vec(),
+            spacing: image.spacing().to_vec(),
+            direction: image.direction().to_vec(),
+        });
+        self
+    }
+
+    /// Validate every configured transform and the virtual domain against the
+    /// images' dimension. Upstream reaches the same conclusions via failed
+    /// `dynamic_cast`s ("Possible miss matching dimensions!",
+    /// `sitkImageRegistrationMethod.cxx:784-808`) and `sitkSTLVectorToITK`.
+    fn check_dimensions(&self, fixed: &Image, moving: &Image) -> Result<()> {
+        if fixed.dimension() != moving.dimension() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dimension(),
+                moving: moving.dimension(),
+            });
+        }
+        let dim = fixed.dimension();
+        for t in [
+            self.moving_initial_transform.as_ref(),
+            self.fixed_initial_transform.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if t.dimension() != dim {
+                return Err(RegistrationError::TransformDimensionMismatch {
+                    transform: t.dimension(),
+                    image: dim,
+                });
+            }
+        }
+        if let Some(v) = &self.virtual_domain
+            && v.size.len() != dim
+        {
+            return Err(RegistrationError::VirtualDomainLength {
+                field: "size",
+                got: v.size.len(),
+                expected: dim,
+            });
+        }
+        Ok(())
+    }
+
     /// The sampling percentage for level `level`. An empty schedule means 1.0
     /// (every candidate voxel); a single entry applies to every level.
     fn sampling_percentage(&self, level: usize) -> f64 {
@@ -1002,16 +1464,24 @@ impl ImageRegistrationMethod {
         }
     }
 
-    /// Construct the metric selected by [`MetricKind`] for one resolution
-    /// level's fixed/moving pair, applying the sampling strategy (with the
-    /// level's percentage and the resampled fixed mask), the interpolator, and
-    /// the moving mask.
+    /// Construct the metric selected by [`MetricKind`] over one already-prepared
+    /// fixed/moving pair, applying `strategy` at `percentage` (with the
+    /// resampled fixed mask), the interpolator, and the moving mask.
+    ///
+    /// `fixed` here is the fixed image **already resampled onto the virtual
+    /// domain** by [`prepare_level`](Self::prepare_level), so its grid is the
+    /// sample grid. The sampling arguments are explicit rather than read from
+    /// `self` because [`metric_evaluate`](Self::metric_evaluate) samples densely
+    /// regardless of the configured strategy — upstream sets the strategy on the
+    /// *registration*, not the metric, and `EvaluateInternal` never builds a
+    /// registration (ledger §3.35).
     fn build_metric(
         &self,
         fixed: &Image,
         moving: &Image,
         fixed_mask: Option<&Image>,
-        level: usize,
+        strategy: SamplingStrategy,
+        percentage: f64,
     ) -> Result<ActiveMetric> {
         if fixed.dimension() != moving.dimension() {
             return Err(RegistrationError::DimensionMismatch {
@@ -1021,8 +1491,8 @@ impl ImageRegistrationMethod {
         }
         let samples = FixedSamples::from_image_with(
             fixed,
-            self.sampling_strategy,
-            self.sampling_percentage(level),
+            strategy,
+            percentage,
             self.sampling_seed,
             fixed_mask,
         )?;
@@ -1134,6 +1604,12 @@ impl ImageRegistrationMethod {
     /// next finer one. Transforms act in physical space, shared across levels, so
     /// the parameters carry over directly with no rescaling.
     ///
+    /// A configured [`set_moving_initial_transform`], [`set_fixed_initial_transform`]
+    /// and [`set_virtual_domain`] all apply; the stored
+    /// [`set_initial_transform`] does not — `initial` is the transform this call
+    /// optimizes. Use [`execute_with_initial_transform`] for upstream's
+    /// stored-transform form, which additionally honors the in-place flag.
+    ///
     /// Errors if the transform/image dimensions disagree, the shrink and
     /// smoothing schedules differ in length, the moving direction matrix is
     /// singular, scales are the wrong length, or no fixed sample maps inside the
@@ -1141,6 +1617,11 @@ impl ImageRegistrationMethod {
     ///
     /// [`set_shrink_factors_per_level`]: Self::set_shrink_factors_per_level
     /// [`set_smoothing_sigmas_per_level`]: Self::set_smoothing_sigmas_per_level
+    /// [`set_moving_initial_transform`]: Self::set_moving_initial_transform
+    /// [`set_fixed_initial_transform`]: Self::set_fixed_initial_transform
+    /// [`set_virtual_domain`]: Self::set_virtual_domain
+    /// [`set_initial_transform`]: Self::set_initial_transform
+    /// [`execute_with_initial_transform`]: Self::execute_with_initial_transform
     pub fn execute<T: ParametricTransform>(
         &self,
         fixed: &Image,
@@ -1153,6 +1634,7 @@ impl ImageRegistrationMethod {
                 image: fixed.dimension(),
             });
         }
+        self.check_dimensions(fixed, moving)?;
 
         let dim = fixed.dimension();
         let schedule = self.level_schedule(fixed)?;
@@ -1204,6 +1686,114 @@ impl ImageRegistrationMethod {
         })
     }
 
+    /// Register `moving` onto `fixed` starting from the transform stored by
+    /// [`set_initial_transform`](Self::set_initial_transform) — SimpleITK
+    /// `Execute(fixed, moving)` (`sitkImageRegistrationMethod.cxx:763-990`).
+    ///
+    /// The in-place flag decides what comes back and what happens to the stored
+    /// transform (`:961-989`):
+    ///
+    /// - **in-place** (the default): the stored transform is updated to the
+    ///   optimum and returned, keeping its concrete kind.
+    /// - **not in-place**: the stored transform keeps its starting values, and
+    ///   the optimum is returned as a [`CompositeTransform`] holding a single
+    ///   sub-transform. Upstream wraps it because `sitk::Transform` has no
+    ///   constructor from an arbitrary ITK transform — its own source calls this
+    ///   out as a TODO (ledger §3.34).
+    ///
+    /// Errors with [`RegistrationError::NoInitialTransform`] when no initial
+    /// transform was set, and otherwise exactly as [`execute`](Self::execute).
+    pub fn execute_with_initial_transform(
+        &mut self,
+        fixed: &Image,
+        moving: &Image,
+    ) -> Result<RegistrationResult<Transform>> {
+        let initial = self
+            .initial_transform
+            .clone()
+            .ok_or(RegistrationError::NoInitialTransform)?;
+        let result = self.execute(fixed, moving, initial)?;
+
+        if self.initial_transform_in_place {
+            self.initial_transform = Some(result.transform.clone());
+            return Ok(result);
+        }
+
+        let mut composite = CompositeTransform::new(result.transform.dimension());
+        composite.add_transform(result.transform)?;
+        Ok(RegistrationResult {
+            transform: composite.into(),
+            metric_value: result.metric_value,
+            iterations: result.iterations,
+            stop_reason: result.stop_reason,
+            valid_points: result.valid_points,
+        })
+    }
+
+    /// Evaluate the configured metric once, at the configured transforms, with
+    /// no optimization — SimpleITK `MetricEvaluate(fixed, moving)`
+    /// (`sitkImageRegistrationMethod.cxx:993-1093`).
+    ///
+    /// The metric compares `F(fixed_initial(x))` against
+    /// `M(moving_initial(initial(x)))` over every voxel center `x` of the
+    /// virtual domain, and returns its value — for mean squares, the mean of the
+    /// squared differences over the samples that map inside the moving image.
+    ///
+    /// What upstream's `EvaluateInternal` skips, and so does this:
+    ///
+    /// - the **optimizer** and the **parameter-scales estimator**: neither is
+    ///   constructed, so `set_optimizer_*` and `set_optimizer_scales_*` have no
+    ///   effect here;
+    /// - the **multi-resolution schedule**: the images are used at full
+    ///   resolution, unsmoothed and unshrunk;
+    /// - the **metric sampling strategy, percentage and seed**: upstream sets
+    ///   those on `itk::ImageRegistrationMethodv4`, which `EvaluateInternal`
+    ///   never builds, so the metric samples the virtual domain densely
+    ///   (ledger §3.35).
+    ///
+    /// The interpolator, both image masks, the virtual domain, and all three
+    /// transforms *do* apply — `SetupMetric` configures them.
+    ///
+    /// With no initial transform set this evaluates at the identity (ledger
+    /// §4.65). Upstream's `MetricEvaluate` also rejects a fixed/moving pair of
+    /// differing pixel types; this port works in `f64` throughout and does not
+    /// (ledger §4.67).
+    pub fn metric_evaluate(&self, fixed: &Image, moving: &Image) -> Result<f64> {
+        self.check_dimensions(fixed, moving)?;
+        let dim = fixed.dimension();
+
+        let identity = Transform::from(TranslationTransform::new(vec![0.0; dim]));
+        let mut initial = match &self.initial_transform {
+            Some(t) => t.clone(),
+            None => identity,
+        };
+        if initial.dimension() != dim {
+            return Err(RegistrationError::TransformDimensionMismatch {
+                transform: initial.dimension(),
+                image: dim,
+            });
+        }
+
+        // Full resolution, no shrink, no smoothing: `sigma = 0` makes
+        // `recursive_gaussian` a no-op and a unit shrink factor keeps the grid.
+        let (fixed_level, moving_level, fixed_mask_level) =
+            self.prepare_level(fixed, moving, &vec![0.0; dim], &vec![1; dim], dim)?;
+        let metric = self.build_metric(
+            &fixed_level,
+            &moving_level,
+            fixed_mask_level.as_ref(),
+            SamplingStrategy::None,
+            1.0,
+        )?;
+
+        let composed = Composed {
+            optimized: &mut initial,
+            moving_initial: self.moving_initial_transform.as_ref(),
+        };
+        metric.check_transform(&composed)?;
+        Ok(metric.value(&composed, self.backend.as_ref()))
+    }
+
     /// The per-level `(shrink_factors, sigma)` schedule, coarsest first. With no
     /// schedule configured this is one full-resolution level (factor 1, sigma 0).
     /// Errors if the shrink and smoothing schedules differ in length.
@@ -1251,19 +1841,49 @@ impl ImageRegistrationMethod {
     /// The moving image is only smoothed (it is resampled through the transform,
     /// so it is not shrunk). The fixed image is smoothed and then placed on the
     /// coarse **virtual-domain** grid: ITK shrinks the virtual domain with
-    /// `ShrinkImageFilter`, so we take that grid's geometry, but the fixed values
-    /// on it are obtained by **resampling the smoothed fixed with linear
-    /// interpolation** — matching ITK's metric, which interpolates the smoothed
-    /// fixed at each virtual point. Reusing `ShrinkImageFilter`'s subsampled
-    /// pixel values instead would introduce a sub-voxel translation bias, because
-    /// that filter's output origin (from the real-valued center shift) and its
-    /// sampling offset (that shift rounded to an integer) intentionally differ by
-    /// up to half a voxel.
-    /// A configured fixed mask is carried to the level by resampling it onto the
-    /// same coarse grid with **nearest-neighbor** interpolation and no
-    /// smoothing: the mask is a binary predicate over physical space, so it is
-    /// re-evaluated at the coarse voxel centers rather than blurred and
-    /// re-thresholded.
+    /// `ShrinkImageFilter` (`itkImageRegistrationMethodv4.hxx:444-452`), so we
+    /// take that grid's geometry, but the fixed values on it are obtained by
+    /// **resampling the smoothed fixed** — matching ITK's metric, which
+    /// interpolates the smoothed fixed at each virtual point. Reusing
+    /// `ShrinkImageFilter`'s subsampled pixel values instead would introduce a
+    /// sub-voxel translation bias, because that filter's output origin (from the
+    /// real-valued center shift) and its sampling offset (that shift rounded to
+    /// an integer) intentionally differ by up to half a voxel.
+    ///
+    /// The base grid that is shrunk is the configured **virtual domain**, or the
+    /// fixed image's own grid when none is set — ITK's fallback
+    /// (`itkImageRegistrationMethodv4.hxx:388-392`). The resampling transform is
+    /// the **fixed-initial transform**, so the level's fixed image holds
+    /// `F(fixed_initial(x))` at each virtual point `x`, which is exactly what
+    /// `ImageToImageMetricv4::TransformAndEvaluateFixedPoint` evaluates
+    /// per-sample (`itkImageToImageMetricv4.h:831-847`). Both default to no-ops,
+    /// so a method with neither configured resamples the smoothed fixed onto its
+    /// own shrunk grid through the identity, as before.
+    ///
+    /// A virtual point whose mapped fixed point falls outside the fixed image's
+    /// buffer is **not a sample**: ITK's `TransformAndEvaluateFixedPoint` returns
+    /// `pointIsValid = false` for it. Resampling alone cannot express that (it
+    /// would substitute the default pixel value), so when a virtual domain or a
+    /// fixed-initial transform is configured this also resamples an all-ones
+    /// image over the fixed grid to get the in-buffer predicate on the virtual
+    /// grid, and folds it into the level's fixed mask. With neither configured
+    /// every coarse voxel center lies inside the fixed buffer by construction,
+    /// so the predicate is identically true and is skipped.
+    ///
+    /// A configured fixed mask is carried to the level the same way, with
+    /// **nearest-neighbor** interpolation and no smoothing: the mask is a binary
+    /// predicate over physical space, evaluated by ITK at the *mapped fixed*
+    /// point (`m_FixedImageMask->IsInsideInWorldSpace(mappedFixedPoint)`), so it
+    /// travels through the fixed-initial transform exactly as the fixed image
+    /// does, rather than being blurred and re-thresholded.
+    ///
+    /// The fixed image is read with **linear** interpolation here, whereas
+    /// upstream hands `m_Interpolator` to the metric as its fixed interpolator
+    /// (`sitkImageRegistrationMethod.cxx:1137-1139`); [`set_interpolator`] still
+    /// selects the moving-image interpolator, which is the one the optimizer's
+    /// gradient flows through (ledger §4.66).
+    ///
+    /// [`set_interpolator`]: Self::set_interpolator
     fn prepare_level(
         &self,
         fixed: &Image,
@@ -1273,25 +1893,42 @@ impl ImageRegistrationMethod {
         dim: usize,
     ) -> Result<(Image, Image, Option<Image>)> {
         let smoothed_fixed = recursive_gaussian(fixed, sigma)?;
-        let coarse_grid = shrink(&smoothed_fixed, factors)?;
-        let mut resampler = ResampleImageFilter::new();
-        resampler
-            .set_reference_image(&coarse_grid)
-            .set_interpolator(Interpolator::Linear);
-        let fixed_level = resampler.execute(&smoothed_fixed, &AffineTransform::identity(dim))?;
+        let coarse_grid = match &self.virtual_domain {
+            Some(v) => shrink(&v.grid()?, factors)?,
+            None => shrink(&smoothed_fixed, factors)?,
+        };
+
+        // Output point x ↦ input point fixed_initial(x): `ResampleImageFilter`
+        // maps each output voxel's physical point through the transform and
+        // samples the input there, which is the mapping the metric applies.
+        let onto_virtual = |input: &Image, interpolator: Interpolator| -> Result<Image> {
+            let mut resampler = ResampleImageFilter::new();
+            resampler
+                .set_reference_image(&coarse_grid)
+                .set_interpolator(interpolator)
+                .set_default_pixel_value(0.0);
+            Ok(match &self.fixed_initial_transform {
+                Some(t) => resampler.execute(input, t)?,
+                None => resampler.execute(input, &AffineTransform::identity(dim))?,
+            })
+        };
+
+        let fixed_level = onto_virtual(&smoothed_fixed, Interpolator::Linear)?;
         let moving_level = recursive_gaussian(moving, sigma)?;
 
-        let fixed_mask_level = match &self.fixed_mask {
+        let inside_fixed =
+            if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
+                let ones = with_geometry_of(fixed, vec![1.0f64; fixed.size().iter().product()])?;
+                Some(onto_virtual(&ones, Interpolator::NearestNeighbor)?)
+            } else {
+                None
+            };
+        let user_mask = match &self.fixed_mask {
+            Some(mask) => Some(onto_virtual(mask, Interpolator::NearestNeighbor)?),
             None => None,
-            Some(mask) if factors.iter().all(|&f| f == 1) => Some(mask.clone()),
-            Some(mask) => {
-                let mut mask_resampler = ResampleImageFilter::new();
-                mask_resampler
-                    .set_reference_image(&coarse_grid)
-                    .set_interpolator(Interpolator::NearestNeighbor);
-                Some(mask_resampler.execute(mask, &AffineTransform::identity(dim))?)
-            }
         };
+        let fixed_mask_level = intersect_masks(inside_fixed, user_mask)?;
+
         Ok((fixed_level, moving_level, fixed_mask_level))
     }
 
@@ -1305,12 +1942,33 @@ impl ImageRegistrationMethod {
         level: usize,
         initial: T,
     ) -> Result<RegistrationResult<T>> {
-        let metric = self.build_metric(fixed, moving, fixed_mask, level)?;
-        metric.check_transform(&initial)?;
+        let metric = self.build_metric(
+            fixed,
+            moving,
+            fixed_mask,
+            self.sampling_strategy,
+            self.sampling_percentage(level),
+        )?;
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
         let backend = self.backend.as_ref();
+        let moving_initial = self.moving_initial_transform.as_ref();
+
+        // Every metric call goes through the moving-initial composition, so the
+        // optimizer sees the same objective the metric evaluates: the moving
+        // image is read at `moving_initial(transform(x))`. With no
+        // moving-initial transform this is a pass-through to `transform`.
+        macro_rules! composed {
+            () => {
+                Composed {
+                    optimized: &mut transform,
+                    moving_initial,
+                }
+            };
+        }
+
+        metric.check_transform(&composed!())?;
 
         // Both L-BFGS variants ignore parameter scales and the learning-rate
         // estimator (ITK's LBFGSBOptimizerv4/LBFGS2Optimizerv4 force identity
@@ -1324,7 +1982,7 @@ impl ImageRegistrationMethod {
         let needs_estimator = !ignores_scales
             && (matches!(self.scales_mode, ScalesMode::PhysicalShift)
                 || matches!(self.learning_rate_mode, LearningRateMode::Estimate(_)));
-        let estimator = needs_estimator.then(|| metric.physical_shift_scales(&transform));
+        let estimator = needs_estimator.then(|| metric.physical_shift_scales(&composed!()));
 
         let scales: Vec<f64> = if ignores_scales {
             vec![1.0; nparams]
@@ -1356,8 +2014,9 @@ impl ImageRegistrationMethod {
         macro_rules! objective {
             () => {
                 |p: &[f64]| {
-                    transform.set_parameters(p);
-                    let m = metric.evaluate(&transform, backend);
+                    let mut c = composed!();
+                    c.set_parameters(p);
+                    let m = metric.evaluate(&c, backend);
                     (m.value, m.derivative)
                 }
             };
@@ -1368,7 +2027,7 @@ impl ImageRegistrationMethod {
         macro_rules! line_search_objective {
             () => {
                 MetricObjective {
-                    transform: &mut transform,
+                    transform: composed!(),
                     metric: &metric,
                     backend,
                 }
@@ -1379,8 +2038,9 @@ impl ImageRegistrationMethod {
         macro_rules! value_objective {
             () => {
                 |p: &[f64]| {
-                    transform.set_parameters(p);
-                    metric.value(&transform, backend)
+                    let mut c = composed!();
+                    c.set_parameters(p);
+                    metric.value(&c, backend)
                 }
             };
         }
@@ -1408,8 +2068,9 @@ impl ImageRegistrationMethod {
                     // removes the need for this cap entirely.)
                     LearningRateMode::Estimate(EstimateLearningRate::Once) => {
                         let est = estimator.as_ref().unwrap();
-                        transform.set_parameters(&start);
-                        let m0 = metric.evaluate(&transform, backend);
+                        let mut c = composed!();
+                        c.set_parameters(&start);
+                        let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.optimize_with_lr(start, objective!(), |grad| {
                             lr_once.min(est.estimate_learning_rate(&scaled(grad)))
@@ -1441,8 +2102,9 @@ impl ImageRegistrationMethod {
                     // before any runaway step.
                     LearningRateMode::Estimate(EstimateLearningRate::Once) => {
                         let est = estimator.as_ref().unwrap();
-                        transform.set_parameters(&start);
-                        let m0 = metric.evaluate(&transform, backend);
+                        let mut c = composed!();
+                        c.set_parameters(&start);
+                        let m0 = metric.evaluate(&c, backend);
                         let scaled0 = scaled(&m0.derivative);
                         let grad_mag_0 = scaled0.iter().map(|g| g * g).sum::<f64>().sqrt();
                         optimizer
@@ -1482,8 +2144,9 @@ impl ImageRegistrationMethod {
                     // setter fixes the mode to `Once`.)
                     LearningRateMode::Estimate(_) => {
                         let est = estimator.as_ref().unwrap();
-                        transform.set_parameters(&start);
-                        let m0 = metric.evaluate(&transform, backend);
+                        let mut c = composed!();
+                        c.set_parameters(&start);
+                        let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
                         optimizer.optimize_objective(start, line_search_objective!())
@@ -1506,8 +2169,9 @@ impl ImageRegistrationMethod {
                     // no per-iteration re-estimation or step cap is needed.
                     LearningRateMode::Estimate(_) => {
                         let est = estimator.as_ref().unwrap();
-                        transform.set_parameters(&start);
-                        let m0 = metric.evaluate(&transform, backend);
+                        let mut c = composed!();
+                        c.set_parameters(&start);
+                        let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
                         optimizer.optimize_objective(start, line_search_objective!())
@@ -1552,8 +2216,11 @@ impl ImageRegistrationMethod {
             }
         };
 
-        transform.set_parameters(&result.parameters);
-        let final_metric = metric.evaluate(&transform, backend);
+        let final_metric = {
+            let mut c = composed!();
+            c.set_parameters(&result.parameters);
+            metric.evaluate(&c, backend)
+        };
         if final_metric.valid_points == 0 {
             return Err(RegistrationError::NoValidSamples);
         }
@@ -1565,6 +2232,577 @@ impl ImageRegistrationMethod {
             stop_reason: result.stop_reason,
             valid_points: final_metric.valid_points,
         })
+    }
+}
+
+#[cfg(test)]
+mod initial_transform_tests {
+    use super::*;
+    use sitk_transform::{Euler2DTransform, ScaleTransform};
+
+    /// A 2-D Gaussian blob of width `sigma` centred at the **physical** point
+    /// `center`, sampled on a grid of `size` voxels at `spacing` from `origin`
+    /// (identity direction). The same continuous function sampled on two
+    /// different grids gives two images that agree in physical space, which is
+    /// what lets a virtual domain unrelated to either grid still register them.
+    fn blob(
+        size: &[usize],
+        spacing: &[f64],
+        origin: &[f64],
+        center: [f64; 2],
+        sigma: f64,
+    ) -> Image {
+        let (w, h) = (size[0], size[1]);
+        let s2 = 2.0 * sigma * sigma;
+        let mut v = vec![0.0f64; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let px = origin[0] + x as f64 * spacing[0];
+                let py = origin[1] + y as f64 * spacing[1];
+                let (dx, dy) = (px - center[0], py - center[1]);
+                v[y * w + x] = (-(dx * dx + dy * dy) / s2).exp();
+            }
+        }
+        let mut image = Image::from_vec(&[w, h], v).unwrap();
+        image.set_spacing(spacing).unwrap();
+        image.set_origin(origin).unwrap();
+        image
+    }
+
+    /// The 3×3 ramp `f(x, y) = 3y + x`, unit spacing at the origin. Every
+    /// one-voxel step in `+x` raises it by exactly 1, so a translated
+    /// mean-squares evaluation over it is exact integer arithmetic.
+    fn ramp3x3() -> Image {
+        Image::from_vec(&[3, 3], (0..9).map(f64::from).collect::<Vec<f64>>()).unwrap()
+    }
+
+    fn translation(tx: f64, ty: f64) -> Transform {
+        TranslationTransform::new(vec![tx, ty]).into()
+    }
+
+    /// A fully-recovered translation is the fixture the composition-order tests
+    /// read: two identical blobs, so the optimum of `optimized` is whatever the
+    /// initial transforms leave for it to undo.
+    fn recover_translation(
+        reg: &ImageRegistrationMethod,
+        fixed: &Image,
+        moving: &Image,
+    ) -> Vec<f64> {
+        reg.execute(fixed, moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap()
+            .transform
+            .parameters()
+    }
+
+    // ---- MetricEvaluate --------------------------------------------------
+
+    /// Mean squares of the ramp against itself under a one-voxel translation.
+    ///
+    /// The metric samples the moving image at `T(x) = x + (1, 0)`. For the six
+    /// virtual points with `x < 2` that lands one voxel right, where the ramp is
+    /// exactly 1 greater; the three points at `x == 2` map to continuous index
+    /// 3.0, outside a size-3 buffer, and are not samples. So the value is
+    /// `(1/6)·Σ 1² = 1`, with no floating-point slack at all.
+    #[test]
+    fn metric_evaluate_of_a_one_voxel_translation_is_hand_computable() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_initial_transform(translation(1.0, 0.0));
+
+        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 1.0);
+    }
+
+    /// Two voxels right: only the `x == 0` column stays inside, its three
+    /// samples each differing by exactly 2, so the value is `(1/3)·Σ 2² = 4`.
+    #[test]
+    fn metric_evaluate_scales_with_the_squared_difference() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_initial_transform(translation(2.0, 0.0));
+
+        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 4.0);
+    }
+
+    /// With no initial transform the metric evaluates at the identity, so an
+    /// image against itself scores 0.
+    #[test]
+    fn metric_evaluate_defaults_to_the_identity_transform() {
+        let image = ramp3x3();
+        let reg = ImageRegistrationMethod::new();
+        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 0.0);
+    }
+
+    /// `EvaluateInternal` builds no `itk::ImageRegistrationMethodv4`, and the
+    /// sampling strategy lives on that object — so `MetricEvaluate` samples the
+    /// virtual domain densely no matter how the strategy is configured
+    /// (ledger §3.35). Same for the multi-resolution schedule.
+    #[test]
+    fn metric_evaluate_ignores_the_sampling_strategy_and_the_pyramid() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_initial_transform(translation(1.0, 0.0))
+            .set_metric_sampling_strategy(SamplingStrategy::Random)
+            .set_metric_sampling_percentage(0.1, 7)
+            .set_shrink_factors_per_level(vec![4, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 0.0]);
+
+        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 1.0);
+    }
+
+    /// `MetricEvaluate` performs no optimization: it leaves the stored initial
+    /// transform exactly as it was set, and takes `&self`.
+    #[test]
+    fn metric_evaluate_does_not_optimize_the_initial_transform() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_initial_transform(translation(2.0, 0.0));
+
+        reg.metric_evaluate(&image, &image).unwrap();
+        assert_eq!(
+            reg.initial_transform().unwrap().parameters(),
+            vec![2.0, 0.0]
+        );
+    }
+
+    // ---- composition order -----------------------------------------------
+
+    /// The moving-initial transform is applied **after** the optimized one:
+    /// `moving_initial(optimized(x))`, per `itk::CompositeTransform`'s
+    /// reverse-queue evaluation. Pinned against the reversed order with a
+    /// non-commuting pair — a scale and a translation.
+    #[test]
+    fn composed_applies_the_optimized_transform_before_the_moving_initial_one() {
+        let moving_initial: Transform = ScaleTransform::new(vec![2.0, 2.0], vec![0.0, 0.0]).into();
+        let mut optimized = TranslationTransform::new(vec![1.0, 0.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: Some(&moving_initial),
+        };
+
+        // scale(translate(x)) = 2·(x + (1,0)) = (2x₀ + 2, 2x₁)
+        assert_eq!(composed.transform_point(&[3.0, 5.0]), vec![8.0, 10.0]);
+        // The reversed order, translate(scale(x)) = (2x₀ + 1, 2x₁), would give
+        // [7, 10] — this is the assertion that fixes the order.
+    }
+
+    /// Without a moving-initial transform the composition is the identity
+    /// wrapper: every accessor is the optimized transform's own.
+    #[test]
+    fn composed_without_a_moving_initial_transform_is_a_pass_through() {
+        let mut optimized = Euler2DTransform::new(0.3, [1.0, 2.0], [3.0, 4.0]);
+        let expected_point = optimized.transform_point(&[5.0, 6.0]);
+        let expected_jacobian = optimized.jacobian_wrt_parameters(&[5.0, 6.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: None,
+        };
+
+        assert_eq!(composed.transform_point(&[5.0, 6.0]), expected_point);
+        assert_eq!(
+            composed.jacobian_wrt_parameters(&[5.0, 6.0]),
+            expected_jacobian
+        );
+    }
+
+    /// The chain-ruled parameter Jacobian `J_g(f(x))·J_f(x)` is the true
+    /// derivative of the composed map, so the gradient the optimizer descends is
+    /// the gradient of the objective the metric evaluates.
+    #[test]
+    fn composed_parameter_jacobian_matches_a_finite_difference() {
+        let moving_initial: Transform = Euler2DTransform::new(0.4, [2.0, -1.0], [1.0, 1.0]).into();
+        let mut optimized = Euler2DTransform::new(0.2, [1.0, 3.0], [4.0, 2.0]);
+        let point = [7.0, -3.0];
+
+        let (dim, nparams) = (2usize, 3usize);
+        let analytic = {
+            let composed = Composed {
+                optimized: &mut optimized,
+                moving_initial: Some(&moving_initial),
+            };
+            composed.jacobian_wrt_parameters(&point)
+        };
+
+        let h = 1e-6;
+        let base = optimized.parameters();
+        for k in 0..nparams {
+            let mut plus = base.clone();
+            plus[k] += h;
+            let mut minus = base.clone();
+            minus[k] -= h;
+
+            let at = |p: &[f64]| {
+                let mut t = optimized.clone();
+                t.set_parameters(p);
+                let composed = Composed {
+                    optimized: &mut t,
+                    moving_initial: Some(&moving_initial),
+                };
+                composed.transform_point(&point)
+            };
+            let (fp, fm) = (at(&plus), at(&minus));
+            for i in 0..dim {
+                let fd = (fp[i] - fm[i]) / (2.0 * h);
+                assert!(
+                    (analytic[i * nparams + k] - fd).abs() < 1e-5,
+                    "d(out[{i}])/d(p[{k}]): analytic {} vs finite difference {fd}",
+                    analytic[i * nparams + k]
+                );
+            }
+        }
+    }
+
+    /// The fixed- and moving-initial transforms sit on opposite sides of the
+    /// metric's comparison, so the same translation pushes the optimum the
+    /// opposite way.
+    ///
+    /// With identical images the metric compares `F(fixed_initial(x))` against
+    /// `M(moving_initial(optimized(x)))`:
+    ///
+    /// - a moving-initial `+d` is undone by `optimized = −d`, because the moving
+    ///   sample point is `x + optimized + d` and must land back on `x`;
+    /// - a fixed-initial `+d` moves the fixed sample point to `x + d`, which the
+    ///   moving sample point `x + optimized` matches only at `optimized = +d`.
+    #[test]
+    fn moving_and_fixed_initial_transforms_displace_the_optimum_in_opposite_directions() {
+        let size = [40usize, 40];
+        let spacing = [1.0f64, 1.0];
+        let origin = [0.0f64, 0.0];
+        let image = blob(&size, &spacing, &origin, [20.0, 20.0], 7.0);
+        let (dx, dy) = (3.0f64, -2.0);
+
+        let configure = |reg: &mut ImageRegistrationMethod| {
+            reg.set_metric_as_mean_squares()
+                .set_optimizer_scales_from_physical_shift()
+                .set_optimizer_as_regular_step_gradient_descent_estimated(
+                    1e-6,
+                    300,
+                    1e-8,
+                    EstimateLearningRate::Once,
+                );
+        };
+
+        let mut moving_side = ImageRegistrationMethod::new();
+        configure(&mut moving_side);
+        moving_side.set_moving_initial_transform(translation(dx, dy));
+        let p_moving = recover_translation(&moving_side, &image, &image);
+
+        let mut fixed_side = ImageRegistrationMethod::new();
+        configure(&mut fixed_side);
+        fixed_side.set_fixed_initial_transform(translation(dx, dy));
+        let p_fixed = recover_translation(&fixed_side, &image, &image);
+
+        assert!(
+            (p_moving[0] + dx).abs() < 1e-2 && (p_moving[1] + dy).abs() < 1e-2,
+            "moving-initial optimum {p_moving:?}, expected [{}, {}]",
+            -dx,
+            -dy
+        );
+        assert!(
+            (p_fixed[0] - dx).abs() < 1e-2 && (p_fixed[1] - dy).abs() < 1e-2,
+            "fixed-initial optimum {p_fixed:?}, expected [{dx}, {dy}]"
+        );
+        // The statement of the test: opposite signs on both axes.
+        assert!(p_moving[0] * p_fixed[0] < 0.0 && p_moving[1] * p_fixed[1] < 0.0);
+    }
+
+    /// A moving-initial transform absorbs the alignment an earlier stage already
+    /// found: with it set to the true offset the optimizer starts at the optimum
+    /// and stays there, and the metric there is ~0.
+    #[test]
+    fn a_moving_initial_transform_carries_a_previous_stage_alignment() {
+        let size = [40usize, 40];
+        let (spacing, origin) = ([1.0f64, 1.0], [0.0f64, 0.0]);
+        let fixed = blob(&size, &spacing, &origin, [20.0, 20.0], 7.0);
+        let moving = blob(&size, &spacing, &origin, [23.0, 18.0], 7.0);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_moving_initial_transform(translation(3.0, -2.0))
+            .set_initial_transform(translation(0.0, 0.0));
+
+        // F(x) vs M(x + (3,−2)) — the blobs coincide, so mean squares is ~0.
+        let value = reg.metric_evaluate(&fixed, &moving).unwrap();
+        assert!(value < 1e-12, "metric at the composed optimum was {value}");
+
+        // Without it, the same evaluation sees the full 3-voxel misalignment.
+        let mut plain = ImageRegistrationMethod::new();
+        plain.set_metric_as_mean_squares();
+        assert!(plain.metric_evaluate(&fixed, &moving).unwrap() > 1e-3);
+    }
+
+    // ---- in-place ---------------------------------------------------------
+
+    fn in_place_fixture() -> (Image, Image) {
+        let size = [40usize, 40];
+        let (spacing, origin) = ([1.0f64, 1.0], [0.0f64, 0.0]);
+        (
+            blob(&size, &spacing, &origin, [20.0, 20.0], 7.0),
+            blob(&size, &spacing, &origin, [23.0, 18.0], 7.0),
+        )
+    }
+
+    fn tuned(reg: &mut ImageRegistrationMethod) {
+        reg.set_metric_as_mean_squares()
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                1e-6,
+                300,
+                1e-8,
+                EstimateLearningRate::Once,
+            );
+    }
+
+    /// In place: the stored transform is updated to the optimum and `Execute`
+    /// hands back that same concrete transform kind.
+    #[test]
+    fn in_place_execute_updates_the_stored_transform_and_keeps_its_kind() {
+        let (fixed, moving) = in_place_fixture();
+        let mut reg = ImageRegistrationMethod::new();
+        tuned(&mut reg);
+        reg.set_initial_transform(translation(0.0, 0.0));
+        assert!(reg.initial_transform_in_place());
+
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+
+        assert!(matches!(result.transform, Transform::Translation(_)));
+        let optimum = result.transform.parameters();
+        assert!((optimum[0] - 3.0).abs() < 1e-2 && (optimum[1] + 2.0).abs() < 1e-2);
+        assert_eq!(reg.initial_transform().unwrap().parameters(), optimum);
+    }
+
+    /// Not in place: the stored transform keeps its starting values, and the
+    /// optimum comes back wrapped in a single-entry `CompositeTransform`
+    /// (ledger §3.34).
+    #[test]
+    fn not_in_place_execute_leaves_the_stored_transform_and_returns_a_composite() {
+        let (fixed, moving) = in_place_fixture();
+        let mut reg = ImageRegistrationMethod::new();
+        tuned(&mut reg);
+        reg.set_initial_transform_in_place(translation(0.0, 0.0), false);
+        assert!(!reg.initial_transform_in_place());
+
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+
+        let sub = match &result.transform {
+            Transform::Composite(c) => {
+                assert_eq!(c.number_of_transforms(), 1);
+                c.nth_transform(0).unwrap()
+            }
+            other => panic!("expected a composite, got {other:?}"),
+        };
+        assert!(matches!(sub, Transform::Translation(_)));
+        let optimum = sub.parameters();
+        assert!((optimum[0] - 3.0).abs() < 1e-2 && (optimum[1] + 2.0).abs() < 1e-2);
+
+        // The stored transform never moved.
+        assert_eq!(
+            reg.initial_transform().unwrap().parameters(),
+            vec![0.0, 0.0]
+        );
+    }
+
+    /// The two modes reach the same optimum; they differ only in what they
+    /// write back and what they hand out.
+    #[test]
+    fn in_place_and_not_in_place_agree_on_the_optimum() {
+        let (fixed, moving) = in_place_fixture();
+
+        let mut a = ImageRegistrationMethod::new();
+        tuned(&mut a);
+        a.set_initial_transform_in_place(translation(0.0, 0.0), true);
+        let ra = a.execute_with_initial_transform(&fixed, &moving).unwrap();
+
+        let mut b = ImageRegistrationMethod::new();
+        tuned(&mut b);
+        b.set_initial_transform_in_place(translation(0.0, 0.0), false);
+        let rb = b.execute_with_initial_transform(&fixed, &moving).unwrap();
+
+        assert_eq!(ra.transform.parameters(), rb.transform.parameters());
+        assert_eq!(ra.metric_value, rb.metric_value);
+    }
+
+    /// The single-argument setter turns the in-place flag back on, exactly as
+    /// `SetInitialTransform(const Transform &)` does after a
+    /// `SetInitialTransform(t, false)`.
+    #[test]
+    fn the_single_argument_setter_restores_the_in_place_flag() {
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_initial_transform_in_place(translation(0.0, 0.0), false);
+        assert!(!reg.initial_transform_in_place());
+        reg.set_initial_transform(translation(0.0, 0.0));
+        assert!(reg.initial_transform_in_place());
+    }
+
+    #[test]
+    fn execute_without_an_initial_transform_errors() {
+        let (fixed, moving) = in_place_fixture();
+        let mut reg = ImageRegistrationMethod::new();
+        assert!(matches!(
+            reg.execute_with_initial_transform(&fixed, &moving),
+            Err(RegistrationError::NoInitialTransform)
+        ));
+    }
+
+    // ---- virtual domain ---------------------------------------------------
+
+    /// The virtual domain is the grid the metric samples in, and it is unrelated
+    /// to either image's grid. Here all three geometries differ — the fixed
+    /// image is 40² at spacing 1 from the origin, the moving image 80² at
+    /// spacing 0.5 from `(−5, −5)`, and the virtual domain 20² at spacing 1.5
+    /// from `(8, 8)` — and the same physical translation is still recovered,
+    /// because every transform acts in physical space.
+    #[test]
+    fn a_virtual_domain_unrelated_to_both_images_still_recovers_the_translation() {
+        let (tx, ty) = (3.0f64, -2.0);
+        let fixed = blob(&[40, 40], &[1.0, 1.0], &[0.0, 0.0], [20.0, 20.0], 7.0);
+        let moving = blob(
+            &[80, 80],
+            &[0.5, 0.5],
+            &[-5.0, -5.0],
+            [20.0 + tx, 20.0 + ty],
+            7.0,
+        );
+
+        let mut reg = ImageRegistrationMethod::new();
+        tuned(&mut reg);
+        reg.set_virtual_domain(
+            vec![20, 20],
+            vec![8.0, 8.0],
+            vec![1.5, 1.5],
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        let p = recover_translation(&reg, &fixed, &moving);
+        assert!(
+            (p[0] - tx).abs() < 5e-2 && (p[1] - ty).abs() < 5e-2,
+            "recovered {p:?}, expected [{tx}, {ty}]"
+        );
+    }
+
+    /// A virtual domain equal to the fixed image's geometry is ITK's own
+    /// fallback, so setting it must change nothing.
+    #[test]
+    fn a_virtual_domain_equal_to_the_fixed_grid_is_a_no_op() {
+        let (fixed, moving) = in_place_fixture();
+
+        let mut plain = ImageRegistrationMethod::new();
+        plain.set_metric_as_mean_squares();
+        let a = plain.metric_evaluate(&fixed, &moving).unwrap();
+
+        let mut with_domain = ImageRegistrationMethod::new();
+        with_domain
+            .set_metric_as_mean_squares()
+            .set_virtual_domain_from_image(&fixed);
+        let b = with_domain.metric_evaluate(&fixed, &moving).unwrap();
+
+        assert_eq!(a, b);
+    }
+
+    /// `SetVirtualDomainFromImage` copies the image's four geometry fields and
+    /// nothing else — a virtual domain taken from the *moving* image samples on
+    /// the moving grid.
+    #[test]
+    fn set_virtual_domain_from_image_copies_the_geometry() {
+        let moving = blob(&[80, 80], &[0.5, 0.5], &[-5.0, -5.0], [20.0, 20.0], 7.0);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_virtual_domain_from_image(&moving);
+
+        let domain = reg.virtual_domain.as_ref().unwrap();
+        assert_eq!(domain.size, moving.size());
+        assert_eq!(domain.origin, moving.origin());
+        assert_eq!(domain.spacing, moving.spacing());
+        assert_eq!(domain.direction, moving.direction());
+    }
+
+    /// A virtual point whose mapped fixed point falls outside the fixed image is
+    /// not a sample (ITK's `pointIsValid == false`), rather than a sample of the
+    /// resampler's default pixel value.
+    ///
+    /// The moving image is one column *wider* than the fixed one, and the
+    /// virtual domain covers that wider extent. The last virtual column maps to
+    /// fixed index 3 — outside a size-3 buffer — while mapping to a perfectly
+    /// valid moving voxel, so only the fixed side can drop it. The two images
+    /// agree everywhere they overlap, so:
+    ///
+    /// - dropping the column (ITK's behavior, and this port's) gives 0;
+    /// - zero-filling it from the resampler's default pixel value would give
+    ///   `(1/12)·3·100² = 2500`.
+    #[test]
+    fn virtual_points_outside_the_fixed_image_are_dropped_not_zero_filled() {
+        let fixed = ramp3x3();
+        let moving = Image::from_vec(
+            &[4, 3],
+            (0..3)
+                .flat_map(|y| (0..4).map(move |x| if x < 3 { f64::from(3 * y + x) } else { 100.0 }))
+                .collect::<Vec<f64>>(),
+        )
+        .unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_virtual_domain(
+                vec![4, 3],
+                vec![0.0, 0.0],
+                vec![1.0, 1.0],
+                vec![1.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+
+        assert_eq!(reg.metric_evaluate(&fixed, &moving).unwrap(), 0.0);
+    }
+
+    /// The fixed-initial transform reaches the fixed image the same way, so a
+    /// fixed-initial `+1` voxel shift reads the ramp one voxel right — the
+    /// mirror of the moving-side evaluation, and the sample that maps outside is
+    /// again dropped. `F(x + 1) − M(x) = 1` over the six survivors.
+    #[test]
+    fn a_fixed_initial_transform_shifts_the_fixed_sample_point() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares()
+            .set_fixed_initial_transform(translation(1.0, 0.0));
+
+        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn set_virtual_domain_rejects_mismatched_vector_lengths() {
+        let mut reg = ImageRegistrationMethod::new();
+        assert!(matches!(
+            reg.set_virtual_domain(vec![4, 4], vec![0.0], vec![1.0, 1.0], vec![1.0; 4]),
+            Err(RegistrationError::VirtualDomainLength {
+                field: "origin",
+                got: 1,
+                expected: 2
+            })
+        ));
+        assert!(matches!(
+            reg.set_virtual_domain(vec![4, 4], vec![0.0; 2], vec![1.0; 2], vec![1.0; 3]),
+            Err(RegistrationError::VirtualDomainLength {
+                field: "direction",
+                got: 3,
+                expected: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn a_three_dimensional_initial_transform_on_two_dimensional_images_errors() {
+        let image = ramp3x3();
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_moving_initial_transform(TranslationTransform::new(vec![0.0; 3]).into());
+        assert!(matches!(
+            reg.metric_evaluate(&image, &image),
+            Err(RegistrationError::TransformDimensionMismatch {
+                transform: 3,
+                image: 2
+            })
+        ));
     }
 }
 
