@@ -54,6 +54,7 @@ use crate::{FilterError, Result};
 mod inverse;
 mod invert;
 mod iterative_inverse;
+mod jacobian_determinant;
 
 pub use inverse::inverse_displacement_field;
 pub use invert::{
@@ -61,6 +62,9 @@ pub use invert::{
 };
 pub use iterative_inverse::{
     IterativeInverseDisplacementFieldSettings, iterative_inverse_displacement_field,
+};
+pub use jacobian_determinant::{
+    DisplacementFieldJacobianDeterminantSettings, displacement_field_jacobian_determinant,
 };
 
 /// Check that `img` is what SimpleITK's `GetImageFromVectorImage` accepts as a
@@ -250,7 +254,7 @@ impl Field {
             .then(|| self.evaluate_at_continuous_index(&cindex))
     }
 
-    fn linear_index(&self, index: &[usize]) -> usize {
+    pub(crate) fn linear_index(&self, index: &[usize]) -> usize {
         let mut offset = 0usize;
         let mut stride = 1usize;
         for (&i, &s) in index.iter().zip(&self.size) {
