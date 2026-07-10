@@ -49,6 +49,7 @@ use crate::gipl::GiplImageIo;
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
+use crate::png::PngImageIo;
 use crate::vtk::VtkImageIo;
 use crate::writer::WriteOptions;
 
@@ -181,6 +182,7 @@ static NRRD_IMAGE_IO: NrrdImageIo = NrrdImageIo;
 static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
 static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
+static PNG_IMAGE_IO: PngImageIo = PngImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -188,14 +190,14 @@ static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 /// both `CreateImageIO` and `GetRegisteredImageIOs` iterate. Probe order is
 /// this order, so an earlier entry wins a tie.
 ///
-/// [`MetaImageIo`], [`NrrdImageIo`], [`NiftiImageIo`] and [`VtkImageIo`]
-/// advertise disjoint extension sets, so their relative order decides nothing
-/// for a named file. It does matter in phase 2 of [`create_image_io`], where an
-/// extension-less path is offered to every IO in turn: `MetaImageIo::
-/// can_read_file` re-checks the extension and declines, `NrrdImageIo::
-/// can_read_file` probes the magic and may claim it, and `NiftiImageIo::
-/// can_read_file` then resolves the file through `nifti_findhdrname` and may
-/// claim it.
+/// [`MetaImageIo`], [`NrrdImageIo`], [`NiftiImageIo`], [`VtkImageIo`] and
+/// [`PngImageIo`] advertise disjoint extension sets, so their relative order
+/// decides nothing for a named file. It does matter in phase 2 of
+/// [`create_image_io`], where an extension-less path is offered to every IO in
+/// turn: `MetaImageIo::can_read_file` re-checks the extension and declines,
+/// `NrrdImageIo::can_read_file` probes the magic and may claim it, and
+/// `NiftiImageIo::can_read_file` then resolves the file through
+/// `nifti_findhdrname` and may claim it.
 ///
 /// [`GiplImageIo`] advertises *no* extensions — `itk::GiplImageIO`'s
 /// constructor registers none — so it is reachable only from phase 2, where its
@@ -204,6 +206,7 @@ static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 ///
 /// [`VtkImageIo`]: crate::vtk::VtkImageIo
 /// [`GiplImageIo`]: crate::gipl::GiplImageIo
+/// [`PngImageIo`]: crate::png::PngImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
         &META_IMAGE_IO,
@@ -211,6 +214,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &NIFTI_IMAGE_IO,
         &GIPL_IMAGE_IO,
         &VTK_IMAGE_IO,
+        &PNG_IMAGE_IO,
     ];
     IOS
 }

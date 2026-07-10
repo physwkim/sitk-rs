@@ -36,6 +36,17 @@
 //! NIfTI is the odd one out: `znzopen(fname, "wb", ...)` never names a level,
 //! so nifti always compresses at zlib's `Z_DEFAULT_COMPRESSION` (6) and ignores
 //! `SetCompressionLevel` entirely (§3.40).
+//!
+//! PNG differs again: `PNGImageIO` constructs with `SetMaximumCompressionLevel(9)`
+//! then `SetCompressionLevel(4)` (itkPNGImageIO.cxx:271-272) — the same ceiling
+//! as MetaImage/NRRD but a different default — and its own constructor calls
+//! `UseCompressionOff()` (`:267`). `Write` only calls
+//! `png_set_compression_level(png_ptr, GetCompressionLevel())` **inside `if
+//! (m_UseCompression)`** (`:661-665`); PNG's deflate stream is written either
+//! way (compression is inherent to the format), so `m_UseCompression = false`
+//! — SimpleITK's default — leaves libpng/zlib at their own built-in default,
+//! `Z_DEFAULT_COMPRESSION` (6), not at `m_CompressionLevel`'s `4`. Only a
+//! caller that turns compression on ever sees the `4`. See [`crate::png`].
 
 use std::io::{Read, Write};
 
@@ -61,6 +72,12 @@ pub const ITK_DEFAULT_COMPRESSION_LEVEL: i32 = 2;
 /// `Z_DEFAULT_COMPRESSION` as zlib resolves it — the level `gzopen(path, "wb")`
 /// uses, and therefore the only level nifti ever compresses at.
 pub const ZLIB_DEFAULT_COMPRESSION_LEVEL: i32 = 6;
+
+/// `SetCompressionLevel(4)`, `PNGImageIO`'s own default (itkPNGImageIO.cxx:272)
+/// — the level PNG writes at when `m_UseCompression` is true and the caller
+/// never overrode it. Distinct from [`ITK_DEFAULT_COMPRESSION_LEVEL`], which is
+/// MetaImage's/NRRD's `2`.
+pub const PNG_DEFAULT_COMPRESSION_LEVEL: i32 = 4;
 
 /// The two bytes `gz_look` / `check_header` test for.
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
