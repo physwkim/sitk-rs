@@ -4,6 +4,7 @@
 //! it maps a point in the **output** image's physical space to the **input**
 //! image's physical space (ITK's backward mapping convention).
 
+use crate::error::{Result, TransformError};
 use sitk_core::matrix;
 
 /// A spatial coordinate transform.
@@ -1041,6 +1042,100 @@ impl VersorRigid3DTransform {
     /// Translation offset actually applied (`y = M·x + offset`).
     pub fn offset(&self) -> &[f64] {
         &self.offset
+    }
+
+    /// Set the rotation from a row-major 3×3 matrix, converting it to the
+    /// equivalent versor via the branch method of
+    /// `itk::Versor<T>::Set(const MatrixType&)`
+    /// (`itkVersor.hxx:301-381`, Shepperd 1978) — the same conversion
+    /// `itk::VersorRigid3DTransform` performs internally whenever `SetMatrix`
+    /// is called, via `MatrixOffsetTransformBase::SetMatrix`
+    /// (`itkMatrixOffsetTransformBase.h:232-236`) invoking the virtual
+    /// `VersorTransform::ComputeMatrixParameters`
+    /// (`itkVersorTransform.hxx:130-135`): `m_Versor.Set(this->GetMatrix())`.
+    ///
+    /// Errors with [`TransformError::NotARotationMatrix`] if `matrix` is not
+    /// orthonormal (`m·mᵀ ≈ I`) or is a reflection (`det < 0`), to within
+    /// `itk::Versor<double>`'s own tolerance (`Epsilon() = 1e-10`,
+    /// `itkVersor.h:305-309`), mirroring the `itkGenericExceptionMacro` guard
+    /// in `Versor::Set` (`itkVersor.hxx:323-338`).
+    ///
+    /// Unlike ITK — which stores `matrix` verbatim in `m_Matrix` and only
+    /// *derives* the versor (parameters) from it, so a later `GetMatrix()`
+    /// echoes the caller's input exactly — this port has no separate cached
+    /// matrix distinct from the versor: [`matrix`](Self::matrix) is always
+    /// re-derived from the stored versor (as every other mutator on this type
+    /// already does), so it can differ from the `matrix` argument by a few
+    /// ULPs of floating-point rounding (ledger §4.45).
+    pub fn set_matrix(&mut self, matrix: &[f64]) -> Result<()> {
+        assert_eq!(matrix.len(), 9, "matrix must be row-major 3x3");
+        const EPS: f64 = 1e-10;
+
+        let m = |r: usize, c: usize| matrix[r * 3 + c];
+        let mt = |r: usize, c: usize| m(c, r);
+        // I = m * m^T; check orthonormality and that it isn't a reflection.
+        let dot_row = |r: usize, c: usize| (0..3).map(|k| m(r, k) * mt(k, c)).sum::<f64>();
+        let orthonormal = (dot_row(0, 1)).abs() <= EPS
+            && (dot_row(0, 2)).abs() <= EPS
+            && (dot_row(1, 2)).abs() <= EPS
+            && (dot_row(0, 0) - 1.0).abs() <= EPS
+            && (dot_row(1, 1) - 1.0).abs() <= EPS
+            && (dot_row(2, 2) - 1.0).abs() <= EPS;
+        let det = m(0, 0) * (m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1))
+            - m(0, 1) * (m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0))
+            + m(0, 2) * (m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0));
+        if !orthonormal || det < 0.0 {
+            return Err(TransformError::NotARotationMatrix);
+        }
+
+        let (mut x, mut y, mut z, mut w);
+        let trace = m(0, 0) + m(1, 1) + m(2, 2) + 1.0;
+        if trace > EPS {
+            let s = 0.5 / trace.sqrt();
+            w = 0.25 / s;
+            x = (m(2, 1) - m(1, 2)) * s;
+            y = (m(0, 2) - m(2, 0)) * s;
+            z = (m(1, 0) - m(0, 1)) * s;
+        } else if m(0, 0) > m(1, 1) && m(0, 0) > m(2, 2) {
+            let s = 2.0 * (1.0 + m(0, 0) - m(1, 1) - m(2, 2)).sqrt();
+            x = 0.25 * s;
+            y = (m(0, 1) + m(1, 0)) / s;
+            z = (m(0, 2) + m(2, 0)) / s;
+            w = (m(1, 2) - m(2, 1)) / s;
+        } else if m(1, 1) > m(2, 2) {
+            let s = 2.0 * (1.0 + m(1, 1) - m(0, 0) - m(2, 2)).sqrt();
+            x = (m(0, 1) + m(1, 0)) / s;
+            y = 0.25 * s;
+            z = (m(1, 2) + m(2, 1)) / s;
+            w = (m(0, 2) - m(2, 0)) / s;
+        } else {
+            let s = 2.0 * (1.0 + m(2, 2) - m(0, 0) - m(1, 1)).sqrt();
+            x = (m(0, 2) + m(2, 0)) / s;
+            y = (m(1, 2) + m(2, 1)) / s;
+            z = 0.25 * s;
+            w = (m(0, 1) - m(1, 0)) / s;
+        }
+
+        // Normalize (`Versor::Normalize`), then canonicalize to a
+        // non-negative scalar part by negating all four components together
+        // — required since this type always reconstructs
+        // `w = +sqrt(1 - vx^2 - vy^2 - vz^2)` from the stored right part, and
+        // a versor and its negation represent the same rotation only if
+        // negated as a whole (the double cover of SO(3)).
+        let norm = (x * x + y * y + z * z + w * w).sqrt();
+        x /= norm;
+        y /= norm;
+        z /= norm;
+        w /= norm;
+        if w < 0.0 {
+            x = -x;
+            y = -y;
+            z = -z;
+        }
+
+        self.set_versor(x, y, z);
+        self.recompute();
+        Ok(())
     }
 
     /// Set the normalized versor from a right part, mirroring
@@ -3329,6 +3424,61 @@ mod tests {
             (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
         );
         assert_eq!(v.translation(), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn set_matrix_recovers_known_versor_for_z_rotation() {
+        use std::f64::consts::FRAC_PI_4;
+        // Rz(90 deg), row-major: (1,0,0) -> (0,1,0).
+        let rz90 = vec![0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let mut v = VersorRigid3DTransform::identity();
+        v.set_matrix(&rz90).unwrap();
+
+        let half = FRAC_PI_4; // half of 90 degrees
+        assert!(v.versor_x().abs() < 1e-12);
+        assert!(v.versor_y().abs() < 1e-12);
+        assert!((v.versor_z() - half.sin()).abs() < 1e-12);
+        assert!((v.versor_w() - half.cos()).abs() < 1e-12);
+
+        let p = v.transform_point(&[1.0, 0.0, 7.0]);
+        assert!(
+            p[0].abs() < 1e-12 && (p[1] - 1.0).abs() < 1e-12 && (p[2] - 7.0).abs() < 1e-12,
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn set_matrix_keeps_center_fixed_and_updates_offset() {
+        let center = [1.0, 2.0, 3.0];
+        let mut v = VersorRigid3DTransform::new(0.0, 0.0, 0.0, [5.0, -1.0, 0.0], center);
+        let rz90 = vec![0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        v.set_matrix(&rz90).unwrap();
+
+        assert_eq!(v.center(), &center);
+        assert_eq!(v.translation(), &[5.0, -1.0, 0.0]);
+        // y(center) = R*(center-center) + center + translation = center + translation.
+        let y = v.transform_point(&center);
+        assert!(
+            (y[0] - 6.0).abs() < 1e-12 && (y[1] - 1.0).abs() < 1e-12 && (y[2] - 3.0).abs() < 1e-12,
+            "{y:?}"
+        );
+    }
+
+    #[test]
+    fn set_matrix_rejects_non_orthonormal_matrix() {
+        let scaled = vec![2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0];
+        let mut v = VersorRigid3DTransform::identity();
+        let err = v.set_matrix(&scaled).unwrap_err();
+        assert!(matches!(err, TransformError::NotARotationMatrix));
+    }
+
+    #[test]
+    fn set_matrix_rejects_reflection() {
+        // det = -1: a valid orthonormal matrix, but a reflection, not a rotation.
+        let reflect_z = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+        let mut v = VersorRigid3DTransform::identity();
+        let err = v.set_matrix(&reflect_z).unwrap_err();
+        assert!(matches!(err, TransformError::NotARotationMatrix));
     }
 
     #[test]

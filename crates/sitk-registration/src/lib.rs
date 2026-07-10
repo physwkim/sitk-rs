@@ -116,9 +116,12 @@
 //! [`PhysicalShiftScales`]: crate::PhysicalShiftScales
 
 pub mod ants_correlation;
+pub mod bspline_initializer;
+pub mod centered_versor;
 pub mod convergence;
 pub mod correlation;
 pub mod demons;
+mod eigen;
 pub mod error;
 pub mod gradient_free;
 pub mod initializer;
@@ -133,6 +136,8 @@ pub mod optimizer;
 pub mod scales;
 
 pub use ants_correlation::AntsNeighborhoodCorrelationMetric;
+pub use bspline_initializer::BSplineTransformInitializer;
+pub use centered_versor::CenteredVersorTransformInitializer;
 pub use convergence::WindowConvergenceMonitor;
 pub use correlation::CorrelationMetric;
 pub use demons::DemonsMetric;
