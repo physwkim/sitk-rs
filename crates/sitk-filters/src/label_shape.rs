@@ -99,7 +99,7 @@ pub struct BoundingBox {
 /// `itk::ShapeLabelObject`'s oriented bounding box: the tightest box aligned
 /// with the object's principal axes that contains every pixel *including the
 /// pixels' own extent*, not just their centers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrientedBoundingBox {
     /// Edge lengths, in physical units, along each principal axis.
     pub size: Vec<f64>,
@@ -117,7 +117,7 @@ pub struct OrientedBoundingBox {
 }
 
 /// Shape attributes of one label, as `itk::ShapeLabelObject` stores them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapeStatistics {
     /// Number of pixels carrying this label.
     pub number_of_pixels: u64,
@@ -291,7 +291,7 @@ fn continuous_index_to_physical(
 }
 
 /// `Image::TransformIndexToPhysicalPoint`.
-fn index_to_physical(
+pub(crate) fn index_to_physical(
     idx: &[i64; MAX_DIM],
     dim: usize,
     spacing: &[f64],
@@ -351,7 +351,7 @@ fn hyper_sphere_radius_from_volume(dim: i64, volume: f64) -> f64 {
 /// with a 4-ULP tolerance. The ULP distance between `±0.0` and a finite `x`
 /// of the same sign is the magnitude of `x`'s bit pattern, so this is true
 /// only for `x` within four subnormal steps of zero.
-fn is_almost_zero(x: f64) -> bool {
+pub(crate) fn is_almost_zero(x: f64) -> bool {
     x.abs().to_bits() <= 4
 }
 
@@ -359,7 +359,7 @@ fn is_almost_zero(x: f64) -> bool {
 ///
 /// ITK instead builds `RealEigenDecomposition(principalAxes)` and multiplies
 /// the complex eigenvalues; that product *is* the determinant.
-fn determinant(m: &Mat, n: usize) -> f64 {
+pub(crate) fn determinant(m: &Mat, n: usize) -> f64 {
     let mut a = *m;
     let mut det = 1.0;
     for col in 0..n {
