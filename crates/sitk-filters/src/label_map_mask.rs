@@ -109,11 +109,15 @@
 //!    `SetBackgroundValue`'s parameter. The yaml author knew the alias was wrong
 //!    — the `FeatureImage` input carries a `custom_itk_cast` spelling
 //!    `typename FilterType::OutputImageType` explicitly — but left the member
-//!    alone. Consequences: a negative `background_value` cannot reach a signed
-//!    feature image, and a `background_value` above the label type's range
-//!    cannot reach a wider feature image. This port reproduces the two-stage
-//!    cast; pinned by `background_value_is_narrowed_through_the_label_type` and
-//!    `a_negative_background_value_cannot_reach_a_signed_feature_image`.
+//!    alone. Consequences upstream: a negative `background_value` cannot reach a
+//!    signed feature image, and a `background_value` above the label type's
+//!    range cannot reach a wider feature image. **This port does not reproduce
+//!    the two-stage cast** (ledger §3.21's sibling §3.23): `background_value` is
+//!    cast once, straight to the feature image's pixel type — which is what
+//!    `itkLabelMapMaskImageFilter.h:123`'s
+//!    `itkSetMacro(BackgroundValue, OutputImagePixelType)` asks for. Pinned by
+//!    `background_value_casts_directly_to_the_output_type` and
+//!    `a_negative_background_value_reaches_a_signed_feature_image`.
 //! 2. **`testIdxIsInside` is dead code.** Both write loops that can leave the
 //!    crop region guard themselves with
 //!    `m_Crop && (input->GetBackgroundValue() == m_Label) ^ m_Negated`
@@ -160,8 +164,9 @@ pub struct LabelMapMaskSettings {
     /// The label to keep (`negated == false`) or to erase (`negated == true`),
     /// `static_cast<LabelType>`-ed before it is compared. `1`.
     pub label: u64,
-    /// The value written where the feature image is masked out, narrowed first
-    /// to the map's label type — see the module docs' upstream finding 1. `0.0`.
+    /// The value written where the feature image is masked out,
+    /// `static_cast`-ed to the feature image's pixel type — see the module
+    /// docs' upstream finding 1. `0.0`.
     pub background_value: f64,
     /// Erase `label` instead of keeping it. `false`.
     pub negated: bool,
@@ -195,30 +200,6 @@ fn cast_to_label_type(id: PixelId, label: u64) -> i64 {
         PixelId::UInt16 => (label as u16) as i64,
         PixelId::UInt32 => (label as u32) as i64,
         _ => label as i64,
-    }
-}
-
-/// `static_cast<OutputPixelType>(v)` where `v` already went through
-/// `static_cast<LabelType>` — a non-negative integer inside an unsigned label
-/// type's range. C++ narrows an integer to a narrower integer modulo `2^bits`
-/// (well-defined since C++20), and converts it to a float exactly-or-rounded;
-/// `as` reproduces both. The complex feature types arrive here as their
-/// [`PixelId::component_id`], `Float32`/`Float64`, which is what
-/// `std::complex<T>`'s converting constructor sees.
-fn cast_label_value_to_component(id: PixelId, v: f64) -> f64 {
-    let u = v as u64;
-    match id {
-        PixelId::UInt8 => (u as u8) as f64,
-        PixelId::Int8 => (u as i8) as f64,
-        PixelId::UInt16 => (u as u16) as f64,
-        PixelId::Int16 => (u as i16) as f64,
-        PixelId::UInt32 => (u as u32) as f64,
-        PixelId::Int32 => (u as i32) as f64,
-        PixelId::UInt64 => u as f64,
-        PixelId::Int64 => (u as i64) as f64,
-        PixelId::Float32 => (u as f32) as f64,
-        PixelId::Float64 => u as f64,
-        _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
     }
 }
 
@@ -284,11 +265,8 @@ pub fn label_map_mask(
         .flat_map(|object| object_offsets(object, &st))
         .collect();
 
-    // Two-stage cast; upstream finding 1.
-    let background = cast_label_value_to_component(
-        feature_id.component_id(),
-        quantize_to_pixel_type(map.pixel_id(), settings.background_value),
-    );
+    // One cast, straight to the output pixel type; upstream finding 1.
+    let background = quantize_to_pixel_type(feature_id.component_id(), settings.background_value);
 
     let mut out = dispatch_scalar!(
         feature_id,
@@ -530,11 +508,11 @@ mod tests {
     }
 
     #[test]
-    fn background_value_is_narrowed_through_the_label_type() {
-        // Upstream finding 1. The map's label type is `UInt8`, so a
-        // `background_value` of 300 cannot reach the `UInt16` feature image: it
-        // is `static_cast<uint8_t>`-ed to 255 first (upstream's cast of an
-        // out-of-range double is UB; this port saturates), and only then widened.
+    fn background_value_casts_directly_to_the_output_type() {
+        // Upstream finding 1, fixed (§3.23). The map's label type is `UInt8`,
+        // but 300 is not routed through it: the single cast is
+        // `static_cast<uint16_t>(300.0) == 300`, which the `UInt16` feature
+        // image holds exactly. Upstream's two-stage cast would give 255.
         let map = map_of(&[2, 1], 0, &[(1, &[([0, 0], 1)])]);
         let feature = Image::from_vec(&[2, 1], vec![1000u16, 2000]).unwrap();
         let s = LabelMapMaskSettings {
@@ -542,13 +520,13 @@ mod tests {
             ..settings(1, false)
         };
         let out = label_map_mask(&map, &feature, &s).unwrap();
-        assert_eq!(out.scalar_slice::<u16>().unwrap(), &[1000, 255]);
+        assert_eq!(out.scalar_slice::<u16>().unwrap(), &[1000, 300]);
     }
 
     #[test]
-    fn a_negative_background_value_cannot_reach_a_signed_feature_image() {
-        // Upstream finding 1 again: `static_cast<uint8_t>(-5.0)` runs before the
-        // conversion to `int8_t`. Upstream's cast is UB; this port saturates to 0.
+    fn a_negative_background_value_reaches_a_signed_feature_image() {
+        // `static_cast<int8_t>(-5.0) == -5`. Upstream's `static_cast<uint8_t>`
+        // ran first and clamped/wrapped the sign away.
         let map = map_of(&[2, 1], 0, &[(1, &[([0, 0], 1)])]);
         let feature = Image::from_vec(&[2, 1], vec![-7i8, -9]).unwrap();
         let s = LabelMapMaskSettings {
@@ -556,13 +534,15 @@ mod tests {
             ..settings(1, false)
         };
         let out = label_map_mask(&map, &feature, &s).unwrap();
-        assert_eq!(out.scalar_slice::<i8>().unwrap(), &[-7, 0]);
+        assert_eq!(out.scalar_slice::<i8>().unwrap(), &[-7, -5]);
     }
 
     #[test]
-    fn the_label_typed_background_value_then_wraps_into_a_narrower_output() {
-        // `static_cast<uint8_t>(200.0)` is 200; `static_cast<int8_t>(uint8_t(200))`
-        // is -56 (well-defined modular narrowing since C++20).
+    fn an_out_of_range_background_value_saturates_into_the_output_type() {
+        // 200 does not fit `int8_t`. The single cast is `200.0 as i8`, which
+        // saturates to 127 — [`Scalar::from_f64`]'s documented divergence from
+        // C++'s undefined out-of-range float-to-integer `static_cast`. Upstream
+        // instead reached `int8_t(uint8_t(200)) == -56` via its two-stage cast.
         let map = map_of(&[2, 1], 0, &[(1, &[([0, 0], 1)])]);
         let feature = Image::from_vec(&[2, 1], vec![1i8, 2]).unwrap();
         let s = LabelMapMaskSettings {
@@ -570,11 +550,13 @@ mod tests {
             ..settings(1, false)
         };
         let out = label_map_mask(&map, &feature, &s).unwrap();
-        assert_eq!(out.scalar_slice::<i8>().unwrap(), &[1, -56]);
+        assert_eq!(out.scalar_slice::<i8>().unwrap(), &[1, 127]);
     }
 
     #[test]
-    fn background_value_truncates_toward_zero_like_a_static_cast() {
+    fn a_fractional_background_value_survives_into_a_float_output() {
+        // `static_cast<float>(3.9)` keeps the fraction; upstream's
+        // `static_cast<uint8_t>(3.9) == 3` truncated it away first.
         let map = map_of(&[2, 1], 0, &[(1, &[([0, 0], 1)])]);
         let feature = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
         let s = LabelMapMaskSettings {
@@ -582,7 +564,12 @@ mod tests {
             ..settings(1, false)
         };
         let out = label_map_mask(&map, &feature, &s).unwrap();
-        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[1.0, 3.0]);
+        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[1.0, 3.9f32]);
+
+        // An integer output still truncates toward zero, as a `static_cast` does.
+        let feature = Image::from_vec(&[2, 1], vec![1u8, 2]).unwrap();
+        let out = label_map_mask(&map, &feature, &s).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 3]);
     }
 
     // ---- Label's cast ------------------------------------------------------
