@@ -805,7 +805,12 @@ fn compute_intercept_slope_pixel_type(pf: PixelFormat, intercept: f64, slope: f6
     if pf.scalar_type() == ScalarType::SingleBit {
         return ScalarType::SingleBit;
     }
-    if slope != slope.trunc() || intercept != intercept.trunc() {
+    // `Slope != (int)Slope || Intercept != (int)Intercept` (gdcmRescaler.cxx:206):
+    // the integrality test is a 32-bit `(int)` cast, not a full-range truncation,
+    // so an integral magnitude beyond `i32` range fails it and short-circuits to
+    // `Float64` (Rust's saturating `as i32` reproduces the practical result of
+    // C++'s out-of-range float→int cast).
+    if slope != f64::from(slope as i32) || intercept != f64::from(intercept as i32) {
         return ScalarType::Float64;
     }
     compute_best_fit(pf, intercept, slope)
