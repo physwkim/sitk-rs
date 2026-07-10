@@ -188,6 +188,84 @@ pub fn normalize(img: &Image) -> Result<Image> {
     crate::image_from_f64(real_type(img.pixel_id()), img.size(), img, &vals)
 }
 
+// ---- ShiftScale -----------------------------------------------------------
+
+/// [`shift_scale`]'s result: the shifted-and-scaled image plus
+/// `ShiftScaleImageFilter`'s two measurements.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShiftScaleResult {
+    /// The shifted-and-scaled, clamped image.
+    pub image: Image,
+    /// `GetUnderflowCount()`: pixels whose computed value was below the
+    /// output pixel type's `NonpositiveMin()` and were clamped up to it.
+    pub underflow_count: u64,
+    /// `GetOverflowCount()`: pixels whose computed value was above the
+    /// output pixel type's `max()` and were clamped down to it.
+    pub overflow_count: u64,
+}
+
+/// `ShiftScaleImageFilter` (`itkShiftScaleImageFilter.h(.hxx)`): `value =
+/// (RealType(x) + shift) * scale` for every pixel — the shift is applied
+/// *before* the scale, both member docs say so explicitly ("The shift is
+/// followed by a Scale" / "The Scale is applied after the Shift"), and the
+/// `.hxx` computes exactly `(static_cast<RealType>(it.Get()) + m_Shift) *
+/// m_Scale` in that order. `RealType` is `NumericTraits<OutputPixelType>::RealType`,
+/// always `double`; this port computes in `f64` throughout, an exact match
+/// (not a precision simplification, unlike this module's other filters —
+/// see [`real_type`]'s doc for the family this usually diverges in).
+///
+/// Unlike a plain `static_cast` narrowing, the `.hxx` clamps explicitly
+/// *before* assigning: `value < NonpositiveMin() -> NonpositiveMin(),
+/// ++underflow`; `value > max() -> max(), ++overflow`; otherwise
+/// `static_cast<Output>(value)`. This is not undefined behavior to begin
+/// with, so there is nothing to "define instead of" here (contrast
+/// [`crate::math::round`]) — this port reproduces the same three-way clamp
+/// directly against `output_id`'s bounds ([`crate::morphology::bounds_for`]),
+/// so the final narrow through [`crate::image_from_f64`] is always exact
+/// (the value is already inside the target type's range).
+///
+/// `output_pixel_type`: `None` is SimpleITK's `sitkUnknown` default (`type2 =
+/// (m_OutputPixelType != sitkUnknown) ? m_OutputPixelType : type1` —
+/// `ShiftScaleImageFilter.yaml`'s `custom_type2`), meaning the output keeps
+/// `img`'s own pixel type. A `Some` target outside `img`'s own type is where
+/// under/overflow actually happens in practice — e.g. shifting/scaling a
+/// `Int16` image down to `Int8`.
+pub fn shift_scale(
+    img: &Image,
+    shift: f64,
+    scale: f64,
+    output_pixel_type: Option<PixelId>,
+) -> Result<ShiftScaleResult> {
+    let output_id = output_pixel_type.unwrap_or(img.pixel_id());
+    let (max_value, nonpositive_min) = crate::morphology::bounds_for(output_id);
+
+    let mut underflow_count = 0u64;
+    let mut overflow_count = 0u64;
+    let vals: Vec<f64> = img
+        .to_f64_vec()?
+        .iter()
+        .map(|&x| {
+            let value = (x + shift) * scale;
+            if value < nonpositive_min {
+                underflow_count += 1;
+                nonpositive_min
+            } else if value > max_value {
+                overflow_count += 1;
+                max_value
+            } else {
+                value
+            }
+        })
+        .collect();
+
+    let image = crate::image_from_f64(output_id, img.size(), img, &vals)?;
+    Ok(ShiftScaleResult {
+        image,
+        underflow_count,
+        overflow_count,
+    })
+}
+
 // ---- Otsu ---------------------------------------------------------------
 
 /// `itk::Math::FloatAlmostEqual(x1, x2, maxUlps=1)`
@@ -689,6 +767,65 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|v| v.is_nan())
+        );
+    }
+
+    // ---- ShiftScale ----
+
+    #[test]
+    fn shift_scale_applies_shift_before_scale() {
+        // (1 + 2) * 3 = 9; scale-then-shift would give 1*3+2 = 5.
+        let a = img_f64(&[1, 1], vec![1.0]);
+        let result = shift_scale(&a, 2.0, 3.0, None).unwrap();
+        assert_eq!(result.image.scalar_slice::<f64>().unwrap(), &[9.0]);
+        assert_eq!(result.underflow_count, 0);
+        assert_eq!(result.overflow_count, 0);
+    }
+
+    #[test]
+    fn shift_scale_yaml_defaults_are_identity() {
+        // Shift=0, Scale=1.0 (yaml defaults) leave every pixel unchanged.
+        let a = img_f64(&[3, 1], vec![-4.0, 0.0, 10.5]);
+        let result = shift_scale(&a, 0.0, 1.0, None).unwrap();
+        assert_eq!(
+            result.image.scalar_slice::<f64>().unwrap(),
+            &[-4.0, 0.0, 10.5]
+        );
+        assert_eq!(result.underflow_count, 0);
+        assert_eq!(result.overflow_count, 0);
+    }
+
+    #[test]
+    fn shift_scale_none_output_pixel_type_keeps_input_type() {
+        let a = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        let result = shift_scale(&a, 1.0, 1.0, None).unwrap();
+        assert_eq!(result.image.pixel_id(), PixelId::Float32);
+    }
+
+    #[test]
+    fn shift_scale_clamps_and_counts_underflow_and_overflow_into_int8() {
+        // Int8 range is [-128, 127]. Shift=0, Scale=1 passes values through
+        // unclamped except where they fall outside that range.
+        let a = img_f64(&[5, 1], vec![-200.0, -128.0, 0.0, 127.0, 200.0]);
+        let result = shift_scale(&a, 0.0, 1.0, Some(PixelId::Int8)).unwrap();
+        assert_eq!(result.image.pixel_id(), PixelId::Int8);
+        assert_eq!(
+            result.image.scalar_slice::<i8>().unwrap(),
+            &[-128, -128, 0, 127, 127]
+        );
+        assert_eq!(result.underflow_count, 1);
+        assert_eq!(result.overflow_count, 1);
+    }
+
+    #[test]
+    fn shift_scale_rejects_non_scalar_pixel_type() {
+        let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        let err = shift_scale(&a, 0.0, 1.0, None).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
         );
     }
 
