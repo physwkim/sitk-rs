@@ -200,13 +200,6 @@ pub enum IoError {
     #[error("the extraction region has unsupported output dimension of {0}")]
     ExtractOutputDimension(usize),
 
-    /// The direction submatrix left by collapsing the zero-size axes is
-    /// singular. `ExtractImageFilter`'s `DIRECTIONCOLLAPSETOSUBMATRIX` throws
-    /// `"Invalid submatrix extracted for collapsed direction."`
-    /// (itkExtractImageFilter.hxx:196-199).
-    #[error("invalid submatrix extracted for collapsed direction")]
-    SingularCollapsedDirection,
-
     /// The file's own dimension is below the minimum SimpleITK will load.
     /// `ImageFileReader::Execute` throws `"The file has unsupported image
     /// dimension of ..."` (sitkImageFileReader.cxx:302-307).
@@ -241,6 +234,19 @@ pub enum IoError {
     /// (sitkTransform.cxx:676-680).
     #[error("read transform file {0}, but there appears to be no transform in the file")]
     NoTransformInFile(PathBuf),
+
+    /// The transform file holds more than one top-level transform, none of
+    /// which is a leading `CompositeTransform` that would absorb the rest.
+    /// `itk::simple::ReadTransform` returns `list->front()` and merely warns
+    /// through an off-by-default channel (sitkTransform.cxx:683-693), silently
+    /// dropping the remaining transforms — the `usize` here — and SimpleITK
+    /// offers no `ReadTransformList` to reach them. This port refuses instead
+    /// of dropping them silently (ledger §3.30).
+    #[error(
+        "transform file {path} holds {count} transforms; ReadTransform returns a single \
+         transform and cannot represent the rest — wrap them in a leading CompositeTransform"
+    )]
+    MultipleTransformsInFile { path: PathBuf, count: usize },
 
     /// An `#Insight Transform File` line broke the format —
     /// e.g. `"Tags must be delimited by :"` (itkTxtTransformIO.cxx:152).
