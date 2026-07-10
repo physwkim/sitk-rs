@@ -595,7 +595,8 @@ mod tests {
     #[test]
     fn display_of_a_composite_lists_its_sub_transforms() {
         let mut c = CompositeTransform::new(2);
-        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into());
+        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into())
+            .unwrap();
         let t: Transform = c.into();
         assert_eq!(
             t.to_string(),
