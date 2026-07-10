@@ -128,13 +128,19 @@
 //! `UseNonContiguousLabels` is set, or `1` (contiguous `0, 1, 2, ...`)
 //! otherwise; class `i`'s label is then `i * labelInterval`, accumulated the
 //! same way upstream does (`label = 0; classLabels[k] = label; label +=
-//! labelInterval;`) via wrapping `u32` arithmetic to reproduce C++'s defined
-//! unsigned-integer overflow, then narrowed to `u8` (`static_cast`-style
-//! truncation, matching `ImageRegionIterator<uint8_t>::Set` receiving an
-//! `unsigned int` class label). `numberOfClasses > 255` underflows
-//! `labelInterval` to `u32::MAX`, an upstream footgun this port reproduces
-//! rather than guards against -- the class's own doxygen comment already
-//! assumes "less than 256 classes".
+//! labelInterval;`).
+//!
+//! **Fixed here (upstream bug §1.14):** upstream computes that interval in
+//! `unsigned int`, so `numberOfClasses >= 256` makes `255 / k` zero and the
+//! `- 1` underflow to `u32::MAX` -- class 1 is then labelled `255`, class 2
+//! `254`, and so on down; and `numberOfClasses` in `128..=255` makes the
+//! interval exactly `0`, collapsing every class onto label `0`. This port
+//! floors the interval at `1` (the contiguous spacing the filter uses when
+//! `UseNonContiguousLabels` is off), which is the widest spacing that still
+//! keeps `k <= 256` classes distinct inside the `uint8_t` output. Beyond 256
+//! classes no `uint8_t` labelling can be distinct at all, and `label as u8`
+//! truncates as upstream's `static_cast` does; the class's own doxygen
+//! comment assumes "less than 256 classes".
 //!
 //! ## `SetImageRegion` is not ported
 //!
@@ -239,8 +245,14 @@ pub fn scalar_image_kmeans(
     let values = img.to_f64_vec()?;
     let final_means = run_kmeans(&values, &initial_means);
 
+    // `labelInterval = NumericTraits<uint8_t>::max() / numberOfClasses - 1`,
+    // floored at the contiguous spacing of 1: at `k >= 256` the quotient is
+    // `0` and upstream's `unsigned int` subtraction underflows to `u32::MAX`,
+    // and at `k` in `128..=255` the quotient is `1` and the spacing collapses
+    // to `0`, giving every class the same label. Both leave the classes
+    // indistinguishable; a spacing of 1 is the widest one that still fits.
     let label_interval: u32 = if use_non_contiguous_labels {
-        (u8::MAX as u32 / k as u32).wrapping_sub(1)
+        (u8::MAX as u32 / k as u32).saturating_sub(1).max(1)
     } else {
         1
     };
@@ -327,6 +339,35 @@ mod tests {
         let result = scalar_image_kmeans(&img, &[0.0, 50.0, 100.0], true).unwrap();
         let labels = result.image.scalar_slice::<u8>().unwrap();
         assert_eq!(labels, &[0, 84, 168]);
+    }
+
+    #[test]
+    fn non_contiguous_label_interval_is_floored_at_one() {
+        // labelInterval = max(1, 255/k - 1), evaluated by hand:
+        //   k = 128: 255/128 = 1, so 1 - 1 = 0. Upstream spaces every class
+        //            by zero and labels all 128 classes `0`.
+        //   k = 256: 255/256 = 0, so `0 - 1` underflows the `unsigned int` to
+        //            u32::MAX. Upstream's labels are then 0, 255, 254, ...
+        //            (each class truncating `i * u32::MAX` to `u8`).
+        // Floored at 1, both cases label class `i` with `i` -- the widest
+        // spacing that keeps k <= 256 classes distinct in a `uint8_t`.
+        for k in [128usize, 256] {
+            let means: Vec<f64> = (0..k).map(|i| i as f64).collect();
+            let img = img_f64(&[k, 1], means.clone());
+            let result = scalar_image_kmeans(&img, &means, true).unwrap();
+            let labels = result.image.scalar_slice::<u8>().unwrap();
+            let expected: Vec<u8> = (0..k).map(|i| i as u8).collect();
+            assert_eq!(labels, expected.as_slice(), "k = {k}");
+        }
+
+        // Below the floor the formula is untouched: k = 85 gives
+        // 255/85 - 1 = 2, so the labels keep a real spread 0, 2, ..., 168.
+        let means: Vec<f64> = (0..85).map(|i| (i * 3) as f64).collect();
+        let img = img_f64(&[85, 1], means.clone());
+        let result = scalar_image_kmeans(&img, &means, true).unwrap();
+        let labels = result.image.scalar_slice::<u8>().unwrap();
+        let expected: Vec<u8> = (0..85u8).map(|i| i * 2).collect();
+        assert_eq!(labels, expected.as_slice());
     }
 
     #[test]
