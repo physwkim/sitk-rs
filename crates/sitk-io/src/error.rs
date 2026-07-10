@@ -355,6 +355,33 @@ pub enum IoError {
     /// ruled out.
     #[error("jpeg encoding error: {0}")]
     JpegEncode(#[from] jpeg_encoder::EncodingError),
+
+    /// A DICOM file whose bytes `dicom-object` could parse but whose contents
+    /// `itk::GDCMImageIO` would reject at read time — a pixel type its
+    /// component-type switch does not handle (`"Unhandled PixelFormat: ..."`,
+    /// itkGDCMImageIO.cxx:502), a rescale that would overflow the output type
+    /// (`"Pixel type larger than output type"`, `:544`), or a geometry element
+    /// GDCM reads past its declared values. See [`crate::dicom`].
+    #[error("malformed DICOM image: {0}")]
+    MalformedDicom(String),
+
+    /// A DICOM feature this port refuses rather than approximates: any
+    /// encapsulated (compressed) transfer syntax, whose pixel output is
+    /// libijg / CharLS / OpenJPEG's bit-for-bit (ledger §4.106); a SOP class
+    /// whose geometry lives in a functional-groups sequence this port does not
+    /// traverse (ledger §4.107); 12-bit-allocated pixels; or a photometric /
+    /// bit-depth combination `GDCMImageIO` mishandles silently and this port
+    /// declines to reproduce. See [`crate::dicom`] and ledger §5.30.
+    #[error("unsupported DICOM feature: {0}")]
+    UnsupportedDicomFeature(String),
+
+    /// A DICOM file `dicom-object` could not parse at all — a broken preamble,
+    /// a transfer syntax its registry does not know, or a corrupt element
+    /// stream. `gdcm::ImageReader::Read` returns `false` for the same files and
+    /// `GDCMImageIO::Read` then throws `"Cannot read requested file"`
+    /// (itkGDCMImageIO.cxx:284).
+    #[error("dicom read error: {0}")]
+    DicomRead(String),
 }
 
 /// Convenience alias for IO results.

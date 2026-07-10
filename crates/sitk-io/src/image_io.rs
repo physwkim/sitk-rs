@@ -44,6 +44,7 @@ use std::path::Path;
 
 use sitk_core::{Image, PixelId};
 
+use crate::dicom::DicomImageIo;
 use crate::error::{IoError, Result};
 use crate::gipl::GiplImageIo;
 use crate::image_hdf5::Hdf5ImageIo;
@@ -189,6 +190,7 @@ static PNG_IMAGE_IO: PngImageIo = PngImageIo;
 static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
 static JPEG_IMAGE_IO: JpegImageIo = JpegImageIo;
 static TIFF_IMAGE_IO: TiffImageIo = TiffImageIo;
+static DICOM_IMAGE_IO: DicomImageIo = DicomImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -240,6 +242,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &HDF5_IMAGE_IO,
         &JPEG_IMAGE_IO,
         &TIFF_IMAGE_IO,
+        &DICOM_IMAGE_IO,
     ];
     IOS
 }

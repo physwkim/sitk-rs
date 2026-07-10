@@ -40,3 +40,20 @@ jpeg-decoder = { version = "0.3.2", default-features = false }
 # palette images and libtiff's `TIFFReadRGBAImageOriented` fallback — is
 # refused rather than approximated (ledger §4.100, §4.102).
 tiff = "0.11"
+# Pure-Rust DICOM parsing, used by the `dicom` module to read `.dcm` files in
+# place of GDCM, which `itk::GDCMImageIO` links — no `*-sys` crate enters the
+# tree (verified with `cargo tree -p sitk-io`: only `byteordered`, `chrono`,
+# `encoding`, `safe-transmute`, `smallvec`, `snafu` and `tracing` are pulled
+# in) — ledger §5.8(a). `deflate` adds Deflated Explicit VR Little Endian,
+# which rides on the same `flate2`/`miniz_oxide` backend as
+# `crate::compression`. Every *encapsulated* transfer syntax is refused rather
+# than decoded, because GDCM's pixel output for those is libijg/openjpeg's
+# bit-for-bit and no pure-Rust codec reproduces it — ledger §4.106.
+#
+# `dicom-pixeldata` is deliberately *not* a dependency: it exists to decode
+# encapsulated pixel data, which this module refuses, and its `native` feature
+# rewrites the photometric interpretation of every 3-sample frame to `RGB`,
+# which `GDCMImageIO` does not do.
+dicom-object = { version = "0.10", default-features = false, features = ["deflate"] }
+dicom-core = { version = "0.10", default-features = false }
+dicom-dictionary-std = { version = "0.10", default-features = false }
