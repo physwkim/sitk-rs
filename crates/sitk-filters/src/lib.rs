@@ -55,6 +55,7 @@ pub mod convolution;
 pub mod deconvolution;
 pub mod demons;
 pub mod denoise;
+pub mod dicom_orient;
 pub mod displacement_field;
 pub mod distance;
 pub mod edge;
@@ -154,6 +155,10 @@ pub use demons::{
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
     discrete_gaussian_derivative, mean, median,
+};
+pub use dicom_orient::{
+    DEFAULT_ORIENTATION, DicomOrientResult, dicom_orient, get_direction_cosines_from_orientation,
+    get_orientation_from_direction_cosines,
 };
 pub use displacement_field::{
     DisplacementFieldJacobianDeterminantSettings, InvertDisplacementFieldResult,
@@ -1068,7 +1073,10 @@ mod tests {
 /// signatures: they reach the buffer through the component-aware accessors
 /// ([`Image::component_slice`], [`Image::components_to_f64_vec`]) and check the
 /// pixel type themselves, because for them a vector image is the *only* legal
-/// input.
+/// input. [`crate::dicom_orient`] is a third case: it accepts *either* scalar
+/// or vector, dispatching on [`sitk_core::PixelId::is_vector`] and, for a
+/// vector image, decomposing into components with [`Image::extract_component`]
+/// before ever reaching the scalar seam.
 #[cfg(test)]
 mod vector_guard {
     use super::*;
