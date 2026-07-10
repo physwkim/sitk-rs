@@ -24,11 +24,11 @@
 //!
 //! - ITK pins `RealType = float`; this computes in `f64`, the workspace's
 //!   `to_f64_vec` idiom. Every formula is transcribed literally otherwise.
-//! - ITK's `SharpenImage` indexes its histogram with
-//!   `static_cast<unsigned int>` of a `float` that is negative when
-//!   `binMinimum` is degenerate (see [`sharpen_image`]); that cast is
-//!   undefined behaviour in C++. Here the index is bounds-checked and the
-//!   voxel skipped.
+//! - ITK's `SharpenImage` indexes its histogram with `itk::Math::floor` —
+//!   a `static_cast<int>` of a `float` that is `0.0/0.0 = NaN` when the
+//!   bin range is degenerate (see [`sharpen_image`]); a NaN→int conversion
+//!   is undefined behaviour in C++ and the resulting index is used
+//!   unchecked. Here the index is bounds-checked and the voxel skipped.
 //! - Degeneracies ITK dereferences a null lattice on, or divides by zero on,
 //!   are rejected up front: see [`FilterError::N4NoBiasFieldEstimated`] and
 //!   [`FilterError::N4InvalidHistogramBins`].
