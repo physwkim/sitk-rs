@@ -45,11 +45,19 @@
 //! `DistanceThreshold` default of `1.0` sits exactly on that boundary, so
 //! two regions of orthogonal (but otherwise unrelated) vectors merge under
 //! the *default* threshold; see the
-//! `orthogonal_regions_merge_under_the_default_threshold` test. A **zero**
-//! vector is not special-cased anywhere in the functor (there is no
-//! normalization to divide by zero in the first place): it gives `dot = 0`
-//! against anything, so it joins a neighbor exactly like an orthogonal
-//! vector would, never producing `NaN` or an error.
+//! `orthogonal_regions_merge_under_the_default_threshold` test.
+//!
+//! A **zero** vector is not special-cased *upstream*: `1 - |dot(0, b)| = 1`
+//! joins any neighbor at the default `DistanceThreshold = 1`, exactly like an
+//! orthogonal vector would — so a flat (zero) region silently bridges or
+//! absorbs adjacent directioned regions on realistic input (a gradient- or
+//! displacement-direction field is zero wherever the field is flat). **This
+//! port fixes that (§2.40):** a zero vector has no direction, so it is
+//! dissimilar to a directioned neighbor. Two zero vectors are still similar
+//! (they are identical, so an all-zero image stays one component); only the
+//! mixed zero/non-zero case changes. The unnormalized dot product and the
+//! antiparallel-similarity are documented, deliberate upstream behavior and
+//! are kept.
 //!
 //! `VectorConnectedComponentImageFilter.yaml`'s `pixel_types` is
 //! `RealVectorPixelIDTypeList`, and `itkConceptMacro(InputValyeTypeIsFloatingCheck, ...)`
@@ -87,6 +95,19 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 
 /// `Functor::SimilarVectorsFunctor::operator()`; see the module docs.
 fn similar<T: Scalar>(a: &[T], b: &[T], threshold: T) -> bool {
+    // Fix (§2.40): a zero vector has no direction, so it is not directionally
+    // similar to a *directioned* neighbor. Upstream leaves it unguarded, so
+    // `1 - |dot(0, b)| = 1` joins any neighbor at the wrapped default
+    // `DistanceThreshold = 1` — a flat (zero) region then silently bridges or
+    // absorbs adjacent directioned regions on realistic input (a gradient- or
+    // displacement-direction field is zero wherever the field is flat). Two
+    // zero vectors are still similar (they are identical, so an all-zero image
+    // stays a single component); only the mixed zero/non-zero case changes.
+    let a_zero = a.iter().all(|&x| x.as_f64() == 0.0);
+    let b_zero = b.iter().all(|&x| x.as_f64() == 0.0);
+    if a_zero != b_zero {
+        return false;
+    }
     // The dot product accumulates in `NumericTraits<ValueType>::RealType`,
     // which is `double` even for a `float` component type.
     let dot: f64 = a
@@ -216,16 +237,38 @@ mod tests {
         assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 1]);
     }
 
-    /// The zero vector is not special-cased: it gives `dot = 0` against
-    /// anything, exactly like an orthogonal vector, and never produces a
-    /// `NaN` or an error.
+    /// Fix (§2.40): a zero vector is dissimilar to a directioned neighbor, so
+    /// it no longer joins one even at the default threshold `1.0` — where
+    /// upstream would merge them (`1 - |dot| = 1 <= 1`). The two pixels stay
+    /// separate at both thresholds.
     #[test]
-    fn zero_vector_behaves_like_an_orthogonal_vector() {
+    fn a_zero_vector_does_not_join_a_directioned_neighbor() {
         let image = vec_img(&[2], 2, vec![0.0, 0.0, 1.0, 0.0]);
         let below = vector_connected_component(&image, 0.5, false).unwrap();
         assert_eq!(below.scalar_slice::<u32>().unwrap(), &[1, 2]);
         let at_boundary = vector_connected_component(&image, 1.0, false).unwrap();
-        assert_eq!(at_boundary.scalar_slice::<u32>().unwrap(), &[1, 1]);
+        assert_eq!(at_boundary.scalar_slice::<u32>().unwrap(), &[1, 2]);
+    }
+
+    /// Two zero vectors are still similar (they are identical), so an all-zero
+    /// image collapses to a single component — the fix guards only the mixed
+    /// zero/non-zero case, not zero-against-zero.
+    #[test]
+    fn zero_vectors_still_merge_with_each_other() {
+        let image = vec_img(&[3], 2, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let out = vector_connected_component(&image, 1.0, false).unwrap();
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 1, 1]);
+    }
+
+    /// A zero vector wedged between two identical directioned regions no longer
+    /// bridges them: upstream's unguarded functor would chain
+    /// `(1,0) ~ 0 ~ (1,0)` into one component at the default threshold; here the
+    /// zero forms its own component and the two directioned runs stay apart.
+    #[test]
+    fn a_zero_vector_does_not_bridge_two_directioned_regions() {
+        let image = vec_img(&[3], 2, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let out = vector_connected_component(&image, 1.0, false).unwrap();
+        assert_eq!(out.scalar_slice::<u32>().unwrap(), &[1, 2, 3]);
     }
 
     /// Two single-pixel components that touch only diagonally: face
