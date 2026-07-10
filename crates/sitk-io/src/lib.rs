@@ -115,6 +115,29 @@ mod tests {
         .ok();
     }
 
+    /// The header hard-codes `ElementNumberOfChannels = 1`, so anything whose
+    /// buffer holds more than one component per pixel must be refused before a
+    /// file is created. Complex is the case a `is_vector()` blacklist would
+    /// have let through: upstream it is a *basic* pixel type, yet its buffer
+    /// carries two components per pixel.
+    #[test]
+    fn write_rejects_every_non_scalar_pixel_type() {
+        for id in [PixelId::ComplexFloat32, PixelId::ComplexFloat64] {
+            let img = Image::new(&[2, 2], id);
+            let path = tmp_path("nonscalar.mha");
+            assert!(matches!(
+                write_image(&img, &path),
+                Err(IoError::Unsupported(_))
+            ));
+            assert!(!path.exists(), "{id:?}: rejected write left a file behind");
+        }
+        let img = Image::new_vector(&[2, 2], PixelId::VectorFloat32, 3).unwrap();
+        assert!(matches!(
+            write_image(&img, tmp_path("nonscalar.mha")),
+            Err(IoError::Unsupported(_))
+        ));
+    }
+
     #[test]
     fn unknown_extension_errors() {
         let img = Image::new(&[2, 2], PixelId::UInt8);

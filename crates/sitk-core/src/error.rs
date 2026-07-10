@@ -33,11 +33,11 @@ pub enum Error {
     #[error("radius length does not match image dimension {dimension}")]
     RadiusMismatch { dimension: usize },
 
-    /// A scalar-only accessor, filter, or writer was handed a vector
-    /// (multi-component) image.
+    /// A scalar-only accessor, filter, or writer was handed a non-scalar image
+    /// — a vector (multi-component) or complex one.
     ///
     /// This is the single guard that keeps a scalar consumer from reading an
-    /// interleaved vector buffer as if it were one value per pixel. SimpleITK
+    /// interleaved buffer as if it were one value per pixel. SimpleITK
     /// expresses the same restriction at compile time: a filter whose yaml
     /// declares `pixel_types: BasicPixelIDTypeList` is never instantiated for a
     /// `VectorPixelID`, so calling it on a vector image throws from the
@@ -45,9 +45,16 @@ pub enum Error {
     #[error("this operation requires a scalar pixel type, got {0:?}")]
     RequiresScalarPixelType(PixelId),
 
-    /// A vector-only accessor or filter was handed a scalar image.
+    /// A vector-only accessor or filter was handed a non-vector image.
     #[error("this operation requires a vector pixel type, got {0:?}")]
     RequiresVectorPixelType(PixelId),
+
+    /// A complex-only accessor or filter was handed a non-complex image —
+    /// SimpleITK's `pixel_types: ComplexPixelIDTypeList`
+    /// (sitkPixelIDTypeLists.h:104), which instantiates the wrapper for
+    /// `sitkComplexFloat32`/`sitkComplexFloat64` and no other pixel type.
+    #[error("this operation requires a complex pixel type, got {0:?}")]
+    RequiresComplexPixelType(PixelId),
 
     /// `Image::AllocateInternal` (sitkImage.hxx:63-67) throws "Specified number
     /// of components as N but did not specify pixelID as a vector type!" when a

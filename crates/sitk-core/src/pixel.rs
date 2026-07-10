@@ -10,30 +10,46 @@
 use crate::image::PixelBuffer;
 
 /// Runtime pixel-type tag, mirroring SimpleITK's `PixelIDValueEnum`
-/// (sitkPixelIDValues.h:100-134).
+/// (sitkPixelIDValues.h:100-134), discriminants included.
 ///
-/// The ten scalar variants tag an `itk::Image<T, N>`; the ten `Vector*`
-/// variants tag an `itk::VectorImage<T, N>`, whose pixels hold
-/// [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel)
-/// components of the same underlying scalar type. SimpleITK's
-/// `VectorPixelIDTypeList` (sitkPixelIDTypeLists.h:125-141) instantiates a
-/// vector variant for every one of the ten scalar types and for no other, so
-/// this list is exactly the scalar list mirrored once.
+/// # The three categories
+///
+/// SimpleITK's `AllPixelIDTypeList` (sitkPixelIDTypeLists.h:180) concatenates
+/// `BasicPixelIDTypeList ++ ComplexPixelIDTypeList ++ VectorPixelIDTypeList`,
+/// and each pixel type's discriminant is its position in that list. This enum
+/// reproduces those positions exactly:
+///
+/// - `0..=9` — the ten scalars, tagging `itk::Image<T, N>`.
+/// - `10..=11` — the two `std::complex` pixel types, tagging
+///   `itk::Image<std::complex<T>, N>`. Complex is a **basic** pixel type
+///   upstream, not a vector one: `IsVector` is specialized only for
+///   `VectorPixelID`/`itk::VectorImage` (sitkPixelIDTokens.h:53-69), so
+///   `GetNumberOfComponentsPerPixel()` returns `1` for a complex image
+///   (sitkPimpleImageBase.hxx:202-209) even though its buffer holds two
+///   `T` per pixel.
+/// - `12..=21` — the ten `Vector*` variants, tagging `itk::VectorImage<T, N>`,
+///   whose pixels hold
+///   [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel)
+///   components of the same underlying scalar type. `VectorPixelIDTypeList`
+///   (sitkPixelIDTypeLists.h:125-141) instantiates a vector variant for every
+///   one of the ten scalar types and for no other, so this list is exactly the
+///   scalar list mirrored once.
+///
+/// `22..=25` are `sitkLabelUInt8..sitkLabelUInt64` upstream
+/// (sitkPixelIDValues.h:130-133) and are deliberately left unassigned here: an
+/// `itk::LabelMap` derives from `ImageBase` and has no pixel container
+/// (itkLabelMap.h:69), so it is not an [`Image`](crate::Image) in this port.
+///
+/// [`PixelId::is_scalar`], [`PixelId::is_complex`] and [`PixelId::is_vector`]
+/// partition this enum exhaustively; `pixel_id_predicates_partition_the_enum`
+/// pins that. Category tests must be written as whitelists over those three, so
+/// that a future fourth category defaults to *rejected* rather than to
+/// whichever branch happened to be the `else`.
 ///
 /// A vector variant is a *distinct pixel type* from its component's scalar
 /// variant even at one component per pixel: SimpleITK's `sitkVectorFloat32`
 /// with `GetNumberOfComponentsPerPixel() == 1` is not `sitkFloat32`, because
 /// the two name different ITK image templates.
-///
-/// # Deviation: discriminant values
-///
-/// SimpleITK derives each discriminant from the pixel type's position in
-/// `AllPixelIDTypeList`, which interleaves the two `std::complex` pixel types
-/// (`sitkComplexFloat32`, `sitkComplexFloat64`) between the scalars and the
-/// vectors. This port has no complex pixel type, so the vector variants take
-/// the ten values immediately after the scalars (10..=19) rather than 12..=21.
-/// Nothing in this workspace reads a `PixelId` discriminant numerically, and
-/// the values are not part of any serialized format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(i8)]
 pub enum PixelId {
@@ -47,22 +63,27 @@ pub enum PixelId {
     Int64 = 7,
     Float32 = 8,
     Float64 = 9,
-    VectorUInt8 = 10,
-    VectorInt8 = 11,
-    VectorUInt16 = 12,
-    VectorInt16 = 13,
-    VectorUInt32 = 14,
-    VectorInt32 = 15,
-    VectorUInt64 = 16,
-    VectorInt64 = 17,
-    VectorFloat32 = 18,
-    VectorFloat64 = 19,
+    ComplexFloat32 = 10,
+    ComplexFloat64 = 11,
+    VectorUInt8 = 12,
+    VectorInt8 = 13,
+    VectorUInt16 = 14,
+    VectorInt16 = 15,
+    VectorUInt32 = 16,
+    VectorInt32 = 17,
+    VectorUInt64 = 18,
+    VectorInt64 = 19,
+    VectorFloat32 = 20,
+    VectorFloat64 = 21,
+    // 22..=25 are sitkLabelUInt8..sitkLabelUInt64 upstream; see the type docs.
 }
 
 impl PixelId {
     /// Size in bytes of one *component* of this pixel type — SimpleITK's
-    /// `Image::GetSizeOfPixelComponent()`. A vector pixel occupies
-    /// `size_in_bytes() * number_of_components_per_pixel()` bytes.
+    /// `Image::GetSizeOfPixelComponent()`, which is
+    /// `sizeof(NumericTraits<PixelType>::ValueType)` and so reports `4` for
+    /// `sitkComplexFloat32`. A pixel occupies `size_in_bytes()` times its
+    /// image's [`Image::buffer_stride`](crate::Image::buffer_stride) bytes.
     pub const fn size_in_bytes(self) -> usize {
         match self {
             PixelId::UInt8 | PixelId::Int8 | PixelId::VectorUInt8 | PixelId::VectorInt8 => 1,
@@ -70,19 +91,52 @@ impl PixelId {
             PixelId::UInt32
             | PixelId::Int32
             | PixelId::Float32
+            | PixelId::ComplexFloat32
             | PixelId::VectorUInt32
             | PixelId::VectorInt32
             | PixelId::VectorFloat32 => 4,
             PixelId::UInt64
             | PixelId::Int64
             | PixelId::Float64
+            | PixelId::ComplexFloat64
             | PixelId::VectorUInt64
             | PixelId::VectorInt64
             | PixelId::VectorFloat64 => 8,
         }
     }
 
+    /// `true` for the ten single-component (`itk::Image<T, N>`) pixel types.
+    ///
+    /// This is the positive form of the "not a vector, not complex" test. Every
+    /// scalar-only guard in this workspace is written against it rather than
+    /// against `!is_vector()`, so a pixel category added later cannot slip
+    /// through a scalar accessor.
+    pub const fn is_scalar(self) -> bool {
+        matches!(
+            self,
+            PixelId::UInt8
+                | PixelId::Int8
+                | PixelId::UInt16
+                | PixelId::Int16
+                | PixelId::UInt32
+                | PixelId::Int32
+                | PixelId::UInt64
+                | PixelId::Int64
+                | PixelId::Float32
+                | PixelId::Float64
+        )
+    }
+
+    /// `true` for the two `std::complex` pixel types
+    /// (`sitkComplexFloat32`, `sitkComplexFloat64`).
+    pub const fn is_complex(self) -> bool {
+        matches!(self, PixelId::ComplexFloat32 | PixelId::ComplexFloat64)
+    }
+
     /// `true` for the ten multi-component (`itk::VectorImage`) pixel types.
+    ///
+    /// A complex pixel type is **not** a vector type — upstream's `IsVector`
+    /// token is specialized only for `VectorPixelID` (sitkPixelIDTokens.h:53-69).
     pub const fn is_vector(self) -> bool {
         matches!(
             self,
@@ -99,13 +153,72 @@ impl PixelId {
         )
     }
 
-    /// The scalar type of this pixel's components: the identity on a scalar
-    /// pixel type, and `T` for `Vector<T>` (ITK's
-    /// `VectorImage<T, N>::InternalPixelType`).
+    /// How many buffer components one pixel of this type occupies, when the
+    /// image reports `components_per_pixel` from
+    /// [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel);
+    /// `None` when that count is illegal for this pixel category.
     ///
-    /// Always one of the ten scalar variants.
+    /// This is the three-way rule of [`Image`](crate::Image)'s invariant, held
+    /// in one total `match` so that every category names its own stride rather
+    /// than inheriting an `else` branch. `Image::assemble` is the only caller.
+    /// A basic pixel type — complex included — admits exactly one component
+    /// (`AllocateInternal`, sitkImage.hxx:60-67), a vector type any count `>= 1`.
+    pub(crate) const fn buffer_stride_for(self, components_per_pixel: usize) -> Option<usize> {
+        match self {
+            PixelId::UInt8
+            | PixelId::Int8
+            | PixelId::UInt16
+            | PixelId::Int16
+            | PixelId::UInt32
+            | PixelId::Int32
+            | PixelId::UInt64
+            | PixelId::Int64
+            | PixelId::Float32
+            | PixelId::Float64 => {
+                if components_per_pixel == 1 {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+            PixelId::ComplexFloat32 | PixelId::ComplexFloat64 => {
+                if components_per_pixel == 1 {
+                    Some(2)
+                } else {
+                    None
+                }
+            }
+            PixelId::VectorUInt8
+            | PixelId::VectorInt8
+            | PixelId::VectorUInt16
+            | PixelId::VectorInt16
+            | PixelId::VectorUInt32
+            | PixelId::VectorInt32
+            | PixelId::VectorUInt64
+            | PixelId::VectorInt64
+            | PixelId::VectorFloat32
+            | PixelId::VectorFloat64 => {
+                if components_per_pixel >= 1 {
+                    Some(components_per_pixel)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The scalar type of this pixel's components: the identity on a scalar
+    /// pixel type, `T` for `Vector<T>` (ITK's
+    /// `VectorImage<T, N>::InternalPixelType`), and `T` for `std::complex<T>`
+    /// (`NumericTraits<std::complex<T>>::ValueType`).
+    ///
+    /// Always one of the ten scalar variants. For a complex pixel type this is
+    /// the element type of the interleaved buffer SimpleITK hands back from
+    /// `GetBufferAsFloat()` (sitkPimpleImageBase.hxx:838-842).
     pub const fn component_id(self) -> PixelId {
         match self {
+            PixelId::ComplexFloat32 => PixelId::Float32,
+            PixelId::ComplexFloat64 => PixelId::Float64,
             PixelId::VectorUInt8 => PixelId::UInt8,
             PixelId::VectorInt8 => PixelId::Int8,
             PixelId::VectorUInt16 => PixelId::UInt16,
@@ -120,12 +233,18 @@ impl PixelId {
         }
     }
 
-    /// The vector pixel type whose components are of this pixel's scalar type:
-    /// the identity on a vector pixel type, and `Vector<T>` for `T`.
+    /// The vector pixel type whose components are of this pixel's *component*
+    /// type — the inverse of [`PixelId::component_id`] on the vector variants,
+    /// and the identity on a vector pixel type.
     ///
-    /// Always one of the ten vector variants.
+    /// Always one of the ten vector variants. `ComplexFloat32` maps to
+    /// `VectorFloat32` because `Float32` is its component type; upstream has no
+    /// `sitkVectorComplexFloat32`, and no caller here vectorizes a complex
+    /// pixel type.
     pub const fn vector_id(self) -> PixelId {
         match self {
+            PixelId::ComplexFloat32 => PixelId::VectorFloat32,
+            PixelId::ComplexFloat64 => PixelId::VectorFloat64,
             PixelId::UInt8 => PixelId::VectorUInt8,
             PixelId::Int8 => PixelId::VectorInt8,
             PixelId::UInt16 => PixelId::VectorUInt16,
@@ -230,4 +349,53 @@ impl_scalar! {
     i64 => Int64,
     f32 => Float32,
     f64 => Float64,
+}
+
+/// The two component types that admit a `std::complex` pixel: `f32` and `f64`.
+///
+/// This is SimpleITK's `ComplexPixelIDTypeList` (sitkPixelIDTypeLists.h:104)
+/// read as a trait, and it doubles as `RealPixelIDTypeList`
+/// (sitkPixelIDTypeLists.h:98) — the two lists range over the same component
+/// types, which is why `ComplexToReal` maps `ComplexFloat32 -> Float32` and
+/// `RealAndImaginaryToComplex` maps `Float32 -> ComplexFloat32`.
+pub trait Real: Scalar {
+    /// The complex pixel type whose components are `Self`.
+    const COMPLEX_ID: PixelId;
+}
+
+impl Real for f32 {
+    const COMPLEX_ID: PixelId = PixelId::ComplexFloat32;
+}
+
+impl Real for f64 {
+    const COMPLEX_ID: PixelId = PixelId::ComplexFloat64;
+}
+
+/// One complex pixel, passed and returned by value.
+///
+/// SimpleITK's `GetPixelAsComplexFloat32` / `SetPixelAsComplexFloat32`
+/// (sitkImage.h:536-538, sitkImage.cxx:596-608) likewise trade in
+/// `std::complex<T>` values; the buffer itself stays interleaved `re, im, ...`
+/// and is reached through
+/// [`Image::complex_components`](crate::Image::complex_components), the exact
+/// analogue of `GetBufferAsFloat()` on a complex image
+/// (sitkPimpleImageBase.hxx:838-842).
+///
+/// `#[repr(C)]` records that the field order matches `std::complex<T>`'s
+/// storage. No code in this workspace reinterprets a `&[T]` as a
+/// `&[Complex<T>]`: doing so would need `unsafe`, and the workspace has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct Complex<T> {
+    /// Real part — `std::complex<T>::real()`.
+    pub re: T,
+    /// Imaginary part — `std::complex<T>::imag()`.
+    pub im: T,
+}
+
+impl<T> Complex<T> {
+    /// A complex value from its real and imaginary parts.
+    pub const fn new(re: T, im: T) -> Self {
+        Complex { re, im }
+    }
 }
