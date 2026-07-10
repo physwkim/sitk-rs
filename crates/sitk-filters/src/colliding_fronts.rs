@@ -35,9 +35,18 @@
 //! would otherwise be `0` and fall outside the negative region it anchors.
 //!
 //! With `apply_connectivity` (the default) the output keeps only the negative
-//! component reachable from **`seed_points1`** — `seedList` is built from
-//! `m_SeedPoints1` alone, so a negative region touching only `seed_points2`,
-//! including the forced `negative_epsilon` at those very seeds, is dropped.
+//! component reachable from a seed. Upstream builds the flood `seedList` from
+//! `m_SeedPoints1` **alone** (`.hxx:116-120`), so a negative region touching
+//! only `seed_points2` — including the forced `negative_epsilon` at those very
+//! seeds — is dropped, even though both seed sets are forced to
+//! `negative_epsilon` symmetrically (`.hxx:85-97`) and the whole filter is
+//! otherwise symmetric in its two seed sets (the gradient dot product is
+//! commutative). That asymmetry made the output depend on which set the caller
+//! labels "1"; this port seeds the flood from **both** seed sets (§2.23), so the
+//! result is invariant under swapping `seed_points1` and `seed_points2`. It
+//! changes nothing for a genuine collision — whose negative region is connected
+//! to both fronts — and only keeps the far seed's marker in degenerate configs
+//! where the fronts never meet.
 //! The flood fill is `FloodFilledImageFunctionConditionalConstIterator` over a
 //! `BinaryThresholdImageFunction::ThresholdBelow(negative_epsilon)`, i.e. face
 //! connectivity (`±1` per axis, no diagonals) over the *closed* condition
@@ -171,7 +180,8 @@ fn march_front(
 
 /// `FloodFilledImageFunctionConditionalConstIterator` over
 /// `BinaryThresholdImageFunction::ThresholdBelow(negative_epsilon)`, seeded on
-/// front 1: the visited pixels keep their dot product, the rest stay `0`.
+/// both seed sets (upstream seeds front 1 alone; see the module doc, §2.23):
+/// the visited pixels keep their dot product, the rest stay `0`.
 fn connected_negative_region(
     dot: &[f32],
     seeds: &[(usize, f64)],
@@ -228,7 +238,9 @@ fn connected_negative_region(
 ///   optionally a `dim + 1`-th giving the seed's initial arrival time). Both
 ///   must be inside the image.
 /// - `apply_connectivity` (ITK's default: `true`) keeps only the negative
-///   region face-connected to `seed_points1`, zeroing everything else.
+///   region face-connected to a seed, zeroing everything else. This port floods
+///   from both seed sets (upstream floods from `seed_points1` alone), so the
+///   result does not depend on which set is labelled "1" (§2.23).
 /// - `negative_epsilon` (ITK's default: `-1e-6`) is both the value forced onto
 ///   every seed and the inclusive upper bound of the connectivity threshold.
 /// - `stop_on_targets` (ITK's default: `false`) stops each front once every
@@ -263,12 +275,14 @@ pub fn colliding_fronts(
         .collect();
 
     let negative_epsilon32 = negative_epsilon as f32;
-    for &(index, _) in seeds1.trial.iter().chain(&seeds2.trial) {
+    let flood_seeds: Vec<(usize, f64)> =
+        seeds1.trial.iter().chain(&seeds2.trial).copied().collect();
+    for &(index, _) in &flood_seeds {
         dot[index] = negative_epsilon32;
     }
 
     let values = if apply_connectivity {
-        connected_negative_region(&dot, &seeds1.trial, negative_epsilon32, size, &strides)
+        connected_negative_region(&dot, &flood_seeds, negative_epsilon32, size, &strides)
     } else {
         dot.iter().map(|&v| f64::from(v)).collect()
     };
@@ -342,10 +356,12 @@ mod tests {
 
     /// A zero-speed wall keeps each front inside its own half, so every
     /// gradient product is zero and the only negative pixels are the two forced
-    /// seeds. `seed_points2`'s speckle is not connected to `seed_points1`, and
-    /// the flood fill — seeded on front 1 alone — drops it.
+    /// seeds. `seed_points2`'s marker is not connected to `seed_points1`;
+    /// upstream (flooding from front 1 alone) would drop it, but this port floods
+    /// from both seed sets (§2.23), so both isolated markers survive and the
+    /// connectivity result is symmetric — identical, here, to the ungated one.
     #[test]
-    fn apply_connectivity_drops_a_speckle_not_reachable_from_seed_points_1() {
+    fn apply_connectivity_keeps_both_seed_markers_when_the_fronts_are_walled_apart() {
         let eps = NEGATIVE_EPSILON;
         let mut data = vec![1.0f64; 5];
         data[2] = 0.0;
@@ -359,7 +375,12 @@ mod tests {
         );
         assert_close(
             &run(&image, &seeds1, &seeds2, true),
-            &[eps, 0.0, 0.0, 0.0, 0.0],
+            &[eps, 0.0, 0.0, 0.0, eps],
+        );
+        // Swapping the two seed sets gives the same output — the fix's point.
+        assert_close(
+            &run(&image, &seeds2, &seeds1, true),
+            &[eps, 0.0, 0.0, 0.0, eps],
         );
     }
 
@@ -378,13 +399,15 @@ mod tests {
             .unwrap();
         assert_close(&at_boundary, &[-1.0; 7]);
 
-        // Just past it, only the seeds themselves (forced to -1.5) qualify, and
-        // the fill cannot cross the -1 interior to reach seed 2.
+        // Just past it, only the seeds themselves (forced to -1.5) qualify: the
+        // -1 interior is now above the threshold and excluded. Each seed is a
+        // flood source (this port seeds both, §2.23), so both isolated markers
+        // survive even though the interior between them is not crossed.
         let past_boundary = colliding_fronts(&image, &seeds1, &seeds2, true, -1.5, false)
             .unwrap()
             .to_f64_vec()
             .unwrap();
-        assert_close(&past_boundary, &[-1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_close(&past_boundary, &[-1.5, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5]);
 
         let ungated = colliding_fronts(&image, &seeds1, &seeds2, false, -1.5, false)
             .unwrap()
@@ -448,8 +471,13 @@ mod tests {
         // the sole negative pixel is the forced seed.
         let one_sided = run(&image, &[], &[vec![4, 0]], false);
         assert_close(&one_sided, &[0.0, 0.0, 0.0, 0.0, NEGATIVE_EPSILON]);
-        // ...and with no front-1 seed there is nothing to flood from.
-        assert_close(&run(&image, &[], &[vec![4, 0]], true), &[0.0; 5]);
+        // ...and since this port floods from both seed sets (§2.23), that lone
+        // `seed_points2` marker still anchors the flood and survives — upstream,
+        // flooding from the empty front 1, would have dropped it.
+        assert_close(
+            &run(&image, &[], &[vec![4, 0]], true),
+            &[0.0, 0.0, 0.0, 0.0, NEGATIVE_EPSILON],
+        );
     }
 
     /// `AllTargets` demands at least one target point, and front 1 — whose
