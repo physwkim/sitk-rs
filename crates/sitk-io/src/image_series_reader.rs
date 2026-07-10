@@ -766,3 +766,590 @@ fn assemble_image(
     image.set_direction(&direction).map_err(IoError::Core)?;
     Ok(image)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::write_image;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "sitk_io_series_reader_test_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Hand-build a 2-D MetaImage with an arbitrary extra header line —
+    /// `write_image` cannot express a custom meta-data field (`meta_image::
+    /// write` never emits `img.meta_data_keys()`), so the `ITK_ImageOrigin`
+    /// override tests need the header text directly.
+    fn hand_built_2d_mha(
+        size: [usize; 2],
+        origin: [f64; 2],
+        extra: &str,
+        element_type: &str,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let header = format!(
+            "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             BinaryDataByteOrderMSB = False\n\
+             CompressedData = False\n\
+             TransformMatrix = 1 0 0 1\n\
+             Offset = {} {}\n\
+             ElementSpacing = 1 1\n\
+             DimSize = {} {}\n\
+             {extra}\
+             ElementType = {element_type}\n\
+             ElementDataFile = LOCAL\n",
+            origin[0], origin[1], size[0], size[1],
+        );
+        let mut bytes = header.into_bytes();
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    #[test]
+    fn two_2d_files_stack_into_a_3d_volume_in_series_order() {
+        let dir = tmp_dir("basic_stack");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(
+            &Image::from_vec(&[2, 2], vec![10u8, 11, 12, 13]).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(image.dimension(), 3);
+        assert_eq!(image.size(), &[2, 2, 2]);
+        assert_eq!(
+            image.scalar_slice::<u8>().unwrap(),
+            &[0, 1, 2, 3, 10, 11, 12, 13]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reverse_order_swaps_which_file_fills_which_series_slot() {
+        let dir = tmp_dir("reverse_order");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(
+            &Image::from_vec(&[2, 2], vec![10u8, 11, 12, 13]).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]).set_reverse_order(true);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(
+            image.scalar_slice::<u8>().unwrap(),
+            &[10, 11, 12, 13, 0, 1, 2, 3]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_2d_file_promotes_with_one_z_slice_and_unmodified_geometry() {
+        let dir = tmp_dir("single_2d");
+        let path = dir.join("s0.mha");
+        let mut img = Image::from_vec(&[3, 2], vec![0u8, 1, 2, 3, 4, 5]).unwrap();
+        img.set_spacing(&[2.0, 3.0]).unwrap();
+        img.set_origin(&[10.0, 20.0]).unwrap();
+        img.set_direction(&[0.0, 1.0, -1.0, 0.0]).unwrap();
+        write_image(&img, &path).unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&path]);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(image.dimension(), 3);
+        assert_eq!(image.size(), &[3, 2, 1]);
+        assert_eq!(image.spacing(), &[2.0, 3.0, 1.0]);
+        assert_eq!(image.origin(), &[10.0, 20.0, 0.0]);
+        assert_eq!(
+            image.direction(),
+            &[0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(image.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3, 4, 5]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_3d_file_with_a_unit_third_axis_collapses_and_keeps_its_own_geometry() {
+        let dir = tmp_dir("single_3d_collapse");
+        let path = dir.join("s0.mha");
+        let mut img = Image::from_vec(&[3, 2, 1], (0u8..6).collect()).unwrap();
+        img.set_spacing(&[1.5, 2.5, 4.0]).unwrap();
+        img.set_origin(&[1.0, 2.0, 3.0]).unwrap();
+        write_image(&img, &path).unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&path]);
+        let image = reader.execute().unwrap();
+
+        // A 4-D promotion of a 3-D file collapses back to 3-D when that
+        // file's own third axis has size 1 (sitkImageSeriesReader.cxx:219-229).
+        assert_eq!(image.dimension(), 3);
+        assert_eq!(image.size(), &[3, 2, 1]);
+        assert_eq!(image.spacing(), &[1.5, 2.5, 4.0]);
+        assert_eq!(image.origin(), &[1.0, 2.0, 3.0]);
+        assert_eq!(image.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3, 4, 5]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn three_3d_files_promote_to_a_4d_volume_when_the_z_axis_is_not_unit() {
+        let dir = tmp_dir("promote_4d");
+        let paths: Vec<_> = (0..3).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        for (i, path) in paths.iter().enumerate() {
+            let value = (i as u8) * 10;
+            write_image(&Image::from_vec(&[2, 2, 2], vec![value; 8]).unwrap(), path).unwrap();
+        }
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&paths);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(image.dimension(), 4);
+        assert_eq!(image.size(), &[2, 2, 2, 3]);
+        let mut expected = Vec::new();
+        expected.extend(std::iter::repeat_n(0u8, 8));
+        expected.extend(std::iter::repeat_n(10u8, 8));
+        expected.extend(std::iter::repeat_n(20u8, 8));
+        assert_eq!(image.scalar_slice::<u8>().unwrap(), expected.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn size_mismatch_between_slices_is_reported_with_the_reference_file() {
+        let dir = tmp_dir("size_mismatch");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(
+            &Image::from_vec(&[3, 2], vec![0u8, 1, 2, 3, 4, 5]).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let err = reader.execute().unwrap_err();
+        match err {
+            IoError::SeriesSizeMismatch {
+                file,
+                size,
+                expected,
+                reference_file,
+            } => {
+                assert_eq!(file, p1);
+                assert_eq!(size, vec![3, 2, 1]);
+                assert_eq!(expected, vec![2, 2, 1]);
+                assert_eq!(reference_file, p0);
+            }
+            other => panic!("expected SeriesSizeMismatch, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pixel_type_mismatch_at_a_middle_slice_is_reported() {
+        let dir = tmp_dir("pixel_mismatch");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        let p2 = dir.join("s2.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(&Image::from_vec(&[2, 2], vec![0u16, 1, 2, 3]).unwrap(), &p1).unwrap();
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p2).unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1, &p2]);
+        let err = reader.execute().unwrap_err();
+        match err {
+            IoError::SeriesPixelTypeMismatch {
+                file,
+                pixel_type,
+                expected,
+            } => {
+                assert_eq!(file, p1);
+                assert_eq!(pixel_type, PixelId::UInt16.as_str());
+                assert_eq!(expected, PixelId::UInt8.as_str());
+            }
+            other => panic!("expected SeriesPixelTypeMismatch, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_file_names_is_rejected() {
+        let mut reader = ImageSeriesReader::new();
+        assert!(matches!(
+            reader.execute().unwrap_err(),
+            IoError::EmptySeriesFileNames
+        ));
+    }
+
+    #[test]
+    fn a_5d_input_file_exceeds_sitk_max_dimension() {
+        let dir = tmp_dir("too_many_dims");
+        let path = dir.join("s0.mha");
+        write_image(
+            &Image::from_vec(&[2, 2, 2, 2, 2], vec![0u8; 32]).unwrap(),
+            &path,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&path]);
+        assert!(matches!(
+            reader.execute().unwrap_err(),
+            IoError::UnsupportedSeriesDimension(5)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn itk_image_origin_override_feeds_spacing_but_not_the_output_origin() {
+        let dir = tmp_dir("origin_override_spacing");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        std::fs::write(
+            &p0,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 0 0\n",
+                "MET_UCHAR",
+                &[0, 1, 2, 3],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 0 8\n",
+                "MET_UCHAR",
+                &[10, 11, 12, 13],
+            ),
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        // The override feeds the spacing/direction derivation (8 / (2-1)).
+        assert_eq!(image.spacing(), &[1.0, 1.0, 8.0]);
+        // But the image's own origin is always the first file's *real*,
+        // un-overridden origin (itkImageSeriesReader.hxx:121,226).
+        assert_eq!(image.origin(), &[5.0, 5.0, 0.0]);
+        assert_eq!(
+            image.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_wrong_length_itk_image_origin_override_is_ignored() {
+        let dir = tmp_dir("origin_override_wrong_length");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        std::fs::write(
+            &p0,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 1 2\n",
+                "MET_UCHAR",
+                &[0, 1, 2, 3],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 1 2\n",
+                "MET_UCHAR",
+                &[10, 11, 12, 13],
+            ),
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        // The malformed (wrong-token-count) override falls back to the real
+        // (identical, here) origins, so the derived vector is zero.
+        assert_eq!(image.spacing(), &[1.0, 1.0, 1.0]);
+        // Falling back to spacing_defined = false means the rolling
+        // non-uniform-sampling check never runs, so nothing is collected.
+        assert!(matches!(
+            reader.meta_data_keys(0).unwrap_err(),
+            IoError::SeriesSliceIndexOutOfRange { slice: 0, len: 0 }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn force_orthogonal_direction_on_flips_sign_to_agree_with_the_derived_direction() {
+        let dir = tmp_dir("force_orthogonal_flip");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        std::fs::write(
+            &p0,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 0 0\n",
+                "MET_UCHAR",
+                &[0, 1, 2, 3],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 -3 -4\n",
+                "MET_UCHAR",
+                &[10, 11, 12, 13],
+            ),
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        // dirN = [0,-3,-4], dot with the identity's existing column [0,0,1]
+        // is -4 < 0, so the existing column is kept but sign-flipped.
+        assert_eq!(
+            image.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn force_orthogonal_direction_off_replaces_the_column_with_the_derived_direction() {
+        let dir = tmp_dir("force_orthogonal_replace");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        std::fs::write(
+            &p0,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 0 0\n",
+                "MET_UCHAR",
+                &[0, 1, 2, 3],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &p1,
+            hand_built_2d_mha(
+                [2, 2],
+                [5.0, 5.0],
+                "ITK_ImageOrigin = 0 3 4\n",
+                "MET_UCHAR",
+                &[10, 11, 12, 13],
+            ),
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader
+            .set_file_names(&[&p0, &p1])
+            .set_force_orthogonal_direction(false);
+        let image = reader.execute().unwrap();
+
+        // dirN = [0,3,4], norm 5: the moving-axis column is replaced outright
+        // with [0, 0.6, 0.8], not merely sign-agreed with the existing one.
+        assert_eq!(
+            image.direction(),
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.6, 0.0, 0.0, 0.8]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meta_data_dictionary_array_update_off_collects_nothing_when_spacing_is_uniform() {
+        let dir = tmp_dir("mdda_off");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(
+            &Image::from_vec(&[2, 2], vec![10u8, 11, 12, 13]).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        reader.execute().unwrap();
+
+        assert!(matches!(
+            reader.meta_data_keys(0).unwrap_err(),
+            IoError::SeriesSliceIndexOutOfRange { slice: 0, len: 0 }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn meta_data_dictionary_array_update_on_collects_every_slice_from_the_start() {
+        let dir = tmp_dir("mdda_on");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        write_image(&Image::from_vec(&[2, 2], vec![0u8, 1, 2, 3]).unwrap(), &p0).unwrap();
+        write_image(
+            &Image::from_vec(&[2, 2], vec![10u8, 11, 12, 13]).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader
+            .set_file_names(&[&p0, &p1])
+            .set_meta_data_dictionary_array_update(true);
+        reader.execute().unwrap();
+
+        assert!(!reader.meta_data_keys(0).unwrap().is_empty());
+        assert!(reader.has_meta_data_key(0, "ITK_InputFilterName").unwrap());
+        assert!(reader.has_meta_data_key(1, "ITK_InputFilterName").unwrap());
+        assert!(matches!(
+            reader.meta_data_keys(2).unwrap_err(),
+            IoError::SeriesSliceIndexOutOfRange { slice: 2, len: 2 }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_uniform_sampling_activates_collection_mid_series_and_shifts_the_slice_index() {
+        let dir = tmp_dir("non_uniform");
+        let paths: Vec<_> = (0..4).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        for (i, path) in paths.iter().enumerate() {
+            let extra = match i {
+                0 => "ITK_ImageOrigin = 0 0 0\nSliceTag = 0\n".to_string(),
+                3 => "ITK_ImageOrigin = 0 0 6\nSliceTag = 3\n".to_string(),
+                n => format!("SliceTag = {n}\n"),
+            };
+            std::fs::write(
+                path,
+                hand_built_2d_mha([2, 2], [7.0, 7.0], &extra, "MET_UCHAR", &[i as u8; 4]),
+            )
+            .unwrap();
+        }
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&paths);
+        let image = reader.execute().unwrap();
+
+        // Uniform derived spacing is 6 / (4-1) = 2.0, but every file's own
+        // (un-overridden) origin is identical, so every step after the first
+        // registers as a full deviation and collection turns on at series
+        // slot 1 and stays on (itkImageSeriesReader.hxx:439-452).
+        assert_eq!(
+            image.meta_data("ITK_non_uniform_sampling_deviation"),
+            Some("2")
+        );
+        assert!(!reader.meta_data_keys(0).unwrap().is_empty());
+        // Collected index 0 is series slot 1, not slot 0 — the index-shift
+        // quirk the upstream `.at(i)` reproduces (sitkMetaDataDictionaryCustomCast.hxx:38-46).
+        assert_eq!(reader.meta_data(0, "SliceTag").unwrap(), Some("1"));
+        assert_eq!(reader.meta_data(1, "SliceTag").unwrap(), Some("2"));
+        assert_eq!(reader.meta_data(2, "SliceTag").unwrap(), Some("3"));
+        assert!(matches!(
+            reader.meta_data_keys(3).unwrap_err(),
+            IoError::SeriesSliceIndexOutOfRange { slice: 3, len: 3 }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vector_pixel_slices_scatter_by_component() {
+        let dir = tmp_dir("vector_scatter");
+        let p0 = dir.join("s0.mha");
+        let p1 = dir.join("s1.mha");
+        let d0: Vec<u8> = vec![0, 1, 2, 10, 11, 12, 20, 21, 22, 30, 31, 32];
+        let d1: Vec<u8> = d0.iter().map(|v| v + 100).collect();
+        write_image(
+            &Image::from_vec_vector::<u8>(&[2, 2], 3, d0.clone()).unwrap(),
+            &p0,
+        )
+        .unwrap();
+        write_image(
+            &Image::from_vec_vector::<u8>(&[2, 2], 3, d1.clone()).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(image.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(image.number_of_components_per_pixel(), 3);
+        assert_eq!(image.size(), &[2, 2, 2]);
+        let mut expected = d0;
+        expected.extend(d1);
+        assert_eq!(image.component_slice::<u8>().unwrap(), expected.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn complex_pixel_slices_round_trip_through_nrrd() {
+        let dir = tmp_dir("complex_scatter");
+        let p0 = dir.join("s0.nrrd");
+        let p1 = dir.join("s1.nrrd");
+        let d0: Vec<Complex<f32>> = (0..4)
+            .map(|i| Complex::new(i as f32 + 1.0, -(i as f32) - 1.0))
+            .collect();
+        let d1: Vec<Complex<f32>> = (0..4)
+            .map(|i| Complex::new(i as f32 + 10.0, -(i as f32) - 10.0))
+            .collect();
+        write_image(
+            &Image::from_vec_complex::<f32>(&[2, 2], d0.clone()).unwrap(),
+            &p0,
+        )
+        .unwrap();
+        write_image(
+            &Image::from_vec_complex::<f32>(&[2, 2], d1.clone()).unwrap(),
+            &p1,
+        )
+        .unwrap();
+
+        let mut reader = ImageSeriesReader::new();
+        reader.set_file_names(&[&p0, &p1]);
+        let image = reader.execute().unwrap();
+
+        assert_eq!(image.pixel_id(), PixelId::ComplexFloat32);
+        assert_eq!(image.size(), &[2, 2, 2]);
+        let flatten =
+            |v: &[Complex<f32>]| -> Vec<f32> { v.iter().flat_map(|c| [c.re, c.im]).collect() };
+        let mut expected = flatten(&d0);
+        expected.extend(flatten(&d1));
+        assert_eq!(image.component_slice::<f32>().unwrap(), expected.as_slice());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

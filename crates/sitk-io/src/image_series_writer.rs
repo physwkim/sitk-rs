@@ -409,3 +409,206 @@ fn assemble_2d_image(
     image.set_direction(&direction).map_err(IoError::Core)?;
     Ok(image)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read_image;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "sitk_io_series_writer_test_{}_{name}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn basic_3d_image_writes_one_file_per_z_slice() {
+        let dir = tmp_dir("basic_write");
+        let paths: Vec<_> = (0..3).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        let data: Vec<u8> = (0..12).collect();
+        let image = Image::from_vec(&[2, 2, 3], data).unwrap();
+
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&paths);
+        writer.execute(&image).unwrap();
+
+        for (i, path) in paths.iter().enumerate() {
+            let slice = read_image(path).unwrap();
+            assert_eq!(slice.dimension(), 2);
+            assert_eq!(slice.size(), &[2, 2]);
+            let expected: Vec<u8> = (0..4).map(|j| (i * 4 + j) as u8).collect();
+            assert_eq!(slice.scalar_slice::<u8>().unwrap(), expected.as_slice());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn origin_and_spacing_truncate_not_project() {
+        let dir = tmp_dir("truncate");
+        let paths: Vec<_> = (0..2).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        let mut image = Image::from_vec(&[2, 2, 2], vec![0u8; 8]).unwrap();
+        image.set_spacing(&[2.0, 3.0, 5.0]).unwrap();
+        image.set_origin(&[10.0, 20.0, 30.0]).unwrap();
+        // A non-orthonormal top-left 2x2 submatrix, which a physical
+        // re-projection would never produce — proving this is a literal
+        // truncation, not a projection.
+        image
+            .set_direction(&[2.0, 0.0, 5.0, 0.0, 3.0, 0.0, 1.0, 0.0, 1.0])
+            .unwrap();
+
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&paths);
+        writer.execute(&image).unwrap();
+
+        let slice0 = read_image(&paths[0]).unwrap();
+        assert_eq!(slice0.spacing(), &[2.0, 3.0]);
+        assert_eq!(slice0.origin(), &[10.0, 20.0]);
+        assert_eq!(slice0.direction(), &[2.0, 0.0, 0.0, 3.0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn singular_2x2_submatrix_falls_back_to_identity() {
+        let dir = tmp_dir("singular");
+        let paths: Vec<_> = (0..2).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        let mut image = Image::from_vec(&[2, 2, 2], vec![0u8; 8]).unwrap();
+        // Top-left 2x2 is [[1,0],[2,0]], determinant exactly 0.
+        image
+            .set_direction(&[1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&paths);
+        writer.execute(&image).unwrap();
+
+        let slice0 = read_image(&paths[0]).unwrap();
+        assert_eq!(slice0.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dot_extension_dcm_is_rejected() {
+        let image = Image::from_vec(&[2, 2, 1], vec![0u8; 4]).unwrap();
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&["out.dcm"]);
+        assert!(matches!(
+            writer.execute(&image).unwrap_err(),
+            IoError::SeriesWriterDicomRejected
+        ));
+    }
+
+    #[test]
+    fn dot_extension_dicom_is_rejected_case_insensitively() {
+        let image = Image::from_vec(&[2, 2, 1], vec![0u8; 4]).unwrap();
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&["out.DICOM"]);
+        assert!(matches!(
+            writer.execute(&image).unwrap_err(),
+            IoError::SeriesWriterDicomRejected
+        ));
+    }
+
+    /// `fn.substr(fn.find_last_of(".") + 1)` with no `.` anywhere wraps
+    /// (`std::string::npos + 1 == 0`) to the *whole path string*
+    /// (sitkImageSeriesWriter.cxx:227-234): a bare, dot-less file named
+    /// literally `dcm` is rejected even though it has no extension at all.
+    #[test]
+    fn a_bare_dotless_filename_named_dcm_is_rejected_via_the_wraparound_quirk() {
+        let image = Image::from_vec(&[2, 2, 1], vec![0u8; 4]).unwrap();
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&["dcm"]);
+        assert!(matches!(
+            writer.execute(&image).unwrap_err(),
+            IoError::SeriesWriterDicomRejected
+        ));
+    }
+
+    #[test]
+    fn non_3d_image_is_rejected_with_the_dispatch_message() {
+        let image = Image::from_vec(&[2, 2], vec![0u8; 4]).unwrap();
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&["out.mha"]);
+        match writer.execute(&image).unwrap_err() {
+            IoError::SeriesWriterUnsupportedDimension {
+                pixel_type,
+                dimension,
+            } => {
+                assert_eq!(pixel_type, PixelId::UInt8.as_str());
+                assert_eq!(dimension, 2);
+            }
+            other => panic!("expected SeriesWriterUnsupportedDimension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_file_names_is_rejected() {
+        let image = Image::from_vec(&[2, 2, 1], vec![0u8; 4]).unwrap();
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names::<&str>(&[]);
+        assert!(matches!(
+            writer.execute(&image).unwrap_err(),
+            IoError::EmptySeriesWriterFileNames
+        ));
+    }
+
+    #[test]
+    fn filename_count_mismatch_is_a_hard_error() {
+        let dir = tmp_dir("count_mismatch");
+        let paths: Vec<_> = (0..2).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        let image = Image::from_vec(&[2, 2, 3], vec![0u8; 12]).unwrap();
+
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&paths);
+        match writer.execute(&image).unwrap_err() {
+            IoError::SeriesFileNameCountMismatch { actual, expected } => {
+                assert_eq!(actual, 2);
+                assert_eq!(expected, 3);
+            }
+            other => panic!("expected SeriesFileNameCountMismatch, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn per_slice_metadata_round_trips_through_hdf5() {
+        let dir = tmp_dir("metadata_hdf5");
+        let paths: Vec<_> = (0..2).map(|i| dir.join(format!("s{i}.h5"))).collect();
+        let mut image = Image::from_vec(&[2, 2, 2], vec![0u8; 8]).unwrap();
+        image.set_spacing(&[1.5, 2.5, 4.0]).unwrap();
+        image.set_origin(&[10.0, 20.0, 30.0]).unwrap();
+
+        let mut writer = ImageSeriesWriter::new();
+        writer.set_file_names(&paths);
+        writer.execute(&image).unwrap();
+
+        let slice0 = read_image(&paths[0]).unwrap();
+        assert_eq!(slice0.meta_data("ITK_Origin"), Some("10 20 30"));
+        assert_eq!(slice0.meta_data("ITK_Spacing"), Some("1.5 2.5 4"));
+        assert_eq!(slice0.meta_data("ITK_NumberOfDimensions"), Some("3"));
+        assert_eq!(
+            slice0.meta_data("ITK_ZDirection"),
+            Some("1 0 0 0 1 0 0 0 1")
+        );
+
+        let slice1 = read_image(&paths[1]).unwrap();
+        assert_eq!(slice1.meta_data("ITK_Origin"), Some("10 20 34"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_image_series_is_execute_with_the_defaults() {
+        let dir = tmp_dir("free_function");
+        let paths: Vec<_> = (0..2).map(|i| dir.join(format!("s{i}.mha"))).collect();
+        let image = Image::from_vec(&[2, 2, 2], vec![0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+
+        write_image_series(&image, &paths, false, -1).unwrap();
+
+        let slice1 = read_image(&paths[1]).unwrap();
+        assert_eq!(slice1.scalar_slice::<u8>().unwrap(), &[4, 5, 6, 7]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
