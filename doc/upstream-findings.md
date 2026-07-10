@@ -18,6 +18,12 @@ Porting policy (see per-module docs for the citations):
 ITK reference checkout: `v6.0b02-5846-ge46eb723a5` (`/home/stevek/work/ITK`).
 SimpleITK yamls: `/home/stevek/work/SimpleITK/Code/BasicFilters/yaml/`.
 
+Reported upstream 2026-07-10: all of §1 and the upstream-relevant rows of
+§2 were re-verified against the checkout above and filed as
+<https://github.com/InsightSoftwareConsortium/ITK/issues/6575>
+(source text: `doc/issues/itk-upstream-findings.md`). §3 (SimpleITK
+wrapping) is not yet reported.
+
 ---
 
 ## 1. ITK bugs (wrong results, NaN, or C++ UB in live code paths)
@@ -132,7 +138,7 @@ SimpleITK yamls: `/home/stevek/work/SimpleITK/Code/BasicFilters/yaml/`.
 
 | # | Question | Options |
 |---|---|---|
-| 5.1 | **Projection origin bug (§1.1)** — keep bit-for-bit parity (current state) or fix? | (a) keep verbatim; (b) fix to `(size − 1)/2` centering + document divergence; (c) report upstream to ITK and track their resolution. |
+| 5.1 | **Projection origin bug (§1.1)** — keep bit-for-bit parity (current state) or fix? | (a) keep verbatim; (b) fix to `(size − 1)/2` centering + document divergence; (c) **done 2026-07-10** — reported upstream as ITK issue #6575 (item B1); parity-vs-fix decision still pending on their resolution. |
 | 5.2 | **Crate-added `time_step` guards (§4.6)** — `curvature_flow` and `min_max_curvature_flow` reject unstable steps; ITK does not. Keep the safety guard or drop for parity? Currently inconsistent with `anisotropic_diffusion` (which faithfully warns-and-proceeds… except it can't warn, so it just proceeds). | (a) keep guards; (b) drop both for parity; (c) unify on warn-and-proceed semantics via a returned diagnostic. |
 | 5.3 | **`#[allow(clippy::too_many_arguments)]`** on `threshold_segmentation_level_set` (9 args) and `canny_segmentation_level_set` (11 args), matching existing practice in `region_growing.rs`/`geodesic_active_contour_level_set`/registration modules. Structural fix would be a params struct across the whole family. | (a) accept as crate convention; (b) params-struct refactor for every >7-arg filter. |
 | 5.4 | **`fast_marching()` trial-point length rule** — SimpleITK's `sitkSTLVectorToITK` accepts any length ≥ dim and reads `point[dim]` as the seed's initial arrival time; `fast_marching()` (`fast_marching.rs:190`) rejects length ≠ dim, pinned by `trial_point_of_wrong_length_is_an_error`. The newer `fast_marching_upwind_gradient`/`colliding_fronts` implement the upstream rule — so `[0,0,3]` is a valued seed in those two and an error in `fast_marching`. Fixing changes existing public behavior and deletes a pinned test. | (a) align `fast_marching` on len ≥ dim + trailing seed value (parity, breaking); (b) keep the strict check as a documented divergence (§4.9-adjacent), inconsistent within the crate. |
