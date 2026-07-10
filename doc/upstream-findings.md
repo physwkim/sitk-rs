@@ -214,8 +214,9 @@ decisions; vector items are now just unported):
 - **Complex pixels (sitk-core done 2026-07-10)**: `PixelId::ComplexFloat32/64`,
   `Image::from_vec_complex`/`get_complex`/`set_complex`/`complex_components`,
   and the `buffer_stride` vs `number_of_components_per_pixel` split all exist;
-  see §4.15 and §4.22. Filters `ComplexToReal`/`Imaginary`/`Modulus`/`Phase`,
-  `RealAndImaginaryToComplex`, `MagnitudeAndPhaseToComplex` follow.
+  see §4.15 and §4.22. `ComplexToReal`/`Imaginary`/`Modulus`/`Phase`,
+  `RealAndImaginaryToComplex` and `MagnitudeAndPhaseToComplex` are ported in
+  `sitk-filters::complex` (§2.50, §3.13, §4.23).
   `ForwardFFT`/`InverseFFT` remain **unexposed**: `ForwardFFTImageFilter.yaml`
   declares no pad parameter, so it must transform the input size as given,
   while `sitk-filters::fft` is radix-2-only. See §5.7.

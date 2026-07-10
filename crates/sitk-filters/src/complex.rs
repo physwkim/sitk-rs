@@ -38,10 +38,33 @@
 //!   from `ComplexToModulusImageFilter.yaml`. The filter computes
 //!   `std::atan2(A.imag(), A.real())`
 //!   (`itkComplexToPhaseImageFilter.h:50`), which is what this port does.
+//!
+//! - **`RealAndImaginaryToComplexImageFilter` is `itk::ComposeImageFilter`**
+//!   under an alias (its yaml's `itk_name`), taking the complex specialization
+//!   at `itkComposeImageFilter.hxx:132-138` — a `constexpr` branch that exists
+//!   because `std::complex` "provides no `operator[]`"
+//!   (`itkComposeImageFilter.h:104-105`), unlike every vector pixel type.
+//!
+//! - **`std::polar(rho, theta)` is undefined in C++ for a negative or `NaN`
+//!   `rho`** (\[complex.value.ops\]/6), yet
+//!   `itkMagnitudeAndPhaseToComplexImageFilter.h:72` calls it on an unchecked
+//!   pixel value. libstdc++ evaluates `complex(rho * cos(theta),
+//!   rho * sin(theta))` regardless. Diverge-for-C++-UB: this port *defines* the
+//!   operation as exactly that expansion. Pinned by
+//!   `magnitude_and_phase_to_complex_accepts_a_negative_magnitude`.
+//!
+//! # Input checks on the two-input filters
+//!
+//! Both check pixel type then size, through the crate's `require_same_shape`.
+//! Upstream additionally rejects inputs that do not occupy the same physical
+//! space (`ImageToImageFilter::VerifyInputInformation` compares origin,
+//! spacing, and direction within a tolerance); this crate's two-input filters
+//! uniformly do not, and that pre-existing divergence is not changed here.
 
-use sitk_core::{Image, PixelId, Real};
+use sitk_core::{Complex, Image, PixelId, Real};
 
-use crate::Result;
+use crate::error::FilterError;
+use crate::{Result, require_same_shape};
 
 /// The component-type arithmetic the four complex functors need, held on one
 /// trait so the `f32` and `f64` instantiations cannot silently diverge.
@@ -55,6 +78,12 @@ trait ComplexMath: Real {
 
     /// `std::atan2(A.imag(), A.real())` — `itkComplexToPhaseImageFilter.h:50`.
     fn phase(re: Self, im: Self) -> Self;
+
+    /// `std::polar(rho, theta)` as libstdc++ expands it:
+    /// `complex(rho * cos(theta), rho * sin(theta))` —
+    /// `itkMagnitudeAndPhaseToComplexImageFilter.h:72`. See the module docs on
+    /// the negative-`rho` undefined behavior this makes defined.
+    fn polar(rho: Self, theta: Self) -> Complex<Self>;
 }
 
 macro_rules! impl_complex_math {
@@ -69,6 +98,11 @@ macro_rules! impl_complex_math {
                 #[inline]
                 fn phase(re: Self, im: Self) -> Self {
                     im.atan2(re)
+                }
+
+                #[inline]
+                fn polar(rho: Self, theta: Self) -> Complex<Self> {
+                    Complex::new(rho * theta.cos(), rho * theta.sin())
                 }
             }
         )+
@@ -153,6 +187,86 @@ pub fn complex_to_modulus(img: &Image) -> Result<Image> {
 /// see the module docs.)
 pub fn complex_to_phase(img: &Image) -> Result<Image> {
     complex_unary(img, Part::Phase)
+}
+
+/// Which complex-valued combination of two real pixels a [`complex_binary`]
+/// call forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compose {
+    /// `OutputPixelType{ (ValueType)in0, (ValueType)in1 }` —
+    /// `itkComposeImageFilter.hxx:132-138`.
+    RealAndImaginary,
+    /// `std::complex<TOutput>(std::polar(A, B))` —
+    /// `itkMagnitudeAndPhaseToComplexImageFilter.h:72`.
+    MagnitudeAndPhase,
+}
+
+fn combine<T: ComplexMath>(a: &Image, b: &Image, how: Compose) -> Result<Image> {
+    let x = a.scalar_slice::<T>()?;
+    let y = b.scalar_slice::<T>()?;
+    let data: Vec<Complex<T>> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(&p, &q)| match how {
+            Compose::RealAndImaginary => Complex::new(p, q),
+            Compose::MagnitudeAndPhase => T::polar(p, q),
+        })
+        .collect();
+    let mut result = Image::from_vec_complex(a.size(), data)?;
+    result.copy_geometry_from(a);
+    Ok(result)
+}
+
+/// The single dispatch seam for the two `*ToComplex` filters.
+///
+/// `pixel_types: RealPixelIDTypeList` (sitkPixelIDTypeLists.h:98) — `Float32`
+/// and `Float64` and nothing else, so the pixel-type check is a whitelist and a
+/// complex or vector input falls out as [`FilterError::RequiresRealPixelType`].
+///
+/// The check order mirrors SimpleITK's generated two-input wrapper: it selects
+/// the member function from `image1`'s pixel id (an unsupported type throws
+/// first), then casts `image2` to that same ITK type (a mismatch throws next),
+/// and only then does ITK compare regions.
+fn complex_binary(a: &Image, b: &Image, how: Compose) -> Result<Image> {
+    match a.pixel_id() {
+        PixelId::Float32 => {
+            require_same_shape(a, b)?;
+            combine::<f32>(a, b, how)
+        }
+        PixelId::Float64 => {
+            require_same_shape(a, b)?;
+            combine::<f64>(a, b, how)
+        }
+        other => Err(FilterError::RequiresRealPixelType(other)),
+    }
+}
+
+/// `RealAndImaginaryToComplexImageFilter` — `itk::ComposeImageFilter`'s complex
+/// specialization (`itkComposeImageFilter.hxx:132-138`): pixel `i` of the
+/// output is `re[i] + im[i]·j`.
+///
+/// Both inputs must be `Float32` or `Float64`
+/// (`pixel_types: RealPixelIDTypeList`), of the same pixel type and size; the
+/// output is that type's complex variant, with `re`'s geometry.
+///
+/// Errors with [`FilterError::RequiresRealPixelType`] on any other pixel type,
+/// [`FilterError::TypeMismatch`] when the two disagree, and
+/// [`FilterError::SizeMismatch`] where ITK throws "All Inputs must have the
+/// same dimensions." (`itkComposeImageFilter.hxx:99-102`).
+pub fn real_and_imaginary_to_complex(re: &Image, im: &Image) -> Result<Image> {
+    complex_binary(re, im, Compose::RealAndImaginary)
+}
+
+/// `MagnitudeAndPhaseToComplexImageFilter`
+/// (`itkMagnitudeAndPhaseToComplexImageFilter.h:72`): pixel `i` of the output is
+/// `polar(magnitude[i], phase[i])`, i.e.
+/// `magnitude[i]·cos(phase[i]) + magnitude[i]·sin(phase[i])·j`.
+///
+/// Same input rules and errors as [`real_and_imaginary_to_complex`]. A negative
+/// or `NaN` magnitude is undefined in C++ and defined here — see the module
+/// docs.
+pub fn magnitude_and_phase_to_complex(magnitude: &Image, phase: &Image) -> Result<Image> {
+    complex_binary(magnitude, phase, Compose::MagnitudeAndPhase)
 }
 
 #[cfg(test)]
@@ -304,6 +418,167 @@ mod tests {
             assert_eq!(out.origin(), img.origin());
             assert_eq!(out.direction(), img.direction());
         }
+    }
+
+    #[test]
+    fn real_and_imaginary_to_complex_pairs_the_two_inputs() {
+        let re = Image::from_vec(&[2, 1], vec![1.0f64, 2.0]).unwrap();
+        let im = Image::from_vec(&[2, 1], vec![3.0f64, 4.0]).unwrap();
+        let out = real_and_imaginary_to_complex(&re, &im).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::ComplexFloat64);
+        assert_eq!(out.number_of_components_per_pixel(), 1);
+        assert_eq!(
+            out.complex_components::<f64>().unwrap(),
+            &[1.0, 3.0, 2.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn real_and_imaginary_to_complex_round_trips_through_the_projections() {
+        let re = Image::from_vec(&[3, 1], vec![1.5f32, -0.0, 7.25]).unwrap();
+        let im = Image::from_vec(&[3, 1], vec![-2.5f32, 3.0, 0.0]).unwrap();
+        let c = real_and_imaginary_to_complex(&re, &im).unwrap();
+        assert_eq!(c.pixel_id(), PixelId::ComplexFloat32);
+        assert_eq!(complex_to_real(&c).unwrap(), re);
+        assert_eq!(complex_to_imaginary(&c).unwrap(), im);
+    }
+
+    #[test]
+    fn real_and_imaginary_to_complex_takes_the_first_inputs_geometry() {
+        let mut re = Image::from_vec(&[2, 1], vec![1.0f64, 2.0]).unwrap();
+        re.set_spacing(&[0.5, 2.0]).unwrap();
+        re.set_origin(&[-1.0, 3.0]).unwrap();
+        let im = Image::from_vec(&[2, 1], vec![3.0f64, 4.0]).unwrap();
+        let out = real_and_imaginary_to_complex(&re, &im).unwrap();
+        assert_eq!(out.spacing(), re.spacing());
+        assert_eq!(out.origin(), re.origin());
+    }
+
+    #[test]
+    fn magnitude_and_phase_to_complex_is_polars_expansion() {
+        use std::f64::consts::PI;
+        let mag = Image::from_vec(&[3, 1], vec![2.0f64, 2.0, 0.0]).unwrap();
+        let phase = Image::from_vec(&[3, 1], vec![0.0f64, PI / 2.0, 1.0]).unwrap();
+        let out = magnitude_and_phase_to_complex(&mag, &phase).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::ComplexFloat64);
+
+        // theta = 0: exactly (rho, 0).
+        assert_eq!(
+            out.get_complex::<f64>(&[0, 0]).unwrap(),
+            Complex::new(2.0, 0.0)
+        );
+        // theta = pi/2: `rho * cos(theta)` is NOT special-cased to zero —
+        // cos(PI/2) is 6.123233995736766e-17 in f64.
+        let q = out.get_complex::<f64>(&[1, 0]).unwrap();
+        assert_eq!(q.re, 2.0 * (PI / 2.0).cos());
+        assert_eq!(q.re, 1.2246467991473532e-16);
+        assert_eq!(q.im, 2.0);
+        // rho = 0 zeroes both parts whatever the phase.
+        assert_eq!(
+            out.get_complex::<f64>(&[2, 0]).unwrap(),
+            Complex::new(0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn magnitude_and_phase_to_complex_accepts_a_negative_magnitude() {
+        // std::polar's precondition is rho >= 0 ([complex.value.ops]/6); ITK
+        // does not check, and libstdc++ just multiplies. Defined here as that
+        // same product, so a negative magnitude reflects through the origin.
+        let mag = Image::from_vec(&[1], vec![-1.0f64]).unwrap();
+        let phase = Image::from_vec(&[1], vec![0.0f64]).unwrap();
+        let out = magnitude_and_phase_to_complex(&mag, &phase).unwrap();
+        assert_eq!(
+            out.get_complex::<f64>(&[0]).unwrap(),
+            Complex::new(-1.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn magnitude_and_phase_to_complex_computes_in_f32_for_f32_inputs() {
+        // polar(1, pi/2) in f32: cos(pi/2f32) = -4.371139e-8, not the f64 value.
+        let theta = std::f32::consts::PI / 2.0;
+        let mag = Image::from_vec(&[1], vec![1.0f32]).unwrap();
+        let phase = Image::from_vec(&[1], vec![theta]).unwrap();
+        let out = magnitude_and_phase_to_complex(&mag, &phase).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::ComplexFloat32);
+        let v = out.get_complex::<f32>(&[0]).unwrap();
+        assert_eq!(v.re, theta.cos());
+        assert_eq!(v.re, -4.371139e-8);
+        assert_eq!(v.im, 1.0);
+    }
+
+    #[test]
+    fn magnitude_and_phase_then_modulus_and_phase_round_trips() {
+        use std::f64::consts::PI;
+        let mag = Image::from_vec(&[2, 1], vec![2.0f64, 5.0]).unwrap();
+        let phase = Image::from_vec(&[2, 1], vec![PI / 6.0, -3.0 * PI / 4.0]).unwrap();
+        let c = magnitude_and_phase_to_complex(&mag, &phase).unwrap();
+
+        let m = complex_to_modulus(&c).unwrap();
+        let p = complex_to_phase(&c).unwrap();
+        for (got, want) in m.scalar_slice::<f64>().unwrap().iter().zip([2.0, 5.0]) {
+            assert!((got - want).abs() < 1e-15, "{got} vs {want}");
+        }
+        for (got, want) in p
+            .scalar_slice::<f64>()
+            .unwrap()
+            .iter()
+            .zip([PI / 6.0, -3.0 * PI / 4.0])
+        {
+            assert!((got - want).abs() < 1e-15, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn complex_binary_filters_reject_non_real_first_inputs() {
+        let f32_img = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        for bad in [
+            Image::from_vec(&[2, 1], vec![1u8, 2]).unwrap(),
+            Image::new(&[2, 1], PixelId::ComplexFloat32),
+            Image::from_vec_vector(&[2, 1], 2, vec![1.0f32; 4]).unwrap(),
+        ] {
+            let id = bad.pixel_id();
+            assert_eq!(
+                real_and_imaginary_to_complex(&bad, &f32_img),
+                Err(FilterError::RequiresRealPixelType(id))
+            );
+            assert_eq!(
+                magnitude_and_phase_to_complex(&bad, &f32_img),
+                Err(FilterError::RequiresRealPixelType(id))
+            );
+        }
+    }
+
+    #[test]
+    fn complex_binary_filters_reject_mismatched_types_and_sizes() {
+        let a = Image::from_vec(&[2, 1], vec![1.0f32, 2.0]).unwrap();
+        let wrong_type = Image::from_vec(&[2, 1], vec![1.0f64, 2.0]).unwrap();
+        assert_eq!(
+            real_and_imaginary_to_complex(&a, &wrong_type),
+            Err(FilterError::TypeMismatch {
+                a: PixelId::Float32,
+                b: PixelId::Float64,
+            })
+        );
+        let wrong_size = Image::from_vec(&[3, 1], vec![1.0f32; 3]).unwrap();
+        assert_eq!(
+            magnitude_and_phase_to_complex(&a, &wrong_size),
+            Err(FilterError::SizeMismatch {
+                a: vec![2, 1],
+                b: vec![3, 1],
+            })
+        );
+        // A complex *second* input is a type mismatch, not a real-type error:
+        // upstream reaches it through CastImageToITK, not the wrapper factory.
+        let complex_b = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        assert_eq!(
+            real_and_imaginary_to_complex(&a, &complex_b),
+            Err(FilterError::TypeMismatch {
+                a: PixelId::Float32,
+                b: PixelId::ComplexFloat32,
+            })
+        );
     }
 
     #[test]
