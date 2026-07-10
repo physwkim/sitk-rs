@@ -22,9 +22,9 @@
 //! `[min, max]` (clamped above by `UpperBoundary`) and the loop terminates
 //! once the interval narrows to `<= 2` raw intensity units.
 //!
-//! ## Preserved upstream quirk: `midpoint` is not the true center
+//! ## Fixed upstream bug: `midpoint` is now the true center
 //!
-//! `GenerateData` computes the very first split point as
+//! Upstream `GenerateData` computes the very first split point as
 //!
 //! ```text
 //! midpoint = (upperBound - lowerBound) / 2
@@ -32,24 +32,22 @@
 //!
 //! which is **half the span**, not `(lowerBound + upperBound) / 2` (the
 //! actual midpoint of `[lowerBound, upperBound]`). This only coincides with
-//! the true center when `lowerBound == 0`. Every subsequent `midpointL`/
-//! `midpointR` recomputation *does* use the correct quarter-point formula
-//! relative to whatever `midpoint` currently is
+//! the true center when `lowerBound == 0`, and for a nonzero `lowerBound`
+//! biases the search's very first split toward `lowerBound`; upstream then
+//! computes `midpoint - lowerBound` on that biased value, which for integer
+//! pixel types can go negative and, for unsigned pixel types, wraps modulo
+//! `2^bits`. [`bisect`] instead computes the true center,
+//! `lowerBound + (upperBound - lowerBound) / 2`, matching the quarter-point
+//! formula every subsequent iteration already uses
 //! (`lowerBound + (midpoint - lowerBound) / 2` and
-//! `upperBound - (upperBound - midpoint) / 2`), so this bug affects only the
-//! search's starting point, not its self-correcting per-iteration algebra --
-//! but for **integer pixel types with a nonzero `lowerBound`**, that first
-//! `(midpoint - lowerBound)` can go negative (`midpoint < lowerBound`), and
-//! for **unsigned pixel types** that negative subtraction wraps modulo
-//! `2^bits` exactly as C++ unsigned-integer arithmetic is defined to
-//! (`itk::Math`/plain `PixelType` ops, no saturation). [`bisect`] reproduces
-//! this bit-for-bit via Rust's `wrapping_sub`/`wrapping_add` rather than
-//! "fixing" the formula. For **floating-point pixel types**, this port uses
-//! plain (non-wrapping) arithmetic, matching C++ float semantics -- no
-//! modular wraparound is possible there, but the *biased starting point* bug
-//! still applies, and floating images with an intensity span `<= 2.0` (e.g.
-//! normalized to `[0, 1]` or `[-1, 1]`) never enter the loop at all, so
-//! `threshold_value` is exactly that biased `span / 2` value.
+//! `upperBound - (upperBound - midpoint) / 2`). With the true center as the
+//! invariant, `lowerBound <= midpoint <= upperBound` holds at the start of
+//! every iteration (by induction: each branch replaces either bound with the
+//! current `midpoint` and recomputes `midpoint_l`/`midpoint_r` from quarter
+//! points that stay within `[lowerBound, upperBound]`), so `midpoint -
+//! lowerBound` and `upperBound - midpoint` are never negative and the
+//! bisection arithmetic needs no wrapping semantics at all -- plain
+//! subtraction/addition suffices for every pixel type, integer or float.
 //!
 //! ## `UpperBoundary` is fixed for the whole search; `upperBound` is not
 //!
@@ -136,19 +134,21 @@ pub struct ThresholdMaximumConnectedComponentsResult {
     pub number_of_objects: u64,
 }
 
-/// Per-pixel-type bisection arithmetic reproducing C++ `PixelType` overflow
-/// semantics -- see the module doc's "Preserved upstream quirk" section.
+/// Per-pixel-type bisection arithmetic. Plain (non-wrapping) `+`/`-` for
+/// every pixel type, integer or float: the true-center invariant (see the
+/// module doc) keeps every subtraction non-negative, so no wrapping
+/// semantics are needed.
 trait Bisect: Scalar {
-    fn wsub(self, rhs: Self) -> Self;
-    fn wadd(self, rhs: Self) -> Self;
+    fn sub(self, rhs: Self) -> Self;
+    fn add(self, rhs: Self) -> Self;
     fn half(self) -> Self;
 }
 
 macro_rules! impl_bisect_int {
     ($($t:ty),+ $(,)?) => {$(
         impl Bisect for $t {
-            fn wsub(self, rhs: Self) -> Self { self.wrapping_sub(rhs) }
-            fn wadd(self, rhs: Self) -> Self { self.wrapping_add(rhs) }
+            fn sub(self, rhs: Self) -> Self { self - rhs }
+            fn add(self, rhs: Self) -> Self { self + rhs }
             fn half(self) -> Self { self / 2 }
         }
     )+};
@@ -158,8 +158,8 @@ impl_bisect_int!(u8, i8, u16, i16, u32, i32, u64, i64);
 macro_rules! impl_bisect_float {
     ($($t:ty),+ $(,)?) => {$(
         impl Bisect for $t {
-            fn wsub(self, rhs: Self) -> Self { self - rhs }
-            fn wadd(self, rhs: Self) -> Self { self + rhs }
+            fn sub(self, rhs: Self) -> Self { self - rhs }
+            fn add(self, rhs: Self) -> Self { self + rhs }
             fn half(self) -> Self { self / (2 as $t) }
         }
     )+};
@@ -176,13 +176,13 @@ fn bisect<T: Bisect>(
 ) -> Result<(T, u64)> {
     let mut lower_bound = lower0;
     let mut upper_bound = upper0;
-    let mut midpoint = upper_bound.wsub(lower_bound).half();
-    let mut midpoint_l = lower_bound.wadd(midpoint.wsub(lower_bound).half());
-    let mut midpoint_r = upper_bound.wsub(upper_bound.wsub(midpoint).half());
+    let mut midpoint = lower_bound.add(upper_bound.sub(lower_bound).half());
+    let mut midpoint_l = lower_bound.add(midpoint.sub(lower_bound).half());
+    let mut midpoint_r = upper_bound.sub(upper_bound.sub(midpoint).half());
     let mut number_of_objects = 0u64;
 
     let two = T::from_f64(2.0);
-    while upper_bound.wsub(lower_bound) > two {
+    while upper_bound.sub(lower_bound) > two {
         let right_count = count_at(midpoint_r)?;
         let left_count = count_at(midpoint_l)?;
 
@@ -196,8 +196,8 @@ fn bisect<T: Bisect>(
             number_of_objects = left_count;
         }
 
-        midpoint_l = lower_bound.wadd(midpoint.wsub(lower_bound).half());
-        midpoint_r = upper_bound.wsub(upper_bound.wsub(midpoint).half());
+        midpoint_l = lower_bound.add(midpoint.sub(lower_bound).half());
+        midpoint_r = upper_bound.sub(upper_bound.sub(midpoint).half());
     }
 
     Ok((midpoint, number_of_objects))
@@ -378,10 +378,12 @@ mod tests {
 
     #[test]
     fn merges_below_bridge_and_fragments_above_known_optimum() {
-        // image_min = 0, image_max = 200, span = 200 > 2, so the loop runs
-        // and the biased-midpoint quirk (module doc) is inert here (lower
-        // bound 0). Hand-traced bisection path (u8 arithmetic, no
-        // wraparound since lower_bound starts at 0):
+        // image_min = 0, image_max = 200, span = 200 > 2, so the loop runs.
+        // The true-center and half-span formulas agree here (lower bound is
+        // 0), so this trace does not exercise the fix by itself -- see
+        // [`nonzero_lower_bound_uses_the_true_center_not_the_half_span`] for
+        // a trace where they diverge. Hand-traced bisection path (u8
+        // arithmetic):
         //   iter1: L=count_at(50)=1 (merged), R=count_at(150)=2 (split) ->
         //     R>L: lower=100, mid=150, #obj=2
         //   iter2..6: L and R both land in (100, 200], tied at 2 -> always
@@ -400,6 +402,43 @@ mod tests {
         // 102), blob2 (cols 5-7), background.
         assert_eq!(&out[0..9], &[0, 1, 1, 1, 0, 1, 1, 1, 0]);
         // Same pattern repeats for all 3 rows.
+        assert_eq!(&out[9..18], &out[0..9]);
+        assert_eq!(&out[18..27], &out[0..9]);
+    }
+
+    #[test]
+    fn nonzero_lower_bound_uses_the_true_center_not_the_half_span() {
+        // The same two-blobs-with-bridge structure as
+        // `merges_below_bridge_and_fragments_above_known_optimum`, shifted
+        // down by 60 under a signed pixel type: background -60, bridge 40,
+        // blob 140 (image_min = -60, image_max = 140). Since the whole
+        // fixture is just a coordinate shift, the fixed bisection's true
+        // center (lower + span/2 = -60 + 100 = 40) lands on the exact
+        // shifted counterpart of the unshifted trace's first split (100 -
+        // 60 = 40), and the entire search path is that trace shifted by
+        // -60: threshold_value = 102 - 60 = 42, number_of_objects = 2.
+        //
+        // The bug this replaces would have computed the first split as
+        // half the *span* alone, `(upperBound - lowerBound) / 2 = 100`,
+        // landing deep inside the blob region instead of near the true
+        // boundary at 40 -- hand-tracing that biased path converges to
+        // threshold_value = 101 instead, over 30 units away from the
+        // correct answer and past the bridge, entirely misjudging the
+        // component structure.
+        let w = 9;
+        let h = 3;
+        let row: [i16; 9] = [-60, 140, 140, 140, 40, 140, 140, 140, -60];
+        let mut data = Vec::with_capacity(w * h);
+        for _ in 0..h {
+            data.extend_from_slice(&row);
+        }
+        let img = Image::from_vec(&[w, h], data).unwrap();
+
+        let result = threshold_maximum_connected_components(&img, 0, f64::MAX, 1, 0).unwrap();
+        assert_eq!(result.threshold_value, 42.0);
+        assert_eq!(result.number_of_objects, 2);
+        let out = result.image.scalar_slice::<u8>().unwrap();
+        assert_eq!(&out[0..9], &[0, 1, 1, 1, 0, 1, 1, 1, 0]);
         assert_eq!(&out[9..18], &out[0..9]);
         assert_eq!(&out[18..27], &out[0..9]);
     }
@@ -506,20 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn negative_constant_image_pins_the_biased_midpoint_quirk() {
+    fn negative_constant_image_pins_the_true_center_midpoint() {
         // A constant image at a negative value under a signed pixel type:
         // image_min == image_max == -50, so the loop never runs (span 0).
-        // threshold_value = midpoint = (upperBound - lowerBound) / 2 =
-        // (-50 - -50) / 2 = 0 -- NOT the true center -50 (module doc's
-        // "Preserved upstream quirk"). Because threshold_value (0) exceeds
-        // the actual constant pixel value (-50), every pixel fails the
-        // `>= threshold_value` test and the output is entirely background,
-        // despite the input being a single uniform intensity.
+        // threshold_value = midpoint = lowerBound + (upperBound - lowerBound)
+        // / 2 = -50 + (-50 - -50) / 2 = -50 -- the true center (module doc's
+        // "Fixed upstream bug" section), matching the constant pixel value
+        // exactly. Every pixel therefore passes the `>= threshold_value`
+        // test and the output is entirely foreground.
         let img = Image::from_vec(&[3, 1], vec![-50i16, -50, -50]).unwrap();
         let result = threshold_maximum_connected_components(&img, 0, f64::MAX, 1, 0).unwrap();
-        assert_eq!(result.threshold_value, 0.0);
+        assert_eq!(result.threshold_value, -50.0);
         let out = result.image.scalar_slice::<u8>().unwrap();
-        assert_eq!(out, &[0, 0, 0]);
+        assert_eq!(out, &[1, 1, 1]);
     }
 
     #[test]
