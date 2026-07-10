@@ -4534,25 +4534,26 @@ mod tests {
         assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
     }
 
-    /// `InternalWrite` sends every component count other than 1 down the
-    /// `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:725-732), so a two-component
-    /// image is written as RGB with `SamplesPerPixel = 2` — a file no TIFF
-    /// reader can interpret as colour, and which upstream's own reader takes
-    /// back as a *one*-component grayscale of half-rows (§2.140). This port
-    /// writes the same bytes and refuses to read them.
+    /// Fixed §2.141: `InternalWrite` sent every component count other than 1
+    /// down the `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:725-732), so a
+    /// two-component image was written as RGB with `SamplesPerPixel = 2` — a
+    /// file no TIFF reader can interpret as colour, and which this port's own
+    /// reader refused outright. A 2-component image now writes
+    /// `PHOTOMETRIC_MINISBLACK` with one `ExtraSamples::Unspecified` sample,
+    /// which `layout_for`'s §2.140 fix reads back as a 2-component vector
+    /// image intact.
     #[test]
-    fn tiff_write_of_a_two_component_image_emits_photometric_rgb_with_two_samples() {
+    fn tiff_roundtrip_two_component_vector_uint8() {
         let data: Vec<u8> = (0..24u32).map(|i| i as u8).collect();
-        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data).unwrap();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data.clone()).unwrap();
         let path = tmp_path("two_component.tif");
         write_image(&img, &path).unwrap();
-        let back = read_image(&path);
+        let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert!(
-            matches!(&back, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("SamplesPerPixel = 2")),
-            "{back:?}"
-        );
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
     }
 
     /// A 3-D image writes one directory per slice, each tagged

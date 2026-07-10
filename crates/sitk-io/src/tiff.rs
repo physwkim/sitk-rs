@@ -105,6 +105,20 @@
 //! [`page_rows`] takes a single `components` count and copies each row
 //! verbatim rather than truncating it.
 //!
+//! # A 2-component image wrote as `PHOTOMETRIC_RGB` with 2 samples — this port writes `MINISBLACK` plus one extra sample
+//!
+//! `InternalWrite` picks its photometric with `if (m_NumberOfComponents == 1)
+//! MINISBLACK else RGB` (itkTIFFImageIO.cxx:725-732), so a 2-component image
+//! was written as `PHOTOMETRIC_RGB` with `SamplesPerPixel = 2` — a file no
+//! TIFF reader can interpret as colour, and which this crate's own reader
+//! refuses outright (§4.102). Ledger §2.141.
+//!
+//! **Fixed §2.141** — a 2-component image now writes `PHOTOMETRIC_MINISBLACK`
+//! with one `ExtraSamples::Unspecified` sample past the declared grayscale
+//! sample, a standard, unambiguous TIFF construct: `SamplesPerPixel = 2`
+//! with an `ExtraSamples` tag describing the second. [`layout_for`]'s §2.140
+//! fix reads that back as a 2-component vector image, every sample intact.
+//!
 //! # Multi-page TIFF → 3-D volume, and two ways upstream walks off the buffer
 //!
 //! `Initialize` counts directories, then — only when there is more than one —
@@ -835,15 +849,24 @@ pub fn read(path: &Path) -> Result<Image> {
 /// `PHOTOMETRIC_MINISBLACK`, the photometric `InternalWrite` picks for a
 /// 1-component image once `GetWritePalette()` is ruled out
 /// (itkTIFFImageIO.cxx:725-738).
+///
+/// Fixed §2.141: also used for a 2-component image. Upstream writes
+/// `PHOTOMETRIC_RGB` with `SAMPLESPERPIXEL = 2` for that case — a file no
+/// TIFF reader can interpret as colour, and which this crate's own reader
+/// refuses outright (§4.102). A grayscale-plus-one-extra-sample image is a
+/// standard, unambiguous TIFF construct and is exactly what [`layout_for`]
+/// now reads back correctly (§2.140), so `write_pages` reaches this type
+/// through its generic `ImageEncoder::extra_samples` extension the same way
+/// it already does for [`Rgb`] beyond 3 components.
 struct MinIsBlack<T>(PhantomData<T>);
 
 /// `PHOTOMETRIC_RGB` over `N` declared samples.
 ///
-/// `InternalWrite` writes `PHOTOMETRIC_RGB` for *every* image with more than
-/// one component, `SAMPLESPERPIXEL = scomponents`, and — for `scomponents > 3`
-/// — an `EXTRASAMPLES` array (`:678-690`, `:739-746`). `N == 2` is upstream's
-/// invalid-but-emitted "RGB with two samples"; `N == 3` covers 3 components and,
-/// with `ImageEncoder::extra_samples`, everything above.
+/// `InternalWrite` writes `PHOTOMETRIC_RGB` for every image with more than
+/// two components, `SAMPLESPERPIXEL = scomponents`, and — for
+/// `scomponents > 3` — an `EXTRASAMPLES` array (`:678-690`, `:739-746`).
+/// `N == 3` covers 3 components and, with `ImageEncoder::extra_samples`,
+/// everything above.
 struct Rgb<T, const N: usize>(PhantomData<T>);
 
 macro_rules! encoder_color_types {
@@ -1026,12 +1049,21 @@ where
     for page in 0..ctx.pages {
         let mut image = encoder.new_image::<C>(ctx.width, ctx.height)?;
 
-        // `if (scomponents > 3)`: one associated-alpha sample, the rest
-        // unspecified (itkTIFFImageIO.cxx:678-690). `extra_samples` extends
-        // `SamplesPerPixel` and `BitsPerSample` to match.
-        if ctx.components > 3 {
-            let mut extras = vec![ExtraSamples::Unspecified; ctx.components - 3];
-            extras[0] = ExtraSamples::AssociatedAlpha;
+        // `C::BITS_PER_SAMPLE.len()` is the sample count the photometric
+        // interpretation declares on its own (1 for `MinIsBlack`, 3 for
+        // `Rgb`); anything past that must be described via `ExtraSamples`
+        // per the TIFF6 spec, which `extra_samples` folds into
+        // `SamplesPerPixel` and `BitsPerSample`. Upstream's own extension
+        // is RGB-only — `if (scomponents > 3)`, one associated-alpha sample
+        // then unspecified (itkTIFFImageIO.cxx:678-690) — so a 2-component
+        // `MinIsBlack` image's one extra sample (fixed §2.141) has no
+        // alpha semantics to assume and is left `Unspecified`.
+        let core_samples = C::BITS_PER_SAMPLE.len();
+        if ctx.components > core_samples {
+            let mut extras = vec![ExtraSamples::Unspecified; ctx.components - core_samples];
+            if C::TIFF_VALUE == PhotometricInterpretation::RGB {
+                extras[0] = ExtraSamples::AssociatedAlpha;
+            }
             image.extra_samples(&extras)?;
         }
 
@@ -1070,8 +1102,7 @@ where
     macro_rules! by_components {
         ($data:expr, $inner:ty) => {
             match ctx.components {
-                1 => write_pages::<_, _, MinIsBlack<$inner>>(encoder, $data, ctx),
-                2 => write_pages::<_, _, Rgb<$inner, 2>>(encoder, $data, ctx),
+                1 | 2 => write_pages::<_, _, MinIsBlack<$inner>>(encoder, $data, ctx),
                 _ => write_pages::<_, _, Rgb<$inner, 3>>(encoder, $data, ctx),
             }
         };
