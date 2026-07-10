@@ -1158,6 +1158,7 @@ mod tests {
             let options = WriteOptions {
                 use_compression: false,
                 compression_level: level,
+                compressor: None,
             };
             write(&image, &path, &options).unwrap();
             assert_eq!(read(&path).unwrap(), image, "level {level}");
@@ -1262,6 +1263,7 @@ mod tests {
             &WriteOptions {
                 use_compression: false,
                 compression_level: -1,
+                compressor: None,
             },
         )
         .unwrap();

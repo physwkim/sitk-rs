@@ -60,28 +60,27 @@
 //! private. [`read`] and [`read_information`] both refuse a palette TIFF.
 //! Ledger §4.100, §5.28.
 //!
-//! # `MINISWHITE` is not inverted upstream, and is by the `tiff` crate
+//! # `MINISWHITE` is read out un-inverted upstream — this port returns the true value
 //!
 //! `GetFormat` maps both `PHOTOMETRIC_MINISWHITE` and `PHOTOMETRIC_MINISBLACK`
 //! to `GRAYSCALE` (itkTIFFImageIO.cxx:111-114), and `ReadGenericImage`'s
 //! `GRAYSCALE` arm is `PutGrayscale`, a plain `std::copy_n` under a
 //! `// check inverted` comment that never grew a body
 //! (`:1399-1402`, `:1467-1482`). A white-is-zero TIFF therefore reads out with
-//! its raw samples, tone-inverted relative to what a viewer shows. Ledger
-//! §2.139.
+//! its raw samples, tone-inverted relative to what a viewer shows — a silently
+//! wrong value, not a format quirk to reproduce. Ledger §2.139.
 //!
-//! The `tiff` crate *does* invert, calling `invert_colors` whenever
-//! `photometric_interpretation == WhiteIsZero` (decoder/image.rs:948). Its
-//! transform is an involution for the unsigned integer arms it supports
-//! (`!x`, `0xffff - v`, `0xffff_ffff - v`, decoder/mod.rs:718-748), so
-//! [`undo_minis_white_inversion`] applies it a second time and lands exactly on
-//! the file's raw samples — upstream's output. The float arm (`1.0 - v`) is
-//! *not* an involution under rounding, so a 32-bit-float `MINISWHITE` image is
-//! refused rather than round-tripped approximately (ledger §4.101); the signed
-//! and multi-sample arms the crate has no code for surface as its own
-//! `UnknownInterpretation` error.
+//! The `tiff` crate already inverts correctly, calling `invert_colors`
+//! whenever `photometric_interpretation == WhiteIsZero` (decoder/image.rs:948)
+//! for every arm it supports (unsigned 8/16/32-bit and `f32`,
+//! decoder/mod.rs:718-748). **Fixed §2.139** — [`read`] no longer reverses
+//! that correction back to upstream's raw, tone-inverted value; the crate's
+//! own output is used as-is, which also means a 32-bit-float `MINISWHITE`
+//! image is no longer refused (that refusal existed solely to avoid
+//! round-tripping back through a non-invertible `1.0 - v`, a concern that
+//! does not arise when the corrected value is kept rather than undone).
 //!
-//! # A multi-sample `MINISBLACK` image reads its first half-row, twice over
+//! # A multi-sample `MINISBLACK` image reads its first half-row, twice over — this port reads every sample
 //!
 //! `GetFormat` maps `MINISBLACK` to `GRAYSCALE` before ever looking at
 //! `SamplesPerPixel`, so `ReadImageInformation` sets `NumberOfComponents` to 1
@@ -92,8 +91,33 @@
 //! of its first `width / 2` pixels. No error, no warning — `CanRead()` is
 //! perfectly happy with it, and the declared-but-never-defined
 //! `ReadTwoSamplesPerPixelImage` (itkTIFFImageIO.h:228-229) has no body in the
-//! `.cxx` at all. Ledger §2.140; [`page_rows`] reproduces it by taking the
-//! first `width * inc` samples of each `width * samples_per_pixel` row.
+//! `.cxx` at all. Ledger §2.140.
+//!
+//! Dropping every sample past the first is silent data loss, not a shape to
+//! reproduce: this crate's [`PixelId`] has no restriction against a
+//! multi-component grayscale image, so **fixed §2.140** — [`layout_for`] now
+//! sets `number_of_components` to the page's true `SamplesPerPixel` for
+//! `GRAYSCALE` too, exactly as it already did for `RGB`, and the file reads
+//! back as a vector image with every sample intact. This also makes
+//! [`page_rows`]'s two stride parameters always equal — `layout.number_of_components`
+//! and `page.samples_per_pixel` are the same count on every path once
+//! `read_current_page`'s per-page geometry check (§1.67) has passed — so
+//! [`page_rows`] takes a single `components` count and copies each row
+//! verbatim rather than truncating it.
+//!
+//! # A 2-component image wrote as `PHOTOMETRIC_RGB` with 2 samples — this port writes `MINISBLACK` plus one extra sample
+//!
+//! `InternalWrite` picks its photometric with `if (m_NumberOfComponents == 1)
+//! MINISBLACK else RGB` (itkTIFFImageIO.cxx:725-732), so a 2-component image
+//! was written as `PHOTOMETRIC_RGB` with `SamplesPerPixel = 2` — a file no
+//! TIFF reader can interpret as colour, and which this crate's own reader
+//! refuses outright (§4.102). Ledger §2.141.
+//!
+//! **Fixed §2.141** — a 2-component image now writes `PHOTOMETRIC_MINISBLACK`
+//! with one `ExtraSamples::Unspecified` sample past the declared grayscale
+//! sample, a standard, unambiguous TIFF construct: `SamplesPerPixel = 2`
+//! with an `ExtraSamples` tag describing the second. [`layout_for`]'s §2.140
+//! fix reads that back as a 2-component vector image, every sample intact.
 //!
 //! # Multi-page TIFF → 3-D volume, and two ways upstream walks off the buffer
 //!
@@ -169,7 +193,7 @@
 //! hand this module native-order `u16`/`i16`/`u32`/`i32`/`f32`, and [`read`]
 //! swaps nothing.
 //!
-//! # Compression: only `PackBits` and "none" are reachable on write
+//! # Compression: `PackBits`, `LZW` and `Deflate` are selectable on write
 //!
 //! `TIFFImageIO`'s constructor calls `SetCompressor("")`, which
 //! `InternalSetCompressor` resolves to `PackBits`
@@ -179,24 +203,37 @@
 //! `LZW` / `PACKBITS` / `JPEG` / `DEFLATE` / `ADOBE_DEFLATE`
 //! (`:692-722`). Selecting one of those needs `SetCompressor("LZW")` etc.
 //! SimpleITK's own `ImageFileWriter` *does* expose that selector
-//! (`sitkImageFileWriter.h:123`, forwarded at `sitkImageFileWriter.cxx:237-240`),
-//! so every TIFF compressor is reachable there; this crate does not expose it
-//! (ledger §6) — so [`WriteOptions::use_compression`] toggles exactly between
-//! `COMPRESSION_NONE` and `COMPRESSION_PACKBITS`, and `m_Compression` never
-//! leaves its constructed default. The restriction is this port's, not
-//! SimpleITK's. Ledger §3.51.
+//! (`sitkImageFileWriter.h:123`, forwarded at `sitkImageFileWriter.cxx:237-240`).
+//! Ledger §3.51.
 //!
-//! `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality` is
-//! `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor seeds
-//! it with `75` (`:213`). It reaches libtiff only through
+//! **Fixed §3.51** — of that selector, this crate's encoder can write
+//! `LZW`, `PackBits` and one `Deflate` (the `tiff` crate has no JPEG
+//! encoder at all, and its `Deflate` writes only the modern tag `8`, never
+//! upstream's legacy tag `32946`; see [`TiffCompressor`]). Those three are
+//! now reachable through [`WriteOptions::compressor`] /
+//! [`ImageFileWriter::set_compressor`](crate::writer::ImageFileWriter::set_compressor),
+//! gated by [`WriteOptions::use_compression`] exactly as upstream gates
+//! `m_Compression` on `m_UseCompression` (`:692-716`). `None` (the default)
+//! keeps the prior behaviour: `COMPRESSION_NONE` ↔ `COMPRESSION_PACKBITS`.
+//!
+//! Upstream's `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality`
+//! is `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor
+//! seeds it with `75` (`:213`). It reaches libtiff only through
 //! `TIFFSetField(tif, TIFFTAG_JPEGQUALITY, ...)` inside
-//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). Because
-//! *this crate* selects no compressor, [`WriteOptions::compression_level`] is
-//! dead here — but through SimpleITK, `SetCompressor("JPEG")` plus
-//! `UseCompressionOn()` makes the level live as the JPEG quality.
-//! It is also the only `ImageIOBase` in this crate that leaves
+//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751) — a
+//! mapping this port cannot reproduce, since it cannot write JPEG at all
+//! (§3.51). It is also the only `ImageIOBase` in this crate that leaves
 //! `m_MaximumCompressionLevel` at its `100` default rather than lowering it to
 //! `9` (itkImageIOBase.h:830). Ledger §3.52.
+//!
+//! **Fixed §3.52** — rather than leave [`WriteOptions::compression_level`]
+//! permanently dead here (there being no pure-Rust JPEG encoder for it to
+//! drive), it now controls the ratio of the one compressor this port can
+//! actually vary: `deflate_level_for` maps the resolved `1..=9` level onto
+//! [`TiffCompressor::Deflate`]'s three [`DeflateLevel`] tiers. This is a new
+//! use of the knob, not a port of one upstream ever had — TIFF's
+//! `CompressionLevel` never controlled a Deflate ratio in `itkTIFFImageIO`,
+//! only JPEG quality.
 //!
 //! On read, every compression scheme libtiff has a codec for is accepted
 //! (`TIFFIsCODECConfigured`). The `tiff` crate supports `None`, `LZW`,
@@ -231,7 +268,7 @@ use sitk_core::{Image, PixelBuffer, PixelId};
 use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::encoder::colortype::ColorType as EncoderColorType;
-use tiff::encoder::{Compression, Rational, TiffEncoder, TiffKind, TiffValue};
+use tiff::encoder::{Compression, DeflateLevel, Rational, TiffEncoder, TiffKind, TiffValue};
 use tiff::tags::{ExtraSamples, PhotometricInterpretation, ResolutionUnit, SampleFormat, Tag};
 
 use crate::error::{IoError, Result};
@@ -527,14 +564,6 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
 
     let component = component_type(page0.bits_per_sample, page0.sample_format)?;
 
-    if photometric == PhotometricInterpretation::WhiteIsZero && component == PixelId::Float32 {
-        return unsupported(
-            "the `tiff` crate inverts a 32-bit-float MINISWHITE image with `1.0 - v`, which \
-             rounding makes non-invertible, so upstream's un-inverted samples cannot be \
-             recovered — doc/upstream-findings.md §4.101",
-        );
-    }
-
     // `GetFormat() == RGB_` takes `SetNumberOfComponents(m_SamplesPerPixel)` and
     // copies `m_SamplesPerPixel * width` components per row, whatever that count
     // is, because the scanline path never interprets the channels. The `tiff`
@@ -544,7 +573,15 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
     // 5 has no name and cannot be decoded, and one whose count *is* named must
     // still agree, or the crate would silently drop the samples upstream keeps.
     let number_of_components = match format {
-        Format::Grayscale => 1,
+        // Fixed §2.140: upstream's `GetFormat` maps `MINISBLACK`/`MINISWHITE`
+        // to `GRAYSCALE` before ever consulting `SamplesPerPixel`, so a
+        // multi-sample grayscale page reads back as 1 component — dropping
+        // every sample past the first, silently. The `tiff` crate's own
+        // `colortype()` decodes a multi-sample `BlackIsZero`/`WhiteIsZero`
+        // page as `Multiband { num_samples: SamplesPerPixel, .. }`
+        // (decoder/image.rs:460-471) — every sample, verbatim — so the true
+        // count is simply the page's own `SamplesPerPixel`.
+        Format::Grayscale => usize::from(page0.samples_per_pixel),
         Format::Rgb => {
             let color: ColorType = decoder.colortype().map_err(|source| {
                 IoError::UnsupportedTiffFeature(format!(
@@ -638,45 +675,29 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
     })
 }
 
-/// Re-apply the `tiff` crate's `invert_colors` involution so a `MINISWHITE`
-/// page comes out with the raw samples upstream's `PutGrayscale` copies
-/// (decoder/mod.rs:713-748). Every arm here is exactly `max - v`, its own
-/// inverse.
-fn undo_minis_white_inversion(buffer: &mut PixelBuffer) {
-    match buffer {
-        PixelBuffer::UInt8(v) => v.iter_mut().for_each(|x| *x = !*x),
-        PixelBuffer::UInt16(v) => v.iter_mut().for_each(|x| *x = 0xffff - *x),
-        PixelBuffer::UInt32(v) => v.iter_mut().for_each(|x| *x = 0xffff_ffff - *x),
-        // The crate has no `invert_colors` arm for the signed types, and the
-        // float arm is refused in `layout_for`, so nothing else can reach here.
-        _ => {}
-    }
-}
-
-/// Pull `height` rows of `width * inc` components out of a page decoded as
-/// `width * samples_per_pixel` components per row, placing row `r` at `r` for
-/// `ORIENTATION_TOPLEFT` and at `height - 1 - r` for `ORIENTATION_BOTLEFT`
-/// (itkTIFFImageIO.cxx:1381-1395).
+/// Pull `height` rows of `width * components` samples out of a decoded page,
+/// placing row `r` at `r` for `ORIENTATION_TOPLEFT` and at `height - 1 - r`
+/// for `ORIENTATION_BOTLEFT` (itkTIFFImageIO.cxx:1381-1395).
 ///
-/// The `inc < samples_per_pixel` case is `GRAYSCALE` over a multi-sample file:
-/// `PutGrayscale` copies `width` components off a longer scanline, so the row
-/// ends up holding the interleaved samples of its first `width / spp` pixels
-/// (§2.140).
+/// Fixed §2.140: this used to take the source and destination stride
+/// separately, because upstream's `GRAYSCALE` arm keeps only the first
+/// component of a multi-sample scanline. Now that [`layout_for`] reports the
+/// page's true `SamplesPerPixel` for `GRAYSCALE` too, `read_current_page`'s
+/// per-page geometry check (§1.67) guarantees the two strides are always
+/// equal, so there is only one `components` count and every sample is kept.
 fn page_rows<T: Copy>(
     decoded: &[T],
     out: &mut [T],
     width: usize,
     height: usize,
-    samples_per_pixel: usize,
-    inc: usize,
+    components: usize,
     top_left: bool,
 ) {
-    let src_stride = width * samples_per_pixel;
-    let dst_stride = width * inc;
+    let stride = width * components;
     for row in 0..height {
-        let src = &decoded[row * src_stride..row * src_stride + dst_stride];
+        let src = &decoded[row * stride..(row + 1) * stride];
         let dst_row = if top_left { row } else { height - 1 - row };
-        out[dst_row * dst_stride..(dst_row + 1) * dst_stride].copy_from_slice(src);
+        out[dst_row * stride..(dst_row + 1) * stride].copy_from_slice(src);
     }
 }
 
@@ -691,7 +712,6 @@ macro_rules! place_page {
                     $ctx.1,
                     $ctx.2,
                     $ctx.3,
-                    $ctx.4,
                 );
                 true
             }
@@ -751,10 +771,9 @@ fn read_current_page(
 
     let width = page.width as usize;
     let height = page.height as usize;
-    let samples_per_pixel = usize::from(page.samples_per_pixel);
-    let inc = layout.number_of_components;
+    let components = layout.number_of_components;
     let top_left = page.orientation == ORIENTATION_TOPLEFT;
-    let page_len = width * height * inc;
+    let page_len = width * height * components;
 
     if pixel_offset
         .checked_add(page_len)
@@ -769,12 +788,9 @@ fn read_current_page(
         ));
     }
 
-    let mut decoded = decoded_to_buffer(decoder.read_image()?, layout.component)?;
-    if page.photometric == Some(PhotometricInterpretation::WhiteIsZero.to_u16()) {
-        undo_minis_white_inversion(&mut decoded);
-    }
+    let decoded = decoded_to_buffer(decoder.read_image()?, layout.component)?;
 
-    let ctx = (width, height, samples_per_pixel, inc, top_left);
+    let ctx = (width, height, components, top_left);
     let placed = place_page!(decoded, out, UInt8, pixel_offset, page_len, ctx)
         || place_page!(decoded, out, Int8, pixel_offset, page_len, ctx)
         || place_page!(decoded, out, UInt16, pixel_offset, page_len, ctx)
@@ -846,15 +862,24 @@ pub fn read(path: &Path) -> Result<Image> {
 /// `PHOTOMETRIC_MINISBLACK`, the photometric `InternalWrite` picks for a
 /// 1-component image once `GetWritePalette()` is ruled out
 /// (itkTIFFImageIO.cxx:725-738).
+///
+/// Fixed §2.141: also used for a 2-component image. Upstream writes
+/// `PHOTOMETRIC_RGB` with `SAMPLESPERPIXEL = 2` for that case — a file no
+/// TIFF reader can interpret as colour, and which this crate's own reader
+/// refuses outright (§4.102). A grayscale-plus-one-extra-sample image is a
+/// standard, unambiguous TIFF construct and is exactly what [`layout_for`]
+/// now reads back correctly (§2.140), so `write_pages` reaches this type
+/// through its generic `ImageEncoder::extra_samples` extension the same way
+/// it already does for [`Rgb`] beyond 3 components.
 struct MinIsBlack<T>(PhantomData<T>);
 
 /// `PHOTOMETRIC_RGB` over `N` declared samples.
 ///
-/// `InternalWrite` writes `PHOTOMETRIC_RGB` for *every* image with more than
-/// one component, `SAMPLESPERPIXEL = scomponents`, and — for `scomponents > 3`
-/// — an `EXTRASAMPLES` array (`:678-690`, `:739-746`). `N == 2` is upstream's
-/// invalid-but-emitted "RGB with two samples"; `N == 3` covers 3 components and,
-/// with `ImageEncoder::extra_samples`, everything above.
+/// `InternalWrite` writes `PHOTOMETRIC_RGB` for every image with more than
+/// two components, `SAMPLESPERPIXEL = scomponents`, and — for
+/// `scomponents > 3` — an `EXTRASAMPLES` array (`:678-690`, `:739-746`).
+/// `N == 3` covers 3 components and, with `ImageEncoder::extra_samples`,
+/// everything above.
 struct Rgb<T, const N: usize>(PhantomData<T>);
 
 macro_rules! encoder_color_types {
@@ -1037,12 +1062,21 @@ where
     for page in 0..ctx.pages {
         let mut image = encoder.new_image::<C>(ctx.width, ctx.height)?;
 
-        // `if (scomponents > 3)`: one associated-alpha sample, the rest
-        // unspecified (itkTIFFImageIO.cxx:678-690). `extra_samples` extends
-        // `SamplesPerPixel` and `BitsPerSample` to match.
-        if ctx.components > 3 {
-            let mut extras = vec![ExtraSamples::Unspecified; ctx.components - 3];
-            extras[0] = ExtraSamples::AssociatedAlpha;
+        // `C::BITS_PER_SAMPLE.len()` is the sample count the photometric
+        // interpretation declares on its own (1 for `MinIsBlack`, 3 for
+        // `Rgb`); anything past that must be described via `ExtraSamples`
+        // per the TIFF6 spec, which `extra_samples` folds into
+        // `SamplesPerPixel` and `BitsPerSample`. Upstream's own extension
+        // is RGB-only — `if (scomponents > 3)`, one associated-alpha sample
+        // then unspecified (itkTIFFImageIO.cxx:678-690) — so a 2-component
+        // `MinIsBlack` image's one extra sample (fixed §2.141) has no
+        // alpha semantics to assume and is left `Unspecified`.
+        let core_samples = C::BITS_PER_SAMPLE.len();
+        if ctx.components > core_samples {
+            let mut extras = vec![ExtraSamples::Unspecified; ctx.components - core_samples];
+            if C::TIFF_VALUE == PhotometricInterpretation::RGB {
+                extras[0] = ExtraSamples::AssociatedAlpha;
+            }
             image.extra_samples(&extras)?;
         }
 
@@ -1081,8 +1115,7 @@ where
     macro_rules! by_components {
         ($data:expr, $inner:ty) => {
             match ctx.components {
-                1 => write_pages::<_, _, MinIsBlack<$inner>>(encoder, $data, ctx),
-                2 => write_pages::<_, _, Rgb<$inner, 2>>(encoder, $data, ctx),
+                1 | 2 => write_pages::<_, _, MinIsBlack<$inner>>(encoder, $data, ctx),
                 _ => write_pages::<_, _, Rgb<$inner, 3>>(encoder, $data, ctx),
             }
         };
@@ -1098,6 +1131,52 @@ where
              (itkTIFFImageIO.cxx:594-613)",
             other.component_id().as_str()
         )),
+    }
+}
+
+/// The TIFF compressor to write with — the subset of
+/// `TIFFImageIO::TIFFCompressionTypes` (itkTIFFImageIO.h:113-121) the `tiff`
+/// crate's encoder can actually write. Selected through
+/// [`WriteOptions::compressor`]; `None` keeps the previous behaviour, where
+/// [`WriteOptions::use_compression`] alone toggles `PackBits` on or off.
+///
+/// **Fixed §3.51** — `JPEG` is not offered: the `tiff` crate's encoder has no
+/// JPEG codec (`encoder::compression` lists only `Uncompressed`/`Lzw`/
+/// `Deflate`/`Packbits`), and there is no pure-Rust path to it. Upstream's
+/// legacy tag-`32946` `Deflate` is not offered either: the crate's own
+/// `Compression::Deflate` always writes tag `8`
+/// (`PhotometricInterpretation`-style — upstream's `AdobeDeflate`), the only
+/// Deflate tag its encoder can produce; both upstream names decode to the
+/// same zlib stream, so this port's [`TiffCompressor::Deflate`] covers what
+/// upstream calls `DEFLATE` and `ADOBEDEFLATE` alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TiffCompressor {
+    /// `COMPRESSION_LZW`.
+    Lzw,
+    /// `COMPRESSION_ADOBE_DEFLATE` (tag `8`). Ratio set by
+    /// [`WriteOptions::compression_level`] through [`deflate_level_for`] —
+    /// fixed §3.52.
+    Deflate,
+    /// `COMPRESSION_PACKBITS` — the same compressor a bare
+    /// [`WriteOptions::use_compression`] already selects.
+    PackBits,
+}
+
+/// Fixed §3.52: partitions [`WriteOptions::resolved_level`]'s clamped `1..=9`
+/// (`itkImageIOBase.h:288`'s `1..=GetMaximumCompressionLevel()`) into the
+/// three tiers [`DeflateLevel`] exposes, each discriminant sitting at the
+/// middle of its own bucket (`Fast = 1`, `Balanced = 6`, `Best = 9`).
+///
+/// Upstream never mapped `CompressionLevel` to a Deflate ratio at all — on a
+/// TIFF the field is JPEG quality, full stop (`itkTIFFImageIO.h:171-179`,
+/// `:749`), and this port cannot write JPEG (§3.51). Rather than leave the
+/// level permanently dead now that [`TiffCompressor::Deflate`] exists, it
+/// drives the ratio of the one compressor this port can actually vary.
+fn deflate_level_for(level: i32) -> DeflateLevel {
+    match level {
+        ..=3 => DeflateLevel::Fast,
+        4..=6 => DeflateLevel::Balanced,
+        _ => DeflateLevel::Best,
     }
 }
 
@@ -1159,10 +1238,21 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
         )
     });
 
-    let compression = if options.use_compression {
-        Compression::Packbits
-    } else {
+    // `if (m_UseCompression) { switch (m_Compression) {...} } else { compression
+    // = COMPRESSION_NONE; }` (itkTIFFImageIO.cxx:692-716) — the toggle gates the
+    // selector, not the other way around.
+    let compression = if !options.use_compression {
         Compression::Uncompressed
+    } else {
+        match options.compressor {
+            None | Some(TiffCompressor::PackBits) => Compression::Packbits,
+            Some(TiffCompressor::Lzw) => Compression::Lzw,
+            Some(TiffCompressor::Deflate) => {
+                // `DeflateLevel::Balanced as u8`'s `6` is the crate's own
+                // `Default`, used when `compression_level` is left at `-1`.
+                Compression::Deflate(deflate_level_for(options.resolved_level(6)))
+            }
+        }
     };
 
     let ctx = WriteContext {
@@ -1267,6 +1357,7 @@ mod tests {
     const TAG_RESOLUTION_UNIT: u16 = 296;
     const TAG_COLOR_MAP: u16 = 320;
     const TAG_SUBFILE_TYPE: u16 = 254;
+    const TAG_SAMPLE_FORMAT: u16 = 339;
 
     fn short(v: u16) -> Vec<u8> {
         v.to_le_bytes().to_vec()
@@ -1377,44 +1468,75 @@ mod tests {
     }
 
     /// `PutGrayscale` is a plain `std::copy_n` — the `// check inverted`
-    /// comment (itkTIFFImageIO.cxx:1400) never grew a body — so a
-    /// `PHOTOMETRIC_MINISWHITE` page reads out with its raw samples. The `tiff`
-    /// crate inverts; [`undo_minis_white_inversion`] takes the inversion back
-    /// out. Ledger §2.139.
+    /// comment (itkTIFFImageIO.cxx:1400) never grew a body — so upstream reads
+    /// a `PHOTOMETRIC_MINISWHITE` page out with its raw, tone-inverted samples.
+    /// The `tiff` crate already inverts correctly; **fixed §2.139** — this
+    /// port keeps that correction (`!x` for `u8`) instead of reversing it back
+    /// to upstream's raw value.
     #[test]
-    fn minis_white_reads_its_raw_samples_uninverted() {
+    fn minis_white_reads_the_true_photometric_value_not_the_raw_sample() {
         let pixels = vec![0u8, 1, 254, 255];
         let bytes = build_tiff(vec![Page {
             entries: base_entries(2, 2, 8, 1, 0), // photometric 0 == MINISWHITE
-            pixels: pixels.clone(),
+            pixels,
         }]);
         let path = write_fixture("sitk_io_tiff_minis_white.tif", &bytes);
         let image = read(&path).expect("MINISWHITE reads");
         std::fs::remove_file(&path).ok();
 
         assert_eq!(image.pixel_id(), PixelId::UInt8);
-        assert_eq!(image.buffer(), &PixelBuffer::UInt8(pixels));
+        // `!raw`: 0 (white) inverts to 255 (max intensity), 255 (black) to 0.
+        assert_eq!(image.buffer(), &PixelBuffer::UInt8(vec![255, 254, 1, 0]));
     }
 
-    /// `GetFormat` calls a two-sample `MINISBLACK` page `GRAYSCALE`, so
-    /// `NumberOfComponents` is 1 and `PutGrayscale` copies `width` components
-    /// off a `2 * width` scanline — the interleaved samples of the row's first
-    /// `width / 2` pixels. Ledger §2.140.
+    /// Fixed §2.139, 32-bit-float counterpart: keeping the crate's correction
+    /// rather than undoing it removes the reason `layout_for` used to refuse a
+    /// `WhiteIsZero` + `Float32` page (formerly ledger §4.101, whose rationale
+    /// was that the crate's `1.0 - v` is not invertible under rounding) — that
+    /// concern only applied to reversing the correction, not to keeping it.
     #[test]
-    fn two_sample_grayscale_keeps_the_first_half_of_each_row() {
+    fn minis_white_float32_reads_the_crates_own_inverted_value() {
+        let pixels: Vec<u8> = [0.0f32, 0.25, 0.75, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut entries = base_entries(2, 2, 32, 1, 0); // photometric 0 == MINISWHITE
+        entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, short(3))); // IEEE float
+        let bytes = build_tiff(vec![Page { entries, pixels }]);
+        let path = write_fixture("sitk_io_tiff_minis_white_float32.tif", &bytes);
+        let image = read(&path).expect("float32 MINISWHITE reads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(image.pixel_id(), PixelId::Float32);
+        match image.buffer() {
+            PixelBuffer::Float32(v) => assert_eq!(v, &[1.0, 0.75, 0.25, 0.0]),
+            other => panic!("expected Float32, got {other:?}"),
+        }
+    }
+
+    /// `GetFormat` calls a two-sample `MINISBLACK` page `GRAYSCALE` before ever
+    /// consulting `SamplesPerPixel`, so upstream's `NumberOfComponents` is 1
+    /// and `PutGrayscale` copies `width` components off a `2 * width`
+    /// scanline — the interleaved samples of the row's first `width / 2`
+    /// pixels, dropping the rest. Ledger §2.140. **Fixed** — every sample is
+    /// silent data loss otherwise, not a shape to reproduce; this port reads
+    /// the page as a 2-component vector image instead.
+    #[test]
+    fn two_sample_grayscale_reads_as_a_two_component_vector_image() {
         // Two rows of two pixels, two samples each: [g,a, g,a].
         let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         let bytes = build_tiff(vec![Page {
             entries: base_entries(2, 2, 8, 2, 1),
-            pixels,
+            pixels: pixels.clone(),
         }]);
         let path = write_fixture("sitk_io_tiff_gray_alpha.tif", &bytes);
         let image = read(&path).expect("two-sample grayscale reads");
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(image.pixel_id(), PixelId::UInt8);
+        assert_eq!(image.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(image.number_of_components_per_pixel(), 2);
         assert_eq!(image.size(), &[2, 2]);
-        assert_eq!(image.buffer(), &PixelBuffer::UInt8(vec![1, 2, 5, 6]));
+        assert_eq!(image.buffer(), &PixelBuffer::UInt8(pixels));
     }
 
     /// `ORIENTATION_BOTLEFT` sends scanline `row` to `height - 1 - row`
@@ -1640,6 +1762,34 @@ mod tests {
         assert_eq!(rows_per_strip(2_000_000, 1, 8), 1);
     }
 
+    /// Fixed §3.52: the clamped `1..=9` `compression_level` range partitions
+    /// into exactly three `DeflateLevel` tiers, each discriminant at the
+    /// middle of its own bucket.
+    #[test]
+    fn deflate_level_for_partitions_one_through_nine_into_three_tiers() {
+        for level in 1..=3 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Fast,
+                "level {level}"
+            );
+        }
+        for level in 4..=6 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Balanced,
+                "level {level}"
+            );
+        }
+        for level in 7..=9 {
+            assert_eq!(
+                deflate_level_for(level),
+                DeflateLevel::Best,
+                "level {level}"
+            );
+        }
+    }
+
     /// libtiff's `DoubleToRational` easy paths, and the continued-fraction one
     /// that `25.4 / spacing` almost always lands in.
     #[test]
@@ -1665,15 +1815,14 @@ mod tests {
         assert_eq!(25.4 / f64::from(recovered), 1.000_000_015_018_493_3);
     }
 
-    /// `PutGrayscale` copies `width` components off a `width * spp` scanline,
-    /// so a two-sample grey image keeps only the interleaved samples of its
-    /// first `width / 2` pixels (§2.140).
+    /// Fixed §2.140: `page_rows` no longer takes a separate declared
+    /// component count to truncate against — every row is copied whole.
     #[test]
-    fn page_rows_truncates_a_multi_sample_grayscale_row() {
+    fn page_rows_copies_every_sample_of_each_row() {
         let decoded: Vec<u8> = (0..8).collect();
-        let mut out = vec![0u8; 4];
-        page_rows(&decoded, &mut out, 2, 2, 2, 1, true);
-        assert_eq!(out, vec![0, 1, 4, 5]);
+        let mut out = vec![0u8; 8];
+        page_rows(&decoded, &mut out, 2, 2, 2, true);
+        assert_eq!(out, decoded);
     }
 
     /// `ORIENTATION_BOTLEFT` places scanline `row` at `height - 1 - row`
@@ -1682,22 +1831,7 @@ mod tests {
     fn page_rows_flips_a_bottom_left_image() {
         let decoded: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
         let mut out = vec![0u8; 6];
-        page_rows(&decoded, &mut out, 3, 2, 1, 1, false);
+        page_rows(&decoded, &mut out, 3, 2, 1, false);
         assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
-    }
-
-    /// The `tiff` crate's `invert_colors` is `max - v` on every arm this module
-    /// can reach, so applying it twice is the identity.
-    #[test]
-    fn minis_white_inversion_is_its_own_inverse() {
-        let mut b = PixelBuffer::UInt8(vec![0, 1, 0x7f, 0xff]);
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt8(vec![0xff, 0xfe, 0x80, 0x00]));
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt8(vec![0, 1, 0x7f, 0xff]));
-
-        let mut b = PixelBuffer::UInt16(vec![0, 1, 0xfffe, 0xffff]);
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt16(vec![0xffff, 0xfffe, 1, 0]));
     }
 }

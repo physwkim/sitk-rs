@@ -105,6 +105,7 @@ pub fn write_image_with<P: AsRef<Path>>(
     let options = WriteOptions {
         use_compression,
         compression_level,
+        compressor: None,
     };
     image_io::writer_for(path)?.write(image, path, &options)
 }
@@ -4321,6 +4322,43 @@ mod tests {
         assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §3.45: a 2-channel (gray + alpha) PNG is readable/writable by
+    /// raw `PNGImageIO`, but `GetPixelIDFromImageIO` cannot represent it
+    /// through SimpleITK's own pixel-ID wrapping (`SCALAR` with
+    /// `NumberOfComponents == 2` matches neither its scalar nor its
+    /// RGB/RGBA/VECTOR arms). This crate's `PixelId::VectorUInt8` has no such
+    /// restriction, so it round-trips as a 2-component vector image.
+    #[test]
+    fn png_roundtrip_gray_alpha_vector_uint8() {
+        let data: Vec<u8> = (0..24u32).map(|i| (i * 11) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data.clone()).unwrap();
+        let path = tmp_path("gray_alpha_u8.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.45, 16-bit counterpart.
+    #[test]
+    fn png_roundtrip_gray_alpha_vector_uint16() {
+        let data: Vec<u16> = (0..24u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec_vector::<u16>(&[4, 3], 2, data.clone()).unwrap();
+        let path = tmp_path("gray_alpha_u16.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
+    }
+
     #[test]
     fn png_roundtrip_rgba_vector_uint8() {
         let data: Vec<u8> = (0..48u32).map(|i| (i * 5) as u8).collect();
@@ -4352,20 +4390,43 @@ mod tests {
     }
 
     /// `WriteSlice` takes `height` from `GetDimensions(1)` alone
-    /// (itkPNGImageIO.cxx:605) and never consults any axis beyond it, so a
-    /// 3-D image's second and later slices are never written. Ledger §2.125.
+    /// (itkPNGImageIO.cxx:605) and never consults any axis beyond it, so
+    /// upstream silently writes only a 3-D image's first Z-slice. PNG has no
+    /// container for a third axis, so that file could never round-trip back
+    /// to 3-D; **fixed §2.125** — this port refuses the write instead, and
+    /// leaves no file behind, matching `jpeg_write_of_a_three_dimensional_image_is_rejected`.
     #[test]
-    fn png_write_of_a_three_dimensional_image_writes_only_the_first_slice() {
-        let data: Vec<u8> = (0..12u32).map(|i| i as u8).collect(); // size [2, 2, 3]
-        let img = Image::from_vec(&[2, 2, 3], data.clone()).unwrap();
+    fn png_write_of_a_three_dimensional_image_is_rejected() {
+        let img = Image::from_vec(&[2, 2, 3], vec![0u8; 12]).unwrap();
         let path = tmp_path("three_d.png");
-        write_image(&img, &path).unwrap();
-        let back = read_image(&path).unwrap();
-        std::fs::remove_file(&path).ok();
 
-        assert_eq!(back.dimension(), 2);
-        assert_eq!(back.size(), &[2, 2]);
-        assert_eq!(back.scalar_slice::<u8>().unwrap(), &data[..4]);
+        let result = write_image(&img, &path);
+
+        assert!(
+            matches!(&result, Err(IoError::PngWriteRejected(m)) if m.contains("§2.125")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
+    }
+
+    /// `WriteSlice`'s `colorType` switch on `numComp` has arms only for 1-3
+    /// and a `default:` that always picks a declared 4-channel `RGBA` write
+    /// for anything else (itkPNGImageIO.cxx:579-600), silently dropping every
+    /// row's trailing components. PNG has no color type past 4 channels, so
+    /// that file could never round-trip; **fixed §2.126** — this port refuses
+    /// the write instead, and leaves no file behind.
+    #[test]
+    fn png_write_of_a_five_component_image_is_rejected() {
+        let img = Image::from_vec_vector::<u8>(&[2, 2], 5, vec![0u8; 20]).unwrap();
+        let path = tmp_path("five_component.png");
+
+        let result = write_image(&img, &path);
+
+        assert!(
+            matches!(&result, Err(IoError::PngWriteRejected(m)) if m.contains("§2.126")),
+            "{result:?}"
+        );
+        assert!(!path.exists());
     }
 
     /// Fixed §1.59: upstream's `WriteSlice` opens the file with
@@ -4658,25 +4719,26 @@ mod tests {
         assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
     }
 
-    /// `InternalWrite` sends every component count other than 1 down the
-    /// `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:725-732), so a two-component
-    /// image is written as RGB with `SamplesPerPixel = 2` — a file no TIFF
-    /// reader can interpret as colour, and which upstream's own reader takes
-    /// back as a *one*-component grayscale of half-rows (§2.140). This port
-    /// writes the same bytes and refuses to read them.
+    /// Fixed §2.141: `InternalWrite` sent every component count other than 1
+    /// down the `PHOTOMETRIC_RGB` arm (itkTIFFImageIO.cxx:725-732), so a
+    /// two-component image was written as RGB with `SamplesPerPixel = 2` — a
+    /// file no TIFF reader can interpret as colour, and which this port's own
+    /// reader refused outright. A 2-component image now writes
+    /// `PHOTOMETRIC_MINISBLACK` with one `ExtraSamples::Unspecified` sample,
+    /// which `layout_for`'s §2.140 fix reads back as a 2-component vector
+    /// image intact.
     #[test]
-    fn tiff_write_of_a_two_component_image_emits_photometric_rgb_with_two_samples() {
+    fn tiff_roundtrip_two_component_vector_uint8() {
         let data: Vec<u8> = (0..24u32).map(|i| i as u8).collect();
-        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data).unwrap();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data.clone()).unwrap();
         let path = tmp_path("two_component.tif");
         write_image(&img, &path).unwrap();
-        let back = read_image(&path);
+        let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert!(
-            matches!(&back, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("SamplesPerPixel = 2")),
-            "{back:?}"
-        );
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
     }
 
     /// A 3-D image writes one directory per slice, each tagged
@@ -4765,10 +4827,186 @@ mod tests {
         assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §3.51: `SetCompressor("PACKBITS")` with no explicit
+    /// [`ImageFileWriter::set_compressor`] call is upstream's own default
+    /// (itkTIFFImageIO.cxx:214, :260-266), so leaving
+    /// [`TiffCompressor`](crate::tiff::TiffCompressor) unset must write
+    /// byte-identical output to selecting `PackBits` explicitly.
+    #[test]
+    fn tiff_explicit_packbits_compressor_matches_the_bare_use_compression_default() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data).unwrap();
+
+        let implicit = tmp_path("packbits_implicit.tif");
+        let explicit = tmp_path("packbits_explicit.tif");
+        write_image_with(&img, &implicit, true, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&explicit)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::PackBits));
+        writer.execute(&img).unwrap();
+
+        let a = std::fs::read(&implicit).unwrap();
+        let b = std::fs::read(&explicit).unwrap();
+        std::fs::remove_file(&implicit).ok();
+        std::fs::remove_file(&explicit).ok();
+
+        assert_eq!(a, b);
+    }
+
+    /// Fixed §3.51: this port's encoder can write `COMPRESSION_LZW`, which
+    /// upstream reaches through `SetCompressor("LZW")`
+    /// (itkTIFFImageIO.cxx:264-266, :700-703). The image must still round-trip
+    /// through the same multi-row strips as the `PackBits` case.
+    #[test]
+    fn tiff_lzw_compression_round_trips_and_shrinks_compressible_data() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data.clone()).unwrap();
+
+        let plain = tmp_path("lzw_off.tif");
+        let compressed = tmp_path("lzw_on.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&compressed)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+        writer.execute(&img).unwrap();
+
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let compressed_len = std::fs::metadata(&compressed).unwrap().len();
+        let back = read_image(&compressed).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&compressed).ok();
+
+        assert!(
+            compressed_len < plain_len,
+            "{compressed_len} !< {plain_len}"
+        );
+        assert_eq!(back.size(), &[64, 64]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.51: this port's encoder can write `COMPRESSION_ADOBE_DEFLATE`
+    /// (tag `8`), which upstream reaches through `SetCompressor("DEFLATE")` or
+    /// `SetCompressor("ADOBEDEFLATE")` (itkTIFFImageIO.cxx:271-278, :706-712).
+    #[test]
+    fn tiff_deflate_compression_round_trips_and_shrinks_compressible_data() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data.clone()).unwrap();
+
+        let plain = tmp_path("deflate_off.tif");
+        let compressed = tmp_path("deflate_on.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&compressed)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+        writer.execute(&img).unwrap();
+
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let compressed_len = std::fs::metadata(&compressed).unwrap().len();
+        let back = read_image(&compressed).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&compressed).ok();
+
+        assert!(
+            compressed_len < plain_len,
+            "{compressed_len} !< {plain_len}"
+        );
+        assert_eq!(back.size(), &[64, 64]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.52: `deflate_level_for`'s three tiers are byte-identical
+    /// within a tier and strictly ordered `Fast > Balanced > Best` across
+    /// tiers — a 256x256 texture with both fine and coarse repetition, so
+    /// zlib's effort level actually has room to matter. Upstream never had a
+    /// Deflate-ratio knob to pin against; this is pinned directly against the
+    /// `tiff` crate's own flate2-backed output.
+    #[test]
+    fn tiff_deflate_compression_level_selects_one_of_three_ratio_tiers() {
+        let data: Vec<u8> = (0..256 * 256u32)
+            .map(|i| (((i % 251) + (i / 37) % 17) % 256) as u8)
+            .collect();
+        let img = Image::from_vec(&[256, 256], data.clone()).unwrap();
+
+        let size_at = |level: i32| -> u64 {
+            let path = tmp_path(&format!("deflate_tier_{level}.tif"));
+            let mut writer = ImageFileWriter::new();
+            writer
+                .set_file_name(&path)
+                .use_compression_on()
+                .set_compression_level(level)
+                .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+            writer.execute(&img).unwrap();
+            let back = read_image(&path).unwrap();
+            assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+            let len = std::fs::metadata(&path).unwrap().len();
+            std::fs::remove_file(&path).ok();
+            len
+        };
+
+        let fast = size_at(1);
+        let balanced = size_at(4);
+        let best = size_at(7);
+
+        assert_eq!(fast, size_at(2));
+        assert_eq!(fast, size_at(3));
+        assert_eq!(balanced, size_at(5));
+        assert_eq!(balanced, size_at(6));
+        assert_eq!(best, size_at(8));
+        assert_eq!(best, size_at(9));
+
+        assert!(fast > balanced, "{fast} !> {balanced}");
+        assert!(balanced > best, "{balanced} !> {best}");
+
+        // `-1` resolves to this crate's own `6` default, and `100` clamps
+        // (itkImageIOBase.h:288) to `9` — `Balanced` and `Best` respectively.
+        assert_eq!(size_at(-1), balanced, "default is the Balanced tier");
+        assert_eq!(size_at(100), best, "100 clamps to 9, the Best tier");
+    }
+
+    /// Fixed §3.51: `if (m_UseCompression) { switch (m_Compression) {...} }
+    /// else { compression = COMPRESSION_NONE; }` (itkTIFFImageIO.cxx:692-716)
+    /// — an explicit compressor never overrides `UseCompressionOff`.
+    #[test]
+    fn tiff_use_compression_off_ignores_an_explicit_compressor() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data).unwrap();
+
+        let plain = tmp_path("compression_off_plain.tif");
+        let gated_off = tmp_path("compression_off_gated.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&gated_off)
+            .use_compression_off()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+        writer.execute(&img).unwrap();
+
+        let a = std::fs::read(&plain).unwrap();
+        let b = std::fs::read(&gated_off).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&gated_off).ok();
+
+        assert_eq!(a, b);
+    }
+
     /// `SetCompressionLevel` is TIFF's *JPEG quality*
-    /// (itkTIFFImageIO.cxx:213, itkTIFFImageIO.h:171-179), and the only site that
-    /// reads it is the unreachable `JPEG` arm (`:749`) —
-    /// so it changes nothing about the bytes written. Ledger §3.52.
+    /// (itkTIFFImageIO.cxx:213, itkTIFFImageIO.h:171-179), and upstream's only
+    /// site that reads it is the unreachable `JPEG` arm (`:749`). This port
+    /// now gives the level a use of its own for `TiffCompressor::Deflate`
+    /// (§3.52, `tiff_deflate_compression_level_selects_one_of_three_ratio_tiers`)
+    /// — but the *default* compressor stays `PackBits`, which has no ratio to
+    /// vary, so for a write with no explicit compressor the level still
+    /// changes nothing about the bytes written.
     #[test]
     fn tiff_compression_level_does_not_change_the_written_bytes() {
         let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();

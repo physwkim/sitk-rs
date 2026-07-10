@@ -24,7 +24,7 @@
 //! unreachable through this crate's [`ImageFileReader`](crate::ImageFileReader).
 //! Ledger §4.84.
 //!
-//! # Pixel types: a 2-channel PNG is unrepresentable through SimpleITK
+//! # Pixel types: a 2-channel PNG, unrepresentable through SimpleITK, is implemented here
 //!
 //! `ReadImageInformation` sets `m_PixelType = SCALAR` unconditionally
 //! (`:444`/`:449`), then `SetNumberOfComponents(png_get_channels(...))`
@@ -35,13 +35,17 @@
 //! (sitkImageReaderBase.cxx:215-228); `SCALAR` with `numberOfComponents == 2`
 //! matches neither arm and falls into `"Unknown PixelType: ..."`
 //! (`:236-237`). A gray+alpha PNG is therefore readable and writable by raw
-//! `PNGImageIO` but unrepresentable through this crate's public reader.
-//! Ledger §3.45; see [`IoError::UnsupportedPngFeature`].
+//! `PNGImageIO`, but SimpleITK's own pixel-ID wrapping cannot name the result —
+//! not a PNG-format limit at all. This port's [`Image`] has no such
+//! restriction (a [`PixelId::VectorUInt8`]/[`PixelId::VectorUInt16`] admits any
+//! component count ≥ 1), so [`read`]/[`read_information`]/[`write`] implement
+//! the 2-channel case exactly like 3 and 4: a vector image, `component_id()`
+//! plus `vector_id()`. **Fixed §3.45.**
 //!
 //! | source channels | `m_PixelType` | reachable through this crate? |
 //! |---|---|---|
 //! | 1 (gray, no `tRNS`) | `SCALAR` | yes — scalar |
-//! | 2 (gray + alpha) | `SCALAR` | **no** — `IoError::UnsupportedPngFeature` |
+//! | 2 (gray + alpha) | `SCALAR` | yes — `VectorUInt8`/`VectorUInt16` |
 //! | 3 (RGB) | `RGB` | yes — `VectorUInt8`/`VectorUInt16` |
 //! | 4 (RGBA) | `RGBA` | yes — `VectorUInt8`/`VectorUInt16` |
 //!
@@ -80,17 +84,18 @@
 //! `foo.PNG` is claimed (both `.png` and `.PNG` are registered extensions,
 //! `:281-287`) but `foo.PnG` is not. Ledger §2.124.
 //!
-//! # Writing a 3-D (or higher) image writes only its first slice
+//! # Writing a 3-D (or higher) image is refused
 //!
 //! `WriteSlice` takes `height` from `GetDimensions(1)` alone —
 //! `(m_NumberOfDimensions > 1) ? GetDimensions(1) : 1` (`:605`) — and never
 //! consults any axis beyond that. `png_write_image` therefore reads exactly
 //! `height` rows starting at the buffer's first byte; a 3-D image's second and
-//! later slices are simply never addressed, with no error. Ledger §2.125;
-//! [`write`] reproduces it structurally (see next section) rather than
-//! special-casing the dimension.
+//! later slices are simply never addressed, with no error upstream. PNG has no
+//! container for a third axis, so a 3-D source could never round-trip back
+//! out of the file it produces; [`write`] refuses it instead of reproducing
+//! the silent data loss. **Fixed §2.125** — see [`IoError::PngWriteRejected`].
 //!
-//! # A >4-component vector image writes deterministic garbage
+//! # A >4-component vector image is refused
 //!
 //! `WriteSlice`'s `colorType` switch on `numComp` has arms for 1–3 and a
 //! `default:` that always picks `PNG_COLOR_TYPE_RGB_ALPHA` — 4 declared
@@ -99,17 +104,10 @@
 //! 8`, `:686-693`), so each row starts at the right offset; but
 //! `png_write_image` reads only `width * 4 * bitDepth / 8` bytes from each —
 //! the declared channel count — leaving every row's trailing
-//! `(numComp - 4)` components' worth of bytes untouched and unwritten. No
-//! error. Ledger §2.126.
-//!
-//! [`write`] reproduces both quirks above with one routine,
-//! [`rows_for_declared_channels`]: it is handed the whole flat buffer, the
-//! *actual* per-row byte stride, and the *declared* one, and copies only the
-//! declared-length prefix of each of `height` actual-length rows starting at
-//! byte 0. A 3-D image's `height` is `size[1]` alone, so slices at `size[2..]`
-//! are simply never reached by the row loop — the same "take the first
-//! `height` actual-stride rows" rule that truncates a >4-component row also
-//! truncates the image to its first Z-slice; neither needs its own branch.
+//! `(numComp - 4)` components' worth of bytes untouched and unwritten, with no
+//! error upstream. PNG has no color type past 4 channels, so such a write
+//! could never round-trip; [`write`] refuses it instead of reproducing the
+//! truncation. **Fixed §2.126** — see [`IoError::PngWriteRejected`].
 //!
 //! # Not implemented
 //!
@@ -190,8 +188,12 @@ struct Header {
 /// `png_get_channels` after every `png_set_*` transform, translated into this
 /// crate's [`PixelId`] exactly as `ReadImageInformation`'s bit-depth/channel
 /// switch does (itkPNGImageIO.cxx:442-461): `<= 8` bits is `UInt8`, `16` bits
-/// is `UInt16`, 3 channels is the vector counterpart, 4 channels likewise, and
-/// 2 channels — gray plus alpha — is unrepresentable (§3.45).
+/// is `UInt16`, and 2 (gray + alpha), 3 (RGB) or 4 (RGBA) channels are all the
+/// vector counterpart. Upstream's own `SetPixelType` never distinguishes a
+/// 2-channel PNG from a 1-channel one — `SCALAR` either way — so SimpleITK's
+/// `GetPixelIDFromImageIO` rejects the 2-channel case outright; this crate's
+/// [`PixelId::VectorUInt8`]/[`PixelId::VectorUInt16`] has no such restriction,
+/// so the 2-channel case is implemented rather than reproduced (§3.45, fixed).
 fn header_from_reader<R: std::io::BufRead + std::io::Seek>(reader: &Reader<R>) -> Result<Header> {
     let (color, depth) = reader.output_color_type();
     let channels = color.samples();
@@ -202,13 +204,11 @@ fn header_from_reader<R: std::io::BufRead + std::io::Seek>(reader: &Reader<R>) -
     };
     let pixel_id = match channels {
         1 => component,
-        3 | 4 => component.vector_id(),
+        2..=4 => component.vector_id(),
         _ => {
             return Err(IoError::UnsupportedPngFeature(format!(
-                "Unknown PixelType: a {channels}-channel PNG (grayscale + alpha) \
-                 keeps m_PixelType == SCALAR with NumberOfComponents == {channels} \
-                 (itkPNGImageIO.cxx:444-461), which GetPixelIDFromImageIO has no \
-                 arm for (sitkImageReaderBase.cxx:215-237) — doc/upstream-findings.md §3.45"
+                "unsupported PNG channel count {channels}: png_get_channels after \
+                 Transformations::EXPAND should only ever report 1, 2, 3 or 4"
             )));
         }
     };
@@ -305,7 +305,10 @@ fn component_bit_depth(component: PixelId) -> Option<BitDepth> {
     }
 }
 
-/// `WriteSlice`'s `colorType` switch on `numComp` (itkPNGImageIO.cxx:579-600).
+/// `WriteSlice`'s `colorType` switch on `numComp` (itkPNGImageIO.cxx:579-600),
+/// restricted to the 1-4 range [`write`] admits after its own §2.126 guard —
+/// upstream's `default:` arm collapsing every higher count to `Rgba` is the
+/// bug that guard exists to refuse, not a case for this function to repeat.
 /// `GetWritePalette()` is unreachable (§4.87), so `numComp == 1` always
 /// selects `Grayscale`, never `Palette`.
 fn color_type_for(number_of_components: usize) -> ColorType {
@@ -313,7 +316,10 @@ fn color_type_for(number_of_components: usize) -> ColorType {
         1 => ColorType::Grayscale,
         2 => ColorType::GrayscaleAlpha,
         3 => ColorType::Rgb,
-        _ => ColorType::Rgba,
+        4 => ColorType::Rgba,
+        other => unreachable!(
+            "write() must reject a {other}-component image before calling color_type_for (§2.126)"
+        ),
     }
 }
 
@@ -323,28 +329,6 @@ fn buffer_to_be_bytes(buffer: &PixelBuffer) -> Vec<u8> {
         PixelBuffer::UInt16(v) => v.iter().flat_map(|x| x.to_be_bytes()).collect(),
         other => unreachable!("{:?} is not a PNG component type", other.component_id()),
     }
-}
-
-/// Copy only the first `declared_channels` samples of each pixel, for the
-/// first `height` rows of `all_bytes`. This is [`write`]'s single reproduction
-/// of both the row-truncation quirk (§2.126) and the first-slice-only quirk
-/// (§2.125) — see the module doc.
-fn rows_for_declared_channels(
-    all_bytes: &[u8],
-    width: usize,
-    height: usize,
-    actual_components: usize,
-    declared_channels: usize,
-    bytes_per_sample: usize,
-) -> Vec<u8> {
-    let actual_row = width * actual_components * bytes_per_sample;
-    let declared_row = width * declared_channels * bytes_per_sample;
-    let mut out = Vec::with_capacity(declared_row * height);
-    for row in 0..height {
-        let start = row * actual_row;
-        out.extend_from_slice(&all_bytes[start..start + declared_row]);
-    }
-    out
 }
 
 /// Write a `.png` file.
@@ -366,6 +350,38 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
             component.as_str()
         )));
     };
+    // Fixed §2.125: `WriteSlice` takes `height` from `GetDimensions(1)` alone
+    // and never consults any axis beyond it, so a 3-D (or higher) image's
+    // second and later slices are silently never written
+    // (itkPNGImageIO.cxx:605). PNG has no container for a third axis, so a
+    // 3-D image cannot round-trip through it; refuse instead of silently
+    // dropping every slice past the first.
+    if image.dimension() > 2 {
+        return Err(IoError::PngWriteRejected(format!(
+            "a PNG file has only two axes; WriteSlice takes height from \
+             GetDimensions(1) alone and never writes any later slice, with no \
+             error (itkPNGImageIO.cxx:605) — doc/upstream-findings.md §2.125; \
+             not {}-dimensional",
+            image.dimension()
+        )));
+    }
+    // Fixed §2.126: `WriteSlice`'s `colorType` switch on `numComp` has arms
+    // only for 1-3 and a `default:` that always picks
+    // `PNG_COLOR_TYPE_RGB_ALPHA` — 4 declared channels — for anything else
+    // (itkPNGImageIO.cxx:579-600), so a >4-component image's every row is
+    // silently truncated to its first 4 channels' worth of bytes, with no
+    // error. PNG has no color type past 4 channels, so such a write could
+    // never round-trip; refuse it instead of reproducing the truncation.
+    let actual_components = image.buffer_stride();
+    if actual_components > 4 {
+        return Err(IoError::PngWriteRejected(format!(
+            "PNG has no color type for a {actual_components}-component vector \
+             image; WriteSlice's colorType switch collapses any count above 4 \
+             to a declared RGBA (4-channel) write and silently drops the rest \
+             of each row, with no error (itkPNGImageIO.cxx:579-600) — \
+             doc/upstream-findings.md §2.126"
+        )));
+    }
 
     let file = std::fs::File::create(path)?;
 
@@ -375,20 +391,9 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     } else {
         1
     };
-    let actual_components = image.buffer_stride();
     let color = color_type_for(actual_components);
-    let declared_channels = color.samples();
-    let bytes_per_sample = if bit_depth == BitDepth::Sixteen { 2 } else { 1 };
 
-    let all_bytes = buffer_to_be_bytes(image.buffer());
-    let data = rows_for_declared_channels(
-        &all_bytes,
-        width,
-        height,
-        actual_components,
-        declared_channels,
-        bytes_per_sample,
-    );
+    let data = buffer_to_be_bytes(image.buffer());
 
     let mut encoder = Encoder::new(file, width as u32, height as u32);
     encoder.set_color(color);
@@ -545,30 +550,22 @@ mod tests {
     }
 
     #[test]
-    fn rows_for_declared_channels_truncates_each_row_to_the_declared_prefix() {
-        // Two "rows" of 5 components each; declared channels is 4 (RGBA),
-        // reproducing the >4-component write quirk (§2.126).
-        let all: Vec<u8> = (0..10).collect();
-        let out = rows_for_declared_channels(&all, 1, 2, 5, 4, 1);
-        assert_eq!(out, vec![0, 1, 2, 3, 5, 6, 7, 8]);
-    }
-
-    #[test]
-    fn rows_for_declared_channels_stops_after_the_requested_height() {
-        // Three "slices" of one row each; only the first slice's row is kept,
-        // reproducing the first-slice-only write quirk (§2.125).
-        let all: Vec<u8> = (0..9).collect();
-        let out = rows_for_declared_channels(&all, 1, 1, 3, 3, 1);
-        assert_eq!(out, vec![0, 1, 2]);
-    }
-
-    #[test]
     fn color_type_for_never_selects_palette() {
         assert_eq!(color_type_for(1), ColorType::Grayscale);
         assert_eq!(color_type_for(2), ColorType::GrayscaleAlpha);
         assert_eq!(color_type_for(3), ColorType::Rgb);
         assert_eq!(color_type_for(4), ColorType::Rgba);
-        assert_eq!(color_type_for(5), ColorType::Rgba);
+    }
+
+    /// Fixed §2.126: `write` refuses a >4-component image before ever calling
+    /// `color_type_for`, so a 5th arm collapsing to `Rgba` — upstream's
+    /// `default:` bug — has no reason to exist; this pins that the guard is
+    /// enforced by construction rather than by every caller remembering to
+    /// check first.
+    #[test]
+    #[should_panic(expected = "5-component")]
+    fn color_type_for_panics_rather_than_silently_collapsing_a_higher_count() {
+        color_type_for(5);
     }
 
     #[test]
@@ -633,6 +630,7 @@ mod tests {
             &WriteOptions {
                 use_compression: true,
                 compression_level: -1,
+                compressor: None,
             },
         )
         .unwrap();

@@ -8,11 +8,13 @@ use sitk_core::Image;
 use crate::compression::{MAX_COMPRESSION_LEVEL, MIN_COMPRESSION_LEVEL};
 use crate::error::Result;
 use crate::image_io::{image_io_by_name, registered_image_ios, writer_for};
+use crate::tiff::TiffCompressor;
 
-/// The two compression knobs SimpleITK's writer hands to `itk::ImageIOBase`,
-/// as one value, because this crate's [`ImageIo`](crate::ImageIo) implementors
+/// The compression knobs SimpleITK's writer hands to `itk::ImageIOBase`, as
+/// one value, because this crate's [`ImageIo`](crate::ImageIo) implementors
 /// are stateless singletons in a static registry where upstream's are
-/// per-write objects carrying `m_UseCompression` / `m_CompressionLevel`.
+/// per-write objects carrying `m_UseCompression` / `m_CompressionLevel` (and,
+/// for TIFF, `m_Compressor`).
 ///
 /// [`WriteOptions::default`] is SimpleITK's default: no compression, and a
 /// level of `-1` meaning "leave the `ImageIO` on its own default".
@@ -25,6 +27,12 @@ pub struct WriteOptions {
     /// own level, because `itk::ImageFileWriter::GenerateData` forwards the
     /// value only when it is non-negative (itkImageFileWriter.hxx:199-201).
     pub compression_level: i32,
+    /// `SetCompressor` (sitkImageFileWriter.h:123), narrowed to
+    /// [`TiffCompressor`] — the one format this port currently offers more
+    /// than a single compressor for (ledger §3.51). `None` is upstream's
+    /// default (empty) compressor string, resolving to `PackBits` exactly as
+    /// before this field existed; every other format's `write` ignores it.
+    pub compressor: Option<TiffCompressor>,
 }
 
 impl Default for WriteOptions {
@@ -32,6 +40,7 @@ impl Default for WriteOptions {
         Self {
             use_compression: false,
             compression_level: -1,
+            compressor: None,
         }
     }
 }
@@ -67,12 +76,13 @@ impl WriteOptions {
 /// # Ok::<(), sitk_io::IoError>(())
 /// ```
 ///
-/// `SetCompressor` and the DICOM-only `SetKeepOriginalImageUID` are not
-/// exposed. Upstream's compressor string selects between `gzip` and `bzip2`
-/// for NRRD and does nothing for the other two formats; the default — the
-/// empty string, which `NrrdImageIO::InternalSetCompressor` resolves to `gzip`
-/// (itkNrrdImageIO.cxx:380-392) — is the only setting this port implements
-/// (ledger §6).
+/// `SetCompressor` is exposed only for TIFF, through
+/// [`ImageFileWriter::set_compressor`] and [`TiffCompressor`] (ledger §3.51);
+/// the DICOM-only `SetKeepOriginalImageUID` is not exposed at all. Upstream's
+/// compressor string also selects between `gzip` and `bzip2` for NRRD; the
+/// default — the empty string, which `NrrdImageIO::InternalSetCompressor`
+/// resolves to `gzip` (itkNrrdImageIO.cxx:380-392) — is the only setting this
+/// port implements for every format but TIFF (ledger §6).
 #[derive(Clone, Debug, Default)]
 pub struct ImageFileWriter {
     file_name: PathBuf,
@@ -133,6 +143,20 @@ impl ImageFileWriter {
     /// `GetCompressionLevel`.
     pub fn compression_level(&self) -> i32 {
         self.options.compression_level
+    }
+
+    /// `SetCompressor`, narrowed to [`TiffCompressor`] (ledger §3.51). `None`
+    /// (the default) restores the pre-existing behaviour, where
+    /// [`ImageFileWriter::set_use_compression`] alone toggles `PackBits` on a
+    /// TIFF write; every other format ignores this setting.
+    pub fn set_compressor(&mut self, compressor: Option<TiffCompressor>) -> &mut Self {
+        self.options.compressor = compressor;
+        self
+    }
+
+    /// `GetCompressor`, narrowed to [`TiffCompressor`].
+    pub fn compressor(&self) -> Option<TiffCompressor> {
+        self.options.compressor
     }
 
     /// Override the automatically detected [`ImageIo`](crate::ImageIo) by class

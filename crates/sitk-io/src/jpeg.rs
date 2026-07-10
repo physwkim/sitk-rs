@@ -604,6 +604,7 @@ mod tests {
             resolved_quality(&WriteOptions {
                 use_compression: false,
                 compression_level: 0,
+                compressor: None,
             }),
             1
         );
@@ -611,6 +612,7 @@ mod tests {
             resolved_quality(&WriteOptions {
                 use_compression: false,
                 compression_level: 250,
+                compressor: None,
             }),
             100
         );
@@ -618,6 +620,7 @@ mod tests {
             resolved_quality(&WriteOptions {
                 use_compression: false,
                 compression_level: 42,
+                compressor: None,
             }),
             42
         );
@@ -630,10 +633,12 @@ mod tests {
         let on = WriteOptions {
             use_compression: true,
             compression_level: 80,
+            compressor: None,
         };
         let off = WriteOptions {
             use_compression: false,
             compression_level: 80,
+            compressor: None,
         };
         assert_eq!(resolved_quality(&on), resolved_quality(&off));
     }
