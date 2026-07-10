@@ -142,6 +142,7 @@ wrapping) is not yet reported.
 | 2.64 | `StatisticsLabelMapFilter` extremum indices report the *last* tie | The updates are `if (v <= min)` and `if (v >= max)` (`itkStatisticsLabelMapFilter.hxx:117-127`), non-strict on both sides, so a tied pixel later in raster order overwrites the recorded `MinimumIndex` / `MaximumIndex`. Reproduced; pinned by `minimum_and_maximum_indices_report_the_last_tie_in_raster_order`. | `sitk-filters` `label_intensity.rs` |
 | 2.65 | `StatisticsLabelMapFilter` weighted elongation/flatness: one guard, no clamp, no sign check | Three deviations from the same computation in its own base class. (a) Eigenvalues are taken raw (`itkStatisticsLabelMapFilter.hxx:231-237`) where `ShapeLabelMapFilter` clamps with `std::max(pm(i), 0.0)`, commented "near-zero negative eigenvalues from numerical precision cause FPE in `std::pow`" (`itkShapeLabelMapFilter.hxx:315`). (b) Both `WeightedElongation` and `WeightedFlatness` sit under the single guard `NotAlmostEquals(principalMoments[0], 0)` (`itkStatisticsLabelMapFilter.hxx:261-267`) where the shape filter guards flatness on `principalMoments[0]` and elongation *separately* on `principalMoments[ImageDimension-2]` (`itkShapeLabelMapFilter.hxx:344`/`:353`). (c) Neither square root is preceded by the shape filter's `if (ratio > 0.0)`. Consequence: a signed or float feature image whose per-object `Sum` makes the weighted covariance indefinite yields `NaN` for both attributes where the shape filter yields `0`. `if constexpr (ImageDimension < 2)` (`:256-260`) is unreachable through SimpleITK (2-D/3-D instantiations only). All reproduced; pinned by `a_mixed_sign_feature_image_gives_negative_moments_and_nan_ratios`. | `sitk-filters` `label_intensity.rs` |
 | 2.66 | `itk::Statistics::Histogram::Initialize` narrows the bin width to `float` | `float interval = (static_cast<float>(upper[i]) - static_cast<float>(lower[i])) / static_cast<float>(size[i])` (`itkHistogram.hxx:214-238`, lines 225-226), and every bin bound but the last is `double(lower) + float(j) * interval` — so a `Histogram<double>` has `float`-quantized bin edges. `StatisticsLabelMapFilter`'s `Median` is the centre of a bin of exactly this histogram (`.hxx:173-196`, bin centre via `GetMeasurementVector`, `itkHistogram.hxx:462-472`), with `SetClipBinsAtEnds(false)` (`itkHistogram.hxx:255-290`) folding the image maximum into the last bin. Reproduced exactly, including the `f32` narrowing; pinned by `histogram_bin_bounds_narrow_the_interval_to_f32` and `the_maximum_valued_pixel_lands_in_the_last_bin`. | `sitk-filters` `label_intensity.rs` |
+| 2.67 | MetaIO cannot round-trip a complex pixel type as complex | `MetaImageIO` derives `ElementNumberOfChannels` from `GetNumberOfComponentsPerPixel()`, which is 2 for `std::complex<T>` — indistinguishable on disk from a 2-component vector. On read, `itkMetaImageIO.cxx:241-244` forces `IOPixelEnum::VECTOR` for any `ElementNumberOfChannels() > 1` and never sets `COMPLEX`, and SimpleITK's `sitkImageReaderBase.cxx:215-233` takes the scalar/complex branch only at `numberOfComponents == 1` (its later `COMPLEX` else-if is unreachable via MetaImage). Net: a `ComplexFloat32/64` image written to `.mha`/`.mhd` reads back as `VectorFloat32/64` — in ITK, SimpleITK, and this port alike. Reproduced faithfully; pinned by `mha_roundtrip_complex_float32_reads_back_as_vector` / `..._float64_...`. Verified against sources 2026-07-10 (io-porter finding, spot-checked). Not yet filed. | `sitk-io` `meta_image.rs` |
 
 ## 3. SimpleITK wrapping issues
 
@@ -204,6 +205,7 @@ All nine items re-verified against SimpleITK master `3e193179` / ITK master
 | 4.27 | `sitk-filters` `label_map.rs` — `merge_label_map` KEEP drains its deferred list once per input | Closes §1.40. Upstream's never-cleared deque leaves two `std::map` keys aliasing one `LabelObject`, which the user-approved `objects[k].label() == k` invariant of this port's `LabelMap` makes unrepresentable by construction. This port drains the deque after each input, which is what the surrounding code plainly intends: a deferred object receives exactly one new label. Observable difference only with three or more inputs *and* a deferred object from input 1 — upstream yields the object at `L2` with a stale alias at `L1` and an object count one too high, this port yields it at `L1`. Pinned by `merge_keep_gives_a_deferred_object_one_label_across_three_inputs`. | `sitk-filters` `label_map.rs` |
 | 4.28 | `sitk-filters` `label_map_overlay.rs` — overlapping label objects paint in ascending label order | `ThreadedProcessLabelObject` is dispatched from a multithreaded region (`itkLabelMapFilter.hxx:83-113`), so when two objects of one label map share a pixel — representable, and what `LabelUniqueLabelMapFilter` exists to remove — ITK's painted colour is whichever work unit wrote last, which is unspecified. `label_map_to_rgb` and `label_map_overlay` paint in ascending label order, so the greatest label wins deterministically. `label_map_contour_overlay` is unaffected: its temporary map has already been through `label_unique_label_map`. Pinned by `a_higher_label_wins_an_overlap_in_label_map_to_rgb`. | `sitk-filters` `label_map_overlay.rs` |
 | 4.29 | `sitk-core` `label_map.rs` — labels are range-checked against `pixel_id` | `itk::LabelMap`'s `LabelType` *is* the label image's pixel type, so an out-of-range label cannot exist upstream; the narrowing happens in the caller's `static_cast` before `AddLabelObject`/`SetLine` are ever reached. This port carries labels as `i64`, so it enforces the same guarantee at a single private seam (`insert_object`): every key, and the background value, must lie inside `PixelId::integer_scalar_bounds`, else `Error::LabelOutOfRange`. `add_label_object`, `push_label_object` and `set_line` all route through it; `new` and `set_background` range-check the background for the same reason (`to_label_image` fills every uncovered pixel with it). No upstream behaviour is lost: the states this rejects are exactly the ones `LabelType` makes unrepresentable. | `sitk-core` `label_map.rs` |
+| 4.30 | `sitk-io` `meta_image.rs` — `ElementNumberOfChannels` written unconditionally | `metaImage.cxx:2341-2346` emits the key only when the count is > 1; this port's writer emits it for every image, including `= 1` for scalars (pre-existing behavior from before multi-channel support, kept so existing single-channel files/tests stay byte-identical). Semantically inert to real MetaIO readers: the field is optional and defaults to 1. | `sitk-io` `meta_image.rs` |
 
 ## 5. Open decision points
 
@@ -215,43 +217,75 @@ All nine items re-verified against SimpleITK master `3e193179` / ITK master
 | 5.4 | **`fast_marching()` trial-point length rule** — SimpleITK's `sitkSTLVectorToITK` accepts any length ≥ dim and reads `point[dim]` as the seed's initial arrival time; `fast_marching()` (`fast_marching.rs:190`) rejects length ≠ dim, pinned by `trial_point_of_wrong_length_is_an_error`. The newer `fast_marching_upwind_gradient`/`colliding_fronts` implement the upstream rule — so `[0,0,3]` is a valued seed in those two and an error in `fast_marching`. Fixing changes existing public behavior and deletes a pinned test. | (a) align `fast_marching` on len ≥ dim + trailing seed value (parity, breaking); (b) keep the strict check as a documented divergence (§4.9-adjacent), inconsistent within the crate. |
 | 5.5 | **`n4_bias_field.rs` mask pixel-type handling** — quantizes any mask pixel type to `UInt8` by value, but SimpleITK's codegen (`CastImageToITK`, `sitkProcessObject.h:386-400`) uses a strict `dynamic_cast`: a non-`UInt8` mask **errors** upstream. The newer `stochastic_fractal_dimension` implements the strict rule (`RequiresUInt8MaskPixelType`) — crate-internal inconsistency. Fixing n4 changes existing public behavior. | (a) align `n4_bias_field` on strict `UInt8` (parity, breaking); (b) keep value-converting quantize as a documented §4 divergence. |
 | 5.6 | **`RealType = double` output-type family** — ITK defines `NumericTraits<float>::RealType` as `double` (`itkNumericTraits.h:1349/1356`); several port mappings keep `Float32 → Float32`, so every member outputs `Float32` where upstream outputs `Float64` for a `Float32` input. Full family (audited 2026-07-10, anchor `PixelId::Float32 => PixelId::Float32`): `lib.rs::real_pixel_id` (`fast_marching`, `anti_alias_binary`), `math.rs::real_type` (`divide_real`), `intensity.rs::real_type` (`normalize`), `projection.rs::real_type` (mean/sum/std projections), `fft_correlation.rs::real_type` (both filters), and `vector.rs::edge_potential`'s Float32 output branch. All are now documented divergences at each function. The *non-breaking* members of the misbelief (f32 accumulation branches in `vector_magnitude`/`edge_potential`/`vector_connected_component`; `watershed_classic`'s internal `real_pixel_type`) were fixed 2026-07-10 — only the public output-type flips remain. | (a) flip all six to `double` semantics in one release (parity, breaking); (b) keep as documented divergences. |
-| 5.7 | **FFT padding rule and `ForwardFFT` exposure** — `fft.rs:8-20`'s radix-2-only justification is stale: in this ITK checkout the VNL backend is a deprecated wrapper (`itkVnlForwardFFTImageFilter.h:27/:34`) and the always-compiled default is PocketFFT, whose `GetSizeGreatestPrimeFactor()` returns **11** (`itkPocketFFTForwardFFTImageFilter.hxx:72-76`), seeded into `FFTConvolutionImageFilter` at `.hxx:39` — so `itkFFTPadImageFilter` pads each axis to GPF ≤ 11 while this port pads to a power of two (100 → 100 upstream vs → 128 here; whether outputs differ after cropping is **unverified**). And a public `ForwardFFT` does no padding at all (yaml has no pad parameter) — it needs mixed-radix/Bluestein transforms the radix-2 backend cannot provide. Verified against sources 2026-07-10 (pixel-architect finding, spot-checked). **Status: option (a) executed 2026-07-10** (complex pixel type + the six `ComplexTo*`/`*ToComplex` filters merged; `fft.rs` untouched). Remaining open: the mixed-radix/Bluestein rewrite to expose `ForwardFFT`/`InverseFFT`, and whether to align `padded_length` on GPF ≤ 11 (changes existing `fft_convolution`/`deconvolution`/`fft_correlation` transform sizes; output impact after cropping unverified). |
+| 5.7 | **FFT padding rule and `ForwardFFT` exposure** — `fft.rs:8-20`'s radix-2-only justification is stale: in this ITK checkout the VNL backend is a deprecated wrapper (`itkVnlForwardFFTImageFilter.h:27/:34`) and the always-compiled default is PocketFFT, whose `GetSizeGreatestPrimeFactor()` returns **11** (`itkPocketFFTForwardFFTImageFilter.hxx:72-76`), seeded into `FFTConvolutionImageFilter` at `.hxx:39` — so `itkFFTPadImageFilter` pads each axis to GPF ≤ 11 while this port pads to a power of two (100 → 100 upstream vs → 128 here; whether outputs differ after cropping is **unverified**). And a public `ForwardFFT` does no padding at all (yaml has no pad parameter) — it needs mixed-radix/Bluestein transforms the radix-2 backend cannot provide. Verified against sources 2026-07-10 (pixel-architect finding, spot-checked). **Status: option (a) executed 2026-07-10** (complex pixel type + the six `ComplexTo*`/`*ToComplex` filters merged; `fft.rs` untouched). Remaining open: the mixed-radix/Bluestein rewrite to expose `ForwardFFT`/`InverseFFT` (plus `RealToHalfHermitianForwardFFT`/`HalfHermitianToRealInverseFFT`/public `FFTPad`, surfaced by the 2026-07-10 coverage audit), and whether to align `padded_length` on GPF ≤ 11 (changes existing `fft_convolution`/`deconvolution`/`fft_correlation` transform sizes; output impact after cropping unverified — worth measuring before deciding). |
+| 5.8 | **External dependencies for IO formats** — the workspace has exactly one external crate (`thiserror`). Compressed MetaImage / NRRD gzip / `.nii.gz` need zlib (`flate2` or pure-Rust `miniz_oxide`, or in-tree inflate/deflate); PNG/JPEG/TIFF need format crates (`png`, `jpeg-decoder`/`zune-jpeg`, `tiff`); DICOM needs `dicom-rs`; transform `.h5` needs the C-binding `hdf5` crate (recommendation: skip `.h5`, ship dep-free `.tfm`/`.txt`). Surfaced by the 2026-07-10 coverage audit; gates the binary-format IO waves. | (a) pure-Rust crates only, no C bindings; (b) all listed; (c) no new deps — in-tree zlib only, dropping PNG/JPEG/TIFF/DICOM; (d) decide per format later; dep-needing waves stay blocked meanwhile. |
+| 5.9 | **External test data for IO byte-parity** — NIfTI/NRRD/DICOM parity realistically needs upstream fixtures. | (a) read fixtures in place from `/home/stevek/work/ITK/Testing/Data/`; (b) synthetic fixtures + round-trip tests only; (c) both. |
+| 5.10 | **Erased `Transform` representation** — SimpleITK's `Transform` (`sitkTransform.h:86`) is one concrete class over `itk::TransformBase::Pointer` + a runtime enum; every API taking/returning `Transform` by value (`ReadTransform`, `SetInitialTransform`, `CompositeTransform::AddTransform`, `GetInverse`) needs a Rust counterpart. Gates the registration/transform wave. | (a) `#[non_exhaustive] enum Transform` over the 15 concrete types (architect recommendation — matches how `PixelId` models runtime dispatch in this workspace); (b) `Box<dyn ParametricTransform>` object type (open set, but object-safety plumbing and hand-written `Clone`/`PartialEq`). |
 
-## 6. Filter clusters blocked on sitk-core pixel-model gaps
+## 6. Remaining coverage gaps
 
-**Vector pixels are no longer a gap**: `sitk_core::PixelId` gained the 10
-`Vector*` variants (SimpleITK `VectorPixelIDTypeList` parity), `Image` carries
-`components_per_pixel` over an interleaved buffer, and all scalar filters
-reject vector inputs by construction at the accessor seam
-(`Error::RequiresScalarPixelType`; see §4.15). `Compose`,
-`VectorIndexSelectionCast`, `VectorMagnitude` are ported. Still open on the
-vector track: `meta_image::write` refuses vector images
-(`ElementNumberOfChannels` hard-coded 1 — feature, not guard), and the
-remaining vector consumers below.
+Rewritten 2026-07-10 after a full-surface audit of the SimpleITK checkout
+(all 298 `Code/BasicFilters/yaml/` definitions hand-adjudicated against every
+`pub fn` in the workspace, plus the hand-written `Code/BasicFilters/include/`
+layer, `sitkImage.h`, `Code/IO/`, and `sitkImageRegistrationMethod.h`).
+Every cluster this section previously listed as blocked is ported: the vector
+consumers (`LabelOverlay`, `LabelToRGB`, `ScalarToRGBColormap`,
+`LabelMapToRGB`/`LabelMapOverlay`/`LabelMapContourOverlay`), the six complex
+conversion filters (`sitk-filters::complex`, §2.58/§3.16/§4.23/§4.24), and the
+LabelMap object type with its manipulation/statistics filters
+(`sitk-core::label_map`, §4.25–4.29). Multi-channel (vector/complex) MetaImage
+read/write landed 2026-07-10 (§2.67/§4.30).
 
-Still blocked or unqueued (complex / LabelMap are structural sitk-core
-decisions; vector items are now just unported):
+What actually remains unported:
 
-- **Vector consumers (unblocked, unported)**: `LabelOverlay`, `LabelToRGB`,
-  `ScalarToRGBColormap` (plus the LabelMap-gated
-  `LabelMapOverlay`/`LabelMapContourOverlay`/`LabelMapToRGB`). Ported since
-  this section was written: the displacement-field filters
-  (`Invert`/`Inverse`/`IterativeInverse`/`JacobianDeterminant`),
-  `TransformToDisplacementFieldFilter`, `Warp`, `EdgePotential`,
-  `PhysicalPointImageSource`, `VectorConnectedComponent`,
-  `VectorConfidenceConnected`, and the full Demons family
-  (`Demons`/`Diffeomorphic`/`FastSymmetricForces`/`SymmetricForces` +
-  `LevelSetMotionRegistrationFilter`).
-- **Complex pixels (sitk-core done 2026-07-10)**: `PixelId::ComplexFloat32/64`,
-  `Image::from_vec_complex`/`get_complex`/`set_complex`/`complex_components`,
-  and the `buffer_stride` vs `number_of_components_per_pixel` split all exist;
-  see §4.15 and §4.22. `ComplexToReal`/`Imaginary`/`Modulus`/`Phase`,
-  `RealAndImaginaryToComplex` and `MagnitudeAndPhaseToComplex` are ported in
-  `sitk-filters::complex` (§2.50, §3.13, §4.23).
-  `ForwardFFT`/`InverseFFT` remain **unexposed**: `ForwardFFTImageFilter.yaml`
-  declares no pad parameter, so it must transform the input size as given,
-  while `sitk-filters::fft` is radix-2-only. See §5.7.
-- **LabelMap object type**: `AggregateLabelMapFilter`, `ChangeLabelLabelMap`,
-  `MergeLabelMap`, `RelabelLabelMap`, `LabelUniqueLabelMap`,
-  `LabelMapToLabel`, `BinaryImageToLabelMap`, `LabelIntensityStatistics`
-  (via LabelStatistics equivalent may be portable scalar-side — unassessed).
+- **BasicFilters (yaml), 13 non-FFT**: `Equal`, `Greater`, `Less`, `Round`,
+  `CyclicShift`, `ShiftScale`, `NormalizeToConstant`, `Rank` (only
+  `FastApproximateRank` is ported — upstream ships both as separate filters),
+  `VotingBinaryHoleFilling` (only the iterative variant is ported),
+  `NormalizedCorrelation` (image + mask + template kernel via
+  `sitkImageToKernel.hxx`); plus the near-mechanical composites
+  `SmoothingRecursiveGaussian`, `GradientRecursiveGaussian`, `Gradient`
+  (vector output). *Assigned wave-16, 2026-07-10.*
+- **LabelMap residue (2)**: `LabelMapMask`, `LabelMapToBinary`.
+  *Assigned wave-16.*
+- **FFT family (5)**: `ForwardFFT`, `InverseFFT`,
+  `RealToHalfHermitianForwardFFT`, `HalfHermitianToRealInverseFFT`, public
+  `FFTPad`. Blocked on the mixed-radix decision, §5.7.
+- **Hand-written BasicFilters layer** (`Code/BasicFilters/include/`): `Hash`
+  (`sitkHashImageFilter.h`), `BSplineTransformInitializer`,
+  `CenteredVersorTransformInitializer`, and `sitkImageOperators.h`'s
+  `std::ops` surface for `Image`.
+- **`sitk-core::Image` vs `sitkImage.h`**: the metadata dictionary
+  (`{Get,Set,Erase,Has}MetaData*`, `sitkImage.h:401-432` — load-bearing: every
+  real IO format round-trips header keys through it),
+  `TransformIndexToPhysicalPoint`/`TransformPhysicalPointToIndex`,
+  `EvaluateAtContinuousIndex`/`EvaluateAtPhysicalPoint`,
+  `IsCongruentImageGeometry`/`IsSameImageGeometryAs`,
+  `ToVectorImage`/`ToScalarImage`, scalar `GetPixelAs*`/`SetPixelAs*`,
+  `GetSizeOfPixelComponent`, `GetPixelIDTypeAsString`, `ToString`.
+  *Metadata + accessors assigned wave-16.*
+- **`sitk-io`**: everything beyond uncompressed MetaImage. SimpleITK registers
+  every default ITK ImageIO factory (BioRad, BMP, Bruker2dseq, FDF, GDCM, GE4,
+  GE5, GEAdw, Gipl, HDF5, JPEG, JPEG2000, LSM, MGH, MINC, MRC, Nifti, Nrrd,
+  PhilipsREC, PNG, Scanco, SiemensVision, Stimulate, TIFF, VTI, VTK) plus the
+  class-level surface: `ImageFileReader`/`ImageFileWriter` objects
+  (`ReadImageInformation`, extract-region streaming, compression control),
+  `ImageSeriesReader`/`Writer` (GDCM series enumeration), `ImportImageFilter`,
+  `ImageViewer`/`Show`, `GetRegisteredImageIOs`. Binary formats gated on §5.8
+  (dependencies) and §5.9 (test data); compressed MetaImage likewise.
+- **Registration/Transform**: the erased `Transform` value type (§5.10) with
+  `ReadTransform`/`WriteTransform` (`.tfm`/`.txt` are dep-free; `.h5`/`.mat`/
+  `.xfm` gated on §5.8); the initial-transform model
+  (`SetInitialTransform`(+in-place)/`SetMovingInitialTransform`/
+  `SetFixedInitialTransform`/`SetInitialTransformAsBSpline`,
+  `SetVirtualDomain{,FromImage}`, `MetricEvaluate`); the observer/introspection
+  surface (`GetOptimizerIteration`/`GetMetricValue`/…/`StopRegistration`,
+  upstream `sitkCommand.h`/`sitkEvent.h`);
+  `SetOptimizerScalesFrom{Jacobian,IndexShift}`, `Set/GetOptimizerWeights`,
+  `SetMetricUse{Fixed,Moving}ImageGradientFilter`; and the
+  `BSpline`/`CenteredVersor` transform initializers. All 15 concrete transform
+  classes and all metrics/optimizers of `ImageRegistrationMethod` are already
+  ported.
+- **Facade (`crates/sitk`)**: stale phase-0 docs, `LabelMap`/transform types
+  not hoisted, no `Resample`/`ReadTransform` free functions, no operator
+  overloads (see hand-written layer above).
