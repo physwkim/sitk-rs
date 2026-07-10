@@ -466,8 +466,10 @@ pub(crate) fn quantize_to_pixel_type(target: PixelId, v: f64) -> f64 {
 /// `itk::NumericTraits<T>::max()` (`itkNumericTraits.h`'s
 /// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`, `std::numeric_limits<T>::max()` for
 /// every basic type with no ITK override -- unlike `min()`, which floating
-/// types override to the smallest *positive* normalized value; see
-/// [`numeric_traits_min`]).
+/// types override to the smallest *positive* normalized value
+/// (`FLT_MIN`/`DBL_MIN`), not the most negative representable value; **not**
+/// the right seed for a running-maximum scan, see
+/// [`numeric_traits_nonpositive_min`]).
 pub(crate) fn numeric_traits_max(id: PixelId) -> f64 {
     match id.component_id() {
         PixelId::UInt8 => u8::MAX as f64,
@@ -484,14 +486,17 @@ pub(crate) fn numeric_traits_max(id: PixelId) -> f64 {
     }
 }
 
-/// `itk::NumericTraits<T>::min()` (`itkNumericTraits.h`'s
-/// `itkNUMERIC_TRAITS_MIN_MAX_MACRO`): `std::numeric_limits<T>::min()` for
-/// every integer type (the most-negative representable value), but for
-/// `float`/`double` ITK overrides it to `std::numeric_limits<T>::min()`'s
-/// *own* meaning for floating types -- the smallest *positive* normalized
-/// value (`FLT_MIN`/`DBL_MIN`), not the most negative representable value.
-/// Rust's `f32::MIN_POSITIVE`/`f64::MIN_POSITIVE` are the exact equivalents.
-pub(crate) fn numeric_traits_min(id: PixelId) -> f64 {
+/// `itk::NumericTraits<T>::NonpositiveMin()` (`itkNumericTraits.h`,
+/// `std::numeric_limits<T>::lowest()` for every type): the correct seed for
+/// a running-maximum scan -- unlike plain `NumericTraits<T>::min()`, which
+/// floating types override to the smallest *positive* normalized value
+/// (`FLT_MIN`/`DBL_MIN`), a footgun this crate hit and fixed at ledger
+/// §1.38. For `float`/`double`, `NonpositiveMin()` is the true most-negative
+/// representable value (`-FLT_MAX`/`-DBL_MAX`, Rust's `f32::MIN`/`f64::MIN`),
+/// and for every integer type it coincides with `min()`.
+/// `MinimumMaximumImageCalculator` and this crate's own
+/// [`crate::scalar_to_rgb_colormap`] fix use exactly this idiom.
+pub(crate) fn numeric_traits_nonpositive_min(id: PixelId) -> f64 {
     match id.component_id() {
         PixelId::UInt8 => u8::MIN as f64,
         PixelId::Int8 => i8::MIN as f64,
@@ -501,8 +506,8 @@ pub(crate) fn numeric_traits_min(id: PixelId) -> f64 {
         PixelId::Int32 => i32::MIN as f64,
         PixelId::UInt64 => u64::MIN as f64,
         PixelId::Int64 => i64::MIN as f64,
-        PixelId::Float32 => f32::MIN_POSITIVE as f64,
-        PixelId::Float64 => f64::MIN_POSITIVE,
+        PixelId::Float32 => f32::MIN as f64,
+        PixelId::Float64 => f64::MIN,
         _ => unreachable!("PixelId::component_id() always returns a scalar variant"),
     }
 }
