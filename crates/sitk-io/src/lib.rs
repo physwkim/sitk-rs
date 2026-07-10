@@ -100,6 +100,7 @@ pub fn write_image_with<P: AsRef<Path>>(
     let options = WriteOptions {
         use_compression,
         compression_level,
+        compressor: None,
     };
     image_io::writer_for(path)?.write(image, path, &options)
 }
@@ -4640,6 +4641,129 @@ mod tests {
         assert!(packed_len < plain_len, "{packed_len} !< {plain_len}");
         assert_eq!(back.size(), &[64, 64]);
         assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.51: `SetCompressor("PACKBITS")` with no explicit
+    /// [`ImageFileWriter::set_compressor`] call is upstream's own default
+    /// (itkTIFFImageIO.cxx:214, :260-266), so leaving
+    /// [`TiffCompressor`](crate::tiff::TiffCompressor) unset must write
+    /// byte-identical output to selecting `PackBits` explicitly.
+    #[test]
+    fn tiff_explicit_packbits_compressor_matches_the_bare_use_compression_default() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data).unwrap();
+
+        let implicit = tmp_path("packbits_implicit.tif");
+        let explicit = tmp_path("packbits_explicit.tif");
+        write_image_with(&img, &implicit, true, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&explicit)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::PackBits));
+        writer.execute(&img).unwrap();
+
+        let a = std::fs::read(&implicit).unwrap();
+        let b = std::fs::read(&explicit).unwrap();
+        std::fs::remove_file(&implicit).ok();
+        std::fs::remove_file(&explicit).ok();
+
+        assert_eq!(a, b);
+    }
+
+    /// Fixed §3.51: this port's encoder can write `COMPRESSION_LZW`, which
+    /// upstream reaches through `SetCompressor("LZW")`
+    /// (itkTIFFImageIO.cxx:264-266, :700-703). The image must still round-trip
+    /// through the same multi-row strips as the `PackBits` case.
+    #[test]
+    fn tiff_lzw_compression_round_trips_and_shrinks_compressible_data() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data.clone()).unwrap();
+
+        let plain = tmp_path("lzw_off.tif");
+        let compressed = tmp_path("lzw_on.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&compressed)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+        writer.execute(&img).unwrap();
+
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let compressed_len = std::fs::metadata(&compressed).unwrap().len();
+        let back = read_image(&compressed).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&compressed).ok();
+
+        assert!(
+            compressed_len < plain_len,
+            "{compressed_len} !< {plain_len}"
+        );
+        assert_eq!(back.size(), &[64, 64]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.51: this port's encoder can write `COMPRESSION_ADOBE_DEFLATE`
+    /// (tag `8`), which upstream reaches through `SetCompressor("DEFLATE")` or
+    /// `SetCompressor("ADOBEDEFLATE")` (itkTIFFImageIO.cxx:271-278, :706-712).
+    #[test]
+    fn tiff_deflate_compression_round_trips_and_shrinks_compressible_data() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data.clone()).unwrap();
+
+        let plain = tmp_path("deflate_off.tif");
+        let compressed = tmp_path("deflate_on.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&compressed)
+            .use_compression_on()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+        writer.execute(&img).unwrap();
+
+        let plain_len = std::fs::metadata(&plain).unwrap().len();
+        let compressed_len = std::fs::metadata(&compressed).unwrap().len();
+        let back = read_image(&compressed).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&compressed).ok();
+
+        assert!(
+            compressed_len < plain_len,
+            "{compressed_len} !< {plain_len}"
+        );
+        assert_eq!(back.size(), &[64, 64]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.51: `if (m_UseCompression) { switch (m_Compression) {...} }
+    /// else { compression = COMPRESSION_NONE; }` (itkTIFFImageIO.cxx:692-716)
+    /// — an explicit compressor never overrides `UseCompressionOff`.
+    #[test]
+    fn tiff_use_compression_off_ignores_an_explicit_compressor() {
+        let data: Vec<u8> = (0..64 * 64u32).map(|i| (i / 97) as u8).collect();
+        let img = Image::from_vec(&[64, 64], data).unwrap();
+
+        let plain = tmp_path("compression_off_plain.tif");
+        let gated_off = tmp_path("compression_off_gated.tif");
+        write_image_with(&img, &plain, false, -1).unwrap();
+
+        let mut writer = ImageFileWriter::new();
+        writer
+            .set_file_name(&gated_off)
+            .use_compression_off()
+            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+        writer.execute(&img).unwrap();
+
+        let a = std::fs::read(&plain).unwrap();
+        let b = std::fs::read(&gated_off).unwrap();
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(&gated_off).ok();
+
+        assert_eq!(a, b);
     }
 
     /// `SetCompressionLevel` is TIFF's *JPEG quality*

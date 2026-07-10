@@ -193,7 +193,7 @@
 //! hand this module native-order `u16`/`i16`/`u32`/`i32`/`f32`, and [`read`]
 //! swaps nothing.
 //!
-//! # Compression: only `PackBits` and "none" are reachable on write
+//! # Compression: `PackBits`, `LZW` and `Deflate` are selectable on write
 //!
 //! `TIFFImageIO`'s constructor calls `SetCompressor("")`, which
 //! `InternalSetCompressor` resolves to `PackBits`
@@ -203,20 +203,26 @@
 //! `LZW` / `PACKBITS` / `JPEG` / `DEFLATE` / `ADOBE_DEFLATE`
 //! (`:692-722`). Selecting one of those needs `SetCompressor("LZW")` etc.
 //! SimpleITK's own `ImageFileWriter` *does* expose that selector
-//! (`sitkImageFileWriter.h:123`, forwarded at `sitkImageFileWriter.cxx:237-240`),
-//! so every TIFF compressor is reachable there; this crate does not expose it
-//! (ledger §6) — so [`WriteOptions::use_compression`] toggles exactly between
-//! `COMPRESSION_NONE` and `COMPRESSION_PACKBITS`, and `m_Compression` never
-//! leaves its constructed default. The restriction is this port's, not
-//! SimpleITK's. Ledger §3.51.
+//! (`sitkImageFileWriter.h:123`, forwarded at `sitkImageFileWriter.cxx:237-240`).
+//! Ledger §3.51.
+//!
+//! **Fixed §3.51** — of that selector, this crate's encoder can write
+//! `LZW`, `PackBits` and one `Deflate` (the `tiff` crate has no JPEG
+//! encoder at all, and its `Deflate` writes only the modern tag `8`, never
+//! upstream's legacy tag `32946`; see [`TiffCompressor`]). Those three are
+//! now reachable through [`WriteOptions::compressor`] /
+//! [`ImageFileWriter::set_compressor`](crate::writer::ImageFileWriter::set_compressor),
+//! gated by [`WriteOptions::use_compression`] exactly as upstream gates
+//! `m_Compression` on `m_UseCompression` (`:692-716`). `None` (the default)
+//! keeps the prior behaviour: `COMPRESSION_NONE` ↔ `COMPRESSION_PACKBITS`.
 //!
 //! `m_CompressionLevel` is TIFF's *JPEG quality*: `SetJPEGQuality` is
 //! `SetCompressionLevel` (itkTIFFImageIO.h:171-180) and the constructor seeds
 //! it with `75` (`:213`). It reaches libtiff only through
 //! `TIFFSetField(tif, TIFFTAG_JPEGQUALITY, ...)` inside
-//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). Because
-//! *this crate* selects no compressor, [`WriteOptions::compression_level`] is
-//! dead here — but through SimpleITK, `SetCompressor("JPEG")` plus
+//! `if (compression == COMPRESSION_JPEG)` (itkTIFFImageIO.cxx:747-751). This
+//! crate cannot write JPEG at all (§3.51), so
+//! [`WriteOptions::compression_level`] is still dead here — but through SimpleITK, `SetCompressor("JPEG")` plus
 //! `UseCompressionOn()` makes the level live as the JPEG quality.
 //! It is also the only `ImageIOBase` in this crate that leaves
 //! `m_MaximumCompressionLevel` at its `100` default rather than lowering it to
@@ -255,7 +261,7 @@ use sitk_core::{Image, PixelBuffer, PixelId};
 use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::encoder::colortype::ColorType as EncoderColorType;
-use tiff::encoder::{Compression, Rational, TiffEncoder, TiffKind, TiffValue};
+use tiff::encoder::{Compression, DeflateLevel, Rational, TiffEncoder, TiffKind, TiffValue};
 use tiff::tags::{ExtraSamples, PhotometricInterpretation, ResolutionUnit, SampleFormat, Tag};
 
 use crate::error::{IoError, Result};
@@ -1121,6 +1127,34 @@ where
     }
 }
 
+/// The TIFF compressor to write with — the subset of
+/// `TIFFImageIO::TIFFCompressionTypes` (itkTIFFImageIO.h:113-121) the `tiff`
+/// crate's encoder can actually write. Selected through
+/// [`WriteOptions::compressor`]; `None` keeps the previous behaviour, where
+/// [`WriteOptions::use_compression`] alone toggles `PackBits` on or off.
+///
+/// **Fixed §3.51** — `JPEG` is not offered: the `tiff` crate's encoder has no
+/// JPEG codec (`encoder::compression` lists only `Uncompressed`/`Lzw`/
+/// `Deflate`/`Packbits`), and there is no pure-Rust path to it. Upstream's
+/// legacy tag-`32946` `Deflate` is not offered either: the crate's own
+/// `Compression::Deflate` always writes tag `8`
+/// (`PhotometricInterpretation`-style — upstream's `AdobeDeflate`), the only
+/// Deflate tag its encoder can produce; both upstream names decode to the
+/// same zlib stream, so this port's [`TiffCompressor::Deflate`] covers what
+/// upstream calls `DEFLATE` and `ADOBEDEFLATE` alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TiffCompressor {
+    /// `COMPRESSION_LZW`.
+    Lzw,
+    /// `COMPRESSION_ADOBE_DEFLATE` (tag `8`), at the `tiff` crate's own
+    /// `DeflateLevel::default()` ratio (`Balanced`). `WriteOptions::compression_level`
+    /// does not yet reach this — ledger §3.52.
+    Deflate,
+    /// `COMPRESSION_PACKBITS` — the same compressor a bare
+    /// [`WriteOptions::use_compression`] already selects.
+    PackBits,
+}
+
 /// Write a `.tif` / `.tiff` file.
 ///
 /// `WriteImageInformation` is a no-op upstream (itkTIFFImageIO.cxx:555-557);
@@ -1179,10 +1213,18 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
         )
     });
 
-    let compression = if options.use_compression {
-        Compression::Packbits
-    } else {
+    // `if (m_UseCompression) { switch (m_Compression) {...} } else { compression
+    // = COMPRESSION_NONE; }` (itkTIFFImageIO.cxx:692-716) — the toggle gates the
+    // selector, not the other way around.
+    let compression = if !options.use_compression {
         Compression::Uncompressed
+    } else {
+        match options.compressor {
+            None | Some(TiffCompressor::PackBits) => Compression::Packbits,
+            Some(TiffCompressor::Lzw) => Compression::Lzw,
+            // `compression_level` does not vary this ratio yet — ledger §3.52.
+            Some(TiffCompressor::Deflate) => Compression::Deflate(DeflateLevel::default()),
+        }
     };
 
     let ctx = WriteContext {
