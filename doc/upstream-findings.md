@@ -510,7 +510,19 @@ What actually remains unported:
   `itk::ImageIOFactory::CreateImageIO`, with `MetaImageIo` as its first
   implementor — and the class-level surface built on it: `ImageFileReader`
   (`read_image_information`, extract-region), `ImageFileWriter` (`set_image_io`),
-  `registered_image_ios`. Wave-18 landed `NrrdImageIo` (`.nrrd`/`.nhdr`, raw
+  `registered_image_ios`. The one reader-layer behavior left unported by that
+  seam — `itk::ImageFileReader`'s post-read geometry normalization, which flips a
+  negative spacing component positive, negates the matching direction column, and
+  records the raw values under `ITK_original_spacing`/`ITK_original_direction`
+  (`itkImageFileReader.hxx:216-239`; GDCM is the motivating producer of a negative
+  Z-spacing, `itkGDCMImageIO.cxx:703`) — **is now ported** (2026-07-11) in
+  `reader::normalize_reader_geometry`, applied by both `ImageFileReader::execute`
+  and the free `read_image` so every format gets it at once (each `ImageIo` still
+  reports raw values). The two originals are stored as space-separated
+  round-trippable f64 rather than through SimpleITK's `MetaDataObject::Print`,
+  which renders the spacing vector as the useless `"[UNKNOWN PRINT
+  CHARACTERISTICS]"` and the direction as a `vnl_matrix` dump — the silent-data-
+  loss policy fix. Wave-18 landed `NrrdImageIo` (`.nrrd`/`.nhdr`, raw
   and ascii-read encodings, §1.46-1.48/§2.82-2.85/§3.31/§4.51-4.54), the
   Insight legacy transform reader/writer `read_transform`/`write_transform`
   (`.tfm`/`.txt`, §1.45/§2.78-2.81/§3.30/§4.47/§4.50 — since joined by the HDF5

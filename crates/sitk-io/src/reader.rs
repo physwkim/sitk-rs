@@ -1,5 +1,17 @@
 //! [`ImageFileReader`] — SimpleITK's `itk::simple::ImageFileReader`
 //! (sitkImageFileReader.h:95-219, sitkImageFileReader.cxx).
+//!
+//! # Geometry normalization
+//!
+//! Both read entry points — [`ImageFileReader::execute`] and the free
+//! [`crate::read_image`] — pass the raw image an `ImageIo` returns through
+//! [`normalize_reader_geometry`], the port of `itk::ImageFileReader`'s own
+//! post-read block (`itkImageFileReader.hxx:216-239`). Each `ImageIo` reports
+//! the file's raw geometry; the reader flips any negative spacing component
+//! positive (negating the matching direction column so the physical geometry is
+//! unchanged) and records the raw spacing/direction under `ITK_original_spacing`
+//! / `ITK_original_direction`. This layering — raw at the IO, normalized at the
+//! reader — matches upstream and gives every format the fix at once.
 
 use std::path::{Path, PathBuf};
 
@@ -171,7 +183,8 @@ impl ImageFileReader {
             return Err(IoError::ExtractOutputDimension(out_dim));
         }
 
-        let image = io.read(&self.file_name)?;
+        let mut image = io.read(&self.file_name)?;
+        normalize_reader_geometry(&mut image)?;
         self.information = Some(info);
 
         if self.extract_size.is_empty() {
@@ -281,6 +294,74 @@ impl ImageFileReader {
     }
 }
 
+/// `itk::ImageFileReader`'s post-read geometry normalization
+/// (itkImageFileReader.hxx:216-239), the layer every SimpleITK read passes
+/// through: the individual `ImageIo` reports the file's raw geometry, and the
+/// reader normalizes it here so every format benefits.
+///
+/// Two steps, in upstream's order:
+///
+/// 1. Record the **raw** spacing and direction under `ITK_original_spacing` and
+///    `ITK_original_direction`, *unconditionally* — upstream encapsulates both
+///    before it looks at any sign (`itkImageFileReader.hxx:219-221`), so every
+///    image read through this path carries them, flip or no flip.
+/// 2. "Spacing is expected to be greater than 0. If negative, flip image
+///    direction along this axis" (`itkImageFileReader.hxx:223-236`): for each
+///    axis whose spacing is negative, make the spacing positive and negate the
+///    matching **column** of the direction cosine matrix (direction cosines are
+///    stored as columns), leaving the physical geometry unchanged while
+///    restoring the positive-spacing invariant this port's [`Image`] expects.
+///    GDCM is the motivating producer of a negative Z-spacing
+///    (`itkGDCMImageIO.cxx:703`); the normalization is format-agnostic.
+///
+/// Upstream stores the two originals as typed dictionary objects
+/// (`std::vector<double>` and `itk::Matrix`), which SimpleITK then renders to a
+/// string through `MetaDataObject::Print` — yielding the useless
+/// `"[UNKNOWN PRINT CHARACTERISTICS]"` for the spacing vector (no `operator<<`)
+/// and a multi-line `vnl_matrix` dump for the direction. This port's dictionary
+/// is string-valued, so it stores both as space-separated round-trippable f64
+/// (row-major for the matrix): the originals stay recoverable instead of being
+/// lost to `Print`'s rendering (upstream-findings §6, silent-data-loss policy).
+pub(crate) fn normalize_reader_geometry(image: &mut Image) -> Result<()> {
+    let dim = image.dimension();
+
+    // Step 1: record the raw geometry, unconditionally.
+    let original_spacing = join_f64(image.spacing());
+    let original_direction = join_f64(image.direction());
+    image.set_meta_data("ITK_original_spacing", &original_spacing);
+    image.set_meta_data("ITK_original_direction", &original_direction);
+
+    // Step 2: flip any negative spacing component positive, negating the
+    // matching direction column. Touch the geometry only when a flip is needed,
+    // so a file with a legitimate zero spacing (which upstream leaves alone —
+    // the guard is `spacing[i] < 0`) is not rejected by `set_spacing`.
+    if image.spacing().iter().any(|&s| s < 0.0) {
+        let mut spacing = image.spacing().to_vec();
+        let mut direction = image.direction().to_vec();
+        for i in 0..dim {
+            if spacing[i] < 0.0 {
+                spacing[i] = -spacing[i];
+                for j in 0..dim {
+                    direction[j * dim + i] = -direction[j * dim + i];
+                }
+            }
+        }
+        image.set_spacing(&spacing)?;
+        image.set_direction(&direction)?;
+    }
+    Ok(())
+}
+
+/// Space-separated shortest-round-trip decimals, the string form the reader
+/// stores the `ITK_original_*` geometry under.
+fn join_f64(values: &[f64]) -> String {
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `extractor->GetOutput()->SetMetaDataDictionary(itkImage->GetMetaDataDictionary())`
 /// (sitkImageFileReader.cxx:453).
 fn copy_metadata(from: &Image, mut to: Image) -> Image {
@@ -375,4 +456,87 @@ fn gather(
         PixelBuffer::Float32(v) => pick!(v, Float32),
         PixelBuffer::Float64(v) => pick!(v, Float64),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An image with a raw (possibly negative) spacing, as an `ImageIo` would
+    /// hand one back before the reader normalizes it. `Image::set_spacing`
+    /// rejects a non-positive spacing, so `from_parts` is the only way to build
+    /// the pre-normalization state — exactly the seam the reader closes.
+    fn raw_2x2(spacing: &[f64], direction: &[f64]) -> Image {
+        Image::from_parts(
+            PixelBuffer::UInt8(vec![1, 2, 3, 4]),
+            vec![2, 2],
+            spacing.to_vec(),
+            vec![0.0, 0.0],
+            direction.to_vec(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn negative_spacing_flips_positive_and_negates_the_direction_column() {
+        let mut image = raw_2x2(&[2.0, -3.0], &[1.0, 0.0, 0.0, 1.0]);
+        normalize_reader_geometry(&mut image).unwrap();
+
+        // Axis 1 flipped: spacing positive, its direction *column* negated.
+        assert_eq!(image.spacing(), &[2.0, 3.0]);
+        assert_eq!(image.direction(), &[1.0, 0.0, 0.0, -1.0]);
+        // The raw values are recorded, sign intact.
+        assert_eq!(image.meta_data("ITK_original_spacing"), Some("2 -3"));
+        assert_eq!(image.meta_data("ITK_original_direction"), Some("1 0 0 1"));
+    }
+
+    #[test]
+    fn the_flipped_axis_is_a_column_not_a_row_of_the_direction() {
+        // A 90° rotation: column 1 is (row0=-1, row1=0). Flipping axis 1 must
+        // negate that whole column, not the row that starts at index 1.
+        let mut image = raw_2x2(&[1.0, -1.0], &[0.0, -1.0, 1.0, 0.0]);
+        normalize_reader_geometry(&mut image).unwrap();
+
+        assert_eq!(image.spacing(), &[1.0, 1.0]);
+        assert_eq!(image.direction(), &[0.0, 1.0, 1.0, 0.0]);
+        assert_eq!(image.meta_data("ITK_original_direction"), Some("0 -1 1 0"));
+    }
+
+    #[test]
+    fn positive_spacing_records_the_originals_without_flipping() {
+        let dir = [0.0, -1.0, 1.0, 0.0];
+        let mut image = raw_2x2(&[0.5, 1.5], &dir);
+        normalize_reader_geometry(&mut image).unwrap();
+
+        // Nothing flips, but the originals are recorded unconditionally.
+        assert_eq!(image.spacing(), &[0.5, 1.5]);
+        assert_eq!(image.direction(), &dir);
+        assert_eq!(image.meta_data("ITK_original_spacing"), Some("0.5 1.5"));
+        assert_eq!(image.meta_data("ITK_original_direction"), Some("0 -1 1 0"));
+    }
+
+    #[test]
+    fn each_negative_axis_flips_its_own_column_independently() {
+        let mut image = Image::from_parts(
+            PixelBuffer::UInt8((0..8).collect()),
+            vec![2, 2, 2],
+            vec![-1.0, 2.0, -3.0],
+            vec![0.0, 0.0, 0.0],
+            matrix::identity(3),
+        )
+        .unwrap();
+        normalize_reader_geometry(&mut image).unwrap();
+
+        assert_eq!(image.spacing(), &[1.0, 2.0, 3.0]);
+        // Columns 0 and 2 negated, column 1 untouched.
+        assert_eq!(
+            image.direction(),
+            &[-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0]
+        );
+        assert_eq!(image.meta_data("ITK_original_spacing"), Some("-1 2 -3"));
+        assert_eq!(
+            image.meta_data("ITK_original_direction"),
+            Some("1 0 0 0 1 0 0 0 1")
+        );
+    }
 }
