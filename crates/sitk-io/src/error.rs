@@ -235,6 +235,19 @@ pub enum IoError {
     #[error("read transform file {0}, but there appears to be no transform in the file")]
     NoTransformInFile(PathBuf),
 
+    /// The transform file holds more than one top-level transform, none of
+    /// which is a leading `CompositeTransform` that would absorb the rest.
+    /// `itk::simple::ReadTransform` returns `list->front()` and merely warns
+    /// through an off-by-default channel (sitkTransform.cxx:683-693), silently
+    /// dropping the remaining transforms — the `usize` here — and SimpleITK
+    /// offers no `ReadTransformList` to reach them. This port refuses instead
+    /// of dropping them silently (ledger §3.30).
+    #[error(
+        "transform file {path} holds {count} transforms; ReadTransform returns a single \
+         transform and cannot represent the rest — wrap them in a leading CompositeTransform"
+    )]
+    MultipleTransformsInFile { path: PathBuf, count: usize },
+
     /// An `#Insight Transform File` line broke the format —
     /// e.g. `"Tags must be delimited by :"` (itkTxtTransformIO.cxx:152).
     #[error("malformed transform file: {0}")]

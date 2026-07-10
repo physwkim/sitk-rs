@@ -499,10 +499,12 @@ fn can_handle(path: &Path) -> bool {
 /// `.hdf5`), or a MATLAB one (`.mat`) — `itk::simple::ReadTransform`
 /// (`sitkTransform.cxx:668-723`).
 ///
-/// A file may hold several transforms; as upstream, only the first is returned
-/// (SimpleITK prints a warning here, which this port has no channel for —
-/// ledger §3.30). A `CompositeTransform` at the head of the file absorbs the
-/// rest and is returned whole.
+/// A `CompositeTransform` at the head of the file absorbs every following
+/// transform and is returned whole. A file that holds several transforms with
+/// no such leading composite is [`IoError::MultipleTransformsInFile`]: upstream
+/// returns `list->front()` and drops the rest behind an off-by-default warning
+/// (sitkTransform.cxx:683-693), which this port has no channel for, so it
+/// refuses rather than dropping them silently (ledger §3.30).
 ///
 /// Only 2D and 3D transforms are supported, matching `ReadTransform`'s final
 /// `sitkExceptionMacro`.
@@ -517,6 +519,15 @@ fn can_handle(path: &Path) -> bool {
 pub fn read_transform<P: AsRef<Path>>(path: P) -> Result<Transform> {
     let path = path.as_ref();
     let list = read_and_fold(path, 0)?;
+    // A leading CompositeTransform has already folded the rest into itself, so
+    // more than one transform here means transforms unreachable through this
+    // single-Transform API. Refuse rather than drop them silently — §3.30.
+    if list.len() > 1 {
+        return Err(IoError::MultipleTransformsInFile {
+            path: path.to_path_buf(),
+            count: list.len(),
+        });
+    }
     let transform = list.into_iter().next().expect("read_and_fold is non-empty");
     match transform.dimension() {
         2 | 3 => Ok(transform),
@@ -866,6 +877,63 @@ mod tests {
              FixedParameters: 0.5 0.5\n"
         );
         assert_eq!(read, transform);
+    }
+
+    /// §3.30: a file holding several transforms with no leading composite is
+    /// refused, not silently truncated to its first transform. Upstream returns
+    /// `list->front()` behind an off-by-default warning; this port has no such
+    /// channel, so it errors and names the count it cannot represent.
+    #[test]
+    fn multiple_top_level_transforms_are_refused_not_silently_dropped() {
+        let path = tmp_path("multi_transform.tfm");
+        std::fs::write(
+            &path,
+            "#Insight Transform File V1.0\n\
+             Transform: TranslationTransform_double_2_2\n\
+             Parameters: 1 2\n\
+             FixedParameters: \n\
+             Transform: TranslationTransform_double_2_2\n\
+             Parameters: 3 4\n\
+             FixedParameters: \n",
+        )
+        .unwrap();
+
+        let result = read_transform(&path);
+        let _ = std::fs::remove_file(&path);
+
+        match result {
+            Err(IoError::MultipleTransformsInFile { count, .. }) => assert_eq!(count, 2),
+            other => panic!("expected MultipleTransformsInFile, got {other:?}"),
+        }
+    }
+
+    /// The same two transforms, wrapped in a leading `CompositeTransform`, fold
+    /// into it and read back as one — the supported way to carry several.
+    #[test]
+    fn a_leading_composite_folds_the_following_transforms() {
+        let path = tmp_path("multi_transform_composite.tfm");
+        std::fs::write(
+            &path,
+            "#Insight Transform File V1.0\n\
+             Transform: CompositeTransform_double_2_2\n\
+             Transform: TranslationTransform_double_2_2\n\
+             Parameters: 1 2\n\
+             FixedParameters: \n\
+             Transform: TranslationTransform_double_2_2\n\
+             Parameters: 3 4\n\
+             FixedParameters: \n",
+        )
+        .unwrap();
+
+        let read = read_transform(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let Transform::Composite(composite) = read else {
+            panic!("expected a composite transform");
+        };
+        assert_eq!(composite.transforms().len(), 2);
+        assert_eq!(composite.transforms()[0].parameters(), vec![1.0, 2.0]);
+        assert_eq!(composite.transforms()[1].parameters(), vec![3.0, 4.0]);
     }
 
     #[test]
