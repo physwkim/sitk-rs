@@ -181,6 +181,31 @@ pub enum RegistrationError {
         image: Vec<usize>,
     },
 
+    /// The per-level B-spline mesh scale-factor list set by
+    /// [`set_initial_transform_as_bspline`] does not have exactly one entry per
+    /// resolution level. Upstream (`SetInitialTransformAsBSpline`) silently skips
+    /// a level with no factor and drops factors past the last level; this port
+    /// requires the list length to match the number of levels so the caller's
+    /// per-level intent is unambiguous (ledger §2.146). An empty list is still
+    /// valid and means "run no B-spline mesh adaptation".
+    ///
+    /// [`set_initial_transform_as_bspline`]:
+    /// crate::ImageRegistrationMethod::set_initial_transform_as_bspline
+    #[error("B-spline scale-factor count {got} != number of resolution levels {expected}")]
+    BSplineScaleFactorLength { got: usize, expected: usize },
+
+    /// The per-level B-spline mesh scale-factor list set by
+    /// [`set_initial_transform_as_bspline`] contains an entry below `1` at
+    /// `level`. Upstream treats a zero (or otherwise `< 1`) factor as a null
+    /// adaptor and silently leaves that level's mesh unadapted; this port rejects
+    /// it, since a factor is documented to *multiply* the initial mesh size and a
+    /// value below `1` cannot express any mesh (ledger §2.146).
+    ///
+    /// [`set_initial_transform_as_bspline`]:
+    /// crate::ImageRegistrationMethod::set_initial_transform_as_bspline
+    #[error("B-spline scale factor at level {level} is {factor}, must be at least 1")]
+    BSplineScaleFactorTooSmall { level: usize, factor: usize },
+
     /// `BSplineTransformInitializerFilter::execute` was asked for a B-spline
     /// order other than 3 (cubic) — the only order
     /// [`sitk_transform::BSplineTransform`] implements. SimpleITK's own

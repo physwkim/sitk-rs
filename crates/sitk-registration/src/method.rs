@@ -1492,7 +1492,15 @@ impl ImageRegistrationMethod {
     /// and never raises: a level with no entry, or an entry of `0`, gets **no
     /// adaptor** and keeps the mesh it already has (`if (scaleFactor < 1) return
     /// nullptr`, `:43-46`), while entries past the last level are ignored (ledger
-    /// §2.146). This port does the same.
+    /// §2.146). **This port instead validates the list at
+    /// [`execute_with_initial_transform`](Self::execute_with_initial_transform)
+    /// time**, so the caller's per-level intent is unambiguous: a non-empty list
+    /// must have exactly one entry per resolution level
+    /// ([`RegistrationError::BSplineScaleFactorLength`]) and every entry must be
+    /// at least `1` ([`RegistrationError::BSplineScaleFactorTooSmall`]). An empty
+    /// list — the default, and what the other initial-transform setters leave
+    /// behind — is still valid and runs no adaptation. The *mesh-absolute*
+    /// meaning of each factor (multiplying the initial mesh, above) is unchanged.
     ///
     /// The adaptation only runs through
     /// [`execute_with_initial_transform`](Self::execute_with_initial_transform),
@@ -1953,6 +1961,26 @@ impl ImageRegistrationMethod {
         // *initial* transform's mesh size, so the factors are absolute rather
         // than cumulative (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:147,62-68`).
         let scale_factors = self.bspline_scale_factors.clone();
+
+        // A non-empty scale-factor list must have exactly one entry per
+        // resolution level, and every entry must be at least 1. Upstream
+        // silently skips a level with no factor and treats a `< 1` factor as a
+        // null adaptor; this port rejects both so the caller's per-level intent
+        // is unambiguous (ledger §2.146). An empty list runs no adaptation.
+        if !scale_factors.is_empty() {
+            let num_levels = self.level_schedule(fixed)?.len();
+            if scale_factors.len() != num_levels {
+                return Err(RegistrationError::BSplineScaleFactorLength {
+                    got: scale_factors.len(),
+                    expected: num_levels,
+                });
+            }
+            if let Some((level, &factor)) = scale_factors.iter().enumerate().find(|&(_, &f)| f < 1)
+            {
+                return Err(RegistrationError::BSplineScaleFactorTooSmall { level, factor });
+            }
+        }
+
         let initial_mesh = match &initial {
             Transform::BSpline(b) => Some(b.transform_domain_mesh_size()),
             _ => None,
@@ -1961,7 +1989,9 @@ impl ImageRegistrationMethod {
             let (Some(mesh), Transform::BSpline(bspline)) = (&initial_mesh, transform) else {
                 return Ok(());
             };
-            // No entry for this level, or a factor of zero, means no adaptor.
+            // Validation above guarantees a non-empty list has one `>= 1` entry
+            // per level; the only way to reach the skip is an empty list, which
+            // means no B-spline adaptation at all.
             let scale = scale_factors.get(level).copied().unwrap_or(0);
             if scale < 1 {
                 return Ok(());
@@ -3942,19 +3972,18 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_or_missing_bspline_scale_factor_leaves_the_level_unadapted() {
-        // `if (scaleFactor < 1) { return nullptr; }`
-        // (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:43-46`) and
-        // the `m_TransformBSplineScaleFactors.size() > level` guard (`:169-172`,
-        // which leaves `bsplineScaleFactor = 0`) both yield a null adaptor: that
-        // level keeps whatever grid the transform already has. Neither a short
-        // factor list nor a zero entry is an error (ledger §2.146).
+    fn a_zero_or_short_bspline_scale_factor_list_is_rejected() {
+        // Upstream silently turns a `< 1` factor or a missing level into a null
+        // adaptor (`if (scaleFactor < 1) return nullptr`,
+        // `sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:43-46`, plus
+        // the `m_TransformBSplineScaleFactors.size() > level` guard `:169-172`),
+        // silently leaving that level's mesh unadapted. This port rejects both so
+        // the caller's per-level intent is unambiguous (ledger §2.146). The
+        // mesh-absolute meaning of a valid factor is unchanged.
         let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
         let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
 
-        // Factor 0 at level 0: the level runs on the untouched [2,2] mesh whose
-        // grid came from `from_image_domain` (physical dimensions 16, not 15).
-        // Level 1 then adapts to 2·[2,2].
+        // Factor 0 at level 0 is rejected — it cannot express a mesh.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
@@ -3963,14 +3992,22 @@ mod tests {
                 true,
                 vec![0, 2],
             );
-        let zeroed = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
-        assert_eq!(as_bspline(&zeroed.transform).grid_size(), [7, 7]);
-        assert_eq!(as_bspline(&zeroed.transform).grid_spacing(), [3.75, 3.75]);
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorTooSmall {
+                    level: 0,
+                    factor: 0
+                }
+            ),
+            "unexpected error {err:?}"
+        );
 
-        // Only one factor for two levels: level 1 has no adaptor, so the result
-        // keeps level 0's grid — built from the *shrunk* fixed image's origin
-        // 0.5 and physical dimensions 15, giving spacing 15/6 and origin
-        // 0.5 − 2.5 = −2.0.
+        // Only one factor for two levels is rejected — the second level would be
+        // silently unadapted upstream.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
@@ -3979,16 +4016,46 @@ mod tests {
                 true,
                 vec![3],
             );
-        let short = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
-        assert_eq!(
-            as_bspline(&short.transform).transform_domain_mesh_size(),
-            [6, 6]
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorLength {
+                    got: 1,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
         );
-        assert_eq!(as_bspline(&short.transform).grid_spacing(), [2.5, 2.5]);
-        assert_eq!(as_bspline(&short.transform).grid_origin(), [-2.0, -2.0]);
+
+        // Too many factors for the level count is likewise rejected, where
+        // upstream would silently drop the extras.
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![1, 2, 4],
+            );
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorLength {
+                    got: 3,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
+        );
 
         // An empty factor list — what `set_initial_transform` leaves behind —
-        // adapts no level at all.
+        // remains valid and adapts no level at all.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
