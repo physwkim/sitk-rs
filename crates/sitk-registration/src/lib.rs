@@ -120,6 +120,7 @@ pub mod bspline_initializer;
 pub mod convergence;
 pub mod correlation;
 pub mod demons;
+mod eigen;
 pub mod error;
 pub mod gradient_free;
 pub mod initializer;
