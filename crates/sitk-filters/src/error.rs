@@ -736,6 +736,21 @@ pub enum FilterError {
     #[error("objectness_measure supports 2-D and 3-D images only, got {0}-D")]
     UnsupportedObjectnessDimension(usize),
 
+    /// [`crate::sources::grid_source`]: `GridImageSource::BeforeThreadedGenerateData`
+    /// builds each axis's response with every *other* index held at `0`
+    /// (`itkGridImageSource.hxx:60-81`), which only reduces to the correct
+    /// physical point when `direction`'s off-diagonal entries are all zero —
+    /// upstream's per-axis `PixelArrays` are documented as "an internal
+    /// variable to speed up the calculation of pixel values"
+    /// (`itkGridImageSource.h:141`), i.e. an intentional separable-axis
+    /// optimization, not a general one. Rather than silently producing an
+    /// axis-aligned pattern for a caller's rotated or sheared `direction`,
+    /// this port rejects it outright.
+    #[error(
+        "grid_source requires a diagonal direction matrix (its separable per-axis algorithm cannot honor off-diagonal direction terms)"
+    )]
+    NonDiagonalGridDirection,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
