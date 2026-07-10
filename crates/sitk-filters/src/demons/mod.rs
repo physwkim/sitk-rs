@@ -118,6 +118,7 @@ mod fast_symmetric;
 mod field;
 mod geometry;
 mod image_function;
+mod level_set_motion;
 mod symmetric;
 
 use sitk_core::Image;
@@ -132,6 +133,7 @@ pub use esm::EsmGradient;
 pub use fast_symmetric::{
     FastSymmetricForcesDemonsParams, fast_symmetric_forces_demons_registration,
 };
+pub use level_set_motion::{LevelSetMotionParams, level_set_motion_registration};
 pub use symmetric::{SymmetricForcesDemonsParams, symmetric_forces_demons_registration};
 
 /// The yaml's parameter surface. [`Default`] carries the yaml defaults.

@@ -141,8 +141,9 @@ pub use convolution::{
 };
 pub use demons::{
     DemonsParams, DemonsResult, DiffeomorphicDemonsParams, EsmGradient,
-    FastSymmetricForcesDemonsParams, SymmetricForcesDemonsParams, demons_registration,
-    diffeomorphic_demons_registration, fast_symmetric_forces_demons_registration,
+    FastSymmetricForcesDemonsParams, LevelSetMotionParams, SymmetricForcesDemonsParams,
+    demons_registration, diffeomorphic_demons_registration,
+    fast_symmetric_forces_demons_registration, level_set_motion_registration,
     symmetric_forces_demons_registration,
 };
 pub use denoise::{
