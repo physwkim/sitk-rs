@@ -44,10 +44,25 @@
 //! `q_i = NaN`; the `NaN` then floods the output `W` through the M-step. A
 //! zero denominator means the rater faced no trials of that class, so this
 //! port takes the rate to be vacuously `1` (universal quantification over the
-//! empty set) at both sites — one uniform rule, not an asymmetric special
-//! case. Any finite value yields the identical, correct fused output (an
-//! all-background input makes the prior `g_t == 0`, which drives `W` to
-//! all-zeros regardless of `p`); `1` is the natural vacuous-truth choice.
+//! empty set) at both sites. `1` is correct at both, but the two sites justify
+//! it differently — only the `p`-side is value-independent:
+//!
+//! - **`p`-side (all-background, `p_denom == 0`) is value-independent.** An
+//!   all-background seed makes the prior `g_t == 0`, and the M-step
+//!   `W = g_t·α / (g_t·α + (1−g_t)·β)` then zeros the numerator, so `W == 0`
+//!   *regardless of `p`*. Any finite sensitivity yields the identical (correct
+//!   all-zeros) fused output; `1` is merely the natural vacuous-truth choice.
+//! - **`q`-side (all-foreground, `q_denom == 0`) needs `1` specifically.** An
+//!   all-foreground seed makes `g_t == confidence_weight`, not `0`. In the
+//!   M-step every rater is foreground, so `β = Π(1 − q_i)`, and only `q_i == 1`
+//!   drives `β` to `0` and forces the correct fused output `W == 1`. When
+//!   `confidence_weight != 1` (so `g_t != 1`) a *different* finite specificity
+//!   leaks the `(1 − g_t)·β` term and changes `W` — e.g. `confidence_weight =
+//!   0.5`, one rater: `q_i = 1` gives `W = 1`, but `q_i = 0.5` gives
+//!   `W = 0.5 / (0.5 + 0.5·0.5) = 0.667`. So on the `q`-side `1` is the unique
+//!   vacuous-specificity value that yields the correct all-foreground fusion,
+//!   not an interchangeable finite choice. (Only when `confidence_weight == 1`,
+//!   `g_t == 1`, does the `q`-side also become value-independent.)
 //!
 //! ## `label_voting`
 //!
@@ -301,8 +316,12 @@ pub fn staple(
             // (all-background empties `p_denom`, all-foreground empties
             // `q_denom`). The rate is then vacuously 1 — universal
             // quantification over the empty set — rather than upstream's
-            // unguarded `0/0 = NaN` (§1.11). Any finite value gives the
-            // identical fused `W`; `1` is the uniform choice for both duals.
+            // unguarded `0/0 = NaN` (§1.11). `1` is correct at both duals but
+            // for different reasons (see the module doc): the `p`-side is
+            // value-independent (the prior `g_t == 0` zeros the M-step
+            // numerator), whereas on the `q`-side `1` is the *unique*
+            // specificity that yields the correct fused `W` unless
+            // `confidence_weight == 1`.
             p[i] = if p_denom == 0.0 { 1.0 } else { p_num / p_denom };
             q[i] = if q_denom == 0.0 { 1.0 } else { q_num / q_denom };
         }
