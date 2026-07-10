@@ -106,7 +106,7 @@ use sitk_transform::interpolator::{physical_to_index_matrix, strides};
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{FixedSamples, MetricValue, MovingImage, local_support_block};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Per-point windowed statistics: the local correlation and (when defined)
 /// the ANTs windowed-center derivative contribution `derivWRTImage`, in
@@ -325,14 +325,14 @@ impl AntsNeighborhoodCorrelationMetric {
         self.radius
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform`
-    /// over this metric's fixed sample points (shared with every metric in
-    /// this crate).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (shared with every metric in this crate).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// Linear index into `raster` for sample `s`'s precomputed grid position.
@@ -802,7 +802,7 @@ mod tests {
         // against this metric to confirm the derivative is at least a usable
         // descent direction end-to-end, not merely locally FD-consistent. The
         // learning rate is estimated once from the initial gradient via
-        // `physical_shift_scales` (ITK's `EstimateLearningRate::Once`) rather
+        // `scales_estimator` (ITK's `EstimateLearningRate::Once`) rather
         // than hand-picked: this metric's raw derivative magnitude (unlike
         // mean-squares/Mattes) is not O(1) — see the module docs — so a fixed
         // guessed rate is not a reliable way to drive it.
@@ -815,7 +815,7 @@ mod tests {
         let metric = AntsNeighborhoodCorrelationMetric::new(&fixed, &moving, 2).unwrap();
         let start = vec![0.0f64, 0.0];
         let start_transform = TranslationTransform::new(start.clone());
-        let estimator = metric.physical_shift_scales(&start_transform);
+        let estimator = metric.scales_estimator(&start_transform, ScalesEstimatorKind::default());
         let scales = estimator.estimate_scales();
         let scaled =
             |grad: &[f64]| -> Vec<f64> { grad.iter().zip(&scales).map(|(&g, &s)| g / s).collect() };

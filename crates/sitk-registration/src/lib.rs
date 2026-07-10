@@ -20,10 +20,12 @@
 //! [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information).
 //!
 //! Optimizer scales and the learning rate are **estimated automatically** from
-//! physical shift ([`PhysicalShiftScales`], ITK's
+//! physical shift ([`ScalesEstimator`], ITK's
 //! `RegistrationParameterScalesFromPhysicalShift` +
 //! `GradientDescentOptimizerv4` learning-rate estimation), so no hand-tuning is
-//! required:
+//! required. The Jacobian and index-shift estimators are available too, via
+//! [`ImageRegistrationMethod::set_optimizer_scales_from_jacobian`] and
+//! [`ImageRegistrationMethod::set_optimizer_scales_from_index_shift`]:
 //!
 //! ```
 //! use sitk_core::Image;
@@ -113,7 +115,7 @@
 //!
 //! [`AffineTransform`]: sitk_transform::AffineTransform
 //! [`TranslationTransform`]: sitk_transform::TranslationTransform
-//! [`PhysicalShiftScales`]: crate::PhysicalShiftScales
+//! [`ScalesEstimator`]: crate::ScalesEstimator
 
 pub mod ants_correlation;
 pub mod bspline_initializer;
@@ -158,4 +160,7 @@ pub use optimizer::{
     GradientDescentOptimizer, Objective, OptimizerResult, RegularStepGradientDescentOptimizer,
     StopReason,
 };
-pub use scales::PhysicalShiftScales;
+pub use scales::{
+    DEFAULT_CENTRAL_REGION_RADIUS, DEFAULT_SMALL_PARAMETER_VARIATION, ScalesEstimator,
+    ScalesEstimatorKind, VirtualGrid,
+};

@@ -110,7 +110,7 @@ use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{FixedSamples, MetricValue, MovingImage, local_support_block};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Threshold below which the denominator `|∇|² + (F−M)²/normalizer` is treated
 /// as degenerate. ITK: `m_DenominatorThreshold`, fixed at this value in the
@@ -241,14 +241,15 @@ impl DemonsMetric {
         DENOMINATOR_THRESHOLD
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform`
-    /// over this metric's fixed sample points (shared with the mean-squares
-    /// and Mattes metrics).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (shared with the mean-squares and Mattes
+    /// metrics).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// Check that `transform` can be used with this metric: Demons requires a

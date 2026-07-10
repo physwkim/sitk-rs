@@ -21,6 +21,12 @@ pub enum RegistrationError {
     #[error("optimizer scales length {got} != number of parameters {expected}")]
     ScalesLength { got: usize, expected: usize },
 
+    /// Optimizer weights were supplied with a length other than the transform's
+    /// *local* parameter count. The message is ITK's
+    /// (`itkObjectToObjectOptimizerBase.cxx:149-150`).
+    #[error("Size of weights ({got}) must equal number of local parameters ({expected}).")]
+    OptimizerWeightsLength { got: usize, expected: usize },
+
     /// No sampled fixed point mapped inside the moving image, so the metric is
     /// undefined. Usually means the initial transform is far off.
     #[error("no valid sample points: every fixed point mapped outside the moving image")]

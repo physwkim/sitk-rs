@@ -54,7 +54,7 @@ use sitk_transform::interpolator::{
 };
 
 use crate::error::{RegistrationError, Result};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind, VirtualGrid};
 
 /// Fixed-image sampling strategy for the registration virtual domain
 /// (`itk::ImageRegistrationMethodv4::MetricSamplingStrategyEnum` / SimpleITK's
@@ -74,12 +74,15 @@ pub enum SamplingStrategy {
 /// domain) for reproducible [`SamplingStrategy::Random`] sampling. Not
 /// bit-parity with ITK's Mersenne Twister — the task only requires
 /// reproducibility for a fixed seed, not ITK-identical draws.
-struct SplitMix64 {
+///
+/// Shared with [`crate::scales`], whose `Sampling::Random` strategy stands in
+/// for ITK's `ImageRandomConstIteratorWithIndex` for the same reason.
+pub(crate) struct SplitMix64 {
     state: u64,
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
@@ -92,7 +95,7 @@ impl SplitMix64 {
     }
 
     /// A uniform index in `[0, n)`. `n` must be nonzero.
-    fn next_below(&mut self, n: usize) -> usize {
+    pub(crate) fn next_below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
 }
@@ -132,6 +135,15 @@ pub struct FixedSamples {
     pub(crate) points: Vec<f64>,
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
+    /// The virtual domain as a grid. The metric never reads it — only the
+    /// parameter-scales estimator does, because ITK's estimator draws its own
+    /// sample points from the virtual domain rather than reusing the metric's
+    /// [`points`](Self::points) (see [`crate::scales`]). Keeping the geometry
+    /// rather than the points is what lets the estimator honor its own
+    /// sampling strategy, its own `central_region_radius`, and ITK's rule that
+    /// neither the metric's sampling percentage nor its fixed mask narrows the
+    /// scale estimate.
+    grid: VirtualGrid,
 }
 
 impl FixedSamples {
@@ -173,6 +185,7 @@ impl FixedSamples {
             values,
             points,
             min_spacing,
+            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
         })
     }
 
@@ -281,6 +294,7 @@ impl FixedSamples {
             values,
             points,
             min_spacing,
+            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
         })
     }
 
@@ -312,14 +326,26 @@ impl FixedSamples {
         }
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform` over
-    /// these fixed sample points (shared by every metric). See
-    /// [`PhysicalShiftScales`].
-    pub(crate) fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's **virtual domain** (shared by every metric). See
+    /// [`ScalesEstimator`].
+    ///
+    /// `moving` supplies the physical-to-continuous-index matrix
+    /// [`ScalesEstimatorKind::IndexShift`] measures its shifts in; the other
+    /// two kinds ignore it.
+    pub(crate) fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        PhysicalShiftScales::new(&self.points, self.dim, transform, self.min_spacing)
+        moving: &MovingImage,
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        ScalesEstimator::new(
+            &self.grid,
+            transform,
+            &moving.phys_to_index,
+            self.min_spacing,
+            kind,
+        )
     }
 }
 
@@ -817,14 +843,15 @@ impl MeanSquaresMetric {
         self.fixed.len()
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform`
-    /// over this metric's fixed sample points (ITK
-    /// `RegistrationParameterScalesFromPhysicalShift`).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (ITK's
+    /// `RegistrationParameterScalesEstimator` hierarchy).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// Evaluate value + derivative for `transform` using `backend`.
