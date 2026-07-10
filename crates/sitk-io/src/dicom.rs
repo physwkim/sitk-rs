@@ -2380,3 +2380,596 @@ pub fn read(path: &Path) -> Result<Image> {
     }
     Ok(image)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // --- Byte-level DICOM fixture builder (Explicit VR Little Endian) --------
+
+    /// VRs encoded with a 2-byte reserved field and a 32-bit length.
+    fn is_long_vr(vr: &[u8; 2]) -> bool {
+        matches!(
+            vr,
+            b"OB" | b"OW" | b"OF" | b"OD" | b"OL" | b"OV" | b"SQ" | b"UC" | b"UR" | b"UT" | b"UN"
+        )
+    }
+
+    /// One Explicit VR Little Endian data element, value auto-padded to even
+    /// length (`\0` for UI/binary, space for text).
+    fn elem(group: u16, element: u16, vr: &[u8; 2], value: &[u8]) -> Vec<u8> {
+        let mut v = value.to_vec();
+        if v.len() % 2 == 1 {
+            v.push(if matches!(vr, b"UI" | b"OB" | b"OW" | b"UN") {
+                0x00
+            } else {
+                b' '
+            });
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&element.to_le_bytes());
+        out.extend_from_slice(vr);
+        if is_long_vr(vr) {
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        } else {
+            out.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        }
+        out.extend_from_slice(&v);
+        out
+    }
+
+    fn us(v: u16) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    /// The (0002) file-meta group with its computed group length.
+    fn meta_group(ts: &str, sop_class: &str) -> Vec<u8> {
+        let mut g = Vec::new();
+        g.extend(elem(0x0002, 0x0001, b"OB", &[0x00, 0x01]));
+        g.extend(elem(0x0002, 0x0002, b"UI", sop_class.as_bytes()));
+        g.extend(elem(0x0002, 0x0003, b"UI", b"1.2.3.4.5"));
+        g.extend(elem(0x0002, 0x0010, b"UI", ts.as_bytes()));
+        let mut out = elem(0x0002, 0x0000, b"UL", &(g.len() as u32).to_le_bytes());
+        out.extend(g);
+        out
+    }
+
+    /// A full file: 128-byte preamble, `DICM`, meta group, then the dataset.
+    fn dicom_file(ts: &str, sop_class: &str, dataset: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 128];
+        f.extend_from_slice(b"DICM");
+        f.extend(meta_group(ts, sop_class));
+        f.extend_from_slice(dataset);
+        f
+    }
+
+    fn write_temp(bytes: &[u8], name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("sitk_dicom_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        path
+    }
+
+    const EVR_LE: &str = "1.2.840.10008.1.2.1";
+    const CT: &str = "1.2.840.10008.5.1.4.1.1.2";
+    const SC: &str = "1.2.840.10008.5.1.4.1.1.7";
+    const ENHANCED_CT: &str = "1.2.840.10008.5.1.4.1.1.2.1";
+    const JPEG_BASELINE: &str = "1.2.840.10008.1.2.4.50";
+
+    /// A grayscale 16-bit CT slice: `cols`×`rows`, MONOCHROME2, the given pixel
+    /// words, Pixel Spacing `0.5\0.75`, position `1\2\3`, slice spacing `2.5`.
+    fn ct_dataset(cols: u16, rows: u16, pixels: &[u16]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0008, 0x0060, b"CS", b"CT"));
+        d.extend(elem(0x0018, 0x0088, b"DS", b"2.5"));
+        d.extend(elem(0x0020, 0x0032, b"DS", b"1\\2\\3"));
+        d.extend(elem(0x0020, 0x0037, b"DS", b"1\\0\\0\\0\\1\\0"));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(rows)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(cols)));
+        d.extend(elem(0x0028, 0x0030, b"DS", b"0.5\\0.75"));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(15)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        let mut pd = Vec::new();
+        for &p in pixels {
+            pd.extend_from_slice(&p.to_le_bytes());
+        }
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &pd));
+        d
+    }
+
+    #[test]
+    fn read_information_ct_slice_is_three_dimensional() {
+        let bytes = dicom_file(EVR_LE, CT, &ct_dataset(4, 2, &[0; 8]));
+        let path = write_temp(&bytes, "ct_info.dcm");
+        let info = read_information(&path).unwrap();
+
+        assert_eq!(info.dimension, 3, "GDCMImageIO forces 3 dimensions");
+        assert_eq!(info.size, vec![4, 2, 1]);
+        assert_eq!(info.pixel_id, PixelId::UInt16);
+        assert_eq!(info.number_of_components, 1);
+        // Pixel Spacing 0.5\0.75 is stored row\column and swapped to column\row.
+        assert_eq!(info.spacing, vec![0.75, 0.5, 2.5]);
+        assert_eq!(info.origin, vec![1.0, 2.0, 3.0]);
+        assert_eq!(
+            info.direction,
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn read_information_multiframe_sets_depth() {
+        let mut d = ct_dataset(2, 2, &[0; 12]);
+        // Re-declare with NumberOfFrames = 3 and 3 frames of pixel data.
+        d = {
+            let mut nd = Vec::new();
+            nd.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+            nd.extend(elem(0x0028, 0x0008, b"IS", b"3"));
+            nd.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+            nd.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+            nd.extend(elem(0x0028, 0x0010, b"US", &us(2)));
+            nd.extend(elem(0x0028, 0x0011, b"US", &us(2)));
+            nd.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+            nd.extend(elem(0x0028, 0x0101, b"US", &us(16)));
+            nd.extend(elem(0x0028, 0x0102, b"US", &us(15)));
+            nd.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+            let mut pd = Vec::new();
+            for _ in 0..12 {
+                pd.extend_from_slice(&0u16.to_le_bytes());
+            }
+            nd.extend(elem(0x7fe0, 0x0010, b"OW", &pd));
+            let _ = &d;
+            nd
+        };
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "ct_multiframe.dcm");
+        let info = read_information(&path).unwrap();
+        assert_eq!(info.size, vec![2, 2, 3]);
+    }
+
+    #[test]
+    fn read_ct_pixels_verbatim_without_rescale() {
+        let pixels: Vec<u16> = vec![100, 200, 300, 400];
+        let bytes = dicom_file(EVR_LE, CT, &ct_dataset(2, 2, &pixels));
+        let path = write_temp(&bytes, "ct_pixels.dcm");
+        let image = read(&path).unwrap();
+        match image.buffer() {
+            PixelBuffer::UInt16(v) => assert_eq!(v, &pixels),
+            other => panic!("expected UInt16 buffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rescale_promotes_component_type_and_applies() {
+        // Bits Stored 12, unsigned; intercept -1024 pushes the range negative,
+        // so ComputeBestFit lands on Int16.
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(2)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(12)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(11)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x0028, 0x1052, b"DS", b"-1024"));
+        d.extend(elem(0x0028, 0x1053, b"DS", b"1"));
+        let mut pd = Vec::new();
+        pd.extend_from_slice(&1024u16.to_le_bytes());
+        pd.extend_from_slice(&2000u16.to_le_bytes());
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &pd));
+
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "ct_rescale.dcm");
+
+        let info = read_information(&path).unwrap();
+        assert_eq!(info.pixel_id, PixelId::Int16);
+
+        let image = read(&path).unwrap();
+        match image.buffer() {
+            PixelBuffer::Int16(v) => assert_eq!(v, &vec![0i16, 976i16]),
+            other => panic!("expected Int16 buffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monochrome1_eight_bit_is_inverted() {
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME1"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(2)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(7)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OB", &[10, 200]));
+
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "mono1.dcm");
+        let image = read(&path).unwrap();
+        match image.buffer() {
+            // 255 - value.
+            PixelBuffer::UInt8(v) => assert_eq!(v, &vec![245u8, 55u8]),
+            other => panic!("expected UInt8 buffer, got {other:?}"),
+        }
+    }
+
+    fn rgb_dataset(planar: u16, pixel_data: &[u8]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", SC.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(3)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"RGB"));
+        d.extend(elem(0x0028, 0x0006, b"US", &us(planar)));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(2)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(7)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OB", pixel_data));
+        d
+    }
+
+    #[test]
+    fn rgb_interleaved_loads_as_vector() {
+        // 2×1 RGB, planar 0: [R0,G0,B0, R1,G1,B1].
+        let bytes = dicom_file(EVR_LE, SC, &rgb_dataset(0, &[10, 20, 30, 40, 50, 60]));
+        let path = write_temp(&bytes, "rgb0.dcm");
+        let info = read_information(&path).unwrap();
+        assert_eq!(info.number_of_components, 3);
+        assert_eq!(info.pixel_id, PixelId::VectorUInt8);
+
+        let image = read(&path).unwrap();
+        assert_eq!(image.number_of_components_per_pixel(), 3);
+        match image.buffer() {
+            PixelBuffer::UInt8(v) => assert_eq!(v, &vec![10, 20, 30, 40, 50, 60]),
+            other => panic!("expected UInt8 buffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rgb_planar_configuration_one_is_deinterleaved() {
+        // Same pixels stored plane-by-plane: [R0,R1, G0,G1, B0,B1].
+        let bytes = dicom_file(EVR_LE, SC, &rgb_dataset(1, &[10, 40, 20, 50, 30, 60]));
+        let path = write_temp(&bytes, "rgb1.dcm");
+        let image = read(&path).unwrap();
+        match image.buffer() {
+            PixelBuffer::UInt8(v) => assert_eq!(v, &vec![10, 20, 30, 40, 50, 60]),
+            other => panic!("expected UInt8 buffer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_dictionary_keys_and_values() {
+        let mut d = ct_dataset(2, 1, &[0, 0]);
+        // Append a public OB element to exercise the base64 branch, and a
+        // multi-valued US to exercise StringFilter's backslash join.
+        d.extend(elem(0x0028, 0x2000, b"OB", &[1, 2, 3, 4])); // ICC Profile
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "meta.dcm");
+        let info = read_information(&path).unwrap();
+
+        // "gggg|eeee" lowercase keys. `StringFilter::ToString` truncates an
+        // ASCII value only at the first NUL, so the even-length space padding
+        // DICOM adds to odd-length values survives (gdcmStringFilter.cxx:418-421).
+        assert_eq!(
+            info.metadata.get("0028|0011").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            info.metadata.get("0028|0004").map(String::as_str),
+            Some("MONOCHROME2 ")
+        );
+        assert_eq!(
+            info.metadata.get("0020|0032").map(String::as_str),
+            Some("1\\2\\3 ")
+        );
+        // Binary VR → base64.
+        assert_eq!(
+            info.metadata.get("0028|2000").map(String::as_str),
+            Some("AQIDBA==")
+        );
+        // Pixel Data is never emitted.
+        assert!(!info.metadata.contains_key("7fe0|0010"));
+    }
+
+    #[test]
+    fn can_read_valid_file_and_rejects_garbage() {
+        let bytes = dicom_file(EVR_LE, CT, &ct_dataset(2, 1, &[0, 0]));
+        let path = write_temp(&bytes, "canread.dcm");
+        assert!(DicomImageIo.can_read_file(&path));
+
+        let junk = write_temp(&[0u8; 64], "junk.bin");
+        assert!(!DicomImageIo.can_read_file(&junk));
+    }
+
+    #[test]
+    fn encapsulated_transfer_syntax_is_refused() {
+        // A JPEG-baseline file with an encapsulated (undefined-length) Pixel Data.
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(7)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        // Pixel Data (7fe0,0010) OB, undefined length, one fragment.
+        d.extend_from_slice(&[0xe0, 0x7f, 0x10, 0x00]);
+        d.extend_from_slice(b"OB");
+        d.extend_from_slice(&[0, 0]);
+        d.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        // Basic offset table item, empty.
+        d.extend_from_slice(&[0xfe, 0xff, 0x00, 0xe0, 0, 0, 0, 0]);
+        // Fragment item, 2 bytes.
+        d.extend_from_slice(&[0xfe, 0xff, 0x00, 0xe0, 0x02, 0, 0, 0, 0xaa, 0xbb]);
+        // Sequence delimiter.
+        d.extend_from_slice(&[0xfe, 0xff, 0xdd, 0xe0, 0, 0, 0, 0]);
+
+        let bytes = dicom_file(JPEG_BASELINE, CT, &d);
+        let path = write_temp(&bytes, "jpeg.dcm");
+        assert!(matches!(
+            read_information(&path),
+            Err(IoError::UnsupportedDicomFeature(_))
+        ));
+    }
+
+    #[test]
+    fn sequence_driven_sop_class_is_refused() {
+        // The dataset's own SOP Class UID must name the enhanced class — it wins
+        // over the file-meta UID in `MediaStorage::SetFromFile`.
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", ENHANCED_CT.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(2)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(15)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &[0, 0, 0, 0]));
+
+        let bytes = dicom_file(EVR_LE, ENHANCED_CT, &d);
+        let path = write_temp(&bytes, "enhanced_ct.dcm");
+        assert!(matches!(
+            read_information(&path),
+            Err(IoError::UnsupportedDicomFeature(_))
+        ));
+    }
+
+    #[test]
+    fn z_spacing_tag_present_but_unparsable_is_refused() {
+        // A CT with (0018,0088) Spacing Between Slices present but non-numeric.
+        // GDCM's `el.Read` pushes nothing, leaving `sp` two long, then reads
+        // `sp[2]` out of bounds — no deterministic value to reproduce (§1.70).
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0018, 0x0088, b"DS", b"abc"));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(16)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(15)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &[0, 0]));
+
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "zspacing_unparsable.dcm");
+        assert!(matches!(
+            read_information(&path),
+            Err(IoError::MalformedDicom(_))
+        ));
+    }
+
+    #[test]
+    fn ultrasound_single_valued_pixel_spacing_is_refused() {
+        // UltrasoundImageStorage takes ITK's ultrasound spacing override, which
+        // asserts (0028,0030) has two values and reads both; a single value
+        // leaves the second slot uninitialised, so this port refuses (§1.71).
+        const US_STORAGE: &str = "1.2.840.10008.5.1.4.1.1.6.1";
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", US_STORAGE.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0030, b"DS", b"0.5"));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(8)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(7)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OW", &[0, 0]));
+
+        let bytes = dicom_file(EVR_LE, US_STORAGE, &d);
+        let path = write_temp(&bytes, "us_single_spacing.dcm");
+        assert!(matches!(
+            read_information(&path),
+            Err(IoError::MalformedDicom(_))
+        ));
+    }
+
+    #[test]
+    fn single_bit_non_byte_aligned_width_is_refused() {
+        // BitsAllocated = 1 → SINGLEBIT. Columns = 3 is not a multiple of 8, so
+        // ITK's bit-expansion loop would read past the per-row byte padding GDCM
+        // adds — the wrong bytes for the row. Refused at decode time (§1.72).
+        let mut d = Vec::new();
+        d.extend(elem(0x0008, 0x0016, b"UI", CT.as_bytes()));
+        d.extend(elem(0x0028, 0x0002, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0004, b"CS", b"MONOCHROME2"));
+        d.extend(elem(0x0028, 0x0010, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0011, b"US", &us(3)));
+        d.extend(elem(0x0028, 0x0100, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0101, b"US", &us(1)));
+        d.extend(elem(0x0028, 0x0102, b"US", &us(0)));
+        d.extend(elem(0x0028, 0x0103, b"US", &us(0)));
+        d.extend(elem(0x7fe0, 0x0010, b"OB", &[0b0000_0101]));
+
+        let bytes = dicom_file(EVR_LE, CT, &d);
+        let path = write_temp(&bytes, "singlebit_unaligned.dcm");
+        // The header reads fine (a single-bit image reports UInt8); the refusal
+        // is at pixel decode.
+        assert!(read_information(&path).is_ok());
+        assert!(matches!(
+            read(&path),
+            Err(IoError::UnsupportedDicomFeature(_))
+        ));
+    }
+
+    #[test]
+    fn write_is_refused() {
+        let bytes = dicom_file(EVR_LE, CT, &ct_dataset(2, 1, &[0, 0]));
+        let path = write_temp(&bytes, "for_write.dcm");
+        let image = read(&path).unwrap();
+        let out = write_temp(&[], "out.dcm");
+        assert!(matches!(
+            DicomImageIo.write(&image, &out, &WriteOptions::default()),
+            Err(IoError::UnsupportedDicomFeature(_))
+        ));
+    }
+
+    #[test]
+    fn io_reports_gdcm_class_name_and_extensions() {
+        assert_eq!(DicomImageIo.name(), "GDCMImageIO");
+        assert_eq!(
+            DicomImageIo.supported_read_extensions(),
+            &[".dcm", ".DCM", ".dicom", ".DICOM"]
+        );
+    }
+
+    // --- Unit tests for the arithmetic / encoding helpers -------------------
+
+    #[test]
+    fn native_transfer_syntaxes_only() {
+        assert!(is_native_transfer_syntax("1.2.840.10008.1.2"));
+        assert!(is_native_transfer_syntax("1.2.840.10008.1.2.1"));
+        assert!(is_native_transfer_syntax("1.2.840.10008.1.2.1.99"));
+        assert!(is_native_transfer_syntax("1.2.840.10008.1.2.2"));
+        assert!(!is_native_transfer_syntax("1.2.840.10008.1.2.4.50"));
+        assert!(!is_native_transfer_syntax("1.2.840.10008.1.2.4.90"));
+        assert!(!is_native_transfer_syntax("1.2.840.10008.1.2.5"));
+    }
+
+    #[test]
+    fn media_storage_uid_lookup() {
+        assert_eq!(
+            media_storage_from_uid("1.2.840.10008.5.1.4.1.1.2"),
+            MediaStorage::CtImageStorage
+        );
+        assert_eq!(
+            media_storage_from_uid("1.2.840.10008.5.1.4.1.1.2.1"),
+            MediaStorage::EnhancedCtImageStorage
+        );
+        // Trailing space is trimmed before the lookup.
+        assert_eq!(
+            media_storage_from_uid("1.2.840.10008.5.1.4.1.1.4 "),
+            MediaStorage::MrImageStorage
+        );
+        assert_eq!(media_storage_from_uid("9.9.9"), MediaStorage::Other);
+    }
+
+    #[test]
+    fn best_fit_matches_gdcm_for_ct_rescale() {
+        let pf = PixelFormat {
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            bits_stored: 12,
+            high_bit: 11,
+            pixel_representation: 0,
+        };
+        // slope 1, intercept -1024 over [0, 4095] → [-1024, 3071] → Int16.
+        assert_eq!(
+            compute_intercept_slope_pixel_type(pf, -1024.0, 1.0),
+            ScalarType::Int16
+        );
+        // A non-integral slope forces Float64.
+        assert_eq!(
+            compute_intercept_slope_pixel_type(pf, 0.0, 2.5),
+            ScalarType::Float64
+        );
+    }
+
+    #[test]
+    fn pixel_type_larger_than_output_uses_signed_yardstick() {
+        // A signed input may widen into an unsigned output of the same width.
+        assert!(!pixel_type_larger_than_output(
+            ScalarType::Int16,
+            ScalarType::UInt16
+        ));
+        assert!(pixel_type_larger_than_output(
+            ScalarType::UInt16,
+            ScalarType::UInt8
+        ));
+    }
+
+    #[test]
+    fn default_float_formatting_matches_ostream() {
+        assert_eq!(format_default_float(0.0), "0");
+        assert_eq!(format_default_float(1.0), "1");
+        assert_eq!(format_default_float(1.5), "1.5");
+        assert_eq!(format_default_float(0.75), "0.75");
+        // Six significant digits, trailing zeros stripped.
+        assert_eq!(format_default_float(1234.5678), "1234.57");
+        assert_eq!(format_default_float(0.123456789), "0.123457");
+        assert_eq!(format_default_float(100000.0), "100000");
+        // Beyond six significant digits switches to exponential.
+        assert_eq!(format_default_float(1_000_000.0), "1e+06");
+        assert_eq!(format_default_float(0.0001), "0.0001");
+        assert_eq!(format_default_float(0.00001), "1e-05");
+        assert_eq!(format_default_float(-2.5), "-2.5");
+    }
+
+    #[test]
+    fn base64_matches_kwsys() {
+        assert_eq!(base64_encode(&[1, 2, 3, 4]), "AQIDBA==");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn scalar_type_from_bits_and_representation() {
+        let mut pf = PixelFormat {
+            samples_per_pixel: 1,
+            bits_allocated: 16,
+            bits_stored: 12,
+            high_bit: 11,
+            pixel_representation: 0,
+        };
+        // Bits Stored is ignored: 16/12 unsigned is UInt16, not UInt12.
+        assert_eq!(pf.scalar_type(), ScalarType::UInt16);
+        pf.pixel_representation = 1;
+        assert_eq!(pf.scalar_type(), ScalarType::Int16);
+    }
+
+    #[test]
+    fn ycbcr_to_rgb_black_and_grey() {
+        // Y=0, Cb=Cr=128 → black.
+        let mut buf = vec![0u8, 128, 128];
+        ycbcr_to_rgb(&mut buf).unwrap();
+        assert_eq!(buf, vec![0, 0, 0]);
+        // Y=128, Cb=Cr=128 → mid grey (R=G=B=128).
+        let mut buf = vec![128u8, 128, 128];
+        ycbcr_to_rgb(&mut buf).unwrap();
+        assert_eq!(buf, vec![128, 128, 128]);
+    }
+}
