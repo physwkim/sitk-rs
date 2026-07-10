@@ -411,17 +411,21 @@ pub enum FilterError {
     #[error("input image {index} does not occupy the same physical space as the first input")]
     PhysicalSpaceMismatch { index: usize },
 
-    /// An input to a multi-input filter is smaller, along some axis, than the
-    /// primary (first) input, whose extent determines the filter's requested
-    /// region for every input. Upstream this surfaces as ITK's
-    /// `InvalidRequestedRegionError`, thrown when the pipeline propagates the
-    /// primary input's region onto an input too small to contain it -- e.g.
-    /// `JoinSeriesImageFilter::GenerateInputRequestedRegion`, which copies the
-    /// output region (sized from the first input) onto every input unchanged.
+    /// An input to a multi-input filter has a different size, along some axis,
+    /// than the primary (first) input, whose extent determines the output. In
+    /// `JoinSeriesImageFilter` upstream this asymmetry was silent one way and
+    /// fatal the other: a *smaller* input surfaced as ITK's
+    /// `InvalidRequestedRegionError` when the pipeline propagated the primary
+    /// input's region onto an input too small to contain it, but a *larger*
+    /// input was silently corner-cropped to `[0, primary_size)` and the rest of
+    /// its data discarded (`GenerateInputRequestedRegion` copies the
+    /// first-input-sized region onto every input unchanged). This port rejects
+    /// any size mismatch uniformly, so no input data is ever silently dropped
+    /// (ledger §2.33).
     #[error(
-        "input image {index} has size {size:?}, smaller than the primary input's size {primary_size:?}"
+        "input image {index} has size {size:?}, which differs from the primary input's size {primary_size:?}"
     )]
-    InputSmallerThanPrimary {
+    InputSizeMismatch {
         index: usize,
         size: Vec<usize>,
         primary_size: Vec<usize>,
