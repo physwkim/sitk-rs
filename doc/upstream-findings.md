@@ -185,6 +185,7 @@ All nine items re-verified against SimpleITK master `3e193179` / ITK master
 | 3.24 | `LabelMapMaskImageFilter` `testIdxIsInside` is dead code | `itkLabelMapMaskImageFilter.hxx:281/:346` guard writes with `m_Crop && (GetBackgroundValue() == m_Label) ^ m_Negated` — `^` binds tighter than `&&`, so this is `m_Crop && (B ^ N)`; `B ^ N` is true only in the two combinations where `GenerateOutputInformation` already fell back to the full image, so `outputRegion.IsInside(idx)` can never fail, and in the two genuinely-cropping combinations the guard is `false` while the painted set is exactly what the bounding box was computed from. The guard cannot change an output pixel. Not ported: the fill-then-repaint formulation makes an out-of-region write unrepresentable. Verified against sources 2026-07-10 (labelmask-porter finding, spot-checked). Not yet filed. | `sitk-filters` `label_map_mask.rs` |
 | 3.25 | `LabelMapToBinaryImageFilter` background-image input is unreachable through SimpleITK; `ForegroundValue` default overridden | `SetBackgroundImage` (`itkLabelMapToBinaryImageFilter.h:99-104`) installs a second input whose pixels replace the flat fill (`.hxx:99-119`), but the yaml declares `number_of_inputs: 1` and exposes no setter, so only the flat-fill branch runs through SimpleITK — not ported, no corresponding parameter. Separately the yaml overrides ITK's own `ForegroundValue` default of `NumericTraits<PixelType>::max()` (255 for `uint8`) to `1.0`, so a SimpleITK caller and a raw-ITK caller see different output; this port follows the yaml (`1`), pinned by `itks_own_defaults_differ_from_the_yamls`. Verified against sources 2026-07-10 (labelmask-porter finding). Not yet filed. | `sitk-filters` `label_map_to_binary.rs` |
 | 3.26 | `NormalizedCorrelationImageFilter.yaml` `MaskImage` | Declared as a required member with no `optional: true` marker (unlike e.g. `ConnectedComponentImageFilter.yaml`'s own `MaskImage`), so SimpleITK's generated procedural wrapper cannot be called without a mask at all — even though `itk::NormalizedCorrelationImageFilter` genuinely supports a null mask (`if (!mask) { ... }`, `itkNormalizedCorrelationImageFilter.hxx:167-198`) and its own class doc calls masking optional. This port exposes `mask: Option<&Image>` instead, matching its established convention for every other optional-mask filter (`n4_bias_field`, `fft_correlation`, `scalar_connected_component`, `stochastic_fractal_dimension`) rather than SimpleITK's incidentally more restrictive generated signature. | `normalized_correlation.rs` module doc |
+| 3.27 | `HashImageFilter` default hash function disagrees between ITK and SimpleITK | `itk::HashImageFilter`'s own constructor defaults `m_HashFunction = MD5` (`itkHashImageFilter.hxx:34`), but the hand-written SimpleITK facing layer defaults to `HashFunction m_HashFunction{ SHA1 }` (`sitkHashImageFilter.h:75`) and `HashImageFilter::ExecuteInternal` always calls `hasher->SetHashFunction(this->GetHashFunction())` before `Update()` (`sitkHashImageFilter.cxx:120-127`) — so the ITK-level `MD5` default can never actually reach a caller through `itk::simple::Hash`/`HashImageFilter::Execute`; it is a dead default. A caller porting code from raw ITK (where an unconfigured `itk::HashImageFilter` hashes with MD5) to SimpleITK (where an unconfigured `Hash()` call hashes with SHA1) silently gets a different digest — same shape as §3.10/§3.11's disagreeing defaults. This port follows the SimpleITK-level default (`HashFunction::default() == HashFunction::Sha1`). | `sitk-filters` `hash.rs` module doc |
 
 ## 4. Deliberate divergences of this port (no upstream defect implied)
 
@@ -272,10 +273,11 @@ What actually remains unported:
 - **FFT family (5)**: `ForwardFFT`, `InverseFFT`,
   `RealToHalfHermitianForwardFFT`, `HalfHermitianToRealInverseFFT`, public
   `FFTPad`. Blocked on the mixed-radix decision, §5.7.
-- **Hand-written BasicFilters layer** (`Code/BasicFilters/include/`): `Hash`
-  (`sitkHashImageFilter.h`), `BSplineTransformInitializer`,
-  `CenteredVersorTransformInitializer`. `sitkImageOperators.h`'s `std::ops`
-  surface for `Image` landed 2026-07-10 (`sitk-core::ops`, §4.37/§5.13).
+- **Hand-written BasicFilters layer** (`Code/BasicFilters/include/`):
+  `BSplineTransformInitializer`, `CenteredVersorTransformInitializer` remain.
+  `sitkImageOperators.h`'s `std::ops` surface for `Image` landed 2026-07-10
+  (`sitk-core::ops`, §4.37/§5.13); `sitkHashImageFilter.h`'s `Hash`/
+  `HashImageFilter` landed 2026-07-10 (`sitk-filters::hash`, §3.27).
 - **`sitk-core::Image` vs `sitkImage.h`**: the metadata dictionary
   (`{Get,Set,Erase,Has}MetaData*`, `sitkImage.h:401-432` — load-bearing: every
   real IO format round-trips header keys through it),

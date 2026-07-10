@@ -73,6 +73,7 @@ pub mod geodesic_morphology;
 pub mod geometry;
 pub mod gradient;
 pub mod grid_utility;
+pub mod hash;
 mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
@@ -201,6 +202,7 @@ pub use gradient::{
     gradient_recursive_gaussian, laplacian, laplacian_recursive_gaussian, sobel_edge_detection,
 };
 pub use grid_utility::{checker_board, paste, tile};
+pub use hash::{HashFunction, hash_image};
 pub use histogram_matching::histogram_matching;
 pub use intensity::{
     ShiftScaleResult, intensity_windowing, intensity_windowing_in_place, invert_intensity,
