@@ -1200,3 +1200,116 @@ mod vector_guard {
         );
     }
 }
+
+/// The same structural guard, exercised against a **complex** image.
+///
+/// [`vector_guard`] proves that no scalar filter can read a vector image. That
+/// proof rested on `Image::require_scalar` rejecting `is_vector()` — a
+/// blacklist, which a complex image (a *basic* pixel type upstream, whose
+/// buffer nonetheless holds two components per pixel) would have walked
+/// straight through, handing a `2N`-long slice to a consumer that indexes it
+/// per pixel. The guard is now a whitelist on
+/// [`PixelId::is_scalar`](sitk_core::PixelId::is_scalar), and these cases pin
+/// each route to the buffer against the category that used to bypass it.
+///
+/// The complex-consuming filters — [`crate::complex`] — are the exception, and
+/// they say so in their signatures: they reach the buffer through
+/// [`Image::complex_components`] and check the pixel type themselves.
+#[cfg(test)]
+mod complex_guard {
+    use super::*;
+    use crate::morphology::StructuringElement;
+
+    /// A 2x2 `ComplexFloat32` image: 4 pixels, 8 buffer components.
+    fn complex_image() -> Image {
+        Image::new(&[2, 2], PixelId::ComplexFloat32)
+    }
+
+    fn assert_requires_scalar(err: FilterError, expected: PixelId) {
+        match err {
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(id)) => {
+                assert_eq!(id, expected)
+            }
+            other => panic!("expected RequiresScalarPixelType, got {other:?}"),
+        }
+    }
+
+    /// Math op: `sqrt` reads through `scalar_slice` inside `unary_pixel_apply`.
+    #[test]
+    fn math_filter_rejects_a_complex_image() {
+        let err = crate::math::sqrt(&complex_image()).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Binary op: `require_same_shape` compares `pixel_id`, which differs.
+    #[test]
+    fn binary_math_filter_rejects_a_complex_operand() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        assert!(crate::math::absolute_value_difference(&scalar, &complex_image()).is_err());
+    }
+
+    /// Morphology: reads through a `NeighborhoodIterator`, which takes a
+    /// `ScalarView` at construction.
+    #[test]
+    fn morphology_filter_rejects_a_complex_image() {
+        let kernel = StructuringElement::ball(&[1, 1]);
+        let err = crate::morphology::grayscale_dilate(&complex_image(), &kernel).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Level set: reads through `to_f64_vec`.
+    #[test]
+    fn level_set_filter_rejects_a_complex_image() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        let err = crate::level_set::threshold_segmentation_level_set(
+            &complex_image(),
+            &scalar,
+            0.0,
+            1.0,
+            0.02,
+            1.0,
+            1.0,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// Boundary conditions: `constant_pad` reaches pixels only through
+    /// `Image::scalar_view`.
+    #[test]
+    fn pad_filter_rejects_a_complex_image() {
+        let err =
+            crate::geometry::constant_pad(&complex_image(), &[1, 1], &[1, 1], 0.0).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// `patch_based_denoising` reads through `Image::scalar_slice`. Sized to
+    /// clear the patch-fits-in-image check, so this pins the guard rather than
+    /// an earlier validation error.
+    #[test]
+    fn patch_based_denoising_rejects_a_complex_image() {
+        let img = Image::new(&[9, 9], PixelId::ComplexFloat64);
+        let err = crate::patch_based_denoising(&img, &Default::default()).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat64);
+    }
+
+    /// The write side of the seam. A complex `target` dispatches to its
+    /// component type, so `build_from_f64` would produce an `N`-element buffer
+    /// where `assemble` demands `2N`; the guard rejects it at the seam instead,
+    /// symmetric with the read side.
+    #[test]
+    fn image_from_f64_rejects_a_complex_target() {
+        let geom = Image::new(&[2, 2], PixelId::Float32);
+        let err = image_from_f64(PixelId::ComplexFloat32, &[2, 2], &geom, &[0.0; 4]).unwrap_err();
+        assert_requires_scalar(err, PixelId::ComplexFloat32);
+    }
+
+    /// The complex-consuming filters are the exception, and only they.
+    #[test]
+    fn the_complex_filters_accept_a_complex_image() {
+        assert!(crate::complex::complex_to_real(&complex_image()).is_ok());
+        assert!(crate::complex::complex_to_modulus(&complex_image()).is_ok());
+    }
+}
