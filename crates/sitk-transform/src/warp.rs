@@ -37,7 +37,7 @@ use crate::resample::{InterpolatedImage, Interpolator, build_output, increment};
 ///
 /// Unlike [`ResampleImageFilter`](crate::ResampleImageFilter), whose reference
 /// geometry defaults to the *input image*'s, this filter's defaults are ITK's
-/// hardcoded ones (itkWarpImageFilter.hxx:41-45): unit spacing, zero origin,
+/// hardcoded ones (itkWarpImageFilter.hxx:43-48): unit spacing, zero origin,
 /// identity direction — none of them borrowed from either input. The size
 /// defaults to the displacement field's ("The LargestPossibleRegion for the
 /// output is inherited from the input displacement field",
@@ -46,7 +46,7 @@ use crate::resample::{InterpolatedImage, Interpolator, build_output, increment};
 /// is how a caller opts into a reference image's geometry.
 ///
 /// ITK keys "size unset" on `m_OutputSize[0] == 0`
-/// (itkWarpImageFilter.hxx:388) — only the *first* axis — so an explicit
+/// (itkWarpImageFilter.hxx:428) — only the *first* axis — so an explicit
 /// `[0, 5, 5]` also falls back to the field's whole size. That quirk is
 /// reproduced.
 ///
@@ -148,7 +148,7 @@ impl WarpImageFilter {
     /// `image` must be scalar ([`Image::to_f64_vec`] is the guard);
     /// `displacement_field` must be a vector image of the same dimension with
     /// exactly `image.dimension()` components per pixel, which is
-    /// `VerifyInputInformation`'s check (itkWarpImageFilter.hxx:103-108).
+    /// `VerifyInputInformation`'s check (itkWarpImageFilter.hxx:103-109).
     ///
     /// SimpleITK's `pixel_types2: RealVectorPixelIDTypeList`
     /// (sitkPixelIDTypeLists.h:143) narrows the field further, to
@@ -180,7 +180,7 @@ impl WarpImageFilter {
         }
 
         // `m_OutputSize[0] == 0` — the first axis alone — means "inherit the
-        // field's LargestPossibleRegion" (itkWarpImageFilter.hxx:386-396).
+        // field's LargestPossibleRegion" (itkWarpImageFilter.hxx:426-436).
         let out_size = match &self.output_size {
             Some(s) if s.first() != Some(&0) => s.clone(),
             _ => field.size().to_vec(),
@@ -271,7 +271,7 @@ impl WarpImageFilter {
 }
 
 /// `GenerateInputRequestedRegion`'s `m_DefFieldSameInformation`
-/// (itkWarpImageFilter.hxx:355-364): output and field agree on origin, spacing,
+/// (itkWarpImageFilter.hxx:384-392): output and field agree on origin, spacing,
 /// and direction to within ITK's tolerances, so each output pixel's
 /// displacement is the field pixel at the same index — no interpolation, no
 /// physical-point round trip.
@@ -280,10 +280,10 @@ impl WarpImageFilter {
 ///
 /// ITK compares only the three geometry vectors. When they agree but the output
 /// is *larger* than the field, its `ImageRegionConstIterator fieldIt(fieldPtr,
-/// outputRegionForThread)` (itkWarpImageFilter.hxx:274) walks past the end of
+/// outputRegionForThread)` (itkWarpImageFilter.hxx:294) walks past the end of
 /// the field's buffer — a heap over-read, since `GenerateInputRequestedRegion`
 /// has already fallen back to the field's largest possible region when the
-/// output's requested region failed to verify (hxx:369-372). Adding the size to
+/// output's requested region failed to verify (hxx:407-410). Adding the size to
 /// the test costs nothing on the path ITK actually intends (where the output
 /// *is* the field's region, the sizes are equal by construction) and sends the
 /// over-reading case down the general path instead, where the field is sampled
@@ -298,7 +298,7 @@ fn same_information(
 ) -> bool {
     // itkImageBase.h:52-53: DefaultImageCoordinateTolerance and
     // DefaultImageDirectionTolerance are both 1e-6; the coordinate tolerance is
-    // scaled by the output's first-axis spacing (hxx:352-354).
+    // scaled by the output's first-axis spacing (hxx:384-385).
     const TOL: f64 = 1e-6;
     let coordinate_tol = TOL * out_spacing[0];
     let close = |a: &[f64], b: &[f64], tol: f64| a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol);
@@ -310,7 +310,7 @@ fn same_information(
 }
 
 /// The displacement field, sampled by `EvaluateDisplacementAtPhysicalPoint`
-/// (itkWarpImageFilter.hxx:169-247).
+/// (itkWarpImageFilter.hxx:181-267).
 struct FieldReader<'a> {
     buf: &'a [f64],
     size: Vec<usize>,
@@ -338,7 +338,7 @@ impl FieldReader<'_> {
 
         for d in 0..dim {
             // `m_StartIndex` is 0 and `m_EndIndex` is `size - 1`
-            // (hxx:150-155); this crate's images have no non-zero start index.
+            // (hxx:153-157); this crate's images have no non-zero start index.
             let end = self.size[d] - 1;
             let floor = cindex[d].floor();
             // `floor >= 0.0` is false for NaN too, which then clamps to the

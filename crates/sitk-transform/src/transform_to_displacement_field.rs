@@ -106,9 +106,9 @@ impl TransformToDisplacementFieldFilter {
     ///
     /// # Linear fast path
     ///
-    /// `DynamicThreadedGenerateData` (itkTransformToDisplacementFieldFilter.hxx:154-167)
+    /// `DynamicThreadedGenerateData` (itkTransformToDisplacementFieldFilter.hxx:151-168)
     /// branches on `transform->IsLinear()`. The linear branch
-    /// (`LinearThreadedGenerateData`, hxx:210-262) evaluates the transform only
+    /// (`LinearThreadedGenerateData`, hxx:213-273) evaluates the transform only
     /// at the two ends of each scan line — continuous indices
     /// `(0, j, k, …)` and `(size[0], j, k, …)`, both taken from the *largest
     /// possible region* so a split region does not change the numbers — and

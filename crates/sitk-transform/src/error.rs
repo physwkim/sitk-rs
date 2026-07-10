@@ -50,7 +50,7 @@ pub enum TransformError {
     )]
     UnsupportedDisplacementFieldPixelType(PixelId),
 
-    /// `WarpImageFilter::VerifyInputInformation` (itkWarpImageFilter.hxx:103-108)
+    /// `WarpImageFilter::VerifyInputInformation` (itkWarpImageFilter.hxx:103-109)
     /// throws "Expected number of components of displacement field to match
     /// image dimensions!" when the field's pixels are not `ImageDimension`
     /// components long.

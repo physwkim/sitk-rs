@@ -143,8 +143,8 @@ fn vector_magnitude_typed<T: Scalar>(img: &Image) -> Result<Image> {
 /// of a gradient (covariant vector) image, as a scalar image.
 ///
 /// The functor is `static_cast<TOutput>(std::exp(-1.0 * A.GetNorm()))`
-/// (itkEdgePotentialImageFilter.h:56). `A.GetNorm()` is
-/// `VariableLengthVector::GetNorm` (itkVariableLengthVector.hxx:380-401), whose
+/// (itkEdgePotentialImageFilter.h:57). `A.GetNorm()` is
+/// `VariableLengthVector::GetNorm` (itkVariableLengthVector.hxx:382-401), whose
 /// accumulator is `RealValueType` = `NumericTraits<T>::RealType` — `f32` for an
 /// `f32` component type, `f64` for every other one. `-1.0 * norm` then promotes
 /// to `double` before `std::exp`, so the exponential is always evaluated in
