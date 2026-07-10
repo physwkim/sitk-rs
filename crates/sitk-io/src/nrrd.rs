@@ -62,14 +62,20 @@
 //!
 //! # `space` and the conversion to LPS
 //!
-//! `ReadImageInformation` (itkNrrdImageIO.cxx:764-786) flips axis signs for
-//! exactly three spaces: `right-anterior-superior` (flip axes 0 and 1),
+//! `ReadImageInformation` (itkNrrdImageIO.cxx:764-786) flips axis signs to bring
+//! the anatomical spaces to LPS: `right-anterior-superior` (flip axes 0 and 1),
 //! `left-anterior-superior` (flip axis 1) and `left-posterior-superior` (no
-//! flip). **No space is rejected.** `scanner-xyz`, `right-up`, `3D-left-handed`
-//! and every `*-time` space fall into the `default:` arm and their direction
-//! vectors are used unconverted — see ledger §2.82. The same sign flips are
-//! applied to `space origin`, and (only when there are at most three domain
-//! axes) to the columns of `measurement frame`.
+//! flip). Upstream's `switch` then has a bare `default:` arm, so `scanner-xyz`,
+//! `right-up`, `3D-left-handed` and every `*-time` space fall through and their
+//! direction vectors are used **unconverted** — silently loaded as if already
+//! LPS. This port **fixes** that (ledger §2.82): it additionally converts the
+//! `-time` anatomical spaces (`right-anterior-superior-time` etc.), whose flip
+//! is purely spatial and therefore well-defined, and it *rejects* a named
+//! non-anatomical space — `scanner-xyz`, `right-up`, `3D-right-handed` and
+//! friends — with an [`IoError::UnsupportedNrrdFeature`] rather than loading it
+//! mis-oriented. The unknown space (no `space:` field) is used verbatim, as
+//! before. The same sign flips are applied to `space origin`, and (only when
+//! there are at most three domain axes) to the columns of `measurement frame`.
 //!
 //! # Pixel types
 //!
@@ -2191,20 +2197,42 @@ fn image_information(nrrd: &Nrrd) -> Result<Information> {
     let mut origin = vec![0.0; dimension];
     let mut direction = identity(dimension);
 
-    // itkNrrdImageIO.cxx:764-786. No space is rejected; the ones with no
-    // well-defined LPS conversion are simply left alone (ledger §2.82).
+    // itkNrrdImageIO.cxx:764-786 converts the anatomical spaces to LPS and, in a
+    // bare `default:` arm, silently leaves every other named space unconverted —
+    // so `scanner-xyz`, `3D-right-handed`, `right-up` and the like load
+    // mis-oriented, their direction cosines used verbatim as if already LPS
+    // (ledger §2.82). This port instead converts every space with a well-defined
+    // LPS mapping — the anatomical spaces and their `-time` variants, whose flip
+    // is purely spatial — and rejects a named non-anatomical space with a typed
+    // error rather than loading it silently mis-oriented. The unknown space (no
+    // `space:` field) carries no anatomical claim, so its directions are used
+    // as-is, exactly as before.
     let mut factors = [1.0f64; SPACE_DIM_MAX];
     let normalize_to_lps = match nrrd.space {
-        SPACE_RAS => {
-            factors[0] = -1.0;
-            factors[1] = -1.0;
+        SPACE_RAS | SPACE_RAST => {
+            factors[0] = -1.0; // R -> L
+            factors[1] = -1.0; // A -> P
             true
         }
-        SPACE_LAS => {
-            factors[1] = -1.0;
+        SPACE_LAS | SPACE_LAST => {
+            factors[1] = -1.0; // A -> P
             true
         }
-        SPACE_LPS => true,
+        SPACE_LPS | SPACE_LPST => true,
+        SPACE_RIGHT_UP
+        | SPACE_RIGHT_DOWN
+        | SPACE_SCANNER_XYZ
+        | SPACE_SCANNER_XYZ_TIME
+        | SPACE_3D_RIGHT
+        | SPACE_3D_LEFT
+        | SPACE_3D_RIGHT_TIME
+        | SPACE_3D_LEFT_TIME => {
+            return Err(unsupported(format!(
+                "NRRD space \"{}\" has no well-defined conversion to LPS; refusing to \
+                 load it silently mis-oriented (ledger §2.82)",
+                SPACE_STR[nrrd.space as usize]
+            )));
+        }
         _ => false,
     };
 

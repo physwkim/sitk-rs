@@ -2347,11 +2347,13 @@ mod tests {
         assert_eq!(img.meta_data("NRRD_space"), Some("left-posterior-superior"));
     }
 
-    /// `scanner-xyz` has no well-defined LPS conversion, so
-    /// `ReadImageInformation`'s `switch` falls to `default:` and the direction
-    /// vectors survive unconverted — the space is *not* rejected. Ledger §2.82.
+    /// `scanner-xyz` has no well-defined LPS conversion. Upstream's `switch`
+    /// falls to a bare `default:` and loads the direction vectors unconverted,
+    /// silently mis-orienting the volume; this port **rejects** it with a typed
+    /// [`IoError::UnsupportedNrrdFeature`] rather than loading it wrong. Ledger
+    /// §2.82.
     #[test]
-    fn nrrd_scanner_xyz_space_is_left_unconverted() {
+    fn nrrd_rejects_a_scanner_xyz_space_with_no_lps_conversion() {
         let path = tmp_path("scanner.nrrd");
         std::fs::write(
             &path,
@@ -2368,11 +2370,52 @@ mod tests {
               \x07",
         )
         .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(err, IoError::UnsupportedNrrdFeature(ref m) if m.contains("scanner-xyz")),
+            "expected a typed rejection of scanner-xyz, got {err:?}"
+        );
+    }
+
+    /// `right-anterior-superior-time` has a well-defined LPS conversion — the
+    /// flip is purely spatial — so this port converts it (flipping axes 0 and 1
+    /// of the direction and origin) even though upstream's `switch` leaves the
+    /// `-time` spaces in the `default:` arm unconverted. Ledger §2.82.
+    #[test]
+    fn nrrd_ras_time_space_is_converted_to_lps() {
+        let path = tmp_path("rast.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 4\n\
+              space: right-anterior-superior-time\n\
+              sizes: 1 1 1 1\n\
+              space directions: (2,0,0,0) (0,3,0,0) (0,0,4,0) (0,0,0,5)\n\
+              kinds: domain domain domain domain\n\
+              encoding: raw\n\
+              space origin: (10,20,30,40)\n\
+              \n\
+              \x07",
+        )
+        .unwrap();
         let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(img.origin(), &[10.0, 20.0, 30.0]);
-        assert_eq!(img.meta_data("NRRD_space"), Some("scanner-xyz"));
+        assert_eq!(img.spacing(), &[2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            img.direction(),
+            &[
+                -1.0, 0.0, 0.0, 0.0, //
+                0.0, -1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ]
+        );
+        assert_eq!(img.origin(), &[-10.0, -20.0, 30.0, 40.0]);
+        assert_eq!(img.meta_data("NRRD_space"), Some("left-posterior-superior"));
     }
 
     /// `kinds: domain domain vector` puts the pixel axis last, so
