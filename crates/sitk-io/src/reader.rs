@@ -126,38 +126,39 @@ impl ImageFileReader {
     ///
     /// # Which geometry the extracted image gets
     ///
-    /// Upstream picks one of two pipelines by comparing the extract size's
-    /// *length* with the output dimension (sitkImageFileReader.cxx:362-389),
-    /// and they do not agree on geometry. Both are reproduced here.
+    /// Upstream splits into two pipelines on the extract size's *length*
+    /// (sitkImageFileReader.cxx:362-389) that disagree on geometry: reading
+    /// `[10, 20]` versus `[10, 20, 0]` from the same oblique 3-D file gives an
+    /// identity direction and a dropped `extract_index[2]` in the first case,
+    /// but the file direction's submatrix and an honoured `extract_index[2]` in
+    /// the second — the same requested slice, two different directions and two
+    /// different pixel sets. Only the first matches the header's documented
+    /// contract, "when the dimension of the image is reduced, the direction
+    /// cosine matrix will be set to the identity ... the matrix from the file
+    /// can still be obtained by `GetDirection`" (sitkImageFileReader.h:176-186).
+    /// Ledger §3.27; that divergence is **not reproduced here**.
     ///
-    /// * **No zero entries** (`extract_size.len() == out_dim`): the file is
-    ///   read straight into an `out_dim`-dimensional `itk::Image`. When the
-    ///   file has more axes than that, `itk::ImageFileReader` discards the
-    ///   file's direction cosines entirely and substitutes
-    ///   `GetDefaultDirection` — the **identity**
-    ///   (itkImageFileReader.hxx:155-162). The trailing file axes are read at
-    ///   index `0`, so `extract_index` entries past `extract_size`'s length are
-    ///   silently ignored.
-    /// * **Some zero entry**: the file is read into a higher-dimensional image
-    ///   carrying the real direction matrix, and `itk::ExtractImageFilter`
-    ///   collapses the zero-size axes with `DIRECTIONCOLLAPSETOSUBMATRIX`
-    ///   (sitkImageFileReader.cxx:399-403) — so the output direction is the
-    ///   file direction's **submatrix** over the retained axes, and every
-    ///   `extract_index` entry applies.
+    /// This port runs a single pipeline that always honours the documented
+    /// contract, equivalent to ITK's `SetDirectionCollapseToIdentity` rather
+    /// than `…ToSubmatrix`:
     ///
-    /// So `[10, 20]` and `[10, 20, 0]` on the same oblique 3-D file give
-    /// different output directions (identity vs. submatrix), and only the
-    /// latter honours `extract_index[2]`. The class doc's blanket claim that
-    /// "the direction cosine matrix will be set to the identity"
-    /// (sitkImageFileReader.h:190-193) describes the first pipeline only.
+    /// * The output direction is the **identity** whenever the extraction
+    ///   reduces the dimension (a zero-size axis, or a short `extract_size`
+    ///   whose missing trailing entries are taken as `0`); a pure crop that
+    ///   keeps every axis keeps the file direction. A singular file direction
+    ///   is therefore never an error — the collapse no longer inverts a
+    ///   submatrix.
+    /// * Every `extract_index` entry applies, on any axis, collapsed or not
+    ///   (`GetExtractIndex`'s "missing dimensions are treated the same as 0",
+    ///   sitkImageFileReader.h:210-213). So `[10, 20]` and `[10, 20, 0]` select
+    ///   the same slice and return the same image.
     ///
-    /// In both, the origin comes from `ExtractImageFilter::
-    /// GenerateOutputInformation` plus SimpleITK's `FixNonZeroIndex`
-    /// (itkExtractImageFilter.hxx:156-180, sitkImageFileReader.cxx:39-67): it
-    /// is the retained axes' origin shifted by the retained axes' own index,
-    /// through the *output* direction and spacing. A collapsed axis's index
-    /// never shifts the origin, even when the direction matrix couples it to a
-    /// retained axis.
+    /// The origin comes from `ExtractImageFilter::GenerateOutputInformation`
+    /// plus SimpleITK's `FixNonZeroIndex` (itkExtractImageFilter.hxx:156-180,
+    /// sitkImageFileReader.cxx:39-67): the retained axes' origin shifted by the
+    /// retained axes' own index, through the output (identity, when reduced)
+    /// direction and spacing. A collapsed axis's index selects its slice but
+    /// never shifts the origin.
     pub fn execute(&mut self) -> Result<Image> {
         let io = reader_for(&self.file_name)?;
         let info = io.read_information(&self.file_name)?;
@@ -181,21 +182,16 @@ impl ImageFileReader {
 
     fn execute_extract(&self, image: &Image, out_dim: usize) -> Result<Image> {
         let file_dim = image.dimension();
-        let has_zero = self.extract_size.contains(&0);
 
-        // The dimension of the itk::Image the extractor sees. Without a zero
-        // entry SimpleITK reads directly into the output-dimensional image;
-        // with one, into an image that still carries every file axis.
-        let internal_dim = if has_zero {
-            file_dim.max(self.extract_size.len())
-        } else {
-            out_dim
-        };
+        // One pipeline: read at the file's own dimension (padded up to the
+        // extract size's length), so `[10, 20]` and `[10, 20, 0]` describe the
+        // same region — the trailing entry missing from `extract_size` is `0`,
+        // per the header. Ledger §3.27.
+        let internal_dim = file_dim.max(self.extract_size.len());
 
         // itk::ImageFileReader pads the axes the file does not have with size
         // 1, spacing 1, origin 0 and an identity direction row
-        // (itkImageFileReader.hxx:172-193), and replaces the whole direction
-        // matrix with the identity when the file out-ranks the image.
+        // (itkImageFileReader.hxx:172-193).
         let at = |v: &[f64], i: usize, pad: f64| if i < file_dim { v[i] } else { pad };
         let internal_size: Vec<usize> = (0..internal_dim)
             .map(|i| if i < file_dim { image.size()[i] } else { 1 })
@@ -206,17 +202,13 @@ impl ImageFileReader {
         let internal_origin: Vec<f64> = (0..internal_dim)
             .map(|i| at(image.origin(), i, 0.0))
             .collect();
-        let internal_direction = if !has_zero && file_dim > internal_dim {
-            matrix::identity(internal_dim)
-        } else {
-            let mut m = matrix::identity(internal_dim);
-            for row in 0..internal_dim.min(file_dim) {
-                for col in 0..internal_dim.min(file_dim) {
-                    m[row * internal_dim + col] = image.direction()[row * file_dim + col];
-                }
+        let mut internal_direction = matrix::identity(internal_dim);
+        for row in 0..file_dim {
+            for col in 0..file_dim {
+                internal_direction[row * internal_dim + col] =
+                    image.direction()[row * file_dim + col];
             }
-            m
-        };
+        }
 
         let sizes: Vec<usize> = (0..internal_dim)
             .map(|i| self.extract_size.get(i).copied().unwrap_or(0))
@@ -244,17 +236,20 @@ impl ImageFileReader {
 
         let out_size: Vec<usize> = retained.iter().map(|&i| sizes[i]).collect();
         let out_spacing: Vec<f64> = retained.iter().map(|&i| internal_spacing[i]).collect();
-        let mut out_direction = vec![0.0; out_dim * out_dim];
-        for (a, &i) in retained.iter().enumerate() {
-            for (b, &j) in retained.iter().enumerate() {
-                out_direction[a * out_dim + b] = internal_direction[i * internal_dim + j];
+        // The documented contract: a reduced dimension collapses the direction
+        // to the identity (`SetDirectionCollapseToIdentity`); a pure crop that
+        // keeps every axis keeps the file direction. Ledger §3.27.
+        let out_direction = if out_dim < internal_dim {
+            matrix::identity(out_dim)
+        } else {
+            let mut m = vec![0.0; out_dim * out_dim];
+            for (a, &i) in retained.iter().enumerate() {
+                for (b, &j) in retained.iter().enumerate() {
+                    m[a * out_dim + b] = internal_direction[i * internal_dim + j];
+                }
             }
-        }
-        // DIRECTIONCOLLAPSETOSUBMATRIX only runs when the dimension changes
-        // (itkExtractImageFilter.hxx:185-201).
-        if internal_dim != out_dim && matrix::invert(&out_direction, out_dim).is_none() {
-            return Err(IoError::SingularCollapsedDirection);
-        }
+            m
+        };
 
         // FixNonZeroIndex: origin += out_direction * (out_spacing .* index).
         let scaled: Vec<f64> = retained

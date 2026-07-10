@@ -1003,14 +1003,15 @@ mod tests {
         assert_eq!(extracted, full);
     }
 
-    /// A zero-size axis collapses. The output direction is the file direction's
-    /// submatrix over the retained axes (`SetDirectionCollapseToSubmatrix`,
-    /// sitkImageFileReader.cxx:403), and the origin is shifted by the retained
-    /// axes' index through that submatrix (`FixNonZeroIndex`, :39-67). The
-    /// collapsed axis's own index selects the slice but never shifts the origin
-    /// (itkExtractImageFilter.hxx:162-179).
+    /// A zero-size axis collapses to the **identity** direction, per the
+    /// documented contract (§3.27): reduction sets the direction to the
+    /// identity (`SetDirectionCollapseToIdentity`), not the file direction's
+    /// submatrix. The origin is shifted by the retained axes' index through
+    /// that identity direction (`FixNonZeroIndex`, sitkImageFileReader.cxx:
+    /// 39-67); the collapsed axis's own index selects the slice (`z = 1`) but
+    /// never shifts the origin (itkExtractImageFilter.hxx:162-179).
     #[test]
-    fn extract_collapses_a_zero_size_axis_and_keeps_the_direction_submatrix() {
+    fn extract_with_a_zero_size_axis_gets_the_identity_direction_and_honours_every_index() {
         let path = write_volume("extract_slice.mha");
         let mut reader = ImageFileReader::new();
         reader.set_file_name(&path);
@@ -1022,26 +1023,23 @@ mod tests {
         assert_eq!(img.dimension(), 2);
         assert_eq!(img.size(), &[2, 2]);
         assert_eq!(img.spacing(), &[1.0, 2.0]);
-        assert_eq!(img.direction(), &[0.0, -1.0, 1.0, 0.0]);
-        // origin + D * (spacing .* index) = [10, 20] + [[0,-1],[1,0]] * [1, 2]
-        assert_eq!(img.origin(), &[8.0, 21.0]);
+        assert_eq!(img.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        // origin + I * (spacing .* index) = [10, 20] + [1*1, 2*1] = [11, 22];
+        // the collapsed z index (1) selects the slice but does not shift it.
+        assert_eq!(img.origin(), &[11.0, 22.0]);
+        // z = 1 slice at x,y in {1,2}: value x + 3y + 9z.
         assert_eq!(img.scalar_slice::<i16>().unwrap(), &[13, 14, 16, 17]);
         // The dictionary rides along (sitkImageFileReader.cxx:453).
         assert_eq!(img.meta_data("ITK_InputFilterName"), Some("MetaImageIO"));
     }
 
-    /// The *other* pipeline. With no zero entry the extract size's length
-    /// equals the output dimension, so SimpleITK reads the file straight into a
-    /// lower-dimensional `itk::Image` (sitkImageFileReader.cxx:362-379) — and
-    /// `itk::ImageFileReader` then throws the file's direction cosines away for
-    /// `GetDefaultDirection`, the identity (itkImageFileReader.hxx:155-162).
-    /// The trailing axis is read at index `0`, so `extract_index[2]` is ignored.
-    ///
-    /// Same file, same index, one fewer `0` in the size: different direction,
-    /// different origin, different pixels than
-    /// [`extract_collapses_a_zero_size_axis_and_keeps_the_direction_submatrix`].
+    /// The one-fewer-`0` spelling of the same request. Upstream sent this
+    /// through a *second* pipeline that gave the identity direction but dropped
+    /// `extract_index[2]` (reading `z = 0`), so `[2, 2]` and `[2, 2, 0]`
+    /// returned different pixels (§3.27). This port runs a single pipeline, so
+    /// the two spellings agree byte for byte.
     #[test]
-    fn extract_without_a_zero_axis_gets_the_identity_direction_and_ignores_the_trailing_index() {
+    fn extract_without_a_zero_axis_agrees_with_the_zero_axis_spelling() {
         let path = write_volume("extract_direct.mha");
         let mut reader = ImageFileReader::new();
         reader.set_file_name(&path);
@@ -1053,7 +1051,8 @@ mod tests {
         assert_eq!(img.size(), &[2, 2]);
         assert_eq!(img.direction(), &[1.0, 0.0, 0.0, 1.0]);
         assert_eq!(img.origin(), &[11.0, 22.0]);
-        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[4, 5, 7, 8]);
+        // The trailing index is now honoured — `z = 1`, as for `[2, 2, 0]`.
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[13, 14, 16, 17]);
     }
 
     /// Fewer than two non-zero axes is rejected before any pixel is read
@@ -1091,11 +1090,14 @@ mod tests {
         );
     }
 
-    /// `DIRECTIONCOLLAPSETOSUBMATRIX` throws when the retained axes' submatrix
-    /// is singular (itkExtractImageFilter.hxx:194-200). A direction that maps
-    /// the two retained axes onto the same physical axis does that.
+    /// Collapsing to the identity never inverts a submatrix, so a file
+    /// direction whose retained axes map onto the same physical axis — one that
+    /// `DIRECTIONCOLLAPSETOSUBMATRIX` would reject as singular
+    /// (itkExtractImageFilter.hxx:194-200) — is no longer an error under the
+    /// documented `…ToIdentity` contract (§3.27): the output direction is
+    /// simply the identity.
     #[test]
-    fn extract_rejects_a_singular_collapsed_direction() {
+    fn extract_of_a_singular_file_direction_gives_the_identity_not_an_error() {
         let header = "ObjectType = Image\n\
              NDims = 3\n\
              TransformMatrix = 0 0 1 0 0 1 1 0 0\n\
@@ -1106,12 +1108,12 @@ mod tests {
         let mut reader = ImageFileReader::new();
         reader.set_file_name(&path);
         reader.set_extract_size(&[2, 2, 0]);
-        let result = reader.execute();
+        let img = reader.execute().unwrap();
         std::fs::remove_file(&path).ok();
-        assert!(
-            matches!(result, Err(IoError::SingularCollapsedDirection)),
-            "{result:?}"
-        );
+
+        assert_eq!(img.size(), &[2, 2]);
+        assert_eq!(img.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[0, 0, 0, 0]);
     }
 
     // ---- NIfTI-1 ----------------------------------------------------------

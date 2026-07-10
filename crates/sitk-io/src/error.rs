@@ -200,13 +200,6 @@ pub enum IoError {
     #[error("the extraction region has unsupported output dimension of {0}")]
     ExtractOutputDimension(usize),
 
-    /// The direction submatrix left by collapsing the zero-size axes is
-    /// singular. `ExtractImageFilter`'s `DIRECTIONCOLLAPSETOSUBMATRIX` throws
-    /// `"Invalid submatrix extracted for collapsed direction."`
-    /// (itkExtractImageFilter.hxx:196-199).
-    #[error("invalid submatrix extracted for collapsed direction")]
-    SingularCollapsedDirection,
-
     /// The file's own dimension is below the minimum SimpleITK will load.
     /// `ImageFileReader::Execute` throws `"The file has unsupported image
     /// dimension of ..."` (sitkImageFileReader.cxx:302-307).
