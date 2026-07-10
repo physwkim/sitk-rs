@@ -200,8 +200,8 @@ pub use grid_utility::{checker_board, paste, tile};
 pub use histogram_matching::histogram_matching;
 pub use intensity::{
     ShiftScaleResult, intensity_windowing, intensity_windowing_in_place, invert_intensity,
-    invert_intensity_in_place, normalize, otsu_multiple_thresholds, otsu_threshold, shift_scale,
-    sigmoid, sigmoid_in_place, triangle_threshold,
+    invert_intensity_in_place, normalize, normalize_to_constant, otsu_multiple_thresholds,
+    otsu_threshold, shift_scale, sigmoid, sigmoid_in_place, triangle_threshold,
 };
 pub use kmeans::{KmeansResult, scalar_image_kmeans};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};

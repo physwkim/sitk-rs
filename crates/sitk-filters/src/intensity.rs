@@ -6,9 +6,12 @@
 //! - `Modules/Filtering/ImageIntensity/include/itkIntensityWindowingImageFilter.h(.hxx)`
 //! - `Modules/Filtering/ImageIntensity/include/itkInvertIntensityImageFilter.h`
 //! - `Modules/Filtering/ImageIntensity/include/itkNormalizeImageFilter.h(.hxx)`,
-//!   `itkShiftScaleImageFilter.h(.hxx)` (this crate's [`crate::statistics`] is
-//!   already verified against `itkStatisticsImageFilter.hxx`'s sample
-//!   variance, divisor `n - 1`, which `normalize` reuses for mean/sigma).
+//!   `itkShiftScaleImageFilter.h(.hxx)`, `itkNormalizeToConstantImageFilter.h(.hxx)`
+//!   (this crate's [`crate::statistics`] is already verified against
+//!   `itkStatisticsImageFilter.hxx`'s sample variance, divisor `n - 1`, which
+//!   `normalize`/`normalize_to_constant` reuse for mean/sigma/sum), and
+//!   `itkArithmeticOpsFunctors.h`'s `Div` functor (the zero-divisor rule
+//!   `normalize_to_constant` reproduces).
 //! - `Modules/Numerics/Statistics/include/itkImageToHistogramFilter.h(.hxx)`,
 //!   `itkHistogram.h(.hxx)`, `itkScalarImageToHistogramGenerator.hxx`,
 //!   `itkSampleToHistogramFilter.hxx`
@@ -264,6 +267,67 @@ pub fn shift_scale(
         underflow_count,
         overflow_count,
     })
+}
+
+// ---- NormalizeToConstant --------------------------------------------------
+
+/// `NormalizeToConstantImageFilter` (`itkNormalizeToConstantImageFilter.hxx:64-81`):
+/// scales every pixel so the image sum equals `constant` (default `1.0`,
+/// `NormalizeToConstantImageFilter.yaml`'s `Constant` member): computes
+/// `divisor = StatisticsImageFilter(img).sum / constant` once, then applies
+/// `DivideImageFilter`'s per-pixel-vs-scalar-constant mode (`div->SetConstant2(divisor)`),
+/// i.e. every output pixel is `input / divisor`. Output pixel type is
+/// `NumericTraits<InputPixelType>::RealType` ([`crate::real_pixel_id`], reused
+/// per `fast_marching`'s precedent).
+///
+/// **Divisor-is-zero quirk, reproduced exactly**: `DivideImageFilter`'s `Div`
+/// functor (`itkArithmeticOpsFunctors.h:142-151`) special-cases a
+/// (near-)zero divisor to `NumericTraits<TOutput>::max()` — the type's
+/// largest finite value — *regardless of the numerator's sign or magnitude*;
+/// the `TOutput` argument to `NumericTraits<TOutput>::max(...)` is an
+/// unused overload parameter for scalar types (only meaningful for
+/// `VariableLengthVector`), so this is unconditionally the type maximum, not
+/// `NonpositiveMin()` for a negative numerator and not `0` for a zero
+/// numerator. `divisor == sum / constant` is the *same* value for every
+/// pixel, so this branch triggers on the whole image at once whenever the
+/// image's pixel sum is exactly zero (e.g. a zero-mean or all-zero image)
+/// with a finite nonzero `constant` — a real, easily-reached edge case, not
+/// a corner requiring an astronomical constant. This is handled by an
+/// explicit `divisor == 0.0` check rather than relying on plain `f64`
+/// division + saturating narrow: unlike [`crate::math::divide_floor`] (where
+/// `A / 0.0` naturally narrows to the same `NumericTraits::max`/`NonpositiveMin`
+/// upstream substitutes for an infinite `floor` result), a *negative*
+/// numerator over a zero divisor here would naturally narrow to
+/// `NonpositiveMin()`, and a *zero* numerator to `NaN` narrowing to `0` —
+/// both would silently diverge from upstream's unconditional `max()` without
+/// this explicit branch.
+///
+/// Setting `constant = 0.0` on a *nonzero*-sum image is a different case:
+/// `divisor = sum / 0.0` is `±infinity`, not "almost zero", so `Div` takes
+/// its ordinary branch and every finite numerator divided by an infinite
+/// divisor is `0` — the whole image collapses to zero (this is exactly
+/// `NormalizeToConstantImageFilter.yaml`'s `vector` test, "Running with
+/// vector image to normalize to 0", `Constant: 0.0`), and needs no special
+/// casing since plain `f64` division already produces it.
+pub fn normalize_to_constant(img: &Image, constant: f64) -> Result<Image> {
+    let stats = crate::statistics(img)?;
+    let output_id = crate::real_pixel_id(img.pixel_id());
+    let divisor = stats.sum / constant;
+    let (max_value, _) = crate::morphology::bounds_for(output_id);
+
+    let vals: Vec<f64> = img
+        .to_f64_vec()?
+        .iter()
+        .map(|&x| {
+            if divisor == 0.0 {
+                max_value
+            } else {
+                x / divisor
+            }
+        })
+        .collect();
+
+    crate::image_from_f64(output_id, img.size(), img, &vals)
 }
 
 // ---- Otsu ---------------------------------------------------------------
@@ -821,6 +885,62 @@ mod tests {
     fn shift_scale_rejects_non_scalar_pixel_type() {
         let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
         let err = shift_scale(&a, 0.0, 1.0, None).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
+        );
+    }
+
+    // ---- NormalizeToConstant ----
+
+    #[test]
+    fn normalize_to_constant_scales_the_sum_to_the_given_constant() {
+        let a = img_f64(&[4, 1], vec![1.0, 2.0, 3.0, 4.0]); // sum = 10
+        let out = normalize_to_constant(&a, 5.0).unwrap(); // divisor = 10/5 = 2
+        assert_eq!(out.scalar_slice::<f64>().unwrap(), &[0.5, 1.0, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn normalize_to_constant_yaml_default_constant_1_normalizes_sum_to_1() {
+        let a = img_f64(&[2, 1], vec![1.0, 3.0]); // sum = 4
+        let out = normalize_to_constant(&a, 1.0).unwrap(); // divisor = 4
+        let got = out.scalar_slice::<f64>().unwrap();
+        assert_eq!(got, &[0.25, 0.75]);
+        assert!((got.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normalize_to_constant_zero_sum_forces_every_pixel_to_the_type_maximum() {
+        // sum == 0 -> divisor == 0 -> Div's NumericTraits<TOutput>::max()
+        // branch, unconditionally, for every pixel regardless of its own
+        // sign (see the doc comment on normalize_to_constant).
+        let a = img_f64(&[2, 1], vec![-3.0, 3.0]);
+        let out = normalize_to_constant(&a, 1.0).unwrap();
+        assert_eq!(out.scalar_slice::<f64>().unwrap(), &[f64::MAX, f64::MAX]);
+    }
+
+    #[test]
+    fn normalize_to_constant_zero_constant_on_a_nonzero_sum_image_zeroes_everything() {
+        // divisor = sum/0 = +inf (not "almost zero"), so Div's ordinary
+        // branch runs: finite / inf == 0 for every pixel.
+        let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
+        let out = normalize_to_constant(&a, 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<f64>().unwrap(), &[0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn normalize_to_constant_promotes_output_pixel_type_to_the_real_type() {
+        let a = Image::from_vec(&[2, 1], vec![1u8, 3]).unwrap();
+        let out = normalize_to_constant(&a, 1.0).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float64);
+    }
+
+    #[test]
+    fn normalize_to_constant_rejects_non_scalar_pixel_type() {
+        let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        let err = normalize_to_constant(&a, 1.0).unwrap_err();
         assert_eq!(
             err,
             FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
