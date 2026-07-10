@@ -1400,24 +1400,29 @@ impl ImageRegistrationMethod {
     /// Set the transform the optimizer drives — SimpleITK
     /// `SetInitialTransform(const Transform &)`
     /// (`sitkImageRegistrationMethod.cxx:115-122`), which stores a deep copy
-    /// (`MakeUnique`) and turns the in-place flag **on**.
+    /// (`MakeUnique`).
     ///
     /// [`execute_with_initial_transform`](Self::execute_with_initial_transform)
     /// then optimizes it and returns it as the same concrete transform kind, and
     /// [`initial_transform`](Self::initial_transform) reflects the optimum. Use
     /// [`set_initial_transform_in_place`](Self::set_initial_transform_in_place)
     /// with `false` to leave the stored transform at its starting value and
-    /// receive the optimum as a fresh composite instead.
+    /// receive the optimum separately instead.
     ///
-    /// Note that this **re-enables** the in-place flag: calling it after a
-    /// `set_initial_transform_in_place(t, false)` silently restores in-place
-    /// optimization, exactly as upstream's single-argument overload does
-    /// (ledger §3.36). It also clears any per-level B-spline mesh scale factors
-    /// left by [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
+    /// The **in-place flag is left as it stands** — this setter only replaces the
+    /// transform. Upstream's single-argument overload silently forces the flag
+    /// back on, so a `set_initial_transform_in_place(t, false)` followed by a
+    /// plain `set_initial_transform` would quietly re-enable in-place
+    /// optimization with no diagnostic; this port removes that surprise by giving
+    /// the flag one meaning across every overload — it is the last *explicit*
+    /// choice made through [`set_initial_transform_in_place`](Self::set_initial_transform_in_place)
+    /// or [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline),
+    /// defaulting to `true` (ledger §3.36). It also clears any per-level B-spline
+    /// mesh scale factors left by
+    /// [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
     /// (`sitkImageRegistrationMethod.cxx:121`).
     pub fn set_initial_transform(&mut self, transform: Transform) -> &mut Self {
         self.initial_transform = Some(transform);
-        self.initial_transform_in_place = true;
         self.bspline_scale_factors = Vec::new();
         self
     }
@@ -2963,16 +2968,24 @@ mod initial_transform_tests {
         assert_eq!(ra.metric_value, rb.metric_value);
     }
 
-    /// The single-argument setter turns the in-place flag back on, exactly as
-    /// `SetInitialTransform(const Transform &)` does after a
-    /// `SetInitialTransform(t, false)`.
+    /// The single-argument setter leaves the in-place flag as it stands: unlike
+    /// upstream's `SetInitialTransform(const Transform &)`, which silently forces
+    /// the flag back on, this port keeps the last explicit choice so the flag has
+    /// one meaning across every overload (ledger §3.36).
     #[test]
-    fn the_single_argument_setter_restores_the_in_place_flag() {
+    fn the_single_argument_setter_preserves_the_in_place_flag() {
         let mut reg = ImageRegistrationMethod::new();
+        // Fresh method: the flag defaults to true, and a plain set keeps it.
+        assert!(reg.initial_transform_in_place());
+        reg.set_initial_transform(translation(0.0, 0.0));
+        assert!(reg.initial_transform_in_place());
+
+        // After an explicit not-in-place choice, a plain set does NOT re-enable
+        // it — the surprise upstream has.
         reg.set_initial_transform_in_place(translation(0.0, 0.0), false);
         assert!(!reg.initial_transform_in_place());
         reg.set_initial_transform(translation(0.0, 0.0));
-        assert!(reg.initial_transform_in_place());
+        assert!(!reg.initial_transform_in_place());
     }
 
     #[test]
