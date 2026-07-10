@@ -31,3 +31,12 @@ png = "0.18"
 # that would otherwise pull in a large extra dependency graph.
 jpeg-encoder = "0.6.1"
 jpeg-decoder = { version = "0.3.2", default-features = false }
+# Pure-Rust TIFF decoding/encoding, used by the `tiff` module for
+# `.tif` / `.tiff` image IO in place of libtiff, which `itk::TIFFImageIO` links
+# — no `*-sys` crate enters the tree (verified with `cargo tree -p sitk-io`:
+# only `fax`, `flate2`, `half`, `quick-error`, `weezl` and `zune-jpeg` are
+# pulled in) — ledger §5.8. The crate reads LZW, Deflate and PackBits, which
+# covers every compressor `TIFFImageIO` can write; what it cannot express —
+# palette images and libtiff's `TIFFReadRGBAImageOriented` fallback — is
+# refused rather than approximated (ledger §4.100, §4.102).
+tiff = "0.11"
