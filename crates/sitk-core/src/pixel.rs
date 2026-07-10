@@ -290,7 +290,7 @@ impl PixelId {
     }
 
     /// `(NumericTraits<T>::NonpositiveMin(), NumericTraits<T>::max())` for the
-    /// ten integer scalar types, `None` for every other pixel type.
+    /// eight integer scalar types, `None` for every other pixel type.
     ///
     /// This is the constructor-side guard for [`LabelMap`](crate::LabelMap):
     /// taking the bounds *is* the proof that the pixel type can back a label
