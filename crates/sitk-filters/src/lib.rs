@@ -265,7 +265,9 @@ pub use reconstruction::{
     double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
     h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
 };
-pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
+pub use recursive_gaussian::{
+    GaussianOrder, recursive_gaussian, recursive_gaussian_with_order, smoothing_recursive_gaussian,
+};
 pub use region_growing::{
     IsolatedConnectedResult, VectorConfidenceConnectedResult, confidence_connected,
     connected_threshold, isolated_connected, neighborhood_connected, vector_confidence_connected,

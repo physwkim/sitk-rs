@@ -55,7 +55,7 @@
 //! an [`AxisTooShortForRecursion`](crate::FilterError::AxisTooShortForRecursion)
 //! error.
 //!
-//! Two public entry points, both taking `sigma` per dimension:
+//! Three public entry points, all taking `sigma` per dimension:
 //! - [`recursive_gaussian`] applies [`GaussianOrder::ZeroOrder`] (smoothing)
 //!   to every dimension. This is the pre-existing signature, kept exactly as
 //!   it was (rather than adding a defaulted parameter, which Rust has no
@@ -68,10 +68,14 @@
 //!   — and a `normalize_across_scale` flag. `recursive_gaussian` is a thin
 //!   wrapper over it (`ZeroOrder` on every axis, `normalize_across_scale =
 //!   false`).
+//! - [`smoothing_recursive_gaussian`] is the SimpleITK-level composite
+//!   (`SmoothingRecursiveGaussianImageFilter`): same `ZeroOrder` recursion as
+//!   `recursive_gaussian`, but always narrowing to `float`
+//!   (`RebindImageType<float>`) and accepting vector images (per-component).
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use sitk_core::Image;
+use sitk_core::{Image, PixelId};
 
 /// Order of the Gaussian derivative approximated by the recursive filter,
 /// matching ITK's `RecursiveGaussianImageFilterEnums::GaussianOrder`.
@@ -119,6 +123,27 @@ pub fn recursive_gaussian_with_order(
     orders: &[GaussianOrder],
     normalize_across_scale: bool,
 ) -> Result<Image> {
+    let buf = recursive_gaussian_f64(img, sigma, orders, normalize_across_scale)?;
+    image_from_f64(img.pixel_id(), img.size(), img, &buf)
+}
+
+/// The `f64` core of [`recursive_gaussian_with_order`], returning the raw
+/// filtered values before narrowing to any pixel type.
+///
+/// [`recursive_gaussian_with_order`] narrows its result back to `img`'s own
+/// pixel type, which is correct for that function's contract but wrong for a
+/// composite that must narrow to a *different* type without an intermediate
+/// quantization step — [`crate::recursive_gaussian::smoothing_recursive_gaussian`]'s
+/// `RebindImageType<float>` output and
+/// [`crate::gradient::gradient_recursive_gaussian`]'s per-axis derivative
+/// composite both need the unrounded `f64` result of a component that may
+/// itself be, say, `UInt8`. `pub(crate)` for exactly those two callers.
+pub(crate) fn recursive_gaussian_f64(
+    img: &Image,
+    sigma: &[f64],
+    orders: &[GaussianOrder],
+    normalize_across_scale: bool,
+) -> Result<Vec<f64>> {
     let dim = img.dimension();
     if sigma.len() != dim {
         return Err(FilterError::DimensionLength {
@@ -160,7 +185,99 @@ pub fn recursive_gaussian_with_order(
         filter_axis(&mut buf, &size, &strides, d, &coeff);
     }
 
-    image_from_f64(img.pixel_id(), &size, img, &buf)
+    Ok(buf)
+}
+
+/// `SmoothingRecursiveGaussianImageFilter`
+/// (`itkSmoothingRecursiveGaussianImageFilter.hxx`): Gaussian-smooth `img`
+/// with a per-dimension physical-space `sigma`
+/// (`SmoothingRecursiveGaussianImageFilter.yaml:9-14`, `dim_vec: true`,
+/// default `[1.0, 1.0, 1.0]`), applying `recursive_gaussian_f64`'s
+/// [`GaussianOrder::ZeroOrder`] recursion to every axis.
+///
+/// `normalize_across_scale` is ITK's `NormalizeAcrossScale`
+/// (`SmoothingRecursiveGaussianImageFilter.yaml:27-29`, default `false`,
+/// matching the ITK class default at `itkSmoothingRecursiveGaussianImageFilter.h:175`);
+/// [`GaussianOrder::ZeroOrder`] ignores it either way (see
+/// `Coefficients::new`'s `ZeroOrder` arm), so it has no observable effect on
+/// this filter's output — reproduced faithfully rather than dropped, since a
+/// caller may still pass it through generically.
+///
+/// **Cascade order.** ITK's own pipeline (`itkSmoothingRecursiveGaussianImageFilter.hxx:26-57`)
+/// filters axis `D-1` first (`m_FirstSmoothingFilter`), then axes `0..D-2` in
+/// order (`m_SmoothingFilters`) — chosen for cache/in-place performance, not
+/// correctness. This port filters axes `0..D` in the crate's canonical order
+/// (the same order [`recursive_gaussian`]/[`recursive_gaussian_with_order`]
+/// already use). Every axis here is [`GaussianOrder::ZeroOrder`] smoothing —
+/// a separable linear operation — so the two cascades are the *same*
+/// composition of independent per-axis passes; they can only disagree in
+/// floating-point summation order, at the ULP level, not in the axes each
+/// pixel's value is averaged over.
+///
+/// **Output pixel type.** The yaml's `output_image_type` is
+/// `InputImageType::RebindImageType<float>` (`SmoothingRecursiveGaussianImageFilter.yaml:7`) —
+/// rebinding a `VectorImage<T, D>` gives `VectorImage<float, D>`
+/// (`itkVectorImage.h:201`) — so this always outputs [`PixelId::Float32`] for
+/// a scalar input, [`PixelId::VectorFloat32`] for a vector one, regardless of
+/// the input's own pixel type. This is a distinct rule from the crate's
+/// `real_pixel_id`/`NumericTraits<T>::RealType` family (ledger §5.6): that
+/// family widens `Float64` input to `Float64` output but this port's members
+/// keep `Float32`, a documented divergence from ITK's `double` `RealType`.
+/// `RebindImageType<float>` instead narrows unconditionally — a `Float64`
+/// input still produces `Float32` output here, exactly as the real SimpleITK
+/// procedural function does — so there is no Float32↔Float64 flip to
+/// document against that family; this filter (and [`crate::gradient::gradient`]/
+/// [`crate::gradient::gradient_recursive_gaussian`], which share the same
+/// yaml rule) are simply outside it.
+///
+/// **Vector images.** `pixel_types` is `BasicPixelIDTypeList` **+**
+/// `VectorPixelIDTypeList` (`SmoothingRecursiveGaussianImageFilter.yaml:6`) —
+/// unlike [`recursive_gaussian`]/[`recursive_gaussian_with_order`], which are
+/// scalar-only (their `to_f64_vec`/`image_from_f64` scalar seam rejects a
+/// vector image outright). The yaml's own doc says "For multi-component
+/// images, the filter works on each component independently"; this port
+/// reproduces that literally: [`sitk_core::Image::extract_component`] each
+/// component, run the same `recursive_gaussian_f64` recursion on it, narrow
+/// straight to `f32` (skipping any intermediate narrowing to the component's
+/// own type — seeing `img.pixel_id()` narrowed away and then re-cast would
+/// quantize a `UInt8` component to an 8-bit integer before it ever reaches
+/// `float`, which is not what `RebindImageType<float>` means), and
+/// [`sitk_core::Image::from_component_images`] them back together. A complex
+/// image is rejected the same way [`crate::dicom_orient::dicom_orient`]'s
+/// vector/scalar branch rejects one: `is_vector()` is `false` for
+/// `ComplexFloat32`/`ComplexFloat64`, so it falls into the scalar branch,
+/// whose `to_f64_vec` returns `Error::RequiresScalarPixelType`.
+///
+/// Errors if `sigma` has the wrong length, any value is negative, or a
+/// filtered axis (`sigma[d] > 0`) has fewer than four pixels.
+pub fn smoothing_recursive_gaussian(
+    img: &Image,
+    sigma: &[f64],
+    normalize_across_scale: bool,
+) -> Result<Image> {
+    let dim = img.dimension();
+    let zero_orders = vec![GaussianOrder::ZeroOrder; dim];
+
+    if img.pixel_id().is_vector() {
+        let n = img.number_of_components_per_pixel();
+        let mut components = Vec::with_capacity(n);
+        for c in 0..n {
+            let component = img.extract_component(c)?;
+            let buf =
+                recursive_gaussian_f64(&component, sigma, &zero_orders, normalize_across_scale)?;
+            components.push(image_from_f64(
+                PixelId::Float32,
+                component.size(),
+                &component,
+                &buf,
+            )?);
+        }
+        let refs: Vec<&Image> = components.iter().collect();
+        Ok(Image::from_component_images(&refs)?)
+    } else {
+        let buf = recursive_gaussian_f64(img, sigma, &zero_orders, normalize_across_scale)?;
+        image_from_f64(PixelId::Float32, img.size(), img, &buf)
+    }
 }
 
 /// The coefficients of the fourth-order recursion for one `sigmad`
@@ -926,6 +1043,162 @@ mod tests {
                 expected: 2,
                 got: 1
             })
+        ));
+    }
+
+    // ---- smoothing_recursive_gaussian --------------------------------------
+
+    #[test]
+    fn smoothing_recursive_gaussian_scalar_matches_recursive_gaussian_narrowed_to_float32() {
+        let n = 41;
+        let mut data = vec![0.0f64; n * n];
+        data[20 * n + 20] = 100.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+
+        let out = smoothing_recursive_gaussian(&img, &[2.0, 2.0], false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+
+        let reference = recursive_gaussian(&img, &[2.0, 2.0]).unwrap();
+        let reference_f32 = crate::cast(&reference, PixelId::Float32).unwrap();
+        assert_eq!(
+            out.scalar_slice::<f32>().unwrap(),
+            reference_f32.scalar_slice::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_output_is_always_float32() {
+        let img = Image::from_vec(&[9, 9], vec![5u8; 81]).unwrap();
+        let out = smoothing_recursive_gaussian(&img, &[1.0, 1.0], false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_avoids_intermediate_quantization() {
+        // A UInt8 edge (0 -> 255) smoothed with a wide Gaussian blurs to a
+        // fractional value near the edge (e.g. ~90.7), which does NOT survive
+        // an intermediate round to the nearest u8 and back — pinning that this
+        // composite narrows straight from the f64 recursion to f32 rather than
+        // quantizing to the component's own (UInt8) pixel type first.
+        let n = 41;
+        let mut data = vec![0u8; n];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = if i < n / 2 { 0 } else { 255 };
+        }
+        let img = Image::from_vec(&[n, 1], data).unwrap();
+        let out = smoothing_recursive_gaussian(&img, &[3.0, 0.0], false).unwrap();
+        let vals = out.scalar_slice::<f32>().unwrap();
+
+        // The exact-double reference, computed the same way but never narrowed
+        // to anything but f32: this must match to full f32 precision.
+        let buf = recursive_gaussian_f64(
+            &img,
+            &[3.0, 0.0],
+            &[GaussianOrder::ZeroOrder, GaussianOrder::ZeroOrder],
+            false,
+        )
+        .unwrap();
+        for (got, &expected) in vals.iter().zip(buf.iter()) {
+            assert_eq!(*got, expected as f32);
+        }
+        // And at least one value near the edge is non-integral once widened
+        // back to f64 -- proof that no intermediate u8 rounding occurred.
+        let near_edge = vals[n / 2] as f64;
+        assert!(
+            (near_edge - near_edge.round()).abs() > 1e-3,
+            "value near the edge looks like it was rounded to an integer: {near_edge}"
+        );
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_normalize_across_scale_is_inert_for_zero_order() {
+        let n = 41;
+        let mut data = vec![0.0f64; n * n];
+        data[20 * n + 20] = 100.0;
+        let img = Image::from_vec(&[n, n], data).unwrap();
+
+        let off = smoothing_recursive_gaussian(&img, &[2.0, 2.0], false).unwrap();
+        let on = smoothing_recursive_gaussian(&img, &[2.0, 2.0], true).unwrap();
+        assert_eq!(
+            off.scalar_slice::<f32>().unwrap(),
+            on.scalar_slice::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_vector_image_smooths_each_component_independently() {
+        // Two components with different profiles: component 0 an impulse,
+        // component 1 a ramp -- verifies each is filtered on its own, not
+        // mixed, and that the vector composite matches running the scalar
+        // composite on each extracted component.
+        let n = 41;
+        let mut data = vec![0.0f64; n * 2];
+        for x in 0..n {
+            data[x * 2] = if x == 20 { 100.0 } else { 0.0 };
+            data[x * 2 + 1] = x as f64;
+        }
+        let img = Image::from_vec_vector(&[n, 1], 2, data).unwrap();
+
+        let out = smoothing_recursive_gaussian(&img, &[3.0, 0.0], false).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(out.number_of_components_per_pixel(), 2);
+
+        for c in 0..2 {
+            let scalar_component = img.extract_component(c).unwrap();
+            let scalar_out = smoothing_recursive_gaussian(&scalar_component, &[3.0, 0.0], false)
+                .unwrap()
+                .scalar_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            let vector_component = out
+                .extract_component(c)
+                .unwrap()
+                .scalar_slice::<f32>()
+                .unwrap()
+                .to_vec();
+            assert_eq!(scalar_component.pixel_id(), PixelId::Float64);
+            assert_eq!(scalar_out, vector_component);
+        }
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_rejects_a_complex_image() {
+        let img = Image::new(&[8, 8], PixelId::ComplexFloat32);
+        assert!(matches!(
+            smoothing_recursive_gaussian(&img, &[1.0, 1.0], false).unwrap_err(),
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
+        ));
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_wrong_sigma_length_is_rejected() {
+        let img = Image::new(&[8, 8], PixelId::Float64);
+        assert!(matches!(
+            smoothing_recursive_gaussian(&img, &[1.0], false),
+            Err(FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_negative_sigma_is_rejected() {
+        let img = Image::new(&[8, 8], PixelId::Float64);
+        assert!(matches!(
+            smoothing_recursive_gaussian(&img, &[-1.0, 1.0], false),
+            Err(FilterError::InvalidSigma(_))
+        ));
+    }
+
+    #[test]
+    fn smoothing_recursive_gaussian_short_filtered_axis_is_rejected() {
+        let img = Image::new(&[3, 8], PixelId::Float64);
+        assert!(matches!(
+            smoothing_recursive_gaussian(&img, &[1.0, 1.0], false),
+            Err(FilterError::AxisTooShortForRecursion { axis: 0, len: 3 })
         ));
     }
 }
