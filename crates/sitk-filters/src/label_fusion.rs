@@ -79,15 +79,16 @@
 //! entry; with `maximum_number_of_iterations = None` the loop is unbounded,
 //! exactly as upstream (`!m_HasMaximumNumberOfIterations` disables the test).
 //!
-//! **Reject-column quirk, reproduced verbatim:** the seeding loop does
+//! **Fixed here (upstream bug §1.10):** upstream's seeding loop does
 //! `++m_ConfusionMatrixArray[k][in.Get()][out.Get()]` where `out.Get()` is the
 //! voting output, which may be the undecided label `max_label + 1` — one past
 //! the matrix's last *column*. `Array2D` is a flat row-major buffer with
 //! unchecked `operator[]`, so that write lands on `[in.Get() + 1][0]`, and
-//! since there is a spare reject row the index stays inside the allocation.
-//! Ties in the seeding vote therefore leak counts into the next row's column
-//! zero. This port indexes a flat `Vec<f32>` the same way and gets the same
-//! numbers.
+//! since there is a spare reject row the index stays inside the allocation;
+//! ties in the seeding vote silently add counts to the *next* input label's
+//! "decided label 0" cell. This port skips voting-undecided pixels instead —
+//! a tie carries no evidence about any rater's confusion between two real
+//! labels — matching upstream fix PR InsightSoftwareConsortium/ITK#6579.
 //!
 //! Prior probabilities default to the relative label frequencies across all
 //! inputs (an array of length `max_label + 2` whose last entry stays zero;
@@ -427,8 +428,7 @@ pub fn multi_label_staple(
     );
 
     // `AllocateConfusionMatrixArray`: `(n_labels + 1) x n_labels`, one spare
-    // "reject" row. Flat and row-major, so the reject-column write below lands
-    // where `Array2D::operator[]` puts it.
+    // "reject" row, flat and row-major.
     let matrix_len = (n_labels + 1) * n_labels;
     let mut confusion: Vec<Vec<f32>> = vec![vec![0.0; matrix_len]; inputs.len()];
 
@@ -439,10 +439,13 @@ pub fn multi_label_staple(
     let vote = voting_labels(&inputs, n_labels, voting_undecided);
     for (matrix, input) in confusion.iter_mut().zip(&inputs) {
         for (&observed, &fused) in input.iter().zip(&vote) {
-            // `fused == n_labels` (undecided) overflows the row into the next
-            // row's column zero, exactly as upstream. `observed <= n_labels - 1`
-            // keeps the index inside the allocation.
-            matrix[observed as usize * n_labels + fused as usize] += 1.0;
+            // A voting tie has no column: `fused == n_labels` is one past the
+            // last one. Such a pixel says nothing about how this rater confuses
+            // two real labels, so it contributes no count (upstream instead
+            // writes it into row `observed + 1`, column 0).
+            if (fused as usize) < n_labels {
+                matrix[observed as usize * n_labels + fused as usize] += 1.0;
+            }
         }
     }
     // Normalize matrix rows to unit probability sum.
@@ -1037,24 +1040,52 @@ mod tests {
     }
 
     #[test]
-    fn multi_label_staple_seed_vote_ties_leak_into_the_next_row() {
+    fn multi_label_staple_seed_vote_ties_contribute_no_counts() {
         // Two raters that never agree: every voxel is a voting tie, so the
-        // seed increments column `n_labels` (= 2), which the flat row-major
-        // matrix aliases onto row `observed + 1`, column 0.
+        // seeding vote is the undecided label 2 = n_labels everywhere, which
+        // has no confusion-matrix column. Every count is skipped, so both
+        // 3x2 matrices stay all-zero and row normalisation (`sum > 0`) leaves
+        // them alone.
         //
-        // Rater 0 sees label 0 at voxel 0 and label 1 at voxel 1; both votes
-        // are undecided (= 2). Raw counts before normalisation:
-        //   [0][2] -> flat 0*2 + 2 = 2 -> row 1, col 0
-        //   [1][2] -> flat 1*2 + 2 = 4 -> row 2, col 0
-        // so rows 0 is all-zero, row 1 is [1, 0] and row 2 is [1, 0]. After
-        // row normalisation rows 1 and 2 are [1, 0], row 0 stays [0, 0].
+        // Upstream instead increments column `n_labels` (= 2), which the flat
+        // row-major buffer aliases onto row `observed + 1`, column 0, giving
+        // both matrices [0,0, 1,0, 1,0] — a fabricated certainty that input
+        // label 1 means output label 0.
         let a = img(&[2], vec![0u8, 1]);
         let b = img(&[2], vec![1u8, 0]);
         let r = multi_label_staple(&[&a, &b], None, 1e-5, Some(0), None).unwrap();
 
         assert_eq!(r.total_label_count, 2);
-        assert_eq!(r.confusion_matrices[0], vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
-        assert_eq!(r.confusion_matrices[1], vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(r.confusion_matrices[0], vec![0.0; 6]);
+        assert_eq!(r.confusion_matrices[1], vec![0.0; 6]);
+    }
+
+    #[test]
+    fn multi_label_staple_seed_keeps_decided_voxels_when_some_voxels_tie() {
+        // a = [0, 0, 1, 0], b = [0, 1, 1, 1]; n_labels = 2, so undecided = 2.
+        // Per-voxel votes over the two raters, and the `.hxx` scan:
+        //   v0: votes [2, 0] -> winner 0
+        //   v1: votes [1, 1] -> label 1 ties votes[0] -> undecided (2)
+        //   v2: votes [0, 2] -> winner 1
+        //   v3: votes [1, 1] -> undecided (2)
+        // Seeding counts, skipping the two undecided voxels:
+        //   rater a: v0 (observed 0, fused 0), v2 (observed 1, fused 1)
+        //   rater b: v0 (observed 0, fused 0), v2 (observed 1, fused 1)
+        // Both raw matrices are rows [1,0], [0,1], [0,0]; row normalisation is
+        // the identity on them.
+        //
+        // Upstream's out-of-column write would instead put rater a's two
+        // undecided voxels (observed 0) at row 1 column 0, giving row 1 =
+        // [2, 1] -> [0.667, 0.333], and rater b's (observed 1) at row 2
+        // column 0, giving reject row [1, 0].
+        let a = img(&[4], vec![0u8, 0, 1, 0]);
+        let b = img(&[4], vec![0u8, 1, 1, 1]);
+        let r = multi_label_staple(&[&a, &b], None, 1e-5, Some(0), None).unwrap();
+
+        assert_eq!(r.total_label_count, 2);
+        let expected = vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(r.confusion_matrices[0], expected);
+        assert_eq!(r.confusion_matrices[1], expected);
     }
 
     #[test]
