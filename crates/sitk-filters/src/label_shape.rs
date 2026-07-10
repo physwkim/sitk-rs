@@ -78,11 +78,10 @@ use std::collections::{BTreeMap, HashMap};
 
 use sitk_core::Image;
 
+// `MAX_DIM` is the maximum image dimension this filter supports, sized so that
+// fixed-size arrays can stand in for ITK's `Index`/`Offset`/`Matrix` types.
+use crate::linalg::{MAX_DIM, Mat, symmetric_eigen};
 use crate::{FilterError, Result};
-
-/// Maximum image dimension this filter supports. Sized so that fixed-size
-/// arrays can stand in for ITK's `Index`/`Offset`/`Matrix` types.
-const MAX_DIM: usize = 3;
 
 /// A run-length-encoded scanline of one label: `length` consecutive pixels
 /// starting at `index` and running along axis 0.
@@ -393,91 +392,12 @@ fn hyper_sphere_radius_from_volume(dim: i64, volume: f64) -> f64 {
 
 // ---- linear algebra -------------------------------------------------------
 
-type Mat = [[f64; MAX_DIM]; MAX_DIM];
-
 /// `itk::Math::AlmostEquals(x, 0.0)`, which is `FloatAlmostEqual<double>`
 /// with a 4-ULP tolerance. The ULP distance between `±0.0` and a finite `x`
 /// of the same sign is the magnitude of `x`'s bit pattern, so this is true
 /// only for `x` within four subnormal steps of zero.
 fn is_almost_zero(x: f64) -> bool {
     x.abs().to_bits() <= 4
-}
-
-/// Cyclic Jacobi eigendecomposition of a symmetric `n × n` matrix. Returns
-/// the eigenvalues in ascending order together with a matrix whose *columns*
-/// are the matching eigenvectors — the shape `vnl_symmetric_eigensystem`
-/// hands `itkShapeLabelMapFilter.hxx` as `eigen.D` and `eigen.V`.
-fn symmetric_eigen(input: &Mat, n: usize) -> ([f64; MAX_DIM], Mat) {
-    let mut a = *input;
-    let mut v = [[0.0; MAX_DIM]; MAX_DIM];
-    for (i, row) in v.iter_mut().enumerate().take(n) {
-        row[i] = 1.0;
-    }
-
-    let mut norm2 = 0.0;
-    for row in a.iter().take(n) {
-        for &x in row.iter().take(n) {
-            norm2 += x * x;
-        }
-    }
-    let tol = f64::EPSILON * f64::EPSILON * norm2;
-
-    for _sweep in 0..100 {
-        let mut off = 0.0;
-        for (p, row) in a.iter().enumerate().take(n) {
-            for &x in row.iter().take(n).skip(p + 1) {
-                off += x * x;
-            }
-        }
-        if off <= tol {
-            break;
-        }
-        for p in 0..n {
-            for q in p + 1..n {
-                if a[p][q] == 0.0 {
-                    continue;
-                }
-                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
-                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let s = t * c;
-
-                // A <- A * J, then A <- J^T * A, then V <- V * J.
-                for row in a.iter_mut().take(n) {
-                    let (akp, akq) = (row[p], row[q]);
-                    row[p] = c * akp - s * akq;
-                    row[q] = s * akp + c * akq;
-                }
-                {
-                    // p < q, so the two rows can be borrowed disjointly.
-                    let (head, tail) = a.split_at_mut(q);
-                    for (apk, aqk) in head[p].iter_mut().zip(tail[0].iter_mut()).take(n) {
-                        let (x, y) = (*apk, *aqk);
-                        *apk = c * x - s * y;
-                        *aqk = s * x + c * y;
-                    }
-                }
-                for row in v.iter_mut().take(n) {
-                    let (vkp, vkq) = (row[p], row[q]);
-                    row[p] = c * vkp - s * vkq;
-                    row[q] = s * vkp + c * vkq;
-                }
-            }
-        }
-    }
-
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&i, &j| a[i][i].total_cmp(&a[j][j]));
-
-    let mut eigenvalues = [0.0; MAX_DIM];
-    let mut vectors = [[0.0; MAX_DIM]; MAX_DIM];
-    for (dst, &src) in order.iter().enumerate() {
-        eigenvalues[dst] = a[src][src];
-        for k in 0..n {
-            vectors[k][dst] = v[k][src];
-        }
-    }
-    (eigenvalues, vectors)
 }
 
 /// Determinant by LU with partial pivoting.

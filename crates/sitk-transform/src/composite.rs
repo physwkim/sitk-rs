@@ -116,6 +116,13 @@ impl Transform for CompositeTransform {
         self.dimension
     }
 
+    /// `itk::MultiTransform::IsLinear()`: linear iff every sub-transform is
+    /// (trivially `true` for an empty queue, matching an all-quantified
+    /// `all()` over zero elements).
+    fn is_linear(&self) -> bool {
+        self.transforms.iter().all(|t| t.is_linear())
+    }
+
     /// The chain rule over the queue in application order (last-added first):
     /// `dT/dx = J_{T₀} · … · J_{T_{N−1}}`, each evaluated at the point its own
     /// sub-transform sees.

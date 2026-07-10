@@ -1,12 +1,15 @@
-//! `LabelOverlapMeasuresImageFilter` and `HausdorffDistanceImageFilter` /
-//! `DirectedHausdorffDistanceImageFilter`: segmentation-comparison metrics.
+//! `LabelOverlapMeasuresImageFilter`, `HausdorffDistanceImageFilter` /
+//! `DirectedHausdorffDistanceImageFilter`, and
+//! `SimilarityIndexImageFilter`: segmentation-comparison metrics.
 //!
 //! Verified against ITK's `Modules/Filtering/ImageStatistics/include/`
 //! `itkLabelOverlapMeasuresImageFilter.h`/`.hxx` and
-//! `itkLabelOverlapLabelSetMeasures.h`, and
+//! `itkLabelOverlapLabelSetMeasures.h`,
 //! `Modules/Filtering/DistanceMap/include/`
 //! `itkHausdorffDistanceImageFilter.h`/`.hxx` and
-//! `itkDirectedHausdorffDistanceImageFilter.h`/`.hxx`.
+//! `itkDirectedHausdorffDistanceImageFilter.h`/`.hxx`, and
+//! `Modules/Filtering/ImageCompare/include/`
+//! `itkSimilarityIndexImageFilter.h`/`.hxx`.
 //!
 //! ## `label_overlap_measures`
 //!
@@ -448,6 +451,65 @@ pub fn hausdorff_distance(image1: &Image, image2: &Image) -> Result<HausdorffMea
     })
 }
 
+// ---- SimilarityIndexImageFilter -------------------------------------------
+
+/// `SimilarityIndexImageFilter`: `2 |A ∩ B| / (|A| + |B|)`, where `A` and `B`
+/// are the sets of **non-zero** pixels of `image1` and `image2`.
+///
+/// A pixel is in `A` when `image1`'s value is not exactly zero, and in `B`
+/// when `image2`'s is not exactly zero (`ThreadedGenerateData` tests
+/// `it1.Get() != InputImage1PixelType{}` for the first image and
+/// `Math::NotExactlyEquals(it2.Get(), InputImage2PixelType{})` for the
+/// second — two spellings of the same exact `!= 0` comparison, with no
+/// tolerance and no `abs`). A negative pixel is therefore *in* the set, and
+/// a floating-point `NaN` is too, since `NaN != 0.0`. `-0.0` is not: it
+/// compares equal to zero.
+///
+/// **Both-empty quirk, reproduced:** when neither image has a single
+/// non-zero pixel, `AfterThreadedGenerateData` short-circuits to
+/// `RealType{}`, i.e. **`0.0`** — not the `NaN` that `2*0/(0+0)` would give,
+/// and not `1.0` for "two identical (empty) sets". A zero-pixel image hits
+/// the same branch. Note the guard is `if (!countImage1 && !countImage2)`:
+/// only *one* image being empty falls through to the division, which is then
+/// `0.0 / (n + 0)` = `0.0` anyway.
+///
+/// The filter is a pure measurement (`no_return_image: true` in SimpleITK's
+/// `SimilarityIndexImageFilter.yaml`, whose sole measurement is named
+/// `SimilarityIndex`); ITK grafts input 1 through as the output image, which
+/// carries no information and has no analogue here.
+///
+/// Errors with [`FilterError::SizeMismatch`] when the images differ in size:
+/// `GenerateInputRequestedRegion` forces `image2`'s requested region to
+/// `image1`'s, which the ITK pipeline rejects downstream.
+pub fn similarity_index(image1: &Image, image2: &Image) -> Result<f64> {
+    require_same_size(image1, image2)?;
+
+    let vals1 = image1.to_f64_vec()?;
+    let vals2 = image2.to_f64_vec()?;
+
+    let mut count_image1 = 0u64;
+    let mut count_image2 = 0u64;
+    let mut count_intersection = 0u64;
+    for (&v1, &v2) in vals1.iter().zip(&vals2) {
+        let nonzero = v1 != 0.0;
+        if nonzero {
+            count_image1 += 1;
+        }
+        if v2 != 0.0 {
+            count_image2 += 1;
+            if nonzero {
+                count_intersection += 1;
+            }
+        }
+    }
+
+    if count_image1 == 0 && count_image2 == 0 {
+        return Ok(0.0);
+    }
+
+    Ok(2.0 * count_intersection as f64 / (count_image1 as f64 + count_image2 as f64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +810,94 @@ mod tests {
         let b = single_voxel(&[4, 1], &[0]);
         assert!(matches!(
             hausdorff_distance(&a, &b),
+            Err(FilterError::SizeMismatch { .. })
+        ));
+    }
+
+    // ---- similarity_index ----
+
+    /// `2|A ∩ A| / (|A| + |A|) == 1` for any image with a non-empty
+    /// foreground.
+    #[test]
+    fn similarity_index_of_identical_images_is_one() {
+        let a = img_u8(&[4, 1], vec![0, 1, 7, 0]);
+        assert_eq!(similarity_index(&a, &a).unwrap(), 1.0);
+    }
+
+    /// Disjoint foregrounds: the intersection is empty, so the index is 0
+    /// even though both sets are non-empty.
+    #[test]
+    fn similarity_index_of_disjoint_images_is_zero() {
+        let a = img_u8(&[4, 1], vec![1, 1, 0, 0]);
+        let b = img_u8(&[4, 1], vec![0, 0, 1, 1]);
+        assert_eq!(similarity_index(&a, &b).unwrap(), 0.0);
+    }
+
+    /// Hand-derived half overlap: |A| = 4, |B| = 2, |A ∩ B| = 2, so
+    /// `2 * 2 / (4 + 2) = 2/3`.
+    #[test]
+    fn similarity_index_half_overlap_hand_derived() {
+        let a = img_u8(&[6, 1], vec![1, 1, 1, 1, 0, 0]);
+        let b = img_u8(&[6, 1], vec![0, 0, 1, 1, 0, 0]);
+        assert_eq!(similarity_index(&a, &b).unwrap(), 2.0 / 3.0);
+    }
+
+    /// One image empty, the other not: falls through the both-empty guard to
+    /// `2 * 0 / (3 + 0)` = 0.0.
+    #[test]
+    fn similarity_index_with_one_empty_image_is_zero() {
+        let a = img_u8(&[4, 1], vec![1, 1, 1, 0]);
+        let b = img_u8(&[4, 1], vec![0, 0, 0, 0]);
+        assert_eq!(similarity_index(&a, &b).unwrap(), 0.0);
+        assert_eq!(similarity_index(&b, &a).unwrap(), 0.0);
+    }
+
+    /// Both images empty: ITK's `if (!countImage1 && !countImage2)` returns
+    /// `RealType{}` = 0.0, not `NaN` and not 1.0.
+    #[test]
+    fn similarity_index_with_both_images_empty_is_zero() {
+        let a = img_u8(&[4, 1], vec![0, 0, 0, 0]);
+        let b = img_u8(&[4, 1], vec![0, 0, 0, 0]);
+        let s = similarity_index(&a, &b).unwrap();
+        assert_eq!(s, 0.0);
+        assert!(!s.is_nan());
+    }
+
+    /// A zero-pixel image takes the same both-empty branch.
+    #[test]
+    fn similarity_index_of_empty_images_is_zero() {
+        let a = Image::from_vec(&[0, 0], Vec::<u8>::new()).unwrap();
+        assert_eq!(similarity_index(&a, &a).unwrap(), 0.0);
+    }
+
+    /// "Non-zero" is an exact `!= 0` test, not `> 0`: negative pixels are
+    /// foreground. |A| = 2, |B| = 2, |A ∩ B| = 1 -> `2*1/4` = 0.5.
+    #[test]
+    fn similarity_index_counts_negative_pixels_as_foreground() {
+        let a = img_i32(&[4, 1], vec![-3, -1, 0, 0]);
+        let b = img_i32(&[4, 1], vec![0, 5, -2, 0]);
+        assert_eq!(similarity_index(&a, &b).unwrap(), 0.5);
+    }
+
+    /// `NaN != 0.0`, so a `NaN` pixel is foreground; `-0.0 == 0.0`, so it is
+    /// background. Here |A| = 1 (the NaN), |B| = 1 (the 1.0 at index 0),
+    /// |A ∩ B| = 0 -> 0.0.
+    #[test]
+    fn similarity_index_treats_nan_as_foreground_and_negative_zero_as_background() {
+        let a = Image::from_vec(&[3, 1], vec![0.0f64, f64::NAN, -0.0]).unwrap();
+        let b = Image::from_vec(&[3, 1], vec![1.0f64, 0.0, -0.0]).unwrap();
+        assert_eq!(similarity_index(&a, &b).unwrap(), 0.0);
+        // And a NaN shared by both images does land in the intersection.
+        let c = Image::from_vec(&[3, 1], vec![0.0f64, f64::NAN, -0.0]).unwrap();
+        assert_eq!(similarity_index(&a, &c).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn similarity_index_size_mismatch_errors() {
+        let a = img_u8(&[3, 1], vec![1, 0, 0]);
+        let b = img_u8(&[4, 1], vec![1, 0, 0, 0]);
+        assert!(matches!(
+            similarity_index(&a, &b),
             Err(FilterError::SizeMismatch { .. })
         ));
     }

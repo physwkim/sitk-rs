@@ -310,7 +310,7 @@ pub fn box_sigma(img: &Image, radius: &[usize]) -> Result<Image> {
 
 /// `GaussianOperator::ModifiedBesselI0`: the modified Bessel function `I₀(y)`,
 /// via Abramowitz & Stegun's rational-polynomial approximation.
-fn modified_bessel_i0(y: f64) -> f64 {
+pub(crate) fn modified_bessel_i0(y: f64) -> f64 {
     let d = y.abs();
     if d < 3.75 {
         let mut m = y / 3.75;
@@ -334,7 +334,7 @@ fn modified_bessel_i0(y: f64) -> f64 {
 }
 
 /// `GaussianOperator::ModifiedBesselI1`: the modified Bessel function `I₁(y)`.
-fn modified_bessel_i1(y: f64) -> f64 {
+pub(crate) fn modified_bessel_i1(y: f64) -> f64 {
     let d = y.abs();
     let accumulator = if d < 3.75 {
         let mut m = y / 3.75;

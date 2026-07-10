@@ -42,9 +42,13 @@ pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
 pub mod attribute_morphology;
 pub mod binary_morphology;
+pub mod bspline_decomposition;
 pub mod canny;
+pub mod chan_vese;
 pub mod change_label;
 pub mod clamp;
+pub mod coherence_enhancing_diffusion;
+pub mod colliding_fronts;
 pub mod contour;
 pub mod contour_extractor_2d;
 pub mod convolution;
@@ -55,8 +59,10 @@ pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
+pub mod fast_marching_upwind_gradient;
 mod fft;
 pub mod fft_correlation;
+pub mod fft_shift;
 pub mod functor;
 pub mod geodesic_morphology;
 pub mod geometry;
@@ -65,11 +71,13 @@ pub mod grid_utility;
 mod histogram;
 pub mod histogram_matching;
 pub mod intensity;
+pub mod join_series;
 pub mod kmeans;
 pub mod label;
 pub mod label_fusion;
 pub mod label_shape;
 pub mod level_set;
+mod linalg;
 pub mod logic;
 pub mod math;
 pub mod min_max_curvature_flow;
@@ -78,7 +86,9 @@ pub mod morphology_reconstruction;
 pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
+pub mod object_morphology;
 pub mod overlap;
+pub mod patch_based_denoising;
 pub mod projection;
 mod random;
 pub mod rank;
@@ -94,10 +104,13 @@ pub mod slic;
 pub mod slice;
 pub mod smoothing;
 pub mod sources;
+pub mod stochastic_fractal_dimension;
 pub mod threshold;
 pub mod threshold_maximum_connected_components;
+pub mod toboggan;
 pub mod vector;
 pub mod watershed;
+pub mod watershed_classic;
 
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
@@ -108,9 +121,18 @@ pub use binary_morphology::{
     binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
     voting_binary_iterative_hole_filling,
 };
+pub use bspline_decomposition::{bspline_decomposition, bspline_spline_poles};
 pub use canny::{canny_edge_detection, zero_crossing};
+pub use chan_vese::{
+    ChanAndVeseParams, ChanAndVeseResult, HeavisideStepFunction,
+    scalar_chan_and_vese_dense_level_set,
+};
 pub use change_label::change_label;
 pub use clamp::clamp;
+pub use coherence_enhancing_diffusion::{
+    CoherenceEnhancingDiffusionSettings, Enhancement, coherence_enhancing_diffusion,
+};
+pub use colliding_fronts::colliding_fronts;
 pub use contour::{binary_contour, binary_pruning, label_contour, simple_contour_extractor};
 pub use contour_extractor_2d::{Contour, contour_extractor_2d};
 pub use convolution::{
@@ -128,7 +150,12 @@ pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
 pub use expand::{Interpolator, expand};
 pub use fast_marching::fast_marching;
+pub use fast_marching_upwind_gradient::{
+    FastMarchingUpwindGradientResult, FastMarchingUpwindGradientSettings,
+    fast_marching_upwind_gradient,
+};
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
+pub use fft_shift::fft_shift;
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
@@ -194,11 +221,12 @@ pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, spec
 pub use noise_estimate::noise;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
-    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures,
+    directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
 };
+pub use patch_based_denoising::{NoiseModel, PatchBasedDenoisingSettings, patch_based_denoising};
 pub use projection::{
-    binary_projection, maximum_projection, mean_projection, median_projection, minimum_projection,
-    standard_deviation_projection, sum_projection,
+    binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
+    median_projection, minimum_projection, standard_deviation_projection, sum_projection,
 };
 pub use rank::fast_approximate_rank;
 pub use reconstruction::{
@@ -211,7 +239,8 @@ pub use region_growing::{
     neighborhood_connected,
 };
 pub use regional_extrema::{
-    ValuedRegionalExtremaResult, regional_maxima, valued_regional_maxima, valued_regional_minima,
+    ValuedRegionalExtremaResult, regional_maxima, regional_minima, valued_regional_maxima,
+    valued_regional_minima,
 };
 pub use reinitialize_level_set::reinitialize_level_set;
 pub use scalar_connected_component::scalar_connected_component;
@@ -233,8 +262,13 @@ pub use threshold::{
 pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
+pub use toboggan::toboggan;
 pub use vector::{compose, vector_index_selection_cast, vector_magnitude};
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
+pub use watershed_classic::{
+    IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
+    watershed,
+};
 
 // ---- image ⊕ image functor arithmetic -------------------------------------
 //

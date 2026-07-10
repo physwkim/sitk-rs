@@ -13,6 +13,8 @@
 //! - `itkStandardDeviationProjectionImageFilter.h`
 //!   ([`standard_deviation_projection`])
 //! - `itkBinaryProjectionImageFilter.h` ([`binary_projection`])
+//! - `itkBinaryThresholdProjectionImageFilter.h`
+//!   ([`binary_threshold_projection`])
 //!
 //! Output pixel type per filter comes from SimpleITK's
 //! `Code/BasicFilters/yaml/*ProjectionImageFilter.yaml`, not the raw ITK
@@ -25,6 +27,13 @@
 //! pixel type (`pixeltype: Input` on both members) even though ITK's C++
 //! signature types `BackgroundValue` as the output pixel type — moot here
 //! since output type equals input type for this filter.
+//! `BinaryThresholdProjectionImageFilter.yaml` fixes `output_pixel_type:
+//! uint8_t` unconditionally (not input-following, unlike its
+//! `Median`/`Maximum`/`Minimum`/`Binary` siblings), and types
+//! `ForegroundValue`/`BackgroundValue` as plain `uint8_t` (`pixeltype:
+//! Output`, no `double` round-trip) — this crate's convention for other
+//! fixed-output-type `pixeltype: Output` parameters (e.g.
+//! [`crate::binary_threshold`]'s `inside`/`outside`).
 //!
 //! ## Collapsed-axis geometry, verbatim including a real upstream quirk
 //!
@@ -276,6 +285,35 @@ pub fn binary_projection(
             foreground
         } else {
             background
+        }
+    })
+}
+
+/// `BinaryThresholdProjectionImageFilter`: `foreground_value` if any pixel
+/// along the line is `>= threshold_value`, else `background_value`
+/// (`Function::BinaryThresholdAccumulator::operator()`/`GetValue`: `if
+/// (input >= m_ThresholdValue) m_IsForeground = true;`). Output pixel type is
+/// fixed `UInt8` (see the module docs), unlike every sibling projection
+/// filter above.
+///
+/// `threshold_value` is narrowed through the input pixel type and back
+/// (`static_cast<InputPixelType>` in SimpleITK's generated wrapper,
+/// `ThresholdValue` is `pixeltype: Input`) before comparison, via
+/// [`crate::quantize_to_pixel_type`] — the same narrowing
+/// [`binary_projection`]'s `foreground_value`/`background_value` already use.
+pub fn binary_threshold_projection(
+    img: &Image,
+    projection_dimension: usize,
+    threshold_value: f64,
+    foreground_value: u8,
+    background_value: u8,
+) -> Result<Image> {
+    let threshold = crate::quantize_to_pixel_type(img.pixel_id(), threshold_value);
+    project(img, projection_dimension, PixelId::UInt8, |line| {
+        if line.iter().any(|&v| v >= threshold) {
+            foreground_value as f64
+        } else {
+            background_value as f64
         }
     })
 }
@@ -580,5 +618,68 @@ mod tests {
             .unwrap();
         let out = mean_projection(&img, 1).unwrap();
         assert_eq!(out.direction(), img.direction());
+    }
+
+    // ---- binary_threshold_projection ----
+
+    /// Threshold boundary is inclusive (`>=`): axis-0 lines of
+    /// `asymmetric_2d` are `[0,1]`, `[2,3]`, `[4,5]`; at `threshold=3.0` the
+    /// first line's max (1) falls short, the second line's max (3) exactly
+    /// equals the threshold and still counts, the third (5) clears it.
+    #[test]
+    fn threshold_boundary_is_inclusive_at_the_exact_pixel_value() {
+        let img = Image::from_vec(&[2, 3], vec![0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let out = binary_threshold_projection(&img, 0, 3.0, 9, 2).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[2, 9, 9]);
+    }
+
+    /// The same lines just above the pixel value 3 (`threshold=3.5`):
+    /// the second line's max (3) no longer qualifies, demonstrating `>=`
+    /// rather than `>` right at the boundary (contrast with the `3.0` case
+    /// above, where 3 exactly meeting the threshold still counted).
+    #[test]
+    fn threshold_boundary_excludes_a_value_just_below_it() {
+        let img = Image::from_vec(&[2, 3], vec![0.0f64, 1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let out = binary_threshold_projection(&img, 0, 3.5, 9, 2).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[2, 2, 9]);
+    }
+
+    /// `threshold_value` is narrowed through the input pixel type before
+    /// comparison: on an `Int32` image, `3.9` truncates to `3` (`as i32`),
+    /// so it behaves exactly like the `3.0` boundary test above rather than
+    /// excluding the pixel value 3.
+    #[test]
+    fn threshold_value_quantizes_through_input_pixel_type() {
+        let img = asymmetric_2d(); // Int32: lines [0,1], [2,3], [4,5]
+        let out = binary_threshold_projection(&img, 0, 3.9, 9, 2).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[2, 9, 9]);
+    }
+
+    /// Output pixel type is fixed `UInt8`, unlike every sibling projection
+    /// filter (which keeps or promotes the input type).
+    #[test]
+    fn output_pixel_type_is_fixed_uint8() {
+        let img = asymmetric_2d(); // Int32
+        let out = binary_threshold_projection(&img, 0, 0.0, 1, 0).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt8);
+    }
+
+    /// Inherits `project`'s shared, verbatim-from-ITK origin-shift formula —
+    /// same assertions as `geometry_origin_shift_matches_axis_index_not_axis_size`
+    /// above, just through `binary_threshold_projection` instead of
+    /// `mean_projection`.
+    #[test]
+    fn origin_shift_matches_the_shared_projection_formula() {
+        let mut img = Image::new(&[2, 2, 2], PixelId::Float64);
+        img.set_spacing(&[1.0, 5.0, 7.0]).unwrap();
+        img.set_origin(&[10.0, 20.0, 30.0]).unwrap();
+
+        let out1 = binary_threshold_projection(&img, 1, 0.0, 1, 0).unwrap();
+        // (1 - 1) * 5.0 / 2 == 0.0
+        assert_eq!(out1.origin()[1], 20.0);
+
+        let out2 = binary_threshold_projection(&img, 2, 0.0, 1, 0).unwrap();
+        // (2 - 1) * 7.0 / 2 == 3.5
+        assert_eq!(out2.origin()[2], 33.5);
     }
 }

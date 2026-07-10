@@ -196,6 +196,12 @@ impl Transform for DisplacementFieldTransform {
     fn dimension(&self) -> usize {
         self.dim
     }
+
+    /// `DisplacementFieldTransform::GetTransformCategory()` returns
+    /// `DisplacementField`, not `Linear`.
+    fn is_linear(&self) -> bool {
+        false
+    }
 }
 
 impl ParametricTransform for DisplacementFieldTransform {

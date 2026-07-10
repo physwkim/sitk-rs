@@ -147,6 +147,7 @@ pub fn reinitialize_level_set(
                 normalization_factor: NORMALIZATION_FACTOR,
                 stopping_value,
                 collect_points: narrow_banding,
+                upwind: None,
             },
             trial,
         )

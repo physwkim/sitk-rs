@@ -13,6 +13,30 @@ pub trait Transform {
     /// Spatial dimension the transform operates on.
     fn dimension(&self) -> usize;
 
+    /// Whether `transform_point` is `x ↦ M·x + b` for some constant matrix
+    /// `M` and offset `b` (independent of `x`), mirroring
+    /// `itk::Transform::IsLinear()` / `GetTransformCategory() ==
+    /// TransformCategoryEnum::Linear`. Every matrix-offset, translation, and
+    /// scale transform in this crate is unconditionally linear, matching
+    /// ITK's own `MatrixOffsetTransformBase`/`TranslationTransform`
+    /// overrides (both hardcode `true` rather than deriving it from
+    /// `GetTransformCategory()`), so the default here is `true`;
+    /// [`BSplineTransform`] and [`DisplacementFieldTransform`] override it
+    /// to `false` (`GetTransformCategory()` returns `BSpline`/
+    /// `DisplacementField` there), and [`CompositeTransform`] overrides it
+    /// to the conjunction of its sub-transforms' own `is_linear()`
+    /// (`itk::MultiTransform::IsLinear()`).
+    ///
+    /// [`crate::transform_geometry`]'s linearity precondition is the only
+    /// current caller.
+    ///
+    /// [`BSplineTransform`]: crate::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    /// [`CompositeTransform`]: crate::CompositeTransform
+    fn is_linear(&self) -> bool {
+        true
+    }
+
     /// Jacobian `∂(transform_point(point))ᵢ / ∂pointⱼ`, row-major
     /// `dimension × dimension` — ITK's
     /// `Transform::ComputeJacobianWithRespectToPosition`. This is what

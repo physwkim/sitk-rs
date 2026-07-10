@@ -271,6 +271,18 @@ pub enum FilterError {
     #[error("watershed level must be >= 0, got {0}")]
     InvalidWatershedLevel(f64),
 
+    /// `itk::watershed::SegmentTreeGenerator::CompileMergeList` throws
+    /// ("An unexpected and fatal error has occurred.") when a segment in the
+    /// table has an empty adjacency list, because it then dereferences
+    /// `edge_list.front()`. That happens exactly when the initial
+    /// segmentation found a single segment covering the whole image — a flat
+    /// image, or one whose `Threshold` flooded away every minimum but one.
+    #[error(
+        "the watershed initial segmentation produced a segment with no adjacencies \
+         (segment {label}); the image segments to a single region"
+    )]
+    WatershedSegmentWithoutEdges { label: u64 },
+
     /// `ReconstructionByErosionImageFilter`/`ReconstructionByDilationImageFilter`,
     /// via `itkReconstructionImageFilter.hxx`'s per-pixel precondition check
     /// ("be sure that the pixels in the images follow the preconditions"):
@@ -290,6 +302,12 @@ pub enum FilterError {
     /// upwind quadratic `bb^2 - aa*cc` comes out below zero.
     #[error("discriminant of the fast marching quadratic equation is negative")]
     NegativeDiscriminant,
+
+    /// `RegularizedHeavisideStepFunction::SetEpsilon` throws unless
+    /// `epsilon > NumericTraits<double>::epsilon()`. Only the regularised
+    /// variants validate it; `HeavisideStepFunction` ignores `epsilon`.
+    #[error("epsilon must be > f64::EPSILON for a regularized Heaviside, got {0}")]
+    InvalidHeavisideEpsilon(f64),
 
     /// `IsoContourDistanceImageFilter::ComputeValue` throws
     /// `itkGenericExceptionMacro("diff " << diff << " < NumericTraits<
@@ -344,6 +362,31 @@ pub enum FilterError {
     /// input images.
     #[error("this filter requires at least one input image")]
     EmptyImageList,
+
+    /// `ImageToImageFilter::VerifyInputInformation` (`itkImageToImageFilter.hxx`)
+    /// throws "Inputs do not occupy the same physical space!" when an input's
+    /// origin, spacing or direction differs from the primary input's by more
+    /// than `GlobalDefaultCoordinateTolerance`/`GlobalDefaultDirectionTolerance`
+    /// (both `1e-6` by default). `JoinSeriesImageFilter` does not override this
+    /// base check, so it still applies across every joined input.
+    #[error("input image {index} does not occupy the same physical space as the first input")]
+    PhysicalSpaceMismatch { index: usize },
+
+    /// An input to a multi-input filter is smaller, along some axis, than the
+    /// primary (first) input, whose extent determines the filter's requested
+    /// region for every input. Upstream this surfaces as ITK's
+    /// `InvalidRequestedRegionError`, thrown when the pipeline propagates the
+    /// primary input's region onto an input too small to contain it -- e.g.
+    /// `JoinSeriesImageFilter::GenerateInputRequestedRegion`, which copies the
+    /// output region (sized from the first input) onto every input unchanged.
+    #[error(
+        "input image {index} has size {size:?}, smaller than the primary input's size {primary_size:?}"
+    )]
+    InputSmallerThanPrimary {
+        index: usize,
+        size: Vec<usize>,
+        primary_size: Vec<usize>,
+    },
 
     /// `MaskedAssignImageFilter.yaml`'s `filter_type` fixes the mask image's
     /// ITK template parameter to `itk::Image<std::uint8_t, ...>`, with no
@@ -419,6 +462,35 @@ pub enum FilterError {
     #[error("spline_order must be >= 1, got 0")]
     InvalidSplineOrder,
 
+    /// `BSplineDecompositionImageFilter::SetPoles` throws "SplineOrder must be
+    /// between 0 and 5. Requested spline order has not been implemented yet."
+    /// Unlike [`FilterError::InvalidSplineOrder`], order 0 *is* valid here (it
+    /// has no poles and the decomposition is the identity); only the upper
+    /// bound is enforced, because ITK tabulates poles for orders 0 through 5
+    /// only.
+    #[error("spline order must be between 0 and 5, got {0}")]
+    UnsupportedSplineOrder(u32),
+
+    /// `LinearAnisotropicDiffusionLBRImageFilter::StencilFunctor::Stencil` is
+    /// overloaded only on `Dispatch<2>` and `Dispatch<3>`, so the lattice-basis
+    /// -reduction stencil exists in 2-D and 3-D only. In C++ any other
+    /// dimension fails to compile; this port rejects it at run time.
+    #[error("lattice-basis-reduction diffusion supports 2-D and 3-D images only, got {0}-D")]
+    UnsupportedLbrDimension(usize),
+
+    /// `LinearAnisotropicDiffusionLBRImageFilter::SetRatioToMaxStableTimeStep`
+    /// throws "Ratio to max time step ... should be within ]0,1]".
+    #[error("ratio to the maximum stable time step must lie in (0, 1], got {0}")]
+    InvalidTimeStepRatio(f64),
+
+    /// `LinearAnisotropicDiffusionLBRImageFilter::SetMaxNumberOfTimeSteps`
+    /// throws "Max number of time steps must be positive". Reachable from
+    /// SimpleITK because `MaxTimeStepsBetweenTensorUpdates` is a `uint8_t`
+    /// that `AnisotropicDiffusionLBRImageFilter` stores unvalidated and only
+    /// forwards at `Update` time.
+    #[error("max time steps between tensor updates must be >= 1, got 0")]
+    ZeroMaxTimeSteps,
+
     /// `BSplineScatteredDataPointSetToImageFilter::GenerateData` throws "The
     /// number of control points must be greater than the spline order" when
     /// `m_NumberOfControlPoints[i] < m_SplineOrder[i] + 1` — a lattice that
@@ -478,6 +550,61 @@ pub enum FilterError {
     /// buffer rather than simply crash.
     #[error("seed index {seed:?} is out of bounds for an image of size {size:?}")]
     InvalidSeedIndex { seed: Vec<usize>, size: Vec<usize> },
+
+    /// `FastMarchingUpwindGradientImageFilter::VerifyTargetReachedModeConditions`:
+    /// "No target point set. Cannot set the target reached mode." Raised for
+    /// every target-reached mode but `NoTargets`, i.e. whenever
+    /// `number_of_targets` is non-zero and the target-point list is empty.
+    /// `colliding_fronts` hits it through the `stop_on_targets` marches, whose
+    /// targets are the *other* front's seeds.
+    #[error("target reached mode requires at least one target point")]
+    NoTargetPoints,
+
+    /// `PatchBasedDenoisingImageFilter::Initialize` throws "Patch is larger
+    /// than the entire image (in at least one dimension)" when the index
+    /// `2 * PatchRadiusInVoxels` falls outside the largest possible region,
+    /// i.e. when some axis is shorter than the patch diameter.
+    #[error("patch diameter {diameter:?} does not fit in an image of size {size:?}")]
+    PatchLargerThanImage {
+        size: Vec<usize>,
+        diameter: Vec<usize>,
+    },
+
+    /// `PatchBasedDenoisingImageFilter::EnforceConstraints` throws "Each image
+    /// component must be nonconstant" — the kernel-bandwidth rescale factor is
+    /// `100 / (max - min)`, which a constant image would divide by zero.
+    #[error("patch-based denoising requires a nonconstant image; every pixel has the value {0}")]
+    ConstantImage(f64),
+
+    /// `PatchBasedDenoisingImageFilter::EnforceConstraints` throws when the
+    /// POISSON or RICIAN noise model is selected and the image has a negative
+    /// value.
+    #[error("the POISSON and RICIAN noise models require a nonnegative image; the minimum is {0}")]
+    NegativeIntensityForNoiseModel(f64),
+
+    /// `PatchBasedDenoisingImageFilter::Initialize` throws "Gaussian kernel
+    /// sigma ... must be larger than" `MinSigma`
+    /// (`NumericTraits<double>::min() * 100`).
+    #[error("kernel bandwidth sigma {0} must be larger than {1}")]
+    KernelBandwidthSigmaTooSmall(f64, f64),
+
+    /// `PatchBasedDenoisingImageFilter::InitializePatchWeightsSmoothDisc`
+    /// throws "Center pixel's weight ... must be greater than 0.0" when the
+    /// resampled smooth-disc mask has a nonpositive centre.
+    #[error("the smooth-disc patch mask has a nonpositive center weight {0}")]
+    PatchCenterWeightNotPositive(f64),
+
+    /// `PatchBasedDenoisingImageFilter::ThreadedComputeSigmaUpdate`'s
+    /// `itkAssertOrThrowMacro(probJointEntropy[ic] > 0.0, ...)`. Reached when
+    /// `NumberOfSamplePatches` is zero, so the per-pixel probability is `0/0`.
+    #[error("kernel bandwidth estimation sampled no patches; NumberOfSamplePatches must be >= 1")]
+    NoPatchesSampled,
+
+    /// SimpleITK's `PatchBasedDenoisingImageFilter` derives the sampler radius
+    /// as `Math::Floor<unsigned int>(sqrt(SampleVariance) * 2.5)`, which is
+    /// undefined for a negative variance.
+    #[error("sample variance must be nonnegative, got {0}")]
+    InvalidSampleVariance(f64),
 
     /// A core image error surfaced.
     #[error(transparent)]
