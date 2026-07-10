@@ -40,8 +40,9 @@
 //! `f64::MAX`, **not infinity**. This port returns `f64::MAX` in the same
 //! spot rather than substituting `f64::INFINITY` or `NaN`. Two formulas have
 //! *no* zero-guard at all in the `.hxx` and are ported with none: per-label
-//! `volume_similarity` (divides by `source + target` unguarded — `0.0 /
-//! 0.0` is `NaN`, reproduced as-is) and per-label `false_positive_error`,
+//! `volume_similarity` (divides by `source + target` unguarded — though
+//! `0.0 / 0.0` is unreachable there, since every label recorded in the map
+//! has `source + target >= 1`) and per-label `false_positive_error`,
 //! whose guard only checks `source == 0`, not the actual denominator
 //! (`source_complement + (n_vox - union)`), which can itself be zero while
 //! `source != 0`, again yielding `NaN`.
@@ -148,7 +149,8 @@ pub struct LabelOverlapMeasures {
     /// where `uo` is [`Self::union_overlap`] (no additional zero-guard).
     pub mean_overlap: f64,
     /// `GetVolumeSimilarity(label)`: `2*(source-target) / (source+target)`,
-    /// **unguarded** in the `.hxx` — `NaN` when `source == target == 0`.
+    /// **unguarded** in the `.hxx`, though `source == target == 0` is
+    /// unreachable for a recorded label (`source + target >= 1` always).
     pub volume_similarity: f64,
     /// `GetFalseNegativeError(label)`: `target_complement / target`;
     /// [`REAL_TYPE_MAX`] when `target == 0`.
@@ -271,7 +273,8 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
         };
         let union_overlap = union_overlap_of(c.intersection, c.union);
         let mean_overlap = mean_overlap_of(union_overlap);
-        // Unguarded, matching GetVolumeSimilarity(LabelType): 0/0 -> NaN.
+        // Unguarded, matching GetVolumeSimilarity(LabelType); 0/0 is
+        // unreachable (a recorded label has source + target >= 1).
         let volume_similarity = 2.0 * (source - target) / (source + target);
         let false_negative_error = if target == 0.0 {
             REAL_TYPE_MAX
