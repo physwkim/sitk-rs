@@ -1159,9 +1159,11 @@ impl ImageRegistrationMethod {
     ///   never multiplied in (`m_WeightsAreIdentity`,
     ///   `itkObjectToObjectOptimizerBase.cxx:143-166`; ledger §2.116).
     /// - The length is validated for **every** optimizer, but only the
-    ///   gradient-descent family applies the weights; both L-BFGS optimizers
-    ///   and the gradient-free ones validate and then ignore them (ledger
-    ///   §2.117).
+    ///   gradient-descent family applies the weights. The vnl-backed
+    ///   optimizers — `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and the
+    ///   gradient-free `AmoebaOptimizerv4` — validate and then ignore them.
+    ///   `LBFGS2Optimizerv4` derives from the gradient-descent template and
+    ///   *does* apply them (ledger §2.117).
     ///
     /// An empty vector (the default) means identity.
     ///

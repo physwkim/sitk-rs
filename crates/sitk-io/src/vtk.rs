@@ -156,11 +156,16 @@
 //! §4.71.
 //!
 //! `sscanf("%*s %u %u %u", dims, ...)` does not check its return value, and
-//! neither do the `SPACING` / `ORIGIN` scans (`:209`, `:241`, `:255`): a
-//! `DIMENSIONS 4` line leaves `dims[1]` and `dims[2]` indeterminate and they are
-//! used. This port raises [`IoError::MalformedVtkHeader`] for an under-filled
-//! `DIMENSIONS` and leaves the initialised `1.0` / `0.0` defaults in place for an
-//! under-filled `SPACING` / `ORIGIN`. Ledger §1.55 / §4.70.
+//! neither do the `SPACING` / `ORIGIN` scans (`:209`, `:241`, `:255`). All three
+//! destinations are uninitialised locals (`unsigned int dims[3]`,
+//! `double spacing[3]`, `double origin[3]`), so a `DIMENSIONS 4` line leaves
+//! `dims[1]` and `dims[2]` indeterminate and sizes the image from them, and an
+//! under-filled `SPACING 2.0` line stores indeterminate values through
+//! `SetSpacing`; upstream's `1.0` / `0.0` defaults survive only when the line is
+//! absent or fully filled. This port raises [`IoError::MalformedVtkHeader`] for
+//! an under-filled `DIMENSIONS` and, diverging from upstream, keeps the
+//! `1.0` / `0.0` defaults for an under-filled `SPACING` / `ORIGIN` rather than
+//! reading indeterminate memory. Ledger §1.55 / §4.70.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
