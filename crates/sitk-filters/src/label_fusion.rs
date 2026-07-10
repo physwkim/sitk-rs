@@ -511,6 +511,15 @@ pub fn multi_label_staple(
                     priors[label as usize] += 1.0;
                 }
             }
+            // `total_prob_mass` is the total labeled-pixel count across all
+            // inputs; a zero-pixel image leaves it `0`, so this divides by
+            // zero (`0/0 == NaN` for every label), exactly as upstream
+            // `itkMultiLabelSTAPLEImageFilter.hxx:210` does
+            // (`m_PriorProbabilities[l] /= totalProbMass`, unguarded). Left
+            // undocumented before; documented here to match the `staple`
+            // sibling's established rule for empty-image divisions (§1.11
+            // family, the `g_t = (g_t / number_of_pixels) * ...` division
+            // above), which reproduces upstream's 0/0 rather than guarding it.
             let total_prob_mass: f32 = priors[..n_labels].iter().sum();
             for prior in &mut priors[..n_labels] {
                 *prior /= total_prob_mass;
