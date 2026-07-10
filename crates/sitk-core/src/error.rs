@@ -96,6 +96,29 @@ pub enum Error {
     #[error("pixel index {index:?} is outside an image of size {size:?}")]
     IndexOutOfBounds { index: Vec<usize>, size: Vec<usize> },
 
+    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on an
+    /// image whose pixel type or dimension has no `ToVectorInternal`
+    /// instantiation — a complex image, or a scalar image of fewer than three
+    /// dimensions (sitkImageExplicit.cxx:119-131).
+    #[error("cannot convert a {dimension}-D {pixel_id:?} image to a vector image")]
+    CannotConvertToVectorImage { pixel_id: PixelId, dimension: usize },
+
+    /// [`Image::to_scalar_image`](crate::Image::to_scalar_image) was called on an
+    /// image whose pixel type has no `ToScalarInternal` instantiation — a
+    /// complex image (sitkImageExplicit.cxx:143-155).
+    #[error("cannot convert a {dimension}-D {pixel_id:?} image to a scalar image")]
+    CannotConvertToScalarImage { pixel_id: PixelId, dimension: usize },
+
+    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on a
+    /// scalar image whose direction cosine matrix does not have the first
+    /// dimension's row and column equal to the identity's. Upstream's
+    /// `sitkExceptionMacro("Cannot convert image with non-identity direction in
+    /// first dimension to a vector image")` (sitkImage.hxx:134-145).
+    #[error(
+        "cannot convert an image with a non-identity direction in the first dimension to a vector image"
+    )]
+    NonIdentityFirstDimensionDirection,
+
     /// A label-only operation was handed a floating-point or vector image.
     ///
     /// SimpleITK expresses the same restriction at compile time:

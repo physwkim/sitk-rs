@@ -79,11 +79,15 @@ pub enum PixelId {
 }
 
 impl PixelId {
-    /// Size in bytes of one *component* of this pixel type — SimpleITK's
-    /// `Image::GetSizeOfPixelComponent()`, which is
-    /// `sizeof(NumericTraits<PixelType>::ValueType)` and so reports `4` for
-    /// `sitkComplexFloat32`. A pixel occupies `size_in_bytes()` times its
-    /// image's [`Image::buffer_stride`](crate::Image::buffer_stride) bytes.
+    /// Size in bytes of one *component* of this pixel type: `4` for
+    /// `ComplexFloat32`, whose buffer stores `f32`, and `1` for `VectorUInt8`.
+    /// A pixel occupies `size_in_bytes()` times its image's
+    /// [`Image::buffer_stride`](crate::Image::buffer_stride) bytes.
+    ///
+    /// This is **not** SimpleITK's `Image::GetSizeOfPixelComponent()`, which
+    /// returns `2 * sizeof(component)` for a complex pixel type — see
+    /// [`Image::size_of_pixel_component`](crate::Image::size_of_pixel_component),
+    /// where that quirk is reproduced.
     pub const fn size_in_bytes(self) -> usize {
         match self {
             PixelId::UInt8 | PixelId::Int8 | PixelId::VectorUInt8 | PixelId::VectorInt8 => 1,
@@ -102,6 +106,40 @@ impl PixelId {
             | PixelId::VectorUInt64
             | PixelId::VectorInt64
             | PixelId::VectorFloat64 => 8,
+        }
+    }
+
+    /// The human-readable name SimpleITK's `GetPixelIDValueAsString`
+    /// (sitkPixelIDValues.cxx:40-146) prints for this pixel type, byte for byte.
+    ///
+    /// The `sitkUnknown` ("Unknown pixel id") and `sitkLabel*` ("label of ...")
+    /// arms have no counterpart here: an unknown pixel type is unrepresentable,
+    /// and a [`LabelMap`](crate::LabelMap) is not an [`Image`](crate::Image) in
+    /// this port (see the type docs).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PixelId::UInt8 => "8-bit unsigned integer",
+            PixelId::Int8 => "8-bit signed integer",
+            PixelId::UInt16 => "16-bit unsigned integer",
+            PixelId::Int16 => "16-bit signed integer",
+            PixelId::UInt32 => "32-bit unsigned integer",
+            PixelId::Int32 => "32-bit signed integer",
+            PixelId::UInt64 => "64-bit unsigned integer",
+            PixelId::Int64 => "64-bit signed integer",
+            PixelId::Float32 => "32-bit float",
+            PixelId::Float64 => "64-bit float",
+            PixelId::ComplexFloat32 => "complex of 32-bit float",
+            PixelId::ComplexFloat64 => "complex of 64-bit float",
+            PixelId::VectorUInt8 => "vector of 8-bit unsigned integer",
+            PixelId::VectorInt8 => "vector of 8-bit signed integer",
+            PixelId::VectorUInt16 => "vector of 16-bit unsigned integer",
+            PixelId::VectorInt16 => "vector of 16-bit signed integer",
+            PixelId::VectorUInt32 => "vector of 32-bit unsigned integer",
+            PixelId::VectorInt32 => "vector of 32-bit signed integer",
+            PixelId::VectorUInt64 => "vector of 64-bit unsigned integer",
+            PixelId::VectorInt64 => "vector of 64-bit signed integer",
+            PixelId::VectorFloat32 => "vector of 32-bit float",
+            PixelId::VectorFloat64 => "vector of 64-bit float",
         }
     }
 
