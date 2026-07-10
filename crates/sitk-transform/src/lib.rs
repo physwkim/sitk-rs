@@ -13,6 +13,8 @@ pub mod interpolator;
 pub mod resample;
 pub mod transform;
 pub mod transform_geometry;
+pub mod transform_to_displacement_field;
+pub mod warp;
 
 pub use bspline::BSplineTransform;
 pub use composite::CompositeTransform;
@@ -26,3 +28,5 @@ pub use transform::{
     Transform, TranslationTransform, VersorRigid3DTransform, VersorTransform,
 };
 pub use transform_geometry::transform_geometry;
+pub use transform_to_displacement_field::TransformToDisplacementFieldFilter;
+pub use warp::WarpImageFilter;

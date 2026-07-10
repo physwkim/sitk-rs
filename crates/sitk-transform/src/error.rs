@@ -1,5 +1,7 @@
 //! Transform / resampling error type.
 
+use sitk_core::PixelId;
+
 /// Errors produced by transforms and resampling.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransformError {
@@ -38,6 +40,24 @@ pub enum TransformError {
     /// that undefined behavior.
     #[error("transform matrix is singular; cannot invert for TransformGeometryImageFilter")]
     NonInvertibleTransform,
+
+    /// `TransformToDisplacementFieldFilter`'s `OutputPixelType` member accepts
+    /// only `sitkVectorFloat32` and `sitkVectorFloat64`
+    /// (`TransformToDisplacementFieldFilter.yaml`'s `briefdescriptionSet`:
+    /// "only sitkVectorFloat32 and sitkVectorFloat64 are supported").
+    #[error(
+        "displacement-field output pixel type must be VectorFloat32 or VectorFloat64, got {0:?}"
+    )]
+    UnsupportedDisplacementFieldPixelType(PixelId),
+
+    /// `WarpImageFilter::VerifyInputInformation` (itkWarpImageFilter.hxx:103-109)
+    /// throws "Expected number of components of displacement field to match
+    /// image dimensions!" when the field's pixels are not `ImageDimension`
+    /// components long.
+    #[error(
+        "displacement field has {got} components per pixel; expected {expected} (the image dimension)"
+    )]
+    DisplacementFieldComponentMismatch { expected: usize, got: usize },
 
     /// A core image error surfaced.
     #[error(transparent)]

@@ -139,6 +139,66 @@ fn vector_magnitude_typed<T: Scalar>(img: &Image) -> Result<Image> {
     Ok(result)
 }
 
+/// `EdgePotentialImageFilter` (`itkEdgePotentialImageFilter.h`): `exp(-|g|)`
+/// of a gradient (covariant vector) image, as a scalar image.
+///
+/// The functor is `static_cast<TOutput>(std::exp(-1.0 * A.GetNorm()))`
+/// (itkEdgePotentialImageFilter.h:57). `A.GetNorm()` is
+/// `VariableLengthVector::GetNorm` (itkVariableLengthVector.hxx:382-401), whose
+/// accumulator is `RealValueType` = `NumericTraits<T>::RealType` — `f32` for an
+/// `f32` component type, `f64` for every other one. `-1.0 * norm` then promotes
+/// to `double` before `std::exp`, so the exponential is always evaluated in
+/// `f64`; only the squared-norm accumulation is narrow. This is the same
+/// accumulator rule [`vector_magnitude`] follows.
+///
+/// The output pixel type is the yaml's `output_pixel_type`,
+/// `NumericTraits<NumericTraits<PixelType>::ValueType>::RealType` — the *real*
+/// type of the component type, so [`PixelId::Float32`] for a
+/// [`PixelId::VectorFloat32`] input and [`PixelId::Float64`] for every other
+/// input, integer components included. Unlike [`vector_magnitude`] there is no
+/// narrowing cast to worry about: every value of `exp(-|g|)` lies in `(0, 1]`
+/// and the output is floating point.
+///
+/// Errors with [`Error::RequiresVectorPixelType`] on a scalar image
+/// (`pixel_types: VectorPixelIDTypeList`). ITK's own constraint is
+/// stronger — the functor calls `A.GetNorm()`, which does not compile for a
+/// scalar pixel — so there is no upstream run-time check to mirror.
+pub fn edge_potential(img: &Image) -> Result<Image> {
+    if !img.pixel_id().is_vector() {
+        return Err(Error::RequiresVectorPixelType(img.pixel_id()).into());
+    }
+    dispatch_scalar!(img.pixel_id(), edge_potential_typed, img)
+}
+
+fn edge_potential_typed<T: Scalar>(img: &Image) -> Result<Image> {
+    let n = img.number_of_components_per_pixel();
+    let components = img.component_slice::<T>()?;
+
+    // `RealValueType` is `float` only for a `float` component type; the
+    // exponential itself is always taken in `f64` (`-1.0 * norm` promotes).
+    let mut result = if T::PIXEL_ID == PixelId::Float32 {
+        let out: Vec<f32> = components
+            .chunks_exact(n)
+            .map(|pixel| {
+                let sum: f32 = pixel.iter().map(|&c| (c.as_f64() as f32).powi(2)).sum();
+                (-f64::from(sum.sqrt())).exp() as f32
+            })
+            .collect();
+        Image::from_vec(img.size(), out)?
+    } else {
+        let out: Vec<f64> = components
+            .chunks_exact(n)
+            .map(|pixel| {
+                let sum: f64 = pixel.iter().map(|&c| c.as_f64().powi(2)).sum();
+                (-sum.sqrt()).exp()
+            })
+            .collect();
+        Image::from_vec(img.size(), out)?
+    };
+    result.copy_geometry_from(img);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +431,83 @@ mod tests {
             vector_magnitude(&s).unwrap_err(),
             crate::FilterError::Core(Error::RequiresVectorPixelType(PixelId::Float32))
         ));
+    }
+
+    /// `exp(-|g|)` on a 3-4-5 pixel and a zero pixel: `exp(-5)` and `exp(0)`.
+    /// The output of a `VectorFloat32` input is `Float32`.
+    #[test]
+    fn edge_potential_of_a_float32_field_is_exp_of_minus_the_norm() {
+        let v = Image::from_vec_vector(&[2], 2, vec![3.0f32, 4.0, 0.0, 0.0]).unwrap();
+        let p = edge_potential(&v).unwrap();
+        assert_eq!(p.pixel_id(), PixelId::Float32);
+        assert_eq!(p.number_of_components_per_pixel(), 1);
+        let got = p.scalar_slice::<f32>().unwrap();
+        assert_eq!(got[0], (-5.0f64).exp() as f32);
+        assert_eq!(got[1], 1.0);
+    }
+
+    /// `NumericTraits<double>::RealType` is `double`.
+    #[test]
+    fn edge_potential_of_a_float64_field_stays_float64() {
+        // (5, 12) has norm 13.
+        let v = Image::from_vec_vector(&[1], 2, vec![5.0f64, 12.0]).unwrap();
+        let p = edge_potential(&v).unwrap();
+        assert_eq!(p.pixel_id(), PixelId::Float64);
+        assert_eq!(p.scalar_slice::<f64>().unwrap(), &[(-13.0f64).exp()]);
+    }
+
+    /// `NumericTraits<unsigned char>::RealType` is `double`, so an integer
+    /// component type still yields a `Float64` image — the result is never
+    /// truncated to the component type the way `vector_magnitude`'s is.
+    #[test]
+    fn edge_potential_of_an_integer_field_is_float64() {
+        let v = Image::from_vec_vector(&[2], 2, vec![3u8, 4, 0, 0]).unwrap();
+        let p = edge_potential(&v).unwrap();
+        assert_eq!(p.pixel_id(), PixelId::Float64);
+        assert_eq!(p.scalar_slice::<f64>().unwrap(), &[(-5.0f64).exp(), 1.0]);
+    }
+
+    /// A one-component field's norm is the absolute value, so a negative
+    /// component still produces a potential in `(0, 1]`.
+    #[test]
+    fn edge_potential_of_a_one_component_field_uses_the_absolute_value() {
+        let v = Image::from_vec_vector(&[2], 1, vec![-3.0f64, 3.0]).unwrap();
+        let p = edge_potential(&v).unwrap();
+        assert_eq!(
+            p.scalar_slice::<f64>().unwrap(),
+            &[(-3.0f64).exp(), (-3.0f64).exp()]
+        );
+    }
+
+    #[test]
+    fn edge_potential_copies_geometry() {
+        let mut v = Image::from_vec_vector(&[2], 2, vec![0.0f32; 4]).unwrap();
+        v.set_spacing(&[2.5]).unwrap();
+        v.set_origin(&[-1.0]).unwrap();
+        let p = edge_potential(&v).unwrap();
+        assert_eq!(p.spacing(), &[2.5]);
+        assert_eq!(p.origin(), &[-1.0]);
+    }
+
+    #[test]
+    fn edge_potential_rejects_a_scalar_image() {
+        let s = Image::new(&[2], PixelId::Float32);
+        assert!(matches!(
+            edge_potential(&s).unwrap_err(),
+            crate::FilterError::Core(Error::RequiresVectorPixelType(PixelId::Float32))
+        ));
+    }
+
+    /// `gradient` → `edge_potential` is the pipeline this filter exists for:
+    /// a covariant-vector gradient image in, an edge-potential map out.
+    #[test]
+    fn edge_potential_of_a_composed_gradient_field() {
+        // A pixel with gradient (0, 0) is flat -> potential 1; (0, 5) is an
+        // edge -> potential exp(-5).
+        let gx = Image::from_vec(&[2], vec![0.0f64, 0.0]).unwrap();
+        let gy = Image::from_vec(&[2], vec![0.0f64, 5.0]).unwrap();
+        let p = edge_potential(&compose(&[&gx, &gy]).unwrap()).unwrap();
+        assert_eq!(p.scalar_slice::<f64>().unwrap(), &[1.0, (-5.0f64).exp()]);
     }
 
     /// `compose` then `vector_magnitude` is the pipeline the two filters exist

@@ -270,7 +270,7 @@ pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
 pub use toboggan::toboggan;
-pub use vector::{compose, vector_index_selection_cast, vector_magnitude};
+pub use vector::{compose, edge_potential, vector_index_selection_cast, vector_magnitude};
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 pub use watershed_classic::{
     IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
