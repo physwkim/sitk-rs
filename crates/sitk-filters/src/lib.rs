@@ -89,6 +89,7 @@ pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
 pub mod object_morphology;
+pub mod objectness;
 pub mod overlap;
 pub mod patch_based_denoising;
 pub mod projection;

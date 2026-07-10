@@ -638,6 +638,27 @@ pub enum FilterError {
     #[error("Gaussian maximum error must lie strictly inside (0, 1), got {0}")]
     GaussianMaximumErrorOutOfRange(f64),
 
+    /// `HessianToObjectnessMeasureImageFilter::VerifyPreconditions`
+    /// (`itkHessianToObjectnessMeasureImageFilter.hxx:210-217`) throws
+    /// "ObjectDimension must be lower than ImageDimension." The composite
+    /// `ObjectnessMeasureImageFilter` performs no check of its own; it
+    /// forwards the setting and the inner filter throws at `Update` time.
+    #[error(
+        "object dimension {object_dimension} must be lower than image dimension {image_dimension}"
+    )]
+    InvalidObjectDimension {
+        object_dimension: usize,
+        image_dimension: usize,
+    },
+
+    /// [`crate::objectness::objectness_measure`] diagonalizes the Hessian with
+    /// this crate's `linalg::symmetric_eigen`, which is written for matrices up
+    /// to `3 x 3`. SimpleITK's default build instantiates `ObjectnessMeasure`
+    /// for 2-D and 3-D images only, so no supported input reaches this error;
+    /// a 1-D or 4-D image would.
+    #[error("objectness_measure supports 2-D and 3-D images only, got {0}-D")]
+    UnsupportedObjectnessDimension(usize),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
