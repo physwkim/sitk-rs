@@ -18,11 +18,11 @@
 //! (`itkInPlaceLabelMapFilter.hxx:83-105`) copies the input's background value
 //! and objects into the output, which is what `map.clone()` stands for below.
 //!
-//! Two upstream defects are relevant here, and they are handled differently
-//! because only one of them is representable in this port. `MergeLabelMapFilter`'s
+//! Two upstream defects are relevant here. `MergeLabelMapFilter`'s
 //! never-cleared deferred deque is **not** reproduced — see
 //! [`merge_label_map`]; `AttributeUniqueLabelMapFilter`'s inverted
-//! empty-object-removal guard **is** — see [`label_unique_label_map`].
+//! empty-object-removal guard is **fixed here (§2.59)** rather than reproduced —
+//! see [`label_unique_label_map`].
 //!
 //! The first two are one-liners over [`LabelMap::from_label_image`] and
 //! [`LabelMap::to_label_image`], which is where the run-length encoding and the
@@ -552,15 +552,15 @@ impl PartialOrd for LineOfLabelObject {
 /// yaml's default), the smaller when it is `true`. The loser is truncated, and
 /// any part of it left dangling past the winner is pushed back onto the queue.
 ///
-/// # Upstream defect, reproduced
+/// # Upstream defect, fixed here (§2.59)
 ///
 /// The final "remove objects without lines" pass is written
 /// `while (it.IsAtEnd())` (`itkAttributeUniqueLabelMapFilter.hxx:239`) where it
-/// means `while (!it.IsAtEnd())`, so its body never runs. An object whose pixels
-/// were entirely claimed by others therefore survives in the map with **zero
-/// lines**, inflating `GetNumberOfLabelObjects()`. This port keeps the empty
-/// objects, pinned by
-/// `label_unique_keeps_a_fully_overlapped_object_as_an_empty_one`.
+/// means `while (!it.IsAtEnd())`, so upstream's body never runs and an object
+/// whose pixels were entirely claimed by others survives in the map with **zero
+/// lines**, inflating `GetNumberOfLabelObjects()`. This port runs the intended
+/// pass: a fully-overlapped object is dropped. Pinned by
+/// `label_unique_removes_a_fully_overlapped_object`.
 pub fn label_unique_label_map(map: &LabelMap, reverse_ordering: bool) -> Result<LabelMap> {
     let dim = map.dimension();
 
@@ -650,9 +650,14 @@ pub fn label_unique_label_map(map: &LabelMap, reverse_ordering: bool) -> Result<
             .expect("every label came from the input map");
         object.add_line(&entry.line.index()[..dim], entry.line.length())?;
     }
-    // The empty objects go back in too — see the module note on `.hxx:239`.
+    // §2.59 fix: drop objects whose pixels were all claimed by others. Upstream
+    // wrote this pass `while (it.IsAtEnd())` (never enters), leaving zero-line
+    // objects in the map and inflating `GetNumberOfLabelObjects()`; the intended
+    // `while (!it.IsAtEnd())` removes every `Empty()` object.
     for (_, object) in objects {
-        out.add_label_object(object)?;
+        if !object.is_empty() {
+            out.add_label_object(object)?;
+        }
     }
     Ok(out)
 }
@@ -1395,14 +1400,18 @@ mod tests {
     }
 
     #[test]
-    fn label_unique_keeps_a_fully_overlapped_object_as_an_empty_one() {
-        // Upstream's `while (it.IsAtEnd())` (itkAttributeUniqueLabelMapFilter.hxx:239)
-        // never removes it; neither do we.
+    fn label_unique_removes_a_fully_overlapped_object() {
+        // §2.59 fix: label 1's only pixels (x = 2, 3) lie inside label 2's run
+        // (x = 0..5), so the larger label 2 claims them and label 1 is left with
+        // zero lines. Upstream's `while (it.IsAtEnd())`
+        // (itkAttributeUniqueLabelMapFilter.hxx:239) never enters, so the empty
+        // object survived and inflated GetNumberOfLabelObjects(); the intended
+        // `while (!it.IsAtEnd())` removes it.
         let map = map_of(&[8, 1], 0, &[(1, &[([2, 0], 2)]), (2, &[([0, 0], 6)])]);
         let out = label_unique_label_map(&map, false).unwrap();
-        assert_eq!(out.number_of_label_objects(), 2);
-        assert!(out.label_object(1).unwrap().is_empty());
-        assert_eq!(shape_of(&out)[1], (2, vec![([0, 0], 6)]));
+        assert_eq!(out.number_of_label_objects(), 1);
+        assert!(out.label_object(1).is_none());
+        assert_eq!(shape_of(&out)[0], (2, vec![([0, 0], 6)]));
     }
 
     #[test]
