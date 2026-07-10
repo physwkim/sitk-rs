@@ -1508,6 +1508,22 @@ impl ImageRegistrationMethod {
     /// which takes its initial transform as an argument, has no counterpart
     /// upstream and never adapts (ledger §4.105).
     ///
+    /// The B-spline transform domain is derived from the grid the metric samples
+    /// in — the [`set_virtual_domain`](Self::set_virtual_domain) grid when one is
+    /// set, otherwise the fixed image. Upstream always uses the fixed image, so a
+    /// virtual domain silently produced a mismatched transform domain there; this
+    /// port honors it (ledger §3.53).
+    ///
+    /// **In-place contract**: with `in_place = true` (the default) and a
+    /// non-empty `scale_factors` list, the last level's adaptor re-grids the
+    /// transform to the finest mesh, so after `execute_with_initial_transform`
+    /// the stored initial transform ([`initial_transform`](Self::initial_transform))
+    /// carries that finest mesh — the optimum lives on it — **not** the mesh size
+    /// originally passed here. This is the intended in-place result (the stored
+    /// transform is the optimized one); pass `in_place = false` to receive the
+    /// optimized finest-mesh transform as the return value while the stored
+    /// transform is left untouched at its original mesh (ledger §3.53).
+    ///
     /// [`BSplineTransform`]: sitk_transform::BSplineTransform
     pub fn set_initial_transform_as_bspline(
         &mut self,
@@ -1985,6 +2001,17 @@ impl ImageRegistrationMethod {
             Transform::BSpline(b) => Some(b.transform_domain_mesh_size()),
             _ => None,
         };
+
+        // The B-spline transform domain must cover the grid the metric samples
+        // in — the *virtual domain* when one is set, otherwise the fixed image's
+        // own grid (upstream always uses `method->GetFixedImage()`, so a virtual
+        // domain silently derives the wrong transform domain; ledger §3.53). The
+        // metric's per-level fixed image is likewise built on this grid in
+        // `prepare_level`, so the two stay consistent.
+        let reference_grid = match &self.virtual_domain {
+            Some(v) => Some(v.grid()?),
+            None => None,
+        };
         let result = self.execute_levels(fixed, moving, initial, |level, factors, transform| {
             let (Some(mesh), Transform::BSpline(bspline)) = (&initial_mesh, transform) else {
                 return Ok(());
@@ -1996,13 +2023,14 @@ impl ImageRegistrationMethod {
             if scale < 1 {
                 return Ok(());
             }
-            let dim = fixed.dimension();
-            // The required domain's origin and direction come from the fixed
-            // image shrunk by this level's factors; its physical dimensions come
-            // from the full-resolution fixed image, as `spacing · (size − 1)`.
-            let shrunk = shrink(fixed, factors)?;
+            let base = reference_grid.as_ref().unwrap_or(fixed);
+            let dim = base.dimension();
+            // The required domain's origin and direction come from the reference
+            // grid shrunk by this level's factors; its physical dimensions come
+            // from the full-resolution reference grid, as `spacing · (size − 1)`.
+            let shrunk = shrink(base, factors)?;
             let physical_dimensions: Vec<f64> = (0..dim)
-                .map(|i| fixed.spacing()[i] * (fixed.size()[i] as f64 - 1.0))
+                .map(|i| base.spacing()[i] * (base.size()[i] as f64 - 1.0))
                 .collect();
             let required_mesh: Vec<usize> = mesh.iter().map(|&m| m * scale).collect();
             bspline.adapt_transform_parameters(
@@ -4068,6 +4096,59 @@ mod tests {
         let none = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
         assert_eq!(as_bspline(&none.transform).grid_size(), [5, 5]);
         assert_eq!(as_bspline(&none.transform).grid_spacing(), [8.0, 8.0]);
+    }
+
+    #[test]
+    fn the_bspline_adaptor_domain_follows_the_virtual_domain_when_one_is_set() {
+        // Upstream builds every B-spline adaptor from `method->GetFixedImage()`
+        // unconditionally, so a caller-supplied virtual domain silently derives
+        // the wrong transform domain (ledger §3.53). This port honors the virtual
+        // domain: the adapted transform's grid geometry comes from it, not the
+        // fixed image.
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
+
+        // A virtual domain unrelated to the fixed image's grid: 8² voxels at
+        // spacing 1.5 from origin (2, 2). Its physical dimensions are
+        // 1.5·(8 − 1) = 10.5 per axis.
+        let mut reg = geometry_only_method();
+        reg.set_virtual_domain(
+            vec![8, 8],
+            vec![2.0, 2.0],
+            vec![1.5, 1.5],
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        reg.set_initial_transform_as_bspline(
+            BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+            true,
+            vec![2],
+        );
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        let adapted = as_bspline(&result.transform);
+
+        // Mesh 2·[2,2] = [4,4] (grid 4 + 3 = 7 per axis), unchanged by the domain
+        // choice. But the grid spacing and origin follow the *virtual domain*:
+        // gridSpacing = 10.5 / 4 = 2.625 and gridOrigin = 2 − 2.625 = −0.625.
+        assert_eq!(adapted.transform_domain_mesh_size(), [4, 4]);
+        assert_eq!(adapted.grid_size(), [7, 7]);
+        assert_eq!(adapted.grid_spacing(), [2.625, 2.625]);
+        assert_eq!(adapted.grid_origin(), [-0.625, -0.625]);
+
+        // With the fixed image as the domain (physical dims 15, no virtual
+        // domain) the same run would give 15/4 = 3.75 and 0 − 3.75 = −3.75 —
+        // proving the virtual domain, not the fixed image, drove the geometry.
+        let mut baseline = geometry_only_method();
+        baseline.set_initial_transform_as_bspline(
+            BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+            true,
+            vec![2],
+        );
+        let base = baseline
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap();
+        assert_eq!(as_bspline(&base.transform).grid_spacing(), [3.75, 3.75]);
+        assert_eq!(as_bspline(&base.transform).grid_origin(), [-3.75, -3.75]);
     }
 
     #[test]
