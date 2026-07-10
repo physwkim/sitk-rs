@@ -347,12 +347,18 @@ fn hyper_sphere_radius_from_volume(dim: i64, volume: f64) -> f64 {
 
 // ---- linear algebra -------------------------------------------------------
 
-/// `itk::Math::AlmostEquals(x, 0.0)`, which is `FloatAlmostEqual<double>`
-/// with a 4-ULP tolerance. The ULP distance between `±0.0` and a finite `x`
-/// of the same sign is the magnitude of `x`'s bit pattern, so this is true
-/// only for `x` within four subnormal steps of zero.
+/// `itk::Math::AlmostEquals(x, 0.0)`, specialized to a comparison against
+/// exactly zero. `itkMath.h`'s `FloatAlmostEqual<double>` combines a ULP check
+/// (`maxUlps = 4`) with an absolute-difference check whose
+/// `maxAbsoluteDifference` defaults to `0.1 * NumericTraits<double>::epsilon()`
+/// (`itkMath.h:334-335`, `~2.22e-17`). That near-zero absolute path is tested
+/// *first* (`itkMath.h:339-343`) and, against a literal `0.0` comparand, is the
+/// dominant term — the ULP arm never fires — so the comparison collapses to
+/// `|x| <= 0.1 * epsilon`. (A prior version of this helper used a 4-ULP bit
+/// window `~2e-323`, understating the real window by ~10^306 and dividing where
+/// upstream skips the ratio; §2.154.)
 pub(crate) fn is_almost_zero(x: f64) -> bool {
-    x.abs().to_bits() <= 4
+    x.abs() <= 0.1 * f64::EPSILON
 }
 
 /// Determinant by LU with partial pivoting.
@@ -1585,12 +1591,20 @@ mod tests {
     }
 
     #[test]
-    fn is_almost_zero_matches_a_four_ulp_window() {
+    fn is_almost_zero_matches_the_zero_point_one_epsilon_window() {
+        // `AlmostEquals(x, 0.0)` collapses to `|x| <= 0.1 * eps(double)`
+        // (~2.22e-17), so every subnormal and every value up to that bound is
+        // almost-zero, and anything above it is not.
         assert!(is_almost_zero(0.0));
         assert!(is_almost_zero(-0.0));
         assert!(is_almost_zero(f64::from_bits(4)));
-        assert!(!is_almost_zero(f64::from_bits(5)));
-        assert!(!is_almost_zero(1e-300));
+        // Both were `false` under the old 4-ULP bit window; upstream's
+        // 0.1*eps window makes them almost-zero (§2.154).
+        assert!(is_almost_zero(f64::from_bits(5)));
+        assert!(is_almost_zero(1e-300));
+        // Upper edge of the window: `0.1*eps` is inside, `eps` is outside.
+        assert!(is_almost_zero(0.1 * f64::EPSILON));
+        assert!(!is_almost_zero(f64::EPSILON));
     }
 
     // ---- Oriented bounding box --------------------------------------------
