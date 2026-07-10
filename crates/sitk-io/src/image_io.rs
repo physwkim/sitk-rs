@@ -49,6 +49,7 @@ use crate::gipl::GiplImageIo;
 use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
+use crate::vtk::VtkImageIo;
 
 /// Which of [`ImageIo::can_read_file`] / [`ImageIo::can_write_file`] the
 /// registry probe should use. `itk::IOFileModeEnum`
@@ -173,6 +174,7 @@ static META_IMAGE_IO: MetaImageIo = MetaImageIo;
 static NRRD_IMAGE_IO: NrrdImageIo = NrrdImageIo;
 static NIFTI_IMAGE_IO: NiftiImageIo = NiftiImageIo;
 static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
+static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -180,7 +182,7 @@ static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 /// both `CreateImageIO` and `GetRegisteredImageIOs` iterate. Probe order is
 /// this order, so an earlier entry wins a tie.
 ///
-/// [`MetaImageIo`], [`NrrdImageIo`] and [`NiftiImageIo`]
+/// [`MetaImageIo`], [`NrrdImageIo`], [`NiftiImageIo`] and [`VtkImageIo`]
 /// advertise disjoint extension sets, so their relative order decides nothing
 /// for a named file. It does matter in phase 2 of [`create_image_io`], where an
 /// extension-less path is offered to every IO in turn: `MetaImageIo::
@@ -194,6 +196,7 @@ static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 /// own `CheckExtension` gate makes it claim `.gipl` and `.gipl.gz` and nothing
 /// else.
 ///
+/// [`VtkImageIo`]: crate::vtk::VtkImageIo
 /// [`GiplImageIo`]: crate::gipl::GiplImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
@@ -201,6 +204,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &NRRD_IMAGE_IO,
         &NIFTI_IMAGE_IO,
         &GIPL_IMAGE_IO,
+        &VTK_IMAGE_IO,
     ];
     IOS
 }

@@ -95,6 +95,19 @@ pub enum IoError {
     #[error("unsupported GIPL feature: {0}")]
     UnsupportedGiplFeature(String),
 
+    /// A legacy VTK header could not be parsed. Carries `VTKImageIO`'s own
+    /// message: `"Premature EOF in reading a line"`, `"Unrecognized type"`,
+    /// `"Not structured points, can't read"`, `"No dimensions defined"`, or
+    /// `"Unrecognized pixel type"` (itkVTKImageIO.cxx:46-193, :142).
+    #[error("malformed VTK header: {0}")]
+    MalformedVtkHeader(String),
+
+    /// A legacy VTK feature SimpleITK's wrapping layer cannot represent — a
+    /// `TENSORS` attribute (§3.33) — or a write `VTKImageIO` refuses, namely an
+    /// image of more than three dimensions (itkVTKImageIO.cxx:647-651).
+    #[error("unsupported VTK feature: {0}")]
+    UnsupportedVtkFeature(String),
+
     /// The pixel data was shorter than the header's declared size.
     #[error("pixel data is truncated")]
     TruncatedData,
