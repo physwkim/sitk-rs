@@ -60,8 +60,8 @@
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{
-    AffineTransform, BSplineTransform, CompositeTransform, Interpolator, ParametricTransform,
-    ResampleImageFilter, Transform, TransformBase, TranslationTransform,
+    AffineTransform, BSplineTransform, Interpolator, ParametricTransform, ResampleImageFilter,
+    Transform, TransformBase, TranslationTransform,
 };
 
 use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
@@ -482,12 +482,14 @@ enum OptimizerKind {
     ConjugateGradientLineSearch(ConjugateGradientLineSearchOptimizer),
     /// Bound-constrained limited-memory BFGS (`itk::LBFGSBOptimizerv4`). Unlike
     /// the gradient-descent optimizers it does **not** use parameter scales or a
-    /// learning rate — it drives the raw metric gradient through a line search —
-    /// and it optionally clamps every parameter to a scalar `[lower, upper]` box.
+    /// learning rate — it drives the metric gradient through a line search — and
+    /// it optionally clamps every parameter to a scalar `[lower, upper]` box. The
+    /// optimizer weights still apply, through the gradient (ledger §2.117).
     Lbfgsb(LbfgsbConfig),
     /// Unconstrained limited-memory BFGS (`itk::LBFGS2Optimizerv4`). Like
     /// [`Lbfgsb`](Self::Lbfgsb) it ignores parameter scales and the learning
-    /// rate, driving the raw metric gradient through its own line search.
+    /// rate, driving the metric gradient through its own line search; the
+    /// optimizer weights still apply, through the gradient (ledger §2.117).
     Lbfgs2(LBFGS2Optimizer),
     /// Nelder–Mead downhill simplex (`itk::AmoebaOptimizerv4`).
     Amoeba(AmoebaOptimizer),
@@ -503,8 +505,9 @@ enum OptimizerKind {
 impl OptimizerKind {
     /// Whether this optimizer ignores parameter scales and the learning-rate
     /// estimator. Both L-BFGS variants force identity scales in ITK
-    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the raw
-    /// metric gradient directly.
+    /// (`itk::LBFGSBOptimizerv4`, `itk::LBFGS2Optimizerv4`) and drive the metric
+    /// gradient directly. This concerns *scales* only — the optimizer *weights*
+    /// are applied to these optimizers' gradient separately (ledger §2.117).
     fn ignores_scales(&self) -> bool {
         matches!(self, OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_))
     }
@@ -1153,7 +1156,7 @@ impl ImageRegistrationMethod {
     /// `itkGradientDescentOptimizerv4.hxx:205-239`), and are the documented way
     /// to hold a parameter constant: a zero weight freezes it.
     ///
-    /// Three upstream behaviors this reproduces:
+    /// Three behaviors:
     ///
     /// - The length must equal the transform's
     ///   [`number_of_local_parameters`], **not** its parameter count. For a
@@ -1164,12 +1167,16 @@ impl ImageRegistrationMethod {
     /// - Weights within `1e-4` of `1.0` are treated as exactly identity and
     ///   never multiplied in (`m_WeightsAreIdentity`,
     ///   `itkObjectToObjectOptimizerBase.cxx:143-166`; ledger §2.116).
-    /// - The length is validated for **every** optimizer, but only the
-    ///   gradient-descent family applies the weights. The vnl-backed
-    ///   optimizers — `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and the
-    ///   gradient-free `AmoebaOptimizerv4` — validate and then ignore them.
-    ///   `LBFGS2Optimizerv4` derives from the gradient-descent template and
-    ///   *does* apply them (ledger §2.117).
+    /// - The weights are honored by **every** optimizer this crate exposes.
+    ///   Upstream validates them for every v4 optimizer but only the
+    ///   gradient-descent family actually applies them — the vnl-backed
+    ///   `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and gradient-free
+    ///   `AmoebaOptimizerv4` validate and then silently ignore a well-sized
+    ///   array. This port instead applies them uniformly (ledger §2.117): the
+    ///   scale-consuming optimizers fold the weights into their per-parameter
+    ///   step scaling, and the two L-BFGS optimizers — which ignore that scaling
+    ///   — apply the weights to the gradient they descend. A zero weight freezes
+    ///   its parameter exactly on every path.
     ///
     /// An empty vector (the default) means identity.
     ///
@@ -1400,24 +1407,29 @@ impl ImageRegistrationMethod {
     /// Set the transform the optimizer drives — SimpleITK
     /// `SetInitialTransform(const Transform &)`
     /// (`sitkImageRegistrationMethod.cxx:115-122`), which stores a deep copy
-    /// (`MakeUnique`) and turns the in-place flag **on**.
+    /// (`MakeUnique`).
     ///
     /// [`execute_with_initial_transform`](Self::execute_with_initial_transform)
     /// then optimizes it and returns it as the same concrete transform kind, and
     /// [`initial_transform`](Self::initial_transform) reflects the optimum. Use
     /// [`set_initial_transform_in_place`](Self::set_initial_transform_in_place)
     /// with `false` to leave the stored transform at its starting value and
-    /// receive the optimum as a fresh composite instead.
+    /// receive the optimum separately instead.
     ///
-    /// Note that this **re-enables** the in-place flag: calling it after a
-    /// `set_initial_transform_in_place(t, false)` silently restores in-place
-    /// optimization, exactly as upstream's single-argument overload does
-    /// (ledger §3.36). It also clears any per-level B-spline mesh scale factors
-    /// left by [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
+    /// The **in-place flag is left as it stands** — this setter only replaces the
+    /// transform. Upstream's single-argument overload silently forces the flag
+    /// back on, so a `set_initial_transform_in_place(t, false)` followed by a
+    /// plain `set_initial_transform` would quietly re-enable in-place
+    /// optimization with no diagnostic; this port removes that surprise by giving
+    /// the flag one meaning across every overload — it is the last *explicit*
+    /// choice made through [`set_initial_transform_in_place`](Self::set_initial_transform_in_place)
+    /// or [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline),
+    /// defaulting to `true` (ledger §3.36). It also clears any per-level B-spline
+    /// mesh scale factors left by
+    /// [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
     /// (`sitkImageRegistrationMethod.cxx:121`).
     pub fn set_initial_transform(&mut self, transform: Transform) -> &mut Self {
         self.initial_transform = Some(transform);
-        self.initial_transform_in_place = true;
         self.bspline_scale_factors = Vec::new();
         self
     }
@@ -1429,15 +1441,18 @@ impl ImageRegistrationMethod {
     /// Upstream, `inPlace` decides whether `itk::ImageRegistrationMethodv4`
     /// *grafts* the initial transform as its output — so the optimizer mutates
     /// that very ITK object — or `Clone()`s it and optimizes the copy
-    /// (`itkImageRegistrationMethodv4.hxx:733-758`). Two things follow, and both
-    /// are what this port reproduces:
+    /// (`itkImageRegistrationMethodv4.hxx:733-758`). What this port reproduces is
+    /// the observable effect on the stored transform; the returned transform is
+    /// always the same concrete kind that was set:
     ///
     /// - **`true`**: after `Execute`, the method's stored initial transform holds
     ///   the optimized parameters, and `Execute` returns *it* — same concrete
     ///   transform kind as was set.
     /// - **`false`**: the stored initial transform is untouched, and `Execute`
-    ///   returns a [`CompositeTransform`] wrapping a copy of the optimized
-    ///   transform (ledger §3.34).
+    ///   returns the optimized transform as that same concrete kind. Upstream
+    ///   instead wraps it in a single-entry
+    ///   [`CompositeTransform`](sitk_transform::CompositeTransform), which this
+    ///   port does not reproduce (ledger §3.34).
     ///
     /// Upstream's `inPlace = true` *additionally* aliases the caller's own
     /// `Transform` object, because C++ `Transform`s share one refcounted ITK
@@ -1484,13 +1499,37 @@ impl ImageRegistrationMethod {
     /// and never raises: a level with no entry, or an entry of `0`, gets **no
     /// adaptor** and keeps the mesh it already has (`if (scaleFactor < 1) return
     /// nullptr`, `:43-46`), while entries past the last level are ignored (ledger
-    /// §2.146). This port does the same.
+    /// §2.146). **This port instead validates the list at
+    /// [`execute_with_initial_transform`](Self::execute_with_initial_transform)
+    /// time**, so the caller's per-level intent is unambiguous: a non-empty list
+    /// must have exactly one entry per resolution level
+    /// ([`RegistrationError::BSplineScaleFactorLength`]) and every entry must be
+    /// at least `1` ([`RegistrationError::BSplineScaleFactorTooSmall`]). An empty
+    /// list — the default, and what the other initial-transform setters leave
+    /// behind — is still valid and runs no adaptation. The *mesh-absolute*
+    /// meaning of each factor (multiplying the initial mesh, above) is unchanged.
     ///
     /// The adaptation only runs through
     /// [`execute_with_initial_transform`](Self::execute_with_initial_transform),
     /// the port of upstream's `Execute`; the [`execute`](Self::execute) overload,
     /// which takes its initial transform as an argument, has no counterpart
     /// upstream and never adapts (ledger §4.105).
+    ///
+    /// The B-spline transform domain is derived from the grid the metric samples
+    /// in — the [`set_virtual_domain`](Self::set_virtual_domain) grid when one is
+    /// set, otherwise the fixed image. Upstream always uses the fixed image, so a
+    /// virtual domain silently produced a mismatched transform domain there; this
+    /// port honors it (ledger §3.53).
+    ///
+    /// **In-place contract**: with `in_place = true` (the default) and a
+    /// non-empty `scale_factors` list, the last level's adaptor re-grids the
+    /// transform to the finest mesh, so after `execute_with_initial_transform`
+    /// the stored initial transform ([`initial_transform`](Self::initial_transform))
+    /// carries that finest mesh — the optimum lives on it — **not** the mesh size
+    /// originally passed here. This is the intended in-place result (the stored
+    /// transform is the optimized one); pass `in_place = false` to receive the
+    /// optimized finest-mesh transform as the return value while the stored
+    /// transform is left untouched at its original mesh (ledger §3.53).
     ///
     /// [`BSplineTransform`]: sitk_transform::BSplineTransform
     pub fn set_initial_transform_as_bspline(
@@ -1910,16 +1949,19 @@ impl ImageRegistrationMethod {
     /// [`set_initial_transform`](Self::set_initial_transform) — SimpleITK
     /// `Execute(fixed, moving)` (`sitkImageRegistrationMethod.cxx:763-990`).
     ///
-    /// The in-place flag decides what comes back and what happens to the stored
-    /// transform (`:961-989`):
+    /// The in-place flag decides only what happens to the *stored* transform
+    /// (`:961-989`); the returned transform is always the same concrete kind the
+    /// caller configured:
     ///
     /// - **in-place** (the default): the stored transform is updated to the
     ///   optimum and returned, keeping its concrete kind.
     /// - **not in-place**: the stored transform keeps its starting values, and
-    ///   the optimum is returned as a [`CompositeTransform`] holding a single
-    ///   sub-transform. Upstream wraps it because `sitk::Transform` has no
-    ///   constructor from an arbitrary ITK transform — its own source calls this
-    ///   out as a TODO (ledger §3.34).
+    ///   the optimum is returned as that same concrete kind. Upstream instead
+    ///   wraps it in a single-entry
+    ///   [`CompositeTransform`](sitk_transform::CompositeTransform) because
+    ///   `sitk::Transform` has no constructor from an arbitrary ITK transform —
+    ///   its own source calls this out as a TODO — which this port has no need to
+    ///   reproduce (ledger §3.34).
     ///
     /// When the initial transform was set by
     /// [`set_initial_transform_as_bspline`](Self::set_initial_transform_as_bspline)
@@ -1942,26 +1984,60 @@ impl ImageRegistrationMethod {
         // *initial* transform's mesh size, so the factors are absolute rather
         // than cumulative (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:147,62-68`).
         let scale_factors = self.bspline_scale_factors.clone();
+
+        // A non-empty scale-factor list must have exactly one entry per
+        // resolution level, and every entry must be at least 1. Upstream
+        // silently skips a level with no factor and treats a `< 1` factor as a
+        // null adaptor; this port rejects both so the caller's per-level intent
+        // is unambiguous (ledger §2.146). An empty list runs no adaptation.
+        if !scale_factors.is_empty() {
+            let num_levels = self.level_schedule(fixed)?.len();
+            if scale_factors.len() != num_levels {
+                return Err(RegistrationError::BSplineScaleFactorLength {
+                    got: scale_factors.len(),
+                    expected: num_levels,
+                });
+            }
+            if let Some((level, &factor)) = scale_factors.iter().enumerate().find(|&(_, &f)| f < 1)
+            {
+                return Err(RegistrationError::BSplineScaleFactorTooSmall { level, factor });
+            }
+        }
+
         let initial_mesh = match &initial {
             Transform::BSpline(b) => Some(b.transform_domain_mesh_size()),
             _ => None,
+        };
+
+        // The B-spline transform domain must cover the grid the metric samples
+        // in — the *virtual domain* when one is set, otherwise the fixed image's
+        // own grid (upstream always uses `method->GetFixedImage()`, so a virtual
+        // domain silently derives the wrong transform domain; ledger §3.53). The
+        // metric's per-level fixed image is likewise built on this grid in
+        // `prepare_level`, so the two stay consistent.
+        let reference_grid = match &self.virtual_domain {
+            Some(v) => Some(v.grid()?),
+            None => None,
         };
         let result = self.execute_levels(fixed, moving, initial, |level, factors, transform| {
             let (Some(mesh), Transform::BSpline(bspline)) = (&initial_mesh, transform) else {
                 return Ok(());
             };
-            // No entry for this level, or a factor of zero, means no adaptor.
+            // Validation above guarantees a non-empty list has one `>= 1` entry
+            // per level; the only way to reach the skip is an empty list, which
+            // means no B-spline adaptation at all.
             let scale = scale_factors.get(level).copied().unwrap_or(0);
             if scale < 1 {
                 return Ok(());
             }
-            let dim = fixed.dimension();
-            // The required domain's origin and direction come from the fixed
-            // image shrunk by this level's factors; its physical dimensions come
-            // from the full-resolution fixed image, as `spacing · (size − 1)`.
-            let shrunk = shrink(fixed, factors)?;
+            let base = reference_grid.as_ref().unwrap_or(fixed);
+            let dim = base.dimension();
+            // The required domain's origin and direction come from the reference
+            // grid shrunk by this level's factors; its physical dimensions come
+            // from the full-resolution reference grid, as `spacing · (size − 1)`.
+            let shrunk = shrink(base, factors)?;
             let physical_dimensions: Vec<f64> = (0..dim)
-                .map(|i| fixed.spacing()[i] * (fixed.size()[i] as f64 - 1.0))
+                .map(|i| base.spacing()[i] * (base.size()[i] as f64 - 1.0))
                 .collect();
             let required_mesh: Vec<usize> = mesh.iter().map(|&m| m * scale).collect();
             bspline.adapt_transform_parameters(
@@ -1973,20 +2049,17 @@ impl ImageRegistrationMethod {
             Ok(())
         })?;
 
+        // In place: write the optimum back to the stored transform. Not in
+        // place: leave the stored transform at its starting value. Either way the
+        // optimum comes back as the same concrete transform kind the caller
+        // configured — upstream wraps the not-in-place result in a single-entry
+        // CompositeTransform only because `sitk::Transform` has no constructor
+        // from an arbitrary ITK transform (its own source flags this as a TODO),
+        // which this port has no need to reproduce (ledger §3.34).
         if self.initial_transform_in_place {
             self.initial_transform = Some(result.transform.clone());
-            return Ok(result);
         }
-
-        let mut composite = CompositeTransform::new(result.transform.dimension());
-        composite.add_transform(result.transform)?;
-        Ok(RegistrationResult {
-            transform: composite.into(),
-            metric_value: result.metric_value,
-            iterations: result.iterations,
-            stop_reason: result.stop_reason,
-            valid_points: result.valid_points,
-        })
+        Ok(result)
     }
 
     /// Evaluate the configured metric once, at the configured transforms, with
@@ -2299,18 +2372,22 @@ impl ImageRegistrationMethod {
         };
 
         // ITK modifies the gradient in place by `weights[j % n] / scales[j % n]`
-        // (`ModifyGradientByScalesOverSubRange`). This crate's optimizers instead
-        // *divide* the gradient by a per-parameter array, so the driver hands
-        // them the reciprocal of that factor, `scales[j] / weights[j % n]`.
-        // A zero weight — upstream's documented way to hold a parameter constant
-        // — becomes an infinite divisor, and `g / ∞ == 0` is exactly the frozen
-        // parameter `g * 0 == 0` gives ITK.
+        // (`ModifyGradientByScalesOverSubRange`). This crate's optimizers that
+        // consume `scales` instead *divide* the gradient by a per-parameter
+        // array, so the driver folds the weights into that array as its
+        // reciprocal, `scales[j] / weights[j % n]`. A zero weight — upstream's
+        // documented way to hold a parameter constant — becomes an infinite
+        // divisor, and `g / ∞ == 0` is exactly the frozen parameter `g * 0 == 0`
+        // gives ITK.
         //
-        // The optimizers that ignore scales ignore the weights with them: only
-        // the gradient-descent family owns `ModifyGradientByScalesOverSubRange`
-        // (ledger §2.117).
+        // The two L-BFGS variants ignore the estimated/manual `scales` (ITK
+        // forces identity scales on the vnl-backed LBFGSB), so weights cannot
+        // ride in on this array for them; they apply the weights directly to the
+        // gradient they descend instead — see `weighted_objective!` below. Either
+        // way the weights are honored for every optimizer (ledger §2.117).
         let weights = &self.optimizer_weights;
-        let scales: Vec<f64> = if ignores_scales || weights_are_identity(weights) {
+        let apply_weights = !weights_are_identity(weights);
+        let scales: Vec<f64> = if ignores_scales || !apply_weights {
             scales
         } else {
             scales
@@ -2341,6 +2418,29 @@ impl ImageRegistrationMethod {
                     (m.value, m.derivative)
                 }
             };
+        }
+        // The objective with the optimizer weights applied to the gradient the
+        // optimizer descends, `g[j] *= weights[j % n]` — ITK's
+        // `ModifyGradientByScales` mechanism. Used by the two L-BFGS variants,
+        // which ignore the `scales` array the weights otherwise fold into, so the
+        // weights would be validated then silently dropped without this. A zero
+        // weight zeroes that gradient component at every evaluation, which for a
+        // diagonally-initialized (quasi-)Newton method keeps the parameter
+        // exactly at its start — the two-loop recursion never gives a frozen
+        // component a nonzero search direction (ledger §2.117).
+        macro_rules! weighted_objective {
+            () => {{
+                let mut base = objective!();
+                move |p: &[f64]| {
+                    let (v, mut g) = base(p);
+                    if apply_weights {
+                        for (j, gj) in g.iter_mut().enumerate() {
+                            *gj *= weights[j % weights.len()];
+                        }
+                    }
+                    (v, g)
+                }
+            }};
         }
         // The line searches take an `Objective` so their golden-section probes
         // reach `ActiveMetric::value` instead of the closure adapter's
@@ -2501,15 +2601,17 @@ impl ImageRegistrationMethod {
                 }
             }
             OptimizerKind::Lbfgsb(cfg) => {
-                // No scales, no learning-rate estimation: LBFGSB minimizes the raw
+                // No scales and no learning-rate estimation: LBFGSB minimizes the
                 // metric directly under its own bound/convergence configuration.
+                // The optimizer weights still apply, through the gradient.
                 let optimizer = cfg.build(nparams);
-                optimizer.optimize(start, objective!())
+                optimizer.optimize(start, weighted_objective!())
             }
             OptimizerKind::Lbfgs2(l) => {
                 // Unbounded L-BFGS; like LBFGSB it ignores scales and drives the
-                // raw metric gradient through its own line search.
-                l.optimize(start, objective!())
+                // metric gradient through its own line search, with the optimizer
+                // weights applied to that gradient.
+                l.optimize(start, weighted_objective!())
             }
             // The four gradient-free optimizers below take the *unscaled*
             // parameters and apply `scales` themselves — each ports ITK's
@@ -2913,10 +3015,11 @@ mod initial_transform_tests {
     }
 
     /// Not in place: the stored transform keeps its starting values, and the
-    /// optimum comes back wrapped in a single-entry `CompositeTransform`
+    /// optimum comes back as the same concrete transform kind the caller set —
+    /// not wrapped in a single-entry `CompositeTransform` the way upstream does
     /// (ledger §3.34).
     #[test]
-    fn not_in_place_execute_leaves_the_stored_transform_and_returns_a_composite() {
+    fn not_in_place_execute_leaves_the_stored_transform_and_returns_the_concrete_kind() {
         let (fixed, moving) = in_place_fixture();
         let mut reg = ImageRegistrationMethod::new();
         tuned(&mut reg);
@@ -2925,15 +3028,14 @@ mod initial_transform_tests {
 
         let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
 
-        let sub = match &result.transform {
-            Transform::Composite(c) => {
-                assert_eq!(c.number_of_transforms(), 1);
-                c.nth_transform(0).unwrap()
-            }
-            other => panic!("expected a composite, got {other:?}"),
-        };
-        assert!(matches!(sub, Transform::Translation(_)));
-        let optimum = sub.parameters();
+        // The optimum is a Translation — the concrete kind that was set — with no
+        // composite wrapper.
+        assert!(
+            matches!(result.transform, Transform::Translation(_)),
+            "expected a Translation, got {:?}",
+            result.transform
+        );
+        let optimum = result.transform.parameters();
         assert!((optimum[0] - 3.0).abs() < 1e-2 && (optimum[1] + 2.0).abs() < 1e-2);
 
         // The stored transform never moved.
@@ -2963,16 +3065,24 @@ mod initial_transform_tests {
         assert_eq!(ra.metric_value, rb.metric_value);
     }
 
-    /// The single-argument setter turns the in-place flag back on, exactly as
-    /// `SetInitialTransform(const Transform &)` does after a
-    /// `SetInitialTransform(t, false)`.
+    /// The single-argument setter leaves the in-place flag as it stands: unlike
+    /// upstream's `SetInitialTransform(const Transform &)`, which silently forces
+    /// the flag back on, this port keeps the last explicit choice so the flag has
+    /// one meaning across every overload (ledger §3.36).
     #[test]
-    fn the_single_argument_setter_restores_the_in_place_flag() {
+    fn the_single_argument_setter_preserves_the_in_place_flag() {
         let mut reg = ImageRegistrationMethod::new();
+        // Fresh method: the flag defaults to true, and a plain set keeps it.
+        assert!(reg.initial_transform_in_place());
+        reg.set_initial_transform(translation(0.0, 0.0));
+        assert!(reg.initial_transform_in_place());
+
+        // After an explicit not-in-place choice, a plain set does NOT re-enable
+        // it — the surprise upstream has.
         reg.set_initial_transform_in_place(translation(0.0, 0.0), false);
         assert!(!reg.initial_transform_in_place());
         reg.set_initial_transform(translation(0.0, 0.0));
-        assert!(reg.initial_transform_in_place());
+        assert!(!reg.initial_transform_in_place());
     }
 
     #[test]
@@ -3487,6 +3597,44 @@ mod tests {
     }
 
     #[test]
+    fn lbfgs2_applies_the_optimizer_weights() {
+        // LBFGS2Optimizerv4 derives from the gradient-descent template and calls
+        // ModifyGradientByScales in EvaluateCost, so — unlike the vnl-backed
+        // L-BFGS-B — it does apply well-sized weights (ledger §2.117). A zero
+        // weight freezes its parameter exactly.
+        let (fixed, moving, tx, ty) = shifted_blob_pair();
+        let run = |weights: Vec<f64>| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_lbfgs2(1e-8, 0, 6, 0, 1e-5, 40, 1e-20, 1e20, 1e-4)
+                .set_optimizer_weights(weights);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .transform
+                .parameters()
+        };
+
+        // Unweighted, both parameters recover the shift (ty = −2 here).
+        let free = run(Vec::new());
+        assert!(
+            (free[0] - tx).abs() < 1e-3 && (free[1] - ty).abs() < 1e-3,
+            "unweighted recovered {free:?}, expected [{tx}, {ty}]"
+        );
+
+        // A zero y-weight freezes y at its initial 0 exactly while x converges.
+        let frozen = run(vec![1.0, 0.0]);
+        assert_eq!(
+            frozen[1], 0.0,
+            "the zero-weighted parameter moved to {}",
+            frozen[1]
+        );
+        assert!(
+            (frozen[0] - tx).abs() < 5e-2,
+            "the unfrozen parameter recovered {} not ≈{tx}",
+            frozen[0]
+        );
+    }
+
+    #[test]
     fn nearest_neighbor_interpolator_drives_the_exhaustive_scan() {
         // Nearest neighbor makes the metric piecewise constant, so its analytic
         // derivative is zero almost everywhere and gradient descent cannot move.
@@ -3926,19 +4074,18 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_or_missing_bspline_scale_factor_leaves_the_level_unadapted() {
-        // `if (scaleFactor < 1) { return nullptr; }`
-        // (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:43-46`) and
-        // the `m_TransformBSplineScaleFactors.size() > level` guard (`:169-172`,
-        // which leaves `bsplineScaleFactor = 0`) both yield a null adaptor: that
-        // level keeps whatever grid the transform already has. Neither a short
-        // factor list nor a zero entry is an error (ledger §2.146).
+    fn a_zero_or_short_bspline_scale_factor_list_is_rejected() {
+        // Upstream silently turns a `< 1` factor or a missing level into a null
+        // adaptor (`if (scaleFactor < 1) return nullptr`,
+        // `sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:43-46`, plus
+        // the `m_TransformBSplineScaleFactors.size() > level` guard `:169-172`),
+        // silently leaving that level's mesh unadapted. This port rejects both so
+        // the caller's per-level intent is unambiguous (ledger §2.146). The
+        // mesh-absolute meaning of a valid factor is unchanged.
         let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
         let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
 
-        // Factor 0 at level 0: the level runs on the untouched [2,2] mesh whose
-        // grid came from `from_image_domain` (physical dimensions 16, not 15).
-        // Level 1 then adapts to 2·[2,2].
+        // Factor 0 at level 0 is rejected — it cannot express a mesh.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
@@ -3947,14 +4094,22 @@ mod tests {
                 true,
                 vec![0, 2],
             );
-        let zeroed = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
-        assert_eq!(as_bspline(&zeroed.transform).grid_size(), [7, 7]);
-        assert_eq!(as_bspline(&zeroed.transform).grid_spacing(), [3.75, 3.75]);
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorTooSmall {
+                    level: 0,
+                    factor: 0
+                }
+            ),
+            "unexpected error {err:?}"
+        );
 
-        // Only one factor for two levels: level 1 has no adaptor, so the result
-        // keeps level 0's grid — built from the *shrunk* fixed image's origin
-        // 0.5 and physical dimensions 15, giving spacing 15/6 and origin
-        // 0.5 − 2.5 = −2.0.
+        // Only one factor for two levels is rejected — the second level would be
+        // silently unadapted upstream.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
@@ -3963,16 +4118,46 @@ mod tests {
                 true,
                 vec![3],
             );
-        let short = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
-        assert_eq!(
-            as_bspline(&short.transform).transform_domain_mesh_size(),
-            [6, 6]
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorLength {
+                    got: 1,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
         );
-        assert_eq!(as_bspline(&short.transform).grid_spacing(), [2.5, 2.5]);
-        assert_eq!(as_bspline(&short.transform).grid_origin(), [-2.0, -2.0]);
+
+        // Too many factors for the level count is likewise rejected, where
+        // upstream would silently drop the extras.
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![1, 2, 4],
+            );
+        let err = reg
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::BSplineScaleFactorLength {
+                    got: 3,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
+        );
 
         // An empty factor list — what `set_initial_transform` leaves behind —
-        // adapts no level at all.
+        // remains valid and adapts no level at all.
         let mut reg = geometry_only_method();
         reg.set_shrink_factors_per_level(vec![2, 1])
             .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
@@ -3985,6 +4170,59 @@ mod tests {
         let none = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
         assert_eq!(as_bspline(&none.transform).grid_size(), [5, 5]);
         assert_eq!(as_bspline(&none.transform).grid_spacing(), [8.0, 8.0]);
+    }
+
+    #[test]
+    fn the_bspline_adaptor_domain_follows_the_virtual_domain_when_one_is_set() {
+        // Upstream builds every B-spline adaptor from `method->GetFixedImage()`
+        // unconditionally, so a caller-supplied virtual domain silently derives
+        // the wrong transform domain (ledger §3.53). This port honors the virtual
+        // domain: the adapted transform's grid geometry comes from it, not the
+        // fixed image.
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
+
+        // A virtual domain unrelated to the fixed image's grid: 8² voxels at
+        // spacing 1.5 from origin (2, 2). Its physical dimensions are
+        // 1.5·(8 − 1) = 10.5 per axis.
+        let mut reg = geometry_only_method();
+        reg.set_virtual_domain(
+            vec![8, 8],
+            vec![2.0, 2.0],
+            vec![1.5, 1.5],
+            vec![1.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        reg.set_initial_transform_as_bspline(
+            BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+            true,
+            vec![2],
+        );
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        let adapted = as_bspline(&result.transform);
+
+        // Mesh 2·[2,2] = [4,4] (grid 4 + 3 = 7 per axis), unchanged by the domain
+        // choice. But the grid spacing and origin follow the *virtual domain*:
+        // gridSpacing = 10.5 / 4 = 2.625 and gridOrigin = 2 − 2.625 = −0.625.
+        assert_eq!(adapted.transform_domain_mesh_size(), [4, 4]);
+        assert_eq!(adapted.grid_size(), [7, 7]);
+        assert_eq!(adapted.grid_spacing(), [2.625, 2.625]);
+        assert_eq!(adapted.grid_origin(), [-0.625, -0.625]);
+
+        // With the fixed image as the domain (physical dims 15, no virtual
+        // domain) the same run would give 15/4 = 3.75 and 0 − 3.75 = −3.75 —
+        // proving the virtual domain, not the fixed image, drove the geometry.
+        let mut baseline = geometry_only_method();
+        baseline.set_initial_transform_as_bspline(
+            BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+            true,
+            vec![2],
+        );
+        let base = baseline
+            .execute_with_initial_transform(&fixed, &moving)
+            .unwrap();
+        assert_eq!(as_bspline(&base.transform).grid_spacing(), [3.75, 3.75]);
+        assert_eq!(as_bspline(&base.transform).grid_origin(), [-3.75, -3.75]);
     }
 
     #[test]
@@ -5532,11 +5770,15 @@ mod tests {
     }
 
     #[test]
-    fn lbfgsb_validates_the_weights_length_and_then_ignores_the_weights() {
+    fn lbfgsb_validates_the_weights_length_and_applies_them() {
         // ObjectToObjectOptimizerBase::StartOptimization validates m_Weights for
-        // every v4 optimizer, but only the gradient-descent family owns
-        // ModifyGradientByScalesOverSubRange. So L-BFGS-B rejects a mis-sized
-        // array and silently discards a well-sized one (ledger §2.117).
+        // every v4 optimizer. Upstream's vnl-backed L-BFGS-B then validates and
+        // then silently *drops* a well-sized array, because only the
+        // gradient-descent family owns ModifyGradientByScalesOverSubRange. This
+        // port honors the weights instead (ledger §2.117): they scale the
+        // gradient L-BFGS-B descends, so a zero weight freezes its parameter
+        // exactly, the same documented "hold a parameter constant" behavior
+        // gradient descent gives.
         let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
         let moving = gaussian(40, 40, 23.0, 18.0, 7.0, 1.0);
         let run = |weights: Vec<f64>| {
@@ -5546,12 +5788,28 @@ mod tests {
             reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
         };
 
-        // A zero weight would freeze y under gradient descent; L-BFGS-B ignores
-        // it and still recovers the full translation.
-        let weighted = run(vec![1.0, 0.0]).unwrap().transform.parameters();
+        // Unweighted, L-BFGS-B recovers the full translation, y ≈ −2.
         let unweighted = run(Vec::new()).unwrap().transform.parameters();
-        assert_eq!(weighted, unweighted);
-        assert!((weighted[1] + 2.0).abs() < 1e-2, "y = {}", weighted[1]);
+        assert!(
+            (unweighted[1] + 2.0).abs() < 1e-2,
+            "unweighted y = {}",
+            unweighted[1]
+        );
+
+        // A zero y-weight freezes y at its initial 0 exactly, while x still
+        // converges (to the best x under the y = 0 constraint, which the
+        // y-mismatch pulls slightly off 3).
+        let weighted = run(vec![1.0, 0.0]).unwrap().transform.parameters();
+        assert_eq!(
+            weighted[1], 0.0,
+            "the zero-weighted parameter moved to {}",
+            weighted[1]
+        );
+        assert!(
+            (weighted[0] - 3.0).abs() < 5e-2,
+            "the unfrozen parameter recovered {} not ≈3",
+            weighted[0]
+        );
 
         // The length is still validated.
         let err = run(vec![1.0, 1.0, 1.0]).unwrap_err();
