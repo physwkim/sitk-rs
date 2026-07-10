@@ -33,7 +33,7 @@
 //!
 //! ```
 //! use sitk_registration::LandmarkBasedTransformInitializer;
-//! use sitk_transform::{Euler2DTransform, Transform};
+//! use sitk_transform::{Euler2DTransform, TransformBase};
 //!
 //! // Rotate 30 degrees about the origin, then translate by (5, 0).
 //! let angle = 30.0f64.to_radians();
@@ -409,7 +409,7 @@ fn centroid(points: &[Vec<f64>], dim: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::Transform;
+    use sitk_transform::TransformBase;
 
     #[test]
     fn recovers_known_versor_rigid_3d() {

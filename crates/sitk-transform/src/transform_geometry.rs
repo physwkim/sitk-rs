@@ -7,7 +7,7 @@
 //! pixel-value computation to port).
 //!
 //! `VerifyPreconditions` requires `transform->IsLinear()`
-//! ([`Transform::is_linear`]); this port checks the same thing and returns
+//! ([`TransformBase::is_linear`]); this port checks the same thing and returns
 //! [`TransformError::NonLinearTransform`] rather than throwing.
 //!
 //! ## Deriving the new geometry
@@ -26,7 +26,7 @@
 //! ```
 //!
 //! where `Tinv` is `transform`'s inverse. Rather than requiring every
-//! [`Transform`] implementor to expose an `inverse()` method, this port
+//! [`TransformBase`] implementor to expose an `inverse()` method, this port
 //! derives `Tinv` from the two trait methods already guaranteed exact for a
 //! linear transform: `T(x) = M·x + b` with `M = jacobian_wrt_position(_)`
 //! (constant, independent of the point, precisely because `is_linear()` is
@@ -41,13 +41,13 @@
 use sitk_core::{Image, matrix};
 
 use crate::error::{Result, TransformError};
-use crate::transform::Transform;
+use crate::transform::TransformBase;
 
 /// `TransformGeometryImageFilter`: rewrite `image`'s origin, spacing, and
 /// direction so that its physical space relates to the original by
 /// `transform`, leaving every pixel value unchanged. See the module docs for
 /// the exact derivation and the linearity precondition.
-pub fn transform_geometry<T: Transform>(image: &Image, transform: &T) -> Result<Image> {
+pub fn transform_geometry<T: TransformBase>(image: &Image, transform: &T) -> Result<Image> {
     let dim = image.dimension();
     if transform.dimension() != dim {
         return Err(TransformError::DimensionMismatch);

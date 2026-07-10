@@ -10,7 +10,7 @@
 //!
 //! # Why this lives in `sitk-transform` and not `sitk-filters`
 //!
-//! `WarpImageFilter` takes no [`Transform`](crate::Transform) — its second
+//! `WarpImageFilter` takes no [`TransformBase`](crate::TransformBase) — its second
 //! input is a displacement-field *image*. On that count it would belong in
 //! `sitk-filters`. But it needs `sitkCreateInterpolator.hxx`'s full
 //! `InterpolatorEnum` (`WarpImageFilter.yaml`'s `Interpolator` member), which

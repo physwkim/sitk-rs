@@ -1,6 +1,6 @@
 //! Spatial transforms.
 //!
-//! A [`Transform`] maps a point in one physical space to another. In resampling
+//! A [`TransformBase`] maps a point in one physical space to another. In resampling
 //! it maps a point in the **output** image's physical space to the **input**
 //! image's physical space (ITK's backward mapping convention).
 
@@ -8,7 +8,7 @@ use crate::error::{Result, TransformError};
 use sitk_core::matrix;
 
 /// A spatial coordinate transform.
-pub trait Transform {
+pub trait TransformBase {
     /// Map a physical point to its transformed physical point.
     fn transform_point(&self, point: &[f64]) -> Vec<f64>;
     /// Spatial dimension the transform operates on.
@@ -40,7 +40,7 @@ pub trait Transform {
 
     /// Jacobian `∂(transform_point(point))ᵢ / ∂pointⱼ`, row-major
     /// `dimension × dimension` — ITK's
-    /// `Transform::ComputeJacobianWithRespectToPosition`. This is what
+    /// `TransformBase::ComputeJacobianWithRespectToPosition`. This is what
     /// [`CompositeTransform`] chain-rules through when it assembles the
     /// parameter Jacobian of a stack.
     ///
@@ -52,7 +52,7 @@ pub trait Transform {
     /// derivative is a B-spline / field derivative this crate does not yet
     /// expose.
     ///
-    /// [`transform_point`]: Transform::transform_point
+    /// [`transform_point`]: TransformBase::transform_point
     /// [`CompositeTransform`]: crate::CompositeTransform
     /// [`BSplineTransform`]: crate::BSplineTransform
     /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
@@ -101,7 +101,7 @@ macro_rules! matrix_jacobian_wrt_position {
 /// exposes the Jacobian of the mapped point with respect to those parameters.
 /// This is the interface registration optimizes over, mirroring ITK's
 /// `Transform::GetJacobianWithRespectToParameters`.
-pub trait ParametricTransform: Transform {
+pub trait ParametricTransform: TransformBase {
     /// Number of free parameters.
     fn number_of_parameters(&self) -> usize;
 
@@ -140,7 +140,7 @@ pub trait ParametricTransform: Transform {
     /// [`dimension`] (one displacement vector per pixel).
     ///
     /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
-    /// [`dimension`]: Transform::dimension
+    /// [`dimension`]: TransformBase::dimension
     fn number_of_local_parameters(&self) -> usize {
         self.number_of_parameters()
     }
@@ -181,7 +181,7 @@ pub trait ParametricTransform: Transform {
     /// on them (e.g. a future displacement-field scales path).
     ///
     /// [`jacobian_wrt_parameters`]: ParametricTransform::jacobian_wrt_parameters
-    /// [`dimension`]: Transform::dimension
+    /// [`dimension`]: TransformBase::dimension
     /// [`has_local_support`]: ParametricTransform::has_local_support
     /// [`BSplineTransform`]: crate::BSplineTransform
     /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
@@ -195,17 +195,17 @@ pub trait ParametricTransform: Transform {
 /// `itk::MatrixOffsetTransformBase::SetCenter` / `SetTranslation`. This is the
 /// interface `CenteredTransformInitializer` configures; a pure
 /// [`TranslationTransform`] has no center and so does not implement it.
-pub trait CenteredTransform: Transform {
+pub trait CenteredTransform: TransformBase {
     /// Set the fixed center of rotation (length = [`dimension`]). The matrix and
     /// translation are unchanged; the applied offset is recomputed.
     ///
-    /// [`dimension`]: Transform::dimension
+    /// [`dimension`]: TransformBase::dimension
     fn set_center(&mut self, center: &[f64]);
 
     /// Set the translation (length = [`dimension`]). The matrix and center are
     /// unchanged; the applied offset is recomputed.
     ///
-    /// [`dimension`]: Transform::dimension
+    /// [`dimension`]: TransformBase::dimension
     fn set_translation(&mut self, translation: &[f64]);
 }
 
@@ -228,7 +228,7 @@ impl TranslationTransform {
     }
 }
 
-impl Transform for TranslationTransform {
+impl TransformBase for TranslationTransform {
     /// `T(x) = x + t`, so `dT/dx` is the identity.
     fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
         let dim = self.translation.len();
@@ -356,7 +356,7 @@ impl AffineTransform {
     }
 }
 
-impl Transform for AffineTransform {
+impl TransformBase for AffineTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -495,7 +495,7 @@ impl Euler2DTransform {
     }
 }
 
-impl Transform for Euler2DTransform {
+impl TransformBase for Euler2DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -638,7 +638,7 @@ impl Similarity2DTransform {
     }
 }
 
-impl Transform for Similarity2DTransform {
+impl TransformBase for Similarity2DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -843,7 +843,7 @@ impl Euler3DTransform {
     }
 }
 
-impl Transform for Euler3DTransform {
+impl TransformBase for Euler3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -1176,7 +1176,7 @@ impl VersorRigid3DTransform {
     }
 }
 
-impl Transform for VersorRigid3DTransform {
+impl TransformBase for VersorRigid3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -1417,7 +1417,7 @@ impl Similarity3DTransform {
     }
 }
 
-impl Transform for Similarity3DTransform {
+impl TransformBase for Similarity3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -1695,7 +1695,7 @@ impl ScaleVersor3DTransform {
     }
 }
 
-impl Transform for ScaleVersor3DTransform {
+impl TransformBase for ScaleVersor3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -1995,7 +1995,7 @@ impl ScaleSkewVersor3DTransform {
     }
 }
 
-impl Transform for ScaleSkewVersor3DTransform {
+impl TransformBase for ScaleSkewVersor3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -2310,7 +2310,7 @@ impl ComposeScaleSkewVersor3DTransform {
     }
 }
 
-impl Transform for ComposeScaleSkewVersor3DTransform {
+impl TransformBase for ComposeScaleSkewVersor3DTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -2589,7 +2589,7 @@ impl VersorTransform {
     }
 }
 
-impl Transform for VersorTransform {
+impl TransformBase for VersorTransform {
     matrix_jacobian_wrt_position!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
@@ -2715,7 +2715,7 @@ impl ScaleTransform {
     }
 }
 
-impl Transform for ScaleTransform {
+impl TransformBase for ScaleTransform {
     /// `T(x)ᵢ = (xᵢ − cᵢ)·sᵢ + cᵢ`, so `dT/dx = diag(s)`
     /// (`itk::ScaleTransform::ComputeJacobianWithRespectToPosition`).
     fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
@@ -2821,7 +2821,7 @@ impl ScaleLogarithmicTransform {
     }
 }
 
-impl Transform for ScaleLogarithmicTransform {
+impl TransformBase for ScaleLogarithmicTransform {
     /// Identical to [`ScaleTransform`]: the logarithmic parameterization changes
     /// the parameter Jacobian, not the spatial one.
     fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
@@ -4090,10 +4090,10 @@ mod tests {
     }
 
     /// Central finite difference of `transform_point` — the same formula the
-    /// `Transform::jacobian_wrt_position` default uses, recomputed here so the
+    /// `TransformBase::jacobian_wrt_position` default uses, recomputed here so the
     /// analytic overrides are checked against the thing they replace rather
     /// than against themselves.
-    fn fd_position_jacobian(t: &dyn Transform, point: &[f64]) -> Vec<f64> {
+    fn fd_position_jacobian(t: &dyn TransformBase, point: &[f64]) -> Vec<f64> {
         let dim = t.dimension();
         let mut jac = vec![0.0; dim * dim];
         for (c, &pc) in point.iter().enumerate().take(dim) {
@@ -4111,7 +4111,7 @@ mod tests {
         jac
     }
 
-    fn assert_position_jacobian_matches_fd(t: &dyn Transform, point: &[f64], label: &str) {
+    fn assert_position_jacobian_matches_fd(t: &dyn TransformBase, point: &[f64], label: &str) {
         let analytic = t.jacobian_wrt_position(point);
         let fd = fd_position_jacobian(t, point);
         assert_eq!(analytic.len(), fd.len(), "{label}: jacobian length");

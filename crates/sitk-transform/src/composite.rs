@@ -17,9 +17,9 @@
 //! Deformation Field transform. They first add the Affine, then the DF"
 //! (`itkCompositeTransform.h:42-51`).
 //!
-//! [`transform_point`]: Transform::transform_point
+//! [`transform_point`]: TransformBase::transform_point
 
-use crate::transform::{ParametricTransform, Transform};
+use crate::transform::{ParametricTransform, TransformBase};
 
 /// A stack of transforms composed by `y = T0(T1(...TN-1(x)...))`, where
 /// `T0, ..., TN-1` were added in that order (`itk::CompositeTransform`). See
@@ -50,7 +50,7 @@ use crate::transform::{ParametricTransform, Transform};
 /// of an earlier (more-recently-added) sub-transform's parameters correctly
 /// propagates through every transform applied afterwards.
 ///
-/// That spatial Jacobian comes from [`Transform::jacobian_wrt_position`], which
+/// That spatial Jacobian comes from [`TransformBase::jacobian_wrt_position`], which
 /// every matrix-offset, translation and scale transform answers in closed form
 /// (ITK's `ComputeJacobianWithRespectToPosition`); only [`BSplineTransform`] and
 /// [`DisplacementFieldTransform`] fall back to the trait's finite-difference
@@ -103,7 +103,7 @@ impl CompositeTransform {
     }
 }
 
-impl Transform for CompositeTransform {
+impl TransformBase for CompositeTransform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         let mut out = point.to_vec();
         for t in self.transforms.iter().rev() {

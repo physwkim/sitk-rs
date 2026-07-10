@@ -75,7 +75,7 @@ use sitk_core::{Image, matrix};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::physical_to_index_matrix;
-use crate::transform::{ParametricTransform, Transform};
+use crate::transform::{ParametricTransform, TransformBase};
 
 /// The B-spline order. Fixed at 3 (cubic), ITK's default and the only order this
 /// port implements; the Parzen/interpolation kernels elsewhere are cubic too.
@@ -415,7 +415,7 @@ impl BSplineTransform {
     }
 }
 
-impl Transform for BSplineTransform {
+impl TransformBase for BSplineTransform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         let dim = self.dim;
         let mut index = self.continuous_index(point);

@@ -1,7 +1,7 @@
 //! Image resampling: `itk::ResampleImageFilter`.
 //!
 //! For each output voxel the output continuous index is mapped to a physical
-//! point, the [`Transform`] maps that point into the input's physical space, and
+//! point, the [`TransformBase`] maps that point into the input's physical space, and
 //! the input is interpolated there. Points that fall outside the input buffer
 //! take the default pixel value.
 
@@ -13,7 +13,7 @@ use crate::interpolator::{
     gaussian_value_and_gradient, index_to_physical_matrix, linear_at, nearest_at,
     physical_to_index_matrix, strides, windowed_sinc_value_and_gradient,
 };
-use crate::transform::Transform;
+use crate::transform::TransformBase;
 
 /// Interpolation kernel used when sampling the input image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +134,7 @@ impl InterpolatedImage {
 }
 
 /// `itk::ResampleImageFilter`: build an output grid and sample the input through
-/// a [`Transform`].
+/// a [`TransformBase`].
 ///
 /// Reference geometry (size / spacing / origin / direction) defaults to the
 /// input image's own grid when not overridden. Output pixel type defaults to the
@@ -223,7 +223,7 @@ impl ResampleImageFilter {
     }
 
     /// Resample `input` through `transform`.
-    pub fn execute<T: Transform>(&self, input: &Image, transform: &T) -> Result<Image> {
+    pub fn execute<T: TransformBase>(&self, input: &Image, transform: &T) -> Result<Image> {
         let dim = input.dimension();
 
         let out_size = self.size.clone().unwrap_or_else(|| input.size().to_vec());

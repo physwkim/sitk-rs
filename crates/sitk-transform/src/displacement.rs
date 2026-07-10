@@ -56,7 +56,7 @@ use sitk_core::Image;
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{is_inside, physical_to_index_matrix, strides};
-use crate::transform::{ParametricTransform, Transform};
+use crate::transform::{ParametricTransform, TransformBase};
 
 /// A dense displacement-field transform. See the [module docs](self).
 #[derive(Clone, Debug)]
@@ -177,7 +177,7 @@ impl DisplacementFieldTransform {
     }
 }
 
-impl Transform for DisplacementFieldTransform {
+impl TransformBase for DisplacementFieldTransform {
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         let dim = self.dim;
         let cindex = self.continuous_index(point);

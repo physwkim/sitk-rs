@@ -796,7 +796,7 @@ impl JointHistogramMutualInformationMetric {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::{Transform, TranslationTransform};
+    use sitk_transform::{TransformBase, TranslationTransform};
 
     /// A 2-D Gaussian blob of amplitude `amp` and width `sigma`, centred at
     /// `(cx, cy)` in physical (== index, unit spacing) coordinates, on a small
