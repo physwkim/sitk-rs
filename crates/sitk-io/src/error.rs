@@ -210,6 +210,32 @@ pub enum IoError {
     #[error("unsupported HDF5 transform file: {0}")]
     UnsupportedHdf5Transform(String),
 
+    /// An `/ITKImage` group that `itk::HDF5ImageIO::ReadImageInformation`
+    /// would also refuse. Carries upstream's own message where it has one —
+    /// `"Wrong # of dims for TransformType in HDF5 File"` (itkHDF5ImageIO.cxx:479,
+    /// the transform IO's copy-paste), `" Wrong # of dims for Image Directions
+    /// in HDF5 File"` (`:521`), `"Elements > 1 for scalar type in HDF5 File"`
+    /// (`:415`), or `"unsupported HDF5 data type ..."` (`:174`).
+    #[error("malformed HDF5 image: {0}")]
+    MalformedHdf5Image(String),
+
+    /// An HDF5 image this port refuses but `itk::HDF5ImageIO` reads, because
+    /// libhdf5 would convert the stored elements on the way out where
+    /// [`rust_hdf5`] hands back the stored bytes — a big-endian or bit-packed
+    /// dataset — or because upstream would index out of bounds, as it does for
+    /// a non-square `Directions` matrix. See [`crate::image_hdf5`] and ledger
+    /// §4.82, §4.85.
+    #[error("unsupported HDF5 image: {0}")]
+    UnsupportedHdf5Image(String),
+
+    /// The `itk::ImageIO` reported a pixel type SimpleITK cannot load.
+    /// `ImageReaderBase::GetPixelIDFromImageIO` throws `"Unknown PixelType:
+    /// <component>(<n>)"` (sitkImageReaderBase.cxx:236-238). Reachable from
+    /// [`crate::image_hdf5`], whose `ReadImageInformation` leaves the pixel
+    /// type `SCALAR` while setting a component count above one (ledger §3.44).
+    #[error("unknown PixelType: {0}")]
+    UnknownPixelType(String),
+
     /// The transform read is neither 2D nor 3D. `itk::simple::ReadTransform`
     /// throws `"Unable to transform with InputSpaceDimension: ..."`
     /// (sitkTransform.cxx:718-722).
