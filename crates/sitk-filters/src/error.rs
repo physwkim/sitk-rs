@@ -606,6 +606,24 @@ pub enum FilterError {
     #[error("sample variance must be nonnegative, got {0}")]
     InvalidSampleVariance(f64),
 
+    /// SimpleITK's `GetImageFromVectorImage` (`sitkImageConvert.hxx:38-42`)
+    /// throws "Expected number of elements in vector image to be the same as
+    /// the dimension!" -- every `ITKDisplacementField` filter reinterprets its
+    /// `itk::VectorImage<T, N>` input as an `itk::Image<itk::Vector<T, N>, N>`,
+    /// which is only sound when the run-time component count equals `N`.
+    #[error(
+        "a displacement field needs one component per dimension: got {components} components for a {dimension}-D image"
+    )]
+    DisplacementFieldComponentMismatch { components: usize, dimension: usize },
+
+    /// `InverseDisplacementFieldImageFilter::PrepareKernelBaseSpline`
+    /// (`itkInverseDisplacementFieldImageFilter.hxx:131-135`) computes the
+    /// subsampled grid as `size[i] / m_SubsamplingFactor`, an integer division
+    /// that is undefined behavior in C++ for a zero factor. SimpleITK exposes
+    /// the setter without a guard, so this port rejects it here.
+    #[error("subsampling factor must be >= 1, got {0}")]
+    InvalidSubsamplingFactor(u32),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

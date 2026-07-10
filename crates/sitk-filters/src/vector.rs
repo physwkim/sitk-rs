@@ -1,10 +1,10 @@
 //! Filters that cross the scalar/vector pixel boundary.
 //!
 //! SimpleITK groups these under `ImageCompose` and `ImageIntensity`, but they
-//! share the property that separates them from every other filter in this
-//! crate: they are the only ones whose input or output is a vector image. Every
-//! other filter is scalar-only, structurally — see the `vector_guard` tests in
-//! [`crate`].
+//! share the property that separates them from most filters in this crate: their
+//! input or output is a vector image. The only other module of which that is
+//! true is [`crate::displacement_field`]; every remaining filter is scalar-only,
+//! structurally — see the `vector_guard` tests in [`crate`].
 //!
 //! Correspondingly none of them route through `to_f64_vec`/`image_from_f64`
 //! (the scalar seam, which refuses vector images); they read the interleaved

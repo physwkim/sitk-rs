@@ -54,6 +54,7 @@ pub mod contour_extractor_2d;
 pub mod convolution;
 pub mod deconvolution;
 pub mod denoise;
+pub mod displacement_field;
 pub mod distance;
 pub mod edge;
 pub mod error;
@@ -141,6 +142,12 @@ pub use convolution::{
 pub use denoise::{
     bilateral, binomial_blur, box_mean, box_sigma, curvature_flow, discrete_gaussian,
     discrete_gaussian_derivative, mean, median,
+};
+pub use displacement_field::{
+    DisplacementFieldJacobianDeterminantSettings, InvertDisplacementFieldResult,
+    InvertDisplacementFieldSettings, IterativeInverseDisplacementFieldSettings,
+    displacement_field_jacobian_determinant, inverse_displacement_field, invert_displacement_field,
+    iterative_inverse_displacement_field,
 };
 pub use distance::{
     approximate_signed_distance_map, danielsson_distance_map, iso_contour_distance,
@@ -979,8 +986,8 @@ mod tests {
 /// The structural guard that keeps every scalar filter safe against a vector
 /// image, proven at the seam rather than filter by filter.
 ///
-/// No filter in this crate carries a vector check of its own. Instead the two
-/// helpers each scalar filter must use to touch pixel data —
+/// No *scalar* filter in this crate carries a vector check of its own. Instead
+/// the two helpers each scalar filter must use to touch pixel data —
 /// [`Image::to_f64_vec`] on the way in and [`image_from_f64`] on the way out —
 /// and the three `Image` accessors underneath them ([`Image::scalar_slice`],
 /// [`Image::scalar_vec_mut`], [`Image::scalar_view`]) all refuse a vector
@@ -990,6 +997,13 @@ mod tests {
 ///
 /// These cases sample the distinct routes a filter can take to the buffer; a
 /// filter that used none of them could not read a pixel at all.
+///
+/// The vector-consuming filters — [`crate::vector`] and
+/// [`crate::displacement_field`] — are the exception, and they say so in their
+/// signatures: they reach the buffer through the component-aware accessors
+/// ([`Image::component_slice`], [`Image::components_to_f64_vec`]) and check the
+/// pixel type themselves, because for them a vector image is the *only* legal
+/// input.
 #[cfg(test)]
 mod vector_guard {
     use super::*;
