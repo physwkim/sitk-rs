@@ -906,7 +906,7 @@ mod tests {
         let params: Vec<f64> = (0..np)
             .map(|i| ((i * 13 % 11) as f64 - 5.0) * 0.02)
             .collect();
-        field.set_parameters(&params);
+        field.set_parameters(&params).unwrap();
 
         // Force the global-support path for comparison by wrapping identical
         // per-point math: since `evaluate` dispatches internally on

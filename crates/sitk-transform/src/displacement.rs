@@ -56,7 +56,7 @@ use sitk_core::Image;
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{is_inside, physical_to_index_matrix, strides};
-use crate::transform::{ParametricTransform, TransformBase};
+use crate::transform::{ParametricTransform, TransformBase, check_len};
 
 /// A dense displacement-field transform. See the [module docs](self).
 #[derive(Clone, Debug, PartialEq)]
@@ -234,13 +234,10 @@ impl ParametricTransform for DisplacementFieldTransform {
         self.field.clone()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(
-            params.len(),
-            self.field.len(),
-            "displacement-field parameter vector length mismatch"
-        );
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, self.field.len())?;
         self.field.copy_from_slice(params);
+        Ok(())
     }
 
     /// `[size, origin, spacing, direction]` — `dim · (dim + 3)` values, the
@@ -367,7 +364,8 @@ mod tests {
         let mut t =
             DisplacementFieldTransform::new(2, &[2, 2], &[0.0, 0.0], &[1.0, 1.0], &identity_dir(2))
                 .unwrap();
-        t.set_parameters(&vec![7.0; t.number_of_parameters()]);
+        t.set_parameters(&vec![7.0; t.number_of_parameters()])
+            .unwrap();
 
         let target = DisplacementFieldTransform::new(
             2,
@@ -383,6 +381,16 @@ mod tests {
         assert!(t.parameters().iter().all(|&v| v == 0.0));
 
         assert!(t.set_fixed_parameters(&[1.0, 2.0, 3.0]).is_err());
+    }
+
+    #[test]
+    fn set_parameters_rejects_wrong_length() {
+        let mut t = field(3, 2);
+        let n = t.number_of_parameters();
+        assert!(matches!(
+            t.set_parameters(&vec![0.0; n - 1]),
+            Err(TransformError::InvalidParameters { got, expected }) if got == n - 1 && expected == n
+        ));
     }
 
     fn identity_dir(dim: usize) -> Vec<f64> {
@@ -418,7 +426,7 @@ mod tests {
             params[p * 2] = dx;
             params[p * 2 + 1] = dy;
         }
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         for p in &[[2.0, 3.0], [3.4, 1.6], [0.0, 5.0]] {
             let out = t.transform_point(p);
             assert!(
@@ -437,7 +445,7 @@ mod tests {
         // pixel (1,1) raster index = 1 + 1*4 = 5; pixel (2,1) = 2 + 1*4 = 6.
         params[5 * 2] = 2.0; // dx at (1,1)
         params[6 * 2] = 4.0; // dx at (2,1)
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         // Point at continuous index (1.5, 1) is the x-midpoint of the two pixels.
         let out = t.transform_point(&[1.5, 1.0]);
         assert!((out[0] - (1.5 + 3.0)).abs() < 1e-12, "got {out:?}");
@@ -448,7 +456,7 @@ mod tests {
     fn points_outside_the_field_are_unmapped() {
         let mut t = field(6, 6);
         let params = vec![3.0; t.number_of_parameters()];
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         let far = [-50.0, 100.0];
         assert_eq!(t.transform_point(&far), far.to_vec());
     }
@@ -459,7 +467,7 @@ mod tests {
         let n = t.number_of_parameters();
         assert_eq!(n, 3 * 3 * 2);
         let params: Vec<f64> = (0..n).map(|i| i as f64 * 0.1).collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         assert_eq!(t.parameters(), params);
     }
 
@@ -468,7 +476,7 @@ mod tests {
         let mut t = field(4, 4);
         let n = t.number_of_parameters();
         let params: Vec<f64> = (0..n).map(|i| ((i * 17 % 7) as f64 - 3.0) * 0.1).collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         let point = [1.7, 2.3];
         let jac = t.jacobian_wrt_parameters(&point);
@@ -479,9 +487,9 @@ mod tests {
             let mut pm = params.clone();
             pm[k] -= h;
             let mut tp = t.clone();
-            tp.set_parameters(&pp);
+            tp.set_parameters(&pp).unwrap();
             let mut tm = t.clone();
-            tm.set_parameters(&pm);
+            tm.set_parameters(&pm).unwrap();
             let op = tp.transform_point(&point);
             let om = tm.transform_point(&point);
             for d in 0..2 {

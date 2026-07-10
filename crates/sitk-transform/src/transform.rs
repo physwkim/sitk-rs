@@ -100,6 +100,22 @@ pub(crate) fn check_fixed_len(params: &[f64], expected: usize, what: &str) -> Re
     }
 }
 
+/// Reject a parameter array whose length is not `expected`. ITK's
+/// `SetParameters` overrides disagree on strictness (`MatrixOffsetTransformBase`
+/// and `TranslationTransform` throw only when the vector is *shorter*,
+/// `VersorTransform` checks nothing, `BSplineTransform` demands exact
+/// equality); this port requires exact equality everywhere (ledger §4.47).
+pub(crate) fn check_len(params: &[f64], expected: usize) -> Result<()> {
+    if params.len() == expected {
+        Ok(())
+    } else {
+        Err(TransformError::InvalidParameters {
+            got: params.len(),
+            expected,
+        })
+    }
+}
+
 /// Fixed parameters of a matrix-offset transform: the center of rotation, and
 /// nothing else (`itk::MatrixOffsetTransformBase::Get/SetFixedParameters`).
 /// Expands inside `impl ParametricTransform for T` for any `T` with a `center`
@@ -146,11 +162,13 @@ pub trait ParametricTransform: TransformBase {
     /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
     fn parameters(&self) -> Vec<f64>;
 
-    /// Replace the parameter vector. `params.len()` must equal
-    /// [`number_of_parameters`].
+    /// Replace the parameter vector. Errors with
+    /// [`TransformError::InvalidParameters`] if `params.len()` is not
+    /// [`number_of_parameters`], mirroring ITK's `SetParameters` overrides,
+    /// which throw on a length mismatch.
     ///
     /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
-    fn set_parameters(&mut self, params: &[f64]);
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()>;
 
     /// The *fixed* (non-optimizable) parameters — ITK's
     /// `Transform::GetFixedParameters`. These are the values the Insight legacy
@@ -326,9 +344,10 @@ impl ParametricTransform for TranslationTransform {
         self.translation.clone()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), self.translation.len(), "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, self.translation.len())?;
         self.translation.copy_from_slice(params);
+        Ok(())
     }
 
     /// A pure translation has **no** fixed parameters: `itk::TranslationTransform`
@@ -466,12 +485,13 @@ impl ParametricTransform for AffineTransform {
         p
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
         let n = self.dim * self.dim;
-        assert_eq!(params.len(), n + self.dim, "parameter length");
+        check_len(params, n + self.dim)?;
         self.matrix.copy_from_slice(&params[..n]);
         self.translation.copy_from_slice(&params[n..]);
         self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+        Ok(())
     }
 
     /// The center of rotation
@@ -620,12 +640,13 @@ impl ParametricTransform for Euler2DTransform {
         vec![self.angle, self.translation[0], self.translation[1]]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 3, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 3)?;
         self.angle = params[0];
         self.translation[0] = params[1];
         self.translation[1] = params[2];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(2);
@@ -770,13 +791,14 @@ impl ParametricTransform for Similarity2DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 4, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 4)?;
         self.scale = params[0];
         self.angle = params[1];
         self.translation[0] = params[2];
         self.translation[1] = params[3];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(2);
@@ -979,8 +1001,8 @@ impl ParametricTransform for Euler3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 6, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 6)?;
         self.angle_x = params[0];
         self.angle_y = params[1];
         self.angle_z = params[2];
@@ -988,6 +1010,7 @@ impl ParametricTransform for Euler3DTransform {
         self.translation[1] = params[4];
         self.translation[2] = params[5];
         self.recompute();
+        Ok(())
     }
 
     /// `[cx, cy, cz, computeZYX]` — `itk::Euler3DTransform` appends its
@@ -1283,13 +1306,14 @@ impl ParametricTransform for VersorRigid3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 6, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 6)?;
         self.set_versor(params[0], params[1], params[2]);
         self.translation[0] = params[3];
         self.translation[1] = params[4];
         self.translation[2] = params[5];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -1527,14 +1551,15 @@ impl ParametricTransform for Similarity3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 7, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 7)?;
         self.set_versor(params[0], params[1], params[2]);
         self.translation[0] = params[3];
         self.translation[1] = params[4];
         self.translation[2] = params[5];
         self.scale = params[6];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -1809,8 +1834,8 @@ impl ParametricTransform for ScaleVersor3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 9, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 9)?;
         self.set_versor(params[0], params[1], params[2]);
         self.translation[0] = params[3];
         self.translation[1] = params[4];
@@ -1819,6 +1844,7 @@ impl ParametricTransform for ScaleVersor3DTransform {
         self.scale[1] = params[7];
         self.scale[2] = params[8];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -2117,8 +2143,8 @@ impl ParametricTransform for ScaleSkewVersor3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 15, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 15)?;
         self.set_versor(params[0], params[1], params[2]);
         self.translation[0] = params[3];
         self.translation[1] = params[4];
@@ -2128,6 +2154,7 @@ impl ParametricTransform for ScaleSkewVersor3DTransform {
         self.scale[2] = params[8];
         self.skew.copy_from_slice(&params[9..15]);
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -2431,8 +2458,8 @@ impl ParametricTransform for ComposeScaleSkewVersor3DTransform {
         ]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 12, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 12)?;
         self.set_versor(params[0], params[1], params[2]);
         self.translation[0] = params[3];
         self.translation[1] = params[4];
@@ -2444,6 +2471,7 @@ impl ParametricTransform for ComposeScaleSkewVersor3DTransform {
         self.skew[1] = params[10];
         self.skew[2] = params[11];
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -2699,10 +2727,11 @@ impl ParametricTransform for VersorTransform {
         vec![self.vx, self.vy, self.vz]
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), 3, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, 3)?;
         self.set_versor(params[0], params[1], params[2]);
         self.recompute();
+        Ok(())
     }
 
     center_fixed_parameters!(3);
@@ -2832,9 +2861,10 @@ impl ParametricTransform for ScaleTransform {
         self.scale.clone()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(params.len(), self.dim, "parameter length");
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, self.dim)?;
         self.scale.copy_from_slice(params);
+        Ok(())
     }
 
     /// The center of scaling — `itk::ScaleTransform` derives from
@@ -2951,9 +2981,9 @@ impl ParametricTransform for ScaleLogarithmicTransform {
         self.inner.scale().iter().map(|s| s.ln()).collect()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
         let scale: Vec<f64> = params.iter().map(|p| p.exp()).collect();
-        self.inner.set_parameters(&scale);
+        self.inner.set_parameters(&scale)
     }
 
     /// Delegates to [`ScaleTransform`]: the center of scaling.
@@ -3551,6 +3581,18 @@ mod tests {
     }
 
     #[test]
+    fn translation_set_parameters_rejects_wrong_length() {
+        let mut t = TranslationTransform::new(vec![0.0, 0.0]);
+        assert!(matches!(
+            t.set_parameters(&[1.0]),
+            Err(TransformError::InvalidParameters {
+                got: 1,
+                expected: 2
+            })
+        ));
+    }
+
+    #[test]
     fn translation_has_no_fixed_parameters() {
         let mut t = TranslationTransform::new(vec![2.0, -3.0]);
         assert_eq!(t.fixed_parameters(), Vec::<f64>::new());
@@ -3654,7 +3696,7 @@ mod tests {
     fn translation_parameters_roundtrip_and_jacobian_is_identity() {
         let mut t = TranslationTransform::new(vec![0.0, 0.0]);
         assert_eq!(t.number_of_parameters(), 2);
-        t.set_parameters(&[3.0, -4.0]);
+        t.set_parameters(&[3.0, -4.0]).unwrap();
         assert_eq!(t.parameters(), vec![3.0, -4.0]);
         assert_eq!(t.transform_point(&[1.0, 1.0]), vec![4.0, -3.0]);
         // Jacobian is the 2x2 identity regardless of the point.
@@ -3675,8 +3717,20 @@ mod tests {
     fn affine_set_parameters_updates_offset() {
         let mut a = AffineTransform::identity(2);
         // Set matrix to identity, translation to (5,-2), center at origin.
-        a.set_parameters(&[1.0, 0.0, 0.0, 1.0, 5.0, -2.0]);
+        a.set_parameters(&[1.0, 0.0, 0.0, 1.0, 5.0, -2.0]).unwrap();
         assert_eq!(a.transform_point(&[1.0, 1.0]), vec![6.0, -1.0]);
+    }
+
+    #[test]
+    fn affine_set_parameters_rejects_wrong_length() {
+        let mut a = AffineTransform::identity(2);
+        assert!(matches!(
+            a.set_parameters(&[1.0, 0.0, 0.0, 1.0, 5.0]),
+            Err(TransformError::InvalidParameters {
+                got: 5,
+                expected: 6
+            })
+        ));
     }
 
     #[test]
@@ -3705,11 +3759,11 @@ mod tests {
         for k in 0..nparams {
             let mut pp = base.clone();
             pp[k] += h;
-            a.set_parameters(&pp);
+            a.set_parameters(&pp).unwrap();
             let yp = a.transform_point(&point);
             let mut pm = base.clone();
             pm[k] -= h;
-            a.set_parameters(&pm);
+            a.set_parameters(&pm).unwrap();
             let ym = a.transform_point(&point);
             for i in 0..2 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -3757,10 +3811,22 @@ mod tests {
     #[test]
     fn euler2d_parameters_are_angle_then_translation() {
         let mut e = Euler2DTransform::new(0.1, [0.0, 0.0], [2.0, -1.0]);
-        e.set_parameters(&[0.5, 3.0, -4.0]);
+        e.set_parameters(&[0.5, 3.0, -4.0]).unwrap();
         assert_eq!(e.parameters(), vec![0.5, 3.0, -4.0]);
         assert_eq!(e.angle(), 0.5);
         assert_eq!(e.translation(), &[3.0, -4.0]);
+    }
+
+    #[test]
+    fn euler2d_set_parameters_rejects_wrong_length() {
+        let mut e = Euler2DTransform::identity();
+        assert!(matches!(
+            e.set_parameters(&[0.5, 3.0]),
+            Err(TransformError::InvalidParameters {
+                got: 2,
+                expected: 3
+            })
+        ));
     }
 
     #[test]
@@ -3786,11 +3852,11 @@ mod tests {
         for k in 0..nparams {
             let mut pp = base;
             pp[k] += h;
-            e.set_parameters(&pp);
+            e.set_parameters(&pp).unwrap();
             let yp = e.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            e.set_parameters(&pm);
+            e.set_parameters(&pm).unwrap();
             let ym = e.transform_point(&point);
             for i in 0..2 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -3842,11 +3908,23 @@ mod tests {
     #[test]
     fn similarity2d_parameters_are_scale_angle_translation() {
         let mut s = Similarity2DTransform::new(1.0, 0.0, [0.0, 0.0], [2.0, -1.0]);
-        s.set_parameters(&[1.5, 0.5, 3.0, -4.0]);
+        s.set_parameters(&[1.5, 0.5, 3.0, -4.0]).unwrap();
         assert_eq!(s.parameters(), vec![1.5, 0.5, 3.0, -4.0]);
         assert_eq!(s.scale(), 1.5);
         assert_eq!(s.angle(), 0.5);
         assert_eq!(s.translation(), &[3.0, -4.0]);
+    }
+
+    #[test]
+    fn similarity2d_set_parameters_rejects_wrong_length() {
+        let mut s = Similarity2DTransform::identity();
+        assert!(matches!(
+            s.set_parameters(&[1.5, 0.5, 3.0]),
+            Err(TransformError::InvalidParameters {
+                got: 3,
+                expected: 4
+            })
+        ));
     }
 
     #[test]
@@ -3873,11 +3951,11 @@ mod tests {
         for k in 0..nparams {
             let mut pp = base;
             pp[k] += h;
-            s.set_parameters(&pp);
+            s.set_parameters(&pp).unwrap();
             let yp = s.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            s.set_parameters(&pm);
+            s.set_parameters(&pm).unwrap();
             let ym = s.transform_point(&point);
             for i in 0..2 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4034,11 +4112,11 @@ mod tests {
             for k in 0..n {
                 let mut pp = base;
                 pp[k] += h;
-                e.set_parameters(&pp);
+                e.set_parameters(&pp).unwrap();
                 let yp = e.transform_point(&point);
                 let mut pm = base;
                 pm[k] -= h;
-                e.set_parameters(&pm);
+                e.set_parameters(&pm).unwrap();
                 let ym = e.transform_point(&point);
                 for i in 0..3 {
                     let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4055,7 +4133,7 @@ mod tests {
     #[test]
     fn euler3d_parameters_roundtrip() {
         let mut e = Euler3DTransform::identity();
-        e.set_parameters(&[0.1, 0.2, 0.3, 4.0, 5.0, 6.0]);
+        e.set_parameters(&[0.1, 0.2, 0.3, 4.0, 5.0, 6.0]).unwrap();
         assert_eq!(e.parameters(), vec![0.1, 0.2, 0.3, 4.0, 5.0, 6.0]);
         assert_eq!(e.angle_x(), 0.1);
         assert_eq!(e.angle_y(), 0.2);
@@ -4146,11 +4224,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base;
             pp[k] += h;
-            v.set_parameters(&pp);
+            v.set_parameters(&pp).unwrap();
             let yp = v.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            v.set_parameters(&pm);
+            v.set_parameters(&pm).unwrap();
             let ym = v.transform_point(&point);
             for i in 0..3 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4166,7 +4244,7 @@ mod tests {
     #[test]
     fn versor3d_parameters_roundtrip_for_small_right_part() {
         let mut v = VersorRigid3DTransform::identity();
-        v.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0]);
+        v.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0]).unwrap();
         let p = v.parameters();
         // Small right part is stored unchanged (no renormalization).
         assert!(
@@ -4282,7 +4360,8 @@ mod tests {
     #[test]
     fn similarity3d_parameters_roundtrip() {
         let mut t = Similarity3DTransform::identity();
-        t.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.3]);
+        t.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.3])
+            .unwrap();
         let p = t.parameters();
         // Small right part is stored unchanged; scale is parameter 6 (last).
         assert!(
@@ -4313,11 +4392,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base;
             pp[k] += h;
-            t.set_parameters(&pp);
+            t.set_parameters(&pp).unwrap();
             let yp = t.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            t.set_parameters(&pm);
+            t.set_parameters(&pm).unwrap();
             let ym = t.transform_point(&point);
             for i in 0..3 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4381,7 +4460,8 @@ mod tests {
     #[test]
     fn scale_versor3d_parameters_roundtrip() {
         let mut t = ScaleVersor3DTransform::identity();
-        t.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5]);
+        t.set_parameters(&[0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5])
+            .unwrap();
         let p = t.parameters();
         assert!(
             (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
@@ -4411,11 +4491,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base;
             pp[k] += h;
-            t.set_parameters(&pp);
+            t.set_parameters(&pp).unwrap();
             let yp = t.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            t.set_parameters(&pm);
+            t.set_parameters(&pm).unwrap();
             let ym = t.transform_point(&point);
             for i in 0..3 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4488,7 +4568,7 @@ mod tests {
         let params = [
             0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5, 0.05, -0.1, 0.15, -0.2, 0.1, -0.05,
         ];
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         let p = t.parameters();
         assert!(
             (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
@@ -4522,11 +4602,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base;
             pp[k] += h;
-            t.set_parameters(&pp);
+            t.set_parameters(&pp).unwrap();
             let yp = t.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            t.set_parameters(&pm);
+            t.set_parameters(&pm).unwrap();
             let ym = t.transform_point(&point);
             for i in 0..3 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4619,7 +4699,7 @@ mod tests {
         let params = [
             0.1, -0.2, 0.15, 4.0, 5.0, 6.0, 1.2, 0.8, 1.5, 0.05, -0.1, 0.15,
         ];
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         let p = t.parameters();
         assert!(
             (p[0] - 0.1).abs() < 1e-12 && (p[1] + 0.2).abs() < 1e-12 && (p[2] - 0.15).abs() < 1e-12
@@ -4643,16 +4723,16 @@ mod tests {
             let mut params = identity;
             params[mc] = 0.1;
             let mut t = ComposeScaleSkewVersor3DTransform::identity();
-            t.set_parameters(&params);
+            t.set_parameters(&params).unwrap();
             let jac = t.jacobian_wrt_parameters(&point);
             for i in 0..n {
                 let mut p1 = params;
                 p1[i] += h;
-                t.set_parameters(&p1);
+                t.set_parameters(&p1).unwrap();
                 let y1 = t.transform_point(&point);
                 let mut p2 = params;
                 p2[i] -= h;
-                t.set_parameters(&p2);
+                t.set_parameters(&p2).unwrap();
                 let y2 = t.transform_point(&point);
                 for d in 0..3 {
                     let fd = (y1[d] - y2[d]) / (2.0 * h);
@@ -4709,11 +4789,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base;
             pp[k] += h;
-            v.set_parameters(&pp);
+            v.set_parameters(&pp).unwrap();
             let yp = v.transform_point(&point);
             let mut pm = base;
             pm[k] -= h;
-            v.set_parameters(&pm);
+            v.set_parameters(&pm).unwrap();
             let ym = v.transform_point(&point);
             for i in 0..3 {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4724,6 +4804,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn versor_set_parameters_rejects_wrong_length() {
+        let mut v = VersorTransform::identity();
+        assert!(matches!(
+            v.set_parameters(&[0.1, -0.2]),
+            Err(TransformError::InvalidParameters {
+                got: 2,
+                expected: 3
+            })
+        ));
     }
 
     #[test]
@@ -4763,11 +4855,11 @@ mod tests {
         for k in 0..n {
             let mut pp = base.clone();
             pp[k] += h;
-            s.set_parameters(&pp);
+            s.set_parameters(&pp).unwrap();
             let yp = s.transform_point(&point);
             let mut pm = base.clone();
             pm[k] -= h;
-            s.set_parameters(&pm);
+            s.set_parameters(&pm).unwrap();
             let ym = s.transform_point(&point);
             for i in 0..n {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);
@@ -4781,13 +4873,41 @@ mod tests {
     }
 
     #[test]
+    fn scale_set_parameters_rejects_wrong_length() {
+        let mut s = ScaleTransform::identity(3);
+        assert!(matches!(
+            s.set_parameters(&[2.0, 0.5]),
+            Err(TransformError::InvalidParameters {
+                got: 2,
+                expected: 3
+            })
+        ));
+    }
+
+    /// [`ScaleLogarithmicTransform::set_parameters`] maps the given vector
+    /// through `exp` and forwards it unchanged in length, so a wrong-length
+    /// vector surfaces the same error the inner [`ScaleTransform`] would raise
+    /// directly — the delegate propagates rather than re-checking.
+    #[test]
+    fn scale_logarithmic_set_parameters_propagates_the_inner_error() {
+        let mut t = ScaleLogarithmicTransform::identity(3);
+        assert!(matches!(
+            t.set_parameters(&[0.3, -0.5]),
+            Err(TransformError::InvalidParameters {
+                got: 2,
+                expected: 3
+            })
+        ));
+    }
+
+    #[test]
     fn scale_logarithmic_equals_scale_at_exp_params() {
         let center = vec![1.0, -2.0, 3.0];
         let log_scale: Vec<f64> = vec![0.3, -0.5, 0.1];
         let scale: Vec<f64> = log_scale.iter().map(|v| v.exp()).collect();
         let mut log_t = ScaleLogarithmicTransform::identity(3);
         log_t.set_center(&center);
-        log_t.set_parameters(&log_scale);
+        log_t.set_parameters(&log_scale).unwrap();
         let lin_t = ScaleTransform::new(scale, center);
         let p = [10.0, -3.0, 7.0];
         let y_log = log_t.transform_point(&p);
@@ -4814,18 +4934,18 @@ mod tests {
         let point = [4.0, 5.0, -3.0];
         let scale: Vec<f64> = base.iter().map(|v| v.exp()).collect();
         let mut t = ScaleLogarithmicTransform::new(scale, center);
-        t.set_parameters(&base);
+        t.set_parameters(&base).unwrap();
         let jac = t.jacobian_wrt_parameters(&point);
         let n = t.number_of_parameters();
         let h = 1e-6;
         for k in 0..n {
             let mut pp = base.clone();
             pp[k] += h;
-            t.set_parameters(&pp);
+            t.set_parameters(&pp).unwrap();
             let yp = t.transform_point(&point);
             let mut pm = base.clone();
             pm[k] -= h;
-            t.set_parameters(&pm);
+            t.set_parameters(&pm).unwrap();
             let ym = t.transform_point(&point);
             for i in 0..n {
                 let fd = (yp[i] - ym[i]) / (2.0 * h);

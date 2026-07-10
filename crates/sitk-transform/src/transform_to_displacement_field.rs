@@ -391,7 +391,7 @@ mod tests {
         )
         .unwrap();
         let field = vec![1.0, 0.0, 0.0, 2.0, -1.0, 0.0, 0.0, -2.0];
-        t.set_parameters(&field);
+        t.set_parameters(&field).unwrap();
         assert!(!t.is_linear());
 
         let mut f = TransformToDisplacementFieldFilter::new();

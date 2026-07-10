@@ -21,7 +21,7 @@
 
 use crate::erased::Transform;
 use crate::error::{Result, TransformError};
-use crate::transform::{ParametricTransform, TransformBase};
+use crate::transform::{ParametricTransform, TransformBase, check_len};
 
 /// A stack of transforms composed by `y = T0(T1(...TN-1(x)...))`, where
 /// `T0, ..., TN-1` were added in that order (`itk::CompositeTransform`). See
@@ -216,18 +216,15 @@ impl ParametricTransform for CompositeTransform {
         out
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(
-            params.len(),
-            self.number_of_parameters(),
-            "parameter length"
-        );
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, self.number_of_parameters())?;
         let mut offset = 0;
         for t in self.transforms.iter_mut().rev() {
             let n = t.number_of_parameters();
-            t.set_parameters(&params[offset..offset + n]);
+            t.set_parameters(&params[offset..offset + n])?;
             offset += n;
         }
+        Ok(())
     }
 
     /// Each sub-transform's fixed parameters, concatenated in **reverse** queue
@@ -387,6 +384,22 @@ mod tests {
     }
 
     #[test]
+    fn set_parameters_rejects_wrong_length() {
+        let mut c = CompositeTransform::new(2);
+        c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into())
+            .unwrap();
+        c.add_transform(TranslationTransform::new(vec![3.0, 4.0]).into())
+            .unwrap();
+        assert!(matches!(
+            c.set_parameters(&[1.0, 2.0, 3.0]),
+            Err(TransformError::InvalidParameters {
+                got: 3,
+                expected: 4
+            })
+        ));
+    }
+
+    #[test]
     fn parameters_concatenate_in_reverse_add_order() {
         let mut c = CompositeTransform::new(2);
         c.add_transform(TranslationTransform::new(vec![1.0, 2.0]).into())
@@ -462,12 +475,12 @@ mod tests {
         for k in 0..n {
             let mut pp = base.clone();
             pp[k] += h;
-            c.set_parameters(&pp);
+            c.set_parameters(&pp).unwrap();
             let yp = c.transform_point(&point);
 
             let mut pm = base.clone();
             pm[k] -= h;
-            c.set_parameters(&pm);
+            c.set_parameters(&pm).unwrap();
             let ym = c.transform_point(&point);
 
             for i in 0..2 {

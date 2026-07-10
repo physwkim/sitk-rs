@@ -844,7 +844,7 @@ mod tests {
         let params: Vec<f64> = (0..n)
             .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.05)
             .collect();
-        base.set_parameters(&params);
+        base.set_parameters(&params).unwrap();
         let analytic = metric.evaluate(&base).derivative;
 
         let step = 1e-3;
@@ -859,9 +859,9 @@ mod tests {
             let mut pm = params.clone();
             pm[k] -= step;
             let mut tp = base.clone();
-            tp.set_parameters(&pp);
+            tp.set_parameters(&pp).unwrap();
             let mut tm = base.clone();
-            tm.set_parameters(&pm);
+            tm.set_parameters(&pm).unwrap();
             let fd = (metric.evaluate(&tp).value - metric.evaluate(&tm).value) / (2.0 * step);
             assert!(
                 (fd - analytic[k]).abs() < 5e-3,
@@ -932,7 +932,7 @@ mod tests {
         let params: Vec<f64> = (0..np)
             .map(|i| ((i * 13 % 11) as f64 - 5.0) * 0.02)
             .collect();
-        field.set_parameters(&params);
+        field.set_parameters(&params).unwrap();
         (metric, field)
     }
 
@@ -989,7 +989,7 @@ mod tests {
         let params: Vec<f64> = (0..n)
             .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.05)
             .collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         let sparse = metric.evaluate_sparse_support(&t);
         let dense = metric.evaluate_global_support(&t);
@@ -1042,7 +1042,7 @@ mod tests {
         let params: Vec<f64> = (0..n)
             .map(|i| ((i * 31 % 13) as f64 - 6.0) * 0.02)
             .collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         // Sanity-check the setup actually exercises the out-of-region path.
         assert_eq!(
@@ -1102,9 +1102,9 @@ mod tests {
             let mut pm = params.clone();
             pm[k] -= step;
             let mut tp = field.clone();
-            tp.set_parameters(&pp);
+            tp.set_parameters(&pp).unwrap();
             let mut tm = field.clone();
-            tm.set_parameters(&pm);
+            tm.set_parameters(&pm).unwrap();
             let fd = (metric.evaluate(&tp).value - metric.evaluate(&tm).value) / (2.0 * step);
             assert!(
                 (fd - analytic[k]).abs() < 5e-3,
@@ -1148,7 +1148,7 @@ mod tests {
         for (i, p) in params.iter_mut().enumerate() {
             *p = if i % 2 == 0 { 0.4 } else { -0.3 };
         }
-        field.set_parameters(&params);
+        field.set_parameters(&params).unwrap();
 
         let full = metric.evaluate(&field).value;
         let value_only = metric.value(&field);

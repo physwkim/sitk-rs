@@ -77,13 +77,16 @@ pub enum TransformError {
     #[error("invalid fixed parameters: got {got} value(s), expected {expected}")]
     InvalidFixedParameters { got: usize, expected: String },
 
-    /// The erased [`Transform::set_parameters`] was handed an array whose length
-    /// is not [`Transform::number_of_parameters`]. The concrete transforms panic
-    /// in this situation, as they always have; only the erased surface — which
-    /// mirrors a SimpleITK call that throws — reports it as an error.
+    /// [`ParametricTransform::set_parameters`] was handed an array whose length
+    /// is not [`ParametricTransform::number_of_parameters`]. ITK's
+    /// `SetParameters` overrides throw in the same situation, though upstream's
+    /// own strictness is per-class and inconsistent (`MatrixOffsetTransformBase`
+    /// and `TranslationTransform` throw only when the vector is *shorter*,
+    /// `VersorTransform` checks nothing at all, `BSplineTransform` demands exact
+    /// equality); this port requires exact equality everywhere (ledger §4.47).
     ///
-    /// [`Transform::set_parameters`]: crate::Transform::set_parameters
-    /// [`Transform::number_of_parameters`]: crate::Transform::number_of_parameters
+    /// [`ParametricTransform::set_parameters`]: crate::ParametricTransform::set_parameters
+    /// [`ParametricTransform::number_of_parameters`]: crate::ParametricTransform::number_of_parameters
     #[error("invalid parameters: got {got} value(s), expected {expected}")]
     InvalidParameters { got: usize, expected: usize },
 

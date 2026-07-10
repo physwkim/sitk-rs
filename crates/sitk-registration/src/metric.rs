@@ -1134,7 +1134,7 @@ mod tests {
         let params: Vec<f64> = (0..n)
             .map(|i| ((i * 37 % 11) as f64 - 5.0) * 0.05)
             .collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         let sparse = CpuBackend.mean_squares(&fixed_samples, &moving_image, &t);
         let dense = mean_squares_dense_reference(&fixed_samples, &moving_image, &t);
@@ -1162,7 +1162,7 @@ mod tests {
         let mut t = DisplacementFieldTransform::from_image_domain(&img).unwrap();
         let n = t.number_of_parameters();
         let params: Vec<f64> = (0..n).map(|i| ((i * 13 % 7) as f64 - 3.0) * 0.05).collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         let sparse = CpuBackend.mean_squares(&fixed_samples, &moving_image, &t);
         let dense = mean_squares_dense_reference(&fixed_samples, &moving_image, &t);

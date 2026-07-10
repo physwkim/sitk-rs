@@ -75,7 +75,7 @@ use sitk_core::{Image, matrix};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::physical_to_index_matrix;
-use crate::transform::{ParametricTransform, TransformBase};
+use crate::transform::{ParametricTransform, TransformBase, check_len};
 
 /// The B-spline order. Fixed at 3 (cubic), ITK's default and the only order this
 /// port implements; the Parzen/interpolation kernels elsewhere are cubic too.
@@ -507,13 +507,10 @@ impl ParametricTransform for BSplineTransform {
         self.coefficients.clone()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        assert_eq!(
-            params.len(),
-            self.coefficients.len(),
-            "B-spline parameter vector length mismatch"
-        );
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_len(params, self.coefficients.len())?;
         self.coefficients.copy_from_slice(params);
+        Ok(())
     }
 
     /// `[gridSize, gridOrigin, gridSpacing, gridDirection]`, each block `dim`
@@ -633,7 +630,8 @@ mod tests {
         let mut t =
             BSplineTransform::new(2, &[0.0, 0.0], &[4.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[1, 1])
                 .unwrap();
-        t.set_parameters(&vec![1.0; t.number_of_parameters()]);
+        t.set_parameters(&vec![1.0; t.number_of_parameters()])
+            .unwrap();
 
         let target =
             BSplineTransform::new(2, &[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
@@ -646,6 +644,16 @@ mod tests {
         assert!(t.parameters().iter().all(|&c| c == 0.0));
 
         assert!(t.set_fixed_parameters(&[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn set_parameters_rejects_wrong_length() {
+        let mut t = mesh5_grid();
+        let n = t.number_of_parameters();
+        assert!(matches!(
+            t.set_parameters(&vec![0.0; n - 1]),
+            Err(TransformError::InvalidParameters { got, expected }) if got == n - 1 && expected == n
+        ));
     }
 
     /// A unit-spacing, identity-direction 2-D image of the given size.
@@ -717,7 +725,7 @@ mod tests {
         let mut params = vec![0.0; t.number_of_parameters()];
         params[..per].fill(cx); // dimension-0 coefficients
         params[per..2 * per].fill(cy); // dimension-1 coefficients
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         for p in &[[5.0, 5.0], [3.2, 6.8], [1.1, 2.2]] {
             let out = t.transform_point(p);
@@ -744,7 +752,7 @@ mod tests {
         let per = t.number_of_parameters_per_dimension();
         let mut params = vec![0.0; t.number_of_parameters()];
         params[d * per + gy * t.grid_size()[0] + gx] = value;
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
     }
 
     #[test]
@@ -830,7 +838,7 @@ mod tests {
         assert!(t.parameters().iter().all(|&v| v == 0.0));
 
         let params: Vec<f64> = (0..n).map(|i| i as f64 * 0.5 - 3.0).collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         assert_eq!(t.parameters(), params);
     }
 
@@ -842,7 +850,7 @@ mod tests {
             BSplineTransform::new(2, &[0.0, 0.0], &[10.0, 10.0], &matrix::identity(2), &[5, 5])
                 .unwrap();
         let params = vec![3.0; t.number_of_parameters()];
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         let far = [-50.0, -50.0];
         assert_eq!(t.transform_point(&far), far.to_vec());
     }
@@ -857,7 +865,7 @@ mod tests {
                 .unwrap();
         let n = t.number_of_parameters();
         let params: Vec<f64> = (0..n).map(|i| ((i * 37 % 11) as f64 - 5.0) * 0.1).collect();
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         let point = [4.3, 5.7];
         let jac = t.jacobian_wrt_parameters(&point);
@@ -869,9 +877,9 @@ mod tests {
             let mut pm = params.clone();
             pm[k] -= h;
             let mut tp = t.clone();
-            tp.set_parameters(&pp);
+            tp.set_parameters(&pp).unwrap();
             let mut tm = t.clone();
-            tm.set_parameters(&pm);
+            tm.set_parameters(&pm).unwrap();
             let op = tp.transform_point(&point);
             let om = tm.transform_point(&point);
             for d in 0..2 {
@@ -974,7 +982,7 @@ mod tests {
         let per = t.number_of_parameters_per_dimension();
         let mut params = vec![0.0; t.number_of_parameters()];
         params[..per].fill(0.5);
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
         // Corner voxel centres (0,0) and (15,15) both displace by +0.5 in x.
         for p in &[[0.0, 0.0], [15.0, 15.0], [0.0, 15.0]] {
             let out = t.transform_point(p);
@@ -1017,7 +1025,7 @@ mod tests {
             let per = t.number_of_parameters_per_dimension();
             let mut params = vec![0.0; t.number_of_parameters()];
             params[..per].fill(0.5);
-            t.set_parameters(&params);
+            t.set_parameters(&params).unwrap();
         };
 
         let mut init = BSplineTransform::from_image_initializer(&img, &[4, 4]).unwrap();
@@ -1076,7 +1084,7 @@ mod tests {
         let mut params = vec![0.0; t.number_of_parameters()];
         params[..per].fill(cx);
         params[per..2 * per].fill(cy);
-        t.set_parameters(&params);
+        t.set_parameters(&params).unwrap();
 
         for &idx in &[[0.0, 0.0], [11.0, 8.0], [0.0, 8.0], [11.0, 0.0], [5.0, 4.0]] {
             let p = img.continuous_index_to_physical_point(&idx);
