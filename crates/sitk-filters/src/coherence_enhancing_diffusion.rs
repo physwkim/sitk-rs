@@ -68,6 +68,23 @@
 //!   `noise_scale`'s `K_σ` already does via
 //!   `GradientRecursiveGaussianImageFilter`.
 //!
+//! - **§1.23 — `RescaleForUnitMaximumTrace` divided by zero on a constant
+//!   image.** `Adimensionize` turns on `RescaleForUnitMaximumTrace`, whose
+//!   scaling is `1 / max(trace S)`. The trace `K_ρ * |∇u_σ|²` is a smoothed sum
+//!   of squares, so it is `>= 0` and is `0` exactly when the image is constant
+//!   (`S ≡ 0`). Upstream computes the reciprocal unconditionally, so a constant
+//!   image gives `1/0 = +∞` and turns every tensor into `0·∞ = NaN`; the `NaN`s
+//!   reach the diagonal coefficients, where ITK's `MinimumMaximumImageCalculator`
+//!   (max seeded at `NonpositiveMin()`, kept under `value > max`, which `NaN`
+//!   always loses) returns `-DBL_MAX`, so the step count goes negative through a
+//!   C++-undefined `(int)` cast of a non-finite double and the Euler loop runs
+//!   zero times — the input survives only by accident. This port guards the
+//!   division: when `max(trace S) <= 0` there is no structure to normalize, so
+//!   the (zero) tensors are left unscaled. A constant image then diffuses with a
+//!   finite isotropic tensor and is preserved exactly because it is a genuine
+//!   fixed point of `div(D∇u)` (every operator row sums to zero), not because a
+//!   `NaN` zeroed the step count.
+//!
 //! # Faithfully-reproduced upstream behaviors, rather than "fixed"
 //!
 //! - **SimpleITK's yaml doc has the CED/EED formulas swapped** relative to the
@@ -78,16 +95,6 @@
 //!   swapped. The code is authoritative and is what this port follows:
 //!   [`Enhancement::Ced`] uses `g_CED(μ_max − μᵢ)` and [`Enhancement::Eed`]
 //!   uses `g_EED(μᵢ − μ_min)`. See [`Enhancement`] for each formula.
-//! - **`Adimensionize` on a constant image divides by zero.** It turns on
-//!   `RescaleForUnitMaximumTrace`, whose scaling is `1 / max(trace S)`; a
-//!   constant image has `S ≡ 0`, so the scaling is `+∞` and every tensor
-//!   becomes `0 · ∞ = NaN`. The `NaN`s then propagate to the diagonal
-//!   coefficients, where ITK's `MinimumMaximumImageCalculator` — which seeds
-//!   its maximum with `NonpositiveMin()` and keeps it under `value > max`,
-//!   a comparison `NaN` always loses — returns `-DBL_MAX`. The resulting step
-//!   count is negative, the Euler loop runs zero times, and the input is
-//!   returned unchanged. This port reproduces the whole chain, so a constant
-//!   image is still a fixed point; see `constant_image_is_returned_unchanged`.
 //! - **Selling's algorithm gives up silently after 200 flips**, printing to
 //!   `std::cerr` and continuing with a possibly non-obtuse superbase (which
 //!   can yield a negative stencil weight). This port also continues, without
@@ -511,11 +518,20 @@ fn structure_tensor(
 
     if rescale_for_unit_maximum_trace {
         let max_trace = itk_maximum(tensors.iter().map(|t| (0..dim).map(|i| t[i][i]).sum()));
-        let scaling = 1.0 / max_trace;
-        for t in tensors.iter_mut() {
-            for row in t.iter_mut().take(dim) {
-                for cell in row.iter_mut().take(dim) {
-                    *cell *= scaling;
+        // §1.23: the structure-tensor trace is `K_ρ * |∇u_σ|²`, a smoothed sum
+        // of squares, so it is `>= 0` and is `0` exactly when the image is
+        // constant (`S ≡ 0`). Upstream computes `1 / max_trace` unconditionally,
+        // so a constant image gives `1/0 = +∞` and turns every `0·∞` into `NaN`,
+        // which then drives the step count negative and the input survives only
+        // by accident. There is nothing to normalize when there is no structure:
+        // leave the (zero) tensors unscaled.
+        if max_trace > 0.0 {
+            let scaling = 1.0 / max_trace;
+            for t in tensors.iter_mut() {
+                for row in t.iter_mut().take(dim) {
+                    for cell in row.iter_mut().take(dim) {
+                        *cell *= scaling;
+                    }
                 }
             }
         }
@@ -701,8 +717,9 @@ fn linear_diffusion(
 
     // `int n = ceil(m_DiffusionTime / delta)`. C++ leaves the cast of a
     // non-finite or out-of-range double to `int` undefined; Rust defines it as
-    // a saturating cast (NaN -> 0), which is what lets the degenerate
-    // Adimensionize-on-a-constant-image path fall through to zero steps.
+    // a saturating cast (NaN -> 0). With §1.23 fixed the constant-image tensors
+    // are finite, so `delta` is finite and positive here; the saturating cast
+    // remains a defensive backstop, not the constant-image mechanism it was.
     let mut n = (max_time / delta).ceil() as i64;
     let effective_time;
     if n > max_steps {
@@ -1373,14 +1390,39 @@ mod tests {
         Image::from_vec(size, data).unwrap()
     }
 
+    /// §1.23 fix: with `Adimensionize` on, a constant image no longer hits the
+    /// `1/0 -> NaN` path. `RescaleForUnitMaximumTrace` sees `max(trace S) == 0`
+    /// and skips the rescale, so the tensors stay finite (`S ≈ 0`), CED maps the
+    /// zero eigenvalues to an isotropic `α·I`, and the constant is preserved
+    /// because it is a genuine fixed point of `div(D∇u)` — the Euler loop now
+    /// runs with a finite, positive step instead of being zeroed by a `NaN`.
+    ///
+    /// Adimensionize-on vs -off must therefore give the *same* result on a
+    /// constant image, which the NaN accident used to hide.
     #[test]
-    fn constant_image_is_returned_unchanged() {
-        // Adimensionize on a constant image is the 1/0 -> NaN path documented
-        // above; it must still be a fixed point.
+    fn constant_image_is_a_genuine_diffusion_fixed_point_with_adimensionize() {
         let img = f64_image(&[12, 12], vec![7.0; 144]);
-        let out = coherence_enhancing_diffusion(&img, &Default::default()).unwrap();
-        for v in out.to_f64_vec().unwrap() {
-            assert_eq!(v, 7.0);
+        let out_on = coherence_enhancing_diffusion(&img, &Default::default()).unwrap();
+        let s_off = CoherenceEnhancingDiffusionSettings {
+            adimensionize: false,
+            ..Default::default()
+        };
+        let out_off = coherence_enhancing_diffusion(&img, &s_off).unwrap();
+
+        for v in out_on.to_f64_vec().unwrap() {
+            // No NaN, and the constant is held to solver rounding (row sums are
+            // zero, so div(D∇u) of a constant is zero).
+            assert!(v.is_finite(), "constant image produced a non-finite value");
+            assert!((v - 7.0).abs() < 1e-12, "{v}");
+        }
+        // Adimensionize no longer changes the answer on a structureless image.
+        for (a, b) in out_on
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .zip(out_off.to_f64_vec().unwrap())
+        {
+            assert_eq!(*a, b, "adimensionize diverged from non-adimensionize");
         }
     }
 
