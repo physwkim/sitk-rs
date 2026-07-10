@@ -9,9 +9,29 @@ pub enum IoError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The file extension is not a recognised image format.
-    #[error("unrecognised image file extension: {0}")]
-    UnknownExtension(String),
+    /// No registered [`ImageIo`](crate::ImageIo) claimed the file for reading,
+    /// and the file exists and is readable. `ImageReaderBase::GetImageIOBase`
+    /// throws `"Unable to determine ImageIO reader for ..."` here
+    /// (sitkImageReaderBase.cxx:99).
+    #[error("unable to determine ImageIO reader for {0}")]
+    NoReaderFound(PathBuf),
+
+    /// No registered [`ImageIo`](crate::ImageIo) claimed the file for writing.
+    /// `ImageFileWriter::GetImageIOBase` throws `"Unable to determine ImageIO
+    /// writer for ..."` here (sitkImageFileWriter.cxx:209).
+    #[error("unable to determine ImageIO writer for {0}")]
+    NoWriterFound(PathBuf),
+
+    /// A read was requested for a path that does not exist. Checked before
+    /// [`IoError::NoReaderFound`], as in sitkImageReaderBase.cxx:89-92.
+    #[error("the file {0} does not exist")]
+    FileNotFound(PathBuf),
+
+    /// `set_image_io` named an IO that is not registered.
+    /// `ioutils::CreateImageIOByName` throws `"Unable to create ImageIO: ..."`
+    /// (sitkImageIOUtilities.cxx:92).
+    #[error("unable to create ImageIO: {0}")]
+    UnknownImageIo(String),
 
     /// A MetaImage header could not be parsed.
     #[error("malformed MetaImage header")]
@@ -32,6 +52,40 @@ pub enum IoError {
     /// A path lacked a usable stem/filename.
     #[error("invalid image path: {0}")]
     InvalidPath(PathBuf),
+
+    /// An extraction region set on [`ImageFileReader`](crate::ImageFileReader)
+    /// is not contained in the file's region.
+    #[error(
+        "the requested extraction region (index {index:?}, size {size:?}) \
+         is not contained within the file's region {file_size:?}"
+    )]
+    ExtractRegionOutOfBounds {
+        /// The requested start index, per internal axis.
+        index: Vec<usize>,
+        /// The requested size, per internal axis (`0` collapses the axis).
+        size: Vec<usize>,
+        /// The file's own size, padded to the internal dimension.
+        file_size: Vec<usize>,
+    },
+
+    /// The extraction region's non-zero axis count is not a legal output
+    /// dimension. `ImageFileReader::Execute` throws `"The extraction region has
+    /// unsupported output dimension of ..."` (sitkImageFileReader.cxx:319-324).
+    #[error("the extraction region has unsupported output dimension of {0}")]
+    ExtractOutputDimension(usize),
+
+    /// The direction submatrix left by collapsing the zero-size axes is
+    /// singular. `ExtractImageFilter`'s `DIRECTIONCOLLAPSETOSUBMATRIX` throws
+    /// `"Invalid submatrix extracted for collapsed direction."`
+    /// (itkExtractImageFilter.hxx:196-199).
+    #[error("invalid submatrix extracted for collapsed direction")]
+    SingularCollapsedDirection,
+
+    /// The file's own dimension is below the minimum SimpleITK will load.
+    /// `ImageFileReader::Execute` throws `"The file has unsupported image
+    /// dimension of ..."` (sitkImageFileReader.cxx:302-307).
+    #[error("the file has unsupported image dimension of {0}")]
+    UnsupportedImageDimension(usize),
 
     /// A core image error surfaced during assembly.
     #[error(transparent)]

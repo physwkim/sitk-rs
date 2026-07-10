@@ -1,41 +1,44 @@
 //! Image file IO for sitk-rs.
 //!
+//! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
+//! [`read_image`] and [`write_image`] ask the registry which IO handles a path,
+//! exactly as SimpleITK's readers and writers ask `itk::ImageIOFactory`. Adding
+//! NIfTI, NRRD, PNG or DICOM later is a new module plus one registry entry — no
+//! dispatch to extend. See [`image_io`] for the probe order and [`meta_image`]
+//! for the only implementor so far.
+//!
 //! Phase 0 supports MetaImage (`.mha` / `.mhd`), ITK's native uncompressed
 //! format, which round-trips every scalar, vector, and complex pixel type and
 //! the full geometry (see [`meta_image`] for the channel-count caveat that
-//! applies to complex images). The [`read_image`] / [`write_image`] entry
-//! points dispatch on file extension, so adding a format later (PNG via
-//! `image`, NIfTI, DICOM) is a new match arm plus a module.
+//! applies to complex images).
 
 pub mod error;
+pub mod image_io;
 pub mod meta_image;
 
 use std::path::Path;
 
 pub use error::{IoError, Result};
+pub use image_io::{
+    FileMode, ImageInformation, ImageIo, create_image_io, image_io_by_name, registered_image_ios,
+    registry,
+};
 use sitk_core::Image;
 
-/// Read an image, dispatching on the file extension.
+/// Read an image, letting the [`registry`] pick the format —
+/// `itk::simple::ReadImage` (sitkImageFileReader.cxx:70-78).
+///
+/// The returned image carries the file's meta-data dictionary.
 pub fn read_image<P: AsRef<Path>>(path: P) -> Result<Image> {
     let path = path.as_ref();
-    match extension_lower(path).as_deref() {
-        Some("mha") | Some("mhd") => meta_image::read(path),
-        other => Err(IoError::UnknownExtension(other.unwrap_or("").to_string())),
-    }
+    image_io::reader_for(path)?.read(path)
 }
 
-/// Write an image, dispatching on the file extension.
+/// Write an image, letting the [`registry`] pick the format —
+/// `itk::simple::WriteImage`.
 pub fn write_image<P: AsRef<Path>>(image: &Image, path: P) -> Result<()> {
     let path = path.as_ref();
-    match extension_lower(path).as_deref() {
-        Some("mha") | Some("mhd") => meta_image::write(image, path),
-        other => Err(IoError::UnknownExtension(other.unwrap_or("").to_string())),
-    }
-}
-
-fn extension_lower(path: &Path) -> Option<String> {
-    path.extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    image_io::writer_for(path)?.write(image, path)
 }
 
 #[cfg(test)]
@@ -47,6 +50,22 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("sitk_io_test_{}_{name}", std::process::id()));
         p
+    }
+
+    /// The dictionary `MetaImageIO::ReadImageInformation` always installs
+    /// (itkMetaImageIO.cxx:270-278), which a written-then-read image therefore
+    /// carries and its in-memory original does not. Strip it so the two can be
+    /// compared with `assert_eq!`.
+    fn without_metadata(mut img: Image) -> Image {
+        for key in img
+            .meta_data_keys()
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+        {
+            img.erase_meta_data(&key);
+        }
+        img
     }
 
     #[test]
@@ -69,7 +88,7 @@ mod tests {
         assert_eq!(back.origin(), img.origin());
         assert_eq!(back.direction(), img.direction());
         assert_eq!(back.scalar_slice::<i16>().unwrap(), data.as_slice());
-        assert_eq!(back, img);
+        assert_eq!(without_metadata(back), img);
     }
 
     #[test]
@@ -136,7 +155,7 @@ mod tests {
         assert_eq!(back.origin(), img.origin());
         assert_eq!(back.direction(), img.direction());
         assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
-        assert_eq!(back, img);
+        assert_eq!(without_metadata(back), img);
     }
 
     #[test]
@@ -159,7 +178,7 @@ mod tests {
         assert_eq!(back.origin(), img.origin());
         assert_eq!(back.direction(), img.direction());
         assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
-        assert_eq!(back, img);
+        assert_eq!(without_metadata(back), img);
     }
 
     /// MetaIO has no complex element type, so a complex image's
@@ -327,12 +346,334 @@ mod tests {
         assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
     }
 
+    /// No registered `ImageIo` advertises `.png`, so `CreateImageIO` returns
+    /// null and `ImageFileWriter::GetImageIOBase` throws "Unable to determine
+    /// ImageIO writer" (sitkImageFileWriter.cxx:207-210).
     #[test]
     fn unknown_extension_errors() {
         let img = Image::new(&[2, 2], PixelId::UInt8);
         assert!(matches!(
             write_image(&img, tmp_path("x.png")),
-            Err(IoError::UnknownExtension(_))
+            Err(IoError::NoWriterFound(_))
         ));
+    }
+
+    // ---- registry --------------------------------------------------------
+
+    /// `ImageFileWriter::GetRegisteredImageIOs` lists `GetNameOfClass`, not
+    /// extensions (sitkImageIOUtilities.cxx:59-77).
+    #[test]
+    fn registry_lists_the_meta_image_io_by_class_name() {
+        assert_eq!(registered_image_ios(), vec!["MetaImageIO"]);
+        assert_eq!(
+            image_io_by_name("MetaImageIO").unwrap().name(),
+            "MetaImageIO"
+        );
+        assert!(matches!(
+            image_io_by_name("NiftiImageIO"),
+            Err(IoError::UnknownImageIo(name)) if name == "NiftiImageIO"
+        ));
+    }
+
+    /// `MetaImageIO::CanReadFile` opens the file and looks for `NDims` in the
+    /// first 8000 bytes (metaImage.cxx:1201-1228). A `.mhd` extension is not
+    /// enough: `CreateImageIO`'s phase 1 strikes the IO off, phase 2 finds
+    /// nobody, and `GetImageIOBase` reports it cannot determine a reader.
+    #[test]
+    fn extension_alone_does_not_claim_a_file_for_reading() {
+        let path = tmp_path("not_really.mhd");
+        std::fs::write(&path, b"this is a text file, not a MetaImage\n").unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// The mirror image: `MetaImage::CanRead` rejects a name that does not end
+    /// in `.mhd`/`.mha` *before* it looks at the content (metaImage.cxx:
+    /// 1182-1199), so a genuine MetaImage header under a foreign name is not
+    /// rescued by `CreateImageIO`'s phase 2 either. Content beats extension in
+    /// the factory; it does not beat `MetaImageIO`'s own extension check.
+    #[test]
+    fn meta_image_content_under_a_foreign_name_is_still_not_read() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let mha = tmp_path("content_probe.mha");
+        write_image(&img, &mha).unwrap();
+        let foreign = tmp_path("content_probe.foo");
+        std::fs::rename(&mha, &foreign).unwrap();
+
+        let claimed = create_image_io(&foreign, FileMode::Read).is_some();
+        let result = read_image(&foreign);
+        std::fs::remove_file(&foreign).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// `MetaImageIO::CanWriteFile` is `HasSupportedWriteExtension(name, true)` —
+    /// case-**insensitive** (itkMetaImageIO.cxx:370-380) — while
+    /// `MetaImage::CanRead` compares `.mha` case-**sensitively**
+    /// (metaImage.cxx:1190-1194). So upstream writes `IMG.MHA` happily and then
+    /// cannot read it back. Pinned, not fixed.
+    #[test]
+    fn uppercase_extension_is_writable_but_not_readable() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("shouty.MHA");
+        write_image(&img, &path).unwrap();
+        assert!(path.exists());
+
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+    }
+
+    /// A read of a path that does not exist is reported as such before "unable
+    /// to determine ImageIO reader" (sitkImageReaderBase.cxx:87-100).
+    #[test]
+    fn reading_a_missing_file_reports_file_not_found() {
+        let result = read_image(tmp_path("does_not_exist.mha"));
+        assert!(
+            matches!(result, Err(IoError::FileNotFound(_))),
+            "{result:?}"
+        );
+    }
+
+    // ---- header field precedence and boolean parsing ----------------------
+
+    fn write_mha(name: &str, header: &str, data: &[u8]) -> std::path::PathBuf {
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(data);
+        let path = tmp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// `MetaObject::M_Read` applies `Offset`, then `Position`, then `Origin`,
+    /// and `Orientation`, then `Rotation`, then `TransformMatrix`
+    /// (metaObject.cxx:1653-1707) — a fixed order that ignores where the lines
+    /// sit in the file. Here `Origin` and `TransformMatrix` come *first* and
+    /// still win.
+    #[test]
+    fn alias_precedence_is_metaios_apply_order_not_file_order() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             Origin = 7 7\n\
+             TransformMatrix = 0 -1 1 0\n\
+             Position = 5 5\n\
+             Rotation = 1 0 0 1\n\
+             Offset = 1 1\n\
+             DimSize = 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LOCAL\n";
+        let path = write_mha("precedence.mha", header, &[0u8; 4]);
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.origin(), &[7.0, 7.0]);
+        assert_eq!(img.direction(), &[0.0, -1.0, 1.0, 0.0]);
+    }
+
+    /// `BinaryDataByteOrderMSB` is applied after `ElementByteOrderMSB`
+    /// (metaObject.cxx:1618-1642), so it wins regardless of file order — even
+    /// when it turns big-endian *off*.
+    #[test]
+    fn binary_data_byte_order_msb_overrides_element_byte_order_msb() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryDataByteOrderMSB = False\n\
+             ElementByteOrderMSB = True\n\
+             DimSize = 2 1\n\
+             ElementType = MET_SHORT\n\
+             ElementDataFile = LOCAL\n";
+        let path = write_mha("byte_order_precedence.mha", header, &[1, 0, 2, 0]);
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[1, 2]);
+    }
+
+    /// A MetaIO boolean is true iff its first character is `T`, `t` or `1`
+    /// (metaObject.cxx:1586-1642) — `1` is not the string `"true"`, and `yes`
+    /// is false.
+    #[test]
+    fn meta_io_booleans_read_only_the_first_character() {
+        let msb = |value: &str, name: &str| {
+            let header = format!(
+                "ObjectType = Image\n\
+                 NDims = 2\n\
+                 BinaryDataByteOrderMSB = {value}\n\
+                 DimSize = 2 1\n\
+                 ElementType = MET_SHORT\n\
+                 ElementDataFile = LOCAL\n"
+            );
+            let path = write_mha(name, &header, &[0x01, 0x02, 0x03, 0x04]);
+            let img = read_image(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            img.scalar_slice::<i16>().unwrap().to_vec()
+        };
+        // Big-endian: 0x0102 = 258, 0x0304 = 772.
+        assert_eq!(msb("True", "bool_true.mha"), vec![258, 772]);
+        assert_eq!(msb("true", "bool_lower.mha"), vec![258, 772]);
+        assert_eq!(msb("1", "bool_one.mha"), vec![258, 772]);
+        assert_eq!(msb("TRUE", "bool_shout.mha"), vec![258, 772]);
+        // Little-endian: 0x0201 = 513, 0x0403 = 1027.
+        assert_eq!(msb("False", "bool_false.mha"), vec![513, 1027]);
+        assert_eq!(msb("yes", "bool_yes.mha"), vec![513, 1027]);
+        assert_eq!(msb("0", "bool_zero.mha"), vec![513, 1027]);
+    }
+
+    /// `MetaImageIO::Read` calls `ElementByteOrderFix`
+    /// (itkMetaImageIO.cxx:348,359), so a big-endian file round-trips through
+    /// `write` — which always emits little-endian — to the same values.
+    #[test]
+    fn msb_round_trip_recovers_every_component() {
+        let values: Vec<i32> = vec![i32::MIN, -1, 0, 1, 0x0102_0304, i32::MAX];
+        let mut data = Vec::new();
+        for v in &values {
+            data.extend_from_slice(&v.to_be_bytes());
+        }
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             ElementByteOrderMSB = True\n\
+             DimSize = 3 2\n\
+             ElementType = MET_INT\n\
+             ElementDataFile = LOCAL\n";
+        let big = write_mha("msb.mha", header, &data);
+        let from_big = read_image(&big).unwrap();
+        assert_eq!(from_big.scalar_slice::<i32>().unwrap(), values.as_slice());
+
+        let little = tmp_path("msb_out.mha");
+        write_image(&from_big, &little).unwrap();
+        let round = read_image(&little).unwrap();
+        std::fs::remove_file(&big).ok();
+        std::fs::remove_file(&little).ok();
+        assert_eq!(round.scalar_slice::<i32>().unwrap(), values.as_slice());
+    }
+
+    /// Multi-channel data is swapped per component, not per pixel
+    /// (metaImage.cxx:806-838 iterates `quantity * m_ElementNumberOfChannels`).
+    #[test]
+    fn msb_swaps_each_channel_of_a_vector_pixel() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryDataByteOrderMSB = True\n\
+             DimSize = 2 1\n\
+             ElementNumberOfChannels = 2\n\
+             ElementType = MET_USHORT\n\
+             ElementDataFile = LOCAL\n";
+        let path = write_mha(
+            "msb_vector.mha",
+            header,
+            &[0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04],
+        );
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(img.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(img.component_slice::<u16>().unwrap(), &[1, 2, 3, 4]);
+    }
+
+    // ---- ElementDataFile = LIST ------------------------------------------
+
+    /// `ElementDataFile = LIST` names one file per slice on the header lines
+    /// that follow; each holds `prod(DimSize[..NDims-1])` pixels
+    /// (metaImage.cxx:1318-1387).
+    #[test]
+    fn list_reads_one_file_per_slice() {
+        let s0 = tmp_path("list_s0.raw");
+        let s1 = tmp_path("list_s1.raw");
+        std::fs::write(&s0, [1u8, 2, 3, 4]).unwrap();
+        std::fs::write(&s1, [5u8, 6, 7, 8]).unwrap();
+
+        let header = format!(
+            "ObjectType = Image\n\
+             NDims = 3\n\
+             BinaryData = True\n\
+             DimSize = 2 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LIST\n\
+             {}\n{}\n",
+            s0.file_name().unwrap().to_string_lossy(),
+            s1.file_name().unwrap().to_string_lossy(),
+        );
+        let path = tmp_path("list.mhd");
+        std::fs::write(&path, header).unwrap();
+
+        let img = read_image(&path).unwrap();
+        for p in [&path, &s0, &s1] {
+            std::fs::remove_file(p).ok();
+        }
+        assert_eq!(img.size(), &[2, 2, 2]);
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// `LIST <n>` overrides how many axes live inside each file: `LIST 1` on a
+    /// 2-D image means one file per *row*. The word is read with `atof` and
+    /// falls back to `NDims - 1` when it is `0` or exceeds `NDims`
+    /// (metaImage.cxx:1319-1333). Trailing whitespace and carriage returns are
+    /// stripped from each name (metaImage.cxx:1352-1356).
+    #[test]
+    fn list_honours_an_explicit_file_image_dimension() {
+        let r0 = tmp_path("list_r0.raw");
+        let r1 = tmp_path("list_r1.raw");
+        std::fs::write(&r0, [10u8, 20]).unwrap();
+        std::fs::write(&r1, [30u8, 40]).unwrap();
+
+        let header = format!(
+            "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             DimSize = 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LIST 1\n\
+             {}  \r\n{}\n",
+            r0.file_name().unwrap().to_string_lossy(),
+            r1.file_name().unwrap().to_string_lossy(),
+        );
+        let path = tmp_path("list_dim.mhd");
+        std::fs::write(&path, header).unwrap();
+
+        let img = read_image(&path).unwrap();
+        for p in [&path, &r0, &r1] {
+            std::fs::remove_file(p).ok();
+        }
+        assert_eq!(img.scalar_slice::<u8>().unwrap(), &[10, 20, 30, 40]);
+    }
+
+    /// Upstream's `for (i = 0; i < totalFiles && !_stream->eof(); ++i)` returns
+    /// success on a short list, leaving the tail of the pixel buffer
+    /// uninitialised. That is unreproducible in safe Rust; a short list is
+    /// truncated data here.
+    #[test]
+    fn list_with_too_few_slices_is_truncated_data() {
+        let s0 = tmp_path("short_list_s0.raw");
+        std::fs::write(&s0, [1u8, 2, 3, 4]).unwrap();
+        let header = format!(
+            "ObjectType = Image\n\
+             NDims = 3\n\
+             DimSize = 2 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LIST\n\
+             {}\n",
+            s0.file_name().unwrap().to_string_lossy(),
+        );
+        let path = tmp_path("short_list.mhd");
+        std::fs::write(&path, header).unwrap();
+
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&s0).ok();
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
     }
 }
