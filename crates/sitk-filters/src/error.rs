@@ -638,6 +638,29 @@ pub enum FilterError {
     #[error("Gaussian maximum error must lie strictly inside (0, 1), got {0}")]
     GaussianMaximumErrorOutOfRange(f64),
 
+    /// `DICOMOrientImageFilter::ImageDimension` is `static_assert`ed to `3`
+    /// (`itkDICOMOrientImageFilter.h:142`), and `DICOMOrientImageFilter.yaml`'s
+    /// `custom_register` only instantiates the SimpleITK wrapper for 3-D
+    /// images (`factory.RegisterMemberFunctions<PixelIDTypeList, 3>()`).
+    #[error("dicom_orient only supports 3-D images, got {0}-D")]
+    UnsupportedDicomOrientDimension(usize),
+
+    /// `DICOMOrientImageFilter::VerifyPreconditions`
+    /// (`itkDICOMOrientImageFilter.hxx:296-306`) throws
+    /// "DesiredCoordinateOrientation is 'INVALID'." when the desired
+    /// orientation string does not parse to one of the 48 valid 3-letter
+    /// codes.
+    #[error(
+        "desired coordinate orientation '{0}' does not parse to a valid 3-letter orientation code"
+    )]
+    InvalidDesiredOrientation(String),
+
+    /// `sitkSTLToITKDirection` (`sitkTemplateFunctions.h:187-207`), used by
+    /// `GetOrientationFromDirectionCosines`: a non-empty direction vector
+    /// must have exactly `3*3 == 9` elements.
+    #[error("length of input ({0}) does not match matrix dimensions (3, 3)")]
+    InvalidDirectionCosinesLength(usize),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
