@@ -102,7 +102,7 @@ use sitk_core::{
 /// for every filter in this module that computes in `f64` (mirrors
 /// `gradient.rs`'s helper of the same name).
 fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
     Ok(scratch)
 }
@@ -255,7 +255,7 @@ pub fn box_mean(img: &Image, radius: &[usize]) -> Result<Image> {
 
     let size = img.size().to_vec();
     let strides_ = strides(&size);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
 
     let out: Vec<f64> = (0..img.number_of_pixels())
         .map(|flat| {
@@ -292,7 +292,7 @@ pub fn box_sigma(img: &Image, radius: &[usize]) -> Result<Image> {
 
     let size = img.size().to_vec();
     let strides_ = strides(&size);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
 
     let out: Vec<f64> = (0..img.number_of_pixels())
         .map(|flat| {
@@ -485,7 +485,7 @@ pub fn discrete_gaussian(
         maximum_kernel_width,
         use_image_spacing,
     )?;
-    image_from_f64(img.pixel_id(), img.size(), img, &smoothed.to_f64_vec())
+    image_from_f64(img.pixel_id(), img.size(), img, &smoothed.to_f64_vec()?)
 }
 
 /// [`discrete_gaussian`]'s validation and separable-convolution core, stopping
@@ -839,7 +839,7 @@ pub fn discrete_gaussian_derivative(
         current.copy_geometry_from(img);
     }
 
-    image_from_f64(pixel_id, &size, img, &current.to_f64_vec())
+    image_from_f64(pixel_id, &size, img, &current.to_f64_vec()?)
 }
 
 // ---- binomial_blur ----------------------------------------------------
@@ -894,7 +894,7 @@ pub fn binomial_blur(img: &Image, repetitions: u32) -> Result<Image> {
     let dim = img.dimension();
     let size = img.size().to_vec();
     let strides_ = strides(&size);
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
 
     for _ in 0..repetitions {
         for d in 0..dim {
@@ -1141,7 +1141,7 @@ pub fn curvature_flow(
 
     let size = img.size().to_vec();
     let radius = vec![1usize; dim];
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
 
     for _ in 0..number_of_iterations {
         let mut snapshot = Image::from_vec(&size, buf.clone())?;
@@ -1169,14 +1169,19 @@ mod tests {
     fn mean_radius_zero_is_identity() {
         let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
         let out = mean(&img, &[0, 0]).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
     fn mean_constant_image_is_fixed_point() {
         let img = Image::from_vec(&[6, 6], vec![7.0f64; 36]).unwrap();
         let out = mean(&img, &[1, 1]).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| (v - 7.0).abs() < 1e-12));
+        assert!(
+            out.to_f64_vec()
+                .unwrap()
+                .iter()
+                .all(|&v| (v - 7.0).abs() < 1e-12)
+        );
     }
 
     #[test]
@@ -1186,7 +1191,7 @@ mod tests {
         data[2 * n + 2] = 90.0;
         let img = Image::from_vec(&[n, n], data).unwrap();
         let out = mean(&img, &[1, 1]).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         for y in 0..n {
             for x in 0..n {
                 let expected = if x.abs_diff(2) <= 1 && y.abs_diff(2) <= 1 {
@@ -1210,7 +1215,7 @@ mod tests {
         data[2 * n + 2] = 90.0;
         let img = Image::from_vec(&[n, n], data).unwrap();
         let out = mean(&img, &[1, 0]).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // radius=[1,0]: window is 3x1, size 3, spreads only along x.
         for x in 1..=3 {
             assert!((vals[2 * n + x] - 30.0).abs() < 1e-12);
@@ -1290,7 +1295,7 @@ mod tests {
     fn box_mean_radius_zero_is_identity() {
         let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
         let out = box_mean(&img, &[0, 0]).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     /// `box_mean` *clips* the window to the image at the border instead of
@@ -1302,10 +1307,13 @@ mod tests {
     fn box_mean_clips_the_window_at_the_border_unlike_mean() {
         let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = box_mean(&img, &[1, 0]).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![15.0, 20.0, 30.0, 40.0, 45.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![15.0, 20.0, 30.0, 40.0, 45.0]
+        );
 
         let replicated = mean(&img, &[1, 0]).unwrap();
-        assert!((replicated.to_f64_vec()[0] - 40.0 / 3.0).abs() < 1e-12);
+        assert!((replicated.to_f64_vec().unwrap()[0] - 40.0 / 3.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1315,7 +1323,7 @@ mod tests {
         data[2 * n + 2] = 90.0;
         let img = Image::from_vec(&[n, n], data).unwrap();
         let out = box_mean(&img, &[1, 0]).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // Interior of the nonzero axis: same as `mean`'s box (all 3 pixels valid).
         for x in 1..=3 {
             assert!((vals[2 * n + x] - 30.0).abs() < 1e-12);
@@ -1352,7 +1360,7 @@ mod tests {
     fn box_sigma_interior_matches_hand_derived_sample_stddev() {
         let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         let out = box_sigma(&img, &[1, 0]).unwrap();
-        assert!((out.to_f64_vec()[1] - 1.0).abs() < 1e-12);
+        assert!((out.to_f64_vec().unwrap()[1] - 1.0).abs() < 1e-12);
     }
 
     /// Edge window `[1,2]` (clipped, not replicated): mean=1.5, `Σ²=5`,
@@ -1361,7 +1369,7 @@ mod tests {
     fn box_sigma_clips_the_window_at_the_border() {
         let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         let out = box_sigma(&img, &[1, 0]).unwrap();
-        assert!((out.to_f64_vec()[0] - 0.5f64.sqrt()).abs() < 1e-12);
+        assert!((out.to_f64_vec().unwrap()[0] - 0.5f64.sqrt()).abs() < 1e-12);
     }
 
     /// `radius = [0, 0]`: every box has `N = 1`, so the `N - 1` divisor is
@@ -1372,7 +1380,7 @@ mod tests {
     fn box_sigma_radius_zero_is_nan_everywhere() {
         let img = Image::from_vec(&[3, 1], vec![1.0, 2.0, 3.0]).unwrap();
         let out = box_sigma(&img, &[0, 0]).unwrap();
-        assert!(out.to_f64_vec().iter().all(|v| v.is_nan()));
+        assert!(out.to_f64_vec().unwrap().iter().all(|v| v.is_nan()));
     }
 
     #[test]
@@ -1510,7 +1518,7 @@ mod tests {
         let img = linear_ramp(3.0, 0.0, 21, 5);
         let out = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[1, 0], 0.01, 32, false, false)
             .unwrap();
-        let v = out.to_f64_vec();
+        let v = out.to_f64_vec().unwrap();
         for y in 0..5 {
             for x in 1..20 {
                 let got = v[y * 21 + x];
@@ -1534,10 +1542,12 @@ mod tests {
 
         let a = discrete_gaussian_derivative(&coarse, &[4.0, 4.0], &[1, 0], 0.01, 32, true, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let b = discrete_gaussian_derivative(&fine, &[1.0, 1.0], &[1, 0], 0.01, 32, false, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(a, b);
 
         // The shared value is the attenuated slope: neither -3.0 nor -1.5.
@@ -1562,13 +1572,15 @@ mod tests {
         let sharp =
             discrete_gaussian_derivative(&img, &[0.0, 0.0], &[2, 0], 0.01, 32, false, false)
                 .unwrap()
-                .to_f64_vec()[2 * 21 + 10];
+                .to_f64_vec()
+                .unwrap()[2 * 21 + 10];
         assert!((sharp - 2.0).abs() < 1e-9, "expected 2.0, got {sharp}");
 
         let smooth =
             discrete_gaussian_derivative(&img, &[1.0, 1.0], &[2, 0], 0.01, 32, false, false)
                 .unwrap()
-                .to_f64_vec()[2 * 21 + 10];
+                .to_f64_vec()
+                .unwrap()[2 * 21 + 10];
         let expected = 2.0 * clamped_padding_attenuation(1.0, 0.01);
         assert!(
             (smooth - expected).abs() < 1e-9,
@@ -1586,12 +1598,14 @@ mod tests {
 
         let dx = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[1, 0], 0.01, 32, false, false)
             .unwrap()
-            .to_f64_vec()[center];
+            .to_f64_vec()
+            .unwrap()[center];
         assert!((dx - -3.0).abs() < 1e-12, "expected -3.0, got {dx}");
 
         let dy = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[0, 1], 0.01, 32, false, false)
             .unwrap()
-            .to_f64_vec()[center];
+            .to_f64_vec()
+            .unwrap()[center];
         assert!((dy - -5.0).abs() < 1e-12, "expected -5.0, got {dy}");
     }
 
@@ -1604,11 +1618,13 @@ mod tests {
         let plain =
             discrete_gaussian_derivative(&img, &[4.0, 4.0], &[1, 0], 0.01, 32, false, false)
                 .unwrap()
-                .to_f64_vec()[center];
+                .to_f64_vec()
+                .unwrap()[center];
         let normalized =
             discrete_gaussian_derivative(&img, &[4.0, 4.0], &[1, 0], 0.01, 32, false, true)
                 .unwrap()
-                .to_f64_vec()[center];
+                .to_f64_vec()
+                .unwrap()[center];
 
         let expected = -3.0 * clamped_padding_attenuation(4.0, 0.01);
         assert!(
@@ -1642,7 +1658,7 @@ mod tests {
         let real = Image::from_vec(&[5, 5], real).unwrap();
         let out = discrete_gaussian_derivative(&real, &[1.0, 1.0], &[0, 0], 0.01, 32, false, false)
             .unwrap();
-        assert!(out.to_f64_vec()[2 * 5 + 2] > 0.0);
+        assert!(out.to_f64_vec().unwrap()[2 * 5 + 2] > 0.0);
     }
 
     /// `GaussianDerivativeOperator::SetMaximumError` clamps to
@@ -1712,8 +1728,8 @@ mod tests {
     fn discrete_gaussian_variance_zero_is_identity() {
         let img = Image::from_vec(&[6, 6], (0..36).map(|v| v as f64).collect()).unwrap();
         let out = discrete_gaussian(&img, &[0.0, 0.0], &[0.01, 0.01], 32, true).unwrap();
-        let vals = out.to_f64_vec();
-        for (a, b) in vals.iter().zip(img.to_f64_vec()) {
+        let vals = out.to_f64_vec().unwrap();
+        for (a, b) in vals.iter().zip(img.to_f64_vec().unwrap()) {
             assert!((a - b).abs() < 1e-9);
         }
     }
@@ -1722,7 +1738,7 @@ mod tests {
     fn discrete_gaussian_constant_image_is_preserved() {
         let img = Image::from_vec(&[12, 12], vec![3.0f64; 144]).unwrap();
         let out = discrete_gaussian(&img, &[4.0, 4.0], &[0.01, 0.01], 32, true).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 3.0).abs() < 1e-9, "constant not preserved: {v}");
         }
     }
@@ -1733,7 +1749,7 @@ mod tests {
         // still normalizes to sum 1 regardless of why it stopped growing.
         let img = Image::from_vec(&[12, 12], vec![5.0f64; 144]).unwrap();
         let out = discrete_gaussian(&img, &[10.0, 10.0], &[0.01, 0.01], 3, true).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 5.0).abs() < 1e-9, "constant not preserved: {v}");
         }
     }
@@ -1750,10 +1766,12 @@ mod tests {
 
         let peak_fine = discrete_gaussian(&fine, &[4.0, 4.0], &[0.01, 0.01], 32, true)
             .unwrap()
-            .to_f64_vec()[12 * n + 12];
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
         let peak_coarse = discrete_gaussian(&coarse, &[4.0, 4.0], &[0.01, 0.01], 32, true)
             .unwrap()
-            .to_f64_vec()[12 * n + 12];
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
         assert!(
             peak_coarse > peak_fine,
             "coarser spacing should blur less: {peak_coarse} vs {peak_fine}"
@@ -1772,10 +1790,12 @@ mod tests {
 
         let peak_ignored = discrete_gaussian(&img, &[4.0, 4.0], &[0.01, 0.01], 32, false)
             .unwrap()
-            .to_f64_vec()[12 * n + 12];
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
         let peak_unit = discrete_gaussian(&unit, &[4.0, 4.0], &[0.01, 0.01], 32, true)
             .unwrap()
-            .to_f64_vec()[12 * n + 12];
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
         assert!((peak_ignored - peak_unit).abs() < 1e-9);
     }
 
@@ -1833,21 +1853,26 @@ mod tests {
     fn binomial_blur_zero_repetitions_is_identity() {
         let img = Image::from_vec(&[5, 4], (0..20).map(|v| v as f64).collect()).unwrap();
         let out = binomial_blur(&img, 0).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
     fn binomial_blur_constant_image_is_fixed_point() {
         let img = Image::from_vec(&[6, 6, 6], vec![4.0f64; 216]).unwrap();
         let out = binomial_blur(&img, 3).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| (v - 4.0).abs() < 1e-9));
+        assert!(
+            out.to_f64_vec()
+                .unwrap()
+                .iter()
+                .all(|&v| (v - 4.0).abs() < 1e-9)
+        );
     }
 
     #[test]
     fn binomial_blur_one_repetition_matches_hand_derived_1_2_1_and_boundary() {
         let img = Image::from_vec(&[6, 1], vec![0.0f64, 10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = binomial_blur(&img, 1).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // left boundary: (o[0]+o[1])/2; interior: (o[i-1]+2o[i]+o[i+1])/4;
         // right boundary: (o[last-1]+3*o[last])/4.
         let expected = [5.0, 10.0, 20.0, 30.0, 40.0, 47.5];
@@ -1874,8 +1899,8 @@ mod tests {
         // would make ITK's own domain-Gaussian evaluate 0/0 at that tap).
         let img = Image::from_vec(&[5, 5], (0..25).map(|v| v as f64).collect()).unwrap();
         let out = bilateral(&img, -0.1, 50.0, 100).unwrap();
-        let vals = out.to_f64_vec();
-        for (a, b) in vals.iter().zip(img.to_f64_vec()) {
+        let vals = out.to_f64_vec().unwrap();
+        for (a, b) in vals.iter().zip(img.to_f64_vec().unwrap()) {
             assert!((a - b).abs() < 1e-9);
         }
     }
@@ -1884,7 +1909,7 @@ mod tests {
     fn bilateral_constant_image_is_fixed_point() {
         let img = Image::from_vec(&[9, 9], vec![42.0f64; 81]).unwrap();
         let out = bilateral(&img, 2.0, 30.0, 100).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 42.0).abs() < 1e-9, "constant not preserved: {v}");
         }
     }
@@ -1899,7 +1924,7 @@ mod tests {
         }
         let img = Image::from_vec(&[n, 1], data).unwrap();
         let out = bilateral(&img, 3.0, 1.0, 100).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         // just past the edge, output should stay near the local step value,
         // not be pulled toward the 50 a pure domain-Gaussian average gives.
         assert!(vals[n / 2] > 90.0, "edge not preserved: {}", vals[n / 2]);
@@ -1920,8 +1945,14 @@ mod tests {
         let mut coarse = Image::from_vec(&[n, n], data).unwrap();
         coarse.set_spacing(&[2.0, 2.0]).unwrap();
 
-        let peak_fine = bilateral(&fine, 4.0, 1000.0, 100).unwrap().to_f64_vec()[12 * n + 12];
-        let peak_coarse = bilateral(&coarse, 4.0, 1000.0, 100).unwrap().to_f64_vec()[12 * n + 12];
+        let peak_fine = bilateral(&fine, 4.0, 1000.0, 100)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
+        let peak_coarse = bilateral(&coarse, 4.0, 1000.0, 100)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()[12 * n + 12];
         assert!(
             peak_coarse > peak_fine,
             "coarser spacing should blur less: {peak_coarse} vs {peak_fine}"
@@ -1942,16 +1973,16 @@ mod tests {
         let img = Image::from_vec(&[5, 5], (0u8..25).collect()).unwrap();
         let out = curvature_flow(&img, 0, 0.05, true).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float64);
-        let expected: Vec<f64> = img.to_f64_vec();
-        assert_eq!(out.to_f64_vec(), expected);
+        let expected: Vec<f64> = img.to_f64_vec().unwrap();
+        assert_eq!(out.to_f64_vec().unwrap(), expected);
     }
 
     #[test]
     fn curvature_flow_time_step_zero_is_identity_regardless_of_iterations() {
         let img = Image::from_vec(&[6, 6], (0u8..36).collect()).unwrap();
         let out = curvature_flow(&img, 10, 0.0, true).unwrap();
-        let expected: Vec<f64> = img.to_f64_vec();
-        assert_eq!(out.to_f64_vec(), expected);
+        let expected: Vec<f64> = img.to_f64_vec().unwrap();
+        assert_eq!(out.to_f64_vec().unwrap(), expected);
     }
 
     #[test]
@@ -1959,7 +1990,12 @@ mod tests {
         // Zero gradient everywhere => magnitude_sqr < 1e-9 => update == 0.
         let img = Image::from_vec(&[6, 6], vec![7.0f64; 36]).unwrap();
         let out = curvature_flow(&img, 5, 0.05, true).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| (v - 7.0).abs() < 1e-12));
+        assert!(
+            out.to_f64_vec()
+                .unwrap()
+                .iter()
+                .all(|&v| (v - 7.0).abs() < 1e-12)
+        );
     }
 
     #[test]
@@ -1976,7 +2012,7 @@ mod tests {
         }
         let img = Image::from_vec(&[w, h], data.clone()).unwrap();
         let out = curvature_flow(&img, 4, 0.05, true).unwrap();
-        for (a, b) in out.to_f64_vec().iter().zip(&data) {
+        for (a, b) in out.to_f64_vec().unwrap().iter().zip(&data) {
             assert!((a - b).abs() < 1e-9, "expected fixed point: {a} vs {b}");
         }
     }
@@ -2001,8 +2037,8 @@ mod tests {
         // unit scale=[1,1]: update = -2*1*1/(1+1) = -1.0
         let expected_unit = 1.0 - time_step;
 
-        assert!((out_spaced.to_f64_vec()[4] - expected_spaced).abs() < 1e-9);
-        assert!((out_unit.to_f64_vec()[4] - expected_unit).abs() < 1e-9);
+        assert!((out_spaced.to_f64_vec().unwrap()[4] - expected_spaced).abs() < 1e-9);
+        assert!((out_unit.to_f64_vec().unwrap()[4] - expected_unit).abs() < 1e-9);
     }
 
     #[test]

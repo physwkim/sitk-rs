@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::boundary::BoundaryCondition;
 use crate::error::{Error, Result};
-use crate::image::Image;
+use crate::image::{Image, ScalarView};
 use crate::pixel::Scalar;
 
 /// A snapshot of pixel values in an N-dimensional neighborhood window.
@@ -75,12 +75,11 @@ impl<T: Copy> Neighborhood<T> {
 ///
 /// Mirrors `itk::ConstNeighborhoodIterator<TImage, TBoundaryCondition>`
 /// (itkConstNeighborhoodIterator.h). Pixels are read through a single
-/// `image.scalar_slice::<T>()` borrow taken at construction, never converted
-/// through `f64`.
+/// [`ScalarView`] taken at construction, never converted through `f64`; that
+/// view is also the proof the boundary condition needs to read infallibly.
 #[derive(Debug)]
 pub struct NeighborhoodIterator<'a, T: Scalar, B: BoundaryCondition<T>> {
-    image: &'a Image,
-    pixels: &'a [T],
+    view: ScalarView<'a, T>,
     radius: Rc<[usize]>,
     window_size: Rc<[usize]>,
     // Per-neighbor ND offset from the center, dimension-0-fastest.
@@ -104,7 +103,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         if radius.len() != dim {
             return Err(Error::RadiusMismatch { dimension: dim });
         }
-        let pixels = image.scalar_slice::<T>()?;
+        let view = image.scalar_view::<T>()?;
 
         let window_size: Vec<usize> = radius.iter().map(|&r| 2 * r + 1).collect();
         let num_neighbors: usize = window_size.iter().product();
@@ -139,8 +138,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         let exhausted = image.number_of_pixels() == 0;
 
         Ok(Self {
-            image,
-            pixels,
+            view,
             radius: radius.to_vec().into(),
             window_size: window_size.into(),
             neighbor_offsets,
@@ -179,7 +177,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         center
             .iter()
             .enumerate()
-            .all(|(d, &c)| c >= self.radius[d] && c + self.radius[d] < self.image.size()[d])
+            .all(|(d, &c)| c >= self.radius[d] && c + self.radius[d] < self.view.image().size()[d])
     }
 
     /// Fetches the window at `center` via direct offset arithmetic, with no
@@ -192,11 +190,11 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
             self.is_interior(center),
             "neighborhood_at_fast requires an interior center"
         );
-        let center_linear = self.image.linear_index(center) as i64;
+        let center_linear = self.view.image().linear_index(center) as i64;
         let values = self
             .neighbor_deltas
             .iter()
-            .map(|&delta| self.pixels[(center_linear + delta) as usize])
+            .map(|&delta| self.view.pixels()[(center_linear + delta) as usize])
             .collect();
         Neighborhood {
             radius: Rc::clone(&self.radius),
@@ -209,8 +207,8 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     /// and falling back to the boundary condition for any that spill off the
     /// image (itkConstNeighborhoodIterator.h:194-209, `GetPixel`).
     pub fn neighborhood_at_checked(&self, center: &[usize]) -> Neighborhood<T> {
-        let dim = self.image.dimension();
-        let size = self.image.size();
+        let dim = self.view.image().dimension();
+        let size = self.view.image().size();
         let values = self
             .neighbor_offsets
             .iter()
@@ -224,9 +222,9 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
                 }
                 if inside {
                     let idx: Vec<usize> = nd.iter().map(|&v| v as usize).collect();
-                    self.pixels[self.image.linear_index(&idx)]
+                    self.view.pixels()[self.view.image().linear_index(&idx)]
                 } else {
-                    self.boundary.get_pixel(&nd, self.image)
+                    self.boundary.get_pixel(&nd, &self.view)
                 }
             })
             .collect();
@@ -261,7 +259,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> Iterator for NeighborhoodIterator<'
 
         // Advance the cursor, dimension 0 fastest, carrying into higher
         // dimensions on wrap (matches Image's storage order).
-        let size = self.image.size();
+        let size = self.view.image().size();
         let mut carry = true;
         for (c, &s) in self.cursor.iter_mut().zip(size.iter()) {
             *c += 1;

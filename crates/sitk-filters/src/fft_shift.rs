@@ -50,7 +50,7 @@ pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
     let size = img.size();
     let dim = size.len();
     let strides = strides(size);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
 
     let shift: Vec<i64> = size
         .iter()

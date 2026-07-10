@@ -164,7 +164,7 @@ pub fn stochastic_fractal_dimension(
 
     let size = image.size();
     let n = image.number_of_pixels();
-    let pixels = image.to_f64_vec();
+    let pixels = image.to_f64_vec()?;
     let offsets = neighbor_offsets(radius);
     let num_neighbors = offsets.len();
     let min_spacing = min_spacing_f32(image.spacing());
@@ -311,9 +311,9 @@ mod tests {
         let image = img(&[5], vec![0.0f64, 2.0, 5.0, 9.0, 0.0]);
         let out = stochastic_fractal_dimension(&image, None, &[1]).unwrap();
         assert!(
-            (out.to_f64_vec()[2] - 2.0).abs() < 1e-4,
+            (out.to_f64_vec().unwrap()[2] - 2.0).abs() < 1e-4,
             "got {}",
-            out.to_f64_vec()[2]
+            out.to_f64_vec().unwrap()[2]
         );
     }
 
@@ -328,7 +328,7 @@ mod tests {
     fn left_edge_has_no_boundary_condition_and_yields_nan() {
         let image = img(&[5], vec![0.0f64, 2.0, 5.0, 9.0, 0.0]);
         let out = stochastic_fractal_dimension(&image, None, &[1]).unwrap();
-        assert!(out.to_f64_vec()[0].is_nan());
+        assert!(out.to_f64_vec().unwrap()[0].is_nan());
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
         let image = img(&[5], vec![0.0f64, 2.0, 5.0, 9.0, 0.0]);
         let mask = img(&[5], vec![1u8, 1, 0, 1, 1]);
         let out = stochastic_fractal_dimension(&image, Some(&mask), &[1]).unwrap();
-        assert_eq!(out.to_f64_vec()[2], 0.0);
+        assert_eq!(out.to_f64_vec().unwrap()[2], 0.0);
     }
 
     /// Masking out a neighbor changes which pairs feed the regression, so
@@ -350,14 +350,14 @@ mod tests {
         let mask = img(&[7], vec![1u8, 1, 1, 1, 0, 1, 1]);
         let masked = stochastic_fractal_dimension(&image, Some(&mask), &[2]).unwrap();
 
-        let a = unmasked.to_f64_vec()[3];
-        let b = masked.to_f64_vec()[3];
+        let a = unmasked.to_f64_vec().unwrap()[3];
+        let b = masked.to_f64_vec().unwrap()[3];
         assert!(!a.is_nan() && !b.is_nan());
         assert_ne!(a, b, "masking a neighbor should change pixel 3's value");
         // The masked-out voxel itself still gets a real (non-mask-zeroed)
         // value here, since the mask only excludes it as a *neighbor*, not
         // as its own center.
-        assert_eq!(masked.to_f64_vec()[4], 0.0);
+        assert_eq!(masked.to_f64_vec().unwrap()[4], 0.0);
     }
 
     #[test]

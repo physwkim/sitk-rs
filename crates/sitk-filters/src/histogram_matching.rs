@@ -52,8 +52,8 @@ pub fn histogram_matching(
             b: reference.pixel_id(),
         });
     }
-    let source_vals = source.to_f64_vec();
-    let reference_vals = reference.to_f64_vec();
+    let source_vals = source.to_f64_vec()?;
+    let reference_vals = reference.to_f64_vec()?;
     if source_vals.is_empty() || reference_vals.is_empty() {
         return Err(FilterError::DegenerateRange);
     }
@@ -185,7 +185,8 @@ mod tests {
 
         let out = histogram_matching(&src_img, &ref_img, 256, 7, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         // The matched max should land near the reference max (100), and the
         // matched min near the reference min (0), within a few histogram-bin
         // widths of quantization error.
@@ -204,7 +205,8 @@ mod tests {
         let ref_img = Image::from_vec(&[reference.len()], reference).unwrap();
         let out = histogram_matching(&src_img, &ref_img, 100, 5, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(*out.last().unwrap(), 50.0);
     }
 
@@ -230,10 +232,12 @@ mod tests {
 
         let without = histogram_matching(&src_img, &ref_img, 32, 5, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let with = histogram_matching(&src_img, &ref_img, 32, 5, true)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_ne!(without, with);
     }
 
@@ -249,7 +253,8 @@ mod tests {
         let ref_img = Image::from_vec(&[reference.len()], reference).unwrap();
         let out = histogram_matching(&src_img, &ref_img, 64, 3, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         for v in out {
             assert!((v - 42.0).abs() < 1e-9, "expected 42.0, got {v}");
         }

@@ -223,7 +223,7 @@ fn attribute_morphology_image(
     }
 
     let size = image.size();
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let attribute_value_per_pixel = if use_image_spacing {
         image.spacing().iter().product()
     } else {

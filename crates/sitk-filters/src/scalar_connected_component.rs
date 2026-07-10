@@ -108,14 +108,14 @@ pub fn scalar_connected_component(
 
     let size = image.size();
     let total: usize = size.iter().product();
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let id = image.pixel_id();
     let threshold = quantize_to_pixel_type(id, distance_threshold);
 
     let included: Vec<bool> = match mask {
         None => vec![true; total],
         Some(m) => m
-            .to_f64_vec()
+            .to_f64_vec()?
             .into_iter()
             .map(|v| quantize_to_pixel_type(PixelId::UInt8, v) != 0.0)
             .collect(),

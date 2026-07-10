@@ -245,7 +245,7 @@ pub fn fast_marching_upwind_gradient(
         MarchInput {
             size,
             spacing: speed.spacing(),
-            speed: &speed.to_f64_vec(),
+            speed: &speed.to_f64_vec()?,
             narrow_to_f32: out_id == PixelId::Float32,
             normalization_factor: settings.normalization_factor,
             // `m_StoppingValue`'s constructor default; a reached target lowers it.
@@ -314,11 +314,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_close(&out.arrival_time.to_f64_vec(), &[0.0, 0.5, 1.0, 1.5, 2.0]);
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[0.0, 0.5, 1.0, 1.5, 2.0],
+        );
         assert_eq!(out.gradient.len(), 2);
-        assert_close(&out.gradient[0].to_f64_vec(), &[0.0, 0.5, 0.5, 0.5, 0.5]);
+        assert_close(
+            &out.gradient[0].to_f64_vec().unwrap(),
+            &[0.0, 0.5, 0.5, 0.5, 0.5],
+        );
         // Axis 1 has extent 1: no neighbor, so both differences stay zero.
-        assert_close(&out.gradient[1].to_f64_vec(), &[0.0; 5]);
+        assert_close(&out.gradient[1].to_f64_vec().unwrap(), &[0.0; 5]);
     }
 
     /// The stencil admits only *alive* neighbors. A face pixel of a 3x3 march
@@ -338,7 +344,7 @@ mod tests {
 
         #[rustfmt::skip]
         assert_close(
-            &out.gradient[0].to_f64_vec(),
+            &out.gradient[0].to_f64_vec().unwrap(),
             &[
                 -DIAG_DROP, 0.0, DIAG_DROP,
                 -1.0,       0.0, 1.0,
@@ -347,7 +353,7 @@ mod tests {
         );
         #[rustfmt::skip]
         assert_close(
-            &out.gradient[1].to_f64_vec(),
+            &out.gradient[1].to_f64_vec().unwrap(),
             &[
                 -DIAG_DROP, -1.0, -DIAG_DROP,
                  0.0,        0.0,  0.0,
@@ -368,11 +374,11 @@ mod tests {
             &with_gradient(),
         )
         .unwrap();
-        assert_eq!(out.gradient[0].to_f64_vec()[1], 0.0);
-        assert_eq!(out.gradient[1].to_f64_vec()[1], -1.0);
+        assert_eq!(out.gradient[0].to_f64_vec().unwrap()[1], 0.0);
+        assert_eq!(out.gradient[1].to_f64_vec().unwrap()[1], -1.0);
         // The seed sees no alive neighbor on either axis.
-        assert_eq!(out.gradient[0].to_f64_vec()[4], 0.0);
-        assert_eq!(out.gradient[1].to_f64_vec()[4], 0.0);
+        assert_eq!(out.gradient[0].to_f64_vec().unwrap()[4], 0.0);
+        assert_eq!(out.gradient[1].to_f64_vec().unwrap()[4], 0.0);
     }
 
     #[test]
@@ -395,8 +401,14 @@ mod tests {
         let out = fast_marching_upwind_gradient(&speed, &[vec![0, 0]], &[], &[], &with_gradient())
             .unwrap();
         // T(x) = 2x; dx_backward = 2, divided by spacing 2.
-        assert_close(&out.arrival_time.to_f64_vec(), &[0.0, 2.0, 4.0, 6.0, 8.0]);
-        assert_close(&out.gradient[0].to_f64_vec(), &[0.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[0.0, 2.0, 4.0, 6.0, 8.0],
+        );
+        assert_close(
+            &out.gradient[0].to_f64_vec().unwrap(),
+            &[0.0, 1.0, 1.0, 1.0, 1.0],
+        );
     }
 
     /// A 9-pixel line seeded at `x = 4`, with targets at `x = 3` (reached at
@@ -414,7 +426,7 @@ mod tests {
             },
         )
         .unwrap();
-        (out.arrival_time.to_f64_vec(), out.target_value)
+        (out.arrival_time.to_f64_vec().unwrap(), out.target_value)
     }
 
     /// `OneTarget` stops one offset past the *nearest* target; `SomeTargets(2)`
@@ -468,7 +480,7 @@ mod tests {
             },
         )
         .unwrap();
-        (out.arrival_time.to_f64_vec(), out.target_value)
+        (out.arrival_time.to_f64_vec().unwrap(), out.target_value)
     }
 
     #[test]
@@ -518,7 +530,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_close(&out.arrival_time.to_f64_vec(), &[0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[0.0, 1.0, 2.0, 3.0, 4.0],
+        );
         assert_eq!(out.target_value, 0.0);
     }
 
@@ -530,8 +545,8 @@ mod tests {
         let large = large_value(speed.pixel_id());
         let out = fast_marching_upwind_gradient(&speed, &[vec![9, 0]], &[], &[], &with_gradient())
             .unwrap();
-        assert_close(&out.arrival_time.to_f64_vec(), &[large; 5]);
-        assert_close(&out.gradient[0].to_f64_vec(), &[0.0; 5]);
+        assert_close(&out.arrival_time.to_f64_vec().unwrap(), &[large; 5]);
+        assert_close(&out.gradient[0].to_f64_vec().unwrap(), &[0.0; 5]);
         assert_eq!(out.target_value, 0.0);
     }
 
@@ -545,11 +560,17 @@ mod tests {
 
         let out =
             fast_marching_upwind_gradient(&speed, &[vec![0, 0, 3]], &[], &[], &settings).unwrap();
-        assert_close(&out.arrival_time.to_f64_vec(), &[3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[3.0, 4.0, 5.0, 6.0, 7.0],
+        );
 
         let out = fast_marching_upwind_gradient(&speed, &[vec![0, 0, 3]], &[1.0], &[], &settings)
             .unwrap();
-        assert_close(&out.arrival_time.to_f64_vec(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_close(
+            &out.arrival_time.to_f64_vec().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+        );
     }
 
     #[test]

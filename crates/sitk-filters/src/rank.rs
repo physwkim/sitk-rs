@@ -117,10 +117,7 @@ fn fast_approximate_rank_typed<T: Scalar>(
     let dim = img.dimension();
     let size = img.size().to_vec();
     let strides_ = strides(&size);
-    let mut buf: Vec<T> = img
-        .scalar_slice::<T>()
-        .expect("dispatch guarantees T matches pixel_id")
-        .to_vec();
+    let mut buf: Vec<T> = img.scalar_slice::<T>()?.to_vec();
 
     for (axis, &r) in radius.iter().enumerate() {
         let axis_rank = if axis == dim - 1 { 0.5 } else { rank };
@@ -166,7 +163,7 @@ mod tests {
     fn fast_approximate_rank_radius_zero_is_identity_every_axis() {
         let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
         let out = fast_approximate_rank(&img, &[0, 0], 1.0).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -176,7 +173,10 @@ mod tests {
         let img = Image::from_vec(&[5], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         // dim == 1, so the only axis is always forced to rank 0.5 regardless
         // of the 1.0 passed here -- this also exercises that quirk.
-        let out = fast_approximate_rank(&img, &[1], 1.0).unwrap().to_f64_vec();
+        let out = fast_approximate_rank(&img, &[1], 1.0)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out[2], 30.0);
     }
 
@@ -186,7 +186,10 @@ mod tests {
         // k = floor(0.5*(2-1)) = 0 -> the LOWER of the pair (10), not the
         // upper one `median()`'s len/2 convention would pick.
         let img = Image::from_vec(&[5], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
-        let out = fast_approximate_rank(&img, &[1], 1.0).unwrap().to_f64_vec();
+        let out = fast_approximate_rank(&img, &[1], 1.0)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out[0], 10.0);
         // Right edge is symmetric: window = [40, 50], k = 0 -> 40.
         assert_eq!(out[4], 40.0);
@@ -205,7 +208,8 @@ mod tests {
             Image::from_vec(&[3, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap();
         let out = fast_approximate_rank(&img, &[1, 1], 1.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         // If axis 1 also used rank=1.0 (max), row y=2 would stay [7,8,9]-derived
         // maxima and every column's top would dominate. Instead the forced
         // median on axis 1 pulls rows 1 and 2 to the same values.
@@ -225,7 +229,8 @@ mod tests {
         let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = fast_approximate_rank(&img, &[2, 0], 1.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out, vec![30.0, 40.0, 50.0, 50.0, 50.0]);
     }
 
@@ -237,7 +242,8 @@ mod tests {
         let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = fast_approximate_rank(&img, &[2, 0], 0.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out, vec![10.0, 10.0, 10.0, 20.0, 30.0]);
     }
 
@@ -251,7 +257,8 @@ mod tests {
         let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = fast_approximate_rank(&img, &[2, 0], 2.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out, vec![30.0, 40.0, 50.0, 50.0, 50.0]);
     }
 
@@ -260,7 +267,8 @@ mod tests {
         let img = Image::from_vec(&[5, 1], vec![10.0, 20.0, 30.0, 40.0, 50.0]).unwrap();
         let out = fast_approximate_rank(&img, &[2, 0], -1.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out, vec![10.0, 10.0, 10.0, 20.0, 30.0]);
     }
 

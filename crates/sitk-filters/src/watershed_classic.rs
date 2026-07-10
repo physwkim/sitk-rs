@@ -938,15 +938,17 @@ fn segment(
 /// `u64::MAX`-valued pixel widens to, so the equality still fires.
 fn integer_pixel_type_max(pixel_id: PixelId) -> Option<f64> {
     match pixel_id {
-        PixelId::UInt8 => Some(u8::MAX as f64),
-        PixelId::Int8 => Some(i8::MAX as f64),
-        PixelId::UInt16 => Some(u16::MAX as f64),
-        PixelId::Int16 => Some(i16::MAX as f64),
-        PixelId::UInt32 => Some(u32::MAX as f64),
-        PixelId::Int32 => Some(i32::MAX as f64),
-        PixelId::UInt64 => Some(u64::MAX as f64),
-        PixelId::Int64 => Some(i64::MAX as f64),
-        PixelId::Float32 | PixelId::Float64 => None,
+        PixelId::UInt8 | PixelId::VectorUInt8 => Some(u8::MAX as f64),
+        PixelId::Int8 | PixelId::VectorInt8 => Some(i8::MAX as f64),
+        PixelId::UInt16 | PixelId::VectorUInt16 => Some(u16::MAX as f64),
+        PixelId::Int16 | PixelId::VectorInt16 => Some(i16::MAX as f64),
+        PixelId::UInt32 | PixelId::VectorUInt32 => Some(u32::MAX as f64),
+        PixelId::Int32 | PixelId::VectorInt32 => Some(i32::MAX as f64),
+        PixelId::UInt64 | PixelId::VectorUInt64 => Some(u64::MAX as f64),
+        PixelId::Int64 | PixelId::VectorInt64 => Some(i64::MAX as f64),
+        PixelId::Float32 | PixelId::VectorFloat32 | PixelId::Float64 | PixelId::VectorFloat64 => {
+            None
+        }
     }
 }
 
@@ -1235,7 +1237,7 @@ fn watershed_tree(image: &Image, threshold: f64, level: f64) -> Result<Watershed
         });
     }
 
-    let values = image.to_f64_vec();
+    let values = image.to_f64_vec()?;
     let (padded_labels, padded, table) =
         segment(&values, &size, image.pixel_id(), threshold.clamp(0.0, 1.0));
     let tree = generate_segment_tree(&table, level.clamp(0.0, 1.0))?;

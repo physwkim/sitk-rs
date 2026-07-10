@@ -198,8 +198,8 @@ fn comparison_apply_typed<T: Scalar>(
     b: &Image,
     f: &dyn ComparisonFunctor<T>,
 ) -> Result<Image> {
-    let sa = a.scalar_slice::<T>().expect("dispatch guarantees type");
-    let sb = b.scalar_slice::<T>().expect("dispatch guarantees type");
+    let sa = a.scalar_slice::<T>()?;
+    let sb = b.scalar_slice::<T>()?;
     let out: Vec<u8> = sa.iter().zip(sb).map(|(&x, &y)| f.apply(x, y)).collect();
     let mut img = Image::from_vec(a.size(), out)?;
     img.copy_geometry_from(a);
@@ -221,7 +221,7 @@ pub(crate) fn comparison_apply<F: AllScalarsComparisonFunctor>(
 // ---- unary (pixel-type-compute policy) engine --------------------------
 
 fn unary_pixel_apply_typed<T: Scalar>(img: &Image, f: &dyn UnaryPixelFunctor<T>) -> Result<Image> {
-    let s = img.scalar_slice::<T>().expect("dispatch guarantees type");
+    let s = img.scalar_slice::<T>()?;
     let out: Vec<T> = s.iter().map(|&x| f.apply(x)).collect();
     let mut out_img = Image::from_vec(img.size(), out)?;
     out_img.copy_geometry_from(img);
@@ -232,7 +232,7 @@ fn unary_pixel_apply_typed_in_place<T: Scalar>(
     mut img: Image,
     f: &dyn UnaryPixelFunctor<T>,
 ) -> Result<Image> {
-    let v = img.scalar_vec_mut::<T>().expect("dispatch guarantees type");
+    let v = img.scalar_vec_mut::<T>()?;
     for x in v.iter_mut() {
         *x = f.apply(*x);
     }
@@ -262,7 +262,7 @@ pub(crate) fn unary_pixel_apply_in_place<F: AllScalarsUnaryPixelFunctor>(
 /// Apply a [`UnaryFunctor`] over `img`, allocating a new [`Image`] of the
 /// same pixel type.
 pub(crate) fn unary_apply<F: UnaryFunctor>(img: &Image, f: &F) -> Result<Image> {
-    let vals: Vec<f64> = img.to_f64_vec().iter().map(|&v| f.apply(v)).collect();
+    let vals: Vec<f64> = img.to_f64_vec()?.iter().map(|&v| f.apply(v)).collect();
     crate::image_from_f64(img.pixel_id(), img.size(), img, &vals)
 }
 
@@ -290,8 +290,8 @@ pub(crate) fn unary_apply_in_place<F: UnaryFunctor>(mut img: Image, f: &F) -> Re
 // functor crosses as `&dyn BinaryFunctor<T>` rather than a second type
 // parameter.
 fn binary_apply_typed<T: Scalar>(a: &Image, b: &Image, f: &dyn BinaryFunctor<T>) -> Result<Image> {
-    let sa = a.scalar_slice::<T>().expect("dispatch guarantees type");
-    let sb = b.scalar_slice::<T>().expect("dispatch guarantees type");
+    let sa = a.scalar_slice::<T>()?;
+    let sb = b.scalar_slice::<T>()?;
     let out: Vec<T> = sa.iter().zip(sb).map(|(&x, &y)| f.apply(x, y)).collect();
     let mut img = Image::from_vec(a.size(), out)?;
     img.copy_geometry_from(a);
@@ -303,8 +303,8 @@ fn binary_apply_typed_in_place<T: Scalar>(
     b: &Image,
     f: &dyn BinaryFunctor<T>,
 ) -> Result<Image> {
-    let sb = b.scalar_slice::<T>().expect("dispatch guarantees type");
-    let va = a.scalar_vec_mut::<T>().expect("dispatch guarantees type");
+    let sb = b.scalar_slice::<T>()?;
+    let va = a.scalar_vec_mut::<T>()?;
     for (x, &y) in va.iter_mut().zip(sb) {
         *x = f.apply(*x, y);
     }

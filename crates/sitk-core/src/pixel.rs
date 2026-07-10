@@ -9,8 +9,31 @@
 
 use crate::image::PixelBuffer;
 
-/// Runtime pixel-type tag. Discriminants match the scalar subset of SimpleITK's
-/// `PixelIDValueEnum` ordering so the values stay compatible as the port grows.
+/// Runtime pixel-type tag, mirroring SimpleITK's `PixelIDValueEnum`
+/// (sitkPixelIDValues.h:100-134).
+///
+/// The ten scalar variants tag an `itk::Image<T, N>`; the ten `Vector*`
+/// variants tag an `itk::VectorImage<T, N>`, whose pixels hold
+/// [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel)
+/// components of the same underlying scalar type. SimpleITK's
+/// `VectorPixelIDTypeList` (sitkPixelIDTypeLists.h:125-141) instantiates a
+/// vector variant for every one of the ten scalar types and for no other, so
+/// this list is exactly the scalar list mirrored once.
+///
+/// A vector variant is a *distinct pixel type* from its component's scalar
+/// variant even at one component per pixel: SimpleITK's `sitkVectorFloat32`
+/// with `GetNumberOfComponentsPerPixel() == 1` is not `sitkFloat32`, because
+/// the two name different ITK image templates.
+///
+/// # Deviation: discriminant values
+///
+/// SimpleITK derives each discriminant from the pixel type's position in
+/// `AllPixelIDTypeList`, which interleaves the two `std::complex` pixel types
+/// (`sitkComplexFloat32`, `sitkComplexFloat64`) between the scalars and the
+/// vectors. This port has no complex pixel type, so the vector variants take
+/// the ten values immediately after the scalars (10..=19) rather than 12..=21.
+/// Nothing in this workspace reads a `PixelId` discriminant numerically, and
+/// the values are not part of any serialized format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(i8)]
 pub enum PixelId {
@@ -24,29 +47,109 @@ pub enum PixelId {
     Int64 = 7,
     Float32 = 8,
     Float64 = 9,
+    VectorUInt8 = 10,
+    VectorInt8 = 11,
+    VectorUInt16 = 12,
+    VectorInt16 = 13,
+    VectorUInt32 = 14,
+    VectorInt32 = 15,
+    VectorUInt64 = 16,
+    VectorInt64 = 17,
+    VectorFloat32 = 18,
+    VectorFloat64 = 19,
 }
 
 impl PixelId {
-    /// Size in bytes of one pixel of this type.
+    /// Size in bytes of one *component* of this pixel type — SimpleITK's
+    /// `Image::GetSizeOfPixelComponent()`. A vector pixel occupies
+    /// `size_in_bytes() * number_of_components_per_pixel()` bytes.
     pub const fn size_in_bytes(self) -> usize {
         match self {
-            PixelId::UInt8 | PixelId::Int8 => 1,
-            PixelId::UInt16 | PixelId::Int16 => 2,
-            PixelId::UInt32 | PixelId::Int32 | PixelId::Float32 => 4,
-            PixelId::UInt64 | PixelId::Int64 | PixelId::Float64 => 8,
+            PixelId::UInt8 | PixelId::Int8 | PixelId::VectorUInt8 | PixelId::VectorInt8 => 1,
+            PixelId::UInt16 | PixelId::Int16 | PixelId::VectorUInt16 | PixelId::VectorInt16 => 2,
+            PixelId::UInt32
+            | PixelId::Int32
+            | PixelId::Float32
+            | PixelId::VectorUInt32
+            | PixelId::VectorInt32
+            | PixelId::VectorFloat32 => 4,
+            PixelId::UInt64
+            | PixelId::Int64
+            | PixelId::Float64
+            | PixelId::VectorUInt64
+            | PixelId::VectorInt64
+            | PixelId::VectorFloat64 => 8,
         }
     }
 
-    /// `true` for the two floating-point pixel types.
-    pub const fn is_floating_point(self) -> bool {
-        matches!(self, PixelId::Float32 | PixelId::Float64)
+    /// `true` for the ten multi-component (`itk::VectorImage`) pixel types.
+    pub const fn is_vector(self) -> bool {
+        matches!(
+            self,
+            PixelId::VectorUInt8
+                | PixelId::VectorInt8
+                | PixelId::VectorUInt16
+                | PixelId::VectorInt16
+                | PixelId::VectorUInt32
+                | PixelId::VectorInt32
+                | PixelId::VectorUInt64
+                | PixelId::VectorInt64
+                | PixelId::VectorFloat32
+                | PixelId::VectorFloat64
+        )
     }
 
-    /// `true` for pixel types that can represent a negative value: the
-    /// signed integer types and the two floating-point types.
+    /// The scalar type of this pixel's components: the identity on a scalar
+    /// pixel type, and `T` for `Vector<T>` (ITK's
+    /// `VectorImage<T, N>::InternalPixelType`).
+    ///
+    /// Always one of the ten scalar variants.
+    pub const fn component_id(self) -> PixelId {
+        match self {
+            PixelId::VectorUInt8 => PixelId::UInt8,
+            PixelId::VectorInt8 => PixelId::Int8,
+            PixelId::VectorUInt16 => PixelId::UInt16,
+            PixelId::VectorInt16 => PixelId::Int16,
+            PixelId::VectorUInt32 => PixelId::UInt32,
+            PixelId::VectorInt32 => PixelId::Int32,
+            PixelId::VectorUInt64 => PixelId::UInt64,
+            PixelId::VectorInt64 => PixelId::Int64,
+            PixelId::VectorFloat32 => PixelId::Float32,
+            PixelId::VectorFloat64 => PixelId::Float64,
+            scalar => scalar,
+        }
+    }
+
+    /// The vector pixel type whose components are of this pixel's scalar type:
+    /// the identity on a vector pixel type, and `Vector<T>` for `T`.
+    ///
+    /// Always one of the ten vector variants.
+    pub const fn vector_id(self) -> PixelId {
+        match self {
+            PixelId::UInt8 => PixelId::VectorUInt8,
+            PixelId::Int8 => PixelId::VectorInt8,
+            PixelId::UInt16 => PixelId::VectorUInt16,
+            PixelId::Int16 => PixelId::VectorInt16,
+            PixelId::UInt32 => PixelId::VectorUInt32,
+            PixelId::Int32 => PixelId::VectorInt32,
+            PixelId::UInt64 => PixelId::VectorUInt64,
+            PixelId::Int64 => PixelId::VectorInt64,
+            PixelId::Float32 => PixelId::VectorFloat32,
+            PixelId::Float64 => PixelId::VectorFloat64,
+            vector => vector,
+        }
+    }
+
+    /// `true` when this pixel's *components* are floating point.
+    pub const fn is_floating_point(self) -> bool {
+        matches!(self.component_id(), PixelId::Float32 | PixelId::Float64)
+    }
+
+    /// `true` when this pixel's *components* can represent a negative value:
+    /// the signed integer types and the two floating-point types.
     pub const fn is_signed(self) -> bool {
         !matches!(
-            self,
+            self.component_id(),
             PixelId::UInt8 | PixelId::UInt16 | PixelId::UInt32 | PixelId::UInt64
         )
     }
@@ -54,11 +157,26 @@ impl PixelId {
 
 /// A Rust scalar type that can back a pixel buffer.
 ///
-/// The buffer-bridging methods let a filter recover a concrete `&[T]` from the
-/// type-erased [`PixelBuffer`] without `unsafe`: each implementation matches
-/// exactly the one enum variant that holds its own type.
+/// Recovering a concrete `&[T]` from a type-erased [`PixelBuffer`] is
+/// deliberately *not* on this trait — see [`PixelBuffer::as_slice`], which is
+/// crate-private. A `&[T]` taken straight off the buffer says nothing about
+/// whether the owning image is scalar, and reading it as one element per pixel
+/// silently misreads a vector image. Outside this crate the only ways to a
+/// `&[T]` are [`Image::scalar_slice`] / [`Image::scalar_vec_mut`] /
+/// [`Image::scalar_view`] (guarded against vector images) and
+/// [`Image::component_slice`] / [`Image::component_vec_mut`] (which name in
+/// their signature that they return interleaved components).
+///
+/// [`PixelBuffer::as_slice`]: crate::PixelBuffer::as_slice
+/// [`Image::scalar_slice`]: crate::Image::scalar_slice
+/// [`Image::scalar_vec_mut`]: crate::Image::scalar_vec_mut
+/// [`Image::scalar_view`]: crate::Image::scalar_view
+/// [`Image::component_slice`]: crate::Image::component_slice
+/// [`Image::component_vec_mut`]: crate::Image::component_vec_mut
 pub trait Scalar: Copy + PartialOrd + 'static {
-    /// The runtime tag for this Rust type.
+    /// The runtime tag for this Rust type. Always a scalar variant: `Scalar` is
+    /// implemented only for the ten component types, and a vector image's
+    /// buffer stores those components.
     const PIXEL_ID: PixelId;
 
     /// Widen to `f64` for computation (`self as f64`).
@@ -72,13 +190,11 @@ pub trait Scalar: Copy + PartialOrd + 'static {
     /// divergence to verify against ITK when exact parity is required.
     fn from_f64(v: f64) -> Self;
 
-    /// Borrow the buffer as `&[Self]`, or `None` if the tag does not match.
-    fn buffer_ref(buf: &PixelBuffer) -> Option<&[Self]>;
-
-    /// Borrow the backing `Vec<Self>` mutably, or `None` if the tag mismatches.
-    fn buffer_mut(buf: &mut PixelBuffer) -> Option<&mut Vec<Self>>;
-
     /// Wrap a `Vec<Self>` into the matching [`PixelBuffer`] variant.
+    ///
+    /// The write direction stays public: building a buffer cannot misread one,
+    /// and an [`Image`](crate::Image) can only be assembled from it through the
+    /// invariant-checking constructors.
     fn into_buffer(v: Vec<Self>) -> PixelBuffer;
 }
 
@@ -93,22 +209,6 @@ macro_rules! impl_scalar {
 
                 #[inline]
                 fn from_f64(v: f64) -> Self { v as $ty }
-
-                #[inline]
-                fn buffer_ref(buf: &PixelBuffer) -> Option<&[Self]> {
-                    match buf {
-                        PixelBuffer::$variant(v) => Some(v.as_slice()),
-                        _ => None,
-                    }
-                }
-
-                #[inline]
-                fn buffer_mut(buf: &mut PixelBuffer) -> Option<&mut Vec<Self>> {
-                    match buf {
-                        PixelBuffer::$variant(v) => Some(v),
-                        _ => None,
-                    }
-                }
 
                 #[inline]
                 fn into_buffer(v: Vec<Self>) -> PixelBuffer {

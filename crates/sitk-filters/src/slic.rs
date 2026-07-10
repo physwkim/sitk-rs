@@ -261,7 +261,7 @@ pub fn slic(img: &Image, settings: &SlicSettings) -> Result<SlicResult> {
     }
 
     let lat = Lattice::new(&size);
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let spacing = img.spacing().to_vec();
 
     // ---- grid initialisation (itk::ShrinkImageFilter geometry) ------------
@@ -668,6 +668,7 @@ mod tests {
         result
             .labels
             .to_f64_vec()
+            .unwrap()
             .iter()
             .map(|&v| v as u32)
             .collect()
@@ -759,7 +760,7 @@ mod tests {
         let img = step_image_12x12();
         let out = slic(&img, &settings(&[4, 4], 1.0e-6, 1)).unwrap();
         let labels = labels_of(&out);
-        let vals = img.to_f64_vec();
+        let vals = img.to_f64_vec().unwrap();
         // Every pixel joins a cluster seeded with its own intensity, i.e. the
         // super-pixel boundary follows the step, not the grid.
         for (flat, &label) in labels.iter().enumerate() {

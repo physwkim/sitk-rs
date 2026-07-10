@@ -21,7 +21,7 @@ use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, MirrorBoundaryCondition,
-    PeriodicBoundaryCondition, PixelId, Scalar, dispatch_scalar, matrix,
+    PeriodicBoundaryCondition, PixelId, Scalar, ScalarView, dispatch_scalar, matrix,
 };
 
 /// First-index-fastest strides for a size vector.
@@ -59,7 +59,7 @@ fn extract_block(img: &Image, offset: &[usize], out_size: &[usize]) -> Result<Im
     let out_strides = strides(out_size);
     let out_count: usize = out_size.iter().product();
 
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let mut out_vals = vec![0.0f64; out_count];
     for (o, slot) in out_vals.iter_mut().enumerate() {
         let mut in_flat = 0usize;
@@ -219,7 +219,7 @@ pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let mut out_vals = vec![0.0f64; out_count];
     for (o, slot) in out_vals.iter_mut().enumerate() {
         let mut in_flat = 0usize;
@@ -266,7 +266,7 @@ fn pad_geometry(img: &Image, lower: &[usize], upper: &[usize]) -> (Vec<usize>, V
 }
 
 fn pad_fill<T: Scalar, B: BoundaryCondition<T>>(
-    img: &Image,
+    img: &ScalarView<'_, T>,
     lower: &[usize],
     out_size: &[usize],
     boundary: &B,
@@ -293,17 +293,27 @@ fn constant_pad_typed<T: Scalar>(
     constant: f64,
 ) -> Result<Image> {
     let bc = ConstantBoundaryCondition::new(T::from_f64(constant));
-    let vals = pad_fill(img, lower, out_size, &bc);
+    let vals = pad_fill(&img.scalar_view::<T>()?, lower, out_size, &bc);
     Ok(Image::from_vec(out_size, vals)?)
 }
 
 fn mirror_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
-    let vals: Vec<T> = pad_fill(img, lower, out_size, &MirrorBoundaryCondition);
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &MirrorBoundaryCondition,
+    );
     Ok(Image::from_vec(out_size, vals)?)
 }
 
 fn wrap_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
-    let vals: Vec<T> = pad_fill(img, lower, out_size, &PeriodicBoundaryCondition);
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &PeriodicBoundaryCondition,
+    );
     Ok(Image::from_vec(out_size, vals)?)
 }
 
@@ -402,7 +412,7 @@ pub fn flip(img: &Image, axes: &[bool], flip_about_origin: bool) -> Result<Image
     }
 
     let in_strides = strides(size);
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let mut out_vals = vec![0.0f64; in_vals.len()];
     for (o, slot) in out_vals.iter_mut().enumerate() {
         let mut in_flat = 0usize;
@@ -460,7 +470,7 @@ pub fn permute_axes(img: &Image, order: &[usize]) -> Result<Image> {
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec();
+    let in_vals = img.to_f64_vec()?;
     let mut out_vals = vec![0.0f64; out_count];
     for (o_flat, slot) in out_vals.iter_mut().enumerate() {
         let mut in_flat = 0usize;
@@ -516,7 +526,7 @@ mod tests {
         }
         // Row-major, first-index-fastest: interior 2x2 block of a 4x4 grid
         // starting at (1,1) is values [5,6,9,10].
-        assert_eq!(out.to_f64_vec(), vec![5.0, 6.0, 9.0, 10.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![5.0, 6.0, 9.0, 10.0]);
     }
 
     #[test]
@@ -572,7 +582,7 @@ mod tests {
         let out = region_of_interest(&img, &[1, 0], &[2, 2]).unwrap();
         assert_eq!(out.size(), &[2, 2]);
         // Block starting at (1,0), 2x2: values [1,2,5,6].
-        assert_eq!(out.to_f64_vec(), vec![1.0, 2.0, 5.0, 6.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
         let expected_origin = img.continuous_index_to_physical_point(&[1.0, 0.0]);
         assert_eq!(out.origin(), expected_origin.as_slice());
     }
@@ -608,7 +618,7 @@ mod tests {
         assert_eq!(a.size(), b.size());
         assert_eq!(a.origin(), b.origin());
         assert_eq!(a.direction(), b.direction());
-        assert_eq!(a.to_f64_vec(), b.to_f64_vec());
+        assert_eq!(a.to_f64_vec().unwrap(), b.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -633,7 +643,7 @@ mod tests {
         assert_eq!(out.origin(), &[5.0, 5.0]);
         assert_eq!(out.spacing(), &[1.0, 1.0]);
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![
                 100.0, 101.0, 102.0, 110.0, 111.0, 112.0, 120.0, 121.0, 122.0
             ]
@@ -691,7 +701,7 @@ mod tests {
         }
         // Original 2x2 sits at output offset (1,0); new pixels are 9.0.
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![9.0, 1.0, 2.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0]
         );
     }
@@ -702,7 +712,7 @@ mod tests {
         let out = constant_pad(&img, &[0, 0], &[0, 0], 42.0).unwrap();
         assert_eq!(out.size(), img.size());
         assert_eq!(out.origin(), img.origin());
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -712,7 +722,7 @@ mod tests {
         assert_eq!(out.size(), &[8, 1]);
         // index -1,-2 mirror to 0,1; index 4,5 mirror to 3,2.
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![11.0, 10.0, 10.0, 11.0, 12.0, 13.0, 13.0, 12.0]
         );
     }
@@ -724,7 +734,7 @@ mod tests {
         assert_eq!(out.size(), &[8, 1]);
         // index -1,-2 wrap to 3,2; index 4,5 wrap to 0,1.
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0]
         );
     }
@@ -749,7 +759,10 @@ mod tests {
         let d = img.direction();
         assert_eq!(out.direction(), &[-d[0], d[1], -d[2], d[3]]);
         // x-axis reversed per row.
-        assert_eq!(out.to_f64_vec(), vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]
+        );
     }
 
     #[test]
@@ -769,7 +782,10 @@ mod tests {
         }
         // Pixel order still reverses along the flipped axis regardless of
         // the origin convention.
-        assert_eq!(out.to_f64_vec(), vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]
+        );
     }
 
     // ---- permute_axes ----
@@ -789,7 +805,10 @@ mod tests {
         let d = img.direction();
         assert_eq!(out.direction(), &[d[1], d[0], d[3], d[2]]);
         // input(x,y) = x + 3y (row-major); output(y,x) = input(x,y).
-        assert_eq!(out.to_f64_vec(), vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+        );
     }
 
     #[test]
@@ -806,7 +825,7 @@ mod tests {
         assert_eq!(twice.spacing(), img.spacing());
         assert_eq!(twice.origin(), img.origin());
         assert_eq!(twice.direction(), img.direction());
-        assert_eq!(twice.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(twice.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]

@@ -247,7 +247,7 @@ pub fn colliding_fronts(
     let seeds1 = prepare_seeds(seed_points1, size, &strides)?;
     let seeds2 = prepare_seeds(seed_points2, size, &strides)?;
 
-    let speed = image.to_f64_vec();
+    let speed = image.to_f64_vec()?;
     let gradient1 = march_front(&speed, image, &seeds1, &seeds2.targets, stop_on_targets)?;
     let gradient2 = march_front(&speed, image, &seeds2, &seeds1.targets, stop_on_targets)?;
 
@@ -290,6 +290,7 @@ mod tests {
         colliding_fronts(image, s1, s2, connectivity, NEGATIVE_EPSILON, false)
             .unwrap()
             .to_f64_vec()
+            .unwrap()
     }
 
     fn assert_close(actual: &[f64], expected: &[f64]) {
@@ -373,19 +374,22 @@ mod tests {
 
         let at_boundary = colliding_fronts(&image, &seeds1, &seeds2, true, -1.0, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&at_boundary, &[-1.0; 7]);
 
         // Just past it, only the seeds themselves (forced to -1.5) qualify, and
         // the fill cannot cross the -1 interior to reach seed 2.
         let past_boundary = colliding_fronts(&image, &seeds1, &seeds2, true, -1.5, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&past_boundary, &[-1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
 
         let ungated = colliding_fronts(&image, &seeds1, &seeds2, false, -1.5, false)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&ungated, &[-1.5, -1.0, -1.0, -1.0, -1.0, -1.0, -1.5]);
     }
 
@@ -404,6 +408,7 @@ mod tests {
             colliding_fronts(&image, &seeds1, &seeds2, connectivity, eps, stop)
                 .unwrap()
                 .to_f64_vec()
+                .unwrap()
         };
 
         // Front 1 stops one TargetOffset past x = 4, so x >= 6 keeps a zero

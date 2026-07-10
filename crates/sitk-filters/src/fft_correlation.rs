@@ -195,27 +195,27 @@ fn correlate(
 /// set one is binarized by `BinaryThresholdImageFilter` with upper threshold
 /// 0, inside value 0 and outside value 1 — so every pixel `<= 0` is masked
 /// out and every strictly positive pixel is kept.
-fn pre_process_mask(image: &Image, mask: Option<&Image>) -> Vec<f64> {
-    match mask {
+fn pre_process_mask(image: &Image, mask: Option<&Image>) -> Result<Vec<f64>> {
+    Ok(match mask {
         None => vec![1.0; image.number_of_pixels()],
         Some(mask) => mask
-            .to_f64_vec()
+            .to_f64_vec()?
             .into_iter()
             .map(|v| if v <= 0.0 { 0.0 } else { 1.0 })
             .collect(),
-    }
+    })
 }
 
 /// `PreProcessImage` (hxx:354-370): zero the image wherever the (already
 /// binarized) mask is zero, by multiplying the two. The equations above are
 /// only correct on masked-out-to-zero images.
-fn pre_process_image(image: &Image, mask: &[f64]) -> Vec<f64> {
-    image
-        .to_f64_vec()
+fn pre_process_image(image: &Image, mask: &[f64]) -> Result<Vec<f64>> {
+    Ok(image
+        .to_f64_vec()?
         .into_iter()
         .zip(mask)
         .map(|(v, &m)| v * m)
-        .collect()
+        .collect())
 }
 
 /// `RotateImage` (hxx:294-313): `FlipImageFilter` with every axis flipped maps
@@ -295,10 +295,10 @@ fn generate_data(
     check_inputs(fixed, moving, fixed_mask, moving_mask)?;
     let dim = fixed.dimension();
 
-    let fixed_mask = pre_process_mask(fixed, fixed_mask);
-    let mut moving_mask = pre_process_mask(moving, moving_mask);
-    let fixed_image = pre_process_image(fixed, &fixed_mask);
-    let mut moving_image = pre_process_image(moving, &moving_mask);
+    let fixed_mask = pre_process_mask(fixed, fixed_mask)?;
+    let mut moving_mask = pre_process_mask(moving, moving_mask)?;
+    let fixed_image = pre_process_image(fixed, &fixed_mask)?;
+    let mut moving_image = pre_process_image(moving, &moving_mask)?;
     rotate(&mut moving_image);
     rotate(&mut moving_mask);
 

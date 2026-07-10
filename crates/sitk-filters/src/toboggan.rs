@@ -123,7 +123,7 @@ pub fn toboggan(image: &Image) -> Result<Image> {
     let dim = size.len();
     let total: usize = size.iter().product();
     let strides = strides(size);
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
 
     // "Zero the output" — the buffer is the label map and the scratch marks.
     let mut out = vec![0u32; total];

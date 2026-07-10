@@ -174,7 +174,7 @@ pub fn join_series(images: &[&Image], origin: f64, spacing: f64) -> Result<Image
     let slab_len: usize = primary_size.iter().product();
     let mut out_vals = vec![0.0f64; slab_len * images.len()];
     for (slab_index, img) in images.iter().enumerate() {
-        let img_vals = img.to_f64_vec();
+        let img_vals = img.to_f64_vec()?;
         let img_strides = strides(img.size());
         let out_offset = slab_index * slab_len;
         for flat in 0..slab_len {
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(out.dimension(), 3);
         assert_eq!(out.size(), &[2, 2, 2]);
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
         assert_eq!(out.pixel_id(), PixelId::Float32);
@@ -265,7 +265,10 @@ mod tests {
         let a = img(&[3, 2], vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let out = join_series(&[&a], 0.0, 1.0).unwrap();
         assert_eq!(out.size(), &[3, 2, 1]);
-        assert_eq!(out.to_f64_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
     }
 
     #[test]
@@ -274,7 +277,10 @@ mod tests {
         let b = img(&[3], vec![4.0f64, 5.0, 6.0]);
         let out = join_series(&[&a, &b], 0.0, 1.0).unwrap();
         assert_eq!(out.size(), &[3, 2]);
-        assert_eq!(out.to_f64_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
     }
 
     #[test]
@@ -372,7 +378,7 @@ mod tests {
         // Slab 1 is b's top-left 2x2 corner: indices (0,0)=10, (1,0)=20,
         // (0,1)=40, (1,1)=50.
         assert_eq!(
-            out.to_f64_vec(),
+            out.to_f64_vec().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 40.0, 50.0]
         );
     }

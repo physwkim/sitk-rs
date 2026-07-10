@@ -122,7 +122,7 @@ pub fn reinitialize_level_set(
 
     let size = image.size();
     let spacing = image.spacing();
-    let input = image.to_f64_vec();
+    let input = image.to_f64_vec()?;
     let to_f32 = pixel_id == PixelId::Float32;
     let large = large_value(pixel_id);
 
@@ -306,6 +306,7 @@ mod tests {
         reinitialize_level_set(image, level_set_value, false, 12.0, 12.0)
             .unwrap()
             .to_f64_vec()
+            .unwrap()
     }
 
     fn assert_close(actual: &[f64], expected: &[f64]) {
@@ -396,7 +397,7 @@ mod tests {
     fn the_sign_of_the_output_follows_the_shifted_input() {
         for lsv in [-1.0, 0.0, 1.0] {
             let image = ramp(6, 2.5);
-            let input = image.to_f64_vec();
+            let input = image.to_f64_vec().unwrap();
             for (i, &v) in reinit(&image, lsv).iter().enumerate() {
                 if input[i] - lsv > 0.0 {
                     assert!(v > 0.0, "lsv {lsv}, pixel {i}: {v}");
@@ -499,7 +500,8 @@ mod tests {
         let image = ramp(16, 7.5);
         let out = reinitialize_level_set(&image, 0.0, true, 12.0, 6.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         // Inside: x = 7 seeds at 0.5, marching down to x = 3 at 4.5.
         assert_close(&out[3..8], &[-4.5, -3.5, -2.5, -1.5, -0.5]);
@@ -517,7 +519,8 @@ mod tests {
         let image = ramp(16, 7.5);
         let banded = reinitialize_level_set(&image, 0.0, true, 12.0, 100.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_close(&banded, &reinit(&image, 0.0));
     }
 
@@ -530,12 +533,16 @@ mod tests {
         for bandwidth in [0.0, 1.0, 12.0, 1.0e6] {
             let full = reinitialize_level_set(&image, 0.0, false, bandwidth, bandwidth)
                 .unwrap()
-                .to_f64_vec();
+                .to_f64_vec()
+                .unwrap();
             assert_close(&full, &baseline);
         }
         let banded_a = reinitialize_level_set(&image, 0.0, true, 0.0, 6.0).unwrap();
         let banded_b = reinitialize_level_set(&image, 0.0, true, 1.0e6, 6.0).unwrap();
-        assert_close(&banded_a.to_f64_vec(), &banded_b.to_f64_vec());
+        assert_close(
+            &banded_a.to_f64_vec().unwrap(),
+            &banded_b.to_f64_vec().unwrap(),
+        );
     }
 
     // ---- Upstream quirks ------------------------------------------------------
@@ -591,7 +598,10 @@ mod tests {
         let out = reinitialize_level_set(&image, 0.0, false, 12.0, 12.0).unwrap();
 
         assert_eq!(out.pixel_id(), PixelId::Float32);
-        assert_close(&out.to_f64_vec(), &[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5]);
+        assert_close(
+            &out.to_f64_vec().unwrap(),
+            &[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5],
+        );
 
         // The starved-march value is the `float` large value, not the `double`
         // one, and the narrow-band pre-fill is `float`'s maximum.
@@ -599,12 +609,14 @@ mod tests {
             Image::from_vec(&[7, 1], (0..7).map(|x| x as f32 - 3.0).collect::<Vec<_>>()).unwrap();
         let starved = reinitialize_level_set(&on_grid, 0.0, false, 12.0, 12.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(starved[6], large_value(PixelId::Float32));
 
         let banded = reinitialize_level_set(&image, 0.0, true, 12.0, 0.0)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(banded[0], -(f32::MAX as f64));
         assert_eq!(banded[5], f32::MAX as f64);
     }

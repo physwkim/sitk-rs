@@ -104,7 +104,7 @@ impl CorrelationMetric {
             });
         }
         Self::from_samples(
-            FixedSamples::from_image(fixed),
+            FixedSamples::from_image(fixed)?,
             MovingImage::from_image(moving)?,
         )
     }
@@ -375,7 +375,12 @@ mod tests {
         let (w, h, sigma) = (32usize, 32usize, 5.0);
         let fixed = gaussian(w, h, 14.0, 16.0, sigma, 1.0);
         let moving = gaussian(w, h, 17.0, 15.0, sigma, 1.0);
-        let rescaled: Vec<f64> = moving.to_f64_vec().iter().map(|v| 2.5 * v + 7.0).collect();
+        let rescaled: Vec<f64> = moving
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .map(|v| 2.5 * v + 7.0)
+            .collect();
         let rescaled_moving = Image::from_vec(&[w, h], rescaled).unwrap();
 
         let metric_orig = CorrelationMetric::new(&fixed, &moving).unwrap();

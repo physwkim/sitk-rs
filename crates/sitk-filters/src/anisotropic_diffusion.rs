@@ -328,7 +328,7 @@ fn diffuse(
     let scale = scale_coefficients(img, use_image_spacing);
     let size = img.size().to_vec();
     let radius = vec![1usize; dim];
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
     let mut k = 0.0f64;
 
     for elapsed in 0..number_of_iterations {
@@ -504,7 +504,7 @@ mod tests {
             gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 5, true).unwrap(),
             curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 5, true).unwrap(),
         ] {
-            assert!(out.to_f64_vec().iter().all(|&v| v == 7.0));
+            assert!(out.to_f64_vec().unwrap().iter().all(|&v| v == 7.0));
         }
     }
 
@@ -513,24 +513,24 @@ mod tests {
         // K = 0 forces both conductance terms to 0.0 in the `.hxx`'s
         // `if (m_K != 0.0)` guard.
         let img = ripple();
-        let before = img.to_f64_vec();
+        let before = img.to_f64_vec().unwrap();
         for out in [
             gradient_anisotropic_diffusion(&img, 0.125, 0.0, 1, 3, true).unwrap(),
             curvature_anisotropic_diffusion(&img, 0.0625, 0.0, 1, 3, true).unwrap(),
         ] {
-            assert_eq!(out.to_f64_vec(), before);
+            assert_eq!(out.to_f64_vec().unwrap(), before);
         }
     }
 
     #[test]
     fn zero_iterations_is_identity() {
         let img = ripple();
-        let before = img.to_f64_vec();
+        let before = img.to_f64_vec().unwrap();
         for out in [
             gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 0, true).unwrap(),
             curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 0, true).unwrap(),
         ] {
-            assert_eq!(out.to_f64_vec(), before);
+            assert_eq!(out.to_f64_vec().unwrap(), before);
             assert_eq!(out.pixel_id(), PixelId::Float64);
         }
     }
@@ -558,7 +558,7 @@ mod tests {
         let c = 3.0;
         let dt = 0.125;
         let out = gradient_anisotropic_diffusion(&img, dt, c, 1, 1, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
 
         let e = (-25.0 / (2.0 * c * c)).exp();
         let expect_center = 1.0 + dt * (-4.0 * e);
@@ -598,7 +598,7 @@ mod tests {
         let c = 3.0;
         let dt = 0.0625;
         let out = curvature_anisotropic_diffusion(&img, dt, c, 1, 1, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
 
         let e = (-25.0 / (2.0 * c * c)).exp();
         let g = (MIN_NORM + 1.0).sqrt();
@@ -649,7 +649,7 @@ mod tests {
         let img = Image::from_vec(&[w, h], data).unwrap();
 
         let out = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 5, true).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         let row = |x: usize| vals[w + x]; // middle row
 
         let weak_kept = (row(4) - row(3)) / 2.0;
@@ -684,13 +684,13 @@ mod tests {
     #[test]
     fn large_conductance_smooths_isotropically_small_conductance_barely_moves() {
         let img = ripple();
-        let v0 = variance(&img.to_f64_vec());
+        let v0 = variance(&img.to_f64_vec().unwrap());
 
         let small = gradient_anisotropic_diffusion(&img, 0.125, 0.01, 1, 3, true).unwrap();
         let large = gradient_anisotropic_diffusion(&img, 0.125, 1.0e4, 1, 3, true).unwrap();
 
-        let v_small = variance(&small.to_f64_vec());
-        let v_large = variance(&large.to_f64_vec());
+        let v_small = variance(&small.to_f64_vec().unwrap());
+        let v_large = variance(&large.to_f64_vec().unwrap());
 
         assert!(
             (v_small - v0).abs() / v0 < 1e-6,
@@ -713,14 +713,15 @@ mod tests {
 
         let a = gradient_anisotropic_diffusion(&coarse, 0.02, 3.0, 1, 3, false).unwrap();
         let b = gradient_anisotropic_diffusion(&unit, 0.02, 3.0, 1, 3, false).unwrap();
-        assert_eq!(a.to_f64_vec(), b.to_f64_vec());
+        assert_eq!(a.to_f64_vec().unwrap(), b.to_f64_vec().unwrap());
 
         // ... and with spacing on, the same pixel data diffuses differently.
         let c = gradient_anisotropic_diffusion(&coarse, 0.02, 3.0, 1, 3, true).unwrap();
         assert!(
             c.to_f64_vec()
+                .unwrap()
                 .iter()
-                .zip(b.to_f64_vec())
+                .zip(b.to_f64_vec().unwrap())
                 .any(|(x, y)| (x - y).abs() > 1e-9)
         );
     }
@@ -730,7 +731,7 @@ mod tests {
         let img = ripple();
         let a = curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 3, true).unwrap();
         let b = curvature_anisotropic_diffusion(&img, 0.0625, 3.0, 1, 3, false).unwrap();
-        assert_eq!(a.to_f64_vec(), b.to_f64_vec());
+        assert_eq!(a.to_f64_vec().unwrap(), b.to_f64_vec().unwrap());
     }
 
     // ---- conductance scaling update interval ----
@@ -746,8 +747,9 @@ mod tests {
         assert!(
             every
                 .to_f64_vec()
+                .unwrap()
                 .iter()
-                .zip(every_other.to_f64_vec())
+                .zip(every_other.to_f64_vec().unwrap())
                 .any(|(a, b)| (a - b).abs() > 1e-12)
         );
 
@@ -755,7 +757,7 @@ mod tests {
         // every interval agrees there.
         let one_a = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 1, 1, true).unwrap();
         let one_b = gradient_anisotropic_diffusion(&img, 0.125, 3.0, 7, 1, true).unwrap();
-        assert_eq!(one_a.to_f64_vec(), one_b.to_f64_vec());
+        assert_eq!(one_a.to_f64_vec().unwrap(), one_b.to_f64_vec().unwrap());
     }
 
     // ---- average gradient magnitude squared ----

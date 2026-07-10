@@ -178,7 +178,7 @@ pub fn normalize(img: &Image) -> Result<Image> {
     let shift = -stats.mean;
     let scale = 1.0 / stats.sigma;
     let vals: Vec<f64> = img
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .map(|&v| (v + shift) * scale)
         .collect();
@@ -409,7 +409,7 @@ pub fn otsu_threshold(
     outside_value: u8,
 ) -> Result<(Image, f64)> {
     require_bins_over_thresholds(number_of_histogram_bins, 1)?;
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let idx = otsu_multiple_threshold_indices(&hist, 1, false)[0];
     let threshold = threshold_value(&hist, idx, return_bin_midpoint);
@@ -459,7 +459,7 @@ pub fn otsu_multiple_thresholds(
     }
     require_bins_over_thresholds(number_of_histogram_bins, number_of_thresholds)?;
 
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let indices =
         otsu_multiple_threshold_indices(&hist, number_of_thresholds as usize, valley_emphasis);
@@ -574,7 +574,7 @@ pub fn triangle_threshold(
     inside_value: u8,
     outside_value: u8,
 ) -> Result<(Image, f64)> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = triangle_threshold_value(&hist);
 

@@ -417,7 +417,7 @@ impl JointHistogramMutualInformationMetric {
                 moving: moving.dimension(),
             });
         }
-        let fixed_samples = FixedSamples::from_image(fixed);
+        let fixed_samples = FixedSamples::from_image(fixed)?;
         let moving_image = MovingImage::from_image(moving)?;
         Self::from_samples(
             fixed_samples,

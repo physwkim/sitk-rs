@@ -236,7 +236,7 @@ pub fn scalar_image_kmeans(
     };
     let k = initial_means.len();
 
-    let values = img.to_f64_vec();
+    let values = img.to_f64_vec()?;
     let final_means = run_kmeans(&values, &initial_means);
 
     let label_interval: u32 = if use_non_contiguous_labels {

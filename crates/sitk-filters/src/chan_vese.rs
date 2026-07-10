@@ -691,8 +691,8 @@ pub fn scalar_chan_and_vese_dense_level_set(
     };
     let n = size.iter().product::<usize>();
 
-    let mut phi = initial_level_set.to_f64_vec();
-    let feature = feature_image.to_f64_vec();
+    let mut phi = initial_level_set.to_f64_vec()?;
+    let feature = feature_image.to_f64_vec()?;
 
     // SetFeatureImage() takes m_InvSpacing from the *feature* image, always.
     let inv_spacing: Vec<f64> = feature_image.spacing().iter().map(|s| 1.0 / s).collect();
@@ -792,7 +792,7 @@ fn apply_update(
     mask.copy_geometry_from(level_set_geometry);
 
     let distance = signed_maurer_distance_map(&mask, false, false, use_image_spacing, 0.0)?;
-    let distance = distance.to_f64_vec();
+    let distance = distance.to_f64_vec()?;
 
     let mut accumulator = 0.0;
     for (v, &d) in phi.iter_mut().zip(&distance) {
@@ -1145,7 +1145,7 @@ mod tests {
             0.0, 1.0, 1.0, 0.0,
             0.0, 0.0, 0.0, 0.0,
         ];
-        assert_eq!(out.image.to_f64_vec(), expected);
+        assert_eq!(out.image.to_f64_vec().unwrap(), expected);
         assert_eq!(out.image.pixel_id(), PixelId::Float64);
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
 
         // CopyInputToOutput tests `phi < 0` strictly, and every surviving block
         // pixel now holds -0.0, which is not less than zero.
-        assert_eq!(out.image.to_f64_vec(), vec![0.0; 16]);
+        assert_eq!(out.image.to_f64_vec().unwrap(), vec![0.0; 16]);
     }
 
     #[test]

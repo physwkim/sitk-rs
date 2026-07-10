@@ -248,7 +248,7 @@ pub fn bspline_decomposition(img: &Image, spline_order: u32) -> Result<Image> {
     let narrow = narrower(pixel_id);
 
     let size = img.size().to_vec();
-    let mut data = img.to_f64_vec();
+    let mut data = img.to_f64_vec()?;
     for axis in 0..size.len() {
         coefficients_along_axis(&mut data, &size, axis, &poles, TOLERANCE, narrow);
     }
@@ -450,7 +450,7 @@ mod tests {
         let f = vec![1.0, -2.0, 3.5, 0.25, 7.0];
         let img = Image::from_vec(&[1, 5], f.clone()).unwrap();
         let out = bspline_decomposition(&img, 3).unwrap();
-        let got = out.to_f64_vec();
+        let got = out.to_f64_vec().unwrap();
         // Equals the 1-D decomposition of the same 5 samples: the degenerate
         // axis contributed neither gain nor recursion.
         let want = decompose_line(&f, 3, TOLERANCE);
@@ -462,7 +462,13 @@ mod tests {
     #[test]
     fn single_voxel_image_is_the_identity() {
         let img = Image::from_vec(&[1, 1], vec![9.0f64]).unwrap();
-        assert_eq!(bspline_decomposition(&img, 3).unwrap().to_f64_vec(), [9.0]);
+        assert_eq!(
+            bspline_decomposition(&img, 3)
+                .unwrap()
+                .to_f64_vec()
+                .unwrap(),
+            [9.0]
+        );
     }
 
     #[test]
@@ -470,7 +476,13 @@ mod tests {
         let f: Vec<f64> = (0..12).map(|i| (i as f64) * 0.5 - 2.0).collect();
         let img = Image::from_vec(&[3, 4], f.clone()).unwrap();
         for order in [0, 1] {
-            assert_eq!(bspline_decomposition(&img, order).unwrap().to_f64_vec(), f);
+            assert_eq!(
+                bspline_decomposition(&img, order)
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap(),
+                f
+            );
         }
     }
 
@@ -489,7 +501,10 @@ mod tests {
             }
         }
         let img = Image::from_vec(&[g.len(), h.len()], data).unwrap();
-        let out = bspline_decomposition(&img, 3).unwrap().to_f64_vec();
+        let out = bspline_decomposition(&img, 3)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
 
         let cg = decompose_line(&g, 3, TOLERANCE);
         let ch = decompose_line(&h, 3, TOLERANCE);
@@ -517,7 +532,10 @@ mod tests {
             }
         }
         let img = Image::from_vec(&[nx, ny, nz], data).unwrap();
-        let out = bspline_decomposition(&img, 3).unwrap().to_f64_vec();
+        let out = bspline_decomposition(&img, 3)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
         let cg = decompose_line(&g, 3, TOLERANCE);
         for z in 0..nz {
             for y in 0..ny {
@@ -548,7 +566,7 @@ mod tests {
         let mut f32_line: Vec<f64> = f.iter().map(|&v| v as f64).collect();
         let poles = bspline_spline_poles(3).unwrap();
         data_to_coefficients_1d(&mut f32_line, &poles, TOLERANCE, |v| v as f32 as f64);
-        assert_eq!(out.to_f64_vec(), f32_line);
+        assert_eq!(out.to_f64_vec().unwrap(), f32_line);
         assert_ne!(f32_line, f64_line);
     }
 
@@ -576,7 +594,10 @@ mod tests {
         // Order 4 and 5 have two poles each; exercising both pole loops.
         for order in 0..=5 {
             let img = Image::from_vec(&[7, 5], vec![3.0f64; 35]).unwrap();
-            let out = bspline_decomposition(&img, order).unwrap().to_f64_vec();
+            let out = bspline_decomposition(&img, order)
+                .unwrap()
+                .to_f64_vec()
+                .unwrap();
             for v in out {
                 assert!((v - 3.0).abs() < 1e-9, "order {order}: {v}");
             }

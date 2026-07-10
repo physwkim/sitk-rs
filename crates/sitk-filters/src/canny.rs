@@ -245,7 +245,7 @@ pub(crate) fn zero_crossing_values(
 /// buffer for [`zero_crossing`] (matching [`crate::gradient`]'s own
 /// `scratch_f64` helper).
 fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
     Ok(scratch)
 }
@@ -591,7 +591,7 @@ mod tests {
     fn canny_constant_image_has_no_edges_2d() {
         let img = Image::from_vec(&[9, 9], vec![5.0f64; 81]).unwrap();
         let out = canny_edge_detection(&img, &[1.0, 1.0], &[0.01, 0.01], 1.0, 0.5).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v == 0.0));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -599,7 +599,7 @@ mod tests {
         let img = Image::from_vec(&[7, 7, 7], vec![5.0f64; 343]).unwrap();
         let out =
             canny_edge_detection(&img, &[1.0, 1.0, 1.0], &[0.01, 0.01, 0.01], 1.0, 0.5).unwrap();
-        assert!(out.to_f64_vec().iter().all(|&v| v == 0.0));
+        assert!(out.to_f64_vec().unwrap().iter().all(|&v| v == 0.0));
     }
 
     // ---- canny_edge_detection: clean step edge -> one-pixel-wide edge ----
@@ -628,7 +628,7 @@ mod tests {
         let step_x = 10;
         let img = step_column_image(w, h, step_x);
         let out = canny_edge_detection(&img, &[2.0, 2.0], &[0.01, 0.01], 5.0, 1.0).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         for y in 2..h - 2 {
             let row_edges: Vec<usize> = (2..w - 2).filter(|&x| vals[y * w + x] != 0.0).collect();
             assert_eq!(
@@ -663,7 +663,7 @@ mod tests {
         let img = Image::from_vec(&[w, h, d], data).unwrap();
         let out =
             canny_edge_detection(&img, &[2.0, 2.0, 2.0], &[0.01, 0.01, 0.01], 5.0, 1.0).unwrap();
-        let vals = out.to_f64_vec();
+        let vals = out.to_f64_vec().unwrap();
         for z in 2..d - 2 {
             for y in 2..h - 2 {
                 let row_edges: Vec<usize> = (2..w - 2)

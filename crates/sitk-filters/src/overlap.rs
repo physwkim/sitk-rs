@@ -216,12 +216,12 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
     require_same_size(source, target)?;
 
     let source_labels: Vec<i64> = source
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .map(|&v| v.round() as i64)
         .collect();
     let target_labels: Vec<i64> = target
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .map(|&v| v.round() as i64)
         .collect();
@@ -395,8 +395,8 @@ pub fn directed_hausdorff_distance(
     // image2, SquaredDistance(false), UseImageSpacing(true),
     // InsideIsPositive left at the Maurer filter's own default (false).
     let distance_map = signed_maurer_distance_map(image2, false, false, true, 0.0)?;
-    let dist_vals = distance_map.to_f64_vec();
-    let vals1 = image1.to_f64_vec();
+    let dist_vals = distance_map.to_f64_vec()?;
+    let vals1 = image1.to_f64_vec()?;
 
     let mut max_distance = 0.0f64;
     let mut sum = 0.0f64;
@@ -484,8 +484,8 @@ pub fn hausdorff_distance(image1: &Image, image2: &Image) -> Result<HausdorffMea
 pub fn similarity_index(image1: &Image, image2: &Image) -> Result<f64> {
     require_same_size(image1, image2)?;
 
-    let vals1 = image1.to_f64_vec();
-    let vals2 = image2.to_f64_vec();
+    let vals1 = image1.to_f64_vec()?;
+    let vals2 = image2.to_f64_vec()?;
 
     let mut count_image1 = 0u64;
     let mut count_image2 = 0u64;

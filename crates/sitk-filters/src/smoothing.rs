@@ -40,7 +40,7 @@ pub fn smooth_gaussian(img: &Image, sigma: &[f64]) -> Result<Image> {
     let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
     let strides = strides(&size);
-    let mut buf = img.to_f64_vec();
+    let mut buf = img.to_f64_vec()?;
 
     for d in 0..dim {
         if sigma[d] <= 0.0 {
@@ -117,7 +117,7 @@ mod tests {
     fn zero_sigma_is_identity() {
         let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
         let out = smooth_gaussian(&img, &[0.0, 0.0]).unwrap();
-        assert_eq!(out.to_f64_vec(), img.to_f64_vec());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
     }
 
     #[test]
@@ -125,7 +125,7 @@ mod tests {
         // A normalized kernel + edge-replicating boundary preserves a constant.
         let img = Image::from_vec(&[8, 8], vec![5.0; 64]).unwrap();
         let out = smooth_gaussian(&img, &[2.0, 2.0]).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 5.0).abs() < 1e-12, "constant not preserved: {v}");
         }
     }
@@ -139,7 +139,7 @@ mod tests {
         data[10 * n + 10] = 100.0;
         let img = Image::from_vec(&[n, n], data).unwrap();
         let out = smooth_gaussian(&img, &[1.5, 1.5]).unwrap();
-        let v = out.to_f64_vec();
+        let v = out.to_f64_vec().unwrap();
         let total: f64 = v.iter().sum();
         assert!((total - 100.0).abs() < 1e-6, "mass not conserved: {total}");
         // Peak stays at the center and is reduced (spread out).
@@ -163,8 +163,14 @@ mod tests {
         let mut coarse = Image::from_vec(&[n, n], data).unwrap();
         coarse.set_spacing(&[2.0, 2.0]).unwrap();
 
-        let peak_fine = smooth_gaussian(&fine, &[2.0, 2.0]).unwrap().to_f64_vec()[10 * n + 10];
-        let peak_coarse = smooth_gaussian(&coarse, &[2.0, 2.0]).unwrap().to_f64_vec()[10 * n + 10];
+        let peak_fine = smooth_gaussian(&fine, &[2.0, 2.0])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()[10 * n + 10];
+        let peak_coarse = smooth_gaussian(&coarse, &[2.0, 2.0])
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()[10 * n + 10];
         assert!(
             peak_coarse > peak_fine,
             "coarser spacing should blur less: {peak_coarse} vs {peak_fine}"

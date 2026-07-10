@@ -161,10 +161,10 @@ fn wrap_to_unsigned(id: PixelId, v: u64) -> u64 {
 }
 
 /// Read every input's buffer as `u64` label values.
-fn label_buffers(images: &[&Image]) -> Vec<Vec<u64>> {
+fn label_buffers(images: &[&Image]) -> Result<Vec<Vec<u64>>> {
     images
         .iter()
-        .map(|img| img.to_f64_vec().iter().map(|&v| v as u64).collect())
+        .map(|img| Ok(img.to_f64_vec()?.iter().map(|&v| v as u64).collect()))
         .collect()
 }
 
@@ -222,7 +222,10 @@ pub fn staple(
     // `double` parameter.
     let foreground_value = quantize_to_pixel_type(pixel_id, foreground_value);
 
-    let raters: Vec<Vec<f64>> = images.iter().map(|img| img.to_f64_vec()).collect();
+    let raters: Vec<Vec<f64>> = images
+        .iter()
+        .map(|img| Ok(img.to_f64_vec()?))
+        .collect::<Result<_>>()?;
     let indicator =
         |v: f64| v > foreground_value - STAPLE_EPSILON && v < foreground_value + STAPLE_EPSILON;
 
@@ -359,7 +362,7 @@ pub fn label_voting(images: &[&Image], label_for_undecided_pixels: Option<u64>) 
     let pixel_id = images[0].pixel_id();
     require_unsigned_integer(images[0])?;
 
-    let inputs = label_buffers(images);
+    let inputs = label_buffers(images)?;
     let total_label_count = maximum_input_value(&inputs) as usize + 1;
     let undecided = wrap_to_unsigned(
         pixel_id,
@@ -415,7 +418,7 @@ pub fn multi_label_staple(
     let pixel_id = images[0].pixel_id();
     require_unsigned_integer(images[0])?;
 
-    let inputs = label_buffers(images);
+    let inputs = label_buffers(images)?;
     let n_labels = maximum_input_value(&inputs) as usize + 1;
     let n_pixels = inputs[0].len();
     let undecided = wrap_to_unsigned(
@@ -616,7 +619,7 @@ mod tests {
 
         assert_eq!(r.sensitivity, vec![1.0, 1.0]);
         assert_eq!(r.specificity, vec![1.0, 1.0]);
-        assert_eq!(r.image.to_f64_vec(), vec![1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![1.0, 1.0, 0.0, 0.0]);
         assert_eq!(r.elapsed_iterations, 1);
         assert_eq!(r.image.pixel_id(), PixelId::Float64);
     }
@@ -644,7 +647,7 @@ mod tests {
             r.specificity[0]
         );
         // The two honest raters carry the posterior to their own indicator.
-        let w = r.image.to_f64_vec();
+        let w = r.image.to_f64_vec().unwrap();
         for (pix, &wi) in w.iter().enumerate() {
             let expected = if pix < 4 { 1.0 } else { 0.0 };
             assert!(
@@ -660,7 +663,7 @@ mod tests {
         let a = img(&[4], vec![2u8, 2, 1, 0]);
         let b = img(&[4], vec![2u8, 2, 0, 1]);
         let r = staple(&[&a, &b], 2.0, u32::MAX, 1.0).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![1.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -691,7 +694,7 @@ mod tests {
         let r = staple(&[&a, &bad], 1.0, u32::MAX, 1.0).unwrap();
         assert_eq!(r.sensitivity, vec![0.5, 0.5]);
         assert_eq!(r.specificity, vec![0.5, 0.5]);
-        assert_eq!(r.image.to_f64_vec(), vec![0.5; 8]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![0.5; 8]);
         assert_eq!(r.elapsed_iterations, 1);
     }
 
@@ -768,7 +771,7 @@ mod tests {
         let b = img(&[3], vec![1u16, 2, 2]);
         let c = img(&[3], vec![1u16, 3, 2]);
         let out = label_voting(&[&a, &b, &c], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![1.0, 2.0, 2.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 2.0, 2.0]);
         assert_eq!(out.pixel_id(), PixelId::UInt16);
     }
 
@@ -781,7 +784,7 @@ mod tests {
         let c = img(&[2], vec![1u16, 2]);
         // Voxel 0: votes = [0, 2, 1] -> label 1 wins outright.
         let out = label_voting(&[&a, &b, &c], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![1.0, 3.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 3.0]);
     }
 
     #[test]
@@ -789,7 +792,7 @@ mod tests {
         let a = img(&[1], vec![1u16]);
         let b = img(&[1], vec![2u16]);
         let out = label_voting(&[&a, &b], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![3.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![3.0]);
     }
 
     #[test]
@@ -797,7 +800,7 @@ mod tests {
         let a = img(&[1], vec![1u16]);
         let b = img(&[1], vec![2u16]);
         let out = label_voting(&[&a, &b], Some(9)).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![9.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![9.0]);
     }
 
     #[test]
@@ -810,7 +813,7 @@ mod tests {
         let c = img(&[1], vec![2u16]);
         let d = img(&[1], vec![2u16]);
         let out = label_voting(&[&a, &b, &c, &d], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![2.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![2.0]);
     }
 
     #[test]
@@ -823,7 +826,7 @@ mod tests {
         let c = img(&[1], vec![3u16]);
         let d = img(&[1], vec![3u16]);
         let out = label_voting(&[&a, &b, &c, &d], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![4.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![4.0]);
     }
 
     #[test]
@@ -834,21 +837,21 @@ mod tests {
         let b = img(&[2], vec![0u8, 7]);
         let out = label_voting(&[&a, &b], None).unwrap();
         // Voxel 0 ties 0-vs-255 -> undecided -> 0. Voxel 1 agrees on 7.
-        assert_eq!(out.to_f64_vec(), vec![0.0, 7.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![0.0, 7.0]);
         assert_eq!(out.pixel_id(), PixelId::UInt8);
 
         // The same labels in a `u16` image have room for the 256 label.
         let a = img(&[2], vec![255u16, 7]);
         let b = img(&[2], vec![0u16, 7]);
         let out = label_voting(&[&a, &b], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![256.0, 7.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![256.0, 7.0]);
     }
 
     #[test]
     fn label_voting_single_input_is_the_identity() {
         let a = img(&[4], vec![0u16, 1, 2, 3]);
         let out = label_voting(&[&a], None).unwrap();
-        assert_eq!(out.to_f64_vec(), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(out.to_f64_vec().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -936,7 +939,10 @@ mod tests {
         let a = img(&[6], vec![0u16, 0, 1, 1, 2, 2]);
         let b = img(&[6], vec![0u16, 0, 1, 1, 2, 2]);
         let r = multi_label_staple(&[&a, &b], None, 1e-5, None, None).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(
+            r.image.to_f64_vec().unwrap(),
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+        );
         assert_eq!(r.image.pixel_id(), PixelId::UInt16);
     }
 
@@ -948,7 +954,10 @@ mod tests {
         let b = img(&[6], vec![0u16, 0, 1, 1, 2, 2]);
         let bad = img(&[6], vec![1u16, 1, 2, 2, 0, 0]);
         let r = multi_label_staple(&[&a, &b, &bad], None, 1e-5, Some(50), None).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(
+            r.image.to_f64_vec().unwrap(),
+            vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]
+        );
 
         // The honest raters' confusion matrices are near-diagonal; the
         // adversarial rater's mass sits off the diagonal.
@@ -1007,14 +1016,14 @@ mod tests {
         // label and the voxel stays undecided (= max_label + 1 = 2).
         let a = img(&[2], vec![0u8, 1]);
         let r = multi_label_staple(&[&a], None, 1e-5, Some(0), Some(&[0.0, 0.0])).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![2.0, 2.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![2.0, 2.0]);
     }
 
     #[test]
     fn multi_label_staple_explicit_undecided_label() {
         let a = img(&[2], vec![0u8, 1]);
         let r = multi_label_staple(&[&a], Some(7), 1e-5, Some(0), Some(&[0.0, 0.0])).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![7.0, 7.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![7.0, 7.0]);
     }
 
     #[test]
@@ -1023,7 +1032,7 @@ mod tests {
         // wraps to 0 just as in `label_voting`.
         let a = img(&[2], vec![0u8, 255]);
         let r = multi_label_staple(&[&a], None, 1e-5, Some(0), Some(&[0.0; 256])).unwrap();
-        assert_eq!(r.image.to_f64_vec(), vec![0.0, 0.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![0.0, 0.0]);
         assert_eq!(r.total_label_count, 256);
     }
 

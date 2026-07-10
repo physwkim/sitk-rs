@@ -219,7 +219,7 @@ fn count_components(
     let cc = connected_component(&binarized, false)?;
     let relabeled = relabel_component(&cc, minimum_object_size)?;
     let count = relabeled
-        .to_f64_vec()
+        .to_f64_vec()?
         .iter()
         .cloned()
         .fold(0.0f64, f64::max);

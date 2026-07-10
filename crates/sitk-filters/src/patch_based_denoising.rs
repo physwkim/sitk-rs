@@ -1116,8 +1116,7 @@ fn run<T: PatchPixel>(img: &Image, settings: &PatchBasedDenoisingSettings) -> Re
         return Err(FilterError::PatchLargerThanImage { size, diameter });
     }
 
-    let input: &[T] =
-        T::buffer_ref(img.buffer()).expect("dispatch_scalar guarantees the pixel tag matches");
+    let input: &[T] = img.scalar_slice::<T>()?;
     let (image_min, image_max) = min_max(input);
     if image_max <= image_min {
         return Err(FilterError::ConstantImage(image_max.as_f64()));
@@ -1277,7 +1276,7 @@ mod tests {
     }
 
     fn values(img: &Image) -> Vec<f64> {
-        f64::buffer_ref(img.buffer()).unwrap().to_vec()
+        img.scalar_slice::<f64>().unwrap().to_vec()
     }
 
     #[track_caller]
@@ -1501,7 +1500,7 @@ mod tests {
         let img = Image::from_vec(&[5, 5], data).unwrap();
         let out = patch_based_denoising(&img, &settings()).unwrap();
         assert_eq!(
-            u16::buffer_ref(out.buffer()).unwrap(),
+            out.scalar_slice::<u16>().unwrap(),
             &[
                 12, 20, 30, 38, 48, //
                 15, 24, 34, 44, 53, //

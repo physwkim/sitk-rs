@@ -108,6 +108,7 @@ pub mod stochastic_fractal_dimension;
 pub mod threshold;
 pub mod threshold_maximum_connected_components;
 pub mod toboggan;
+pub mod vector;
 pub mod watershed;
 pub mod watershed_classic;
 
@@ -262,6 +263,7 @@ pub use threshold_maximum_connected_components::{
     ThresholdMaximumConnectedComponentsResult, threshold_maximum_connected_components,
 };
 pub use toboggan::toboggan;
+pub use vector::{compose, vector_index_selection_cast, vector_magnitude};
 pub use watershed::{morphological_watershed, morphological_watershed_from_markers};
 pub use watershed_classic::{
     IsolatedWatershedResult, IsolatedWatershedSettings, WatershedTree, isolated_watershed,
@@ -338,12 +340,23 @@ fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Resu
 
 /// Build an image of `target` pixel type from `f64` values, copying `geom`'s
 /// geometry.
+///
+/// The inverse of [`Image::to_f64_vec`], and scalar-only for the same reason:
+/// `vals` is one element per pixel, and [`dispatch_scalar!`] would resolve a
+/// vector `target` to its *component* type, quietly producing a scalar image
+/// of that component type. Rejecting a vector `target` with the same
+/// [`sitk_core::Error::RequiresScalarPixelType`] the read side raises keeps the
+/// pair symmetric: every scalar filter enters through `to_f64_vec` and leaves
+/// through here, and neither end can be handed a vector image.
 pub(crate) fn image_from_f64(
     target: PixelId,
     size: &[usize],
     geom: &Image,
     vals: &[f64],
 ) -> Result<Image> {
+    if target.is_vector() {
+        return Err(sitk_core::Error::RequiresScalarPixelType(target).into());
+    }
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
 }
 
@@ -354,10 +367,19 @@ pub(crate) fn image_from_f64(
 /// itk::NumericTraits<typename InputImageType::PixelType>::RealType` — among
 /// them `FastMarchingImageFilter` and `AntiAliasBinaryImageFilter` — resolve
 /// their output pixel type through this rule.
+/// A vector pixel type maps to the vector variant of its component's real type
+/// (`NumericTraits<VariableLengthVector<T>>::RealType` is
+/// `VariableLengthVector<NumericTraits<T>::RealType>`), so the projection never
+/// silently drops a pixel type's multi-component-ness.
 pub(crate) fn real_pixel_id(input: PixelId) -> PixelId {
-    match input {
+    let real = match input.component_id() {
         PixelId::Float32 => PixelId::Float32,
         _ => PixelId::Float64,
+    };
+    if input.is_vector() {
+        real.vector_id()
+    } else {
+        real
     }
 }
 
@@ -397,7 +419,7 @@ fn require_same_shape(a: &Image, b: &Image) -> Result<()> {
 /// `CastImageFilter`: convert an image to another pixel type (`static_cast`
 /// semantics via [`Scalar::from_f64`]).
 pub fn cast(img: &Image, target: PixelId) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     image_from_f64(target, img.size(), img, &vals)
 }
 
@@ -602,7 +624,7 @@ pub fn binary_threshold(
     inside: u8,
     outside: u8,
 ) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let out: Vec<u8> = vals
         .iter()
         .map(|&v| {
@@ -623,7 +645,7 @@ pub fn binary_threshold(
 /// `RescaleIntensityImageFilter`: linearly remap the actual `[min, max]` of the
 /// image onto `[output_min, output_max]`. Output pixel type follows input.
 pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     if vals.is_empty() {
         return Err(FilterError::DegenerateRange);
     }
@@ -659,7 +681,7 @@ pub struct Statistics {
 
 /// `StatisticsImageFilter`: min / max / mean / variance / sigma / sum.
 pub fn statistics(img: &Image) -> Result<Statistics> {
-    let vals = img.to_f64_vec();
+    let vals = img.to_f64_vec()?;
     let n = vals.len();
     if n == 0 {
         return Err(FilterError::DegenerateRange);
@@ -951,5 +973,138 @@ mod tests {
     fn minimum_maximum_pair() {
         let a = Image::from_vec(&[3, 1], vec![-1i32, 5, 3]).unwrap();
         assert_eq!(minimum_maximum(&a).unwrap(), (-1.0, 5.0));
+    }
+}
+
+/// The structural guard that keeps every scalar filter safe against a vector
+/// image, proven at the seam rather than filter by filter.
+///
+/// No filter in this crate carries a vector check of its own. Instead the two
+/// helpers each scalar filter must use to touch pixel data —
+/// [`Image::to_f64_vec`] on the way in and [`image_from_f64`] on the way out —
+/// and the three `Image` accessors underneath them ([`Image::scalar_slice`],
+/// [`Image::scalar_vec_mut`], [`Image::scalar_view`]) all refuse a vector
+/// image with [`sitk_core::Error::RequiresScalarPixelType`]. `dispatch_scalar!`
+/// resolves a vector `PixelId` to its component type, so a vector image reaches
+/// the typed body and is rejected there, uniformly, with no panic path.
+///
+/// These cases sample the distinct routes a filter can take to the buffer; a
+/// filter that used none of them could not read a pixel at all.
+#[cfg(test)]
+mod vector_guard {
+    use super::*;
+    use crate::morphology::StructuringElement;
+
+    /// A 2x2 two-component vector image; every route below must reject it.
+    fn vector_image() -> Image {
+        Image::from_vec_vector(&[2, 2], 2, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap()
+    }
+
+    fn assert_requires_scalar(err: FilterError, expected: PixelId) {
+        match err {
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(id)) => {
+                assert_eq!(id, expected)
+            }
+            other => panic!("expected RequiresScalarPixelType, got {other:?}"),
+        }
+    }
+
+    /// Math op: `sqrt` reads through `scalar_slice` inside `unary_pixel_apply`.
+    #[test]
+    fn math_filter_rejects_a_vector_image() {
+        let err = crate::math::sqrt(&vector_image()).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// Binary op: both operands are checked, so a scalar/vector mix is caught
+    /// too — `require_same_shape` compares `pixel_id`, which differs.
+    #[test]
+    fn binary_math_filter_rejects_a_vector_operand() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        assert!(crate::math::absolute_value_difference(&scalar, &vector_image()).is_err());
+    }
+
+    /// Morphology: `grayscale_dilate` reads through a `NeighborhoodIterator`,
+    /// which takes a `ScalarView` at construction.
+    #[test]
+    fn morphology_filter_rejects_a_vector_image() {
+        let kernel = StructuringElement::ball(&[1, 1]);
+        let err = crate::morphology::grayscale_dilate(&vector_image(), &kernel).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// Level set: reads through `to_f64_vec`.
+    #[test]
+    fn level_set_filter_rejects_a_vector_image() {
+        let scalar = Image::new(&[2, 2], PixelId::Float32);
+        let err = crate::level_set::threshold_segmentation_level_set(
+            &vector_image(),
+            &scalar,
+            0.0,
+            1.0,
+            0.02,
+            1.0,
+            1.0,
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// Boundary conditions: `constant_pad` reaches pixels only through
+    /// `Image::scalar_view`, so the `BoundaryCondition::get_pixel` loop cannot
+    /// be entered with a vector image at all.
+    #[test]
+    fn pad_filter_rejects_a_vector_image() {
+        let err =
+            crate::geometry::constant_pad(&vector_image(), &[1, 1], &[1, 1], 0.0).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// A one-component vector image is still a vector image: SimpleITK keeps
+    /// `sitkVectorFloat32` distinct from `sitkFloat32` regardless of length, so
+    /// the guard must fire on component count 1 as well.
+    #[test]
+    fn one_component_vector_image_is_still_rejected() {
+        let img = Image::from_vec_vector(&[2, 2], 1, vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let err = crate::math::sqrt(&img).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// The write side of the seam: a vector `target` would otherwise dispatch
+    /// to its component type and build a scalar image of `vals.len()` pixels.
+    #[test]
+    fn image_from_f64_rejects_a_vector_target() {
+        let geom = Image::new(&[2, 2], PixelId::Float32);
+        let err = image_from_f64(PixelId::VectorFloat64, &[2, 2], &geom, &[0.0; 4]).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat64);
+    }
+
+    /// `patch_based_denoising` read its pixels through `Scalar::buffer_ref` on
+    /// the raw `PixelBuffer`, which succeeds for a vector image because the
+    /// buffer is tagged with the *component* type — the interleaved
+    /// `npixels * ncomponents` elements were then processed against a grid of
+    /// `npixels`. It reads through `Image::scalar_slice` now. The image is
+    /// sized to clear the patch-fits-in-image check, so this pins the guard
+    /// rather than an earlier validation error.
+    #[test]
+    fn patch_based_denoising_rejects_a_vector_image() {
+        let data: Vec<f32> = (0..162).map(|i| i as f32).collect();
+        let img = Image::from_vec_vector(&[9, 9], 2, data).unwrap();
+        let err = crate::patch_based_denoising(&img, &Default::default()).unwrap_err();
+        assert_requires_scalar(err, PixelId::VectorFloat32);
+    }
+
+    /// `real_pixel_id` preserves vector-ness, so a filter that projects its
+    /// output type through it cannot launder a vector input into a scalar
+    /// output pixel type.
+    #[test]
+    fn real_pixel_id_keeps_a_vector_input_vector() {
+        assert_eq!(real_pixel_id(PixelId::VectorUInt8), PixelId::VectorFloat64);
+        assert_eq!(
+            real_pixel_id(PixelId::VectorFloat32),
+            PixelId::VectorFloat32
+        );
     }
 }

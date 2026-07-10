@@ -359,11 +359,19 @@ fn create_single_contour<T: Scalar>(
 /// Used only by [`require_unused_label`].
 fn distinct_value_count(pixel_id: PixelId) -> Option<u128> {
     match pixel_id {
-        PixelId::UInt8 | PixelId::Int8 => Some(1 << 8),
-        PixelId::UInt16 | PixelId::Int16 => Some(1 << 16),
-        PixelId::UInt32 | PixelId::Int32 => Some(1 << 32),
-        PixelId::UInt64 | PixelId::Int64 => Some(1 << 64),
-        PixelId::Float32 | PixelId::Float64 => None,
+        PixelId::UInt8 | PixelId::Int8 | PixelId::VectorUInt8 | PixelId::VectorInt8 => Some(1 << 8),
+        PixelId::UInt16 | PixelId::Int16 | PixelId::VectorUInt16 | PixelId::VectorInt16 => {
+            Some(1 << 16)
+        }
+        PixelId::UInt32 | PixelId::Int32 | PixelId::VectorUInt32 | PixelId::VectorInt32 => {
+            Some(1 << 32)
+        }
+        PixelId::UInt64 | PixelId::Int64 | PixelId::VectorUInt64 | PixelId::VectorInt64 => {
+            Some(1 << 64)
+        }
+        PixelId::Float32 | PixelId::Float64 | PixelId::VectorFloat32 | PixelId::VectorFloat64 => {
+            None
+        }
     }
 }
 

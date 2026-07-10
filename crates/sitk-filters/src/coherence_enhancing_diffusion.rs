@@ -462,7 +462,7 @@ fn structure_tensor(
         orders[d] = GaussianOrder::FirstOrder;
         let g = recursive_gaussian_with_order(&base, &sigmas, &orders, false)?;
         let sp = spacing[d];
-        grads.push(g.to_f64_vec().iter().map(|v| v / sp).collect());
+        grads.push(g.to_f64_vec()?.iter().map(|v| v / sp).collect());
     }
 
     // `TransformLocalVectorToPhysicalVector` (m_UseImageDirection is on by
@@ -490,7 +490,7 @@ fn structure_tensor(
         for j in i..dim {
             let comp: Vec<f64> = tensors.iter().map(|t| t[i][j]).collect();
             let smoothed = recursive_gaussian(&scalar_image(size, spacing, comp)?, &rho)?;
-            for (t, v) in tensors.iter_mut().zip(smoothed.to_f64_vec()) {
+            for (t, v) in tensors.iter_mut().zip(smoothed.to_f64_vec()?) {
                 t[i][j] = v;
                 t[j][i] = v;
             }
@@ -768,7 +768,7 @@ pub fn coherence_enhancing_diffusion(
         reference_spacing.clone()
     };
 
-    let mut data = img.to_f64_vec();
+    let mut data = img.to_f64_vec()?;
     let mut remaining = settings.diffusion_time;
     while remaining > 0.0 {
         let tensors = diffusion_tensors(&data, &size, &spacing, &direction, settings)?;
@@ -1222,7 +1222,8 @@ mod tests {
             false,
         )
         .unwrap()
-        .to_f64_vec();
+        .to_f64_vec()
+        .unwrap();
         assert!((ty[c][1][1] - g[c] * g[c]).abs() < 1e-15);
     }
 
@@ -1368,7 +1369,7 @@ mod tests {
         // above; it must still be a fixed point.
         let img = f64_image(&[12, 12], vec![7.0; 144]);
         let out = coherence_enhancing_diffusion(&img, &Default::default()).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert_eq!(v, 7.0);
         }
     }
@@ -1383,7 +1384,7 @@ mod tests {
             ..Default::default()
         };
         let out = coherence_enhancing_diffusion(&img, &s).unwrap();
-        for v in out.to_f64_vec() {
+        for v in out.to_f64_vec().unwrap() {
             assert!((v - 7.0).abs() < 1e-12, "{v}");
         }
     }
@@ -1400,7 +1401,8 @@ mod tests {
             assert_eq!(
                 coherence_enhancing_diffusion(&img, &s)
                     .unwrap()
-                    .to_f64_vec(),
+                    .to_f64_vec()
+                    .unwrap(),
                 data
             );
         }
@@ -1412,7 +1414,8 @@ mod tests {
         let img = f64_image(&[16, 16], data.clone());
         let out = coherence_enhancing_diffusion(&img, &Default::default())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         let lo = data.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         for v in out {
@@ -1445,7 +1448,8 @@ mod tests {
         };
         let out = coherence_enhancing_diffusion(&img, &s)
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
 
         // (1) Variance *along* the edge (down the two columns at the jump)
         //     must fall: that is the coherence-enhancing smoothing.
@@ -1488,6 +1492,7 @@ mod tests {
             coherence_enhancing_diffusion(&img, &s)
                 .unwrap()
                 .to_f64_vec()
+                .unwrap()
         };
         let row_mean = |v: &[f64], x: usize| -> f64 {
             (0..ny).map(|y| v[y * nx + x]).sum::<f64>() / ny as f64
@@ -1513,7 +1518,8 @@ mod tests {
         let img = f64_image(&[nx, ny, nz], data.clone());
         let out = coherence_enhancing_diffusion(&img, &Default::default())
             .unwrap()
-            .to_f64_vec();
+            .to_f64_vec()
+            .unwrap();
         assert_eq!(out.len(), data.len());
         assert!(out.iter().all(|v| v.is_finite()));
         // Conservative scheme: the total is preserved.

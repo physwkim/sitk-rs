@@ -322,8 +322,8 @@ fn reconstruct_images(
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
 
-    let marker = marker_image.to_f64_vec();
-    let mask = mask_image.to_f64_vec();
+    let marker = marker_image.to_f64_vec()?;
+    let mask = mask_image.to_f64_vec()?;
     if marker.iter().zip(&mask).any(|(&m, &k)| kind.compare(m, k)) {
         return Err(FilterError::InvalidReconstructionMarker {
             relation: kind.required_relation(),
@@ -427,7 +427,7 @@ fn border_marker(vals: &[f64], size: &[usize], interior_fill: f64) -> Vec<f64> {
 /// value on the border pixel itself, which the erosion can never raise past.
 pub fn grayscale_fillhole(image: &Image, fully_connected: bool) -> Result<Image> {
     let (_, max_value) = crate::minimum_maximum(image)?;
-    let marker_vals = border_marker(&image.to_f64_vec(), image.size(), max_value);
+    let marker_vals = border_marker(&image.to_f64_vec()?, image.size(), max_value);
     let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &marker_vals)?;
     reconstruction_by_erosion(&marker_image, image, fully_connected)
 }
@@ -439,7 +439,7 @@ pub fn grayscale_fillhole(image: &Image, fully_connected: bool) -> Result<Image>
 /// border values on the shell.
 pub fn grayscale_grindpeak(image: &Image, fully_connected: bool) -> Result<Image> {
     let (min_value, _) = crate::minimum_maximum(image)?;
-    let marker_vals = border_marker(&image.to_f64_vec(), image.size(), min_value);
+    let marker_vals = border_marker(&image.to_f64_vec()?, image.size(), min_value);
     let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &marker_vals)?;
     reconstruction_by_dilation(&marker_image, image, fully_connected)
 }
@@ -457,7 +457,7 @@ pub fn grayscale_grindpeak(image: &Image, fully_connected: bool) -> Result<Image
 /// does via `Scalar::from_f64`.
 pub fn h_minima(image: &Image, height: f64, fully_connected: bool) -> Result<Image> {
     let height = quantize_to_pixel_type(image.pixel_id(), height);
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let shifted: Vec<f64> = vals.iter().map(|&v| v + height).collect();
     let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &shifted)?;
     reconstruction_by_erosion(&marker_image, image, fully_connected)
@@ -469,7 +469,7 @@ pub fn h_minima(image: &Image, height: f64, fully_connected: bool) -> Result<Ima
 /// dilation under the marker `image - height`.
 pub fn h_maxima(image: &Image, height: f64, fully_connected: bool) -> Result<Image> {
     let height = quantize_to_pixel_type(image.pixel_id(), height);
-    let vals = image.to_f64_vec();
+    let vals = image.to_f64_vec()?;
     let shifted: Vec<f64> = vals.iter().map(|&v| v - height).collect();
     let marker_image = image_from_f64(image.pixel_id(), image.size(), image, &shifted)?;
     reconstruction_by_dilation(&marker_image, image, fully_connected)

@@ -178,7 +178,7 @@ pub fn geodesic_active_contour_level_set(
     solve(
         initial_level_set,
         Solve {
-            speed: feature_image.to_f64_vec(),
+            speed: feature_image.to_f64_vec()?,
             advection,
             curvature_speed: CurvatureSpeed::Propagation,
             weights: Weights {
@@ -228,7 +228,7 @@ pub fn shape_detection_level_set(
     solve(
         initial_level_set,
         Solve {
-            speed: feature_image.to_f64_vec(),
+            speed: feature_image.to_f64_vec()?,
             advection: Vec::new(),
             curvature_speed: CurvatureSpeed::Propagation,
             weights: Weights {
@@ -290,7 +290,7 @@ pub fn threshold_segmentation_level_set(
     solve(
         initial_level_set,
         Solve {
-            speed: threshold_speed(feature_image, lower_threshold, upper_threshold),
+            speed: threshold_speed(feature_image, lower_threshold, upper_threshold)?,
             advection: Vec::new(),
             curvature_speed: CurvatureSpeed::Unit,
             weights: Weights {
@@ -420,7 +420,7 @@ pub fn canny_segmentation_level_set(
     check_same_size(initial_level_set, feature_image)?;
 
     let (canny_image, distance) = canny_distance_image(feature_image, threshold, variance)?;
-    let speed = distance.to_f64_vec();
+    let speed = distance.to_f64_vec()?;
     let advection = if advection_scaling == 0.0 {
         Vec::new()
     } else {
@@ -453,7 +453,7 @@ pub fn canny_segmentation_level_set(
             PixelId::Float32,
             canny_image.size(),
             &canny_image,
-            &canny_image.to_f64_vec(),
+            &canny_image.to_f64_vec()?,
         )?,
     })
 }
@@ -519,7 +519,7 @@ fn solve(initial_level_set: &Image, s: Solve) -> Result<LevelSetResult> {
     // the shifted image's zero-crossing map onto the output as the seed of the
     // active layer.
     let shifted: Vec<f64> = initial_level_set
-        .to_f64_vec()
+        .to_f64_vec()?
         .into_iter()
         .map(|v| v - s.iso_surface_value)
         .collect();
@@ -577,7 +577,7 @@ fn advection_field(feature_image: &Image) -> Result<Vec<Vec<f64>>> {
         let derivative = recursive_gaussian_with_order(&scratch, &sigma, &orders, false)?;
         fields.push(
             derivative
-                .to_f64_vec()
+                .to_f64_vec()?
                 .into_iter()
                 .map(|v| -v / spacing[d])
                 .collect(),
@@ -600,10 +600,14 @@ fn check_same_size(initial_level_set: &Image, feature_image: &Image) -> Result<(
 
 /// `ThresholdSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:58-83)
 /// with `m_EdgeWeight == 0`.
-fn threshold_speed(feature_image: &Image, lower_threshold: f64, upper_threshold: f64) -> Vec<f64> {
+fn threshold_speed(
+    feature_image: &Image,
+    lower_threshold: f64,
+    upper_threshold: f64,
+) -> Result<Vec<f64>> {
     let mid = ((upper_threshold - lower_threshold) / 2.0) + lower_threshold;
-    feature_image
-        .to_f64_vec()
+    Ok(feature_image
+        .to_f64_vec()?
         .into_iter()
         .map(|g| {
             if g < mid {
@@ -612,13 +616,13 @@ fn threshold_speed(feature_image: &Image, lower_threshold: f64, upper_threshold:
                 upper_threshold - g
             }
         })
-        .collect()
+        .collect())
 }
 
 /// `LaplacianSegmentationLevelSetFunction::CalculateSpeedImage` (hxx:28-47):
 /// `LaplacianImageFilter` on the cast feature image, `UseImageSpacing` on.
 fn laplacian_speed(feature_image: &Image) -> Result<Vec<f64>> {
-    Ok(laplacian(&scratch_f64(feature_image)?, true)?.to_f64_vec())
+    Ok(laplacian(&scratch_f64(feature_image)?, true)?.to_f64_vec()?)
 }
 
 /// `CannySegmentationLevelSetFunction::CalculateDistanceImage` (hxx:71-97):
@@ -676,7 +680,7 @@ fn canny_advection_field(distance: &Image, values: &[f64]) -> Vec<Vec<f64>> {
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry.
 fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec())?;
+    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
     scratch.copy_geometry_from(img);
     Ok(scratch)
 }
@@ -721,7 +725,12 @@ mod tests {
     /// The output is a sparse-field distance transform, so counting negative
     /// pixels is a far more stable estimate than tracing the contour.
     fn enclosed_radius(image: &Image) -> f64 {
-        let inside = image.to_f64_vec().iter().filter(|&&v| v < 0.0).count();
+        let inside = image
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .filter(|&&v| v < 0.0)
+            .count();
         (inside as f64 / PI).sqrt()
     }
 
@@ -845,7 +854,10 @@ mod tests {
             shape_detection_level_set(&initial, &constant_feature(1.0), 0.0, 1.0, 0.0, 20, true)
                 .unwrap();
 
-        assert_eq!(negated.image.to_f64_vec(), reversed.image.to_f64_vec());
+        assert_eq!(
+            negated.image.to_f64_vec().unwrap(),
+            reversed.image.to_f64_vec().unwrap()
+        );
     }
 
     /// Pure mean-curvature flow (`propagation_scaling == 0`): `phi_t = kappa
@@ -1077,7 +1089,7 @@ mod tests {
     fn threshold_speed_splits_at_the_window_midpoint() {
         let feature =
             Image::from_vec(&[7, 1], vec![0.0, 50.0, 99.0, 100.0, 150.0, 151.0, 200.0]).unwrap();
-        let speed = threshold_speed(&feature, 50.0, 150.0);
+        let speed = threshold_speed(&feature, 50.0, 150.0).unwrap();
 
         // g < 100: g - 50.  g >= 100: 150 - g.  Zero on both window edges,
         // negative outside the window, peaking at 50 on the midpoint.
@@ -1092,7 +1104,10 @@ mod tests {
     #[test]
     fn threshold_speed_is_a_tent_peaking_at_the_midpoint() {
         let feature = Image::from_vec(&[3, 1], vec![4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(threshold_speed(&feature, 0.0, 10.0), vec![4.0, 5.0, 4.0]);
+        assert_eq!(
+            threshold_speed(&feature, 0.0, 10.0).unwrap(),
+            vec![4.0, 5.0, 4.0]
+        );
     }
 
     /// `lower_threshold > upper_threshold` is not rejected by ITK; the tent
@@ -1100,7 +1115,10 @@ mod tests {
     #[test]
     fn threshold_speed_accepts_an_inverted_window() {
         let feature = Image::from_vec(&[3, 1], vec![4.0, 5.0, 6.0]).unwrap();
-        assert_eq!(threshold_speed(&feature, 10.0, 0.0), vec![-6.0, -5.0, -6.0]);
+        assert_eq!(
+            threshold_speed(&feature, 10.0, 0.0).unwrap(),
+            vec![-6.0, -5.0, -6.0]
+        );
     }
 
     /// The intensity plateau the threshold filter is built to find: a disk of
@@ -1176,7 +1194,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+        assert_eq!(
+            reversed.image.to_f64_vec().unwrap(),
+            negated.image.to_f64_vec().unwrap()
+        );
         // And it really does reverse: forward growth, reversed shrinkage.
         let forward = threshold_segmentation_level_set(
             &circle_level_set(8.0),
@@ -1202,7 +1223,10 @@ mod tests {
     #[test]
     fn threshold_curvature_is_not_damped_by_a_vanishing_speed() {
         let feature = constant_feature(50.0);
-        assert_eq!(threshold_speed(&feature, 50.0, 50.0), vec![0.0; N * N]);
+        assert_eq!(
+            threshold_speed(&feature, 50.0, 50.0).unwrap(),
+            vec![0.0; N * N]
+        );
 
         let result = threshold_segmentation_level_set(
             &circle_level_set(12.0),
@@ -1358,7 +1382,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+        assert_eq!(
+            reversed.image.to_f64_vec().unwrap(),
+            negated.image.to_f64_vec().unwrap()
+        );
     }
 
     #[test]
@@ -1421,7 +1448,7 @@ mod tests {
     fn canny_speed_is_the_distance_to_the_canny_edges() {
         let (canny, distance) = canny_distance_image(&step_edge(), 10.0, 0.0).unwrap();
 
-        let edges = canny.to_f64_vec();
+        let edges = canny.to_f64_vec().unwrap();
         let expected_edges: Vec<f64> = (0..9)
             .map(|x| f64::from(u8::from(x == 2 || x == 3)))
             .collect();
@@ -1432,7 +1459,7 @@ mod tests {
         let expected: Vec<f64> = (0..9)
             .map(|x: i32| f64::from((x - 2).abs().min((x - 3).abs())))
             .collect();
-        let d = distance.to_f64_vec();
+        let d = distance.to_f64_vec().unwrap();
         for y in 0..7 {
             assert_eq!(&d[9 * y..9 * (y + 1)], &expected[..], "row {y}");
         }
@@ -1446,7 +1473,7 @@ mod tests {
     #[test]
     fn canny_advection_field_is_the_distance_times_its_own_gradient() {
         let (_, distance) = canny_distance_image(&step_edge(), 10.0, 0.0).unwrap();
-        let values = distance.to_f64_vec();
+        let values = distance.to_f64_vec().unwrap();
         let field = canny_advection_field(&distance, &values);
 
         let expected_x = [-1.0, -1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 2.5];
@@ -1505,7 +1532,7 @@ mod tests {
         .unwrap();
 
         // The Canny ring the front is chasing.
-        let edges = result.canny_image.to_f64_vec();
+        let edges = result.canny_image.to_f64_vec().unwrap();
         let inner_edge = (0..N)
             .flat_map(|y| (0..N).map(move |x| (x, y)))
             .filter(|&(x, y)| edges[x + N * y] == 1.0)
@@ -1561,7 +1588,10 @@ mod tests {
 
         assert_eq!(early.elapsed_iterations, 100);
         assert_eq!(late.elapsed_iterations, 200);
-        assert_eq!(early.image.to_f64_vec(), late.image.to_f64_vec());
+        assert_eq!(
+            early.image.to_f64_vec().unwrap(),
+            late.image.to_f64_vec().unwrap()
+        );
     }
 
     /// The advection field `d grad(d)` points *away* from the Canny edges (it
@@ -1631,7 +1661,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(reversed.image.to_f64_vec(), negated.image.to_f64_vec());
+        assert_eq!(
+            reversed.image.to_f64_vec().unwrap(),
+            negated.image.to_f64_vec().unwrap()
+        );
     }
 
     /// `iso_surface_value` selects which isocontour of the initial image seeds
@@ -1671,8 +1704,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            shifted.image.to_f64_vec(),
-            seeded_directly.image.to_f64_vec()
+            shifted.image.to_f64_vec().unwrap(),
+            seeded_directly.image.to_f64_vec().unwrap()
         );
     }
 
@@ -1696,7 +1729,7 @@ mod tests {
 
         assert_eq!(result.canny_image.pixel_id(), PixelId::Float32);
         assert_eq!(result.canny_image.size(), &[N, N]);
-        let edges = result.canny_image.to_f64_vec();
+        let edges = result.canny_image.to_f64_vec().unwrap();
         assert!(edges.iter().all(|&v| v == 0.0 || v == 1.0));
         let on = edges.iter().filter(|&&v| v == 1.0).count();
         assert!(on > 0, "the disk's boundary produced no Canny edges");
