@@ -19,7 +19,7 @@
 //!
 //! # The shared pipeline
 //!
-//! `PrepareInputs` pads the input out to a power-of-two extent through the
+//! `PrepareInputs` pads the input out to an 11-smooth extent through the
 //! boundary condition ([`crate::convolution::pad_input`]) and builds the
 //! transfer function `H` — the kernel, upper-zero-padded and cyclically shifted
 //! so its origin sits at index 0, transformed

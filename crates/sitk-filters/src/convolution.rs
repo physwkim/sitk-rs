@@ -369,7 +369,8 @@ pub fn convolution(
 pub(crate) struct PaddedInput {
     /// The padded pixels, first-index-fastest, `size.iter().product()` of them.
     pub(crate) values: Vec<f64>,
-    /// The padded extent: every component a power of two.
+    /// The padded extent: every component a length `itkFFTPadImageFilter`
+    /// accepts at `SizeGreatestPrimeFactor == 11` (`crate::fft::padded_length`).
     pub(crate) size: Vec<usize>,
     /// How many of the FFT-pad pixels `FFTPadImageFilter` put on the low side
     /// of each axis (`m_FFTPadSize[d] / 2`).
@@ -420,8 +421,10 @@ fn pad_input_with<B: BoundaryCondition<f64>>(
 /// For a whole-image request it reduces to: take the output region grown by the
 /// kernel radius from the boundary-extended input (the `RegionOfInterest` at
 /// `outputIndex - radius`, size `outputSize + 2*radius`, ibid. 214-221), then
-/// hand *that* to `FFTPadImageFilter`, which grows each axis to a power of two
-/// with `padSize / 2` pixels on the low side and draws the new pixels from the
+/// hand *that* to `FFTPadImageFilter`, which grows each axis to the next size
+/// whose greatest prime factor is at most `m_SizeGreatestPrimeFactor` (11, from
+/// the PocketFFT backend — itkFFTConvolutionImageFilter.hxx:39, :260-263), with
+/// `padSize / 2` pixels on the low side, and draws the new pixels from the
 /// boundary condition applied to the region of interest
 /// (itkFFTPadImageFilter.hxx:52-72).
 ///
@@ -562,8 +565,9 @@ fn convolve_fft(
 /// dimension, boundary condition and output-region mode.
 ///
 /// Ported from itkFFTConvolutionImageFilter.hxx. The transforms are this
-/// crate's own radix-2 DFT (`crate::fft`); see that module for why radix-2
-/// covers every padded length ITK's `SizeGreatestPrimeFactor == 2` can produce.
+/// crate's own mixed-radix DFT (`crate::fft`), and the padding is
+/// `itkFFTPadImageFilter`'s search at the `SizeGreatestPrimeFactor == 11` that
+/// filter's constructor seeds from the PocketFFT backend (`.hxx:39`).
 pub fn fft_convolution(
     image: &Image,
     kernel: &Image,
@@ -876,7 +880,10 @@ mod tests {
 
     #[test]
     fn spatial_and_fft_agree_in_1d() {
-        // 7 is not a power of two, so the FFT path pads (7 + 2r) up to 16.
+        // The FFT path transforms `7 + 2 * (kernel / 2)` points: 9, 11, 7, 12 —
+        // all 11-smooth, so `FFTPadImageFilter` adds nothing. (The radix-2
+        // backend this module used to sit on transformed 16, 16, 8, 16 instead;
+        // the results are the same, which is the point of ledger §4.2.)
         cross_check(&[7], &[3], false);
         cross_check(&[7], &[4], false);
         cross_check(&[7], &[1], false);
