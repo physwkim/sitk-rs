@@ -63,11 +63,11 @@
 //! `SwapBytesIfNecessary` (`:588-653`) has arms for `SCHAR`, `UCHAR`, `SHORT`,
 //! `USHORT`, `FLOAT` and `DOUBLE`, and a `default:` that throws `"Pixel Type
 //! Unknown"` — `INT` and `UINT` fall into it. `Read` calls it after the pixel
-//! data has been read (`:243`) and `Write` calls it before the pixel data is
-//! written (`:1010`/`:1024`), so a 32-bit-integer GIPL file throws on read and,
-//! on write, throws *after* `Write` has already truncated the file and emitted
-//! the full 256-byte header. Ledger §1.52; [`write`] reproduces the truncated
-//! file exactly.
+//! data has been read (`:243`), so a 32-bit-integer GIPL file still throws on
+//! read. Upstream's `Write` calls it before the pixel data is written
+//! (`:1010`/`:1024`), only *after* truncating the file and emitting the full
+//! 256-byte header — fixed in this port (ledger §1.52): [`write`] checks
+//! swappability before writing anything, so the target is left untouched.
 //!
 //! 64-bit integers never reach that point: `Write`'s own `image_type` switch has
 //! no `LONG`/`LONGLONG` arm and throws `"Invalid type"` (`:759-761`) — after the
@@ -470,21 +470,25 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
 
 /// Write a `.gipl` file.
 ///
-/// Upstream's `Write` truncates the file *before* it can discover that the pixel
-/// type is unwritable, so both failure modes leave a partial file behind and
-/// this port leaves the same bytes:
+/// Upstream's `Write` truncates the file *before* it can discover that the
+/// pixel type is unwritable. This port keeps that behaviour for the one case
+/// it does not own — a 64-bit integer image, which has no GIPL type code at
+/// all, leaves the **8 bytes** of `dims`, then `"Invalid type"`
+/// (itkGiplImageIO.cxx:759-761) — but fixes it for `UInt32`/`Int32` (ledger
+/// §1.52): `image_type` accepts both (`GIPL_INT`/`GIPL_U_INT` exist), so
+/// upstream only discovers they are unswappable deep inside the binary write
+/// path (`SwapBytesIfNecessary`, `:1010`/`:1024`), by which point the full
+/// 256-byte header is already on disk. This port checks swappability first
+/// and rejects the pixel type before writing anything at all — the target
+/// file, if one already exists at `path`, is left untouched.
 ///
-/// * a 64-bit integer image leaves the **8 bytes** of `dims`, then
-///   `"Invalid type"` (itkGiplImageIO.cxx:759-761);
-/// * a `UInt32`/`Int32` image leaves the full **256-byte header**, then
-///   `"Pixel Type Unknown"` from `SwapBytesIfNecessary` (`:1010`/`:1024`).
-///
-/// For a `.gipl.gz` target the same partial bytes are what upstream's `gzFile`
-/// ends up holding too: `Write` never calls `gzclose` before either throw, so
-/// zlib's small internal write buffer is only flushed — and the gzip trailer
-/// written — once the exception unwinds and `GiplImageIO`'s destructor runs
-/// (`:81-95`). This port models that outcome directly: every exit point
-/// gzip-compresses the same `out` buffer the uncompressed path writes verbatim.
+/// For a `.gipl.gz` target the 64-bit-integer partial bytes are what
+/// upstream's `gzFile` ends up holding too: `Write` never calls `gzclose`
+/// before that throw, so zlib's small internal write buffer is only flushed —
+/// and the gzip trailer written — once the exception unwinds and
+/// `GiplImageIO`'s destructor runs (`:81-95`). This port models that outcome
+/// directly: that one exit point gzip-compresses the same `out` buffer the
+/// uncompressed path writes verbatim.
 ///
 /// `WriteImageInformation` is a no-op upstream ("not possible to write a Gipl
 /// file", `:655-659`); the header is emitted by `Write` alone.
@@ -510,6 +514,16 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
             component.as_str()
         )));
     };
+    // Fixed §1.52: upstream discovers `UInt32`/`Int32` are unswappable only
+    // deep inside the binary write path (`SwapBytesIfNecessary`,
+    // itkGiplImageIO.cxx:1010/1024), by which point `OpenFileForWriting` has
+    // already truncated the target and the full 256-byte header is on disk.
+    // `image_type` accepts these two types (`GIPL_INT`/`GIPL_U_INT` exist),
+    // so nothing before this point can catch it — check here, before writing
+    // anything at all.
+    if !is_swappable(component) {
+        return Err(pixel_type_unknown(component));
+    }
     out.extend_from_slice(&image_type.to_be_bytes());
 
     // pixdim: spacing, then 1.0.
@@ -537,11 +551,6 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
     out.resize(out.len() + 4 * 4, 0);
     out.extend_from_slice(&GIPL_MAGIC_NUMBER.to_be_bytes());
     debug_assert_eq!(out.len(), HEADER_SIZE);
-
-    if !is_swappable(component) {
-        write_bytes(path, &out, compressed)?;
-        return Err(pixel_type_unknown(component));
-    }
 
     // `GetImageSizeInBytes()` counts every component, so a vector or complex
     // image writes more bytes than its scalar `image_type` describes (§2.96).
