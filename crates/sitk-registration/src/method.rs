@@ -511,6 +511,29 @@ impl OptimizerKind {
     fn ignores_scales(&self) -> bool {
         matches!(self, OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_))
     }
+
+    /// The SimpleITK name of this optimizer when it belongs to the gradient-free
+    /// family (Amoeba, Powell, (1+1) evolutionary, Exhaustive), else `None`.
+    ///
+    /// These four apply parameter scales *multiplicatively* (`internal =
+    /// external · scales`, ITK's `SingleValuedVnlCostFunctionAdaptorv4`) and
+    /// never touch the metric gradient, so the optimizer weights have no vehicle
+    /// to ride in on. Folding a weight into `scales` would poison it — a zero
+    /// weight (the documented freeze idiom) makes `scales / 0 = +∞`, and the
+    /// multiplicative application then yields `0 · ∞ = NaN`. ITK validates the
+    /// weight length then silently ignores the values; this port rejects
+    /// explicitly-set weights for them rather than expose an inert parameter
+    /// (ledger §2.117). Membership and the diagnostic name live here together so
+    /// the honor-or-reject split has a single source of truth.
+    fn gradient_free_name(&self) -> Option<&'static str> {
+        match self {
+            OptimizerKind::Amoeba(_) => Some("Amoeba"),
+            OptimizerKind::Powell(_) => Some("Powell"),
+            OptimizerKind::OnePlusOneEvolutionary(_) => Some("OnePlusOneEvolutionary"),
+            OptimizerKind::Exhaustive(_) => Some("Exhaustive"),
+            _ => None,
+        }
+    }
 }
 
 /// Configuration for the L-BFGS-B optimizer, mirroring SimpleITK
@@ -1167,16 +1190,22 @@ impl ImageRegistrationMethod {
     /// - Weights within `1e-4` of `1.0` are treated as exactly identity and
     ///   never multiplied in (`m_WeightsAreIdentity`,
     ///   `itkObjectToObjectOptimizerBase.cxx:143-166`; ledger §2.116).
-    /// - The weights are honored by **every** optimizer this crate exposes.
-    ///   Upstream validates them for every v4 optimizer but only the
-    ///   gradient-descent family actually applies them — the vnl-backed
-    ///   `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and gradient-free
-    ///   `AmoebaOptimizerv4` validate and then silently ignore a well-sized
-    ///   array. This port instead applies them uniformly (ledger §2.117): the
-    ///   scale-consuming optimizers fold the weights into their per-parameter
-    ///   step scaling, and the two L-BFGS optimizers — which ignore that scaling
-    ///   — apply the weights to the gradient they descend. A zero weight freezes
-    ///   its parameter exactly on every path.
+    /// - The weights are honored by the **gradient family** and rejected for the
+    ///   **gradient-free family** (honor-or-reject). Upstream validates them for
+    ///   every v4 optimizer but only the gradient-descent family actually applies
+    ///   them — the vnl-backed `LBFGSOptimizerv4`, `LBFGSBOptimizerv4`, and
+    ///   gradient-free `AmoebaOptimizerv4` validate and then silently ignore a
+    ///   well-sized array. This port honors them wherever a vehicle exists
+    ///   (ledger §2.117): the scale-consuming gradient-descent optimizers fold
+    ///   the weights into their per-parameter step scaling, and the two L-BFGS
+    ///   optimizers — which ignore that scaling — apply the weights to the
+    ///   gradient they descend, so a zero weight freezes its parameter exactly on
+    ///   every gradient path. The four gradient-free optimizers (Amoeba, Powell,
+    ///   (1+1) evolutionary, Exhaustive) apply scales multiplicatively and form
+    ///   no gradient, so weights have no vehicle; setting non-empty weights for
+    ///   them is rejected with
+    ///   [`RegistrationError::OptimizerWeightsNotApplicable`] rather than exposed
+    ///   as an inert (and, via a zero weight, `NaN`-poisoning) parameter.
     ///
     /// An empty vector (the default) means identity.
     ///
@@ -2331,6 +2360,20 @@ impl ImageRegistrationMethod {
             });
         }
 
+        // Honor-or-reject: the gradient family folds the weights into `scales`
+        // and the two L-BFGS variants apply them to the gradient, but the four
+        // gradient-free optimizers can do neither (they apply scales
+        // multiplicatively and never form a gradient). ITK validates their
+        // length above then silently ignores the values; folding them here would
+        // poison the scales (`scales / 0 = +∞`, then `0 · ∞ = NaN`). Reject
+        // explicitly-set weights rather than expose an inert parameter
+        // (ledger §2.117).
+        if let Some(optimizer) = self.optimizer.gradient_free_name() {
+            if !self.optimizer_weights.is_empty() {
+                return Err(RegistrationError::OptimizerWeightsNotApplicable { optimizer });
+            }
+        }
+
         // Both L-BFGS variants ignore parameter scales and the learning-rate
         // estimator (ITK's LBFGSBOptimizerv4/LBFGS2Optimizerv4 force identity
         // scales), so neither is built for them — they drive the raw metric
@@ -2383,19 +2426,24 @@ impl ImageRegistrationMethod {
         // The two L-BFGS variants ignore the estimated/manual `scales` (ITK
         // forces identity scales on the vnl-backed LBFGSB), so weights cannot
         // ride in on this array for them; they apply the weights directly to the
-        // gradient they descend instead — see `weighted_objective!` below. Either
-        // way the weights are honored for every optimizer (ledger §2.117).
+        // gradient they descend instead — see `weighted_objective!` below. So the
+        // weights are honored by the gradient-descent family (this fold) and the
+        // L-BFGS family (via the gradient), while the gradient-free family
+        // rejects them at the validation site above — they can never reach this
+        // fold with non-empty weights, but the `gradient_free_name` guard keeps
+        // the fold from running for them by construction (ledger §2.117).
         let weights = &self.optimizer_weights;
         let apply_weights = !weights_are_identity(weights);
-        let scales: Vec<f64> = if ignores_scales || !apply_weights {
-            scales
-        } else {
-            scales
-                .iter()
-                .enumerate()
-                .map(|(j, &s)| s / weights[j % weights.len()])
-                .collect()
-        };
+        let scales: Vec<f64> =
+            if ignores_scales || self.optimizer.gradient_free_name().is_some() || !apply_weights {
+                scales
+            } else {
+                scales
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &s)| s / weights[j % weights.len()])
+                    .collect()
+            };
 
         let scaled = |grad: &[f64]| -> Vec<f64> {
             grad.iter()
@@ -5822,6 +5870,90 @@ mod tests {
                 }
             ),
             "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn gradient_free_optimizers_reject_explicitly_set_weights() {
+        // The four gradient-free optimizers apply parameter scales
+        // multiplicatively and never form a metric gradient, so weights have no
+        // vehicle. ITK validates their length then ignores the values; folding a
+        // zero weight into `scales` would give `scales / 0 = +∞` and then
+        // `0 · ∞ = NaN`, silently poisoning the whole registration. This port
+        // rejects explicitly-set weights instead, naming the optimizer
+        // (ledger §2.117). One case per optimizer.
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.0, 10.0, 4.0, 1.0);
+
+        // The documented freeze idiom `[1.0, 0.0]` is exactly what would produce
+        // the NaN if the fold ran; it is the case each optimizer must reject.
+        for name in ["Amoeba", "Powell", "OnePlusOneEvolutionary", "Exhaustive"] {
+            let mut reg = ImageRegistrationMethod::new();
+            match name {
+                "Amoeba" => {
+                    reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
+                }
+                "Powell" => {
+                    reg.set_optimizer_as_powell(50, 100, 1.0, 1e-6, 1e-6);
+                }
+                "OnePlusOneEvolutionary" => {
+                    reg.set_optimizer_as_one_plus_one_evolutionary(
+                        100, 1.5e-4, 1.01, -1.0, -1.0, 1,
+                    );
+                }
+                "Exhaustive" => {
+                    reg.set_optimizer_as_exhaustive(vec![2, 2], 1.0);
+                }
+                _ => unreachable!("unlisted gradient-free optimizer {name}"),
+            }
+            reg.set_optimizer_weights(vec![1.0, 0.0]);
+            let err = reg
+                .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap_err();
+            match err {
+                RegistrationError::OptimizerWeightsNotApplicable { optimizer } => {
+                    assert_eq!(optimizer, name, "{name}: wrong optimizer name in error");
+                }
+                other => panic!("{name}: expected OptimizerWeightsNotApplicable, got {other:?}"),
+            }
+            assert_eq!(
+                reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "optimizer weights are not applicable to gradient-free optimizers (optimizer: {name})"
+                ),
+            );
+        }
+
+        // The length check still precedes the rejection (ITK validates length
+        // for these too): a mis-sized array reports the length error, not the
+        // applicability error.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
+        reg.set_optimizer_weights(vec![1.0, 1.0, 1.0]);
+        let err = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::OptimizerWeightsLength {
+                    got: 3,
+                    expected: 2
+                }
+            ),
+            "expected length error before applicability error, got {err:?}"
+        );
+
+        // An empty (default) weights array is accepted — the gradient-free run
+        // proceeds normally.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
+        assert!(
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .is_ok(),
+            "unweighted gradient-free run should succeed"
         );
     }
 }
