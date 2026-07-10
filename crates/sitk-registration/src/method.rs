@@ -1671,10 +1671,10 @@ impl ImageRegistrationMethod {
     /// `fixed` here is the fixed image **already resampled onto the virtual
     /// domain** by [`prepare_level`](Self::prepare_level), so its grid is the
     /// sample grid. The sampling arguments are explicit rather than read from
-    /// `self` because [`metric_evaluate`](Self::metric_evaluate) samples densely
-    /// regardless of the configured strategy — upstream sets the strategy on the
-    /// *registration*, not the metric, and `EvaluateInternal` never builds a
-    /// registration (ledger §3.35).
+    /// `self` because each caller supplies its own level's percentage:
+    /// [`metric_evaluate`](Self::metric_evaluate) passes the configured strategy
+    /// at the finest level's percentage (ledger §3.35), while the per-level
+    /// `Execute` loop passes that level's percentage.
     fn build_metric(
         &self,
         fixed: &Image,
@@ -1998,17 +1998,25 @@ impl ImageRegistrationMethod {
     /// virtual domain, and returns its value — for mean squares, the mean of the
     /// squared differences over the samples that map inside the moving image.
     ///
-    /// What upstream's `EvaluateInternal` skips, and so does this:
+    /// The **metric sampling strategy, percentage and seed** are honoured, at
+    /// the finest level's percentage — the same sampling `Execute` would apply
+    /// at full resolution. This is a deliberate divergence from upstream, whose
+    /// `EvaluateInternal` sets sampling on `itk::ImageRegistrationMethodv4` (a
+    /// registration it never builds here) and so always samples densely: this
+    /// port makes `set_metric_sampling_*` take effect instead of silently
+    /// dropping it (ledger §3.35).
+    ///
+    /// What is *not* honoured:
     ///
     /// - the **optimizer** and the **parameter-scales estimator**: neither is
     ///   constructed, so `set_optimizer_*` and `set_optimizer_scales_*` have no
     ///   effect here;
-    /// - the **multi-resolution schedule**: the images are used at full
-    ///   resolution, unsmoothed and unshrunk;
-    /// - the **metric sampling strategy, percentage and seed**: upstream sets
-    ///   those on `itk::ImageRegistrationMethodv4`, which `EvaluateInternal`
-    ///   never builds, so the metric samples the virtual domain densely
-    ///   (ledger §3.35).
+    /// - the **multi-resolution pyramid** (`set_shrink_factors_per_level` /
+    ///   `set_smoothing_sigmas_per_level`): the pyramid is `Execute`'s
+    ///   optimization schedule, not an input to a single metric evaluation —
+    ///   one value cannot span several levels — so it is inapplicable by
+    ///   definition, and a configured schedule is neither applied nor an error.
+    ///   The images are used at full resolution, unsmoothed and unshrunk.
     ///
     /// The interpolator, both image masks, the virtual domain, and all three
     /// transforms *do* apply — `SetupMetric` configures them.
@@ -2037,12 +2045,20 @@ impl ImageRegistrationMethod {
         // `recursive_gaussian` a no-op and a unit shrink factor keeps the grid.
         let (fixed_level, moving_level, fixed_mask_level) =
             self.prepare_level(fixed, moving, &vec![0.0; dim], &vec![1; dim], dim)?;
+        // Honour the configured sampling at the finest level's percentage — the
+        // last entry, since the schedule is coarsest-first (§3.35). An empty
+        // schedule samples densely.
+        let percentage = self
+            .sampling_percentage_per_level
+            .last()
+            .copied()
+            .unwrap_or(1.0);
         let metric = self.build_metric(
             &fixed_level,
             &moving_level,
             fixed_mask_level.as_ref(),
-            SamplingStrategy::None,
-            1.0,
+            self.sampling_strategy,
+            percentage,
         )?;
 
         let composed = Composed {
@@ -2640,22 +2656,38 @@ mod initial_transform_tests {
         assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 0.0);
     }
 
-    /// `EvaluateInternal` builds no `itk::ImageRegistrationMethodv4`, and the
-    /// sampling strategy lives on that object — so `MetricEvaluate` samples the
-    /// virtual domain densely no matter how the strategy is configured
-    /// (ledger §3.35). Same for the multi-resolution schedule.
+    /// §3.35: `MetricEvaluate` **honours** the configured sampling (upstream
+    /// silently ignored it), but the multi-resolution pyramid is `Execute`'s
+    /// optimization schedule and inapplicable to one evaluation, so it is
+    /// neither applied nor an error.
+    ///
+    /// Fixed is the ramp `0..8`, moving is all zeros, evaluated at the identity,
+    /// so every voxel's squared difference is the fixed value squared. Dense,
+    /// the mean over all nine voxels is `(0²+1²+…+8²)/9 = 204/9`. `Regular`
+    /// sampling at `0.34` strides by `⌈1/0.34⌉ = 3`, taking flats `0, 3, 6` —
+    /// fixed values `0, 3, 6` — so the mean is `(0²+3²+6²)/3 = 45/3 = 15`, a
+    /// different number, which is the proof the strategy took effect.
     #[test]
-    fn metric_evaluate_ignores_the_sampling_strategy_and_the_pyramid() {
-        let image = ramp3x3();
-        let mut reg = ImageRegistrationMethod::new();
-        reg.set_metric_as_mean_squares()
-            .set_initial_transform(translation(1.0, 0.0))
-            .set_metric_sampling_strategy(SamplingStrategy::Random)
-            .set_metric_sampling_percentage(0.1, 7)
-            .set_shrink_factors_per_level(vec![4, 1])
-            .set_smoothing_sigmas_per_level(vec![2.0, 0.0]);
+    fn metric_evaluate_honours_the_sampling_and_ignores_the_pyramid() {
+        let fixed = ramp3x3();
+        let moving = Image::from_vec(&[3, 3], vec![0.0f64; 9]).unwrap();
 
-        assert_eq!(reg.metric_evaluate(&image, &image).unwrap(), 1.0);
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares();
+        let dense = reg.metric_evaluate(&fixed, &moving).unwrap();
+        assert_eq!(dense, 204.0 / 9.0);
+
+        // Sampling is honoured — the value changes to the sampled subset's mean.
+        reg.set_metric_sampling_strategy(SamplingStrategy::Regular)
+            .set_metric_sampling_percentage(0.34, 0);
+        let sampled = reg.metric_evaluate(&fixed, &moving).unwrap();
+        assert_eq!(sampled, 15.0);
+        assert_ne!(sampled, dense);
+
+        // A configured pyramid is ignored: the single evaluation is unchanged.
+        reg.set_shrink_factors_per_level(vec![4, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 0.0]);
+        assert_eq!(reg.metric_evaluate(&fixed, &moving).unwrap(), 15.0);
     }
 
     /// `MetricEvaluate` performs no optimization: it leaves the stored initial
