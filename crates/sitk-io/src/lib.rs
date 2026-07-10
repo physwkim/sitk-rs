@@ -1963,18 +1963,50 @@ mod tests {
     }
 
     /// A `NIFTI_INTENT_SYMMATRIX` file loads as
-    /// `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`, which
-    /// `GetPixelIDFromImageIO` has no branch for: it falls to the final `else`
-    /// and throws "Unknown PixelType" (sitkImageReaderBase.cxx:238). SimpleITK
-    /// simply cannot open such a file (ledger §3.32).
+    /// `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`, which `GetPixelIDFromImageIO`
+    /// has no branch for and rejects in SimpleITK. This port's [`Image`] can hold
+    /// the tensor, so it loads as a vector image of the unique matrix entries,
+    /// reordered from NIfTI's lower-triangular to ITK's upper-triangular order:
+    /// for the 6-component (3×3) case the map is `[0,1,3,2,4,5]`, so components 2
+    /// and 3 of every pixel swap. Ledger §3.32.
     #[test]
-    fn nii_symmatrix_is_unreadable_through_the_simpleitk_pixel_id_mapping() {
-        let img = Image::from_vec_vector::<f32>(&[2, 2], 3, vec![0.0; 12]).unwrap();
+    fn nii_symmatrix_loads_as_a_vector_image_reordered_to_itk_order() {
+        // Interleaved (component-fastest) source: pixel p holds [p*10 .. p*10+5].
+        let data: Vec<f32> = (0..4)
+            .flat_map(|p| (0..6).map(move |c| (p * 10 + c) as f32))
+            .collect();
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 6, data).unwrap();
         let path = patched_nii("symmatrix.nii", &img, |b| patch_i16(b, 68, 1005));
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 6);
+        assert_eq!(back.size(), &[2, 2]);
+        // Each pixel's components 2 and 3 are swapped by the reorder.
+        let expected: Vec<f32> = (0..4)
+            .flat_map(|p| {
+                let b = (p * 10) as f32;
+                [b, b + 1.0, b + 3.0, b + 2.0, b + 4.0, b + 5.0]
+            })
+            .collect();
+        assert_eq!(back.component_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    /// A `NIFTI_INTENT_SYMMATRIX` whose `dim[5]` is not a triangular number
+    /// d·(d+1)/2 has no valid symmetric-matrix component order, so this port
+    /// rejects it rather than driving upstream's `UpperToLowerOrder` past the
+    /// buffer. Ledger §3.32.
+    #[test]
+    fn nii_symmatrix_with_a_non_triangular_component_count_is_rejected() {
+        // 5 components: T(2) = 3, T(3) = 6, so 5 is not triangular.
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 5, vec![0.0; 20]).unwrap();
+        let path = patched_nii("symmatrix_bad.nii", &img, |b| patch_i16(b, 68, 1005));
         let result = read_image(&path);
         std::fs::remove_file(&path).ok();
         assert!(
-            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("SYMMATRIX")),
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("triangular")),
             "{result:?}"
         );
     }
