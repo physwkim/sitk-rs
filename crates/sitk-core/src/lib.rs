@@ -2,9 +2,13 @@
 //! dispatch, and the physical-space geometry that ITK/SimpleITK attach to every
 //! image.
 //!
-//! This crate is deliberately algorithm-free — it holds pixels and geometry and
+//! This crate is otherwise algorithm-free — it holds pixels and geometry and
 //! provides the [`dispatch_scalar!`] macro that lets the filter and transform
-//! crates recover static typing over a runtime pixel type.
+//! crates recover static typing over a runtime pixel type. The one exception
+//! is [`ops`]'s `std::ops` operator overloads (`img1 + img2`, ...): Rust's
+//! orphan rule only lets the crate that defines [`Image`] implement a foreign
+//! trait like `std::ops::Add` for it, so that arithmetic has to live here
+//! rather than in `sitk-filters` — see the [`ops`] module docs.
 
 pub mod boundary;
 pub mod error;
@@ -12,6 +16,7 @@ pub mod image;
 pub mod label_map;
 pub mod matrix;
 pub mod neighborhood;
+pub mod ops;
 pub mod pixel;
 
 pub use boundary::{
