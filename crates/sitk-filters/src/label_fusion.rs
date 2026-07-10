@@ -37,8 +37,17 @@
 //! zero the upstream filter would publish the uninitialised `p`/`q` scratch
 //! arrays (`make_unique_for_overwrite`).
 //!
-//! Degenerate denominators are not guarded upstream and are not guarded here:
-//! an all-background input set makes `p_denom == 0`, so `p_i` is `NaN`.
+//! **Fixed here (upstream bug §1.11):** upstream leaves the E-step ratios
+//! `p_i = p_num / p_denom` and `q_i = q_num / q_denom` unguarded, so an
+//! all-background input set (`p_denom == 0`) gives sensitivity `p_i = NaN`,
+//! and its dual, an all-foreground set (`q_denom == 0`), gives specificity
+//! `q_i = NaN`; the `NaN` then floods the output `W` through the M-step. A
+//! zero denominator means the rater faced no trials of that class, so this
+//! port takes the rate to be vacuously `1` (universal quantification over the
+//! empty set) at both sites — one uniform rule, not an asymmetric special
+//! case. Any finite value yields the identical, correct fused output (an
+//! all-background input makes the prior `g_t == 0`, which drives `W` to
+//! all-zeros regardless of `p`); `1` is the natural vacuous-truth choice.
 //!
 //! ## `label_voting`
 //!
@@ -288,8 +297,14 @@ pub fn staple(
                 p_denom += wi;
                 q_denom += 1.0 - wi;
             }
-            p[i] = p_num / p_denom;
-            q[i] = q_num / q_denom;
+            // A zero denominator means the rater faced no trials of that class
+            // (all-background empties `p_denom`, all-foreground empties
+            // `q_denom`). The rate is then vacuously 1 — universal
+            // quantification over the empty set — rather than upstream's
+            // unguarded `0/0 = NaN` (§1.11). Any finite value gives the
+            // identical fused `W`; `1` is the uniform choice for both duals.
+            p[i] = if p_denom == 0.0 { 1.0 } else { p_num / p_denom };
+            q[i] = if q_denom == 0.0 { 1.0 } else { q_num / q_denom };
         }
 
         // M-step: rebuild `W` from the new `p`s and `q`s.
@@ -731,17 +746,38 @@ mod tests {
     }
 
     #[test]
-    fn staple_confidence_weight_scales_the_prior() {
-        // g_t = mean(W) * confidence_weight. With one rater whose indicator is
-        // half the image, the seeded g_t is 0.5 * cw. The first E-step gives
-        // p = q = 1, and then W = g_t*1 / (g_t*1 + (1-g_t)*0) = 1 on the
-        // foreground and 0 on the background regardless of cw, so instead
-        // check a degenerate rater where the prior survives: an all-foreground
-        // rater has q_num = q_denom = 0, so q = NaN.
+    fn staple_all_foreground_rater_has_vacuous_specificity_one() {
+        // An all-foreground rater has no background trials, so `q_denom == 0`.
+        // Upstream divides 0/0 and reports specificity NaN; this port takes the
+        // rate as vacuously 1 (§1.11). Sensitivity is the ordinary p = 1: every
+        // foreground pixel is correctly called foreground. The seeded W is the
+        // indicator (all 1), g_t = mean(W)*cw = 1*0.5 = 0.5, and the M-step
+        // rebuilds W = g_t*p / (g_t*p + (1-g_t)*(1-q)) = 0.5 / (0.5 + 0.5*0) = 1
+        // everywhere.
         let a = img(&[4], vec![1u8, 1, 1, 1]);
         let r = staple(&[&a], 1.0, 1, 0.5).unwrap();
         assert_eq!(r.sensitivity, vec![1.0]);
-        assert!(r.specificity[0].is_nan(), "q = {}", r.specificity[0]);
+        assert_eq!(r.specificity, vec![1.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![1.0; 4]);
+    }
+
+    #[test]
+    fn staple_all_background_input_has_vacuous_sensitivity_one_and_zero_truth() {
+        // The dual of the test above: an all-background input set gives every
+        // rater no foreground trials, so `p_denom == 0`. Upstream reports
+        // sensitivity NaN and floods W to NaN through the M-step; this port
+        // takes p = 1 vacuously (§1.11). Specificity is the ordinary q = 1
+        // (every background pixel correctly called background). The prior
+        // g_t = mean(W)*cw = 0 (W seeds to all-zero), so the M-step gives
+        // W = 0*1 / (0*1 + 1*0) ... = g_t*alpha / (g_t*alpha + (1-g_t)*beta):
+        // with g_t = 0 and beta = q = 1 finite, W = 0 / (0 + 1*1) = 0 -- the
+        // correct all-background fused truth, no NaN.
+        let a = img(&[4], vec![0u8, 0, 0, 0]);
+        let b = img(&[4], vec![0u8, 0, 0, 0]);
+        let r = staple(&[&a, &b], 1.0, u32::MAX, 1.0).unwrap();
+        assert_eq!(r.sensitivity, vec![1.0, 1.0]);
+        assert_eq!(r.specificity, vec![1.0, 1.0]);
+        assert_eq!(r.image.to_f64_vec().unwrap(), vec![0.0; 4]);
     }
 
     #[test]
