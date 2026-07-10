@@ -9,9 +9,10 @@
 //!    `itkInverseDisplacementFieldImageFilter.hxx:113-143`). The input field is
 //!    resampled onto a grid of size `size[i] / SubsamplingFactor` (integer
 //!    division) with spacing `spacing[i] * SubsamplingFactor`, keeping the
-//!    input's origin, through an `itk::ResampleImageFilter` with the default
-//!    identity transform and linear interpolation. A sample point outside the
-//!    input's buffer takes the resampler's default pixel value, the zero vector.
+//!    input's origin **and direction** (see the fixed defect below), through an
+//!    `itk::ResampleImageFilter` with the default identity transform and linear
+//!    interpolation. A sample point outside the input's buffer takes the
+//!    resampler's default pixel value, the zero vector.
 //!
 //! 2. **Landmarks** (`hxx:162-181`). For each subsampled pixel, the *target*
 //!    landmark is its physical point `t` and the *source* landmark is the
@@ -33,7 +34,7 @@
 //! input. SimpleITK exposes no direction setter for this filter, so the output
 //! always carries the input field's direction cosines. This port does the same.
 //!
-//! # Upstream defect, reproduced: the subsampling grid ignores the direction
+//! # Fixed here (upstream bug §1.34): the subsampling grid honours the direction
 //!
 //! `PrepareKernelBaseSpline` sets the resampler's size, start index, spacing,
 //! and origin, but never its `OutputDirection`, which
@@ -48,12 +49,15 @@
 //! axis-aligned points back out as the *target* landmarks, so the landmark set
 //! is not a subset of the input lattice at all.
 //!
-//! With an identity direction — the overwhelmingly common case, and the only one
-//! SimpleITK's own test covers — the subsampled grid coincides exactly with
-//! every `SubsamplingFactor`-th input pixel and neither problem appears. This
-//! port reproduces the behaviour rather than fixing it; see
-//! `the_subsampling_grid_ignores_the_input_direction` for the pinned
-//! consequence.
+//! This port builds the subsampled grid with the input field's own direction
+//! cosines — the upstream fix PR InsightSoftwareConsortium/ITK#6577, which sets
+//! `resampler->SetOutputDirection(inputImage->GetDirection())`. The subsampled
+//! physical points are then exactly every `SubsamplingFactor`-th input lattice
+//! point, so the interior samples stay in the buffer and the target landmarks
+//! are genuine input points, for any direction. With an identity direction —
+//! the overwhelmingly common case, and the only one SimpleITK's own test covers
+//! — the fix is a no-op. See
+//! `the_subsampling_grid_honours_the_input_direction`.
 //!
 //! # Divergences
 //!
@@ -256,9 +260,11 @@ pub fn inverse_displacement_field(
     }
     let factor = subsampling_factor as usize;
 
-    // The subsampled landmark grid. Its direction is the identity, not the
-    // input's: `PrepareKernelBaseSpline` never sets the resampler's
-    // OutputDirection. See the module docs.
+    // The subsampled landmark grid, sharing the input field's direction cosines
+    // (upstream fix PR #6577 sets the resampler's OutputDirection; see the
+    // module docs). Its physical points are therefore a subset of the input
+    // lattice, so `TransformIndexToPhysicalPoint` reads back genuine input
+    // points and the interior samples stay inside the buffer.
     let sub_size: Vec<usize> = forward.size.iter().map(|&s| s / factor).collect();
     let sub_spacing: Vec<f64> = forward.spacing.iter().map(|&s| s * factor as f64).collect();
     let landmarks: usize = sub_size.iter().product();
@@ -267,12 +273,17 @@ pub fn inverse_displacement_field(
     let mut source = vec![0.0f64; landmarks * dim];
     for landmark in 0..landmarks {
         let mut rest = landmark;
-        let mut point = vec![0.0f64; dim];
+        let mut index = vec![0.0f64; dim];
         for d in 0..dim {
-            let index = rest % sub_size[d];
+            index[d] = (rest % sub_size[d]) as f64;
             rest /= sub_size[d];
-            point[d] = forward.origin[d] + sub_spacing[d] * index as f64;
         }
+
+        // p = origin + Direction * (sub_spacing ⊙ index), with the input's
+        // direction — matching the output-grid mapping below.
+        let scaled: Vec<f64> = (0..dim).map(|d| index[d] * sub_spacing[d]).collect();
+        let rotated = sitk_core::matrix::mat_vec(&forward.direction, &scaled, dim);
+        let point: Vec<f64> = (0..dim).map(|d| forward.origin[d] + rotated[d]).collect();
 
         // The resampler's identity transform, then linear interpolation of the
         // input field, or its zero default pixel value outside the buffer.
@@ -398,30 +409,31 @@ mod tests {
         assert_close(&out.components_to_f64_vec(), &[0.0, -0.2, -0.4, -0.6], 1e-9);
     }
 
-    /// The upstream defect, pinned. The subsampled grid is built with an
-    /// identity direction, so with `direction = [−1]` — whose lattice occupies
-    /// physical `[−3, 0]` — the sample point at physical `2` falls outside the
-    /// input buffer and takes the zero default pixel value.
+    /// The fix, pinned. With `direction = [−1]` the input lattice (origin `0`,
+    /// spacing `1`, size `4`) occupies physical points `0, −1, −2, −3`.
     ///
-    /// Landmarks: `t = (0, 2)`; the sampled displacements are `(0.5, 0)`, so
-    /// `s = (0.5, 2)`. `Pᵀd = 0` gives `d₀ + d₁ = 0` and `0.5d₀ + 2d₁ = 0`,
-    /// hence `d = 0`; the rows `0.5a + b = −0.5` and `2a + b = 0` give
-    /// `a = 1/3`, `b = −2/3`. So `T(y) = 4y/3 − 2/3` and the inverse
-    /// displacement is `y/3 − 2/3`.
+    /// The subsampled grid now shares that direction, so its two points
+    /// (`sub_spacing = 2`) are `origin + Direction·(2·index)`, i.e. `t = (0,
+    /// −2)` — genuine input-lattice points, both interior. The constant field
+    /// samples `0.5` at each, so `s = t + u = (0.5, −1.5)` and every
+    /// displacement `t − s = −0.5`: a pure translation, fitted exactly as
+    /// `T(y) = y − 0.5` (`D = 0`, `A = 0`, `B = −0.5`, the argument of
+    /// [`a_constant_translation_field_inverts_to_the_negated_translation`]).
+    /// The inverse displacement is therefore the constant `−0.5` everywhere.
     ///
-    /// Had the resampler honoured the input direction, every sample would have
-    /// read `0.5` and the answer would have been the constant `−0.5` of
-    /// [`a_constant_translation_field_inverts_to_the_negated_translation`].
+    /// Under the bug the subsampled grid used an identity direction, so its
+    /// second point landed at physical `+2` — outside the `[−3, 0]` lattice —
+    /// and took the zero default, giving the raster-order-dependent, direction-
+    /// blind field `y/3 − 2/3` instead.
     #[test]
-    fn the_subsampling_grid_ignores_the_input_direction() {
+    fn the_subsampling_grid_honours_the_input_direction() {
         let mut field = field_1d(&[0.5; 4]);
         field.set_direction(&[-1.0]).unwrap();
 
         let out = inverse_displacement_field(&field, &[4], &[0.0], &[1.0], 2).unwrap();
-        // The output points are origin + Direction * (spacing * index), and the
-        // direction is the input's, so y = -index.
-        let expected: Vec<f64> = (0..4).map(|i| -(i as f64) / 3.0 - 2.0 / 3.0).collect();
-        assert_close(&out.components_to_f64_vec(), &expected, 1e-9);
+        // Output points y = origin + Direction·(spacing·index) = −index; the
+        // inverse displacement is the constant −0.5 at every one of them.
+        assert_close(&out.components_to_f64_vec(), &[-0.5; 4], 1e-9);
     }
 
     /// `size[i] / SubsamplingFactor` is integer division, so a factor larger

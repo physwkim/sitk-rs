@@ -39,13 +39,17 @@
 //!   every axis but the first. See
 //!   `the_probe_step_is_the_first_axis_spacing_on_every_axis`.
 //!
-//! - **`smallestError` carries over between pixels.** `double smallestError =
-//!   0;` (`hxx:96`) is declared *outside* the per-pixel loop, and is only
-//!   reassigned when the pixel's initial mapped point lies inside the buffer
-//!   (`hxx:122-132`). A pixel whose mapped point starts outside therefore
-//!   inherits the previous pixel's error as the value its probes must beat, so
-//!   its result depends on the raster order of its neighbours. See
-//!   `smallest_error_carries_over_from_the_previous_pixel`.
+//! - **`smallestError` is reset per pixel (fixed here, upstream bug §1.32).**
+//!   Upstream declares `double smallestError = 0;` (`hxx:96`) *outside* the
+//!   per-pixel loop and only reassigns it when the pixel's initial mapped point
+//!   lies inside the buffer (`hxx:122-132`); a pixel whose mapped point starts
+//!   outside therefore inherits the previous pixel's error as the value its
+//!   probes must beat, making the output depend on the raster order of its
+//!   neighbours. This port resets `smallest_error` to `f64::MAX` at the top of
+//!   every pixel — the upstream fix PR InsightSoftwareConsortium/ITK#6576 — so
+//!   an outside-start pixel searches from a neutral bar (the first in-buffer
+//!   probe wins) rather than inheriting a neighbour's residual. See
+//!   `smallest_error_is_reset_per_pixel`.
 //!
 //! - **The search is in physical space, but the probe axes are the physical
 //!   axes**, not the lattice axes: `mappedPoint[k] += step` moves along world
@@ -144,11 +148,6 @@ pub fn iterative_inverse_displacement_field(
         // `const double spacing = inputPtr->GetSpacing()[0];` (`hxx:89`).
         let spacing = forward.spacing[0];
 
-        // Declared outside the pixel loop upstream (`hxx:96`), and only
-        // reassigned when the mapped point is inside the buffer. Carrying it is
-        // the quirk, not an optimization.
-        let mut smallest_error = 0.0f64;
-
         for pixel in 0..forward.number_of_pixels() {
             let original = forward.index_to_point(&forward.multi_index(pixel));
             let displacement = &values[pixel * dim..(pixel + 1) * dim];
@@ -156,9 +155,13 @@ pub fn iterative_inverse_displacement_field(
             let mut mapped: Vec<f64> = (0..dim).map(|j| original[j] + displacement[j]).collect();
             let mut new_point = mapped.clone();
 
-            // `if (inputFieldInterpolator->IsInsideBuffer(mappedPoint))`
-            // (`hxx:122`): the `else` branch that would reset the error does not
-            // exist upstream.
+            // Reset per pixel (upstream fix PR #6576): a pixel whose initial
+            // mapped point is unevaluable must not inherit the previous pixel's
+            // error bar. Upstream declared this once outside the loop and only
+            // reassigned it inside the `IsInsideBuffer` branch, making the
+            // output depend on raster order (bug §1.32). `f64::MAX` starts every
+            // pixel with no bar, so the first in-buffer probe always wins.
+            let mut smallest_error = f64::MAX;
             if let Some(error) = residual(&forward, &mapped, &original) {
                 smallest_error = error;
             }
@@ -314,29 +317,43 @@ mod tests {
         assert_close(&components(&out), &[0.0, -2.0, 0.0]);
     }
 
-    /// `smallestError` lives outside the pixel loop (`hxx:96`) and is reassigned
-    /// only when the pixel's initial mapped point is inside the buffer
-    /// (`hxx:122`).
+    /// `smallest_error` is reset to `f64::MAX` at the top of every pixel (fixed
+    /// here, §1.32); upstream declared it once outside the loop, so a pixel
+    /// whose initial mapped point is outside the buffer inherited whatever bar
+    /// the previous pixel left behind.
     ///
-    /// `u = [2, 1.5, 0]`, unit spacing. Pixel 0 starts at `x = 0` with residual
-    /// `|0 + 2 − 0| = 2`, and after five sweeps settles at `x = −0.5` with
-    /// residual `1.5`. Pixel 1's first guess is `−2` (see the test above), so it
-    /// starts at `x = −1`, whose continuous index `−1` is **outside** the skirt:
-    /// the residual is not recomputed and `smallestError` is still pixel 0's
-    /// `1.5`. Its first probe, `x = 0`, scores `|0 + 2 − 1| = 1 < 1.5` and is
-    /// accepted; the search walks on to `x = −0.5` and outputs `−1.5`.
+    /// `u = [−1, 1, 0]`, unit spacing, points `x = 0, 1, 2`; the clamped linear
+    /// interpolant is `u(x) = −1 + 2x` on `[0, 1]`, `2 − x` on `[1, 2]`, and
+    /// flat past each edge inside the `[−0.5, 2.5)` skirt.
     ///
-    /// Had `smallestError` been reset to `0` per pixel — the reading the name
-    /// suggests — no probe could ever beat it and pixel 1 would output `−2`.
+    /// **Pixel 0 is the first pixel and its initial mapped point is outside the
+    /// buffer.** Its first guess (`−u` warped by itself) is `−u(1) = −1`, so the
+    /// mapped point is `x = 0 + (−1) = −1`, whose continuous index `−1 < −0.5`
+    /// is outside; the residual is not computed and `smallest_error` keeps its
+    /// reset value. With the fix it is `f64::MAX`, so the first in-buffer probe
+    /// always wins and the coordinate descent runs. Sweeping (step `1`, then
+    /// halving whenever the point does not move), each accepted probe strictly
+    /// the best-so-far: sweep 1 (step 1) probes `x = 0`, residual `|0 + u(0)| =
+    /// 1` < MAX, moving to `0`; sweep 2 (step 1, the point moved so no halving)
+    /// beats nothing; sweep 3 (step 0.5) probes `x = 0.5`, `u = 0`, residual
+    /// `0.5` < `1`, moving to `0.5`; sweep 4 beats nothing; sweep 5 (step 0.25)
+    /// probes `x = 0.25`, `u = −0.5`, residual `0.25` < `0.5`, moving to `0.25`.
+    /// Five sweeps exhaust `NumberOfIterations`, so the mapped point is `0.25`
+    /// and the output displacement is `0.25 − 0 = 0.25`, closing on the true
+    /// preimage `x = 1/3` of `y = 0`.
+    ///
+    /// Under the bug, pixel 0 (the very first pixel) inherits the sentinel
+    /// `smallest_error = 0` declared before the loop; no probe residual is ever
+    /// `< 0`, so it never moves and outputs its first guess `−1`.
     #[test]
-    fn smallest_error_carries_over_from_the_previous_pixel() {
+    fn smallest_error_is_reset_per_pixel() {
         let out = iterative_inverse_displacement_field(
-            &field_1d(&[2.0, 1.5, 0.0], 1.0),
+            &field_1d(&[-1.0, 1.0, 0.0], 1.0),
             &IterativeInverseDisplacementFieldSettings::default(),
         )
         .unwrap();
         let got = components(&out);
-        assert_close(&got[..2], &[-0.5, -1.5]);
+        assert_close(&got[..1], &[0.25]);
     }
 
     /// `step = inputPtr->GetSpacing()[0]` (`hxx:89`), in physical units.

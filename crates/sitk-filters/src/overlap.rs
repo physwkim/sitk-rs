@@ -32,20 +32,26 @@
 //! *total* (whole-image) measures skip label 0, matching every `Get*()`
 //! total accessor's `if (mapIt->first == LabelType{}) continue;` guard.
 //!
-//! **Degenerate-denominator quirk, reproduced verbatim:** every formula
-//! below divides two accumulated counts. When a total's denominator is
-//! exactly `0.0` (`Math::ExactlyEquals`), or a per-label formula's
-//! documented zero-guard fires, ITK returns `NumericTraits<RealType>::max()`
-//! — `RealType` is `double` for every integer label type, so this is
-//! `f64::MAX`, **not infinity**. This port returns `f64::MAX` in the same
-//! spot rather than substituting `f64::INFINITY` or `NaN`. Two formulas have
-//! *no* zero-guard at all in the `.hxx` and are ported with none: per-label
-//! `volume_similarity` (divides by `source + target` unguarded — though
-//! `0.0 / 0.0` is unreachable there, since every label recorded in the map
-//! has `source + target >= 1`) and per-label `false_positive_error`,
-//! whose guard only checks `source == 0`, not the actual denominator
-//! (`source_complement + (n_vox - union)`), which can itself be zero while
-//! `source != 0`, again yielding `NaN`.
+//! **Degenerate denominators:** every formula below divides two accumulated
+//! counts. When the denominator is exactly `0.0` (`Math::ExactlyEquals`), ITK
+//! returns `NumericTraits<RealType>::max()` — `RealType` is `double` for every
+//! integer label type, so this is `f64::MAX`, **not infinity**. This port
+//! returns `f64::MAX` in the same spot rather than substituting
+//! `f64::INFINITY` or `NaN`, and routes every ratio through a single
+//! `guarded_ratio(numerator, denominator)` helper.
+//!
+//! **Fixed here (upstream bug §1.12):** upstream guards two of these formulas
+//! by the wrong quantity. Per-label `GetVolumeSimilarity` divides by
+//! `source + target` with no guard at all, where its whole-image counterpart
+//! guards (`0.0 / 0.0` is nonetheless unreachable there — a label recorded in
+//! the map has `source + target >= 1` — so the uniform guard changes no
+//! result). Per-label `GetFalsePositiveError` guards on `source == 0` while
+//! dividing by `source_complement + (n_vox - union)`: a label present only in
+//! the *target* image (`source == 0`) has `source_complement == 0` and so a
+//! false-positive error of exactly `0`, but upstream reports `f64::MAX`; and a
+//! label covering the whole image drives the real denominator to `0` while
+//! `source != 0`, so upstream divides `0.0 / 0.0` and reports `NaN`. Both are
+//! now guarded on the denominator they actually divide by.
 //!
 //! `false_positive_error`'s `n_vox` is the *source* image's total pixel
 //! count (`GetInput(0)->GetLargestPossibleRegion()->GetNumberOfPixels()`),
@@ -148,18 +154,17 @@ pub struct LabelOverlapMeasures {
     /// `GetMeanOverlap(label)` a.k.a. Dice coefficient: `2*uo / (1+uo)`
     /// where `uo` is [`Self::union_overlap`] (no additional zero-guard).
     pub mean_overlap: f64,
-    /// `GetVolumeSimilarity(label)`: `2*(source-target) / (source+target)`,
-    /// **unguarded** in the `.hxx`, though `source == target == 0` is
-    /// unreachable for a recorded label (`source + target >= 1` always).
+    /// `GetVolumeSimilarity(label)`: `2*(source-target) / (source+target)`;
+    /// [`REAL_TYPE_MAX`] when `source + target == 0`, which is unreachable for
+    /// a recorded label (`source + target >= 1` always).
     pub volume_similarity: f64,
     /// `GetFalseNegativeError(label)`: `target_complement / target`;
     /// [`REAL_TYPE_MAX`] when `target == 0`.
     pub false_negative_error: f64,
     /// `GetFalsePositiveError(label)`: `source_complement /
-    /// (source_complement + (n_vox - union))`; [`REAL_TYPE_MAX`] when
-    /// `source == 0` — the guard checked in the `.hxx`, not the
-    /// denominator itself, so a `source != 0` label whose denominator is
-    /// still `0` yields `NaN` (reproduced, not sanitized).
+    /// (source_complement + (n_vox - union))`; [`REAL_TYPE_MAX`] when that
+    /// denominator is `0`. Upstream instead guards on `source == 0` — see the
+    /// module docs (§1.12).
     pub false_positive_error: f64,
     /// `GetFalseDiscoveryRate(label)`: `source_complement / source`;
     /// [`REAL_TYPE_MAX`] when `source == 0`.
@@ -196,12 +201,21 @@ pub struct OverlapMeasures {
     pub per_label: BTreeMap<i64, LabelOverlapMeasures>,
 }
 
-fn union_overlap_of(intersection: u64, union: u64) -> f64 {
-    if union == 0 {
+/// Every measure below is a ratio of accumulated counts guarded by
+/// `Math::ExactlyEquals(denominator, 0.0)` → `NumericTraits<RealType>::max()`.
+/// Routing all of them through one helper is what keeps a guard from testing
+/// some quantity *other* than the denominator it protects — the shape of
+/// upstream bug §1.12's `GetFalsePositiveError(label)`.
+fn guarded_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator == 0.0 {
         REAL_TYPE_MAX
     } else {
-        intersection as f64 / union as f64
+        numerator / denominator
     }
+}
+
+fn union_overlap_of(intersection: u64, union: u64) -> f64 {
+    guarded_ratio(intersection as f64, union as f64)
 }
 
 fn mean_overlap_of(union_overlap: f64) -> f64 {
@@ -266,32 +280,17 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
         let source_complement = c.source_complement as f64;
         let target_complement = c.target_complement as f64;
 
-        let target_overlap = if target == 0.0 {
-            REAL_TYPE_MAX
-        } else {
-            intersection / target
-        };
+        let target_overlap = guarded_ratio(intersection, target);
         let union_overlap = union_overlap_of(c.intersection, c.union);
         let mean_overlap = mean_overlap_of(union_overlap);
-        // Unguarded, matching GetVolumeSimilarity(LabelType); 0/0 is
-        // unreachable (a recorded label has source + target >= 1).
-        let volume_similarity = 2.0 * (source - target) / (source + target);
-        let false_negative_error = if target == 0.0 {
-            REAL_TYPE_MAX
-        } else {
-            target_complement / target
-        };
+        let volume_similarity = guarded_ratio(2.0 * (source - target), source + target);
+        let false_negative_error = guarded_ratio(target_complement, target);
         let n_complement_intersection = n_vox as f64 - union; // TN
-        let false_positive_error = if source == 0.0 {
-            REAL_TYPE_MAX
-        } else {
-            source_complement / (source_complement + n_complement_intersection)
-        };
-        let false_discovery_rate = if source == 0.0 {
-            REAL_TYPE_MAX
-        } else {
-            source_complement / source
-        };
+        let false_positive_error = guarded_ratio(
+            source_complement,
+            source_complement + n_complement_intersection,
+        );
+        let false_discovery_rate = guarded_ratio(source_complement, source);
 
         // Totals skip the background label, matching every Get*() total
         // accessor's `if (mapIt->first == LabelType{}) continue;`.
@@ -324,37 +323,13 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
         );
     }
 
-    let total_overlap = if den_total == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        num_total / den_total
-    };
-    let union_overlap = if den_union == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        num_union / den_union
-    };
+    let total_overlap = guarded_ratio(num_total, den_total);
+    let union_overlap = guarded_ratio(num_union, den_union);
     let mean_overlap = mean_overlap_of(union_overlap);
-    let volume_similarity = if den_vol == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        2.0 * num_vol / den_vol
-    };
-    let false_negative_error = if den_fne == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        num_fne / den_fne
-    };
-    let false_positive_error = if den_fpe == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        num_fpe / den_fpe
-    };
-    let false_discovery_rate = if den_fdr == 0.0 {
-        REAL_TYPE_MAX
-    } else {
-        num_fdr / den_fdr
-    };
+    let volume_similarity = guarded_ratio(2.0 * num_vol, den_vol);
+    let false_negative_error = guarded_ratio(num_fne, den_fne);
+    let false_positive_error = guarded_ratio(num_fpe, den_fpe);
+    let false_discovery_rate = guarded_ratio(num_fdr, den_fdr);
 
     Ok(OverlapMeasures {
         total_overlap,
@@ -573,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn all_background_hits_the_degenerate_denominator_quirk() {
+    fn all_background_totals_return_real_type_max_not_infinity() {
         // No non-background label appears anywhere, so every *total*
         // accessor's denominator sum is exactly 0.0 -> f64::MAX (ITK's
         // NumericTraits<RealType>::max(), not infinity).
@@ -589,23 +564,73 @@ mod tests {
         assert!(m.total_overlap.is_finite());
         assert_ne!(m.total_overlap, f64::INFINITY);
 
-        // Label 0 itself: source==target==union==intersection==n, so
+        // Label 0 itself: source == target == union == intersection == 4, so
         // union/target/mean overlap are all 1.0 and volume_similarity is
-        // 0/(2n) = 0.0 -- but false_positive_error's source==0 guard does
-        // NOT fire (source == n != 0), and the actual denominator
-        // (source_complement + (n_vox - union)) is 0 + (n - n) == 0, so the
-        // .hxx's unguarded division yields NaN, reproduced here as-is.
+        // 2*(4-4)/(4+4) = 0.0. false_positive_error's denominator is
+        // source_complement + (n_vox - union) = 0 + (4 - 4) = 0, so the guard
+        // fires and it too is f64::MAX. Upstream's guard tests `source == 0`
+        // instead (source == 4 here), divides 0.0/0.0 and reports NaN.
         let bg = &m.per_label[&0];
         assert_eq!(bg.union_overlap, 1.0);
         assert_eq!(bg.target_overlap, 1.0);
         assert_eq!(bg.mean_overlap, 1.0);
         assert_eq!(bg.volume_similarity, 0.0);
         assert_eq!(bg.false_negative_error, 0.0);
-        assert!(
-            bg.false_positive_error.is_nan(),
-            "expected NaN from the .hxx's unguarded 0/0, got {}",
-            bg.false_positive_error
-        );
+        assert_eq!(bg.false_positive_error, REAL_TYPE_MAX);
+    }
+
+    #[test]
+    fn a_label_covering_the_whole_source_image_has_a_guarded_false_positive_error() {
+        // Every pixel is label 3 in both images, so for label 3:
+        //   source = target = union = intersection = 4,
+        //   source_complement = target_complement = 0, n_vox = 4.
+        // false_positive_error = 0 / (0 + (4 - 4)) = 0/0 upstream (its guard
+        // checks source == 4 != 0 and lets the division through) -> NaN.
+        // Guarded on the real denominator it is f64::MAX, like every other
+        // degenerate ratio in this filter.
+        let img = img_u8(&[4, 1], vec![3, 3, 3, 3]);
+        let m = label_overlap_measures(&img, &img).unwrap();
+
+        let l3 = &m.per_label[&3];
+        assert_eq!(l3.false_positive_error, REAL_TYPE_MAX);
+        assert_eq!(l3.union_overlap, 1.0);
+        assert_eq!(l3.false_discovery_rate, 0.0); // 0 / 4
+        // The whole-image total sums the same single non-background label:
+        // num_fpe = 0, den_fpe = 0 + (4 - 4) = 0 -> guarded.
+        assert_eq!(m.false_positive_error, REAL_TYPE_MAX);
+    }
+
+    #[test]
+    fn a_label_present_only_in_the_target_has_zero_false_positive_error() {
+        // source: 0 0 0 0   target: 5 5 0 0   (n_vox = 4)
+        // Pixels 0,1 mismatch: source[0] += 1, target[5] += 1, union[0] += 1,
+        // union[5] += 1, source_complement[0] += 1, target_complement[5] += 1.
+        // Pixels 2,3 match on 0: source[0], target[0], intersection[0],
+        // union[0] each += 1.
+        // Label 5: source = 0, target = 2, union = 2, intersection = 0,
+        //          source_complement = 0, target_complement = 2.
+        // false_positive_error = source_complement / (source_complement +
+        //   (n_vox - union)) = 0 / (0 + (4 - 2)) = 0.0 exactly: a label the
+        // source never claims produces no false positives. Upstream's
+        // `source == 0` guard fires here and reports f64::MAX instead.
+        let source = img_u8(&[4, 1], vec![0, 0, 0, 0]);
+        let target = img_u8(&[4, 1], vec![5, 5, 0, 0]);
+        let m = label_overlap_measures(&source, &target).unwrap();
+
+        let l5 = &m.per_label[&5];
+        assert_eq!(l5.false_positive_error, 0.0);
+        // false_discovery_rate really does divide by `source`, so its guard is
+        // the denominator's and still fires.
+        assert_eq!(l5.false_discovery_rate, REAL_TYPE_MAX);
+        assert_eq!(l5.target_overlap, 0.0); // 0 / 2
+        assert_eq!(l5.false_negative_error, 1.0); // 2 / 2
+        assert_eq!(l5.volume_similarity, -2.0); // 2*(0-2) / (0+2)
+
+        // Label 0: source = 4, target = 2, union = 4, intersection = 2,
+        // source_complement = 2 -> 2 / (2 + (4 - 4)) = 1.0.
+        assert_eq!(m.per_label[&0].false_positive_error, 1.0);
+        // Totals skip label 0, so they are label 5's: 0 / (0 + (4 - 2)).
+        assert_eq!(m.false_positive_error, 0.0);
     }
 
     #[test]

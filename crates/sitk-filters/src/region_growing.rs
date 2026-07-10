@@ -185,28 +185,33 @@
 //! a documented divergence, not expected to trigger for any well-conditioned
 //! covariance.
 //!
-//! ### An emergent NaN quirk (undocumented upstream)
+//! ### An empty re-estimation pass (fixed here, upstream bug §1.35)
 //!
-//! If a later iteration's mask becomes empty — every seed itself was
-//! excluded by the *previous* round's re-estimated statistics, since the
-//! multiplier is never re-bumped after the first flood — `num == 0` makes
-//! every `mean`/`covariance` entry an IEEE-754 `0.0 / 0.0 = NaN`
-//! (`.hxx:289-292`, well-defined float division, not undefined behavior, so
-//! this port reproduces it verbatim rather than special-casing `num == 0`).
-//! The all-`NaN` covariance's determinant-magnitude comparison
-//! (`NaN > 1.0e-6`) is `false` under IEEE-754, so the singular-covariance
-//! branch fires and substitutes a finite `Identity * aLargeDouble` inverse —
-//! but `mean` is still `NaN`, so every subsequent Mahalanobis evaluation
-//! produces a `NaN` squared distance. `EvaluateDistanceAtIndex`'s own
-//! `mahalanobisDistanceSquared > 0.0 ? sqrt(...) : 0.0` guard
-//! (`itkMahalanobisDistanceThresholdImageFunction.hxx:113`) then treats that
-//! `NaN` as "not greater than zero" and clamps the *distance* to exactly
-//! `0.0` — which then compares `<=` any positive threshold as `true`,
-//! meaning every pixel in the image passes the inclusion test and the next
-//! flood covers everything reachable from the seeds. No special-casing is
-//! needed to reproduce this: Rust's `f64` comparisons against `NaN` are
-//! IEEE-754, identical to C++'s, so writing the same `sq > 0.0` guard
-//! reproduces the same emergent behavior for free.
+//! A later iteration's mask can become empty — every seed itself excluded by
+//! the *previous* round's re-estimated statistics, since the multiplier is
+//! never re-bumped after the first flood. Upstream then divides `mean`
+//! /`covariance` by `num == 0` (`.hxx:289-292`, no guard, unlike the initial
+//! statistics' `seed_cnt == 0` guard at `.hxx:179-184`), making every entry
+//! an IEEE-754 `0.0 / 0.0 = NaN`. The all-`NaN` covariance's determinant-
+//! magnitude comparison (`NaN > 1.0e-6`) is `false`, so the singular-
+//! covariance branch substitutes a finite `Identity * aLargeDouble` inverse —
+//! but `mean` is still `NaN`, so every Mahalanobis evaluation produces a `NaN`
+//! squared distance. `EvaluateDistanceAtIndex`'s guard
+//! (`itkMahalanobisDistanceThresholdImageFunction.hxx:113`), `sqrt` the
+//! squared distance only when it is `> 0.0` else `0.0`, treats that `NaN`
+//! as "not greater than zero" and clamps the *distance* to exactly `0.0`,
+//! which compares `<=` any positive threshold as `true` — so the next flood
+//! covers **every pixel reachable from the seeds**, a spurious whole-image
+//! segmentation.
+//!
+//! This port stops the re-estimation loop when a pass visits zero pixels,
+//! keeping the previous pass's statistics and (non-flooded) mask — the
+//! upstream fix PR InsightSoftwareConsortium/ITK#6578. The scalar
+//! [`confidence_connected`] cannot reach this: its flood bounds are clamped
+//! every iteration to span the seed intensities, so its mask always retains
+//! the seeds and `num >= 1` (upstream's scalar filter is likewise already
+//! guarded, `itkConfidenceConnectedImageFilter.hxx:170,202`). See
+//! `vector_confidence_connected_empty_re_estimation_pass_stops_instead_of_flooding`.
 
 use crate::error::{FilterError, Result};
 use crate::morphology::bounds_for;
@@ -1104,8 +1109,14 @@ fn vector_confidence_connected_typed<T: Scalar>(
             }
             num += 1.0;
         }
-        // `num == 0` divides `0.0 / 0.0`, an IEEE-754 `NaN` — see the module
-        // doc's NaN-quirk section for why that is left unguarded.
+        // A re-estimation pass that visits zero pixels has nothing to estimate
+        // from; dividing by `num == 0` would poison `mean`/`covariance` with
+        // `NaN` and — through the Mahalanobis distance guard — flood the whole
+        // image on the next pass (§1.35). Stop instead, keeping the previous
+        // pass's statistics and mask (upstream fix PR #6578).
+        if num == 0.0 {
+            break;
+        }
         for i in 0..n {
             mean[i] = sum[i] / num;
         }
@@ -1481,6 +1492,43 @@ mod tests {
             one_iteration.image.scalar_slice::<u8>().unwrap(),
             zero_iterations.image.scalar_slice::<u8>().unwrap()
         );
+    }
+
+    #[test]
+    fn vector_confidence_connected_empty_re_estimation_pass_stops_instead_of_flooding() {
+        // 1-component field [0, 0, 10, 3, 0, 0, 0], seed index 2 (value 10),
+        // radius 1, multiplier 1.0, 2 iterations. All arithmetic by hand.
+        //
+        // Initial neighborhood {1,2,3} = {0, 10, 3}: mean m0 = 13/3,
+        // E[x^2] = 109/3, var v0 = 109/3 - (13/3)^2 = 158/9 ≈ 17.556 (>1e-6,
+        // non-singular). sqrt(v0) = sqrt(158)/3 ≈ 4.1900.
+        // Seed distance = |10 - 13/3| / sqrt(v0) = (17/3)/4.1900 ≈ 1.3525 >
+        // multiplier 1.0, so the fixed threshold T is bumped to ≈ 1.3525.
+        // Initial flood: |x - 13/3| ≤ T·sqrt(v0) = 17/3, i.e. x ∈ [−1.333, 10];
+        // every value {0, 3, 10} qualifies, so the mask is the whole image.
+        //
+        // Iteration 0 recompute over all 7 pixels: mean m1 = 13/7 ≈ 1.857,
+        // E[x^2] = 109/7, var v1 = 109/7 - (13/7)^2 = 594/49 ≈ 12.122,
+        // sqrt(v1) ≈ 3.4817. Reflood with the *fixed* T ≈ 1.3525:
+        // |x − 13/7| ≤ T·sqrt(v1) ≈ 4.709, i.e. x ∈ [−2.85, 6.57]. The seed
+        // value 10 now falls outside, so the flood from the seed is empty.
+        //
+        // Iteration 1 recompute sees an empty mask: num == 0. Upstream divides
+        // 0/0, the NaN mean clamps every Mahalanobis distance to 0, and the
+        // next flood covers the whole image (mean reported as NaN). The fix
+        // stops at num == 0, so the output is the empty mask of iteration 0 and
+        // the reported statistics are iteration 0's finite m1 / v1.
+        let img =
+            Image::from_vec_vector(&[7], 1, vec![0.0, 0.0, 10.0, 3.0, 0.0, 0.0, 0.0]).unwrap();
+        let result = vector_confidence_connected(&img, &[vec![2]], 2, 1.0, 1, 1).unwrap();
+
+        assert_eq!(
+            result.image.scalar_slice::<u8>().unwrap(),
+            &[0, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(result.mean[0].is_finite(), "mean = {:?}", result.mean);
+        assert!((result.mean[0] - 13.0 / 7.0).abs() < 1e-12);
+        assert!((result.covariance[0] - 594.0 / 49.0).abs() < 1e-12);
     }
 
     #[test]
