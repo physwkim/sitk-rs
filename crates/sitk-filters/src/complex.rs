@@ -14,24 +14,27 @@
 //! # Precision
 //!
 //! Every functor here computes in the *component* type, never in `f64`: ITK's
-//! `ComplexToModulus<std::complex<float>, float>` evaluates
-//! `A.real() * A.real() + A.imag() * A.imag()` in `float` and calls the `float`
-//! overload of `std::sqrt`. Reproducing that is what makes the overflow and
-//! underflow cases below observable, so this module is a deliberate exception
-//! to the crate-wide "compute in `f64`" divergence (ledger §4.1).
+//! `ComplexToPhase<std::complex<float>, float>` evaluates `std::atan2` in
+//! `float`, and `MagnitudeAndPhaseToComplex` expands `std::polar` in `float`.
+//! Reproducing the component-type arithmetic keeps this port's output
+//! bit-for-bit with ITK's, so this module is a deliberate exception to the
+//! crate-wide "compute in `f64`" divergence (ledger §4.1).
 //!
 //! # Upstream notes
 //!
-//! - **`ComplexToModulus` does not use `std::hypot`.**
-//!   `itkComplexToModulusImageFilter.h:49` is
+//! - **`ComplexToModulus` used `std::sqrt(re² + im²)`, not `std::hypot` — fixed
+//!   here (§2.58).** `itkComplexToModulusImageFilter.h:49` is
 //!   `(TOutput)(std::sqrt(A.real() * A.real() + A.imag() * A.imag()))`. On a
-//!   `ComplexFloat32` image the squares overflow to `inf` above
+//!   `ComplexFloat32` image the intermediate squares overflow to `inf` above
 //!   `sqrt(FLT_MAX) ≈ 1.845e19`, lose precision through subnormals below
 //!   `sqrt(FLT_MIN) ≈ 1.084e-19`, and flush to `0` below
-//!   `sqrt(FLT_TRUE_MIN) ≈ 3.74e-23`. `hypot` has none of those three failures.
-//!   Reproduced verbatim; pinned by
-//!   `complex_to_modulus_overflows_on_f32_where_hypot_would_not` and
-//!   `complex_to_modulus_underflows_on_f32_where_hypot_would_not`.
+//!   `sqrt(FLT_TRUE_MIN) ≈ 3.74e-23` — silently returning `inf`/`0` for a
+//!   modulus that is a perfectly ordinary finite `f32`. This port computes the
+//!   modulus with `hypot`, which suffers none of those three failures and
+//!   agrees with `sqrt(re² + im²)` everywhere the latter does not overflow or
+//!   underflow. Pinned by
+//!   `complex_to_modulus_is_finite_on_f32_where_the_naive_norm_overflows` and
+//!   `complex_to_modulus_is_exact_on_f32_where_the_naive_norm_underflows`.
 //!
 //! - **`ComplexToPhaseImageFilter.yaml`'s `briefdescription` is wrong**: it
 //!   reads "Computes pixel-wise the modulus of a complex image", copy-pasted
@@ -72,8 +75,11 @@ use crate::{Result, require_same_shape};
 /// Each method is the exact C++ expression its ITK functor evaluates, in the
 /// component type; `Self` is `TOutput`.
 trait ComplexMath: Real {
-    /// `std::sqrt(A.real() * A.real() + A.imag() * A.imag())` —
-    /// `itkComplexToModulusImageFilter.h:49`. Not `hypot`; see the module docs.
+    /// The modulus `|re + im·i|`. **Fixed here (§2.58):** computed with
+    /// `hypot(re, im)`, not upstream's `std::sqrt(re*re + im*im)`
+    /// (`itkComplexToModulusImageFilter.h:49`), which overflows to `inf` and
+    /// flushes to `0` on `ComplexFloat32` where `hypot` does not. See the module
+    /// docs.
     fn modulus(re: Self, im: Self) -> Self;
 
     /// `std::atan2(A.imag(), A.real())` — `itkComplexToPhaseImageFilter.h:50`.
@@ -92,7 +98,7 @@ macro_rules! impl_complex_math {
             impl ComplexMath for $ty {
                 #[inline]
                 fn modulus(re: Self, im: Self) -> Self {
-                    (re * re + im * im).sqrt()
+                    re.hypot(im)
                 }
 
                 #[inline]
@@ -171,11 +177,12 @@ pub fn complex_to_imaginary(img: &Image) -> Result<Image> {
     complex_unary(img, Part::Imaginary)
 }
 
-/// `ComplexToModulusImageFilter` (`itkComplexToModulusImageFilter.h:49`):
-/// `sqrt(re² + im²)` per pixel, computed in the component type.
+/// `ComplexToModulusImageFilter` (`itkComplexToModulusImageFilter.h:49`): the
+/// modulus `|re + im·i|` per pixel, computed in the component type.
 ///
-/// Reproduces upstream's overflow and underflow on `ComplexFloat32` — see the
-/// module docs; this is `sqrt(re*re + im*im)`, not `hypot(re, im)`.
+/// **Fixed here (§2.58):** computed with `hypot`, not upstream's
+/// `sqrt(re*re + im*im)`, which overflows to `inf` and flushes to `0` on
+/// `ComplexFloat32` for finite moduli — see the module docs.
 pub fn complex_to_modulus(img: &Image) -> Result<Image> {
     complex_unary(img, Part::Modulus)
 }
@@ -327,30 +334,39 @@ mod tests {
     }
 
     #[test]
-    fn complex_to_modulus_overflows_on_f32_where_hypot_would_not() {
-        // 2e19² = 4e38 > f32::MAX ≈ 3.403e38, so `re * re` is already `inf`.
-        // `hypot(2e19, 2e19)` would give ≈ 2.828e19, which fits comfortably.
+    fn complex_to_modulus_is_finite_on_f32_where_the_naive_norm_overflows() {
+        // 2e19² = 4e38 > f32::MAX ≈ 3.403e38, so the upstream `re * re` is
+        // already `inf` and its `sqrt` stays `inf`. `hypot` returns the true
+        // modulus 2e19·√2 ≈ 2.828e19, which fits comfortably in f32. §2.58 fix.
         let img = cimg(&[1], vec![Complex::new(2e19f32, 2e19)]);
         let out = complex_to_modulus(&img).unwrap();
-        assert_eq!(out.scalar_slice::<f32>().unwrap()[0], f32::INFINITY);
-        assert!(2e19f32.hypot(2e19f32).is_finite());
+        let got = out.scalar_slice::<f32>().unwrap()[0];
+        assert!(got.is_finite());
+        assert_eq!(got, 2e19f32.hypot(2e19f32));
+        // Sanity: the upstream `sqrt(re*re + im*im)` would have been `inf` here.
+        assert_eq!(
+            (2e19f32 * 2e19f32 + 2e19f32 * 2e19f32).sqrt(),
+            f32::INFINITY
+        );
     }
 
     #[test]
-    fn complex_to_modulus_underflows_on_f32_where_hypot_would_not() {
-        // 1e-30² = 1e-60, far below f32's smallest subnormal (≈1.4e-45), so
-        // `re * re` flushes to +0 and the modulus is 0 instead of 1e-30.
+    fn complex_to_modulus_is_exact_on_f32_where_the_naive_norm_underflows() {
+        // 1e-30² = 1e-60, far below f32's smallest subnormal (≈1.4e-45), so the
+        // upstream `re * re` flushes to +0 and its modulus is 0. `hypot` returns
+        // 1e-30 exactly (a normal f32). §2.58 fix.
         let img = cimg(&[1], vec![Complex::new(1e-30f32, 0.0)]);
         let out = complex_to_modulus(&img).unwrap();
-        assert_eq!(out.scalar_slice::<f32>().unwrap()[0], 0.0);
-        assert_eq!(1e-30f32.hypot(0.0), 1e-30);
+        assert_eq!(out.scalar_slice::<f32>().unwrap()[0], 1e-30f32);
+        // Sanity: the upstream `sqrt(re*re + im*im)` would have been 0 here.
+        assert_eq!((1e-30f32 * 1e-30f32).sqrt(), 0.0);
     }
 
     #[test]
-    fn complex_to_modulus_in_f64_does_not_overflow_at_the_f32_bound() {
-        // The same magnitudes as the f32 overflow test, in f64: the functor
-        // computes in the component type, so widening the pixel type changes
-        // the answer.
+    fn complex_to_modulus_in_f64_is_the_full_precision_modulus() {
+        // The same magnitudes as the f32 test, in f64: `hypot` gives the true
+        // modulus 2e19·√2 in either component type (with the fix the f32 result
+        // now agrees to f32 precision instead of overflowing to `inf`).
         let img = cimg(&[1], vec![Complex::new(2e19f64, 2e19)]);
         let out = complex_to_modulus(&img).unwrap();
         let got = out.scalar_slice::<f64>().unwrap()[0];
