@@ -279,11 +279,14 @@ pub fn label_overlay(
 
     let base_id = image.pixel_id();
     // §2.54: the palette is scaled by the base image's own
-    // NumericTraits<ValueType>::max(). For a floating-point base that is
+    // NumericTraits<ValueType>::max(). For a scalar floating-point base that is
     // f32/f64 MAX, which swamps the base pixel in the blend and produces a
     // meaningless overlay. Refuse rather than emit the swamped garbage; any
-    // float scaling rule would be invented semantics with no unique answer.
-    if base_id.is_floating_point() {
+    // float scaling rule would be invented semantics with no unique answer. A
+    // complex or vector base falls through to the scalar-required error in
+    // `to_f64_vec` (its component being float is a distinct concern), so this
+    // matches scalar float only.
+    if matches!(base_id, PixelId::Float32 | PixelId::Float64) {
         return Err(FilterError::FloatingPointBaseLabelOverlay(base_id));
     }
     let base_vals = image.to_f64_vec()?;

@@ -241,6 +241,22 @@ pub enum FilterError {
     )]
     FloatingPointBaseLabelOverlay(PixelId),
 
+    /// `LabelMapOverlayImageFilter` / `LabelMapContourOverlayImageFilter` scale
+    /// their palette by the **feature** image's own `NumericTraits<ValueType>::max()`
+    /// — the output pixel type is `RGBPixel<TFeatureImage::PixelType>`
+    /// (`itkLabelMapOverlayImageFilter.h:57-58`), so `LabelOverlayFunctor`'s
+    /// `AddColor` (`itkLabelToRGBFunctor.h:112-116`) uses the feature type. For
+    /// a floating-point feature that is `f32::MAX` / `f64::MAX`, which swamps
+    /// the feature pixel in the blend and makes the overlay meaningless. Same
+    /// honor-or-reject resolution as [`FilterError::FloatingPointBaseLabelOverlay`].
+    /// See the upstream-findings ledger, §2.151.
+    #[error(
+        "label_map_overlay's palette is scaled by the feature image's NumericTraits::max(), \
+         which is meaningless against a floating-point feature (got {0:?}); cast or \
+         rescale the feature image to an integer pixel type first"
+    )]
+    FloatingPointFeatureLabelMapOverlay(PixelId),
+
     /// `MultiLabelSTAPLEImageFilter::InitializePriorProbabilities` throws when
     /// the caller-supplied prior array is shorter than the number of labels.
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
