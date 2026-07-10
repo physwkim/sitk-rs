@@ -5903,48 +5903,81 @@ mod tests {
         // zero weight into `scales` would give `scales / 0 = +∞` and then
         // `0 · ∞ = NaN`, silently poisoning the whole registration. This port
         // rejects explicitly-set weights instead, naming the optimizer
-        // (ledger §2.117). One case per optimizer.
+        // (ledger §2.117). One case per optimizer, through both entry points.
         let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
         let moving = gaussian(20, 20, 11.0, 10.0, 4.0, 1.0);
 
+        let configure = |reg: &mut ImageRegistrationMethod, name: &str| match name {
+            "Amoeba" => {
+                reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
+            }
+            "Powell" => {
+                reg.set_optimizer_as_powell(50, 100, 1.0, 1e-6, 1e-6);
+            }
+            "OnePlusOneEvolutionary" => {
+                reg.set_optimizer_as_one_plus_one_evolutionary(100, 1.5e-4, 1.01, -1.0, -1.0, 1);
+            }
+            "Exhaustive" => {
+                reg.set_optimizer_as_exhaustive(vec![2, 2], 1.0);
+            }
+            _ => unreachable!("unlisted gradient-free optimizer {name}"),
+        };
+        let expected_message = |name: &str| {
+            format!(
+                "optimizer weights are not applicable to gradient-free optimizers (optimizer: {name})"
+            )
+        };
+
         // The documented freeze idiom `[1.0, 0.0]` is exactly what would produce
         // the NaN if the fold ran; it is the case each optimizer must reject.
+        // Both entry points reach the same validation site (`execute_levels`), so
+        // both must reject: `execute` optimizes a caller-passed transform, while
+        // `execute_with_initial_transform` optimizes the stored one.
         for name in ["Amoeba", "Powell", "OnePlusOneEvolutionary", "Exhaustive"] {
             let mut reg = ImageRegistrationMethod::new();
-            match name {
-                "Amoeba" => {
-                    reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
-                }
-                "Powell" => {
-                    reg.set_optimizer_as_powell(50, 100, 1.0, 1e-6, 1e-6);
-                }
-                "OnePlusOneEvolutionary" => {
-                    reg.set_optimizer_as_one_plus_one_evolutionary(
-                        100, 1.5e-4, 1.01, -1.0, -1.0, 1,
-                    );
-                }
-                "Exhaustive" => {
-                    reg.set_optimizer_as_exhaustive(vec![2, 2], 1.0);
-                }
-                _ => unreachable!("unlisted gradient-free optimizer {name}"),
-            }
+            configure(&mut reg, name);
             reg.set_optimizer_weights(vec![1.0, 0.0]);
+
             let err = reg
                 .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
                 .unwrap_err();
             match err {
                 RegistrationError::OptimizerWeightsNotApplicable { optimizer } => {
-                    assert_eq!(optimizer, name, "{name}: wrong optimizer name in error");
+                    assert_eq!(optimizer, name, "{name}: wrong optimizer name via execute");
                 }
-                other => panic!("{name}: expected OptimizerWeightsNotApplicable, got {other:?}"),
+                other => {
+                    panic!(
+                        "{name}: expected OptimizerWeightsNotApplicable via execute, got {other:?}"
+                    )
+                }
             }
             assert_eq!(
                 reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
                     .unwrap_err()
                     .to_string(),
-                format!(
-                    "optimizer weights are not applicable to gradient-free optimizers (optimizer: {name})"
+                expected_message(name),
+            );
+
+            reg.set_initial_transform(TranslationTransform::new(vec![0.0, 0.0]).into());
+            let err = reg
+                .execute_with_initial_transform(&fixed, &moving)
+                .unwrap_err();
+            match err {
+                RegistrationError::OptimizerWeightsNotApplicable { optimizer } => {
+                    assert_eq!(
+                        optimizer, name,
+                        "{name}: wrong optimizer name via execute_with_initial_transform"
+                    );
+                }
+                other => panic!(
+                    "{name}: expected OptimizerWeightsNotApplicable via execute_with_initial_transform, got {other:?}"
                 ),
+            }
+            assert_eq!(
+                reg.execute_with_initial_transform(&fixed, &moving)
+                    .unwrap_err()
+                    .to_string(),
+                expected_message(name),
             );
         }
 
@@ -5968,14 +6001,16 @@ mod tests {
             "expected length error before applicability error, got {err:?}"
         );
 
-        // An empty (default) weights array is accepted — the gradient-free run
-        // proceeds normally.
-        let mut reg = ImageRegistrationMethod::new();
-        reg.set_optimizer_as_amoeba(1.0, 100, 1e-8, 1e-4, false);
-        assert!(
-            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
-                .is_ok(),
-            "unweighted gradient-free run should succeed"
-        );
+        // An empty (default) weights array is accepted for every gradient-free
+        // optimizer — the run proceeds normally rather than rejecting.
+        for name in ["Amoeba", "Powell", "OnePlusOneEvolutionary", "Exhaustive"] {
+            let mut reg = ImageRegistrationMethod::new();
+            configure(&mut reg, name);
+            assert!(
+                reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                    .is_ok(),
+                "{name}: unweighted gradient-free run should succeed"
+            );
+        }
     }
 }
