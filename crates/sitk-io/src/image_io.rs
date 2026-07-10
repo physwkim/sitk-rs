@@ -51,6 +51,7 @@ use crate::meta_image::MetaImageIo;
 use crate::nifti::NiftiImageIo;
 use crate::nrrd::NrrdImageIo;
 use crate::png::PngImageIo;
+use crate::tiff::TiffImageIo;
 use crate::vtk::VtkImageIo;
 use crate::writer::WriteOptions;
 
@@ -185,6 +186,7 @@ static GIPL_IMAGE_IO: GiplImageIo = GiplImageIo;
 static VTK_IMAGE_IO: VtkImageIo = VtkImageIo;
 static PNG_IMAGE_IO: PngImageIo = PngImageIo;
 static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
+static TIFF_IMAGE_IO: TiffImageIo = TiffImageIo;
 
 /// Every registered [`ImageIo`], in registration order.
 ///
@@ -213,7 +215,14 @@ static HDF5_IMAGE_IO: Hdf5ImageIo = Hdf5ImageIo;
 /// [`VtkImageIo`]: crate::vtk::VtkImageIo
 /// [`GiplImageIo`]: crate::gipl::GiplImageIo
 /// [`PngImageIo`]: crate::png::PngImageIo
+/// [`TiffImageIo`]'s `can_read_file` opens the file as a TIFF and looks for the
+/// `IMAGEWIDTH` / `IMAGELENGTH` tags of directory 0, ignoring the extension —
+/// so phase 2 lets it claim a TIFF under any name. It is *not* a promise the
+/// file can be read: upstream's `CanReadFile` likewise skips
+/// `TIFFReaderInternal::CanRead` (itkTIFFImageIO.cxx:30-50).
+///
 /// [`Hdf5ImageIo`]: crate::image_hdf5::Hdf5ImageIo
+/// [`TiffImageIo`]: crate::tiff::TiffImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
         &META_IMAGE_IO,
@@ -223,6 +232,7 @@ pub fn registry() -> &'static [&'static dyn ImageIo] {
         &VTK_IMAGE_IO,
         &PNG_IMAGE_IO,
         &HDF5_IMAGE_IO,
+        &TIFF_IMAGE_IO,
     ];
     IOS
 }

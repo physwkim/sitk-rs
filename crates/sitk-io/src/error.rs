@@ -143,6 +143,27 @@ pub enum IoError {
     #[error("png encoding error: {0}")]
     PngEncode(#[from] png::EncodingError),
 
+    /// A TIFF feature `TIFFImageIO` reaches through libtiff but the `tiff`
+    /// crate cannot express, or one upstream itself refuses. Upstream's own
+    /// refusals are `"TIFF supports unsigned/signed char, unsigned/signed
+    /// short, and float"` on write (itkTIFFImageIO.cxx:612) and `"TIFF Writer
+    /// can only write 2-d or 3-d images"` (`:568`). Everything else this
+    /// variant carries is a gap: palette images, tiled images, and every
+    /// photometric interpretation libtiff renders through
+    /// `TIFFReadRGBAImageOriented` (§4.94, §4.96); the two multi-page buffer
+    /// overflows `ReadVolume` commits, which safe Rust cannot reproduce
+    /// (§1.65, §1.66). See [`crate::tiff`].
+    #[error("unsupported TIFF feature: {0}")]
+    UnsupportedTiffFeature(String),
+
+    /// A TIFF file failed to decode or encode. Upstream routes libtiff's error
+    /// handler through `itkTIFFErrorHandlerExtR`
+    /// (itkTIFFReaderInternal.cxx:41-61), which prints rather than throws;
+    /// `ReadGenericImage` then throws `"Problem reading the row: N"`
+    /// (itkTIFFImageIO.cxx:1383-1386).
+    #[error("tiff error: {0}")]
+    Tiff(#[from] tiff::TiffError),
+
     /// A zlib or gzip stream could not be inflated. Upstream has no such error:
     /// `MET_PerformUncompression` returns `true` after printing "Uncompress
     /// failed" (metaUtils.cxx:883), leaving the caller's buffer uninitialised.

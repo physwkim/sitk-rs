@@ -44,6 +44,7 @@ pub mod nifti;
 pub mod nrrd;
 pub mod png;
 pub mod reader;
+pub mod tiff;
 pub mod transform_hdf5;
 pub mod transform_io;
 pub mod vtk;
@@ -433,7 +434,8 @@ mod tests {
                 "GiplImageIO",
                 "VTKImageIO",
                 "PNGImageIO",
-                "HDF5ImageIO"
+                "HDF5ImageIO",
+                "TIFFImageIO"
             ]
         );
         assert_eq!(
@@ -457,6 +459,10 @@ mod tests {
         assert_eq!(
             image_io_by_name("HDF5ImageIO").unwrap().name(),
             "HDF5ImageIO"
+        );
+        assert_eq!(
+            image_io_by_name("TIFFImageIO").unwrap().name(),
+            "TIFFImageIO"
         );
         assert!(matches!(
             image_io_by_name("JPEGImageIO"),
@@ -592,7 +598,8 @@ mod tests {
                 "GiplImageIO",
                 "VTKImageIO",
                 "PNGImageIO",
-                "HDF5ImageIO"
+                "HDF5ImageIO",
+                "TIFFImageIO"
             ]
         );
     }
