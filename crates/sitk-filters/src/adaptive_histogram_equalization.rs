@@ -24,12 +24,6 @@ fn strides(size: &[usize]) -> Vec<usize> {
 }
 
 /// `itk::Math::sgn`: `-1`/`0`/`+1` via `(x != 0) ? ((x > 0) ? 1 : -1) : 0`.
-/// Note the IEEE-754 quirk this body carries for `x == NaN`: `NaN != 0.0` is
-/// `true` (NaN compares unequal to everything), and `NaN > 0.0` is `false`,
-/// so the `else` branch fires and `sgn(NaN) == -1` — not the `0` a "sign of
-/// an undefined value" intuition might expect. This matters for
-/// [`adaptive_histogram_equalization`]'s constant-image behavior (see its
-/// doc comment).
 fn sgn(x: f64) -> f64 {
     if x != 0.0 {
         if x > 0.0 { 1.0 } else { -1.0 }
@@ -73,17 +67,19 @@ fn cumulative_function(u: f64, v: f64, alpha: f64, beta: f64) -> f64 {
 ///
 /// Errors if `radius.len()` doesn't match `img`'s dimension.
 ///
-/// On a perfectly constant image, `input_minimum == input_maximum`, so every
-/// pixel's normalized coordinate `u = (pixel - minimum) / (maximum -
-/// minimum) - 0.5` is `0.0 / 0.0 == NaN` — and that `NaN` poisons every term
-/// of `CumulativeFunction` from there, *including* the `beta * u` term
-/// unconditionally (IEEE-754 `0.0 * NaN == NaN`, not `0.0`, so this doesn't
-/// even vanish at `beta == 0`). The output is therefore `NaN` everywhere on
-/// a constant image, for *any* `alpha`/`beta` — not the identity a "fixed
-/// point" intuition might expect. Upstream's `.hxx` has no special case for
-/// `maximum == minimum`, so this port doesn't add one either, matching this
-/// crate's existing precedent at [`crate::normalize`] (also an unguarded
-/// `0.0 / 0.0` on a constant image).
+/// Fixed here (upstream bug §1.9): on a perfectly constant image
+/// `input_minimum == input_maximum`, so upstream's normalized coordinate
+/// `u = (pixel - minimum) / iscale - 0.5` is `0.0 / 0.0 == NaN`, which
+/// poisons every term of `CumulativeFunction` — including the `beta * u`
+/// term, since `0.0 * NaN == NaN` — and the whole output image comes out
+/// `NaN` for *any* `alpha`/`beta`. This port instead returns the constant
+/// image unchanged, which is the value the rest of the formula already
+/// carries: with every window value equal to the center pixel, `u - v == 0`,
+/// so `CumulativeFunction` reduces to `beta * u`, the window sum to
+/// `beta * u`, and the reconstruction to
+/// `iscale * (beta * u + 0.5) + minimum = iscale * (0.5 - 0.5 * beta) +
+/// minimum`, which is exactly `minimum` — i.e. the constant — at
+/// `iscale == 0`.
 ///
 /// At `alpha = 1, beta = 1`, `CumulativeFunction` collapses algebraically to
 /// `u - v` scaled so the window sum reduces to exactly `u` again (see the
@@ -97,10 +93,10 @@ fn cumulative_function(u: f64, v: f64, alpha: f64, beta: f64) -> f64 {
 /// sub-ULP precision loss on every pixel. This port keeps `u`/`v`/`sum` in
 /// `f64` throughout, matching the crate's established "widen to `f64`, never
 /// narrow until the final output quantization" idiom (see e.g. [`crate::clamp`]).
-/// This changes no qualitative behavior (the constant-image `NaN` and the
-/// `alpha=1,beta=1` exact-identity collapse both survive the switch from
-/// `f32` to `f64` intermediates unchanged) — it only makes this port's
-/// results *more* precise than upstream's, never differently shaped.
+/// This changes no qualitative behavior (the `alpha=1,beta=1` exact-identity
+/// collapse survives the switch from `f32` to `f64` intermediates unchanged)
+/// — it only makes this port's results *more* precise than upstream's, never
+/// differently shaped.
 pub fn adaptive_histogram_equalization(
     img: &Image,
     radius: &[usize],
@@ -122,8 +118,16 @@ pub fn adaptive_histogram_equalization(
         input_maximum = input_maximum.max(v);
     }
     let iscale = input_maximum - input_minimum;
-
     let size = img.size();
+
+    // A constant image carries no gray-level range to equalize: `iscale == 0`
+    // makes upstream's `u = (pixel - minimum) / iscale - 0.5` a `0/0` NaN.
+    // Every pixel already equals `input_minimum`, and that is the value the
+    // reconstruction converges to — return the input unchanged.
+    if iscale == 0.0 {
+        return image_from_f64(img.pixel_id(), size, img, &vals);
+    }
+
     let strides = strides(size);
     let kernel_size: usize = radius.iter().map(|&r| 2 * r + 1).product();
 
@@ -191,15 +195,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constant_image_is_nan_everywhere_regardless_of_alpha_beta() {
+    fn constant_image_is_the_identity_regardless_of_alpha_beta() {
+        // Hand-derivation, for a constant image with value c (= 7 here):
+        //   input_minimum = input_maximum = c, so iscale = 0.
+        // Every window value v equals the center pixel value c, so u == v and
+        //   s  = sgn(u - v) = sgn(0) = 0
+        //   ad = |2(u - v)|  = 0
+        //   CumulativeFunction = 0.5*0*0^alpha - beta*0.5*0*0 + beta*u
+        //                      = beta*u                for every alpha, beta.
+        // The counts in the frequency map sum to ikernel, so
+        //   sum = ikernel * beta*u / ikernel = beta*u,
+        // and the reconstruction is
+        //   iscale*(beta*u + 0.5) + minimum
+        //     = beta*(iscale*u) + 0.5*iscale + minimum.
+        // With iscale*u = (c - minimum) - 0.5*iscale = -0.5*iscale, this is
+        //   iscale*(0.5 - 0.5*beta) + minimum,
+        // which at iscale = 0 is exactly minimum = c, for every alpha/beta.
+        // (Upstream instead evaluates u as 0/0 = NaN and floods the image.)
         let img = Image::from_vec(&[4, 4], vec![7.0f64; 16]).unwrap();
         for (alpha, beta) in [(0.3, 0.3), (0.0, 0.0), (1.0, 1.0), (1.0, 0.0)] {
             let out = adaptive_histogram_equalization(&img, &[1, 1], alpha, beta).unwrap();
-            assert!(
-                out.to_f64_vec().unwrap().iter().all(|v| v.is_nan()),
-                "alpha={alpha} beta={beta} did not produce all-NaN output"
+            assert_eq!(
+                out.to_f64_vec().unwrap(),
+                vec![7.0; 16],
+                "alpha={alpha} beta={beta}"
             );
         }
+    }
+
+    #[test]
+    fn constant_image_identity_holds_for_negative_and_integer_pixels() {
+        // The `iscale == 0` guard reconstructs the constant itself, not the
+        // `minimum` of some rescaled range, so a negative constant survives.
+        let img = Image::from_vec(&[3, 3], vec![-4.5f64; 9]).unwrap();
+        let out = adaptive_histogram_equalization(&img, &[2, 2], 0.3, 0.3).unwrap();
+        assert_eq!(out.to_f64_vec().unwrap(), vec![-4.5; 9]);
+
+        let img = Image::from_vec(&[2, 2], vec![200u8; 4]).unwrap();
+        let out = adaptive_histogram_equalization(&img, &[1, 1], 0.3, 0.3).unwrap();
+        assert_eq!(out.to_f64_vec().unwrap(), vec![200.0; 4]);
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::UInt8);
+    }
+
+    #[test]
+    fn a_nonconstant_image_is_not_short_circuited_by_the_constant_guard() {
+        // One differing pixel makes iscale = 1 > 0, so the full moving-window
+        // path runs and the output is not the input.
+        let mut data = vec![3.0f64; 9];
+        data[4] = 4.0;
+        let img = Image::from_vec(&[3, 3], data.clone()).unwrap();
+        let out = adaptive_histogram_equalization(&img, &[1, 1], 0.3, 0.3).unwrap();
+        let got = out.to_f64_vec().unwrap();
+        assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+        assert_ne!(got, data);
     }
 
     #[test]
