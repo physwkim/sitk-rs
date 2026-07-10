@@ -78,10 +78,10 @@
 //!    discriminant that underflows to exactly `0.0` raises
 //!    [`FilterError::NegativeDiscriminant`] here and does not there.
 //!
-//! ## Upstream defect: a seed on the image border cannot leave it
+//! ## Fixed here: a seed on the image border propagates off it
 //!
-//! `UpdateNeighbors` guards the *assignment* of the neighbor index, not the
-//! read (`itkFastMarchingImageFilterBase.hxx:145-168`):
+//! Upstream's `UpdateNeighbors` guards the *assignment* of the neighbor index,
+//! not the read (`itkFastMarchingImageFilterBase.hxx:145-168`):
 //!
 //! ```text
 //! const IndexValueType v = iNode[j];
@@ -94,27 +94,24 @@
 //! }
 //! ```
 //!
-//! When `v` sits on either end of axis `j`, the condition is false for **both**
-//! values of `s`, `neighIndex` stays equal to `iNode`, and the label read is
-//! the center's own — which `GenerateData` has just set to `Alive`
-//! (`itkFastMarchingBase.hxx:163-166`). So the in-bounds neighbor at `v ± 1`
-//! is never updated: **a node on the boundary of axis `j` never propagates
-//! along axis `j`.**
+//! When `v` sits on either end of axis `j`, that single condition is false for
+//! **both** values of `s`, so `neighIndex` stays equal to `iNode`, the label
+//! read is the center's own `Alive`, and the in-bounds neighbor at `v ± 1` is
+//! never updated: a node on the boundary of axis `j` never propagates along
+//! axis `j`. A single trial point on a face of the image confines the entire
+//! march to that face (a seed at `x == 0` in 2-D never reaches `x == 1`); a
+//! lone corner seed marches nowhere at all. For an interior seed the defect is
+//! invisible, because the only neighbor a border node fails to update along its
+//! normal axis is the interior node it was reached from, which is already alive.
 //!
-//! The consequences are not cosmetic. A single trial point on a face of the
-//! image confines the entire march to that face (a seed at `x == 0` in 2-D
-//! never reaches `x == 1`); a lone corner seed marches nowhere at all. For an
-//! interior seed the defect is invisible, because the only neighbor a border
-//! node fails to update along its normal axis is the interior node it was
-//! reached from, which is already alive.
-//!
-//! Two things establish this as a defect rather than a design:
-//! `GetInternalNodesUsed`, in the same file, bounds-checks per `s`
-//! (`.hxx:212-232`); and the old `FastMarchingImageFilter::UpdateNeighbors`
-//! guards the two neighbors separately, so it does reach `start + 1` from
-//! `start` (`itkFastMarchingImageFilter.hxx:308-341`). It is reproduced here
-//! bit-for-bit and pinned by
-//! `a_border_seed_never_propagates_along_the_border_normal_axis`.
+//! This port bounds-checks per `s` instead, so each in-bounds neighbor is
+//! reached independently and a border seed fills the image. That matches
+//! `GetInternalNodesUsed`, in the same file, which already bounds-checks per `s`
+//! (`.hxx:212-232`), and the old `FastMarchingImageFilter::UpdateNeighbors`,
+//! which guards the two neighbors separately and so reaches `start + 1` from
+//! `start` (`itkFastMarchingImageFilter.hxx:308-341`) — establishing the single
+//! guard as a defect, not a design. Pinned by
+//! `a_border_seed_propagates_along_the_border_normal_axis`.
 //!
 //! ## Upstream defect: `NoHandles` is `Strict`
 //!
@@ -615,21 +612,25 @@ impl Marcher {
         Ok(())
     }
 
-    /// `UpdateNeighbors` (`itkFastMarchingImageFilterBase.hxx:143-169`),
-    /// including the border defect the module doc describes: on either end of
-    /// axis `j` the neighbor index is left at the center, whose label is the
-    /// `Alive` just written, so nothing along `j` is updated.
+    /// `UpdateNeighbors` (`itkFastMarchingImageFilterBase.hxx:143-169`). The
+    /// bounds check is per-`s` so that a node on either end of axis `j` still
+    /// reaches its one in-bounds neighbor along `j` — matching
+    /// `GetInternalNodesUsed`'s per-`s` check and the old
+    /// `FastMarchingImageFilter::UpdateNeighbors`'s separate guards, rather than
+    /// upstream `...Base`'s single `(v > start) && (v < last)` guard that is
+    /// false for both `s` on a border and confines a face seed to its face.
     fn update_neighbors(&mut self, index: usize) -> Result<()> {
         let coords = self.coords_of(index);
         for j in 0..self.dim() {
-            let v = coords[j];
             let last = self.size[j] - 1;
             let mut neighbor = coords.clone();
 
             for s in [-1i64, 1] {
-                if v > 0 && v < last {
-                    neighbor[j] = (v as i64 + s) as usize;
+                let t = coords[j] as i64 + s;
+                if t < 0 || t > last as i64 {
+                    continue;
                 }
+                neighbor[j] = t as usize;
                 let ni = self.flat(&neighbor);
                 if !matches!(self.labels[ni], Label::Alive | Label::InitialTrial) {
                     self.update_value(ni)?;
@@ -924,39 +925,52 @@ mod tests {
         );
     }
 
-    /// `UpdateNeighbors`'s `(v > start) && (v < last)` guard: a seed on the
-    /// `x == 0` face never updates anything at `x == 1`, so the march is
-    /// trapped in that column.
+    /// With the per-`s` bounds check a seed on the `x == 0` face reaches
+    /// `x == 1` along the border-normal axis, so the whole plane fills. The
+    /// field is the corner-seed field reflected about the seed row `y == 2`:
+    /// the seed column `x == 0` is the 1-D chain `[2,1,0,1,2]` and the seed row
+    /// `y == 2` is the 1-D chain `[0,1,2,3,4]` (the axis the defect used to
+    /// starve). The first off-axis ring is the symmetric upwind quadratic —
+    /// e.g. `(1,1)` has both axis minima `1`, so `2(T-1)^2 = 1`,
+    /// `T = 1 + 1/sqrt(2)` = `CORNER`; `(2,1)` chains it with the row value `2`,
+    /// `(T-CORNER)^2 + (T-2)^2 = 1` giving `2.545329`; and so on outward.
     #[test]
-    fn a_border_seed_never_propagates_along_the_border_normal_axis() {
+    fn a_border_seed_propagates_along_the_border_normal_axis() {
         let out = march(
             &speed(&[5, 5], 1.0),
             &[vec![0, 2]],
             &FastMarchingBaseSettings::default(),
         );
 
-        let column: Vec<f64> = (0..5).map(|y| out[y * 5]).collect();
-        assert_close(&column, &[2.0, 1.0, 0.0, 1.0, 2.0]);
-
-        for y in 0..5 {
-            for x in 1..5 {
-                assert_eq!(out[y * 5 + x], LARGE_VALUE, "pixel ({x}, {y}) was reached");
-            }
-        }
+        // The upwind `Solve` values, chained outward from the two seed axes.
+        let d1 = 2.545_329; // (2,1): quadratic of CORNER and 2
+        let d2 = 3.252_436; // (2,0): quadratic of two 2.545329 minima
+        let d3 = 4.048_043; // (3,0)
+        let d4 = 4.897_906; // (4,0)
+        let q3 = 3.442_230; // (3,1): quadratic of 2.545329 and 3
+        let q4 = 4.370_902; // (4,1): quadratic of 3.442230 and 4
+        assert_close(
+            &out,
+            &[
+                2.0, d1, d2, d3, d4, //  y = 0
+                1.0, CORNER, d1, q3, q4, //  y = 1
+                0.0, 1.0, 2.0, 3.0, 4.0, //  y = 2  (the border-normal axis)
+                1.0, CORNER, d1, q3, q4, //  y = 3
+                2.0, d1, d2, d3, d4, //  y = 4
+            ],
+        );
     }
 
-    /// The 1-D face of the same defect: a corner seed marches nowhere.
+    /// The 1-D face of the same fix: an endpoint seed marches along the whole
+    /// axis rather than being frozen at the endpoint.
     #[test]
-    fn a_corner_seed_marches_nowhere() {
+    fn an_endpoint_seed_marches_along_the_full_axis() {
         let out = march(
             &speed(&[5], 1.0),
             &[vec![0]],
             &FastMarchingBaseSettings::default(),
         );
-        assert_close(
-            &out,
-            &[0.0, LARGE_VALUE, LARGE_VALUE, LARGE_VALUE, LARGE_VALUE],
-        );
+        assert_close(&out, &[0.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
     /// `IsSatisfied` is `>=`, and it fires before the node is accepted, so the
