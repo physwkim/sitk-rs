@@ -1193,4 +1193,97 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn adapt_transform_parameters_is_a_no_op_when_the_required_grid_already_matches() {
+        // `BSplineTransformParametersAdaptor::AdaptTransformParameters` returns
+        // early when `m_RequiredFixedParameters == m_Transform->GetFixedParameters()`
+        // (`itkBSplineTransformParametersAdaptor.hxx:203-206`), so the
+        // coefficients are not run through the resample/decompose round trip and
+        // survive bit-exactly.
+        let mut t =
+            BSplineTransform::new(2, &[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
+                .unwrap();
+        let coefficients: Vec<f64> = (0..t.number_of_parameters())
+            .map(|i| (i as f64 * 0.37).sin())
+            .collect();
+        t.set_parameters(&coefficients).unwrap();
+
+        t.adapt_transform_parameters(&[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
+            .unwrap();
+
+        assert_eq!(t.grid_size(), [5, 7]);
+        assert_eq!(t.parameters(), coefficients);
+    }
+
+    #[test]
+    fn adapt_transform_parameters_rebuilds_the_grid_from_the_required_domain() {
+        // The adaptor's `UpdateRequiredFixedParameters`
+        // (`itkBSplineTransformParametersAdaptor.hxx:145-193`) uses the same
+        // gridSize / gridSpacing / gridOrigin formulas as `new`, so re-gridding
+        // onto a doubled mesh over a shifted domain lands exactly there.
+        let mut t =
+            BSplineTransform::new(2, &[0.0, 0.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
+                .unwrap();
+        t.adapt_transform_parameters(&[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[4, 8])
+            .unwrap();
+
+        assert_eq!(t.grid_size(), [7, 11]);
+        assert_eq!(t.transform_domain_mesh_size(), [4, 8]);
+        assert_eq!(t.grid_spacing(), [1.0, 1.0]);
+        // gridOrigin = domainOrigin - gridSpacing.
+        assert_eq!(t.grid_origin(), [0.0, 1.0]);
+        assert_eq!(t.number_of_parameters(), 2 * 7 * 11);
+    }
+
+    #[test]
+    fn adapt_transform_parameters_preserves_a_constant_displacement_across_a_mesh_refinement() {
+        // A constant coefficient field is a constant displacement everywhere
+        // (the cubic B-spline weights are a partition of unity). ITK's adaptor
+        // resamples the *deformation field* at the new control points — its
+        // interpolator is `BSplineResampleImageFunction`, which installs the
+        // input as the coefficient array instead of decomposing it
+        // (`itkBSplineResampleImageFunction.h:76-86`) — and then decomposes the
+        // samples back into coefficients. A constant survives that round trip,
+        // so the refined transform reproduces the same displacement.
+        let dim = 2;
+        let mut t = BSplineTransform::new(
+            dim,
+            &[0.0, 0.0],
+            &[8.0, 8.0],
+            &[1.0, 0.0, 0.0, 1.0],
+            &[2, 2],
+        )
+        .unwrap();
+        let n = t.number_of_parameters_per_dimension();
+        let mut coefficients = vec![0.0f64; dim * n];
+        coefficients[..n].fill(1.5);
+        coefficients[n..].fill(-0.75);
+        t.set_parameters(&coefficients).unwrap();
+        let before = t.transform_point(&[4.0, 4.0]);
+        assert!((before[0] - 5.5).abs() < 1e-12 && (before[1] - 3.25).abs() < 1e-12);
+
+        t.adapt_transform_parameters(&[0.0, 0.0], &[8.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[4, 4])
+            .unwrap();
+
+        assert_eq!(t.grid_size(), [7, 7]);
+        for p in [[4.0, 4.0], [2.0, 6.0], [6.0, 2.0]] {
+            let after = t.transform_point(&p);
+            assert!(
+                (after[0] - (p[0] + 1.5)).abs() < 1e-9 && (after[1] - (p[1] - 0.75)).abs() < 1e-9,
+                "point {p:?} mapped to {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapt_transform_parameters_rejects_a_zero_required_mesh_size() {
+        let mut t =
+            BSplineTransform::new(2, &[0.0, 0.0], &[4.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[2, 2])
+                .unwrap();
+        assert!(matches!(
+            t.adapt_transform_parameters(&[0.0, 0.0], &[4.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[0, 2]),
+            Err(TransformError::InvalidBSplineDomain)
+        ));
+    }
 }

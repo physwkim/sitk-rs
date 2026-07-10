@@ -3825,6 +3825,211 @@ mod tests {
         );
     }
 
+    /// The B-spline behind an initial transform that must be one, so the mesh
+    /// progression the adaptor produces can be read off the result.
+    fn as_bspline(t: &Transform) -> &BSplineTransform {
+        match t {
+            Transform::BSpline(b) => b,
+            other => panic!("expected a BSplineTransform, got {:?}", other.kind()),
+        }
+    }
+
+    /// A method whose optimizer takes one zero-length step, so a run reports the
+    /// grid geometry the adaptors built and nothing else.
+    fn geometry_only_method() -> ImageRegistrationMethod {
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_gradient_descent(0.0, 1);
+        reg
+    }
+
+    #[test]
+    fn bspline_scale_factors_multiply_the_initial_mesh_size_not_the_previous_levels() {
+        // Upstream builds every level's `BSplineTransformParametersAdaptor` up
+        // front, each reading `bsplineTransform->GetTransformDomainMeshSize()`
+        // off the *initial* transform
+        // (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:147,62-68`),
+        // so a factor is absolute against the mesh the caller set, never
+        // compounded with the previous level's factor. With mesh [2,2] and
+        // factors [2,3] the final mesh is 2·3 = 6 per axis, not 2·2·3 = 12.
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
+
+        let one_level = {
+            let mut reg = geometry_only_method();
+            reg.set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![2],
+            );
+            reg.execute_with_initial_transform(&fixed, &moving).unwrap()
+        };
+        assert_eq!(as_bspline(&one_level.transform).grid_size(), [4 + 3, 4 + 3]);
+
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![2, 3],
+            );
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        let final_bspline = as_bspline(&result.transform);
+
+        assert_eq!(final_bspline.transform_domain_mesh_size(), [6, 6]);
+        assert_eq!(final_bspline.grid_size(), [9, 9]);
+        // The finest level's required domain: origin and direction from the fixed
+        // image shrunk by 1 (so the fixed image's own), physical dimensions
+        // `spacing · (size − 1)` = 15 — not `size · spacing` = 16
+        // (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:70-84`). So
+        // gridSpacing = 15/6 = 2.5 and gridOrigin = 0 − 2.5.
+        assert_eq!(final_bspline.grid_spacing(), [2.5, 2.5]);
+        assert_eq!(final_bspline.grid_origin(), [-2.5, -2.5]);
+        // The stored initial transform is the optimized one (in-place default),
+        // so it carries the adapted mesh rather than the [2,2] that was set.
+        assert_eq!(
+            as_bspline(reg.initial_transform().unwrap()).grid_size(),
+            [9, 9]
+        );
+    }
+
+    #[test]
+    fn a_zero_or_missing_bspline_scale_factor_leaves_the_level_unadapted() {
+        // `if (scaleFactor < 1) { return nullptr; }`
+        // (`sitkImageRegistrationMethod_CreateParametersAdaptor.hxx:43-46`) and
+        // the `m_TransformBSplineScaleFactors.size() > level` guard (`:169-172`,
+        // which leaves `bsplineScaleFactor = 0`) both yield a null adaptor: that
+        // level keeps whatever grid the transform already has. Neither a short
+        // factor list nor a zero entry is an error (ledger §2.143).
+        let fixed = gaussian(16, 16, 8.0, 8.0, 3.0, 1.0);
+        let moving = gaussian(16, 16, 8.5, 8.0, 3.0, 1.0);
+
+        // Factor 0 at level 0: the level runs on the untouched [2,2] mesh whose
+        // grid came from `from_image_domain` (physical dimensions 16, not 15).
+        // Level 1 then adapts to 2·[2,2].
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![0, 2],
+            );
+        let zeroed = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        assert_eq!(as_bspline(&zeroed.transform).grid_size(), [7, 7]);
+        assert_eq!(as_bspline(&zeroed.transform).grid_spacing(), [3.75, 3.75]);
+
+        // Only one factor for two levels: level 1 has no adaptor, so the result
+        // keeps level 0's grid — built from the *shrunk* fixed image's origin
+        // 0.5 and physical dimensions 15, giving spacing 15/6 and origin
+        // 0.5 − 2.5 = −2.0.
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform_as_bspline(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap(),
+                true,
+                vec![3],
+            );
+        let short = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        assert_eq!(
+            as_bspline(&short.transform).transform_domain_mesh_size(),
+            [6, 6]
+        );
+        assert_eq!(as_bspline(&short.transform).grid_spacing(), [2.5, 2.5]);
+        assert_eq!(as_bspline(&short.transform).grid_origin(), [-2.0, -2.0]);
+
+        // An empty factor list — what `set_initial_transform` leaves behind —
+        // adapts no level at all.
+        let mut reg = geometry_only_method();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_initial_transform(
+                BSplineTransform::from_image_domain(&fixed, &[2, 2])
+                    .unwrap()
+                    .into(),
+            );
+        assert!(reg.bspline_scale_factors().is_empty());
+        let none = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+        assert_eq!(as_bspline(&none.transform).grid_size(), [5, 5]);
+        assert_eq!(as_bspline(&none.transform).grid_spacing(), [8.0, 8.0]);
+    }
+
+    #[test]
+    fn set_initial_transform_clears_the_bspline_scale_factors() {
+        // `SetInitialTransform` resets `m_TransformBSplineScaleFactors`
+        // (`sitkImageRegistrationMethod.cxx:121` and `:154`), so a later plain
+        // set silently disables the per-level adaptation.
+        let fixed = gaussian(8, 8, 4.0, 4.0, 2.0, 1.0);
+        let bspline = BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_initial_transform_as_bspline(bspline.clone(), true, vec![1, 2]);
+        assert_eq!(reg.bspline_scale_factors(), [1, 2]);
+
+        reg.set_initial_transform(bspline.clone().into());
+        assert!(reg.bspline_scale_factors().is_empty());
+
+        reg.set_initial_transform_as_bspline(bspline.clone(), false, vec![1, 2]);
+        assert!(!reg.initial_transform_in_place());
+        assert_eq!(reg.bspline_scale_factors(), [1, 2]);
+
+        reg.set_initial_transform_in_place(bspline.into(), false);
+        assert!(reg.bspline_scale_factors().is_empty());
+    }
+
+    #[test]
+    fn bspline_recovers_a_known_deformation_over_two_adapted_levels() {
+        // A two-level run whose B-spline mesh doubles at the finer level: the
+        // coarse level fits the bulk of the shift on a 2×2 mesh, its optimum is
+        // resampled onto the 4×4 mesh by the adaptor
+        // (`itkImageRegistrationMethodv4.hxx:327-331`), and the fine level
+        // refines it. The blob centre lands on the moving blob's centre and the
+        // metric falls well below the identity baseline.
+        use sitk_transform::TransformBase;
+
+        let (w, h, sigma, amp) = (40usize, 40usize, 6.0, 1.0);
+        let (cx, cy) = (20.0f64, 20.0f64);
+        let (tx, ty) = (2.0f64, -1.5f64);
+        let fixed = gaussian(w, h, cx, cy, sigma, amp);
+        let moving = gaussian(w, h, cx + tx, cy + ty, sigma, amp);
+
+        let identity = BSplineTransform::from_image_domain(&fixed, &[2, 2]).unwrap();
+        let baseline = MeanSquaresMetric::new(&fixed, &moving)
+            .unwrap()
+            .evaluate(&identity, &CpuBackend)
+            .value;
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_shrink_factors_per_level(vec![2, 1])
+            .set_smoothing_sigmas_per_level(vec![1.0, 0.0])
+            .set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent_estimated(
+                0.05,
+                200,
+                1e-7,
+                EstimateLearningRate::Once,
+            )
+            .set_initial_transform_as_bspline(identity, true, vec![1, 2]);
+        let result = reg.execute_with_initial_transform(&fixed, &moving).unwrap();
+
+        let recovered = as_bspline(&result.transform);
+        assert_eq!(recovered.transform_domain_mesh_size(), [4, 4]);
+
+        let mapped = result.transform.transform_point(&[cx, cy]);
+        assert!(
+            (mapped[0] - (cx + tx)).abs() < 0.5 && (mapped[1] - (cy + ty)).abs() < 0.5,
+            "blob centre mapped to {mapped:?}, expected {:?}; metric {} (baseline {baseline})",
+            [cx + tx, cy + ty],
+            result.metric_value
+        );
+        assert!(
+            result.metric_value < 0.05 * baseline,
+            "metric {} did not fall well below the identity baseline {baseline}",
+            result.metric_value
+        );
+    }
+
     #[test]
     fn bspline_mattes_recovers_a_deformable_shift_under_contrast_inversion() {
         // Deformable AND multi-modality together: the moving image is the fixed
