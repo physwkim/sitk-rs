@@ -51,8 +51,10 @@ use sitk_core::{Image, PixelId, Scalar, dispatch_scalar, matrix};
 
 use crate::{FilterError, Result};
 
+mod inverse;
 mod invert;
 
+pub use inverse::inverse_displacement_field;
 pub use invert::{
     InvertDisplacementFieldResult, InvertDisplacementFieldSettings, invert_displacement_field,
 };

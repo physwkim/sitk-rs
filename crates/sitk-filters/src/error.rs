@@ -616,6 +616,14 @@ pub enum FilterError {
     )]
     DisplacementFieldComponentMismatch { components: usize, dimension: usize },
 
+    /// `InverseDisplacementFieldImageFilter::PrepareKernelBaseSpline`
+    /// (`itkInverseDisplacementFieldImageFilter.hxx:131-135`) computes the
+    /// subsampled grid as `size[i] / m_SubsamplingFactor`, an integer division
+    /// that is undefined behavior in C++ for a zero factor. SimpleITK exposes
+    /// the setter without a guard, so this port rejects it here.
+    #[error("subsampling factor must be >= 1, got {0}")]
+    InvalidSubsamplingFactor(u32),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
