@@ -59,6 +59,13 @@ pub enum TransformError {
     )]
     DisplacementFieldComponentMismatch { expected: usize, got: usize },
 
+    /// `VersorRigid3DTransform::set_matrix` was given a matrix that is not a
+    /// proper rotation (orthonormal, `det ≥ 0`) to within `itk::Versor`'s own
+    /// tolerance (`Versor::Epsilon() = 1e-7`). Mirrors the
+    /// `itkGenericExceptionMacro` guard in `Versor<T>::Set(const MatrixType&)`.
+    #[error("matrix is not a proper rotation (must be orthonormal with determinant >= 0)")]
+    NotARotationMatrix,
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),
