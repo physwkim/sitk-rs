@@ -317,13 +317,13 @@ impl Image {
     /// `AllocateInternal` (sitkImage.hxx:60-67, :95-100) accepts only `1` for a
     /// basic pixel type, complex included, and any count for a vector one.
     ///
-    /// The assembled image's meta-data dictionary is always empty. Every
-    /// upstream path that reaches this seam does the same: a freshly allocated
-    /// `itk::Image` has an empty dictionary, and both `GetVectorImageFromScalarImage`
-    /// and `GetScalarImageFromVectorImage` (sitkImageConvert.hxx:74-177) build a
-    /// new `itk::Image`, copying regions, spacing, origin and direction across
-    /// but never the dictionary. Metadata is therefore carried only by the
-    /// dedicated accessors, never inherited.
+    /// The assembled image's meta-data dictionary is always empty: a freshly
+    /// allocated `itk::Image` has an empty dictionary. Callers that must carry a
+    /// dictionary across a conversion copy it themselves after assembling —
+    /// [`Image::to_vector_image`] and [`Image::to_scalar_image`] do, a
+    /// deliberate divergence from upstream's `GetVectorImageFromScalarImage` /
+    /// `GetScalarImageFromVectorImage` (sitkImageConvert.hxx:74-177), which build
+    /// a new `itk::Image` and never copy the dictionary (ledger §3.21).
     fn assemble(
         buffer: PixelBuffer,
         pixel_id: PixelId,
@@ -1304,6 +1304,8 @@ impl Image {
     /// - [`Error::NonIdentityFirstDimensionDirection`] when the direction
     ///   matrix's first row or column differs from the identity's
     ///   (sitkImage.hxx:134-145). The comparison is exact, as upstream's is.
+    /// - [`Error::NonTrivialFirstDimensionGeometry`] when `spacing[0] != 1.0`
+    ///   or `origin[0] != 0.0` — this port's fix for ledger §3.21, below.
     ///
     /// # Divergences
     ///
@@ -1314,9 +1316,15 @@ impl Image {
     /// in-place effect. Upstream's `SITK_MAX_DIMENSION` ceiling (a build option,
     /// default 5 — `CMake/sitkMaxDimensionOption.cmake:6`) has no analogue here.
     ///
-    /// Origin element 0 and spacing element 0 are **dropped**, and the meta-data
-    /// dictionary with them; upstream does the same, silently. See the note on
-    /// the private `assemble` seam.
+    /// The first axis becomes the vector's component axis, which has no spacing
+    /// or origin of its own. Upstream silently **drops** `spacing[0]`/`origin[0]`
+    /// there (and the meta-data dictionary too), so a scalar→vector→scalar round
+    /// trip loses them without warning (ledger §3.21). This port instead
+    /// **requires the first axis to be trivial** — `spacing[0] == 1.0`,
+    /// `origin[0] == 0.0`, identity direction row and column — exactly the
+    /// synthetic component axis [`Image::to_scalar_image`] produces, so nothing
+    /// meaningful is ever dropped and the round trip is lossless. The meta-data
+    /// dictionary **is** carried across, unlike upstream.
     pub fn to_vector_image(&self) -> Result<Image> {
         if self.pixel_id.is_vector() {
             return Ok(self.clone());
@@ -1339,6 +1347,12 @@ impl Image {
             return Err(Error::NonIdentityFirstDimensionDirection);
         }
 
+        // The component axis has no geometry slot; refuse to drop a non-trivial
+        // one, mirroring the direction guard above (ledger §3.21).
+        if self.spacing[0] != 1.0 || self.origin[0] != 0.0 {
+            return Err(Error::NonTrivialFirstDimensionGeometry);
+        }
+
         let out_dim = dim - 1;
         let mut direction = vec![0.0; out_dim * out_dim];
         for i in 0..out_dim {
@@ -1346,7 +1360,7 @@ impl Image {
                 direction[i * out_dim + j] = self.direction[(i + 1) * dim + (j + 1)];
             }
         }
-        Self::assemble(
+        let mut out = Self::assemble(
             self.buffer.clone(),
             self.pixel_id.vector_id(),
             self.size[0],
@@ -1354,7 +1368,9 @@ impl Image {
             self.spacing[1..].to_vec(),
             self.origin[1..].to_vec(),
             direction,
-        )
+        )?;
+        out.metadata = self.metadata.clone();
+        Ok(out)
     }
 
     /// Reinterpret this vector image's pixel components as a new leading
@@ -1388,6 +1404,11 @@ impl Image {
     /// Upstream additionally throws for a vector image *at* `SITK_MAX_DIMENSION`
     /// (its factory covers vectors only up to `SITK_MAX_DIMENSION - 1`); with no
     /// dimension ceiling here, that rejection has nothing to key on.
+    ///
+    /// The synthetic leading axis gets `spacing = 1.0`, `origin = 0.0` and an
+    /// identity direction row/column — the trivial component axis that
+    /// [`Image::to_vector_image`] requires, so the pair round-trips losslessly.
+    /// The meta-data dictionary is carried across, unlike upstream (ledger §3.21).
     pub fn to_scalar_image(&self) -> Result<Image> {
         if self.pixel_id.is_scalar() {
             return Ok(self.clone());
@@ -1419,7 +1440,7 @@ impl Image {
                 direction[(i + 1) * out_dim + (j + 1)] = self.direction[i * dim + j];
             }
         }
-        Self::assemble(
+        let mut out = Self::assemble(
             self.buffer.clone(),
             self.pixel_id.component_id(),
             1,
@@ -1427,7 +1448,9 @@ impl Image {
             spacing,
             origin,
             direction,
-        )
+        )?;
+        out.metadata = self.metadata.clone();
+        Ok(out)
     }
 
     /// The scalar pixel at `index` — SimpleITK's `GetPixelAsInt8` and the nine

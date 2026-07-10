@@ -881,10 +881,10 @@ mod tests {
     }
 
     #[test]
-    fn derived_images_start_with_an_empty_dictionary() {
-        // Every image built through `assemble` — the conversions included —
-        // starts empty, because `GetVectorImageFromScalarImage` and
-        // `GetScalarImageFromVectorImage` never copy the dictionary.
+    fn extract_component_starts_with_an_empty_dictionary() {
+        // `extract_component` builds a fresh image through `assemble` and does
+        // not copy the dictionary. (The `to_vector_image`/`to_scalar_image`
+        // converters do, since §3.21 — see `both_converters_carry_the_meta_data_dictionary`.)
         let mut img = Image::from_vec_vector(&[2, 2], 2, vec![0.0f32; 8]).unwrap();
         img.set_meta_data("k", "v");
         assert!(
@@ -893,7 +893,6 @@ mod tests {
                 .meta_data_keys()
                 .is_empty()
         );
-        assert!(img.to_scalar_image().unwrap().meta_data_keys().is_empty());
     }
 
     // ---- integer index <-> physical point ----------------------------------
@@ -1112,11 +1111,15 @@ mod tests {
 
     // ---- to_vector_image / to_scalar_image ---------------------------------
 
+    /// A 3-D ramp whose **first** axis is the trivial component axis
+    /// [`Image::to_vector_image`] requires — unit spacing, zero origin — while
+    /// the trailing axes keep non-unit spacing/origin so the drop is still
+    /// observable.
     fn ramp_3d() -> Image {
         let mut img =
             Image::from_vec(&[2, 3, 4], (0..24).map(|i| i as f32).collect::<Vec<f32>>()).unwrap();
-        img.set_spacing(&[5.0, 6.0, 7.0]).unwrap();
-        img.set_origin(&[1.0, 2.0, 3.0]).unwrap();
+        img.set_spacing(&[1.0, 6.0, 7.0]).unwrap();
+        img.set_origin(&[0.0, 2.0, 3.0]).unwrap();
         img
     }
 
@@ -1228,26 +1231,52 @@ mod tests {
     }
 
     #[test]
-    fn vector_scalar_roundtrip_drops_the_first_spacing_and_origin() {
-        // Upstream quirk: `ToVectorImage` discards spacing[0] and origin[0], and
-        // `ToScalarImage` restores 1.0 / 0.0 in their place. The round trip is
-        // lossy and silently so.
-        let img = ramp_3d();
+    fn vector_scalar_roundtrip_is_lossless_for_a_trivial_first_axis() {
+        // §3.21: upstream's `ToVectorImage` silently dropped spacing[0]/origin[0]
+        // and `ToScalarImage` refilled 1.0/0.0, making the round trip lossy. This
+        // port requires the first axis to be trivial (so nothing is lost) and
+        // carries the meta-data dictionary, so the round trip is the identity.
+        let mut img = ramp_3d();
+        img.set_meta_data("k", "v");
         let back = img.to_vector_image().unwrap().to_scalar_image().unwrap();
         assert_eq!(back.pixel_id(), img.pixel_id());
         assert_eq!(back.size(), img.size());
         assert_eq!(back.buffer(), img.buffer());
         assert_eq!(back.direction(), img.direction());
-        assert_eq!(img.spacing(), &[5.0, 6.0, 7.0]);
-        assert_eq!(back.spacing(), &[1.0, 6.0, 7.0]);
-        assert_eq!(img.origin(), &[1.0, 2.0, 3.0]);
-        assert_eq!(back.origin(), &[0.0, 2.0, 3.0]);
+        assert_eq!(back.spacing(), img.spacing());
+        assert_eq!(back.origin(), img.origin());
+        assert_eq!(back.meta_data("k"), Some("v"));
     }
 
     #[test]
-    fn to_vector_image_drops_the_meta_data_dictionary() {
+    fn to_vector_image_rejects_a_non_trivial_first_dimension_geometry() {
+        // §3.21: a non-unit spacing[0] or non-zero origin[0] would be silently
+        // dropped by the component-axis collapse, so it is refused instead.
+        let mut spaced = ramp_3d();
+        spaced.set_spacing(&[5.0, 6.0, 7.0]).unwrap();
+        assert_eq!(
+            spaced.to_vector_image(),
+            Err(Error::NonTrivialFirstDimensionGeometry)
+        );
+
+        let mut shifted = ramp_3d();
+        shifted.set_origin(&[1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            shifted.to_vector_image(),
+            Err(Error::NonTrivialFirstDimensionGeometry)
+        );
+    }
+
+    #[test]
+    fn both_converters_carry_the_meta_data_dictionary() {
+        // §3.21: unlike upstream, both directions copy the dictionary.
         let mut img = ramp_3d();
         img.set_meta_data("k", "v");
-        assert!(img.to_vector_image().unwrap().meta_data_keys().is_empty());
+        assert_eq!(img.to_vector_image().unwrap().meta_data("k"), Some("v"));
+
+        let mut v =
+            Image::from_vec_vector(&[3, 4], 2, (0..24).map(|i| i as f32).collect()).unwrap();
+        v.set_meta_data("j", "w");
+        assert_eq!(v.to_scalar_image().unwrap().meta_data("j"), Some("w"));
     }
 }

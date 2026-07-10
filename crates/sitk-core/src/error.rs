@@ -119,6 +119,19 @@ pub enum Error {
     )]
     NonIdentityFirstDimensionDirection,
 
+    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on a
+    /// scalar image whose first axis carries geometry — `spacing[0] != 1.0` or
+    /// `origin[0] != 0.0` — that the vector image, which has no slot for a
+    /// component axis, would silently drop. SimpleITK drops it without warning
+    /// (`sitkImageConvert.hxx:148-162`), making a scalar→vector→scalar round
+    /// trip lossy; this port rejects it instead, mirroring the first-dimension
+    /// direction guard above (ledger §3.21).
+    #[error(
+        "cannot convert an image whose first dimension carries non-trivial geometry \
+         (spacing[0] != 1 or origin[0] != 0) to a vector image"
+    )]
+    NonTrivialFirstDimensionGeometry,
+
     /// A label-only operation was handed a floating-point or vector image.
     ///
     /// SimpleITK expresses the same restriction at compile time:
