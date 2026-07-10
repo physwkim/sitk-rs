@@ -185,7 +185,7 @@ pub use fast_marching_upwind_gradient::{
     fast_marching_upwind_gradient,
 };
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
-pub use fft_shift::fft_shift;
+pub use fft_shift::{cyclic_shift, fft_shift};
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{

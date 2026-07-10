@@ -5,14 +5,18 @@
 //!
 //! Ported through the superclass that actually performs the wraparound copy,
 //! `itk::CyclicShiftImageFilter`
-//! (`Modules/Filtering/ImageGrid/include/itkCyclicShiftImageFilter.hxx`):
+//! (`Modules/Filtering/ImageGrid/include/itkCyclicShiftImageFilter.h(.hxx)`),
+//! which this module also exposes directly as [`cyclic_shift`]:
 //! `FFTShiftImageFilter::GenerateData` computes `shift[i] = size[i] / 2`
 //! (integer division), negated when `inverse` is set, then
-//! `CyclicShiftImageFilter::DynamicThreadedGenerateData` reads each output
-//! pixel from `input[(index[i] - outIdx[i] - shift[i]) mod size[i]]`, wrapped
-//! into `[0, size[i])`. This crate's images always start at index 0
-//! (there is no `LargestPossibleRegion` index offset concept here), so the
-//! `outIdx` term is always zero and drops out of the port.
+//! `CyclicShiftImageFilter::DynamicThreadedGenerateData`
+//! (`itkCyclicShiftImageFilter.hxx:70-78`) reads each output pixel from
+//! `input[(index[i] - outIdx[i] - shift[i]) mod size[i]]`, wrapped into
+//! `[0, size[i])`. This crate's images always start at index 0 (there is no
+//! `LargestPossibleRegion` index offset concept here), so the `outIdx` term
+//! is always zero and drops out of the port. Both functions share that same
+//! wraparound core, [`cyclic_permute`], differing only in how `shift` is
+//! produced.
 //!
 //! `FFTShiftImageFilter.yaml` declares `pixel_types: NonLabelPixelIDTypeList`
 //! (SimpleITK's full pixel-type list minus label maps, which for the C++
@@ -29,8 +33,12 @@
 //! doc's note: "applying this filter twice will not produce the same image as
 //! the original one without using SetInverse(true) on one (and only one) of
 //! the two filters."
+//!
+//! `CyclicShiftImageFilter.yaml` declares `pixel_types: NonLabelPixelIDTypeList`
+//! too, and `Shift: type int, dim_vec: true, default [0, 0, 0]` (a per-axis
+//! shift, positive or negative, defaulting to no shift at all).
 
-use crate::error::Result;
+use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::Image;
 
@@ -43,24 +51,23 @@ fn strides(size: &[usize]) -> Vec<usize> {
     s
 }
 
-/// `FFTShiftImageFilter`: cyclically shift every axis by `size[i] / 2`
-/// (`inverse` negates the shift), moving the zero-frequency corner to the
-/// image center. See the module docs for the odd-size/`inverse` interaction.
-pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
-    let size = img.size();
+fn require_dim(len: usize, dim: usize) -> Result<()> {
+    if len != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: len,
+        });
+    }
+    Ok(())
+}
+
+/// The wraparound core shared by [`fft_shift`] and [`cyclic_shift`]:
+/// `output[index] = input[(index[d] - shift[d]) mod size[d]]` for every axis
+/// `d` (`itkCyclicShiftImageFilter.hxx:70-78`, with the always-zero `outIdx`
+/// term dropped, see the module docs).
+fn cyclic_permute(vals: &[f64], size: &[usize], strides: &[usize], shift: &[i64]) -> Vec<f64> {
     let dim = size.len();
-    let strides = strides(size);
-    let vals = img.to_f64_vec()?;
-
-    let shift: Vec<i64> = size
-        .iter()
-        .map(|&s| {
-            let base = (s / 2) as i64;
-            if inverse { -base } else { base }
-        })
-        .collect();
-
-    let out: Vec<f64> = (0..vals.len())
+    (0..vals.len())
         .map(|flat| {
             let mut src_flat = 0usize;
             for d in 0..dim {
@@ -74,8 +81,43 @@ pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
             }
             vals[src_flat]
         })
+        .collect()
+}
+
+/// `FFTShiftImageFilter`: cyclically shift every axis by `size[i] / 2`
+/// (`inverse` negates the shift), moving the zero-frequency corner to the
+/// image center. See the module docs for the odd-size/`inverse` interaction.
+pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
+    let size = img.size();
+    let strides = strides(size);
+    let vals = img.to_f64_vec()?;
+
+    let shift: Vec<i64> = size
+        .iter()
+        .map(|&s| {
+            let base = (s / 2) as i64;
+            if inverse { -base } else { base }
+        })
         .collect();
 
+    let out = cyclic_permute(&vals, size, &strides, &shift);
+    image_from_f64(img.pixel_id(), size, img, &out)
+}
+
+/// `CyclicShiftImageFilter` (`itkCyclicShiftImageFilter.h(.hxx)`): shift every
+/// axis cyclically by the caller-given `shift[d]` (positive or negative;
+/// `CyclicShiftImageFilter.yaml`'s `Shift` member defaults to all zero, one
+/// entry per image axis). A pixel that moves across a boundary wraps around
+/// it, matching the class doc's example: a 40x40 image shifted by `[13, 47]`
+/// puts input pixel `[0, 0]` at output index `[13, 7]`
+/// (`itkCyclicShiftImageFilter.h:36-38`).
+pub fn cyclic_shift(img: &Image, shift: &[i64]) -> Result<Image> {
+    let size = img.size();
+    require_dim(shift.len(), size.len())?;
+    let strides = strides(size);
+    let vals = img.to_f64_vec()?;
+
+    let out = cyclic_permute(&vals, size, &strides, shift);
     image_from_f64(img.pixel_id(), size, img, &out)
 }
 
@@ -153,5 +195,110 @@ mod tests {
         let out = fft_shift(&img, false).unwrap();
         assert_eq!(out.spacing(), img.spacing());
         assert_eq!(out.origin(), img.origin());
+    }
+
+    // ---- CyclicShift ----
+
+    /// Hand-traced positive shift: `output[idx] = input[(idx - 2) mod 5]`.
+    /// `Image::from_vec(&[5, 1], ...)` is a 2-D image, so `shift` needs one
+    /// entry per axis; the trailing size-1 axis's shift is inert.
+    #[test]
+    fn cyclic_shift_positive_shift_wraps_forward() {
+        let img = Image::from_vec(&[5, 1], vec![0i32, 1, 2, 3, 4]).unwrap();
+        let out = cyclic_shift(&img, &[2, 0]).unwrap();
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[3, 4, 0, 1, 2]);
+    }
+
+    /// Hand-traced negative shift: `output[idx] = input[(idx + 2) mod 5]`.
+    #[test]
+    fn cyclic_shift_negative_shift_wraps_backward() {
+        let img = Image::from_vec(&[5, 1], vec![0i32, 1, 2, 3, 4]).unwrap();
+        let out = cyclic_shift(&img, &[-2, 0]).unwrap();
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[2, 3, 4, 0, 1]);
+    }
+
+    /// `CyclicShiftImageFilter` is `FFTShiftImageFilter`'s superclass with a
+    /// caller-chosen shift instead of a fixed `size/2`: `fft_shift(img, true)`
+    /// on a size-5 axis uses `shift = -(5/2) = -2`, so this must agree with
+    /// `cyclic_shift(img, [-2, 0])` pixel-for-pixel.
+    #[test]
+    fn cyclic_shift_agrees_with_fft_shift_inverse_at_the_same_effective_shift() {
+        let img = Image::from_vec(&[5, 1], vec![0i32, 1, 2, 3, 4]).unwrap();
+        let via_cyclic_shift = cyclic_shift(&img, &[-2, 0]).unwrap();
+        let via_fft_shift = fft_shift(&img, true).unwrap();
+        assert_eq!(
+            via_cyclic_shift.scalar_slice::<i32>().unwrap(),
+            via_fft_shift.scalar_slice::<i32>().unwrap()
+        );
+    }
+
+    /// `CyclicShiftImageFilter.yaml`'s default `Shift` is all-zero: the
+    /// identity permutation.
+    #[test]
+    fn cyclic_shift_yaml_default_shift_is_identity() {
+        let img = Image::from_vec(&[4, 1], vec![10i32, 20, 30, 40]).unwrap();
+        let out = cyclic_shift(&img, &[0, 0]).unwrap();
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[10, 20, 30, 40]);
+    }
+
+    /// Each axis shifts independently, with a mix of positive and negative
+    /// per-axis shifts (the class doc: "Negative Shifts are supported").
+    #[test]
+    fn cyclic_shift_shifts_each_axis_independently_with_mixed_signs() {
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[4, 3], vec![
+             0,  1,  2,  3,
+             4,  5,  6,  7,
+             8,  9, 10, 11,
+        ]).unwrap();
+        // x-shift +1, y-shift -1: output[x,y] = input[(x-1) mod 4, (y+1) mod 3].
+        let out = cyclic_shift(&img, &[1, -1]).unwrap();
+        #[rustfmt::skip]
+        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[
+             7,  4,  5,  6,
+            11,  8,  9, 10,
+             3,  0,  1,  2,
+        ]);
+    }
+
+    /// The class doc's own worked example: on a 40x40 image shifted by
+    /// `[13, 47]`, input pixel `[0, 0]` lands at output index `[13, 7]`
+    /// (`itkCyclicShiftImageFilter.h:36-38`).
+    #[test]
+    fn cyclic_shift_matches_the_class_docs_worked_example() {
+        let size = [40usize, 40usize];
+        let mut data = vec![0i32; size[0] * size[1]];
+        data[0] = 99; // input[0, 0]
+        let img = Image::from_vec(&size, data).unwrap();
+        let out = cyclic_shift(&img, &[13, 47]).unwrap();
+        let got = out.scalar_slice::<i32>().unwrap();
+        let flat = 13 + 7 * size[0]; // output index [13, 7]
+        assert_eq!(got[flat], 99);
+        assert_eq!(got.iter().filter(|&&v| v == 99).count(), 1);
+    }
+
+    #[test]
+    fn cyclic_shift_rejects_a_shift_vector_of_the_wrong_dimension() {
+        let img = Image::from_vec(&[4, 3], vec![0i32; 12]).unwrap();
+        let err = cyclic_shift(&img, &[1]).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::DimensionLength {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+
+    #[test]
+    fn cyclic_shift_rejects_non_scalar_pixel_type() {
+        let img = Image::new(&[2, 1], sitk_core::PixelId::ComplexFloat32);
+        let err = cyclic_shift(&img, &[0, 0]).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                sitk_core::PixelId::ComplexFloat32
+            ))
+        );
     }
 }
