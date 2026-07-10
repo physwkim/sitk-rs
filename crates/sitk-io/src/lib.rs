@@ -1717,21 +1717,33 @@ mod tests {
     }
 
     /// `nifti_read_buffer`'s `#ifdef isfinite` block (nifti1_io.c:5036-5070) is
-    /// live on glibc, which defines `isfinite` as a macro: every non-finite
-    /// float read from disk becomes zero. Platform-dependent upstream behaviour,
-    /// pinned for Linux (ledger §2.90).
+    /// live on glibc, which defines `isfinite` as a macro, and maps every
+    /// non-finite float read from disk to zero — silent, irreversible pixel-data
+    /// loss. This port **fixes** it: NaN and ±Inf survive the round trip
+    /// (ledger §2.90).
     #[test]
-    fn nii_non_finite_pixels_are_zeroed_on_read() {
-        let img = Image::from_vec(&[3, 1], vec![f32::NAN, f32::INFINITY, 1.5]).unwrap();
+    fn nii_non_finite_pixels_are_preserved_on_read() {
+        let img = Image::from_vec(
+            &[4, 1],
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5],
+        )
+        .unwrap();
         let path = tmp_path("nonfinite.nii");
         write_image(&img, &path).unwrap();
-        // The writer stores them verbatim; only the reader sanitises.
+        // The writer stores them verbatim.
         let bytes = std::fs::read(&path).unwrap();
         assert!(f32::from_le_bytes(bytes[352..356].try_into().unwrap()).is_nan());
 
         let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(back.scalar_slice::<f32>().unwrap(), &[0.0, 0.0, 1.5]);
+        let pixels = back.scalar_slice::<f32>().unwrap();
+        assert!(
+            pixels[0].is_nan(),
+            "NaN pixel was not preserved: {pixels:?}"
+        );
+        assert_eq!(pixels[1], f32::INFINITY);
+        assert_eq!(pixels[2], f32::NEG_INFINITY);
+        assert_eq!(pixels[3], 1.5);
     }
 
     /// A gzipped NIfTI is claimed by the registry and round-trips. Compression
@@ -1964,18 +1976,50 @@ mod tests {
     }
 
     /// A `NIFTI_INTENT_SYMMATRIX` file loads as
-    /// `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`, which
-    /// `GetPixelIDFromImageIO` has no branch for: it falls to the final `else`
-    /// and throws "Unknown PixelType" (sitkImageReaderBase.cxx:238). SimpleITK
-    /// simply cannot open such a file (ledger §3.32).
+    /// `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`, which `GetPixelIDFromImageIO`
+    /// has no branch for and rejects in SimpleITK. This port's [`Image`] can hold
+    /// the tensor, so it loads as a vector image of the unique matrix entries,
+    /// reordered from NIfTI's lower-triangular to ITK's upper-triangular order:
+    /// for the 6-component (3×3) case the map is `[0,1,3,2,4,5]`, so components 2
+    /// and 3 of every pixel swap. Ledger §3.32.
     #[test]
-    fn nii_symmatrix_is_unreadable_through_the_simpleitk_pixel_id_mapping() {
-        let img = Image::from_vec_vector::<f32>(&[2, 2], 3, vec![0.0; 12]).unwrap();
+    fn nii_symmatrix_loads_as_a_vector_image_reordered_to_itk_order() {
+        // Interleaved (component-fastest) source: pixel p holds [p*10 .. p*10+5].
+        let data: Vec<f32> = (0..4)
+            .flat_map(|p| (0..6).map(move |c| (p * 10 + c) as f32))
+            .collect();
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 6, data).unwrap();
         let path = patched_nii("symmatrix.nii", &img, |b| patch_i16(b, 68, 1005));
+
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 6);
+        assert_eq!(back.size(), &[2, 2]);
+        // Each pixel's components 2 and 3 are swapped by the reorder.
+        let expected: Vec<f32> = (0..4)
+            .flat_map(|p| {
+                let b = (p * 10) as f32;
+                [b, b + 1.0, b + 3.0, b + 2.0, b + 4.0, b + 5.0]
+            })
+            .collect();
+        assert_eq!(back.component_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    /// A `NIFTI_INTENT_SYMMATRIX` whose `dim[5]` is not a triangular number
+    /// d·(d+1)/2 has no valid symmetric-matrix component order, so this port
+    /// rejects it rather than driving upstream's `UpperToLowerOrder` past the
+    /// buffer. Ledger §3.32.
+    #[test]
+    fn nii_symmatrix_with_a_non_triangular_component_count_is_rejected() {
+        // 5 components: T(2) = 3, T(3) = 6, so 5 is not triangular.
+        let img = Image::from_vec_vector::<f32>(&[2, 2], 5, vec![0.0; 20]).unwrap();
+        let path = patched_nii("symmatrix_bad.nii", &img, |b| patch_i16(b, 68, 1005));
         let result = read_image(&path);
         std::fs::remove_file(&path).ok();
         assert!(
-            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("SYMMATRIX")),
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("triangular")),
             "{result:?}"
         );
     }
@@ -2360,11 +2404,13 @@ mod tests {
         assert_eq!(img.meta_data("NRRD_space"), Some("left-posterior-superior"));
     }
 
-    /// `scanner-xyz` has no well-defined LPS conversion, so
-    /// `ReadImageInformation`'s `switch` falls to `default:` and the direction
-    /// vectors survive unconverted — the space is *not* rejected. Ledger §2.82.
+    /// `scanner-xyz` has no well-defined LPS conversion. Upstream's `switch`
+    /// falls to a bare `default:` and loads the direction vectors unconverted,
+    /// silently mis-orienting the volume; this port **rejects** it with a typed
+    /// [`IoError::UnsupportedNrrdFeature`] rather than loading it wrong. Ledger
+    /// §2.82.
     #[test]
-    fn nrrd_scanner_xyz_space_is_left_unconverted() {
+    fn nrrd_rejects_a_scanner_xyz_space_with_no_lps_conversion() {
         let path = tmp_path("scanner.nrrd");
         std::fs::write(
             &path,
@@ -2381,11 +2427,52 @@ mod tests {
               \x07",
         )
         .unwrap();
+        let err = read_image(&path).unwrap_err();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(err, IoError::UnsupportedNrrdFeature(ref m) if m.contains("scanner-xyz")),
+            "expected a typed rejection of scanner-xyz, got {err:?}"
+        );
+    }
+
+    /// `right-anterior-superior-time` has a well-defined LPS conversion — the
+    /// flip is purely spatial — so this port converts it (flipping axes 0 and 1
+    /// of the direction and origin) even though upstream's `switch` leaves the
+    /// `-time` spaces in the `default:` arm unconverted. Ledger §2.82.
+    #[test]
+    fn nrrd_ras_time_space_is_converted_to_lps() {
+        let path = tmp_path("rast.nrrd");
+        std::fs::write(
+            &path,
+            b"NRRD0004\n\
+              type: unsigned char\n\
+              dimension: 4\n\
+              space: right-anterior-superior-time\n\
+              sizes: 1 1 1 1\n\
+              space directions: (2,0,0,0) (0,3,0,0) (0,0,4,0) (0,0,0,5)\n\
+              kinds: domain domain domain domain\n\
+              encoding: raw\n\
+              space origin: (10,20,30,40)\n\
+              \n\
+              \x07",
+        )
+        .unwrap();
         let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(img.origin(), &[10.0, 20.0, 30.0]);
-        assert_eq!(img.meta_data("NRRD_space"), Some("scanner-xyz"));
+        assert_eq!(img.spacing(), &[2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            img.direction(),
+            &[
+                -1.0, 0.0, 0.0, 0.0, //
+                0.0, -1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ]
+        );
+        assert_eq!(img.origin(), &[-10.0, -20.0, 30.0, 40.0]);
+        assert_eq!(img.meta_data("NRRD_space"), Some("left-posterior-superior"));
     }
 
     /// `kinds: domain domain vector` puts the pixel axis last, so
@@ -2729,9 +2816,12 @@ mod tests {
     }
 
     /// A `3D-symmetric-matrix` pixel axis is `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`,
-    /// which falls off the end of `GetPixelIDFromImageIO`'s if-ladder. Ledger §3.31.
+    /// which falls off the end of `GetPixelIDFromImageIO`'s if-ladder and would
+    /// raise "Unknown PixelType" in SimpleITK. This port's [`Image`] can hold the
+    /// six unique matrix entries, so it loads the tensor as a 6-component vector
+    /// image in the NRRD on-disk order. Ledger §3.31.
     #[test]
-    fn nrrd_rejects_a_symmetric_matrix_pixel_axis() {
+    fn nrrd_symmetric_matrix_pixel_axis_loads_as_a_vector_image() {
         let path = tmp_path("tensor.nrrd");
         let mut bytes = b"NRRD0004\n\
               type: float\n\
@@ -2741,14 +2831,62 @@ mod tests {
               endian: little\n\
               encoding: raw\n\n"
             .to_vec();
-        bytes.extend_from_slice(&[0u8; 48]);
+        // Axis 0 (the 6-component tensor) is fastest: pixel 0 is [1..=6],
+        // pixel 1 is [7..=12].
+        for v in 1..=12u32 {
+            bytes.extend_from_slice(&(v as f32).to_le_bytes());
+        }
         std::fs::write(&path, bytes).unwrap();
-        let err = read_image(&path).unwrap_err();
+        let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert!(matches!(
-            err,
-            IoError::UnsupportedNrrdFeature(ref m) if m.contains("Unknown PixelType")
-        ));
+
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(img.size(), &[2]);
+        assert_eq!(img.number_of_components_per_pixel(), 6);
+        assert_eq!(
+            img.component_slice::<f32>().unwrap(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
+            ]
+        );
+    }
+
+    /// A `3D-masked-symmetric-matrix` pixel axis carries a leading mask channel;
+    /// `ReadImageInformation` reports one fewer component and `Read` crops the
+    /// mask out, so the seven on-disk channels become a 6-component vector image
+    /// holding only the matrix entries. Ledger §3.31.
+    #[test]
+    fn nrrd_masked_symmetric_matrix_crops_the_mask_channel() {
+        let path = tmp_path("masked_tensor.nrrd");
+        let mut bytes = b"NRRD0004\n\
+              type: float\n\
+              dimension: 2\n\
+              sizes: 7 2\n\
+              kinds: 3D-masked-symmetric-matrix domain\n\
+              endian: little\n\
+              encoding: raw\n\n"
+            .to_vec();
+        // Axis 0 (mask + 6 tensor entries) is fastest. Pixel 0 is
+        // [mask=1, 10..=15], pixel 1 is [mask=1, 20..=25]; the masks are dropped.
+        for &mask_base in &[10u32, 20u32] {
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            for k in 0..6u32 {
+                bytes.extend_from_slice(&((mask_base + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(img.size(), &[2]);
+        assert_eq!(img.number_of_components_per_pixel(), 6);
+        assert_eq!(
+            img.component_slice::<f32>().unwrap(),
+            &[
+                10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0
+            ]
+        );
     }
 
     /// `nrrd__HeaderCheck` refuses a multi-byte raw type with no `endian`
@@ -3321,25 +3459,45 @@ mod tests {
         assert_eq!(gipl::GIPL_MAGIC_NUMBER2, 719_555_000);
     }
 
-    /// `Write` never consults `m_NumberOfComponents` for the header but
-    /// `GetImageSizeInBytes()` does, so a 3-component image writes a scalar
-    /// `image_type` and three times the described bytes. Reading it back gives a
-    /// scalar image holding the first `numPixels` components (§2.96).
+    /// Upstream's `Write` never consults `m_NumberOfComponents` for the header
+    /// but `GetImageSizeInBytes()` does, so a 3-component image would write a
+    /// scalar `image_type` and three times the described bytes, reading back as
+    /// a scalar holding the first `numPixels` components — silent component
+    /// loss. GIPL is a scalar-only format, so this port rejects the write and
+    /// leaves the target untouched (§2.96).
     #[test]
-    fn gipl_vector_image_writes_a_scalar_header_and_reads_back_scalar() {
+    fn gipl_vector_image_write_is_rejected() {
         let data: Vec<u8> = (0..12).collect();
         let img = Image::from_vec_vector::<u8>(&[2, 2], 3, data).unwrap();
         let path = tmp_path("vector.gipl");
-        write_image(&img, &path).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let back = read_image(&path).unwrap();
+        let result = write_image(&img, &path);
+        let existed = path.exists();
         std::fs::remove_file(&path).ok();
 
-        assert_eq!(bytes.len(), gipl::HEADER_SIZE + 12);
-        assert_eq!(&bytes[8..10], &8u16.to_be_bytes()); // GIPL_U_CHAR, not a vector
-        assert_eq!(back.pixel_id(), PixelId::UInt8);
-        assert_eq!(back.size(), &[2, 2, 1]);
-        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[0, 1, 2, 3]);
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m))
+                if m.contains("scalar-only") && m.contains("3-component")),
+            "{result:?}"
+        );
+        assert!(!existed, "the target file must be left untouched");
+    }
+
+    /// A complex image corrupts the same way — two components per pixel over a
+    /// scalar `image_type` — so it is rejected for the same reason (§2.96).
+    #[test]
+    fn gipl_complex_image_write_is_rejected() {
+        let data: Vec<Complex<f32>> = (0..4)
+            .map(|i| Complex::new(i as f32, i as f32 + 0.5))
+            .collect();
+        let img = Image::from_vec_complex::<f32>(&[2, 2], data).unwrap();
+        let path = tmp_path("complex.gipl");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("scalar-only")),
+            "{result:?}"
+        );
     }
 
     /// Upstream's `success = !m_Ifstream.bad()` accepts a short read and leaves
@@ -3885,24 +4043,37 @@ mod tests {
         assert_eq!(back.spacing(), &[0.25, 4.0]);
     }
 
-    /// `VTKImageIO` reads a `TENSORS` file; SimpleITK's `GetPixelIDFromImageIO`
-    /// has no `SYMMETRICSECONDRANKTENSOR` arm and throws `"Unknown PixelType"`
-    /// (§3.37).
+    /// `VTKImageIO` reads a `TENSORS` file as a six-component
+    /// `SYMMETRICSECONDRANKTENSOR`; SimpleITK's `GetPixelIDFromImageIO` has no arm
+    /// for it and throws `"Unknown PixelType"`. This port's [`Image`] can hold the
+    /// data, so it loads as a 6-component vector image, components in on-disk
+    /// order (VTK does no reordering). Ledger §3.37.
     #[test]
-    fn vtk_tensors_are_unreadable_through_the_simpleitk_pixel_id_mapping() {
+    fn vtk_tensors_load_as_a_six_component_vector_image() {
         let header = format!(
-            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 1 1 1 \n\
-             POINT_DATA 1\nTENSORS tensors float\n"
+            "{VTK_PREAMBLE}BINARY\nDATASET STRUCTURED_POINTS\nDIMENSIONS 2 2 1 \n\
+             POINT_DATA 4\nTENSORS tensors float\n"
         );
-        let path = write_vtk("tensors.vtk", &header, &[0u8; 36]);
+        // Big-endian f32: pixel p holds components [p*10+1 .. p*10+6].
+        let mut data = Vec::new();
+        for p in 0..4 {
+            for c in 1..=6 {
+                data.extend_from_slice(&((p * 10 + c) as f32).to_be_bytes());
+            }
+        }
+        let path = write_vtk("tensors.vtk", &header, &data);
         let claimed = create_image_io(&path, FileMode::Read).is_some();
-        let result = read_image(&path);
+        let back = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
+
         assert!(claimed, "CanReadFile only tests the DATASET line");
-        assert!(
-            matches!(&result, Err(IoError::UnsupportedVtkFeature(m)) if m.contains("Unknown PixelType")),
-            "{result:?}"
-        );
+        assert_eq!(back.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(back.number_of_components_per_pixel(), 6);
+        assert_eq!(back.size(), &[2, 2]);
+        let expected: Vec<f32> = (0..4)
+            .flat_map(|p| (1..=6).map(move |c| (p * 10 + c) as f32))
+            .collect();
+        assert_eq!(back.component_slice::<f32>().unwrap(), expected.as_slice());
     }
 
     /// `CanReadFile` requires `structured_points` on the fourth line, so a

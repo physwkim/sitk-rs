@@ -101,9 +101,9 @@ pub enum IoError {
     #[error("malformed VTK header: {0}")]
     MalformedVtkHeader(String),
 
-    /// A legacy VTK feature SimpleITK's wrapping layer cannot represent — a
-    /// `TENSORS` attribute (§3.37) — or a write `VTKImageIO` refuses, namely an
-    /// image of more than three dimensions (itkVTKImageIO.cxx:647-651).
+    /// A write `VTKImageIO` refuses, namely an image of more than three
+    /// dimensions (itkVTKImageIO.cxx:647-651). (A `TENSORS` attribute is no
+    /// longer refused: this port loads it as a vector image, ledger §3.37.)
     #[error("unsupported VTK feature: {0}")]
     UnsupportedVtkFeature(String),
 

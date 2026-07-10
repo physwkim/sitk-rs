@@ -94,9 +94,14 @@
 //! walk; bug §1.51, fixed here on both read and write by rejecting a
 //! `NIFTI_INTENT_DISPVECT` image whose component count is not 3.
 //!
-//! `NIFTI_INTENT_GENMATRIX` and `NIFTI_INTENT_SYMMATRIX` are rejected: the
-//! first by ITK itself (:806-810), the second by SimpleITK's wrapping layer
-//! (ledger §3.32).
+//! `NIFTI_INTENT_GENMATRIX` is rejected by ITK itself (:806-810).
+//! `NIFTI_INTENT_SYMMATRIX` loads as `SYMMETRICSECONDRANKTENSOR`, which
+//! SimpleITK's `GetPixelIDFromImageIO` cannot represent (it throws "Unknown
+//! PixelType"); this port **implements** the read (ledger §3.32) as a vector
+//! image of the tensor's unique matrix entries, reordered from NIfTI's
+//! lower-triangular to ITK's upper-triangular component order
+//! (`UpperToLowerOrder`, :83-119) so the vector matches what `itk::Image` would
+//! hold. The component count must be a triangular number.
 //!
 //! # Compression
 //!
@@ -1881,9 +1886,10 @@ impl Info {
     /// `ImageReaderBase::GetPixelIDFromImageIO` (sitkImageReaderBase.cxx:
     /// 200-239): one component of a scalar/complex pixel type stays scalar;
     /// RGB/RGBA/VECTOR load as a vector image; a two-component COMPLEX loads as
-    /// complex. `SYMMETRICSECONDRANKTENSOR` reaches the `else` and throws —
-    /// which is why [`read_information`] rejects `NIFTI_INTENT_SYMMATRIX`
-    /// before we get here (ledger §3.32).
+    /// complex. `SYMMETRICSECONDRANKTENSOR` reaches the `else` and throws in
+    /// SimpleITK — so [`read_info`] instead loads a `NIFTI_INTENT_SYMMATRIX`
+    /// image as a `Vector`, whose components this branch maps with `vector_id`
+    /// (ledger §3.32).
     fn pixel_id(&self) -> PixelId {
         match self.kind {
             PixelKind::Scalar => self.component,
@@ -2079,11 +2085,22 @@ fn read_info(path: &Path) -> Result<Info> {
     let mut convert_ras = false;
     match nim.intent_code {
         NIFTI_INTENT_SYMMATRIX => {
-            return Err(IoError::UnsupportedNiftiFeature(format!(
-                "{}: NIFTI_INTENT_SYMMATRIX loads as itk::IOPixelEnum::SYMMETRICSECONDRANKTENSOR, \
-                 which SimpleITK's GetPixelIDFromImageIO rejects (ledger §3.32)",
-                path.display()
-            )));
+            // `itk::Image` reads this as `SYMMETRICSECONDRANKTENSOR`; SimpleITK's
+            // `GetPixelIDFromImageIO` has no arm for it and throws "Unknown
+            // PixelType". This port's `Image` CAN hold the data, so the tensor is
+            // loaded as a vector image of its unique matrix entries (ledger §3.32).
+            // The component count must be a triangular number T(d) = d(d+1)/2 for
+            // the NIfTI-lower → ITK-upper reorder (`UpperToLowerOrder`) applied in
+            // `read` to be a valid permutation.
+            kind = PixelKind::Vector;
+            let d = sym_mat_dim(components);
+            if d * (d + 1) / 2 != components {
+                return Err(IoError::UnsupportedNiftiFeature(format!(
+                    "{}: NIFTI_INTENT_SYMMATRIX declares {components} components, which is not a \
+                     symmetric-matrix triangular count d·(d+1)/2",
+                    path.display()
+                )));
+            }
         }
         NIFTI_INTENT_DISPVECT => {
             kind = PixelKind::Vector;
@@ -2191,8 +2208,11 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
 /// (nifti1_io.c:5030-5034) — for `COMPLEX64` the swap size is `4`, so the real
 /// and imaginary halves are swapped independently.
 ///
-/// `FLOAT32`/`FLOAT64`/`COMPLEX64`/`COMPLEX128` also get the `IS_GOOD_FLOAT`
-/// treatment (:5036-5070): a NaN or infinity read from disk becomes `0`.
+/// `FLOAT32`/`FLOAT64`/`COMPLEX64`/`COMPLEX128` are read verbatim. Upstream's
+/// `IS_GOOD_FLOAT` block (:5036-5070) maps every NaN or infinity read from disk
+/// to `0` — silent, irreversible pixel-data loss active only on glibc (where
+/// `<math.h>` defines `isfinite` as a macro). This port **fixes** that at
+/// source and preserves the non-finite pixels (ledger §2.90).
 fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
     macro_rules! unpack {
         ($ty:ty, $variant:ident) => {{
@@ -2212,25 +2232,6 @@ fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
             )
         }};
     }
-    macro_rules! unpack_float {
-        ($ty:ty, $variant:ident) => {{
-            const S: usize = std::mem::size_of::<$ty>();
-            PixelBuffer::$variant(
-                bytes
-                    .chunks_exact(S)
-                    .map(|c| {
-                        let a: [u8; S] = c.try_into().expect("chunks_exact yields S bytes");
-                        let v = if swapped {
-                            <$ty>::from_be_bytes(a)
-                        } else {
-                            <$ty>::from_le_bytes(a)
-                        };
-                        if v.is_finite() { v } else { 0.0 }
-                    })
-                    .collect(),
-            )
-        }};
-    }
     match datatype {
         NIFTI_TYPE_UINT8 | NIFTI_TYPE_RGB24 | NIFTI_TYPE_RGBA32 => {
             PixelBuffer::UInt8(bytes.to_vec())
@@ -2242,8 +2243,8 @@ fn decode(bytes: &[u8], datatype: i16, swapped: bool) -> PixelBuffer {
         NIFTI_TYPE_UINT32 => unpack!(u32, UInt32),
         NIFTI_TYPE_INT64 => unpack!(i64, Int64),
         NIFTI_TYPE_UINT64 => unpack!(u64, UInt64),
-        NIFTI_TYPE_FLOAT32 | NIFTI_TYPE_COMPLEX64 => unpack_float!(f32, Float32),
-        NIFTI_TYPE_FLOAT64 | NIFTI_TYPE_COMPLEX128 => unpack_float!(f64, Float64),
+        NIFTI_TYPE_FLOAT32 | NIFTI_TYPE_COMPLEX64 => unpack!(f32, Float32),
+        NIFTI_TYPE_FLOAT64 | NIFTI_TYPE_COMPLEX128 => unpack!(f64, Float64),
         _ => unreachable!("datatype validated by read_info"),
     }
 }
@@ -2425,6 +2426,16 @@ pub fn read(path: &Path) -> Result<Image> {
         buffer = truncate(buffer, keep);
     }
 
+    // A symmetric-matrix intent image is stored lower-triangular in NIfTI and
+    // upper-triangular in ITK; after the de-interleave above (which is
+    // component-order-preserving) reorder the components of every pixel so the
+    // vector image matches what `itk::Image` would hold — upstream's `vecOrder`
+    // remap in the copy loop (itkNiftiImageIO.cxx:463-501, ledger §3.32).
+    if info.nim.intent_code == NIFTI_INTENT_SYMMATRIX && info.components > 1 {
+        let order = upper_to_lower_order(sym_mat_dim(info.components));
+        buffer = permute_components(buffer, num_elts, info.components, &order);
+    }
+
     if info.must_rescale() {
         rescale(
             &mut buffer,
@@ -2467,6 +2478,73 @@ pub fn read(path: &Path) -> Result<Image> {
         image.set_meta_data(key, value);
     }
     Ok(image)
+}
+
+/// `SymMatDim(count)` (itkNiftiImageIO.cxx:123-135): the rank `d` of a symmetric
+/// matrix with `count` unique (triangular) entries, where T(d) = d·(d+1)/2.
+fn sym_mat_dim(count: usize) -> usize {
+    let mut dim = 0;
+    let mut row = 1;
+    let mut c = count as isize;
+    while c > 0 {
+        c -= row;
+        dim += 1;
+        row += 1;
+    }
+    dim
+}
+
+/// `UpperToLowerOrder(dim)` (itkNiftiImageIO.cxx:83-119): `order[c]` is the ITK
+/// (upper-triangular) buffer position that on-disk (NIfTI lower-triangular)
+/// component `c` moves to — upstream's `vecOrder`. For `dim = 3` this is
+/// `[0, 1, 3, 2, 4, 5]`.
+fn upper_to_lower_order(dim: usize) -> Vec<usize> {
+    // Linear index of the upper-triangular entry `(r, c)` with `r <= c`, filled
+    // row by row: `sum_{k<r}(dim-k) + (c-r)`.
+    let ut_index = |r: usize, c: usize| r * dim - r * r.saturating_sub(1) / 2 + (c - r);
+    let mut order = Vec::with_capacity(dim * (dim + 1) / 2);
+    for i in 0..dim {
+        for j in 0..=i {
+            order.push(ut_index(j, i));
+        }
+    }
+    order
+}
+
+/// Reorder the `components` components of every one of `num_pixels` pixels in an
+/// interleaved (component-fastest) buffer: `out[pixel][order[c]] = in[pixel][c]`.
+/// `order` is a permutation of `0..components`.
+fn permute_components(
+    buf: PixelBuffer,
+    num_pixels: usize,
+    components: usize,
+    order: &[usize],
+) -> PixelBuffer {
+    macro_rules! p {
+        ($v:expr, $variant:ident) => {{
+            let src = $v;
+            let mut out = src.clone();
+            for pixel in 0..num_pixels {
+                let base = pixel * components;
+                for c in 0..components {
+                    out[base + order[c]] = src[base + c];
+                }
+            }
+            PixelBuffer::$variant(out)
+        }};
+    }
+    match buf {
+        PixelBuffer::UInt8(v) => p!(v, UInt8),
+        PixelBuffer::Int8(v) => p!(v, Int8),
+        PixelBuffer::UInt16(v) => p!(v, UInt16),
+        PixelBuffer::Int16(v) => p!(v, Int16),
+        PixelBuffer::UInt32(v) => p!(v, UInt32),
+        PixelBuffer::Int32(v) => p!(v, Int32),
+        PixelBuffer::UInt64(v) => p!(v, UInt64),
+        PixelBuffer::Int64(v) => p!(v, Int64),
+        PixelBuffer::Float32(v) => p!(v, Float32),
+        PixelBuffer::Float64(v) => p!(v, Float64),
+    }
 }
 
 fn truncate(buf: PixelBuffer, keep: usize) -> PixelBuffer {

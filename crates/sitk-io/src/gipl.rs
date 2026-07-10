@@ -91,11 +91,17 @@
 //!
 //! # Vector and complex images
 //!
-//! `Write` never consults `m_NumberOfComponents` when it fills the header, but
-//! `GetImageSizeInBytes()` does — so a 3-component vector image writes
-//! `image_type = GIPL_U_CHAR` and three times as many bytes as the header
-//! describes. Reading it back yields a *scalar* image holding the first
-//! `numPixels` components. Reproduced, pinned, ledger §2.96.
+//! GIPL is a scalar-only format: `image_type` (`:733-761`) has no
+//! multi-component code, and the reader hard-wires `m_PixelType = SCALAR`.
+//! Upstream's `Write` never consults `m_NumberOfComponents` when it fills the
+//! header, but `GetImageSizeInBytes()` does — so a 3-component vector image
+//! writes `image_type = GIPL_U_CHAR` and three times as many bytes as the
+//! header describes, and reading it back yields a *scalar* image holding the
+//! first `numPixels` components (silent component loss). A complex image
+//! corrupts the same way (two components per pixel). This port **fixes** it
+//! (ledger §2.96): [`write`] rejects any non-scalar image (`buffer_stride > 1`)
+//! with an [`IoError::UnsupportedGiplFeature`] before touching the target,
+//! since GIPL cannot represent one.
 //!
 //! # Extensions and compression
 //!
@@ -496,6 +502,27 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
     let compressed = is_compressed(path);
     let n = img.dimension();
     let size = img.size();
+
+    // GIPL is a scalar-only format: its `image_type` table
+    // (itkGiplImageIO.cxx:733-761) has no multi-component code — the complex
+    // codes are commented out and ITK's reader hard-wires `m_PixelType =
+    // SCALAR`. Upstream's `Write` emits a scalar `image_type` from
+    // `m_ComponentType` alone yet streams `GetImageSizeInBytes()` bytes (every
+    // component), so a vector or complex image writes a scalar header over N×
+    // the described data and reads back as a scalar holding only the first
+    // `numPixels` components — silent component loss (ledger §2.96). This port
+    // rejects any non-scalar image before touching the target, per what GIPL
+    // can actually represent.
+    let stride = img.buffer_stride();
+    if stride > 1 {
+        return Err(IoError::UnsupportedGiplFeature(format!(
+            "GIPL is a scalar-only format and cannot represent a {stride}-component {} \
+             image; refusing to write a scalar header that would silently drop \
+             components on read (ledger §2.96)",
+            img.pixel_id().as_str()
+        )));
+    }
+
     let mut out = Vec::with_capacity(HEADER_SIZE);
 
     // dims: the image's first four axes, then `1`. `unsigned short value =
@@ -552,8 +579,10 @@ pub fn write(img: &Image, path: &Path) -> Result<()> {
     out.extend_from_slice(&GIPL_MAGIC_NUMBER.to_be_bytes());
     debug_assert_eq!(out.len(), HEADER_SIZE);
 
-    // `GetImageSizeInBytes()` counts every component, so a vector or complex
-    // image writes more bytes than its scalar `image_type` describes (§2.96).
+    // Scalar pixel dump. A vector or complex image never reaches here — it is
+    // rejected above, since GIPL's `image_type` can only describe scalars and
+    // `GetImageSizeInBytes()` would otherwise write N× the header's bytes
+    // (§2.96).
     out.extend_from_slice(&buffer_to_be_bytes(img.buffer()));
     write_bytes(path, &out, compressed)?;
     Ok(())
