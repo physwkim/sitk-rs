@@ -1209,71 +1209,7 @@ impl VersorRigid3DTransform {
     /// already does), so it can differ from the `matrix` argument by a few
     /// ULPs of floating-point rounding (ledger §4.45).
     pub fn set_matrix(&mut self, matrix: &[f64]) -> Result<()> {
-        assert_eq!(matrix.len(), 9, "matrix must be row-major 3x3");
-        const EPS: f64 = 1e-10;
-
-        let m = |r: usize, c: usize| matrix[r * 3 + c];
-        let mt = |r: usize, c: usize| m(c, r);
-        // I = m * m^T; check orthonormality and that it isn't a reflection.
-        let dot_row = |r: usize, c: usize| (0..3).map(|k| m(r, k) * mt(k, c)).sum::<f64>();
-        let orthonormal = (dot_row(0, 1)).abs() <= EPS
-            && (dot_row(0, 2)).abs() <= EPS
-            && (dot_row(1, 2)).abs() <= EPS
-            && (dot_row(0, 0) - 1.0).abs() <= EPS
-            && (dot_row(1, 1) - 1.0).abs() <= EPS
-            && (dot_row(2, 2) - 1.0).abs() <= EPS;
-        let det = m(0, 0) * (m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1))
-            - m(0, 1) * (m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0))
-            + m(0, 2) * (m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0));
-        if !orthonormal || det < 0.0 {
-            return Err(TransformError::NotARotationMatrix);
-        }
-
-        let (mut x, mut y, mut z, mut w);
-        let trace = m(0, 0) + m(1, 1) + m(2, 2) + 1.0;
-        if trace > EPS {
-            let s = 0.5 / trace.sqrt();
-            w = 0.25 / s;
-            x = (m(2, 1) - m(1, 2)) * s;
-            y = (m(0, 2) - m(2, 0)) * s;
-            z = (m(1, 0) - m(0, 1)) * s;
-        } else if m(0, 0) > m(1, 1) && m(0, 0) > m(2, 2) {
-            let s = 2.0 * (1.0 + m(0, 0) - m(1, 1) - m(2, 2)).sqrt();
-            x = 0.25 * s;
-            y = (m(0, 1) + m(1, 0)) / s;
-            z = (m(0, 2) + m(2, 0)) / s;
-            w = (m(1, 2) - m(2, 1)) / s;
-        } else if m(1, 1) > m(2, 2) {
-            let s = 2.0 * (1.0 + m(1, 1) - m(0, 0) - m(2, 2)).sqrt();
-            x = (m(0, 1) + m(1, 0)) / s;
-            y = 0.25 * s;
-            z = (m(1, 2) + m(2, 1)) / s;
-            w = (m(0, 2) - m(2, 0)) / s;
-        } else {
-            let s = 2.0 * (1.0 + m(2, 2) - m(0, 0) - m(1, 1)).sqrt();
-            x = (m(0, 2) + m(2, 0)) / s;
-            y = (m(1, 2) + m(2, 1)) / s;
-            z = 0.25 * s;
-            w = (m(0, 1) - m(1, 0)) / s;
-        }
-
-        // Normalize (`Versor::Normalize`), then canonicalize to a
-        // non-negative scalar part by negating all four components together
-        // — required since this type always reconstructs
-        // `w = +sqrt(1 - vx^2 - vy^2 - vz^2)` from the stored right part, and
-        // a versor and its negation represent the same rotation only if
-        // negated as a whole (the double cover of SO(3)).
-        let norm = (x * x + y * y + z * z + w * w).sqrt();
-        x /= norm;
-        y /= norm;
-        z /= norm;
-        w /= norm;
-        if w < 0.0 {
-            x = -x;
-            y = -y;
-            z = -z;
-        }
-
+        let (x, y, z) = versor_right_part_from_matrix(matrix)?;
         self.set_versor(x, y, z);
         self.recompute();
         Ok(())
@@ -3047,9 +2983,566 @@ impl ParametricTransform for ScaleLogarithmicTransform {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inverses
+//
+// Every matrix-offset transform inverts through the same two steps as
+// `itk::MatrixOffsetTransformBase::GetInverse` (`itkMatrixOffsetTransformBase.hxx:425-444`):
+//
+// 1. the inverse's center is this one's, its matrix is `M⁻¹`, and its offset is
+//    `−M⁻¹·offset` (returning `false` when `M` is singular);
+// 2. `ComputeTranslation` recovers the inverse's translation from that offset,
+//    and `ComputeMatrixParameters` — the per-class virtual — recovers the
+//    class's own parameters (angle, versor, scale, skew) from `M⁻¹`.
+//
+// The parameter-recovery step is what decides whether a class *has* an inverse:
+// `ScaleVersor3DTransform` and `ScaleSkewVersor3DTransform` both raise
+// `itkExceptionStringMacro("Setting the matrix of a ... transform is not
+// supported at this time.")` from `ComputeMatrixParameters`
+// (`itkScaleVersor3DTransform.hxx:201-204`, `itkScaleSkewVersor3DTransform.hxx:233-236`),
+// so `GetInverse` on those throws upstream and returns
+// [`TransformError::NoInverse`] here.
+// ---------------------------------------------------------------------------
+
+/// The linear map of the inverse of `y = M·x + offset`, i.e. `(M⁻¹, −M⁻¹·offset)`.
+/// `None` when `M` is singular — the `m_Singular` early return of
+/// `itk::MatrixOffsetTransformBase::GetInverse`.
+fn invert_matrix_offset(
+    matrix: &[f64],
+    offset: &[f64],
+    dim: usize,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let inv = matrix::invert(matrix, dim)?;
+    let inv_offset = matrix::mat_vec(&inv, offset, dim)
+        .into_iter()
+        .map(|v| -v)
+        .collect();
+    Some((inv, inv_offset))
+}
+
+/// `itk::MatrixOffsetTransformBase::ComputeTranslation`:
+/// `translation = offset − (center − M·center)`.
+fn translation_from_offset(matrix: &[f64], offset: &[f64], center: &[f64], dim: usize) -> Vec<f64> {
+    let m_center = matrix::mat_vec(matrix, center, dim);
+    (0..dim)
+        .map(|d| offset[d] - center[d] + m_center[d])
+        .collect()
+}
+
+/// Determinant of a row-major 3×3 matrix.
+fn determinant3(m: &[f64]) -> f64 {
+    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
+        + m[2] * (m[3] * m[7] - m[4] * m[6])
+}
+
+/// The right part `(x, y, z)` of the versor equivalent to the row-major 3×3
+/// rotation `matrix`, via the branch method of `itk::Versor<T>::Set(const
+/// MatrixType&)` (`itkVersor.hxx:301-381`, Shepperd 1978), normalized and
+/// canonicalized to a non-negative scalar part.
+///
+/// Errors with [`TransformError::NotARotationMatrix`] when `matrix` is not
+/// orthonormal or is a reflection, to within `itk::Versor<double>::Epsilon() =
+/// 1e-10` — the `itkGenericExceptionMacro` guard in `Versor::Set`.
+fn versor_right_part_from_matrix(matrix: &[f64]) -> Result<(f64, f64, f64)> {
+    assert_eq!(matrix.len(), 9, "matrix must be row-major 3x3");
+    const EPS: f64 = 1e-10;
+
+    let m = |r: usize, c: usize| matrix[r * 3 + c];
+    // I = m·mᵀ; check orthonormality and that it isn't a reflection.
+    let dot_row = |a: usize, b: usize| (0..3).map(|k| m(a, k) * m(b, k)).sum::<f64>();
+    let orthonormal = dot_row(0, 1).abs() <= EPS
+        && dot_row(0, 2).abs() <= EPS
+        && dot_row(1, 2).abs() <= EPS
+        && (dot_row(0, 0) - 1.0).abs() <= EPS
+        && (dot_row(1, 1) - 1.0).abs() <= EPS
+        && (dot_row(2, 2) - 1.0).abs() <= EPS;
+    if !orthonormal || determinant3(matrix) < 0.0 {
+        return Err(TransformError::NotARotationMatrix);
+    }
+
+    let (mut x, mut y, mut z, mut w);
+    let trace = m(0, 0) + m(1, 1) + m(2, 2) + 1.0;
+    if trace > EPS {
+        let s = 0.5 / trace.sqrt();
+        w = 0.25 / s;
+        x = (m(2, 1) - m(1, 2)) * s;
+        y = (m(0, 2) - m(2, 0)) * s;
+        z = (m(1, 0) - m(0, 1)) * s;
+    } else if m(0, 0) > m(1, 1) && m(0, 0) > m(2, 2) {
+        let s = 2.0 * (1.0 + m(0, 0) - m(1, 1) - m(2, 2)).sqrt();
+        x = 0.25 * s;
+        y = (m(0, 1) + m(1, 0)) / s;
+        z = (m(0, 2) + m(2, 0)) / s;
+        w = (m(1, 2) - m(2, 1)) / s;
+    } else if m(1, 1) > m(2, 2) {
+        let s = 2.0 * (1.0 + m(1, 1) - m(0, 0) - m(2, 2)).sqrt();
+        x = (m(0, 1) + m(1, 0)) / s;
+        y = 0.25 * s;
+        z = (m(1, 2) + m(2, 1)) / s;
+        w = (m(0, 2) - m(2, 0)) / s;
+    } else {
+        let s = 2.0 * (1.0 + m(2, 2) - m(0, 0) - m(1, 1)).sqrt();
+        x = (m(0, 2) + m(2, 0)) / s;
+        y = (m(1, 2) + m(2, 1)) / s;
+        z = 0.25 * s;
+        w = (m(0, 1) - m(1, 0)) / s;
+    }
+
+    // Normalize (`Versor::Normalize`), then canonicalize to a non-negative
+    // scalar part by negating all four components together — a versor and its
+    // negation represent the same rotation only if negated as a whole (the
+    // double cover of SO(3)), and every type here reconstructs
+    // `w = +√(1 − x² − y² − z²)` from the stored right part.
+    let norm = (x * x + y * y + z * z + w * w).sqrt();
+    x /= norm;
+    y /= norm;
+    z /= norm;
+    w /= norm;
+    if w < 0.0 {
+        x = -x;
+        y = -y;
+        z = -z;
+    }
+    Ok((x, y, z))
+}
+
+/// The rotation angle of a row-major 2×2 rotation matrix, porting
+/// `itk::Rigid2DTransform::ComputeMatrixParameters`
+/// (`itkRigid2DTransform.hxx:88-106`): `acos(r₀₀)`, negated when `r₁₀ < 0`.
+///
+/// ITK first replaces the matrix by `U·Vᵀ` of its SVD (the closest rotation);
+/// the callers here always pass an exact rotation's inverse, for which the two
+/// agree to a few ULPs. The `acos` argument is clamped into `[-1, 1]` so a
+/// rounding excursion past `±1` yields `0`/`π` rather than `NaN`.
+fn rotation_angle_2d(matrix: &[f64]) -> f64 {
+    let angle = matrix[0].clamp(-1.0, 1.0).acos();
+    if matrix[2] < 0.0 { -angle } else { angle }
+}
+
+/// The Euler angles `(x, y, z)` of a row-major 3×3 rotation matrix, porting
+/// `itk::Euler3DTransform::ComputeMatrixParameters`
+/// (`itkEuler3DTransform.hxx:179-226`) for both composition orders. The `asin`
+/// arguments are clamped into `[-1, 1]` (ITK does not clamp).
+fn euler_angles_from_matrix(matrix: &[f64], compute_zyx: bool) -> (f64, f64, f64) {
+    let m = |r: usize, c: usize| matrix[r * 3 + c];
+    if compute_zyx {
+        let angle_y = -m(2, 0).clamp(-1.0, 1.0).asin();
+        let c = angle_y.cos();
+        if c.abs() > 0.00005 {
+            let angle_x = (m(2, 1) / c).atan2(m(2, 2) / c);
+            let angle_z = (m(1, 0) / c).atan2(m(0, 0) / c);
+            (angle_x, angle_y, angle_z)
+        } else {
+            (0.0, angle_y, (-m(0, 1)).atan2(m(1, 1)))
+        }
+    } else {
+        let angle_x = m(2, 1).clamp(-1.0, 1.0).asin();
+        let a = angle_x.cos();
+        if a.abs() > 0.00005 {
+            let angle_y = (-m(2, 0) / a).atan2(m(2, 2) / a);
+            let angle_z = (-m(0, 1) / a).atan2(m(1, 1) / a);
+            (angle_x, angle_y, angle_z)
+        } else {
+            (angle_x, m(1, 0).atan2(m(0, 0)), 0.0)
+        }
+    }
+}
+
+impl TranslationTransform {
+    /// The inverse translation, `−t` (`itk::TranslationTransform::GetInverse`).
+    /// Always exists.
+    pub fn inverse(&self) -> Self {
+        Self::new(self.translation.iter().map(|t| -t).collect())
+    }
+}
+
+impl AffineTransform {
+    /// The inverse affine transform about the same center. Errors with
+    /// [`TransformError::NoInverse`] when the matrix is singular — where
+    /// `itk::MatrixOffsetTransformBase::GetInverse` returns `false`.
+    pub fn inverse(&self) -> Result<Self> {
+        let dim = self.dim;
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, dim)
+            .ok_or(TransformError::NoInverse("the affine matrix is singular"))?;
+        let translation = translation_from_offset(&matrix, &offset, &self.center, dim);
+        Ok(Self::new(dim, matrix, translation, self.center.clone()))
+    }
+}
+
+impl Euler2DTransform {
+    /// The inverse rigid transform about the same center. Errors with
+    /// [`TransformError::NoInverse`] only if the cached rotation matrix is
+    /// singular, which a rotation never is.
+    pub fn inverse(&self) -> Result<Self> {
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 2)
+            .ok_or(TransformError::NoInverse("the rotation matrix is singular"))?;
+        let t = translation_from_offset(&matrix, &offset, &self.center, 2);
+        Ok(Self::new(
+            rotation_angle_2d(&matrix),
+            [t[0], t[1]],
+            [self.center[0], self.center[1]],
+        ))
+    }
+}
+
+impl Similarity2DTransform {
+    /// The inverse similarity transform about the same center: reciprocal scale,
+    /// negated angle. Errors with [`TransformError::NoInverse`] when the scale is
+    /// zero — `itk::Similarity2DTransform::ComputeMatrixParameters` throws "Bad
+    /// Rotation Matrix. Scale cannot be zero." there
+    /// (`itkSimilarity2DTransform.hxx:144-155`).
+    pub fn inverse(&self) -> Result<Self> {
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 2).ok_or(
+            TransformError::NoInverse("the similarity matrix is singular"),
+        )?;
+        // ITK: m_Scale = sqrt(sqr(m[0][0]) + sqr(m[0][1])); angle from m/scale.
+        let scale = (matrix[0] * matrix[0] + matrix[1] * matrix[1]).sqrt();
+        if scale < f64::MIN_POSITIVE {
+            return Err(TransformError::NoInverse("the similarity scale is zero"));
+        }
+        let mut angle = (matrix[0] / scale).clamp(-1.0, 1.0).acos();
+        if matrix[2] < 0.0 {
+            angle = -angle;
+        }
+        let t = translation_from_offset(&matrix, &offset, &self.center, 2);
+        Ok(Self::new(
+            scale,
+            angle,
+            [t[0], t[1]],
+            [self.center[0], self.center[1]],
+        ))
+    }
+}
+
+impl Euler3DTransform {
+    /// The inverse rigid transform about the same center, carrying this
+    /// transform's `compute_zyx` flag over — ITK's `GetInverse` copies it with
+    /// `inverse->SetFixedParameters(this->GetFixedParameters())` before it
+    /// extracts the angles, and the extraction itself branches on it.
+    pub fn inverse(&self) -> Result<Self> {
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 3)
+            .ok_or(TransformError::NoInverse("the rotation matrix is singular"))?;
+        let t = translation_from_offset(&matrix, &offset, &self.center, 3);
+        let (angle_x, angle_y, angle_z) = euler_angles_from_matrix(&matrix, self.compute_zyx);
+        let mut inverse = Self::new(
+            angle_x,
+            angle_y,
+            angle_z,
+            [t[0], t[1], t[2]],
+            [self.center[0], self.center[1], self.center[2]],
+        );
+        inverse.set_compute_zyx(self.compute_zyx);
+        Ok(inverse)
+    }
+}
+
+impl VersorTransform {
+    /// The inverse rotation about the same center. The inverse of `R·(x − c) + c`
+    /// is `Rᵀ·(x − c) + c`, whose `MatrixOffsetTransformBase` translation is
+    /// exactly zero — so it is again a pure versor transform.
+    pub fn inverse(&self) -> Result<Self> {
+        let matrix = matrix::invert(&self.matrix, 3)
+            .ok_or(TransformError::NoInverse("the rotation matrix is singular"))?;
+        let (x, y, z) = versor_right_part_from_matrix(&matrix)?;
+        Ok(Self::new(
+            x,
+            y,
+            z,
+            [self.center[0], self.center[1], self.center[2]],
+        ))
+    }
+}
+
+impl VersorRigid3DTransform {
+    /// The inverse rigid transform about the same center.
+    pub fn inverse(&self) -> Result<Self> {
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 3)
+            .ok_or(TransformError::NoInverse("the rotation matrix is singular"))?;
+        let t = translation_from_offset(&matrix, &offset, &self.center, 3);
+        let (x, y, z) = versor_right_part_from_matrix(&matrix)?;
+        Ok(Self::new(
+            x,
+            y,
+            z,
+            [t[0], t[1], t[2]],
+            [self.center[0], self.center[1], self.center[2]],
+        ))
+    }
+}
+
+impl Similarity3DTransform {
+    /// The inverse similarity transform about the same center, porting
+    /// `itk::Similarity3DTransform::ComputeMatrixParameters`
+    /// (`itkSimilarity3DTransform.hxx:288-300`): the scale is the cube root of
+    /// the inverse matrix's determinant, and the versor comes from the matrix
+    /// divided by it.
+    pub fn inverse(&self) -> Result<Self> {
+        let (matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 3).ok_or(
+            TransformError::NoInverse("the similarity matrix is singular"),
+        )?;
+        let scale = determinant3(&matrix).cbrt();
+        if scale == 0.0 || !scale.is_finite() {
+            return Err(TransformError::NoInverse("the similarity scale is zero"));
+        }
+        let rotation: Vec<f64> = matrix.iter().map(|v| v / scale).collect();
+        let (x, y, z) = versor_right_part_from_matrix(&rotation)?;
+        let t = translation_from_offset(&matrix, &offset, &self.center, 3);
+        Ok(Self::new(
+            scale,
+            x,
+            y,
+            z,
+            [t[0], t[1], t[2]],
+            [self.center[0], self.center[1], self.center[2]],
+        ))
+    }
+}
+
+impl ComposeScaleSkewVersor3DTransform {
+    /// The inverse transform about the same center, porting
+    /// `itk::ComposeScaleSkewVersor3DTransform::ComputeMatrixParameters`
+    /// (`itkComposeScaleSkewVersor3DTransform.hxx:240-292`): a Gram–Schmidt
+    /// QR-style factorization of the inverse matrix's columns recovers the
+    /// scales, the three skews and the rotation, with the first scale negated if
+    /// the residual rotation is a reflection.
+    pub fn inverse(&self) -> Result<Self> {
+        let (inverse_matrix, offset) = invert_matrix_offset(&self.matrix, &self.offset, 3)
+            .ok_or(TransformError::NoInverse("the matrix is singular"))?;
+        // ITK's ComputeMatrixParameters factorizes a *copy*; the translation is
+        // computed from the untouched inverse matrix beforehand.
+        let t = translation_from_offset(&inverse_matrix, &offset, &self.center, 3);
+        let mut m = inverse_matrix;
+        let col_norm =
+            |m: &[f64], c: usize| (m[c] * m[c] + m[3 + c] * m[3 + c] + m[6 + c] * m[6 + c]).sqrt();
+        let scale_col = |m: &mut [f64], c: usize, s: f64| {
+            m[c] /= s;
+            m[3 + c] /= s;
+            m[6 + c] /= s;
+        };
+
+        let mut scale = [0.0f64; 3];
+        let mut skew = [0.0f64; 3];
+
+        scale[0] = col_norm(&m, 0);
+        if scale[0] == 0.0 {
+            return Err(TransformError::NoInverse("a scale factor is zero"));
+        }
+        scale_col(&mut m, 0, scale[0]);
+
+        let ortho = m[0] * m[1] + m[3] * m[4] + m[6] * m[7];
+        m[1] -= ortho * m[0];
+        m[4] -= ortho * m[3];
+        m[7] -= ortho * m[6];
+        scale[1] = col_norm(&m, 1);
+        if scale[1] == 0.0 {
+            return Err(TransformError::NoInverse("a scale factor is zero"));
+        }
+        scale_col(&mut m, 1, scale[1]);
+        skew[0] = ortho / scale[0];
+
+        let ortho0 = m[0] * m[2] + m[3] * m[5] + m[6] * m[8];
+        let ortho1 = m[1] * m[2] + m[4] * m[5] + m[7] * m[8];
+        m[2] -= ortho0 * m[0] + ortho1 * m[1];
+        m[5] -= ortho0 * m[3] + ortho1 * m[4];
+        m[8] -= ortho0 * m[6] + ortho1 * m[7];
+        scale[2] = col_norm(&m, 2);
+        if scale[2] == 0.0 {
+            return Err(TransformError::NoInverse("a scale factor is zero"));
+        }
+        scale_col(&mut m, 2, scale[2]);
+        skew[1] = ortho0 / scale[0];
+        skew[2] = ortho1 / scale[1];
+
+        if determinant3(&m) < 0.0 {
+            scale[0] = -scale[0];
+            m[0] = -m[0];
+            m[3] = -m[3];
+            m[6] = -m[6];
+        }
+
+        let (x, y, z) = versor_right_part_from_matrix(&m)?;
+        Ok(Self::new(
+            scale,
+            skew,
+            x,
+            y,
+            z,
+            [t[0], t[1], t[2]],
+            [self.center[0], self.center[1], self.center[2]],
+        ))
+    }
+}
+
+impl ScaleTransform {
+    /// The reciprocal scale about the same center
+    /// (`itk::ScaleTransform::GetInverse`, `itkScaleTransform.hxx:167-181`).
+    ///
+    /// ITK does not guard against a zero scale factor — `1.0 / m_Scale[i]` is
+    /// then an infinity, which the returned transform carries. This port
+    /// reproduces that rather than erroring.
+    pub fn inverse(&self) -> Self {
+        Self::new(
+            self.scale.iter().map(|s| 1.0 / s).collect(),
+            self.center.clone(),
+        )
+    }
+}
+
+impl ScaleLogarithmicTransform {
+    /// The reciprocal scale about the same center — see [`ScaleTransform::inverse`],
+    /// which this delegates to (`itk::ScaleLogarithmicTransform` derives from
+    /// `itk::ScaleTransform` and does not override `GetInverse`).
+    pub fn inverse(&self) -> Self {
+        Self {
+            inner: self.inner.inverse(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every supported inverse must undo its transform on a scatter of points.
+    fn assert_undoes<T: TransformBase, U: TransformBase>(t: &T, inv: &U, dim: usize) {
+        let points: &[&[f64]] = &[
+            &[0.0, 0.0, 0.0],
+            &[1.0, 2.0, 3.0],
+            &[-4.5, 0.25, 7.0],
+            &[100.0, -100.0, 0.5],
+        ];
+        for p in points {
+            let p = &p[..dim];
+            let back = inv.transform_point(&t.transform_point(p));
+            for d in 0..dim {
+                assert!(
+                    (back[d] - p[d]).abs() < 1e-9,
+                    "round trip failed at {p:?}: got {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn translation_inverse_undoes_the_translation() {
+        let t = TranslationTransform::new(vec![2.0, -3.0]);
+        assert_eq!(t.inverse().translation(), [-2.0, 3.0]);
+        assert_undoes(&t, &t.inverse(), 2);
+    }
+
+    #[test]
+    fn affine_inverse_undoes_the_affine() {
+        let a = AffineTransform::new(2, vec![2.0, 1.0, 0.0, 3.0], vec![5.0, -1.0], vec![1.0, 2.0]);
+        let inv = a.inverse().unwrap();
+        assert_eq!(inv.center(), [1.0, 2.0]);
+        assert_undoes(&a, &inv, 2);
+    }
+
+    #[test]
+    fn affine_inverse_errors_on_a_singular_matrix() {
+        let a = AffineTransform::new(2, vec![1.0, 2.0, 2.0, 4.0], vec![0.0, 0.0], vec![0.0, 0.0]);
+        assert!(matches!(a.inverse(), Err(TransformError::NoInverse(_))));
+    }
+
+    #[test]
+    fn euler2d_inverse_negates_the_angle_about_the_same_center() {
+        let e = Euler2DTransform::new(0.7, [3.0, -2.0], [1.0, 5.0]);
+        let inv = e.inverse().unwrap();
+        assert!((inv.angle() + 0.7).abs() < 1e-12, "{}", inv.angle());
+        assert_eq!(inv.center(), [1.0, 5.0]);
+        assert_undoes(&e, &inv, 2);
+    }
+
+    #[test]
+    fn similarity2d_inverse_reciprocates_the_scale() {
+        let s = Similarity2DTransform::new(2.5, 0.3, [1.0, 2.0], [-1.0, 4.0]);
+        let inv = s.inverse().unwrap();
+        assert!((inv.scale() - 0.4).abs() < 1e-12, "{}", inv.scale());
+        assert!((inv.angle() + 0.3).abs() < 1e-12, "{}", inv.angle());
+        assert_undoes(&s, &inv, 2);
+    }
+
+    #[test]
+    fn euler3d_inverse_undoes_the_rotation_in_both_composition_orders() {
+        for zyx in [false, true] {
+            let mut e = Euler3DTransform::new(0.3, -0.4, 0.5, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+            e.set_compute_zyx(zyx);
+            let inv = e.inverse().unwrap();
+            assert_eq!(inv.compute_zyx(), zyx);
+            assert_eq!(inv.center(), [4.0, 5.0, 6.0]);
+            assert_undoes(&e, &inv, 3);
+        }
+    }
+
+    #[test]
+    fn euler3d_inverse_handles_the_gimbal_lock_branch() {
+        // angle_x = pi/2 drives cos(angle_x) to zero in the non-ZYX branch.
+        let e = Euler3DTransform::new(
+            std::f64::consts::FRAC_PI_2,
+            0.0,
+            0.4,
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        );
+        assert_undoes(&e, &e.inverse().unwrap(), 3);
+    }
+
+    #[test]
+    fn versor_inverse_is_a_pure_rotation_about_the_same_center() {
+        let v = VersorTransform::new(0.1, 0.2, 0.3, [1.0, 2.0, 3.0]);
+        let inv = v.inverse().unwrap();
+        assert_eq!(inv.center(), [1.0, 2.0, 3.0]);
+        assert_undoes(&v, &inv, 3);
+    }
+
+    #[test]
+    fn versor_rigid3d_inverse_undoes_the_transform() {
+        let v = VersorRigid3DTransform::new(0.1, -0.2, 0.3, [4.0, 5.0, 6.0], [1.0, 1.0, 1.0]);
+        assert_undoes(&v, &v.inverse().unwrap(), 3);
+    }
+
+    #[test]
+    fn similarity3d_inverse_reciprocates_the_scale() {
+        let s = Similarity3DTransform::new(2.0, 0.1, 0.2, 0.3, [1.0, 2.0, 3.0], [0.5, 0.5, 0.5]);
+        let inv = s.inverse().unwrap();
+        assert!((inv.scale() - 0.5).abs() < 1e-12, "{}", inv.scale());
+        assert_undoes(&s, &inv, 3);
+    }
+
+    #[test]
+    fn compose_scale_skew_versor3d_inverse_undoes_the_transform() {
+        let c = ComposeScaleSkewVersor3DTransform::new(
+            [2.0, 1.5, 0.5],
+            [0.1, 0.2, -0.3],
+            0.1,
+            0.2,
+            0.3,
+            [1.0, 2.0, 3.0],
+            [0.5, -0.5, 1.0],
+        );
+        assert_undoes(&c, &c.inverse().unwrap(), 3);
+    }
+
+    #[test]
+    fn scale_inverse_reciprocates_each_factor() {
+        let s = ScaleTransform::new(vec![2.0, 4.0], vec![1.0, 1.0]);
+        let inv = s.inverse();
+        assert_eq!(inv.scale(), [0.5, 0.25]);
+        assert_eq!(inv.center(), [1.0, 1.0]);
+        assert_undoes(&s, &inv, 2);
+
+        // ITK does not guard a zero scale; the reciprocal is an infinity.
+        let zero = ScaleTransform::new(vec![0.0, 1.0], vec![0.0, 0.0]);
+        assert_eq!(zero.inverse().scale()[0], f64::INFINITY);
+    }
+
+    #[test]
+    fn scale_logarithmic_inverse_reciprocates_each_factor() {
+        let s = ScaleLogarithmicTransform::new(vec![2.0, 4.0], vec![1.0, 1.0]);
+        let inv = s.inverse();
+        assert_eq!(inv.scale(), [0.5, 0.25]);
+        assert_undoes(&s, &inv, 2);
+    }
 
     #[test]
     fn translation_transforms_point() {
