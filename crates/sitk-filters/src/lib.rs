@@ -96,6 +96,7 @@ pub mod morphology_reconstruction;
 pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
+pub mod normalized_correlation;
 pub mod object_morphology;
 pub mod objectness;
 pub mod overlap;
@@ -252,6 +253,7 @@ pub use n4_bias_field::{
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
 pub use noise_estimate::noise;
+pub use normalized_correlation::normalized_correlation;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
