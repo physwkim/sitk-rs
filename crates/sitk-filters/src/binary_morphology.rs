@@ -331,6 +331,7 @@ fn voting_binary_hole_filling_pass_typed<T: Scalar>(
             // `else { it.Set(foregroundValue); }`: any non-background center
             // is stamped to foreground_value, not just an exact-foreground
             // one, and this branch never contributes to the changed count.
+            // Tracked in the upstream-findings ledger, §2.69.
             foreground
         };
         out.push(value);

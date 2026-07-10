@@ -44,7 +44,8 @@ pub enum FilterError {
     /// reproducing the wraparound. Only reachable through a caller-built
     /// `StructuringElement::from_mask` whose on-mask excludes the center
     /// offset, since `box_`/`cross`/`ball` always keep the center on (always
-    /// in-bounds for every pixel).
+    /// in-bounds for every pixel). Tracked in the upstream-findings ledger,
+    /// §4.32.
     #[error("rank filter's structuring element window is empty at some pixel")]
     EmptyRankNeighborhood,
 

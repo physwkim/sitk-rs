@@ -278,7 +278,9 @@ pub fn shift_scale(
 /// `DivideImageFilter`'s per-pixel-vs-scalar-constant mode (`div->SetConstant2(divisor)`),
 /// i.e. every output pixel is `input / divisor`. Output pixel type is
 /// `NumericTraits<InputPixelType>::RealType` ([`crate::real_pixel_id`], reused
-/// per `fast_marching`'s precedent).
+/// per `fast_marching`'s precedent — including that helper's own tracked
+/// `Float32 -> Float32` divergence from ITK's true `RealType` rule, ledger
+/// §5.6).
 ///
 /// **Divisor-is-zero quirk, reproduced exactly**: `DivideImageFilter`'s `Div`
 /// functor (`itkArithmeticOpsFunctors.h:142-151`) special-cases a
@@ -300,7 +302,7 @@ pub fn shift_scale(
 /// numerator over a zero divisor here would naturally narrow to
 /// `NonpositiveMin()`, and a *zero* numerator to `NaN` narrowing to `0` —
 /// both would silently diverge from upstream's unconditional `max()` without
-/// this explicit branch.
+/// this explicit branch. Tracked in the upstream-findings ledger, §2.68.
 ///
 /// Setting `constant = 0.0` on a *nonzero*-sum image is a different case:
 /// `divisor = sum / 0.0` is `±infinity`, not "almost zero", so `Div` takes
