@@ -18,3 +18,8 @@ flate2.workspace = true
 # default feature and rides on the same flate2/miniz_oxide backend as
 # `crate::compression`.
 rust-hdf5 = "0.3"
+# Pure-Rust PNG decoding/encoding, used by the `png` module for `.png` image
+# IO. Default features only: `fdeflate` for the write-side deflate and
+# `miniz_oxide` (via `flate2`) for the read side — no `*-sys` crate enters the
+# tree (verified with `cargo tree`) — ledger §5.8.
+png = "0.18"

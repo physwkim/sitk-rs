@@ -107,6 +107,42 @@ pub enum IoError {
     #[error("unsupported VTK feature: {0}")]
     UnsupportedVtkFeature(String),
 
+    /// A PNG file's 8-byte signature was missing or did not match, discovered
+    /// while parsing a header (rather than by [`ImageIo::can_read_file`]
+    /// (crate::ImageIo), which gates the normal registry path). Two upstream
+    /// messages collapse into this one variant:
+    /// `"PNGImageIO failed to read header for file: ..."` when fewer than 8
+    /// bytes are present, and `"File is not png type: ..."` when 8 bytes are
+    /// present but do not match (itkPNGImageIO.cxx:130-143, :325-338).
+    #[error("malformed PNG header: {0}")]
+    MalformedPngHeader(String),
+
+    /// A PNG feature `PNGImageIO` itself refuses, or that SimpleITK's wrapping
+    /// layer cannot represent. Two sites, both upstream's own: `"PNG supports
+    /// unsigned char and unsigned short"` on write for any other component
+    /// type (itkPNGImageIO.cxx:550), and `GetPixelIDFromImageIO`'s
+    /// `"Unknown PixelType"` for a 2-channel (gray + alpha) PNG, which
+    /// `png_get_channels` never turns into `RGB`/`RGBA` so `m_PixelType` stays
+    /// `SCALAR` with `NumberOfComponents == 2`
+    /// (itkPNGImageIO.cxx:452-461, sitkImageReaderBase.cxx:215-238). See
+    /// [`crate::png`] and ledger §3.
+    #[error("unsupported PNG feature: {0}")]
+    UnsupportedPngFeature(String),
+
+    /// A PNG file failed to decode — a bad signature the `png` crate itself
+    /// caught, a truncated/corrupt IDAT stream, or a malformed chunk. Upstream
+    /// has no single equivalent: libpng's error callback longjmps out of
+    /// either `png_read_info` (`"PNG critical error in ..."`) or
+    /// `png_read_image` (`"Error while reading file: ..."`)
+    /// (itkPNGImageIO.cxx:164-168, :248-252).
+    #[error("png decoding error: {0}")]
+    PngDecode(#[from] png::DecodingError),
+
+    /// A PNG image failed to encode — a bad bit-depth/color-type combination,
+    /// or an IO failure inside the `png` crate's writer.
+    #[error("png encoding error: {0}")]
+    PngEncode(#[from] png::EncodingError),
+
     /// A zlib or gzip stream could not be inflated. Upstream has no such error:
     /// `MET_PerformUncompression` returns `true` after printing "Uncompress
     /// failed" (metaUtils.cxx:883), leaving the caller's buffer uninitialised.

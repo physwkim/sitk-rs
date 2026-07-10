@@ -41,6 +41,7 @@ pub mod image_io;
 pub mod meta_image;
 pub mod nifti;
 pub mod nrrd;
+pub mod png;
 pub mod reader;
 pub mod transform_hdf5;
 pub mod transform_io;
@@ -404,14 +405,14 @@ mod tests {
         assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
     }
 
-    /// No registered `ImageIo` advertises `.png`, so `CreateImageIO` returns
+    /// No registered `ImageIo` advertises `.jpg`, so `CreateImageIO` returns
     /// null and `ImageFileWriter::GetImageIOBase` throws "Unable to determine
     /// ImageIO writer" (sitkImageFileWriter.cxx:207-210).
     #[test]
     fn unknown_extension_errors() {
         let img = Image::new(&[2, 2], PixelId::UInt8);
         assert!(matches!(
-            write_image(&img, tmp_path("x.png")),
+            write_image(&img, tmp_path("x.jpg")),
             Err(IoError::NoWriterFound(_))
         ));
     }
@@ -429,7 +430,8 @@ mod tests {
                 "NrrdImageIO",
                 "NiftiImageIO",
                 "GiplImageIO",
-                "VTKImageIO"
+                "VTKImageIO",
+                "PNGImageIO"
             ]
         );
         assert_eq!(
@@ -449,9 +451,10 @@ mod tests {
             "GiplImageIO"
         );
         assert_eq!(image_io_by_name("VTKImageIO").unwrap().name(), "VTKImageIO");
+        assert_eq!(image_io_by_name("PNGImageIO").unwrap().name(), "PNGImageIO");
         assert!(matches!(
-            image_io_by_name("PNGImageIO"),
-            Err(IoError::UnknownImageIo(name)) if name == "PNGImageIO"
+            image_io_by_name("JPEGImageIO"),
+            Err(IoError::UnknownImageIo(name)) if name == "JPEGImageIO"
         ));
     }
 
@@ -567,7 +570,9 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(written.starts_with(b"NRRD"));
 
-        writer.set_image_io(Some("PNGImageIO"));
+        // PNG is now registered (unlike when this test was written), so an
+        // unregistered name is needed for the negative case.
+        writer.set_image_io(Some("JPEGImageIO"));
         assert!(matches!(
             writer.execute(&img),
             Err(IoError::UnknownImageIo(_))
@@ -579,7 +584,8 @@ mod tests {
                 "NrrdImageIO",
                 "NiftiImageIO",
                 "GiplImageIO",
-                "VTKImageIO"
+                "VTKImageIO",
+                "PNGImageIO"
             ]
         );
     }
@@ -3973,5 +3979,200 @@ mod tests {
         let claimed = create_image_io(&path, FileMode::Read).is_some();
         std::fs::remove_file(&path).ok();
         assert!(!claimed);
+    }
+
+    // ---- PNG ---------------------------------------------------------------
+
+    #[test]
+    fn png_roundtrip_grayscale_uint8() {
+        let data: Vec<u8> = (0..12u32).map(|i| (i * 23) as u8).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("gray_u8.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::UInt8);
+        assert_eq!(back.size(), &[4, 3]);
+        // No `sCAL` support (§4.85): spacing/origin are always the defaults,
+        // whatever the source `Image` carried.
+        assert_eq!(back.spacing(), &[1.0, 1.0]);
+        assert_eq!(back.origin(), &[0.0, 0.0]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// 16-bit samples above 255 pin that the write/read path carries full
+    /// 16-bit range, not just the low byte — the endianness swap itself is
+    /// pinned independently in `png::tests` against a hand-built fixture.
+    #[test]
+    fn png_roundtrip_grayscale_uint16() {
+        let data: Vec<u16> = (0..12u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec(&[4, 3], data.clone()).unwrap();
+        let path = tmp_path("gray_u16.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::UInt16);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.scalar_slice::<u16>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn png_roundtrip_rgb_vector_uint8() {
+        let data: Vec<u8> = (0..36u32).map(|i| (i * 7) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 3, data.clone()).unwrap();
+        let path = tmp_path("rgb_u8.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn png_roundtrip_rgb_vector_uint16() {
+        let data: Vec<u16> = (0..36u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec_vector::<u16>(&[4, 3], 3, data.clone()).unwrap();
+        let path = tmp_path("rgb_u16.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(back.number_of_components_per_pixel(), 3);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn png_roundtrip_rgba_vector_uint8() {
+        let data: Vec<u8> = (0..48u32).map(|i| (i * 5) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 4, data.clone()).unwrap();
+        let path = tmp_path("rgba_u8.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 4);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn png_roundtrip_rgba_vector_uint16() {
+        let data: Vec<u16> = (0..48u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec_vector::<u16>(&[4, 3], 4, data.clone()).unwrap();
+        let path = tmp_path("rgba_u16.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(back.number_of_components_per_pixel(), 4);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
+    }
+
+    /// `WriteSlice` takes `height` from `GetDimensions(1)` alone
+    /// (itkPNGImageIO.cxx:605) and never consults any axis beyond it, so a
+    /// 3-D image's second and later slices are never written. Ledger §2.125.
+    #[test]
+    fn png_write_of_a_three_dimensional_image_writes_only_the_first_slice() {
+        let data: Vec<u8> = (0..12u32).map(|i| i as u8).collect(); // size [2, 2, 3]
+        let img = Image::from_vec(&[2, 2, 3], data.clone()).unwrap();
+        let path = tmp_path("three_d.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.dimension(), 2);
+        assert_eq!(back.size(), &[2, 2]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &data[..4]);
+    }
+
+    /// `WriteSlice` opens the file with `fopen(fileName, "wb")` — which
+    /// truncates immediately — before its component-type switch's `default:`
+    /// throws "PNG supports unsigned char and unsigned short"
+    /// (itkPNGImageIO.cxx:514-553). Ledger §1.59.
+    #[test]
+    fn png_write_of_an_unwritable_component_type_truncates_the_file() {
+        let img = Image::from_vec(&[2, 2], vec![1i16, 2, 3, 4]).unwrap();
+        let path = tmp_path("unwritable.png");
+        std::fs::write(&path, b"pre-existing content that should be truncated").unwrap();
+
+        let result = write_image(&img, &path);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedPngFeature(m))
+                if m.contains("PNG supports unsigned char and unsigned short")),
+            "{result:?}"
+        );
+        assert!(
+            bytes.is_empty(),
+            "expected a truncated file, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    /// `CanReadFile`'s signature check rejects a `.png`-named file whose
+    /// content is not PNG, so `create_image_io` never selects [`png`] for it
+    /// and the top-level [`read_image`] reports [`IoError::NoReaderFound`]
+    /// rather than [`IoError::MalformedPngHeader`] — that error is only
+    /// observable by calling [`png::read`]/[`png::read_information`] directly,
+    /// bypassing the registry, exactly as the analogous GIPL/VTK tests do.
+    #[test]
+    fn png_garbage_bytes_under_a_png_extension_are_not_claimed_for_reading() {
+        let path = tmp_path("garbage.png");
+        std::fs::write(&path, b"this is not a png file, but is long enough\n").unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        let direct_read = png::read(&path);
+        let direct_info = png::read_information(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(!claimed);
+        assert!(
+            matches!(result, Err(IoError::NoReaderFound(_))),
+            "{result:?}"
+        );
+        assert!(
+            matches!(&direct_read, Err(IoError::MalformedPngHeader(_))),
+            "{direct_read:?}"
+        );
+        assert!(
+            matches!(&direct_info, Err(IoError::MalformedPngHeader(_))),
+            "{direct_info:?}"
+        );
+    }
+
+    /// Unlike the garbage-bytes case, `CanReadFile` checks only the 8-byte
+    /// signature (itkPNGImageIO.cxx:79-89) — it does not validate the rest of
+    /// the stream — so a file with a genuine signature but a truncated `IDAT`
+    /// *is* claimed, and the decode failure surfaces through the registry as
+    /// [`IoError::PngDecode`].
+    #[test]
+    fn png_truncated_idat_is_claimed_and_then_a_decode_error() {
+        let img = Image::from_vec(&[8, 8], vec![0u8; 64]).unwrap();
+        let path = tmp_path("truncated.png");
+        write_image(&img, &path).unwrap();
+
+        let full = std::fs::read(&path).unwrap();
+        let truncated = &full[..full.len() - 20];
+        std::fs::write(&path, truncated).unwrap();
+
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert!(claimed);
+        assert!(matches!(&result, Err(IoError::PngDecode(_))), "{result:?}");
     }
 }
