@@ -1309,7 +1309,6 @@ impl ImageIo for TiffImageIo {
     /// `CanWriteFile` is `HasSupportedWriteExtension(name, false)`
     /// (itkTIFFImageIO.cxx:542-553) — case-**sensitive**, unlike the trait's
     /// case-insensitive default. `foo.TIFF` is claimed, `foo.Tiff` is not.
-    /// Ledger §2.142.
     fn can_write_file(&self, path: &Path) -> bool {
         has_supported_extension(path, self.supported_write_extensions(), false)
     }
