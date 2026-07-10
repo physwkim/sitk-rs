@@ -39,6 +39,8 @@ pub mod error;
 pub mod gipl;
 pub mod image_hdf5;
 pub mod image_io;
+pub mod image_series_reader;
+pub mod image_series_writer;
 pub mod jpeg;
 pub mod meta_image;
 pub mod nifti;
@@ -59,6 +61,8 @@ pub use image_io::{
     FileMode, ImageInformation, ImageIo, create_image_io, image_io_by_name, registered_image_ios,
     registry,
 };
+pub use image_series_reader::ImageSeriesReader;
+pub use image_series_writer::ImageSeriesWriter;
 pub use reader::ImageFileReader;
 use sitk_core::Image;
 pub use transform_io::{read_transform, write_transform};
