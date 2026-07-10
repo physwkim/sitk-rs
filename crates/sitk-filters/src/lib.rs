@@ -366,18 +366,22 @@ fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Resu
 ///
 /// The inverse of [`Image::to_f64_vec`], and scalar-only for the same reason:
 /// `vals` is one element per pixel, and [`dispatch_scalar!`] would resolve a
-/// vector `target` to its *component* type, quietly producing a scalar image
-/// of that component type. Rejecting a vector `target` with the same
-/// [`sitk_core::Error::RequiresScalarPixelType`] the read side raises keeps the
-/// pair symmetric: every scalar filter enters through `to_f64_vec` and leaves
-/// through here, and neither end can be handed a vector image.
+/// non-scalar `target` to its *component* type, quietly producing a scalar
+/// image of that component type — or, for a complex `target`, an `N`-element
+/// buffer where `assemble` demands `2N`. Rejecting every non-scalar `target`
+/// with the same [`sitk_core::Error::RequiresScalarPixelType`] the read side
+/// raises keeps the pair symmetric: every scalar filter enters through
+/// `to_f64_vec` and leaves through here, and neither end can be handed a
+/// non-scalar image. The test is a whitelist on
+/// [`PixelId::is_scalar`](sitk_core::PixelId::is_scalar), matching
+/// `Image::require_scalar`.
 pub(crate) fn image_from_f64(
     target: PixelId,
     size: &[usize],
     geom: &Image,
     vals: &[f64],
 ) -> Result<Image> {
-    if target.is_vector() {
+    if !target.is_scalar() {
         return Err(sitk_core::Error::RequiresScalarPixelType(target).into());
     }
     dispatch_scalar!(target, build_from_f64, size, geom, vals)
@@ -399,6 +403,14 @@ pub(crate) fn image_from_f64(
 /// (`NumericTraits<VariableLengthVector<T>>::RealType` is
 /// `VariableLengthVector<NumericTraits<T>::RealType>`), so the projection never
 /// silently drops a pixel type's multi-component-ness.
+///
+/// A complex pixel type maps to its *component's* real type, dropping the
+/// complex-ness — `NumericTraits<std::complex<float>>::RealType` is
+/// `std::complex<double>` upstream. No caller reaches that arm: every filter
+/// routing through here declares a `pixel_types` list that excludes complex and
+/// enters via `to_f64_vec`, which rejects a complex image at the scalar seam.
+/// The arm nevertheless yields the right answer for the one place it *is* the
+/// rule — `ComplexToReal`'s `output_pixel_type: InputImageType::PixelType::value_type`.
 pub(crate) fn real_pixel_id(input: PixelId) -> PixelId {
     let real = match input.component_id() {
         PixelId::Float32 => PixelId::Float32,

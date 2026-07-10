@@ -4,20 +4,24 @@ use std::any::Any;
 
 use crate::error::{Error, Result};
 use crate::matrix;
-use crate::pixel::{PixelId, Scalar};
+use crate::pixel::{Complex, PixelId, Real, Scalar};
 
 /// Type-erased *component* storage: one `Vec` variant per scalar component type.
 ///
 /// Data is stored in ITK/SimpleITK order — the first index (x) varies fastest.
-/// For a scalar image the buffer holds one element per pixel. For a vector
-/// image it holds `number_of_pixels * components_per_pixel` elements,
-/// **interleaved**: the components of one pixel are adjacent, exactly as
+/// The buffer holds `number_of_pixels * buffer_stride` elements, **interleaved**:
+/// the components of one pixel are adjacent. A scalar image has stride 1; a
+/// vector image has stride `number_of_components_per_pixel`, exactly as
 /// `itk::VectorImage` lays out its single contiguous `ImportImageContainer`
 /// (itkVectorImage.h: the pixel components are stored contiguously in a buffer
-/// of length `NumberOfPixels * VectorLength`).
+/// of length `NumberOfPixels * VectorLength`); a complex image has stride 2,
+/// `re, im, re, im, ...`, which is what SimpleITK's `GetBufferAsFloat()` on a
+/// `sitkComplexFloat32` image reinterpret-casts to
+/// (sitkPimpleImageBase.hxx:838-842).
 ///
-/// A `PixelBuffer` therefore knows its *component* type, never whether the
-/// image that owns it is scalar or vector; that distinction lives on [`Image`].
+/// A `PixelBuffer` therefore knows its *component* type, never which pixel
+/// category the image that owns it belongs to; that distinction lives on
+/// [`Image`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum PixelBuffer {
     UInt8(Vec<u8>),
@@ -35,8 +39,8 @@ pub enum PixelBuffer {
 impl PixelBuffer {
     /// A zero-filled buffer of `len` *components* of `id`'s component type.
     ///
-    /// A vector `id` selects the same variant as its component's scalar id;
-    /// `len` is a component count, not a pixel count.
+    /// A vector or complex `id` selects the same variant as its component's
+    /// scalar id; `len` is a component count, not a pixel count.
     pub fn zeroed(id: PixelId, len: usize) -> Self {
         match id {
             PixelId::UInt8 | PixelId::VectorUInt8 => PixelBuffer::UInt8(vec![0; len]),
@@ -47,8 +51,12 @@ impl PixelBuffer {
             PixelId::Int32 | PixelId::VectorInt32 => PixelBuffer::Int32(vec![0; len]),
             PixelId::UInt64 | PixelId::VectorUInt64 => PixelBuffer::UInt64(vec![0; len]),
             PixelId::Int64 | PixelId::VectorInt64 => PixelBuffer::Int64(vec![0; len]),
-            PixelId::Float32 | PixelId::VectorFloat32 => PixelBuffer::Float32(vec![0.0; len]),
-            PixelId::Float64 | PixelId::VectorFloat64 => PixelBuffer::Float64(vec![0.0; len]),
+            PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => {
+                PixelBuffer::Float32(vec![0.0; len])
+            }
+            PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => {
+                PixelBuffer::Float64(vec![0.0; len])
+            }
         }
     }
 
@@ -164,30 +172,52 @@ impl PixelBuffer {
 /// Geometry vectors are all indexed in axis order matching [`Image::size`]; the
 /// direction matrix is stored row-major and is `dimension x dimension`.
 ///
-/// # Scalar and vector images
+/// # Scalar, complex, and vector images
 ///
-/// Mirroring SimpleITK's `sitkImage`, one `Image` type carries both
-/// `itk::Image` and `itk::VectorImage`: [`Image::pixel_id`] names which, and
-/// [`Image::number_of_components_per_pixel`] gives the vector length. The
-/// following invariant holds by construction — every `Image` is built through
-/// the private `assemble` seam, which rejects any other combination:
+/// Mirroring SimpleITK's `sitkImage`, one `Image` type carries `itk::Image<T>`,
+/// `itk::Image<std::complex<T>>`, and `itk::VectorImage<T>`: [`Image::pixel_id`]
+/// names which.
+///
+/// Two quantities are easily confused, and upstream keeps them apart:
+///
+/// - [`Image::buffer_stride`] — how many buffer components one pixel occupies.
+///   This is the **stored** field. `1` for scalar, `2` for complex,
+///   `number_of_components_per_pixel` for vector.
+/// - [`Image::number_of_components_per_pixel`] — SimpleITK's
+///   `GetNumberOfComponentsPerPixel()`, which returns the ITK vector length
+///   only `if constexpr (IsVector<TImageType>::Value)` and otherwise `1`
+///   (sitkPimpleImageBase.hxx:202-209). It is **derived**, and it reports `1`
+///   for a complex image even though that image's buffer holds two components
+///   per pixel.
+///
+/// They coincide for scalar and vector images, which is why one field once
+/// served for both. Storing the stride and deriving the SimpleITK quantity
+/// gives every path the same meaning for the stored value.
+///
+/// The following invariant holds by construction — every `Image` is built
+/// through the private `assemble` seam, which rejects any other combination:
 ///
 /// ```text
-/// components_per_pixel >= 1
-/// !pixel_id.is_vector()  =>  components_per_pixel == 1
+/// pixel_id.is_scalar()   =>  buffer_stride == 1
+/// pixel_id.is_complex()  =>  buffer_stride == 2
+/// pixel_id.is_vector()   =>  buffer_stride >= 1
 /// buffer.component_id()  ==  pixel_id.component_id()
-/// buffer.len()           ==  number_of_pixels * components_per_pixel
+/// buffer.len()           ==  number_of_pixels * buffer_stride
 /// ```
 ///
 /// Consequently the scalar accessors ([`Image::scalar_slice`],
-/// [`Image::scalar_vec_mut`]) can — and do — reject a vector image with
+/// [`Image::scalar_vec_mut`]) can — and do — reject every non-scalar image with
 /// [`Error::RequiresScalarPixelType`] rather than hand back an interleaved
-/// buffer that a scalar consumer would misread.
+/// buffer that a scalar consumer would misread. That guard is a *whitelist* on
+/// [`PixelId::is_scalar`]: a pixel category added later is rejected by default.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     buffer: PixelBuffer,
     pixel_id: PixelId,
-    components_per_pixel: usize,
+    /// Buffer components per pixel. One meaning on every path — see the type
+    /// docs. Never SimpleITK's `GetNumberOfComponentsPerPixel()`, which is
+    /// [`Image::number_of_components_per_pixel`].
+    buffer_stride: usize,
     size: Vec<usize>,
     spacing: Vec<f64>,
     origin: Vec<f64>,
@@ -253,6 +283,12 @@ impl Image {
     /// The single construction seam. Every `Image` in this workspace is built
     /// here, so the type's invariant (see the type docs) cannot be violated by
     /// any constructor, filter, or IO reader.
+    ///
+    /// `components_per_pixel` is SimpleITK's `numberOfComponents` constructor
+    /// argument, i.e. the value [`Image::number_of_components_per_pixel`] will
+    /// report — not the buffer stride, which this seam is the sole owner of.
+    /// `AllocateInternal` (sitkImage.hxx:60-67, :95-100) accepts only `1` for a
+    /// basic pixel type, complex included, and any count for a vector one.
     fn assemble(
         buffer: PixelBuffer,
         pixel_id: PixelId,
@@ -264,17 +300,12 @@ impl Image {
     ) -> Result<Self> {
         assert!(!size.is_empty(), "image dimension must be >= 1");
 
-        let legal_components = if pixel_id.is_vector() {
-            components_per_pixel >= 1
-        } else {
-            components_per_pixel == 1
-        };
-        if !legal_components {
+        let Some(buffer_stride) = pixel_id.buffer_stride_for(components_per_pixel) else {
             return Err(Error::InvalidComponentCount {
                 pixel_id,
                 components_per_pixel,
             });
-        }
+        };
         if buffer.component_id() != pixel_id.component_id() {
             return Err(Error::PixelTypeMismatch {
                 expected: pixel_id.component_id(),
@@ -283,7 +314,7 @@ impl Image {
         }
 
         let number_of_pixels: usize = size.iter().product();
-        let expected = number_of_pixels * components_per_pixel;
+        let expected = number_of_pixels * buffer_stride;
         if buffer.len() != expected {
             return Err(Error::BufferSizeMismatch {
                 expected,
@@ -299,7 +330,7 @@ impl Image {
         Ok(Image {
             buffer,
             pixel_id,
-            components_per_pixel,
+            buffer_stride,
             size,
             spacing,
             origin,
@@ -322,7 +353,8 @@ impl Image {
     /// SimpleITK's `Image(size, valueEnum, numberOfComponents = 0)`, whose
     /// `AllocateInternal` (sitkImage.hxx:70-73) substitutes
     /// `TImageType::ImageDimension` for a component count of zero. Use
-    /// [`Image::new_vector`] to choose the count.
+    /// [`Image::new_vector`] to choose the count. A scalar or complex `id` gets
+    /// one component per pixel, as upstream's basic-pixel-type branch does.
     pub fn new(size: &[usize], id: PixelId) -> Self {
         assert!(!size.is_empty(), "image dimension must be >= 1");
         let components = if id.is_vector() { size.len() } else { 1 };
@@ -332,17 +364,22 @@ impl Image {
 
     /// A new zero-filled image with an explicit component count.
     ///
-    /// A scalar `id` accepts only `components_per_pixel == 1`; a vector `id`
-    /// accepts any count `>= 1`. Mirrors SimpleITK's
+    /// A scalar or complex `id` accepts only `components_per_pixel == 1`; a
+    /// vector `id` accepts any count `>= 1`. Mirrors SimpleITK's
     /// `Image(size, valueEnum, numberOfComponents)` and its `AllocateInternal`
     /// check (sitkImage.hxx:63-67), which throws "Specified number of
     /// components as N but did not specify pixelID as a vector type!".
+    ///
+    /// The allocated buffer is `Π size * buffer_stride` components long, so a
+    /// complex `id` allocates two components per pixel while still reporting
+    /// one from [`Image::number_of_components_per_pixel`].
     pub fn new_vector(size: &[usize], id: PixelId, components_per_pixel: usize) -> Result<Self> {
         assert!(!size.is_empty(), "image dimension must be >= 1");
         let n: usize = size.iter().product();
+        let stride = id.buffer_stride_for(components_per_pixel).unwrap_or(0);
         let (spacing, origin, direction) = Self::default_geometry(size.len());
         Self::assemble(
-            PixelBuffer::zeroed(id, n * components_per_pixel),
+            PixelBuffer::zeroed(id, n * stride),
             id,
             components_per_pixel,
             size.to_vec(),
@@ -400,6 +437,43 @@ impl Image {
         )
     }
 
+    /// Build a complex image from a typed buffer of one [`Complex<T>`] per
+    /// pixel, laid out in first-index-fastest order.
+    ///
+    /// The pixel type is `T`'s complex variant, so `from_vec_complex::<f32>`
+    /// yields a [`PixelId::ComplexFloat32`] image, whose
+    /// [`Image::number_of_components_per_pixel`] is `1` and whose buffer holds
+    /// `2 * Π size` interleaved `f32`.
+    ///
+    /// Errors with [`Error::BufferSizeMismatch`] — counted in *pixels*, since
+    /// `data` is one element per pixel — if `data.len()` does not equal the
+    /// product of `size`.
+    pub fn from_vec_complex<T: Real>(size: &[usize], data: Vec<Complex<T>>) -> Result<Self> {
+        assert!(!size.is_empty(), "image dimension must be >= 1");
+        let number_of_pixels: usize = size.iter().product();
+        if data.len() != number_of_pixels {
+            return Err(Error::BufferSizeMismatch {
+                expected: number_of_pixels,
+                actual: data.len(),
+            });
+        }
+        let mut interleaved = Vec::with_capacity(data.len() * 2);
+        for c in data {
+            interleaved.push(c.re);
+            interleaved.push(c.im);
+        }
+        let (spacing, origin, direction) = Self::default_geometry(size.len());
+        Self::assemble(
+            T::into_buffer(interleaved),
+            T::COMPLEX_ID,
+            1,
+            size.to_vec(),
+            spacing,
+            origin,
+            direction,
+        )
+    }
+
     /// Assemble a scalar image from parts, validating that geometry lengths
     /// agree with the buffer size. Used by IO where all fields are read from a
     /// file.
@@ -423,13 +497,19 @@ impl Image {
     /// detaileddescription). The output takes its geometry from `images[0]` and
     /// its pixel type from that component type's vector variant.
     ///
+    /// A complex input is rejected along with a vector one: its buffer holds
+    /// two components per pixel, and `interleave` reads one. (ITK's
+    /// `ComposeImageFilter` *does* compose two real images into a complex one —
+    /// itkComposeImageFilter.hxx:132-138 — but that is the separate output-type
+    /// specialization behind `RealAndImaginaryToComplex`, not this vector path.)
+    ///
     /// Errors on an empty `images` list.
     pub fn from_component_images(images: &[&Image]) -> Result<Self> {
         let Some(first) = images.first() else {
             return Err(Error::EmptyComponentImageList);
         };
         for img in images {
-            if img.pixel_id.is_vector() {
+            if !img.pixel_id.is_scalar() {
                 return Err(Error::RequiresScalarPixelType(img.pixel_id));
             }
             if img.pixel_id != first.pixel_id {
@@ -484,16 +564,16 @@ impl Image {
         if !self.pixel_id.is_vector() {
             return Err(Error::RequiresVectorPixelType(self.pixel_id));
         }
-        if index >= self.components_per_pixel {
+        if index >= self.buffer_stride {
             return Err(Error::ComponentIndexOutOfRange {
                 index,
-                components_per_pixel: self.components_per_pixel,
+                components_per_pixel: self.buffer_stride,
             });
         }
 
         fn take<T: Scalar>(img: &Image, index: usize) -> Result<PixelBuffer> {
             let all = img.component_slice::<T>()?;
-            let stride = img.components_per_pixel;
+            let stride = img.buffer_stride;
             Ok(T::into_buffer(
                 all.iter().skip(index).step_by(stride).copied().collect(),
             ))
@@ -528,14 +608,34 @@ impl Image {
     }
 
     /// Components per pixel — SimpleITK's `GetNumberOfComponentsPerPixel()`.
-    /// Always `1` for a scalar image, `>= 1` for a vector image.
+    ///
+    /// `1` for a scalar image, `1` for a **complex** image, and the vector
+    /// length for a vector image. Derived, not stored: upstream returns the ITK
+    /// vector length only `if constexpr (IsVector<TImageType>::Value)` and
+    /// otherwise `1` (sitkPimpleImageBase.hxx:202-209), and `IsVector` is not
+    /// specialized for `BasicPixelID<std::complex<T>>`.
+    ///
+    /// A complex image's buffer nonetheless holds two components per pixel;
+    /// that count is [`Image::buffer_stride`].
     pub fn number_of_components_per_pixel(&self) -> usize {
-        self.components_per_pixel
+        if self.pixel_id.is_vector() {
+            self.buffer_stride
+        } else {
+            1
+        }
+    }
+
+    /// Buffer components one pixel occupies: `1` scalar, `2` complex,
+    /// [`Image::number_of_components_per_pixel`] vector.
+    ///
+    /// This is the multiplier relating [`Image::number_of_pixels`] to
+    /// `buffer().len()`, and the stride of [`Image::component_slice`].
+    pub fn buffer_stride(&self) -> usize {
+        self.buffer_stride
     }
 
     /// Total number of pixels — the product of [`Image::size`], *not* the
-    /// buffer length (which is this times
-    /// [`Image::number_of_components_per_pixel`]).
+    /// buffer length (which is this times [`Image::buffer_stride`]).
     pub fn number_of_pixels(&self) -> usize {
         self.size.iter().product()
     }
@@ -616,14 +716,16 @@ impl Image {
         &mut self.buffer
     }
 
-    /// The scalar guard: `Ok(())` for a scalar image, and
-    /// [`Error::RequiresScalarPixelType`] for a vector one.
+    /// The scalar guard: `Ok(())` when [`PixelId::is_scalar`], and
+    /// [`Error::RequiresScalarPixelType`] otherwise.
     ///
     /// Every scalar-typed read of an `Image` goes through this, so no consumer
     /// can reach an interleaved buffer while believing it holds one value per
-    /// pixel.
+    /// pixel. The test is a **whitelist** on the scalar category, not a
+    /// blacklist on the vector one: a complex image's buffer is `2N` long, and
+    /// `!is_vector()` would have admitted it.
     fn require_scalar(&self) -> Result<()> {
-        if self.pixel_id.is_vector() {
+        if !self.pixel_id.is_scalar() {
             return Err(Error::RequiresScalarPixelType(self.pixel_id));
         }
         Ok(())
@@ -632,8 +734,9 @@ impl Image {
     /// Borrow a scalar image's buffer as a concrete `&[T]`, one element per
     /// pixel.
     ///
-    /// Errors with [`Error::RequiresScalarPixelType`] on a vector image and
-    /// with [`Error::PixelTypeMismatch`] if `T` is not the image's pixel type.
+    /// Errors with [`Error::RequiresScalarPixelType`] on a vector or complex
+    /// image and with [`Error::PixelTypeMismatch`] if `T` is not the image's
+    /// pixel type.
     pub fn scalar_slice<T: Scalar>(&self) -> Result<&[T]> {
         self.require_scalar()?;
         self.buffer.as_slice::<T>().ok_or(Error::PixelTypeMismatch {
@@ -669,12 +772,14 @@ impl Image {
             })
     }
 
-    /// Borrow the whole interleaved component buffer as `&[T]`, for scalar and
-    /// vector images alike — `T` is the *component* type.
+    /// Borrow the whole interleaved component buffer as `&[T]`, for every pixel
+    /// category — `T` is the *component* type. SimpleITK's `GetBufferAsFloat()`
+    /// and friends (sitkPimpleImageBase.hxx:826-848).
     ///
-    /// Length is `number_of_pixels() * number_of_components_per_pixel()`. This
-    /// is the accessor vector filters use; scalar consumers want
-    /// [`Image::scalar_slice`], which refuses vector images.
+    /// Length is `number_of_pixels() * buffer_stride()`. This is the accessor
+    /// vector filters use; scalar consumers want [`Image::scalar_slice`], which
+    /// refuses non-scalar images, and complex consumers want
+    /// [`Image::complex_components`], which refuses non-complex ones.
     pub fn component_slice<T: Scalar>(&self) -> Result<&[T]> {
         self.buffer.as_slice::<T>().ok_or(Error::PixelTypeMismatch {
             expected: self.pixel_id.component_id(),
@@ -698,11 +803,11 @@ impl Image {
     /// pixel type, one element per pixel. A typed accessor, not an algorithm —
     /// filters and resampling both widen to `f64` to compute uniformly.
     ///
-    /// Errors with [`Error::RequiresScalarPixelType`] on a vector image. Every
-    /// caller of this function indexes the result by pixel, and a vector image's
-    /// buffer is `components_per_pixel` values per pixel; returning it here
-    /// would silently misalign every one of them. Vector callers want
-    /// [`Image::components_to_f64_vec`].
+    /// Errors with [`Error::RequiresScalarPixelType`] on a vector or complex
+    /// image. Every caller of this function indexes the result by pixel, and a
+    /// non-scalar image's buffer is `buffer_stride()` values per pixel;
+    /// returning it here would silently misalign every one of them. Those
+    /// callers want [`Image::components_to_f64_vec`].
     ///
     /// Together with [`Image::scalar_slice`] this is the whole scalar read
     /// surface of `Image`, so a filter cannot reach pixel data without passing
@@ -712,9 +817,8 @@ impl Image {
         Ok(self.buffer.to_f64_vec())
     }
 
-    /// Copy the interleaved component buffer into an `f64` vector, for scalar
-    /// and vector images alike. Length is `number_of_pixels() *
-    /// number_of_components_per_pixel()`.
+    /// Copy the interleaved component buffer into an `f64` vector, for every
+    /// pixel category. Length is `number_of_pixels() * buffer_stride()`.
     pub fn components_to_f64_vec(&self) -> Vec<f64> {
         self.buffer.to_f64_vec()
     }
@@ -722,9 +826,8 @@ impl Image {
     /// Linear buffer offset of a multi-index (first index fastest). Does not
     /// bounds-check against `size`.
     ///
-    /// This is a *pixel* offset. For a vector image, the components of that
-    /// pixel start at `linear_index(index) * number_of_components_per_pixel()`;
-    /// see [`Image::component_index`].
+    /// This is a *pixel* offset. The components of that pixel start at
+    /// `linear_index(index) * buffer_stride()`; see [`Image::component_index`].
     pub fn linear_index(&self, index: &[usize]) -> usize {
         debug_assert_eq!(index.len(), self.dimension());
         let mut offset = 0usize;
@@ -739,38 +842,50 @@ impl Image {
     /// Offset into the interleaved component buffer of `component` of the pixel
     /// at `index`. Does not bounds-check either argument.
     pub fn component_index(&self, index: &[usize], component: usize) -> usize {
-        self.linear_index(index) * self.components_per_pixel + component
+        self.linear_index(index) * self.buffer_stride + component
     }
 
     /// The components of the pixel at `index`, as a `&[T]` of length
-    /// [`Image::number_of_components_per_pixel`] — SimpleITK's
-    /// `GetPixelAsVector*`.
+    /// [`Image::buffer_stride`] — SimpleITK's `GetPixelAsVector*`.
     ///
-    /// Works for scalar images too, where the slice has length 1. Errors on
-    /// component-type mismatch.
+    /// Works for scalar images too, where the slice has length 1, and for
+    /// complex images, where it is `[re, im]`. The length is the *stride*, not
+    /// [`Image::number_of_components_per_pixel`]; the two differ only for a
+    /// complex image, and returning that image's single "component" would mean
+    /// handing back half its pixel.
+    ///
+    /// Errors on component-type mismatch.
+    ///
+    /// # Divergence
+    ///
+    /// SimpleITK's `GetPixelAsVectorFloat32` throws on a complex image — its
+    /// `InternalGetPixelAsVector` is gated on `IsVector<ImageType>::Value`
+    /// (sitkPimpleImageBase.hxx). One uniform "give me this pixel's components"
+    /// rule is preferred here over a fourth guard; [`Image::get_complex`] is
+    /// the typed accessor.
     ///
     /// # Panics
     ///
     /// Panics if `index` is out of bounds, like indexing a slice.
     pub fn get_vector<T: Scalar>(&self, index: &[usize]) -> Result<&[T]> {
         let start = self.component_index(index, 0);
-        let components = self.components_per_pixel;
+        let stride = self.buffer_stride;
         let all = self.component_slice::<T>()?;
-        Ok(&all[start..start + components])
+        Ok(&all[start..start + stride])
     }
 
     /// Overwrite the components of the pixel at `index` — SimpleITK's
     /// `SetPixelAsVector*`.
     ///
     /// Errors on component-type mismatch, or if `values.len()` is not
-    /// [`Image::number_of_components_per_pixel`].
+    /// [`Image::buffer_stride`]. Same divergence note as [`Image::get_vector`].
     ///
     /// # Panics
     ///
     /// Panics if `index` is out of bounds, like indexing a slice.
     pub fn set_vector<T: Scalar>(&mut self, index: &[usize], values: &[T]) -> Result<()> {
-        let components = self.components_per_pixel;
-        if values.len() != components {
+        let stride = self.buffer_stride;
+        if values.len() != stride {
             return Err(Error::InvalidComponentCount {
                 pixel_id: self.pixel_id,
                 components_per_pixel: values.len(),
@@ -778,8 +893,76 @@ impl Image {
         }
         let start = self.component_index(index, 0);
         let all = self.component_vec_mut::<T>()?;
-        all[start..start + components].copy_from_slice(values);
+        all[start..start + stride].copy_from_slice(values);
         Ok(())
+    }
+
+    /// The complex guard: `Ok(())` when [`PixelId::is_complex`], and
+    /// [`Error::RequiresComplexPixelType`] otherwise. A whitelist, like
+    /// `require_scalar`.
+    fn require_complex(&self) -> Result<()> {
+        if !self.pixel_id.is_complex() {
+            return Err(Error::RequiresComplexPixelType(self.pixel_id));
+        }
+        Ok(())
+    }
+
+    /// The complex pixel at `index` — SimpleITK's
+    /// `GetPixelAsComplexFloat32`/`64` (sitkImage.cxx:596-608).
+    ///
+    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image
+    /// and [`Error::PixelTypeMismatch`] if `T` is not the component type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds, like indexing a slice.
+    pub fn get_complex<T: Real>(&self, index: &[usize]) -> Result<Complex<T>> {
+        self.require_complex()?;
+        let start = self.component_index(index, 0);
+        let all = self.complex_components::<T>()?;
+        Ok(Complex::new(all[start], all[start + 1]))
+    }
+
+    /// Overwrite the complex pixel at `index` — SimpleITK's
+    /// `SetPixelAsComplexFloat32`/`64`.
+    ///
+    /// Errors exactly as [`Image::get_complex`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds, like indexing a slice.
+    pub fn set_complex<T: Real>(&mut self, index: &[usize], value: Complex<T>) -> Result<()> {
+        self.require_complex()?;
+        let start = self.component_index(index, 0);
+        let all = self.complex_components_mut::<T>()?;
+        all[start] = value.re;
+        all[start + 1] = value.im;
+        Ok(())
+    }
+
+    /// A complex image's interleaved `re, im, re, im, ...` buffer, of length
+    /// `2 * number_of_pixels()`.
+    ///
+    /// The exact analogue of `GetBufferAsFloat()` on a `sitkComplexFloat32`
+    /// image, which upstream produces by `reinterpret_cast`ing the
+    /// `std::complex<float>` buffer (sitkPimpleImageBase.hxx:838-842):
+    /// "Vector and Complex pixel types are both accessed via the appropriate
+    /// component type method" (sitkImage.h:622-623).
+    ///
+    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image —
+    /// unlike [`Image::component_slice`], which serves every category and says
+    /// so in its name.
+    pub fn complex_components<T: Real>(&self) -> Result<&[T]> {
+        self.require_complex()?;
+        self.component_slice::<T>()
+    }
+
+    /// The mutable counterpart of [`Image::complex_components`]. Growing or
+    /// shrinking the returned `Vec` would break the [`Image`] invariant that
+    /// ties its length to `2 * number_of_pixels()`.
+    pub fn complex_components_mut<T: Real>(&mut self) -> Result<&mut Vec<T>> {
+        self.require_complex()?;
+        self.component_vec_mut::<T>()
     }
 
     /// Map a continuous index to a physical point:
@@ -813,11 +996,11 @@ impl Image {
 /// identifier, so a turbofish can be appended); the same `R` is returned for
 /// every arm. The first argument is the [`PixelId`] to switch on.
 ///
-/// A vector [`PixelId`] selects the same `T` as its component's scalar id, so
-/// `$func` sees the type the buffer actually stores. That is not a licence to
-/// read the buffer as if it were scalar: `$func` reaches the pixels through
-/// [`Image::scalar_slice`], which rejects a vector image with
-/// [`crate::Error::RequiresScalarPixelType`], or through the explicitly
+/// A vector or complex [`PixelId`] selects the same `T` as its component's
+/// scalar id, so `$func` sees the type the buffer actually stores. That is not
+/// a licence to read the buffer as if it were scalar: `$func` reaches the
+/// pixels through [`Image::scalar_slice`], which rejects every non-scalar image
+/// with [`crate::Error::RequiresScalarPixelType`], or through the explicitly
 /// component-aware [`Image::component_slice`].
 ///
 /// ```
@@ -841,8 +1024,12 @@ macro_rules! dispatch_scalar {
             $crate::PixelId::Int32 | $crate::PixelId::VectorInt32 => $func::<i32>($($arg),*),
             $crate::PixelId::UInt64 | $crate::PixelId::VectorUInt64 => $func::<u64>($($arg),*),
             $crate::PixelId::Int64 | $crate::PixelId::VectorInt64 => $func::<i64>($($arg),*),
-            $crate::PixelId::Float32 | $crate::PixelId::VectorFloat32 => $func::<f32>($($arg),*),
-            $crate::PixelId::Float64 | $crate::PixelId::VectorFloat64 => $func::<f64>($($arg),*),
+            $crate::PixelId::Float32
+            | $crate::PixelId::ComplexFloat32
+            | $crate::PixelId::VectorFloat32 => $func::<f32>($($arg),*),
+            $crate::PixelId::Float64
+            | $crate::PixelId::ComplexFloat64
+            | $crate::PixelId::VectorFloat64 => $func::<f64>($($arg),*),
         }
     }};
 }

@@ -31,8 +31,8 @@ fn nonpositive_min(target: PixelId) -> f64 {
         PixelId::Int32 | PixelId::VectorInt32 => i32::MIN as f64,
         PixelId::UInt64 | PixelId::VectorUInt64 => u64::MIN as f64,
         PixelId::Int64 | PixelId::VectorInt64 => i64::MIN as f64,
-        PixelId::Float32 | PixelId::VectorFloat32 => -(f32::MAX as f64),
-        PixelId::Float64 | PixelId::VectorFloat64 => -f64::MAX,
+        PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => -(f32::MAX as f64),
+        PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => -f64::MAX,
     }
 }
 
@@ -47,8 +47,8 @@ fn numeric_max(target: PixelId) -> f64 {
         PixelId::Int32 | PixelId::VectorInt32 => i32::MAX as f64,
         PixelId::UInt64 | PixelId::VectorUInt64 => u64::MAX as f64,
         PixelId::Int64 | PixelId::VectorInt64 => i64::MAX as f64,
-        PixelId::Float32 | PixelId::VectorFloat32 => f32::MAX as f64,
-        PixelId::Float64 | PixelId::VectorFloat64 => f64::MAX,
+        PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => f32::MAX as f64,
+        PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => f64::MAX,
     }
 }
 
@@ -71,7 +71,12 @@ fn wrap_to_pixel_type(target: PixelId, v: f64) -> f64 {
         PixelId::Int32 | PixelId::VectorInt32 => (v.trunc() as i128 as i32) as f64,
         PixelId::UInt64 | PixelId::VectorUInt64 => (v.trunc() as i128 as u64) as f64,
         PixelId::Int64 | PixelId::VectorInt64 => (v.trunc() as i128 as i64) as f64,
-        PixelId::Float32 | PixelId::Float64 | PixelId::VectorFloat32 | PixelId::VectorFloat64 => v,
+        PixelId::Float32
+        | PixelId::ComplexFloat32
+        | PixelId::VectorFloat32
+        | PixelId::Float64
+        | PixelId::ComplexFloat64
+        | PixelId::VectorFloat64 => v,
     }
 }
 

@@ -28,8 +28,8 @@ fn element_type(id: PixelId) -> &'static str {
         PixelId::Int32 | PixelId::VectorInt32 => "MET_INT",
         PixelId::UInt64 | PixelId::VectorUInt64 => "MET_ULONG_LONG",
         PixelId::Int64 | PixelId::VectorInt64 => "MET_LONG_LONG",
-        PixelId::Float32 | PixelId::VectorFloat32 => "MET_FLOAT",
-        PixelId::Float64 | PixelId::VectorFloat64 => "MET_DOUBLE",
+        PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => "MET_FLOAT",
+        PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => "MET_DOUBLE",
     }
 }
 
@@ -106,8 +106,12 @@ fn buffer_from_bytes(id: PixelId, bytes: &[u8], big_endian: bool) -> Result<Pixe
         PixelId::Int32 | PixelId::VectorInt32 => unpack!(i32, Int32),
         PixelId::UInt64 | PixelId::VectorUInt64 => unpack!(u64, UInt64),
         PixelId::Int64 | PixelId::VectorInt64 => unpack!(i64, Int64),
-        PixelId::Float32 | PixelId::VectorFloat32 => unpack!(f32, Float32),
-        PixelId::Float64 | PixelId::VectorFloat64 => unpack!(f64, Float64),
+        PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => {
+            unpack!(f32, Float32)
+        }
+        PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => {
+            unpack!(f64, Float64)
+        }
     })
 }
 
@@ -151,13 +155,19 @@ fn build_header(img: &Image, element_data_file: &str) -> String {
 /// Write an image as MetaImage. `.mha` embeds the data (`ElementDataFile =
 /// LOCAL`); `.mhd` writes a sibling `.raw` file.
 ///
-/// Vector images are rejected: [`build_header`] hard-codes
+/// Only scalar images are written: [`build_header`] hard-codes
 /// `ElementNumberOfChannels = 1`, so the file would claim one component per
-/// pixel while carrying `number_of_components_per_pixel()` of them. This is the
-/// write-side counterpart of [`read`]'s `header.channels != 1` check.
+/// pixel while carrying `buffer_stride()` of them — `n` for a vector image, `2`
+/// for a complex one (MetaIO has no complex element type at all). This is the
+/// write-side counterpart of [`read`]'s `header.channels != 1` check, and the
+/// test is a whitelist on `PixelId::is_scalar` for the same reason
+/// `Image::require_scalar` is.
 pub fn write(img: &Image, path: &Path) -> Result<()> {
-    if img.pixel_id().is_vector() {
-        return Err(IoError::Unsupported("multi-channel (vector) pixels".into()));
+    if !img.pixel_id().is_scalar() {
+        return Err(IoError::Unsupported(format!(
+            "{:?}: MetaImage writes one component per pixel",
+            img.pixel_id()
+        )));
     }
     let data = buffer_to_le_bytes(img.buffer());
     let is_mhd = path

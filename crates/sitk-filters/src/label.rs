@@ -334,8 +334,8 @@ fn pixel_id_max_label(id: PixelId) -> u64 {
         PixelId::Int32 | PixelId::VectorInt32 => i32::MAX as u64,
         PixelId::UInt64 | PixelId::VectorUInt64 => u64::MAX,
         PixelId::Int64 | PixelId::VectorInt64 => i64::MAX as u64,
-        PixelId::Float32 | PixelId::VectorFloat32 => u64::MAX,
-        PixelId::Float64 | PixelId::VectorFloat64 => u64::MAX,
+        PixelId::Float32 | PixelId::ComplexFloat32 | PixelId::VectorFloat32 => u64::MAX,
+        PixelId::Float64 | PixelId::ComplexFloat64 | PixelId::VectorFloat64 => u64::MAX,
     }
 }
 
