@@ -157,9 +157,22 @@ impl PixelId {
 
 /// A Rust scalar type that can back a pixel buffer.
 ///
-/// The buffer-bridging methods let a filter recover a concrete `&[T]` from the
-/// type-erased [`PixelBuffer`] without `unsafe`: each implementation matches
-/// exactly the one enum variant that holds its own type.
+/// Recovering a concrete `&[T]` from a type-erased [`PixelBuffer`] is
+/// deliberately *not* on this trait — see [`PixelBuffer::as_slice`], which is
+/// crate-private. A `&[T]` taken straight off the buffer says nothing about
+/// whether the owning image is scalar, and reading it as one element per pixel
+/// silently misreads a vector image. Outside this crate the only ways to a
+/// `&[T]` are [`Image::scalar_slice`] / [`Image::scalar_vec_mut`] /
+/// [`Image::scalar_view`] (guarded against vector images) and
+/// [`Image::component_slice`] / [`Image::component_vec_mut`] (which name in
+/// their signature that they return interleaved components).
+///
+/// [`PixelBuffer::as_slice`]: crate::PixelBuffer::as_slice
+/// [`Image::scalar_slice`]: crate::Image::scalar_slice
+/// [`Image::scalar_vec_mut`]: crate::Image::scalar_vec_mut
+/// [`Image::scalar_view`]: crate::Image::scalar_view
+/// [`Image::component_slice`]: crate::Image::component_slice
+/// [`Image::component_vec_mut`]: crate::Image::component_vec_mut
 pub trait Scalar: Copy + PartialOrd + 'static {
     /// The runtime tag for this Rust type. Always a scalar variant: `Scalar` is
     /// implemented only for the ten component types, and a vector image's
@@ -177,13 +190,11 @@ pub trait Scalar: Copy + PartialOrd + 'static {
     /// divergence to verify against ITK when exact parity is required.
     fn from_f64(v: f64) -> Self;
 
-    /// Borrow the buffer as `&[Self]`, or `None` if the tag does not match.
-    fn buffer_ref(buf: &PixelBuffer) -> Option<&[Self]>;
-
-    /// Borrow the backing `Vec<Self>` mutably, or `None` if the tag mismatches.
-    fn buffer_mut(buf: &mut PixelBuffer) -> Option<&mut Vec<Self>>;
-
     /// Wrap a `Vec<Self>` into the matching [`PixelBuffer`] variant.
+    ///
+    /// The write direction stays public: building a buffer cannot misread one,
+    /// and an [`Image`](crate::Image) can only be assembled from it through the
+    /// invariant-checking constructors.
     fn into_buffer(v: Vec<Self>) -> PixelBuffer;
 }
 
@@ -198,22 +209,6 @@ macro_rules! impl_scalar {
 
                 #[inline]
                 fn from_f64(v: f64) -> Self { v as $ty }
-
-                #[inline]
-                fn buffer_ref(buf: &PixelBuffer) -> Option<&[Self]> {
-                    match buf {
-                        PixelBuffer::$variant(v) => Some(v.as_slice()),
-                        _ => None,
-                    }
-                }
-
-                #[inline]
-                fn buffer_mut(buf: &mut PixelBuffer) -> Option<&mut Vec<Self>> {
-                    match buf {
-                        PixelBuffer::$variant(v) => Some(v),
-                        _ => None,
-                    }
-                }
 
                 #[inline]
                 fn into_buffer(v: Vec<Self>) -> PixelBuffer {

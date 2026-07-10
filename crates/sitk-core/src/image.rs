@@ -1,5 +1,7 @@
 //! The runtime-typed N-dimensional [`Image`] and its type-erased [`PixelBuffer`].
 
+use std::any::Any;
+
 use crate::error::{Error, Result};
 use crate::matrix;
 use crate::pixel::{PixelId, Scalar};
@@ -88,6 +90,51 @@ impl PixelBuffer {
     /// `true` if the buffer holds no components.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Borrow the buffer as `&[T]`, or `None` if `T` is not the component type.
+    ///
+    /// Crate-private, and deliberately so: the returned slice holds every
+    /// component of every pixel, and carries no evidence of whether the owning
+    /// image is scalar. Only [`Image`]'s named accessors may hand one out —
+    /// the `scalar_*` family after the vector guard, the `component_*` family
+    /// under a name that says what the length means.
+    pub(crate) fn as_slice<T: Scalar>(&self) -> Option<&[T]> {
+        fn cast<T: 'static>(v: &dyn Any) -> Option<&[T]> {
+            v.downcast_ref::<Vec<T>>().map(Vec::as_slice)
+        }
+        match self {
+            PixelBuffer::UInt8(v) => cast(v),
+            PixelBuffer::Int8(v) => cast(v),
+            PixelBuffer::UInt16(v) => cast(v),
+            PixelBuffer::Int16(v) => cast(v),
+            PixelBuffer::UInt32(v) => cast(v),
+            PixelBuffer::Int32(v) => cast(v),
+            PixelBuffer::UInt64(v) => cast(v),
+            PixelBuffer::Int64(v) => cast(v),
+            PixelBuffer::Float32(v) => cast(v),
+            PixelBuffer::Float64(v) => cast(v),
+        }
+    }
+
+    /// The mutable counterpart of [`PixelBuffer::as_slice`]; crate-private for
+    /// the same reason.
+    pub(crate) fn as_mut_vec<T: Scalar>(&mut self) -> Option<&mut Vec<T>> {
+        fn cast<T: 'static>(v: &mut dyn Any) -> Option<&mut Vec<T>> {
+            v.downcast_mut::<Vec<T>>()
+        }
+        match self {
+            PixelBuffer::UInt8(v) => cast(v),
+            PixelBuffer::Int8(v) => cast(v),
+            PixelBuffer::UInt16(v) => cast(v),
+            PixelBuffer::Int16(v) => cast(v),
+            PixelBuffer::UInt32(v) => cast(v),
+            PixelBuffer::Int32(v) => cast(v),
+            PixelBuffer::UInt64(v) => cast(v),
+            PixelBuffer::Int64(v) => cast(v),
+            PixelBuffer::Float32(v) => cast(v),
+            PixelBuffer::Float64(v) => cast(v),
+        }
     }
 
     /// Widen every stored component to `f64`, preserving interleaved order.
@@ -589,7 +636,7 @@ impl Image {
     /// with [`Error::PixelTypeMismatch`] if `T` is not the image's pixel type.
     pub fn scalar_slice<T: Scalar>(&self) -> Result<&[T]> {
         self.require_scalar()?;
-        T::buffer_ref(&self.buffer).ok_or(Error::PixelTypeMismatch {
+        self.buffer.as_slice::<T>().ok_or(Error::PixelTypeMismatch {
             expected: self.pixel_id,
             requested: T::PIXEL_ID,
         })
@@ -614,10 +661,12 @@ impl Image {
     pub fn scalar_vec_mut<T: Scalar>(&mut self) -> Result<&mut Vec<T>> {
         self.require_scalar()?;
         let id = self.pixel_id;
-        T::buffer_mut(&mut self.buffer).ok_or(Error::PixelTypeMismatch {
-            expected: id,
-            requested: T::PIXEL_ID,
-        })
+        self.buffer
+            .as_mut_vec::<T>()
+            .ok_or(Error::PixelTypeMismatch {
+                expected: id,
+                requested: T::PIXEL_ID,
+            })
     }
 
     /// Borrow the whole interleaved component buffer as `&[T]`, for scalar and
@@ -627,7 +676,7 @@ impl Image {
     /// is the accessor vector filters use; scalar consumers want
     /// [`Image::scalar_slice`], which refuses vector images.
     pub fn component_slice<T: Scalar>(&self) -> Result<&[T]> {
-        T::buffer_ref(&self.buffer).ok_or(Error::PixelTypeMismatch {
+        self.buffer.as_slice::<T>().ok_or(Error::PixelTypeMismatch {
             expected: self.pixel_id.component_id(),
             requested: T::PIXEL_ID,
         })
@@ -637,10 +686,12 @@ impl Image {
     /// The counterpart of [`Image::component_slice`].
     pub fn component_vec_mut<T: Scalar>(&mut self) -> Result<&mut Vec<T>> {
         let expected = self.pixel_id.component_id();
-        T::buffer_mut(&mut self.buffer).ok_or(Error::PixelTypeMismatch {
-            expected,
-            requested: T::PIXEL_ID,
-        })
+        self.buffer
+            .as_mut_vec::<T>()
+            .ok_or(Error::PixelTypeMismatch {
+                expected,
+                requested: T::PIXEL_ID,
+            })
     }
 
     /// Copy a scalar image's buffer into an `f64` vector regardless of stored

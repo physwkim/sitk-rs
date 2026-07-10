@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     fn values(img: &Image) -> Vec<f64> {
-        f64::buffer_ref(img.buffer()).unwrap().to_vec()
+        img.scalar_slice::<f64>().unwrap().to_vec()
     }
 
     #[track_caller]
@@ -1500,7 +1500,7 @@ mod tests {
         let img = Image::from_vec(&[5, 5], data).unwrap();
         let out = patch_based_denoising(&img, &settings()).unwrap();
         assert_eq!(
-            u16::buffer_ref(out.buffer()).unwrap(),
+            out.scalar_slice::<u16>().unwrap(),
             &[
                 12, 20, 30, 38, 48, //
                 15, 24, 34, 44, 53, //
