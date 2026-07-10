@@ -84,8 +84,15 @@
 //! 215-240) turns that into a [`PixelId`]. Unlike MetaImage, NRRD **does**
 //! round-trip a complex image: `kinds: complex` produces `IOPixelEnum::COMPLEX`
 //! with two components, which SimpleITK maps to `ComplexFloat32`/`ComplexFloat64`.
-//! `3D-symmetric-matrix` produces `SYMMETRICSECONDRANKTENSOR`, which SimpleITK
-//! has no pixel id for and rejects — ledger §3.31.
+//! `3D-symmetric-matrix` produces `SYMMETRICSECONDRANKTENSOR`, for which
+//! SimpleITK's `GetPixelIDFromImageIO` has no pixel id and raises "Unknown
+//! PixelType" — even though `itk::Image` reads the file fine. This port
+//! **implements** the read (ledger §3.31): the tensor is loaded as a vector
+//! image whose components are the unique matrix entries in the NRRD on-disk
+//! order (`Dxx Dxy Dxz Dyy Dyz Dzz` for the 6-component symmetric matrix). A
+//! `3D-masked-symmetric-matrix` carries a leading mask channel that upstream's
+//! `Read` crops out; this port drops it too, so the vector image holds only the
+//! six matrix entries.
 //!
 //! # Encodings
 //!
@@ -2126,11 +2133,15 @@ fn pixel_kind_of(kind: u32, size: usize) -> Result<(PixelKind, usize)> {
 /// `RGB`, `RGBA`, `POINT` and `COVARIANTVECTOR` all collapse onto the vector
 /// pixel id here, exactly as they do upstream: this port has no distinct RGB
 /// pixel type. `SYMMETRICSECONDRANKTENSOR` falls off the end of upstream's
-/// if-ladder and raises "Unknown PixelType" (ledger §3.31).
+/// SimpleITK if-ladder and raises "Unknown PixelType" even though `itk::Image`
+/// reads it fine; this port instead loads the tensor as a **vector image** of
+/// its unique matrix entries, which its [`Image`] can hold (ledger §3.31).
 fn sitk_pixel_id(kind: PixelKind, components: usize, component: PixelId) -> Result<PixelId> {
     match kind {
         PixelKind::Scalar if components == 1 => Ok(component),
-        PixelKind::Scalar | PixelKind::Vector => Ok(component.vector_id()),
+        PixelKind::Scalar | PixelKind::Vector | PixelKind::SymmetricSecondRankTensor => {
+            Ok(component.vector_id())
+        }
         PixelKind::Complex => match component {
             PixelId::Float32 => Ok(PixelId::ComplexFloat32),
             PixelId::Float64 => Ok(PixelId::ComplexFloat64),
@@ -2139,10 +2150,6 @@ fn sitk_pixel_id(kind: PixelKind, components: usize, component: PixelId) -> Resu
                 other.as_str()
             ))),
         },
-        PixelKind::SymmetricSecondRankTensor => Err(unsupported(
-            "NRRD symmetric-matrix pixel axis: SimpleITK has no matching pixel id \
-             (\"Unknown PixelType\") — ledger §3.31",
-        )),
     }
 }
 
@@ -2534,6 +2541,26 @@ pub fn read(path: &Path) -> Result<Image> {
         axmap.extend(info.order.image_axes.iter().copied());
         let sizes: Vec<usize> = nrrd.axis.iter().map(|a| a.size).collect();
         data = permute(&data, &sizes, &axmap, type_size(nrrd.ntype));
+    }
+
+    // A `3D-masked-symmetric-matrix` pixel axis carries a leading mask channel
+    // that `ReadImageInformation` excludes from the component count and `Read`
+    // then crops out of the data (itkNrrdImageIO.cxx:1177-1204). After the
+    // permute above the pixel axis is the fastest one, so its on-disk size can
+    // exceed the reported component count only for this masked case; drop the
+    // leading mask component(s) of every pixel (ledger §3.31).
+    if let Some(pixel_axis) = info.order.pixel_axis {
+        let on_disk = nrrd.axis[pixel_axis].size;
+        if on_disk > info.components {
+            let esz = type_size(nrrd.ntype);
+            let stride = on_disk * esz;
+            let drop = (on_disk - info.components) * esz;
+            let mut cropped = Vec::with_capacity(data.len() / stride * info.components * esz);
+            for chunk in data.chunks_exact(stride) {
+                cropped.extend_from_slice(&chunk[drop..]);
+            }
+            data = cropped;
+        }
     }
 
     let buffer = buffer_from_le_bytes(info.pixel_id, &data);

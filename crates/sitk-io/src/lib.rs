@@ -2759,9 +2759,12 @@ mod tests {
     }
 
     /// A `3D-symmetric-matrix` pixel axis is `IOPixelEnum::SYMMETRICSECONDRANKTENSOR`,
-    /// which falls off the end of `GetPixelIDFromImageIO`'s if-ladder. Ledger §3.31.
+    /// which falls off the end of `GetPixelIDFromImageIO`'s if-ladder and would
+    /// raise "Unknown PixelType" in SimpleITK. This port's [`Image`] can hold the
+    /// six unique matrix entries, so it loads the tensor as a 6-component vector
+    /// image in the NRRD on-disk order. Ledger §3.31.
     #[test]
-    fn nrrd_rejects_a_symmetric_matrix_pixel_axis() {
+    fn nrrd_symmetric_matrix_pixel_axis_loads_as_a_vector_image() {
         let path = tmp_path("tensor.nrrd");
         let mut bytes = b"NRRD0004\n\
               type: float\n\
@@ -2771,14 +2774,62 @@ mod tests {
               endian: little\n\
               encoding: raw\n\n"
             .to_vec();
-        bytes.extend_from_slice(&[0u8; 48]);
+        // Axis 0 (the 6-component tensor) is fastest: pixel 0 is [1..=6],
+        // pixel 1 is [7..=12].
+        for v in 1..=12u32 {
+            bytes.extend_from_slice(&(v as f32).to_le_bytes());
+        }
         std::fs::write(&path, bytes).unwrap();
-        let err = read_image(&path).unwrap_err();
+        let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert!(matches!(
-            err,
-            IoError::UnsupportedNrrdFeature(ref m) if m.contains("Unknown PixelType")
-        ));
+
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(img.size(), &[2]);
+        assert_eq!(img.number_of_components_per_pixel(), 6);
+        assert_eq!(
+            img.component_slice::<f32>().unwrap(),
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
+            ]
+        );
+    }
+
+    /// A `3D-masked-symmetric-matrix` pixel axis carries a leading mask channel;
+    /// `ReadImageInformation` reports one fewer component and `Read` crops the
+    /// mask out, so the seven on-disk channels become a 6-component vector image
+    /// holding only the matrix entries. Ledger §3.31.
+    #[test]
+    fn nrrd_masked_symmetric_matrix_crops_the_mask_channel() {
+        let path = tmp_path("masked_tensor.nrrd");
+        let mut bytes = b"NRRD0004\n\
+              type: float\n\
+              dimension: 2\n\
+              sizes: 7 2\n\
+              kinds: 3D-masked-symmetric-matrix domain\n\
+              endian: little\n\
+              encoding: raw\n\n"
+            .to_vec();
+        // Axis 0 (mask + 6 tensor entries) is fastest. Pixel 0 is
+        // [mask=1, 10..=15], pixel 1 is [mask=1, 20..=25]; the masks are dropped.
+        for &mask_base in &[10u32, 20u32] {
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            for k in 0..6u32 {
+                bytes.extend_from_slice(&((mask_base + k) as f32).to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.pixel_id(), PixelId::VectorFloat32);
+        assert_eq!(img.size(), &[2]);
+        assert_eq!(img.number_of_components_per_pixel(), 6);
+        assert_eq!(
+            img.component_slice::<f32>().unwrap(),
+            &[
+                10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0
+            ]
+        );
     }
 
     /// `nrrd__HeaderCheck` refuses a multi-byte raw type with no `endian`
