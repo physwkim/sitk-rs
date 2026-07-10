@@ -2945,27 +2945,199 @@ mod tests {
         assert_eq!(written, [0, 2, 0, 2, 0, 1, 0, 1]);
     }
 
-    /// `CheckExtension` claims `.gipl.gz` for reading and writing; upstream then
-    /// reaches for zlib. This workspace has none (§5.8), so both fail naming it.
+    /// The same partial-header failure as
+    /// `gipl_int32_write_leaves_the_header_and_then_fails`, through
+    /// `.gipl.gz`: `write` never calls `gzclose` before the throw, so upstream's
+    /// buffered `gzwrite`s are flushed only once the exception unwinds and
+    /// `GiplImageIO`'s destructor runs (itkGiplImageIO.cxx:81-95). This port
+    /// models that outcome by gzip-compressing the same partial header bytes.
     #[test]
-    fn gipl_gz_is_claimed_and_then_refused_for_the_missing_zlib() {
+    fn gipl_gz_int32_write_leaves_the_header_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i32, 2, 3, 4]).unwrap();
+        let path = tmp_path("int32.gipl.gz");
+        let result = write_image(&img, &path);
+        let compressed = std::fs::read(&path).unwrap();
+        assert_eq!(&compressed[..2], b"\x1f\x8b");
+        let written = crate::compression::gunzip_transparent(&compressed).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Pixel Type Unknown")),
+            "{result:?}"
+        );
+        assert_eq!(written.len(), gipl::HEADER_SIZE);
+        assert_eq!(&written[8..10], &32u16.to_be_bytes()); // GIPL_INT was written
+    }
+
+    /// The `.gipl.gz` counterpart of `gipl_int64_write_leaves_eight_bytes_and_then_fails`.
+    #[test]
+    fn gipl_gz_int64_write_leaves_eight_bytes_and_then_fails() {
+        let img = Image::from_vec(&[2, 2], vec![1i64, 2, 3, 4]).unwrap();
+        let path = tmp_path("int64.gipl.gz");
+        let result = write_image(&img, &path);
+        let written =
+            crate::compression::gunzip_transparent(&std::fs::read(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.starts_with("Invalid type")),
+            "{result:?}"
+        );
+        assert_eq!(written, [0, 2, 0, 2, 0, 1, 0, 1]);
+    }
+
+    /// `CheckExtension` claims `.gipl.gz` for reading and writing, and `write`
+    /// now compresses through [`crate::compression`] instead of refusing
+    /// (ledger §4.68, closed).
+    #[test]
+    fn gipl_gz_is_recognised_and_round_trips() {
         let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
         let path = tmp_path("compressed.gipl.gz");
 
         assert!(create_image_io(&path, FileMode::Write).is_some());
-        let result = write_image(&img, &path);
-        assert!(
-            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
-            "{result:?}"
-        );
-        assert!(!path.exists(), "write must not create the file");
+        write_image(&img, &path).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[..2], b"\x1f\x8b");
 
-        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
         assert!(create_image_io(&path, FileMode::Read).is_some());
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        // `.gipl` reads back 2-D as 3-D (§2.94); `.gipl.gz` is no exception.
+        assert_eq!(back.size(), &[2, 2, 1]);
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[1, 2, 3, 4]);
+    }
+
+    /// The six component types `SwapBytesIfNecessary` has an arm for, at 2-D
+    /// and 3-D, through `.gipl.gz` — the gzip-door counterpart of
+    /// `gipl_roundtrip_every_supported_scalar_type_2d_and_3d`.
+    #[test]
+    fn gipl_gz_roundtrip_every_supported_scalar_type_2d_and_3d() {
+        macro_rules! case {
+            ($ty:ty, $size:expr, $expected_size:expr, $name:expr) => {{
+                let count: usize = $size.iter().product();
+                let data: Vec<$ty> = (0..count as u32).map(|i| i as $ty).collect();
+                let img = Image::from_vec(&$size, data.clone()).unwrap();
+                let path = tmp_path($name);
+                write_image(&img, &path).unwrap();
+                assert_eq!(&std::fs::read(&path).unwrap()[..2], b"\x1f\x8b", $name);
+                let back = read_image(&path).unwrap();
+                std::fs::remove_file(&path).ok();
+                assert_eq!(back.scalar_slice::<$ty>().unwrap(), data.as_slice(), $name);
+                assert_eq!(back.size(), &$expected_size[..], $name);
+            }};
+        }
+        macro_rules! both {
+            ($ty:ty, $stem:expr) => {{
+                case!(
+                    $ty,
+                    [4usize, 2],
+                    [4usize, 2, 1],
+                    concat!($stem, "_2d.gipl.gz")
+                );
+                case!(
+                    $ty,
+                    [4usize, 2, 3],
+                    [4usize, 2, 3],
+                    concat!($stem, "_3d.gipl.gz")
+                );
+            }};
+        }
+        both!(u8, "gipl_gz_u8");
+        both!(i8, "gipl_gz_i8");
+        both!(u16, "gipl_gz_u16");
+        both!(i16, "gipl_gz_i16");
+        both!(f32, "gipl_gz_f32");
+        both!(f64, "gipl_gz_f64");
+    }
+
+    /// `gzopen(m_FileName.c_str(), "wb")` (itkGiplImageIO.cxx:671) names no
+    /// level, so `.gipl.gz` always compresses at zlib's `Z_DEFAULT_COMPRESSION`
+    /// (6) — `MTIME = 0`, `XFL = 0`, `OS = 3` — regardless of `WriteOptions`.
+    /// Same precedent as NIfTI (ledger §3.40), extended to GIPL at §3.42.
+    #[test]
+    fn gipl_gz_write_ignores_use_compression_and_compression_level() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("framing.gipl.gz");
+        // `use_compression = false` and an explicit level are both ignored: a
+        // `.gipl.gz` is always gzipped, and always at level 6.
+        write_image_with(&img, &path, false, 9).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(&bytes[..2], b"\x1f\x8b");
+        assert_eq!(&bytes[4..10], &[0, 0, 0, 0, 0x00, 0x03], "MTIME, XFL, OS");
+    }
+
+    /// zlib's `gz_look` falls back to a transparent byte-for-byte copy when the
+    /// gzip magic is absent (ledger §2.113), same as NRRD and NIfTI — extended
+    /// to GIPL at §2.118. A `.gipl.gz` holding a plain, uncompressed GIPL file
+    /// reads it verbatim.
+    #[test]
+    fn gipl_gz_over_a_non_gzip_stream_reads_transparently() {
+        let plain = tmp_path("plain_for_transparent.gipl");
+        let img = Image::from_vec(&[2, 2], vec![9u8, 8, 7, 6]).unwrap();
+        write_image(&img, &plain).unwrap();
+        let plain_bytes = std::fs::read(&plain).unwrap();
+        std::fs::remove_file(&plain).ok();
+
+        let path = tmp_path("misnamed.gipl.gz");
+        std::fs::write(&path, &plain_bytes).unwrap();
+        assert!(create_image_io(&path, FileMode::Read).is_some());
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[9, 8, 7, 6]);
+    }
+
+    /// A `.gipl.gz` this port never wrote — one stored (uncompressed) deflate
+    /// block over the whole 256-byte header and the pixels — reads, because
+    /// that is what `gzread` would deliver. No byte of the fixture came from
+    /// this crate's own encoder.
+    #[test]
+    fn gipl_gz_reads_a_hand_built_stored_block_gzip_stream() {
+        let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[7, 8, 9, 10]);
+        let fixture = crate::compression::stored_block_gzip(&bytes);
+
+        let path = tmp_path("fixture.gipl.gz");
+        std::fs::write(&path, &fixture).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.scalar_slice::<u8>().unwrap(), &[7, 8, 9, 10]);
+    }
+
+    /// `Read`'s compressed-path success check is `success = p != nullptr`
+    /// (itkGiplImageIO.cxx:219-223) — the output *pointer*, never the byte
+    /// count `gzread` actually delivered — so a short pixel block reports
+    /// success upstream (§1.58). This port refuses it, extending §4.69's
+    /// closure to the compressed path at §4.79.
+    #[test]
+    fn gipl_gz_truncated_pixel_data_is_an_error() {
+        let mut bytes = gipl_header([4, 4, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
+        bytes.extend_from_slice(&[1, 2, 3]); // 16 pixels declared, 3 present
+        let fixture = crate::compression::stored_block_gzip(&bytes);
+
+        let path = tmp_path("gz_short.gipl.gz");
+        std::fs::write(&path, &fixture).unwrap();
         let result = read_image(&path);
         std::fs::remove_file(&path).ok();
+        assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    /// A gzip stream with the right magic but a payload that will not inflate
+    /// is `IoError::CorruptCompressedData`, not the vacuously-`true` success
+    /// upstream's `p != nullptr` check reports (§1.58). `can_read_file`'s own
+    /// gzread-through-the-magic probe fails the same way — it decompresses the
+    /// same corrupt bytes — so the registry never reaches `gipl::read` for this
+    /// file either, exactly as `gipl_short_header_is_an_error` pins for the
+    /// uncompressed short-header case.
+    #[test]
+    fn gipl_gz_corrupt_stream_is_an_error() {
+        let path = tmp_path("corrupt.gipl.gz");
+        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
+        let claimed = create_image_io(&path, FileMode::Read).is_some();
+        let result = gipl::read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(!claimed);
         assert!(
-            matches!(&result, Err(IoError::UnsupportedGiplFeature(m)) if m.contains("zlib")),
+            matches!(&result, Err(IoError::CorruptCompressedData(_))),
             "{result:?}"
         );
     }

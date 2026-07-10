@@ -87,8 +87,7 @@ pub enum IoError {
     NiftiWriteRejected(String),
 
     /// A GIPL feature this port does not implement, or that `GiplImageIO`
-    /// itself refuses. Three sites, all upstream's own: gzip-compressed
-    /// `.gipl.gz` (not yet wired to [`crate::compression`], §5.8), the
+    /// itself refuses. Two sites, both upstream's own: the
     /// `"Pixel Type Unknown"` `SwapBytesIfNecessary` raises for a
     /// 32-bit integer image (itkGiplImageIO.cxx:648-651), and the
     /// `"Invalid type"` `Write` raises for a 64-bit one (`:759-761`).
