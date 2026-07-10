@@ -24,7 +24,7 @@
 //! unreachable through this crate's [`ImageFileReader`](crate::ImageFileReader).
 //! Ledger §4.84.
 //!
-//! # Pixel types: a 2-channel PNG is unrepresentable through SimpleITK
+//! # Pixel types: a 2-channel PNG, unrepresentable through SimpleITK, is implemented here
 //!
 //! `ReadImageInformation` sets `m_PixelType = SCALAR` unconditionally
 //! (`:444`/`:449`), then `SetNumberOfComponents(png_get_channels(...))`
@@ -35,13 +35,17 @@
 //! (sitkImageReaderBase.cxx:215-228); `SCALAR` with `numberOfComponents == 2`
 //! matches neither arm and falls into `"Unknown PixelType: ..."`
 //! (`:236-237`). A gray+alpha PNG is therefore readable and writable by raw
-//! `PNGImageIO` but unrepresentable through this crate's public reader.
-//! Ledger §3.45; see [`IoError::UnsupportedPngFeature`].
+//! `PNGImageIO`, but SimpleITK's own pixel-ID wrapping cannot name the result —
+//! not a PNG-format limit at all. This port's [`Image`] has no such
+//! restriction (a [`PixelId::VectorUInt8`]/[`PixelId::VectorUInt16`] admits any
+//! component count ≥ 1), so [`read`]/[`read_information`]/[`write`] implement
+//! the 2-channel case exactly like 3 and 4: a vector image, `component_id()`
+//! plus `vector_id()`. **Fixed §3.45.**
 //!
 //! | source channels | `m_PixelType` | reachable through this crate? |
 //! |---|---|---|
 //! | 1 (gray, no `tRNS`) | `SCALAR` | yes — scalar |
-//! | 2 (gray + alpha) | `SCALAR` | **no** — `IoError::UnsupportedPngFeature` |
+//! | 2 (gray + alpha) | `SCALAR` | yes — `VectorUInt8`/`VectorUInt16` |
 //! | 3 (RGB) | `RGB` | yes — `VectorUInt8`/`VectorUInt16` |
 //! | 4 (RGBA) | `RGBA` | yes — `VectorUInt8`/`VectorUInt16` |
 //!
@@ -184,8 +188,12 @@ struct Header {
 /// `png_get_channels` after every `png_set_*` transform, translated into this
 /// crate's [`PixelId`] exactly as `ReadImageInformation`'s bit-depth/channel
 /// switch does (itkPNGImageIO.cxx:442-461): `<= 8` bits is `UInt8`, `16` bits
-/// is `UInt16`, 3 channels is the vector counterpart, 4 channels likewise, and
-/// 2 channels — gray plus alpha — is unrepresentable (§3.45).
+/// is `UInt16`, and 2 (gray + alpha), 3 (RGB) or 4 (RGBA) channels are all the
+/// vector counterpart. Upstream's own `SetPixelType` never distinguishes a
+/// 2-channel PNG from a 1-channel one — `SCALAR` either way — so SimpleITK's
+/// `GetPixelIDFromImageIO` rejects the 2-channel case outright; this crate's
+/// [`PixelId::VectorUInt8`]/[`PixelId::VectorUInt16`] has no such restriction,
+/// so the 2-channel case is implemented rather than reproduced (§3.45, fixed).
 fn header_from_reader<R: std::io::BufRead + std::io::Seek>(reader: &Reader<R>) -> Result<Header> {
     let (color, depth) = reader.output_color_type();
     let channels = color.samples();
@@ -196,13 +204,11 @@ fn header_from_reader<R: std::io::BufRead + std::io::Seek>(reader: &Reader<R>) -
     };
     let pixel_id = match channels {
         1 => component,
-        3 | 4 => component.vector_id(),
+        2..=4 => component.vector_id(),
         _ => {
             return Err(IoError::UnsupportedPngFeature(format!(
-                "Unknown PixelType: a {channels}-channel PNG (grayscale + alpha) \
-                 keeps m_PixelType == SCALAR with NumberOfComponents == {channels} \
-                 (itkPNGImageIO.cxx:444-461), which GetPixelIDFromImageIO has no \
-                 arm for (sitkImageReaderBase.cxx:215-237) — doc/upstream-findings.md §3.45"
+                "unsupported PNG channel count {channels}: png_get_channels after \
+                 Transformations::EXPAND should only ever report 1, 2, 3 or 4"
             )));
         }
     };

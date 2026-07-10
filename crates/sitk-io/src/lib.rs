@@ -4137,6 +4137,43 @@ mod tests {
         assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §3.45: a 2-channel (gray + alpha) PNG is readable/writable by
+    /// raw `PNGImageIO`, but `GetPixelIDFromImageIO` cannot represent it
+    /// through SimpleITK's own pixel-ID wrapping (`SCALAR` with
+    /// `NumberOfComponents == 2` matches neither its scalar nor its
+    /// RGB/RGBA/VECTOR arms). This crate's `PixelId::VectorUInt8` has no such
+    /// restriction, so it round-trips as a 2-component vector image.
+    #[test]
+    fn png_roundtrip_gray_alpha_vector_uint8() {
+        let data: Vec<u8> = (0..24u32).map(|i| (i * 11) as u8).collect();
+        let img = Image::from_vec_vector::<u8>(&[4, 3], 2, data.clone()).unwrap();
+        let path = tmp_path("gray_alpha_u8.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u8>().unwrap(), data.as_slice());
+    }
+
+    /// Fixed §3.45, 16-bit counterpart.
+    #[test]
+    fn png_roundtrip_gray_alpha_vector_uint16() {
+        let data: Vec<u16> = (0..24u32).map(|i| (i * 4111 + 29) as u16).collect();
+        let img = Image::from_vec_vector::<u16>(&[4, 3], 2, data.clone()).unwrap();
+        let path = tmp_path("gray_alpha_u16.png");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(back.pixel_id(), PixelId::VectorUInt16);
+        assert_eq!(back.number_of_components_per_pixel(), 2);
+        assert_eq!(back.size(), &[4, 3]);
+        assert_eq!(back.component_slice::<u16>().unwrap(), data.as_slice());
+    }
+
     #[test]
     fn png_roundtrip_rgba_vector_uint8() {
         let data: Vec<u8> = (0..48u32).map(|i| (i * 5) as u8).collect();

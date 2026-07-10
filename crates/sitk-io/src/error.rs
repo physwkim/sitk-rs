@@ -117,15 +117,14 @@ pub enum IoError {
     #[error("malformed PNG header: {0}")]
     MalformedPngHeader(String),
 
-    /// A PNG feature `PNGImageIO` itself refuses, or that SimpleITK's wrapping
-    /// layer cannot represent. Two sites, both upstream's own: `"PNG supports
-    /// unsigned char and unsigned short"` on write for any other component
-    /// type (itkPNGImageIO.cxx:550), and `GetPixelIDFromImageIO`'s
-    /// `"Unknown PixelType"` for a 2-channel (gray + alpha) PNG, which
-    /// `png_get_channels` never turns into `RGB`/`RGBA` so `m_PixelType` stays
-    /// `SCALAR` with `NumberOfComponents == 2`
-    /// (itkPNGImageIO.cxx:452-461, sitkImageReaderBase.cxx:215-238). See
-    /// [`crate::png`] and ledger §3.
+    /// A PNG feature `PNGImageIO` itself refuses: `"PNG supports unsigned
+    /// char and unsigned short"` on write for any other component type
+    /// (itkPNGImageIO.cxx:550). A 2-channel (gray + alpha) PNG, which
+    /// upstream's own `GetPixelIDFromImageIO` cannot represent
+    /// (itkPNGImageIO.cxx:452-461, sitkImageReaderBase.cxx:215-238), is *not*
+    /// one of these — this crate's [`PixelId`](sitk_core::PixelId) has no such
+    /// restriction, so [`crate::png`] reads and writes it as a 2-component
+    /// vector image instead (ledger §3.45). See [`crate::png`] and ledger §3.
     #[error("unsupported PNG feature: {0}")]
     UnsupportedPngFeature(String),
 
