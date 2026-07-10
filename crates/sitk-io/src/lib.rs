@@ -1451,6 +1451,48 @@ mod tests {
         assert_eq!(back.component_slice::<f32>().unwrap(), data.as_slice());
     }
 
+    /// Fixed §1.51 (write side): upstream's RAS-conversion guard
+    /// (itkNiftiImageIO.cxx:2177-2183) checks only the pixel type, never that
+    /// `numComponents == 3`, so a 2- or 4-component `NIFTI_INTENT_DISPVECT`
+    /// image would get a stride-3 walk over a differently-strided buffer.
+    /// `write` now rejects it instead.
+    #[test]
+    fn nii_write_of_a_non_three_component_dispvect_image_is_rejected() {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let mut img = Image::from_vec_vector::<f32>(&[4, 1], 2, data).unwrap();
+        img.set_meta_data("intent_code", "1006"); // NIFTI_INTENT_DISPVECT
+
+        let path = tmp_path("dispvect_2component_write.nii");
+        let result = write_image(&img, &path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::NiftiWriteRejected(m)) if m.contains("3-component")),
+            "{result:?}"
+        );
+    }
+
+    /// Fixed §1.51 (read side): the mirror-image case of the write-side test
+    /// above, for a file whose header was hand-patched to `intent_code =
+    /// NIFTI_INTENT_DISPVECT` over a 2-component vector body — the shape no
+    /// legitimate writer (including this port's own) produces, since it now
+    /// refuses to write one. `read` rejects it rather than applying the
+    /// stride-3 sign flip across voxel boundaries.
+    #[test]
+    fn nii_read_of_a_non_three_component_dispvect_image_is_rejected() {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let img = Image::from_vec_vector::<f32>(&[4, 1], 2, data).unwrap();
+        let path = patched_nii("dispvect_2component_read.nii", &img, |b| {
+            patch_i16(b, 68, 1006); // intent_code = NIFTI_INTENT_DISPVECT
+        });
+
+        let result = read_image(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&result, Err(IoError::UnsupportedNiftiFeature(m)) if m.contains("3-component")),
+            "{result:?}"
+        );
+    }
+
     /// `ReadImageInformation` derives a vector image's dimension from `dim[4]`,
     /// `dim[3]` and `dim[2]` only (itkNiftiImageIO.cxx:788-805) — `dim[1]` is
     /// never consulted. A 2-D vector image one row tall therefore reads back

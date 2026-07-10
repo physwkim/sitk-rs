@@ -88,7 +88,11 @@
 //! `NIFTI_INTENT_DISPVECT` additionally turns on RAS↔LPS *vector* conversion,
 //! because `m_ConvertRASDisplacementVectors` defaults to `true`
 //! (itkNiftiImageIO.h:289) — the first two components of every 3-vector are
-//! negated on the way in and on the way out.
+//! negated on the way in and on the way out. Upstream's own guard names "3-component
+//! vector or point" in its exception text but never actually checks the count
+//! (:565-571 read, :2177-2183 write) before applying a hard-coded stride-3
+//! walk; bug §1.51, fixed here on both read and write by rejecting a
+//! `NIFTI_INTENT_DISPVECT` image whose component count is not 3.
 //!
 //! `NIFTI_INTENT_GENMATRIX` and `NIFTI_INTENT_SYMMATRIX` are rejected: the
 //! first by ITK itself (:806-810), the second by SimpleITK's wrapping layer
@@ -2291,10 +2295,12 @@ fn rescale(buf: &mut PixelBuffer, slope: f64, intercept: f64, count: usize) {
 /// `ConvertRASToFromLPS_CXYZT` (itkNiftiImageIO.cxx:263-274): negate components
 /// `0` and `1` of every group of three, over `size / 3` groups.
 ///
-/// Upstream checks only the *pixel type* before calling this, never that the
-/// component count is three, so a 2- or 4-component `NIFTI_INTENT_DISPVECT`
-/// image gets a stride-3 walk over an interleaved buffer of a different stride.
-/// Reproduced (it is memory-safe; ledger §1.51).
+/// Fixed §1.51: upstream checks only the *pixel type* before calling this,
+/// never that the component count is three, so a 2- or 4-component
+/// `NIFTI_INTENT_DISPVECT` image got a stride-3 walk over an interleaved
+/// buffer of a different stride. `read` now rejects a non-3-component vector
+/// before calling this, matching what upstream's own exception text already
+/// claimed to enforce.
 fn convert_ras_cxyzt(buf: &mut PixelBuffer, size: usize) {
     let n = size / 3;
     macro_rules! flip {
@@ -2315,6 +2321,10 @@ fn convert_ras_cxyzt(buf: &mut PixelBuffer, size: usize) {
 /// `ConvertRASToFromLPS_XYZTC` (itkNiftiImageIO.cxx:279-289): in NIfTI's
 /// component-slowest layout the first `size / 3 * 2` components are the whole
 /// `x` and `y` planes, so negating that prefix flips `L↔R` and `P↔A`.
+///
+/// Fixed §1.51 (write side): `write` rejects a non-3-component vector before
+/// calling this, mirroring the same missing check in upstream's `Write`
+/// (itkNiftiImageIO.cxx:2177-2183) that `Read` has (:565-571).
 fn convert_ras_xyztc(buf: &mut [u8], component: PixelId, size: usize) {
     let n = size / 3 * 2;
     match component {
@@ -2425,6 +2435,16 @@ pub fn read(path: &Path) -> Result<Image> {
     }
 
     if info.convert_ras {
+        // Fixed §1.51: upstream's guard (itkNiftiImageIO.cxx:566-570) checks
+        // only the pixel type, never that `numComponents == 3`, even though
+        // its own exception text names that count. Enforce it here.
+        if info.components != 3 {
+            return Err(IoError::UnsupportedNiftiFeature(format!(
+                "RAS conversion requires pixel to be 3-component vector or point. \
+                 Current pixel type is {}-component VECTOR.",
+                info.components
+            )));
+        }
         if !matches!(component_after_cast, PixelId::Float32 | PixelId::Float64) {
             return Err(IoError::UnsupportedNiftiFeature(format!(
                 "RAS conversion of datatype {} is not supported",
@@ -2930,6 +2950,16 @@ pub fn write(image: &Image, path: &Path) -> Result<()> {
     };
 
     let component = image.pixel_id().component_id();
+    if info.convert_ras && info.components != 3 {
+        // Fixed §1.51: upstream's guard (itkNiftiImageIO.cxx:2177-2183) checks
+        // only the pixel type, never that `numComponents == 3`, even though its
+        // own exception text names that count. Enforce it here.
+        return Err(IoError::NiftiWriteRejected(format!(
+            "RAS conversion requires pixel to be 3-component vector or point. \
+             Current pixel type is {}-component VECTOR.",
+            info.components
+        )));
+    }
     let mut data = if kind == PixelKind::Vector {
         if info.convert_ras && !matches!(component, PixelId::Float32 | PixelId::Float64) {
             return Err(IoError::NiftiWriteRejected(format!(
