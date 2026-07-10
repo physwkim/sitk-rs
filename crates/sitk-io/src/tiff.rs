@@ -97,8 +97,18 @@
 //! reproduce: this crate's [`PixelId`] has no restriction against a
 //! multi-component grayscale image, so **fixed §2.140** — [`layout_for`] now
 //! sets `number_of_components` to the page's true `SamplesPerPixel` for
-//! `GRAYSCALE` too, exactly as it already did for `RGB`, and the file reads
-//! back as a vector image with every sample intact. This also makes
+//! `GRAYSCALE` too, exactly as it already did for `RGB`, and a `MINISBLACK`
+//! page reads back as a vector image with every sample intact.
+//!
+//! A `MINISWHITE` page is decodable only where the `tiff` crate can invert it:
+//! its `invert_colors` handles single-sample `Gray` with an unsigned-integer or
+//! 32/64-bit float sample and nothing else (decoder/mod.rs:713-769), so a
+//! multi-sample `MINISWHITE` page (`ColorType::Multiband`) or a signed /
+//! non-32-bit-float single-sample one makes [`read`] error with
+//! `UnknownInterpretation`. [`layout_for`] refuses those at
+//! `read_information` time (`crate_can_invert_whiteiszero`) so the header does
+//! not advertise components [`read`] cannot deliver — the same
+//! `colortype()`-based decodability guard the `RGB` arm applies. This also makes
 //! [`page_rows`]'s two stride parameters always equal — `layout.number_of_components`
 //! and `page.samples_per_pixel` are the same count on every path once
 //! `read_current_page`'s per-page geometry check (§1.67) has passed — so
@@ -491,6 +501,25 @@ fn component_type(bits_per_sample: u16, sample_format: u16) -> Result<PixelId> {
     })
 }
 
+/// Whether the `tiff` crate's `invert_colors` (decoder/mod.rs:713-769) can
+/// invert a `WhiteIsZero` page that decodes as `color` with the raw
+/// `SampleFormat` tag `sample_format` (1 = Uint, 2 = Int, 3 = IEEEFP). Its match
+/// arms accept only `Gray(1|2|4|8|16|32|64)` with `Uint` and `Gray(32|64)` with
+/// `IEEEFP`; everything else — `Multiband`, signed-integer `Gray`, non-32/64-bit
+/// float `Gray` — falls to the `_` arm and returns `UnknownInterpretation`.
+/// Mirrored exactly so `layout_for` refuses at `read_information` time whatever
+/// `read` would fail to invert.
+fn crate_can_invert_whiteiszero(color: &ColorType, sample_format: u16) -> bool {
+    match *color {
+        ColorType::Gray(bits) => match sample_format {
+            2 => false,                   // SampleFormat::Int
+            3 => matches!(bits, 32 | 64), // SampleFormat::IEEEFP
+            _ => true,                    // SampleFormat::Uint / default
+        },
+        _ => false, // Multiband and every non-gray interpretation
+    }
+}
+
 /// `TIFFReaderInternal::CanRead` (itkTIFFReaderInternal.cxx:276-290) narrowed to
 /// what the `tiff` crate can decode, plus `ReadImageInformation`'s pixel-type
 /// assignment (itkTIFFImageIO.cxx:433-491).
@@ -581,7 +610,42 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
         // page as `Multiband { num_samples: SamplesPerPixel, .. }`
         // (decoder/image.rs:460-471) — every sample, verbatim — so the true
         // count is simply the page's own `SamplesPerPixel`.
-        Format::Grayscale => usize::from(page0.samples_per_pixel),
+        //
+        // Decodability caveat, symmetric with the `Rgb` arm's `colortype()`
+        // guard: `read` decodes through `decoder.read_image()`, which for a
+        // `WhiteIsZero` page inverts every sample via the crate's
+        // `invert_colors`. That table handles only single-sample `Gray` with an
+        // unsigned-integer sample (any width) or a 32/64-bit IEEE-float sample
+        // (decoder/mod.rs:713-769). A multi-sample page (`ColorType::Multiband`)
+        // or a signed-integer / non-32-bit-float single-sample page is a shape
+        // the table omits, so `invert_colors` returns `UnknownInterpretation`
+        // and `read` errors. Refuse it here so `read_information` does not
+        // advertise components `read` cannot deliver. `BlackIsZero` is never
+        // inverted, so a multi-sample `MINISBLACK` page still reads as a
+        // vector image.
+        Format::Grayscale => {
+            let stored = usize::from(page0.samples_per_pixel);
+            if photometric == PhotometricInterpretation::WhiteIsZero {
+                let color: ColorType = decoder.colortype().map_err(|source| {
+                    IoError::UnsupportedTiffFeature(format!(
+                        "the `tiff` crate cannot name a ColorType for this MINISWHITE TIFF \
+                         ({source}) — doc/upstream-findings.md §2.140"
+                    ))
+                })?;
+                if !crate_can_invert_whiteiszero(&color, page0.sample_format) {
+                    return unsupported(format!(
+                        "a MINISWHITE (WhiteIsZero) TIFF that decodes as {color:?} with \
+                         SampleFormat {} cannot be inverted by the `tiff` crate's invert_colors, \
+                         which handles only single-sample Gray with an unsigned-integer or \
+                         32/64-bit float sample, so read() errors with UnknownInterpretation \
+                         (SamplesPerPixel = {stored}, decoder/mod.rs:713-769) — \
+                         doc/upstream-findings.md §2.140",
+                        page0.sample_format
+                    ));
+                }
+            }
+            stored
+        }
         Format::Rgb => {
             let color: ColorType = decoder.colortype().map_err(|source| {
                 IoError::UnsupportedTiffFeature(format!(
@@ -1537,6 +1601,56 @@ mod tests {
         assert_eq!(image.number_of_components_per_pixel(), 2);
         assert_eq!(image.size(), &[2, 2]);
         assert_eq!(image.buffer(), &PixelBuffer::UInt8(pixels));
+    }
+
+    /// §2.140, `MINISWHITE` counterpart. Unlike `MINISBLACK`, a `WhiteIsZero`
+    /// page is inverted sample-by-sample by the `tiff` crate's `invert_colors`,
+    /// which handles only single-sample `Gray` with an unsigned-integer or
+    /// 32/64-bit float sample (decoder/mod.rs:713-769). A multi-sample page
+    /// (`ColorType::Multiband`) or a signed single-sample page
+    /// (`Gray` + `SampleFormat::Int`) is a shape it omits, so `read` errors with
+    /// `UnknownInterpretation`. `layout_for` now refuses both at
+    /// `read_information` time too, so the header and the pixel read never
+    /// disagree about whether the file is readable.
+    #[test]
+    fn minis_white_pages_the_crate_cannot_invert_are_refused_by_both_read_paths() {
+        // Multi-sample MINISWHITE decodes as ColorType::Multiband.
+        let multiband = build_tiff(vec![Page {
+            entries: base_entries(2, 2, 8, 2, 0), // photometric 0 == MINISWHITE
+            pixels: vec![1u8, 2, 3, 4, 5, 6, 7, 8],
+        }]);
+        let path = write_fixture("sitk_io_tiff_minis_white_multiband.tif", &multiband);
+        let info = read_information(&path);
+        let image = read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&info, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§2.140")),
+            "read_information should refuse multiband MINISWHITE: {info:?}"
+        );
+        assert!(
+            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§2.140")),
+            "read should refuse multiband MINISWHITE: {image:?}"
+        );
+
+        // Signed single-sample MINISWHITE decodes as Gray + SampleFormat::Int.
+        let mut entries = base_entries(2, 2, 8, 1, 0);
+        entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, short(2))); // signed int
+        let signed = build_tiff(vec![Page {
+            entries,
+            pixels: vec![1u8, 2, 3, 4],
+        }]);
+        let path = write_fixture("sitk_io_tiff_minis_white_signed.tif", &signed);
+        let info = read_information(&path);
+        let image = read(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&info, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§2.140")),
+            "read_information should refuse signed MINISWHITE: {info:?}"
+        );
+        assert!(
+            matches!(&image, Err(IoError::UnsupportedTiffFeature(m)) if m.contains("§2.140")),
+            "read should refuse signed MINISWHITE: {image:?}"
+        );
     }
 
     /// `ORIENTATION_BOTLEFT` sends scanline `row` to `height - 1 - row`
