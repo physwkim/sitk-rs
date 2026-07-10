@@ -61,8 +61,27 @@
 //! axis is always the median regardless of `rank`. [`fast_approximate_rank`]
 //! reproduces this exactly: `rank` is applied to every axis except the last,
 //! and `0.5` is applied to the last axis, unconditionally.
+//!
+//! [`rank`] is `RankImageFilter` itself, ported directly rather than through
+//! the separable approximation: every output pixel is the order statistic of
+//! the *full* ND `kernel`-on neighborhood in one shot, using the same
+//! `k = floor(rank * (n - 1))` formula and cropped (not replicated) boundary
+//! rule derived above, plus [`crate::morphology::StructuringElement`] for the
+//! `Box`/`Cross`/`Ball`/custom-mask kernel shapes
+//! (`RankImageFilter.yaml`'s `Radius`/`KernelType` members). ITK's own
+//! `MovingHistogramImageFilter` machinery (`AddBoundary`/`RemoveBoundary`
+//! no-ops, an incremental sliding histogram) has no equivalent in this
+//! crate's [`sitk_core::NeighborhoodIterator`] (every existing
+//! [`sitk_core::BoundaryCondition`] substitutes *some* value for an
+//! out-of-bounds offset, never excludes it), so [`rank`] hand-rolls a direct
+//! per-offset bounds check instead of reusing that iterator — a
+//! from-scratch, non-incremental gather per pixel rather than Huang's
+//! sliding-histogram optimization, matching this port's usual
+//! correctness-over-performance stance for filters whose only obstacle to
+//! reuse is a missing iterator boundary mode.
 
 use crate::error::{FilterError, Result};
+use crate::morphology::StructuringElement;
 use sitk_core::{Image, Scalar, dispatch_scalar};
 
 /// The value that would sit at 0-indexed position `k` in ascending sorted
@@ -289,5 +308,228 @@ mod tests {
                 got: 1
             })
         ));
+    }
+}
+
+// ---- RankImageFilter (exact, ND) -------------------------------------------
+
+/// Per-offset ND coordinates for a `radius`-sized window, dimension-0-fastest
+/// -- the same enumeration [`crate::morphology`]'s own (private)
+/// `window_offsets` builds, and the order [`StructuringElement`]'s `on()`
+/// mask lines up with; duplicated locally per this crate's existing
+/// convention of re-deriving this small enumeration in each module that
+/// needs it (see `object_morphology.rs`/`denoise.rs`'s own local copies),
+/// rather than exporting it across a module boundary.
+fn window_offsets(radius: &[usize]) -> Vec<Vec<i64>> {
+    let dim = radius.len();
+    let n: usize = radius.iter().map(|&r| 2 * r + 1).product();
+    let mut offsets = Vec::with_capacity(n);
+    let mut offset: Vec<i64> = radius.iter().map(|&r| -(r as i64)).collect();
+    for _ in 0..n {
+        offsets.push(offset.clone());
+        for d in 0..dim {
+            offset[d] += 1;
+            if offset[d] > radius[d] as i64 {
+                offset[d] = -(radius[d] as i64);
+            } else {
+                break;
+            }
+        }
+    }
+    offsets
+}
+
+fn rank_typed<T: Scalar>(img: &Image, kernel: &StructuringElement, rank: f32) -> Result<Image> {
+    let size = img.size().to_vec();
+    let dim = size.len();
+    let strides_ = strides(&size);
+    let buf: Vec<T> = img.scalar_slice::<T>()?.to_vec();
+
+    let offsets = window_offsets(kernel.radius());
+    let on_offsets: Vec<&Vec<i64>> = offsets
+        .iter()
+        .zip(kernel.on())
+        .filter_map(|(off, &on)| on.then_some(off))
+        .collect();
+
+    let result: Vec<T> = (0..buf.len())
+        .map(|flat| {
+            let mut window: Vec<T> = Vec::with_capacity(on_offsets.len());
+            'offset: for off in &on_offsets {
+                let mut src_flat = 0usize;
+                for d in 0..dim {
+                    let coord = (flat / strides_[d]) % size[d];
+                    let c = coord as i64 + off[d];
+                    if c < 0 || c >= size[d] as i64 {
+                        continue 'offset;
+                    }
+                    src_flat += c as usize * strides_[d];
+                }
+                window.push(buf[src_flat]);
+            }
+            if window.is_empty() {
+                return Err(FilterError::EmptyRankNeighborhood);
+            }
+            let k = (rank * (window.len() - 1) as f32) as usize;
+            Ok(select_rank(&mut window, k))
+        })
+        .collect::<Result<Vec<T>>>()?;
+
+    let mut out = Image::from_vec(&size, result)?;
+    out.copy_geometry_from(img);
+    Ok(out)
+}
+
+/// `RankImageFilter` (`itkRankImageFilter.h(.hxx)`, order statistic from
+/// `itkRankHistogram.h`): the exact ND rank filter -- unlike
+/// [`fast_approximate_rank`], every output pixel is the `rank`-th order
+/// statistic of the *full* `kernel`-on neighborhood at once (no per-axis
+/// separable approximation, and no last-axis-forced-to-median quirk). The
+/// neighborhood is cropped at the boundary, never replicated
+/// (`RankHistogram::AddBoundary`/`RemoveBoundary` are no-ops, matching
+/// `itkMovingHistogramImageFilter.hxx`'s boundary handling and this module's
+/// [`fast_approximate_rank`]).
+///
+/// `rank` is clamped to `[0, 1]` and narrowed to `f32` before the order
+/// statistic multiply (`itkSetClampMacro(Rank, float, 0.0, 1.0)`;
+/// `RankImageFilter.yaml`'s `Rank` member is `double`-typed at the SimpleITK
+/// wrapper boundary but narrows to the C++ class's `float m_Rank` — see the
+/// module doc's derivation of `k = floor(rank * (n - 1))` in `f32`
+/// precision, same as [`fast_approximate_rank`]).
+///
+/// `kernel`'s radius must match `img`'s dimension (mirrors
+/// [`sitk_core::NeighborhoodIterator::new`]'s own `RadiusMismatch` for the
+/// same condition, since this filter hand-rolls its cropped-boundary
+/// neighborhood gather rather than going through that iterator — see the
+/// module docs on why: none of this crate's boundary conditions model
+/// "exclude out-of-bounds" the way `RankHistogram` needs).
+///
+/// Errors with [`FilterError::EmptyRankNeighborhood`] if `kernel`'s on-cells
+/// are entirely cropped away at some pixel (see that variant's doc for when
+/// this is actually reachable).
+pub fn rank(img: &Image, kernel: &StructuringElement, rank: f64) -> Result<Image> {
+    let dim = img.dimension();
+    if kernel.radius().len() != dim {
+        return Err(sitk_core::Error::RadiusMismatch { dimension: dim }.into());
+    }
+    let rank = (rank as f32).clamp(0.0, 1.0);
+    dispatch_scalar!(img.pixel_id(), rank_typed, img, kernel, rank)
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+    use sitk_core::PixelId;
+
+    #[test]
+    fn rank_median_matches_hand_computed_interior_value() {
+        // 3x3, box radius 1: interior pixel's full 9-neighborhood sorted is
+        // [1..9], k = floor(0.5*8) = 4 -> the true median, 5. 0.5 is also
+        // `RankImageFilter.yaml`'s default `Rank`, so this pins that default
+        // at the same time.
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[3, 3], vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ]).unwrap();
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let out = rank(&img, &kernel, 0.5).unwrap();
+        assert_eq!(out.scalar_slice::<f64>().unwrap()[4], 5.0);
+    }
+
+    #[test]
+    fn rank_boundary_neighborhood_is_cropped_not_replicated() {
+        // Top-left corner of a 3x3 box-radius-1 kernel only overlaps the
+        // 2x2 block {1,2,4,5}: n=4, k = floor(rank*3).
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[3, 3], vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ]).unwrap();
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let out = rank(&img, &kernel, 0.0).unwrap();
+        // rank=0.0 -> the minimum of {1,2,4,5} = 1, not the minimum of the
+        // full image (which would also be 1 here, so also check rank=1.0).
+        assert_eq!(out.scalar_slice::<f64>().unwrap()[0], 1.0);
+        let out_max = rank(&img, &kernel, 1.0).unwrap();
+        // max of the cropped corner window {1,2,4,5} = 5, NOT the image
+        // maximum (9), proving the window really is cropped to 4 elements.
+        assert_eq!(out_max.scalar_slice::<f64>().unwrap()[0], 5.0);
+    }
+
+    #[test]
+    fn rank_zero_is_the_true_minimum_and_one_is_the_true_maximum() {
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[3, 3], vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ]).unwrap();
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let min_out = rank(&img, &kernel, 0.0).unwrap();
+        let max_out = rank(&img, &kernel, 1.0).unwrap();
+        assert_eq!(min_out.scalar_slice::<f64>().unwrap()[4], 1.0); // center's full 3x3 window
+        assert_eq!(max_out.scalar_slice::<f64>().unwrap()[4], 9.0);
+    }
+
+    #[test]
+    fn rank_cross_kernel_only_uses_the_plus_shaped_neighborhood() {
+        // Cross radius 1 at the center excludes the four corners: window =
+        // {2,4,5,6,8} (n=5), k = floor(0.5*4) = 2 -> sorted[2] = 5.
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[3, 3], vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ]).unwrap();
+        let kernel = StructuringElement::cross(&[1, 1]);
+        let out = rank(&img, &kernel, 0.5).unwrap();
+        assert_eq!(out.scalar_slice::<f64>().unwrap()[4], 5.0);
+    }
+
+    #[test]
+    fn rank_output_pixel_type_follows_input() {
+        #[rustfmt::skip]
+        let img = Image::from_vec(&[3, 3], vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let out = rank(&img, &kernel, 0.5).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt8);
+    }
+
+    #[test]
+    fn rank_rejects_a_kernel_of_the_wrong_dimension() {
+        let img = Image::from_vec(&[3, 3], vec![0.0; 9]).unwrap();
+        let kernel = StructuringElement::box_(&[1]);
+        let err = rank(&img, &kernel, 0.5).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::Core(sitk_core::Error::RadiusMismatch { dimension: 2 })
+        );
+    }
+
+    #[test]
+    fn rank_rejects_a_structuring_element_with_no_on_cells_reachable() {
+        // A custom mask that excludes the center: at the single-pixel
+        // image's only position, the sole offset (the center) is off, so no
+        // in-bounds on-cell exists anywhere.
+        let img = Image::from_vec(&[1, 1], vec![5.0]).unwrap();
+        let kernel = StructuringElement::from_mask(&[0, 0], vec![false]).unwrap();
+        let err = rank(&img, &kernel, 0.5).unwrap_err();
+        assert_eq!(err, FilterError::EmptyRankNeighborhood);
+    }
+
+    #[test]
+    fn rank_rejects_non_scalar_pixel_type() {
+        let img = Image::new(&[3, 3], PixelId::ComplexFloat32);
+        let kernel = StructuringElement::box_(&[1, 1]);
+        let err = rank(&img, &kernel, 0.5).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
+                PixelId::ComplexFloat32
+            ))
+        );
     }
 }

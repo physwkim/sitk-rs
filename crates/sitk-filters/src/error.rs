@@ -34,6 +34,20 @@ pub enum FilterError {
     #[error("structuring element mask expected {expected} values (Π 2*radius[d]+1), got {got}")]
     MaskLengthMismatch { expected: usize, got: usize },
 
+    /// `RankImageFilter`'s port ([`crate::rank::rank`]): the structuring
+    /// element's on-cells were entirely cropped away at some pixel, leaving
+    /// nothing to select a rank from. Upstream's `RankHistogram` would
+    /// instead compute `m_Entries - 1` on an unsigned `SizeValueType` while
+    /// `m_Entries == 0`, silently wrapping to a huge value rather than
+    /// erroring — well-defined C++ unsigned overflow, but nonsensical
+    /// output; this port rejects the condition explicitly instead of
+    /// reproducing the wraparound. Only reachable through a caller-built
+    /// `StructuringElement::from_mask` whose on-mask excludes the center
+    /// offset, since `box_`/`cross`/`ball` always keep the center on (always
+    /// in-bounds for every pixel).
+    #[error("rank filter's structuring element window is empty at some pixel")]
+    EmptyRankNeighborhood,
+
     /// A shrink factor was zero (must be a positive integer).
     #[error("shrink factors must be >= 1, got {0:?}")]
     InvalidShrinkFactor(Vec<usize>),
