@@ -1,11 +1,14 @@
 //! Image file IO for sitk-rs.
 //!
 //! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
-//! [`read_image`] and [`write_image`] ask the registry which IO handles a path,
-//! exactly as SimpleITK's readers and writers ask `itk::ImageIOFactory`. Adding
-//! NIfTI, NRRD, PNG or DICOM later is a new module plus one registry entry — no
-//! dispatch to extend. See [`image_io`] for the probe order and [`meta_image`]
-//! for the only implementor so far.
+//! [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
+//! handles a path, exactly as SimpleITK's readers and writers ask
+//! `itk::ImageIOFactory`. Adding NIfTI, NRRD, PNG or DICOM later is a new
+//! module plus one registry entry — no dispatch to extend. See [`image_io`] for
+//! the probe order and [`meta_image`] for the only implementor so far.
+//!
+//! [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
+//! also provides (`itk::simple::ReadImage` / `WriteImage`).
 //!
 //! Phase 0 supports MetaImage (`.mha` / `.mhd`), ITK's native uncompressed
 //! format, which round-trips every scalar, vector, and complex pixel type and
@@ -15,6 +18,8 @@
 pub mod error;
 pub mod image_io;
 pub mod meta_image;
+pub mod reader;
+pub mod writer;
 
 use std::path::Path;
 
@@ -23,7 +28,9 @@ pub use image_io::{
     FileMode, ImageInformation, ImageIo, create_image_io, image_io_by_name, registered_image_ios,
     registry,
 };
+pub use reader::ImageFileReader;
 use sitk_core::Image;
+pub use writer::ImageFileWriter;
 
 /// Read an image, letting the [`registry`] pick the format —
 /// `itk::simple::ReadImage` (sitkImageFileReader.cxx:70-78).
@@ -450,6 +457,165 @@ mod tests {
         );
     }
 
+    /// `SetImageIO` bypasses `CreateImageIO` entirely
+    /// (sitkImageFileWriter.cxx:198-205), so a named IO writes any path.
+    #[test]
+    fn writer_set_image_io_overrides_extension_detection() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("named_io.foo");
+
+        let mut writer = ImageFileWriter::new();
+        writer.set_file_name(&path);
+        assert!(matches!(
+            writer.execute(&img),
+            Err(IoError::NoWriterFound(_))
+        ));
+
+        writer.set_image_io(Some("MetaImageIO"));
+        writer.execute(&img).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(written.starts_with(b"ObjectType = Image\n"));
+
+        writer.set_image_io(Some("NiftiImageIO"));
+        assert!(matches!(
+            writer.execute(&img),
+            Err(IoError::UnknownImageIo(_))
+        ));
+        assert_eq!(writer.registered_image_ios(), vec!["MetaImageIO"]);
+    }
+
+    // ---- ReadImageInformation --------------------------------------------
+
+    /// `ReadImageInformation` parses the header and stops: `ElementDataFile` is
+    /// MetaIO's `terminateRead` field (metaImage.cxx:2209-2212). This header
+    /// declares 10^10 doubles and carries not one byte of them, so only a
+    /// reader that never touches the pixel tail can answer.
+    #[test]
+    fn read_image_information_does_not_load_pixels() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             BinaryDataByteOrderMSB = False\n\
+             CompressedData = False\n\
+             TransformMatrix = 1 0 0 1\n\
+             Offset = 3 4\n\
+             ElementSpacing = 0.5 2\n\
+             DimSize = 100000 100000\n\
+             ElementType = MET_DOUBLE\n\
+             ElementDataFile = LOCAL\n";
+        let path = tmp_path("huge_header.mha");
+        std::fs::write(&path, header).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap().clone();
+        let loaded = reader.execute();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::Float64);
+        assert_eq!(info.dimension, 2);
+        assert_eq!(info.number_of_components, 1);
+        assert_eq!(info.size, vec![100000, 100000]);
+        assert_eq!(info.spacing, vec![0.5, 2.0]);
+        assert_eq!(info.origin, vec![3.0, 4.0]);
+        assert_eq!(info.direction, vec![1.0, 0.0, 0.0, 1.0]);
+        assert!(matches!(loaded, Err(IoError::TruncatedData)), "{loaded:?}");
+    }
+
+    /// A `.mhd`'s `ReadImageInformation` never opens the `.raw` either.
+    #[test]
+    fn read_image_information_of_an_mhd_does_not_need_the_raw_file() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             CompressedData = False\n\
+             DimSize = 2 2\n\
+             ElementNumberOfChannels = 3\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = nowhere.raw\n";
+        let path = tmp_path("no_raw.mhd");
+        std::fs::write(&path, header).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        let info = reader.read_image_information().unwrap().clone();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(info.pixel_id, PixelId::VectorUInt8);
+        assert_eq!(info.number_of_components, 3);
+        // Absent ElementSpacing/Offset/TransformMatrix default to unit geometry.
+        assert_eq!(info.spacing, vec![1.0, 1.0]);
+        assert_eq!(info.origin, vec![0.0, 0.0]);
+    }
+
+    // ---- meta-data dictionary --------------------------------------------
+
+    /// `MetaImageIO::ReadImageInformation` always installs `ITK_InputFilterName`
+    /// and `Modality`, adds every unrecognized header field verbatim, and adds
+    /// `ITK_VoxelUnits` / `ITK_ExperimentDate` when `DistanceUnits` /
+    /// `AcquisitionDate` are present (itkMetaImageIO.cxx:270-304). Field-name
+    /// matching is `strcmp`, so `elementspacing` is *not* `ElementSpacing`: it
+    /// is a custom tag, and the real spacing falls back to its default.
+    #[test]
+    fn read_populates_the_itk_meta_data_dictionary() {
+        let header = "ObjectType = Image\n\
+             NDims = 2\n\
+             BinaryData = True\n\
+             Modality = MET_MOD_CT\n\
+             DistanceUnits = mm\n\
+             AcquisitionDate = 2026.07.10\n\
+             MyTag = some value\n\
+             elementspacing = 9 9\n\
+             DimSize = 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LOCAL\n";
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&[7u8; 4]);
+        let path = tmp_path("dictionary.mha");
+        std::fs::write(&path, bytes).unwrap();
+
+        let img = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            img.meta_data_keys(),
+            vec![
+                "ITK_ExperimentDate",
+                "ITK_InputFilterName",
+                "ITK_VoxelUnits",
+                "Modality",
+                "MyTag",
+                "elementspacing",
+            ]
+        );
+        assert_eq!(img.meta_data("ITK_InputFilterName"), Some("MetaImageIO"));
+        assert_eq!(img.meta_data("Modality"), Some("MET_MOD_CT"));
+        assert_eq!(img.meta_data("ITK_VoxelUnits"), Some("mm"));
+        assert_eq!(img.meta_data("ITK_ExperimentDate"), Some("2026.07.10"));
+        assert_eq!(img.meta_data("MyTag"), Some("some value"));
+        assert_eq!(img.meta_data("elementspacing"), Some("9 9"));
+        assert_eq!(img.spacing(), &[1.0, 1.0]);
+    }
+
+    /// A header with none of the optional keys still gets the two mandatory
+    /// ones, and an unparsable `Modality` falls back to `MET_MOD_UNKNOWN`
+    /// (metaImageUtils.cxx:28-44).
+    #[test]
+    fn default_dictionary_is_the_filter_name_and_unknown_modality() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        let path = tmp_path("default_dict.mha");
+        write_image(&img, &path).unwrap();
+        let back = read_image(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            back.meta_data_keys(),
+            vec!["ITK_InputFilterName", "Modality"]
+        );
+        assert_eq!(back.meta_data("Modality"), Some("MET_MOD_UNKNOWN"));
+    }
+
     // ---- header field precedence and boolean parsing ----------------------
 
     fn write_mha(name: &str, header: &str, data: &[u8]) -> std::path::PathBuf {
@@ -675,5 +841,172 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&s0).ok();
         assert!(matches!(result, Err(IoError::TruncatedData)), "{result:?}");
+    }
+
+    // ---- ImageFileReader extraction ---------------------------------------
+
+    /// A 3x3x2 `Int16` volume with an oblique direction, used by the extraction
+    /// tests. Pixel `(x, y, z)` holds `x + 3y + 9z`.
+    fn write_volume(name: &str) -> std::path::PathBuf {
+        let data: Vec<i16> = (0..18).collect();
+        let mut img = Image::from_vec(&[3, 3, 2], data).unwrap();
+        img.set_spacing(&[1.0, 2.0, 4.0]).unwrap();
+        img.set_origin(&[10.0, 20.0, 30.0]).unwrap();
+        img.set_direction(&[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let path = tmp_path(name);
+        write_image(&img, &path).unwrap();
+        path
+    }
+
+    /// An extraction region equal to the whole file, at index zero, is the full
+    /// read: same buffer, same geometry, same dictionary.
+    #[test]
+    fn extract_of_the_whole_region_equals_a_full_read() {
+        let path = write_volume("extract_full.mha");
+        let full = read_image(&path).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        reader.set_extract_size(&[3, 3, 2]);
+        reader.set_extract_index(&[0, 0, 0]);
+        let extracted = reader.execute().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(extracted, full);
+    }
+
+    /// A zero-size axis collapses. The output direction is the file direction's
+    /// submatrix over the retained axes (`SetDirectionCollapseToSubmatrix`,
+    /// sitkImageFileReader.cxx:403), and the origin is shifted by the retained
+    /// axes' index through that submatrix (`FixNonZeroIndex`, :39-67). The
+    /// collapsed axis's own index selects the slice but never shifts the origin
+    /// (itkExtractImageFilter.hxx:162-179).
+    #[test]
+    fn extract_collapses_a_zero_size_axis_and_keeps_the_direction_submatrix() {
+        let path = write_volume("extract_slice.mha");
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        reader.set_extract_size(&[2, 2, 0]);
+        reader.set_extract_index(&[1, 1, 1]);
+        let img = reader.execute().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.dimension(), 2);
+        assert_eq!(img.size(), &[2, 2]);
+        assert_eq!(img.spacing(), &[1.0, 2.0]);
+        assert_eq!(img.direction(), &[0.0, -1.0, 1.0, 0.0]);
+        // origin + D * (spacing .* index) = [10, 20] + [[0,-1],[1,0]] * [1, 2]
+        assert_eq!(img.origin(), &[8.0, 21.0]);
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[13, 14, 16, 17]);
+        // The dictionary rides along (sitkImageFileReader.cxx:453).
+        assert_eq!(img.meta_data("ITK_InputFilterName"), Some("MetaImageIO"));
+    }
+
+    /// The *other* pipeline. With no zero entry the extract size's length
+    /// equals the output dimension, so SimpleITK reads the file straight into a
+    /// lower-dimensional `itk::Image` (sitkImageFileReader.cxx:362-379) — and
+    /// `itk::ImageFileReader` then throws the file's direction cosines away for
+    /// `GetDefaultDirection`, the identity (itkImageFileReader.hxx:155-162).
+    /// The trailing axis is read at index `0`, so `extract_index[2]` is ignored.
+    ///
+    /// Same file, same index, one fewer `0` in the size: different direction,
+    /// different origin, different pixels than
+    /// [`extract_collapses_a_zero_size_axis_and_keeps_the_direction_submatrix`].
+    #[test]
+    fn extract_without_a_zero_axis_gets_the_identity_direction_and_ignores_the_trailing_index() {
+        let path = write_volume("extract_direct.mha");
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        reader.set_extract_size(&[2, 2]);
+        reader.set_extract_index(&[1, 1, 1]);
+        let img = reader.execute().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(img.size(), &[2, 2]);
+        assert_eq!(img.direction(), &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(img.origin(), &[11.0, 22.0]);
+        assert_eq!(img.scalar_slice::<i16>().unwrap(), &[4, 5, 7, 8]);
+    }
+
+    /// Fewer than two non-zero axes is rejected before any pixel is read
+    /// (sitkImageFileReader.cxx:319-324), and a region reaching past the file
+    /// is rejected against the file's largest possible region (:440-444).
+    #[test]
+    fn extract_rejects_a_degenerate_or_out_of_bounds_region() {
+        let path = write_volume("extract_bad.mha");
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+
+        reader.set_extract_size(&[3, 0, 0]);
+        assert!(matches!(
+            reader.execute(),
+            Err(IoError::ExtractOutputDimension(1))
+        ));
+
+        reader
+            .set_extract_size(&[3, 3, 0])
+            .set_extract_index(&[0, 0, 2]);
+        let out_of_range = reader.execute();
+        assert!(
+            matches!(out_of_range, Err(IoError::ExtractRegionOutOfBounds { .. })),
+            "{out_of_range:?}"
+        );
+
+        reader
+            .set_extract_size(&[4, 3, 1])
+            .set_extract_index(&[0, 0, 0]);
+        let too_wide = reader.execute();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(too_wide, Err(IoError::ExtractRegionOutOfBounds { .. })),
+            "{too_wide:?}"
+        );
+    }
+
+    /// `DIRECTIONCOLLAPSETOSUBMATRIX` throws when the retained axes' submatrix
+    /// is singular (itkExtractImageFilter.hxx:194-200). A direction that maps
+    /// the two retained axes onto the same physical axis does that.
+    #[test]
+    fn extract_rejects_a_singular_collapsed_direction() {
+        let header = "ObjectType = Image\n\
+             NDims = 3\n\
+             TransformMatrix = 0 0 1 0 0 1 1 0 0\n\
+             DimSize = 2 2 2\n\
+             ElementType = MET_UCHAR\n\
+             ElementDataFile = LOCAL\n";
+        let path = write_mha("singular.mha", header, &[0u8; 8]);
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        reader.set_extract_size(&[2, 2, 0]);
+        let result = reader.execute();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(result, Err(IoError::SingularCollapsedDirection)),
+            "{result:?}"
+        );
+    }
+
+    /// Extraction is component-aware: a vector image keeps its channels.
+    #[test]
+    fn extract_preserves_vector_components() {
+        let data: Vec<u8> = (0..27).collect();
+        let img = Image::from_vec_vector::<u8>(&[3, 3], 3, data).unwrap();
+        let path = tmp_path("extract_vector.mha");
+        write_image(&img, &path).unwrap();
+
+        let mut reader = ImageFileReader::new();
+        reader.set_file_name(&path);
+        reader.set_extract_size(&[2, 2]).set_extract_index(&[1, 1]);
+        let out = reader.execute().unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(out.pixel_id(), PixelId::VectorUInt8);
+        assert_eq!(out.number_of_components_per_pixel(), 3);
+        // Pixels (1,1), (2,1), (1,2), (2,2) -> component offsets 12, 15, 21, 24.
+        assert_eq!(
+            out.component_slice::<u8>().unwrap(),
+            &[12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25, 26]
+        );
     }
 }
