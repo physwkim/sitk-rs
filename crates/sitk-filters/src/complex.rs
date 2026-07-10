@@ -31,8 +31,13 @@
 //!   `sqrt(FLT_TRUE_MIN) ≈ 3.74e-23` — silently returning `inf`/`0` for a
 //!   modulus that is a perfectly ordinary finite `f32`. This port computes the
 //!   modulus with `hypot`, which suffers none of those three failures and
-//!   agrees with `sqrt(re² + im²)` everywhere the latter does not overflow or
-//!   underflow. Pinned by
+//!   agrees with `sqrt(re² + im²)` **to component-type rounding** wherever the
+//!   latter is finite and nonzero — the two can still differ by ~1 ULP even in
+//!   the normal range, because `hypot` avoids forming `re² + im²` (and its
+//!   intermediate rounding / over- / underflow), so its result is the
+//!   better-rounded of the two. The port's modulus being thereby *more*
+//!   accurate than upstream's `std::sqrt` form is a deliberate
+//!   correctness-over-mirroring choice, not an incidental drift. Pinned by
 //!   `complex_to_modulus_is_finite_on_f32_where_the_naive_norm_overflows` and
 //!   `complex_to_modulus_is_exact_on_f32_where_the_naive_norm_underflows`.
 //!
