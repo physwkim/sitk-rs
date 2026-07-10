@@ -386,6 +386,17 @@ pub enum FilterError {
     #[error("normalize requires a convolution kernel whose pixels sum to a non-zero value")]
     ZeroKernelSum,
 
+    /// `NormalizeToConstantImageFilter` scales every pixel by
+    /// `divisor = GetSum() / Constant` (itkNormalizeToConstantImageFilter.hxx:71-73).
+    /// When the image sum is zero and the target `Constant` is a nonzero finite
+    /// value, no finite scale maps the sum onto the constant, so the
+    /// normalization is impossible. Upstream's `Div` functor silently fills the
+    /// whole image with `NumericTraits<T>::max()`; this port rejects instead.
+    #[error(
+        "normalize_to_constant cannot scale a zero-sum image to the nonzero constant {constant}"
+    )]
+    ZeroSumNormalization { constant: f64 },
+
     /// `CheckerBoardImageFilter::GenerateData` computes `factors[d] =
     /// size[d] / checker_pattern[d]` (integer division) and later divides an
     /// index by `factors[d]`; a pattern count of `0`, or one exceeding the
