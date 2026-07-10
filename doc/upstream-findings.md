@@ -651,9 +651,12 @@ What actually remains unported:
   are closed by refusal (§1.70-1.72). The DICOM **write** side is not ported —
   `can_write_file` answers for the advertised extensions and `write` refuses
   (§5.30). `itk::ImageFileReader`'s negative-spacing sign flip and its
-  `ITK_original_spacing`/`ITK_original_direction` metadata injection remain
-  unported crate-wide, which bites DICOM because GDCM's Z-spacing can be
-  negative before that flip (`itkGDCMImageIO.cxx:703`).
+  `ITK_original_spacing`/`ITK_original_direction` metadata injection — which
+  bites DICOM because GDCM's Z-spacing can be negative before that flip
+  (`itkGDCMImageIO.cxx:703`) — were ported 2026-07-11 as
+  `reader::normalize_reader_geometry`, applied crate-wide on the shared read
+  path (`execute`/`read_image`; `read_image_information` still reports raw
+  geometry, as SimpleITK does).
   Wave-25 landed **`ImageSeriesReader`/`ImageSeriesWriter`**
   (`sitk-io::image_series_reader`/`image_series_writer`, a port of
   `itk::simple::ImageSeriesReader`/`ImageSeriesWriter` wrapping
