@@ -408,14 +408,13 @@ fn read_transform_list(path: &Path, depth: usize) -> Result<Vec<Transform>> {
 /// the centre and grid geometry the parameters are interpreted against
 /// (`itkTxtTransformIO.cxx:186-217`).
 ///
-/// The parameter count is checked here rather than inside
-/// [`ParametricTransform::set_parameters`], which panics on a length mismatch.
-/// ITK's own checks are per-class and inconsistent — `MatrixOffsetTransformBase`
-/// and `TranslationTransform` throw only when the vector is *shorter* than
-/// needed and silently ignore trailing values, `VersorTransform` checks nothing
-/// at all, and `BSplineTransform` demands exact equality. This port demands
-/// exact equality everywhere (ledger §4.47), and checks it here because
-/// `set_parameters` is infallible by this crate's convention (ledger §5.16).
+/// The parameter count is [`ParametricTransform::set_parameters`]'s own check
+/// (ledger §5.16): ITK's own checks are per-class and inconsistent —
+/// `MatrixOffsetTransformBase` and `TranslationTransform` throw only when the
+/// vector is *shorter* than needed and silently ignore trailing values,
+/// `VersorTransform` checks nothing at all, and `BSplineTransform` demands
+/// exact equality. This port demands exact equality everywhere (ledger §4.47),
+/// uniformly, inside `set_parameters` itself.
 fn apply(
     list: &mut [Transform],
     current: Option<usize>,
@@ -429,15 +428,7 @@ fn apply(
     })?;
     let transform = &mut list[index];
     transform.set_fixed_parameters(fixed_parameters)?;
-    let expected = transform.number_of_parameters();
-    if parameters.len() != expected {
-        return Err(sitk_transform::TransformError::InvalidParameters {
-            got: parameters.len(),
-            expected,
-        }
-        .into());
-    }
-    transform.set_parameters(parameters);
+    transform.set_parameters(parameters)?;
     Ok(())
 }
 
@@ -744,7 +735,7 @@ mod tests {
         .unwrap();
         let n = field.number_of_parameters();
         let values: Vec<f64> = (0..n).map(|i| i as f64 * 0.125).collect();
-        field.set_parameters(&values);
+        field.set_parameters(&values).unwrap();
         field
     }
 
@@ -754,7 +745,7 @@ mod tests {
                 .unwrap();
         let n = transform.number_of_parameters();
         let values: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
-        transform.set_parameters(&values);
+        transform.set_parameters(&values).unwrap();
         transform
     }
 

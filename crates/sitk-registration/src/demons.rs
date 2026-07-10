@@ -601,7 +601,7 @@ mod tests {
             params[i * 2] = px;
             params[i * 2 + 1] = py;
         }
-        field.set_parameters(&params);
+        field.set_parameters(&params).unwrap();
 
         let got = metric.evaluate(&field);
 
@@ -660,7 +660,7 @@ mod tests {
             *p -= lr * d;
         }
         let mut stepped_field = field.clone();
-        stepped_field.set_parameters(&stepped);
+        stepped_field.set_parameters(&stepped).unwrap();
         let after = metric.evaluate(&stepped_field);
         assert!(
             after.value < got.value,
@@ -777,7 +777,7 @@ mod tests {
         let optimizer = GradientDescentOptimizer::new(50.0, 100);
         let result = optimizer.optimize(field.parameters(), |p| {
             let mut t = field.clone();
-            t.set_parameters(p);
+            t.set_parameters(p).unwrap();
             let mv = metric.evaluate(&t);
             (mv.value, mv.derivative)
         });
@@ -837,7 +837,7 @@ mod tests {
         for (i, p) in params.iter_mut().enumerate() {
             *p = if i % 2 == 0 { 0.6 } else { -0.4 };
         }
-        field.set_parameters(&params);
+        field.set_parameters(&params).unwrap();
         let full = metric.evaluate(&field).value;
         let value_only = metric.value(&field);
         assert!(

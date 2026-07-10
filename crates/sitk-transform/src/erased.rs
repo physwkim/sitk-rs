@@ -328,7 +328,7 @@ impl ParametricTransform for Transform {
         dispatch!(self, t => t.parameters())
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
+    fn set_parameters(&mut self, params: &[f64]) -> Result<()> {
         dispatch!(self, t => t.set_parameters(params))
     }
 
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn set_parameters_and_set_fixed_parameters_reach_the_concrete_transform() {
         let mut t: Transform = Euler2DTransform::identity().into();
-        t.set_parameters(&[0.5, 1.0, 2.0]);
+        t.set_parameters(&[0.5, 1.0, 2.0]).unwrap();
         t.set_fixed_parameters(&[3.0, 4.0]).unwrap();
         match &t {
             Transform::Euler2D(e) => {
@@ -534,6 +534,18 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_parameters_rejects_wrong_length_through_the_erased_surface() {
+        let mut t: Transform = Euler2DTransform::identity().into();
+        assert!(matches!(
+            t.set_parameters(&[0.5, 1.0]),
+            Err(TransformError::InvalidParameters {
+                got: 2,
+                expected: 3
+            })
+        ));
     }
 
     #[test]

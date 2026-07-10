@@ -234,8 +234,8 @@ impl<T: ParametricTransform + ?Sized> ParametricTransform for Composed<'_, T> {
         self.optimized.parameters()
     }
 
-    fn set_parameters(&mut self, params: &[f64]) {
-        self.optimized.set_parameters(params);
+    fn set_parameters(&mut self, params: &[f64]) -> sitk_transform::Result<()> {
+        self.optimized.set_parameters(params)
     }
 
     fn fixed_parameters(&self) -> Vec<f64> {
@@ -357,13 +357,19 @@ struct MetricObjective<'a, T: ParametricTransform> {
 
 impl<T: ParametricTransform> Objective for MetricObjective<'_, T> {
     fn value_and_gradient(&mut self, p: &[f64]) -> (f64, Vec<f64>) {
-        self.transform.set_parameters(p);
+        // `Objective` has no fallible surface, and the optimizer driving this
+        // always probes at `self.transform`'s own parameter dimension.
+        self.transform
+            .set_parameters(p)
+            .expect("optimizer probes at the transform's own parameter dimension");
         let m = self.metric.evaluate(&self.transform, self.backend);
         (m.value, m.derivative)
     }
 
     fn value(&mut self, p: &[f64]) -> f64 {
-        self.transform.set_parameters(p);
+        self.transform
+            .set_parameters(p)
+            .expect("optimizer probes at the transform's own parameter dimension");
         self.metric.value(&self.transform, self.backend)
     }
 }
@@ -2015,7 +2021,10 @@ impl ImageRegistrationMethod {
             () => {
                 |p: &[f64]| {
                     let mut c = composed!();
-                    c.set_parameters(p);
+                    // The closure signature the optimizer requires has no
+                    // fallible surface; it always probes at `nparams`.
+                    c.set_parameters(p)
+                        .expect("optimizer probes at the transform's own parameter dimension");
                     let m = metric.evaluate(&c, backend);
                     (m.value, m.derivative)
                 }
@@ -2039,7 +2048,8 @@ impl ImageRegistrationMethod {
             () => {
                 |p: &[f64]| {
                     let mut c = composed!();
-                    c.set_parameters(p);
+                    c.set_parameters(p)
+                        .expect("optimizer probes at the transform's own parameter dimension");
                     metric.value(&c, backend)
                 }
             };
@@ -2069,7 +2079,7 @@ impl ImageRegistrationMethod {
                     LearningRateMode::Estimate(EstimateLearningRate::Once) => {
                         let est = estimator.as_ref().unwrap();
                         let mut c = composed!();
-                        c.set_parameters(&start);
+                        c.set_parameters(&start)?;
                         let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.optimize_with_lr(start, objective!(), |grad| {
@@ -2103,7 +2113,7 @@ impl ImageRegistrationMethod {
                     LearningRateMode::Estimate(EstimateLearningRate::Once) => {
                         let est = estimator.as_ref().unwrap();
                         let mut c = composed!();
-                        c.set_parameters(&start);
+                        c.set_parameters(&start)?;
                         let m0 = metric.evaluate(&c, backend);
                         let scaled0 = scaled(&m0.derivative);
                         let grad_mag_0 = scaled0.iter().map(|g| g * g).sum::<f64>().sqrt();
@@ -2145,7 +2155,7 @@ impl ImageRegistrationMethod {
                     LearningRateMode::Estimate(_) => {
                         let est = estimator.as_ref().unwrap();
                         let mut c = composed!();
-                        c.set_parameters(&start);
+                        c.set_parameters(&start)?;
                         let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
@@ -2170,7 +2180,7 @@ impl ImageRegistrationMethod {
                     LearningRateMode::Estimate(_) => {
                         let est = estimator.as_ref().unwrap();
                         let mut c = composed!();
-                        c.set_parameters(&start);
+                        c.set_parameters(&start)?;
                         let m0 = metric.evaluate(&c, backend);
                         let lr_once = est.estimate_learning_rate(&scaled(&m0.derivative));
                         optimizer.set_learning_rate(lr_once);
@@ -2218,7 +2228,7 @@ impl ImageRegistrationMethod {
 
         let final_metric = {
             let mut c = composed!();
-            c.set_parameters(&result.parameters);
+            c.set_parameters(&result.parameters)?;
             metric.evaluate(&c, backend)
         };
         if final_metric.valid_points == 0 {
@@ -2436,7 +2446,7 @@ mod initial_transform_tests {
 
             let at = |p: &[f64]| {
                 let mut t = optimized.clone();
-                t.set_parameters(p);
+                t.set_parameters(p).unwrap();
                 let composed = Composed {
                     optimized: &mut t,
                     moving_initial: Some(&moving_initial),
