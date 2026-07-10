@@ -176,6 +176,7 @@ pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunc
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
     constant_pad, crop, extract, flip, mirror_pad, permute_axes, region_of_interest, wrap_pad,
+    zero_flux_neumann_pad,
 };
 pub use gradient::{
     derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
