@@ -42,20 +42,31 @@
 //!   center becomes background when it's `< survival_threshold` (the center's
 //!   own foreground-ness counts toward its own survival count), any other
 //!   center value (or a threshold miss) passes through unchanged.
-//! - [`voting_binary_iterative_hole_filling`] —
-//!   `itkVotingBinaryIterativeHoleFillingImageFilter.h`/`.hxx`, which runs
-//!   `itkVotingBinaryHoleFillingImageFilter.h`/`.hxx` in a loop. The inner
-//!   pass fixes `survival_threshold = 0` (a foreground center never dies) and
-//!   derives its birth threshold from `majority_threshold`
-//!   (`BeforeThreadedGenerateData`: `birth_threshold = (Π(2·radius[d]+1) - 1)
-//!   / 2 + majority_threshold`, integer division — the box neighbor count
-//!   excluding the center, halved, plus the caller's margin over 50%); unlike
-//!   `voting_binary`, every non-`background_value` center (not just an exact
-//!   `foreground_value` one) is unconditionally stamped to `foreground_value`
-//!   each pass. The outer loop reruns the pass, input := previous output,
-//!   until either `maximum_number_of_iterations` passes have run or a pass
-//!   changes zero pixels (`m_NumberOfPixelsChanged == 0`, counted only for
-//!   birth-triggered flips, exactly as the `.hxx` does).
+//! - [`voting_binary_hole_filling`] / [`voting_binary_iterative_hole_filling`] —
+//!   `itkVotingBinaryHoleFillingImageFilter.h`/`.hxx` (a single pass) and
+//!   `itkVotingBinaryIterativeHoleFillingImageFilter.h`/`.hxx` (which runs the
+//!   former in a loop). The pass fixes `survival_threshold = 0` (a foreground
+//!   center never dies) and derives its birth threshold from
+//!   `majority_threshold` (`BeforeThreadedGenerateData`: `birth_threshold =
+//!   (Π(2·radius[d]+1) - 1) / 2 + majority_threshold`, integer division — the
+//!   box neighbor count excluding the center, halved, plus the caller's
+//!   margin over 50%); unlike `voting_binary`, every non-`background_value`
+//!   center (not just an exact `foreground_value` one) is unconditionally
+//!   stamped to `foreground_value` each pass, and its boundary condition is
+//!   `ZeroFluxNeumannBoundaryCondition` (replicated, not cropped, unlike
+//!   [`crate::rank::rank`]'s neighborhood). [`voting_binary_hole_filling`]
+//!   runs this pass exactly once and reports `GetNumberOfPixelsChanged()`
+//!   directly; [`voting_binary_iterative_hole_filling`]'s outer loop reruns
+//!   it, input := previous output, until either
+//!   `maximum_number_of_iterations` passes have run or a pass changes zero
+//!   pixels (`m_NumberOfPixelsChanged == 0`, counted only for birth-triggered
+//!   flips, exactly as the `.hxx` does). `VotingBinaryHoleFillingImageFilter.yaml`
+//!   restricts `pixel_types` to `IntegerPixelIDTypeList`;
+//!   [`voting_binary_hole_filling`] enforces this via
+//!   [`crate::logic::require_integer_pixel_type`], but [`voting_binary`] and
+//!   [`voting_binary_iterative_hole_filling`] declare the same restriction in
+//!   their own yamls without enforcing it — a pre-existing gap in this
+//!   port, outside this change's scope.
 //! - [`binary_median`] — `itkBinaryMedianImageFilter.h`/`.hxx`: a
 //!   `ZeroFluxNeumannBoundaryCondition` box neighborhood vote, like
 //!   [`voting_binary`], but with a fixed rule and no birth/survival split:
@@ -320,6 +331,7 @@ fn voting_binary_hole_filling_pass_typed<T: Scalar>(
             // `else { it.Set(foregroundValue); }`: any non-background center
             // is stamped to foreground_value, not just an exact-foreground
             // one, and this branch never contributes to the changed count.
+            // Tracked in the upstream-findings ledger, §2.70.
             foreground
         };
         out.push(value);
@@ -348,6 +360,53 @@ fn voting_binary_hole_filling_pass(
         foreground,
         background
     )
+}
+
+/// [`voting_binary_hole_filling`]'s result: the filled image plus
+/// `VotingBinaryHoleFillingImageFilter::GetNumberOfPixelsChanged()`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VotingBinaryHoleFillingResult {
+    /// The image after one hole-filling pass.
+    pub image: Image,
+    /// Number of background-valued pixels this pass flipped to
+    /// `foreground_value` (`AfterThreadedGenerateData`'s summed per-thread
+    /// count) — never counts the unconditional
+    /// non-background-to-foreground stamp (see the module docs).
+    pub number_of_pixels_changed: u32,
+}
+
+/// `VotingBinaryHoleFillingImageFilter`
+/// (`itkVotingBinaryHoleFillingImageFilter.h(.hxx)`): a single application of
+/// the same per-pass rule [`voting_binary_iterative_hole_filling`] loops —
+/// computes `birth_threshold` from `majority_threshold` and `radius`
+/// (`BeforeThreadedGenerateData`, see module docs), then runs
+/// [`voting_binary_hole_filling_pass`] exactly once, unlike the iterative
+/// filter's convergence loop.
+///
+/// Requires an integer pixel type (`VotingBinaryHoleFillingImageFilter.yaml`'s
+/// `IntegerPixelIDTypeList`), unlike its sibling functions in this module.
+pub fn voting_binary_hole_filling(
+    img: &Image,
+    radius: &[usize],
+    majority_threshold: u32,
+    foreground_value: f64,
+    background_value: f64,
+) -> Result<VotingBinaryHoleFillingResult> {
+    crate::logic::require_integer_pixel_type(img)?;
+    let neighborhood_size: usize = radius.iter().map(|&r| 2 * r + 1).product();
+    let birth_threshold = ((neighborhood_size - 1) / 2) as u32 + majority_threshold;
+
+    let (image, number_of_pixels_changed) = voting_binary_hole_filling_pass(
+        img,
+        radius,
+        birth_threshold,
+        foreground_value,
+        background_value,
+    )?;
+    Ok(VotingBinaryHoleFillingResult {
+        image,
+        number_of_pixels_changed,
+    })
 }
 
 /// `VotingBinaryIterativeHoleFillingImageFilter`
@@ -552,6 +611,8 @@ pub fn binary_thinning(image: &Image) -> Result<Image> {
 mod tests {
     use super::*;
 
+    use sitk_core::PixelId;
+
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()
     }
@@ -731,6 +792,108 @@ mod tests {
         assert_eq!(survives.scalar_slice::<u8>().unwrap()[0], 1);
         let dies = voting_binary(&image, &[1], 1, 3, 1.0, 0.0).unwrap();
         assert_eq!(dies.scalar_slice::<u8>().unwrap()[0], 0);
+    }
+
+    // ---- voting_binary_hole_filling ----
+
+    /// 1-D radius-1 neighborhood (3 pixels incl. center), `MajorityThreshold`
+    /// left at its yaml default of 1: `birth_threshold = (3-1)/2 + 1 = 2`. A
+    /// background center with both neighbors on flips; one fewer does not --
+    /// same shape as [`voting_binary`]'s own birth-threshold test, since this
+    /// is the same `birth_threshold` derivation with `majority_threshold`
+    /// baked to 1.
+    #[test]
+    fn voting_binary_hole_filling_yaml_default_majority_threshold_birth_threshold_is_exact() {
+        let two_on = img_u8(&[3], vec![1, 0, 1]);
+        let flips = voting_binary_hole_filling(&two_on, &[1], 1, 1.0, 0.0).unwrap();
+        assert_eq!(flips.image.scalar_slice::<u8>().unwrap()[1], 1);
+        assert_eq!(flips.number_of_pixels_changed, 1);
+
+        let one_on = img_u8(&[3], vec![1, 0, 0]);
+        let stays = voting_binary_hole_filling(&one_on, &[1], 1, 1.0, 0.0).unwrap();
+        assert_eq!(stays.image.scalar_slice::<u8>().unwrap()[1], 0);
+        assert_eq!(stays.number_of_pixels_changed, 0);
+    }
+
+    /// A center pixel equal to neither `foreground_value` nor
+    /// `background_value` is unconditionally stamped to `foreground_value`
+    /// regardless of its neighbor count (module docs) -- unlike
+    /// [`voting_binary`], there is no pass-through branch.
+    #[test]
+    fn voting_binary_hole_filling_stamps_any_non_background_value_to_foreground() {
+        let image = img_u8(&[3], vec![0, 5, 0]); // center=5, zero on-neighbors
+        let out = voting_binary_hole_filling(&image, &[1], 1, 1.0, 0.0).unwrap();
+        assert_eq!(out.image.scalar_slice::<u8>().unwrap()[1], 1);
+        assert_eq!(out.number_of_pixels_changed, 0); // the unconditional stamp never counts as "changed"
+    }
+
+    /// `GetNumberOfPixelsChanged()` counts only birth-triggered
+    /// background-to-foreground flips, never the unconditional
+    /// non-background-to-foreground stamp -- both occur in the same pass
+    /// here, and only one should be counted.
+    #[test]
+    fn voting_binary_hole_filling_changed_count_excludes_unconditional_stamps() {
+        #[rustfmt::skip]
+        let image = img_u8(&[5, 5], vec![
+            1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1,
+            1, 1, 0, 1, 1,
+            1, 1, 1, 1, 1,
+            1, 1, 1, 5, 1,
+        ]);
+        let result = voting_binary_hole_filling(&image, &[1, 1], 1, 1.0, 0.0).unwrap();
+        let got = result.image.scalar_slice::<u8>().unwrap();
+        assert_eq!(got[12], 1); // the former lone hole: a real birth-count flip
+        assert_eq!(got[23], 1); // the "neither" pixel: an unconditional stamp
+        assert_eq!(result.number_of_pixels_changed, 1);
+    }
+
+    /// `voting_binary_hole_filling` is exactly
+    /// [`voting_binary_iterative_hole_filling`]'s inner pass run once, not a
+    /// convergence loop: a 3x3 hole too large for the birth threshold to
+    /// fill from its own neighbors alone needs a second pass, so composing
+    /// two manual calls must match the iterative filter capped at 2
+    /// iterations, while a single call must NOT already have converged.
+    #[test]
+    fn voting_binary_hole_filling_is_a_single_pass_not_iterative() {
+        #[rustfmt::skip]
+        let image = img_u8(&[5, 5], vec![
+            1, 1, 1, 1, 1,
+            1, 0, 0, 0, 1,
+            1, 0, 0, 0, 1,
+            1, 0, 0, 0, 1,
+            1, 1, 1, 1, 1,
+        ]);
+        let pass1 = voting_binary_hole_filling(&image, &[1, 1], 1, 1.0, 0.0).unwrap();
+        // Center of the 3x3 hole (index 12): its whole 3x3 neighborhood is
+        // still background after only one pass, so it cannot have flipped
+        // yet -- proof this call didn't loop to convergence internally.
+        assert_eq!(pass1.image.scalar_slice::<u8>().unwrap()[12], 0);
+
+        let pass2 = voting_binary_hole_filling(&pass1.image, &[1, 1], 1, 1.0, 0.0).unwrap();
+        let iterative =
+            voting_binary_iterative_hole_filling(&image, &[1, 1], 1, 2, 1.0, 0.0).unwrap();
+        assert_eq!(
+            pass2.image.scalar_slice::<u8>().unwrap(),
+            iterative.scalar_slice::<u8>().unwrap()
+        );
+    }
+
+    #[test]
+    fn voting_binary_hole_filling_rejects_a_floating_point_pixel_type() {
+        let image = Image::from_vec(&[3, 1], vec![1.0f32, 0.0, 1.0]).unwrap();
+        let err = voting_binary_hole_filling(&image, &[1], 1, 1.0, 0.0).unwrap_err();
+        assert_eq!(err, FilterError::RequiresIntegerPixelType(PixelId::Float32));
+    }
+
+    #[test]
+    fn voting_binary_hole_filling_rejects_a_complex_pixel_type() {
+        let image = Image::new(&[3, 1], PixelId::ComplexFloat32);
+        let err = voting_binary_hole_filling(&image, &[1], 1, 1.0, 0.0).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::RequiresIntegerPixelType(PixelId::ComplexFloat32)
+        );
     }
 
     // ---- voting_binary_iterative_hole_filling ----

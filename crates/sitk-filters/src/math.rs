@@ -73,6 +73,75 @@ use crate::functor::{self, UnaryFunctor};
 use crate::{FilterError, Result, image_from_f64, require_same_shape};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
+// ---- round (RealPixelIDTypeList only) ----------------------------------
+//
+// `RoundImageFilter.yaml`'s `pixel_types: RealPixelIDTypeList` restricts the
+// input (and, with no `output_pixel_type` override, the output) to
+// `Float32`/`Float64` -- unlike every other filter in this module, so
+// `round`/`round_in_place` are hand-written instead of going through
+// `functor::unary_functor!`, gating first (mirrors `logic::binary_not`'s
+// gate-then-delegate shape).
+//
+// `itkRoundImageFilter.h`'s functor calls `itk::Math::Round<TOutput,
+// TInput>(A)`, a synonym for `RoundHalfIntegerUp<TOutput, TInput>(A)`
+// (itkMath.h:191-204). `itkTemplateFloatingToIntegerMacro` (itkMath.h:130-146)
+// dispatches purely on `sizeof(TReturn)` -- `<= 4` routes through
+// `Detail::RoundHalfIntegerUp_32` (which always returns `int32_t`), `<= 8`
+// through `Detail::RoundHalfIntegerUp_64` (`int64_t`) -- with **no check that
+// `TReturn` is actually an integer type**, despite the doc comment two lines
+// above claiming "TReturn must be an integer type" (itkMath.h:171). Since
+// `RoundImageFilter`'s `TOutput` is `Float32`/`Float64` (`sizeof` 4/8), a
+// `Float32` output takes the `int32_t`-intermediate path and a `Float64`
+// output the `int64_t`-intermediate path, each ending in
+// `static_cast<TOutput>(int32_or_64_result)` (itkMath.h:136/140).
+// `RoundHalfIntegerUp_base<TReturn, TInput>` (itkMathDetail.h:108-116) is
+// `x += 0.5; r = static_cast<TReturn>(x); nonnegative(x) ? r : (x == TInput(r)
+// ? r : r - 1)`, which is algebraically `floor(x + 0.5)` computed in `TInput`
+// arithmetic and then narrowed to `TReturn` -- exactly what [`Round::apply`]
+// computes directly in `f64`, *for every input whose rounded value fits in
+// the intermediate integer type*. When it doesn't -- `|round(x)|` exceeding
+// `i32::MAX` for a `Float32` input, or `i64::MAX` for a `Float64` input -- the
+// `static_cast<int32_t>(x)`/`static_cast<int64_t>(x)` step is itself an
+// out-of-range float-to-int cast, undefined behavior in C++ (platforms
+// commonly return the "integer indefinite" sentinel, e.g. `INT32_MIN`, via
+// `cvttss2si`/`cvttsd2si`). This port's `f64`-compute engine has no such
+// intermediate: [`Round::apply`] always returns the mathematically correct
+// rounded value, never that sentinel. Tracked as a deliberate divergence
+// (upstream UB, defined here) in the upstream-findings ledger, §4.35.
+struct Round;
+impl UnaryFunctor for Round {
+    fn apply(&self, x: f64) -> f64 {
+        (x + 0.5).floor()
+    }
+}
+
+fn require_real_pixel_type(img: &Image) -> Result<()> {
+    let pixel_id = img.pixel_id();
+    if !matches!(pixel_id, PixelId::Float32 | PixelId::Float64) {
+        return Err(FilterError::RequiresRealPixelType(pixel_id));
+    }
+    Ok(())
+}
+
+/// `RoundImageFilter`: pixel-wise rounding to the nearest integer, ties
+/// rounding away from zero on the positive side (`RoundHalfIntegerUp`: `1.5 ->
+/// 2`, `-1.5 -> -1`, `2.5 -> 3`). Output keeps `img`'s own `Float32`/`Float64`
+/// pixel type (`RoundImageFilter.yaml` has no `output_pixel_type` override).
+/// Errors with [`FilterError::RequiresRealPixelType`] on any other pixel type
+/// (`pixel_types: RealPixelIDTypeList`). See the module docs above for the
+/// two-stage-cast quirk this simplifies away.
+pub fn round(img: &Image) -> Result<Image> {
+    require_real_pixel_type(img)?;
+    functor::unary_apply(img, &Round)
+}
+
+/// In-place variant of [`round`]: reuses `img`'s buffer instead of allocating
+/// a new [`Image`].
+pub fn round_in_place(img: Image) -> Result<Image> {
+    require_real_pixel_type(&img)?;
+    functor::unary_apply_in_place(img, &Round)
+}
+
 // ---- abs --------------------------------------------------------------
 
 /// `Abs` functor (`itkAbsImageFilter.h`): `static_cast<TOutput>(itk::Math::Absolute(A))`.
@@ -605,6 +674,84 @@ pub fn ternary_magnitude_squared(a: &Image, b: &Image, c: &Image) -> Result<Imag
 /// In-place variant of [`ternary_magnitude_squared`]: reuses `a`'s buffer.
 pub fn ternary_magnitude_squared_in_place(a: Image, b: &Image, c: &Image) -> Result<Image> {
     three_image_f64_in_place(a, b, c, &|x, y, z| x * x + y * y + z * z)
+}
+
+// ---- round tests --------------------------------------------------------
+
+#[cfg(test)]
+mod round_tests {
+    use super::*;
+
+    #[test]
+    fn round_half_up_ties_and_ordinary_values() {
+        // RoundHalfIntegerUp: ties round up, not to even and not away from zero.
+        let a = Image::from_vec(&[6, 1], vec![1.5f64, -1.5, 2.5, -2.5, 0.5, -0.5]).unwrap();
+        assert_eq!(
+            round(&a).unwrap().scalar_slice::<f64>().unwrap(),
+            &[2.0, -1.0, 3.0, -2.0, 1.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn round_ordinary_non_halfway_values() {
+        let a = Image::from_vec(&[4, 1], vec![1.1f64, 1.9, -1.1, -1.9]).unwrap();
+        assert_eq!(
+            round(&a).unwrap().scalar_slice::<f64>().unwrap(),
+            &[1.0, 2.0, -1.0, -2.0]
+        );
+    }
+
+    #[test]
+    fn round_in_place_matches_allocating() {
+        let a = Image::from_vec(&[3, 1], vec![1.5f64, -1.5, 0.4]).unwrap();
+        let allocated = round(&a).unwrap();
+        let in_place = round_in_place(a).unwrap();
+        assert_eq!(allocated, in_place);
+    }
+
+    #[test]
+    fn round_output_pixel_type_matches_input() {
+        let f32_img = Image::from_vec(&[1, 1], vec![1.5f32]).unwrap();
+        let out = round(&f32_img).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float32);
+        assert_eq!(out.scalar_slice::<f32>().unwrap(), &[2.0f32]);
+
+        let f64_img = Image::from_vec(&[1, 1], vec![1.5f64]).unwrap();
+        let out = round(&f64_img).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::Float64);
+    }
+
+    #[test]
+    fn round_rejects_non_real_pixel_type() {
+        let a = Image::from_vec(&[2, 1], vec![1u8, 2]).unwrap();
+        assert_eq!(
+            round(&a),
+            Err(FilterError::RequiresRealPixelType(PixelId::UInt8))
+        );
+    }
+
+    #[test]
+    fn round_rejects_a_complex_pixel_type() {
+        let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        assert_eq!(
+            round(&a),
+            Err(FilterError::RequiresRealPixelType(PixelId::ComplexFloat32))
+        );
+    }
+
+    #[test]
+    fn round_large_magnitude_is_defined_unlike_upstreams_int32_intermediate() {
+        // 3e9 exceeds i32::MAX (~2.147e9): ITK's Round<float, float> routes
+        // through an int32_t intermediate here (see the module docs), which
+        // is undefined behavior in C++ for this magnitude. This port's
+        // f64-compute engine has no such intermediate and always returns the
+        // mathematically correct (here: already-integral, no-op) result.
+        let a = Image::from_vec(&[1, 1], vec![3.0e9f32]).unwrap();
+        assert_eq!(
+            round(&a).unwrap().scalar_slice::<f32>().unwrap(),
+            &[3.0e9f32]
+        );
+    }
 }
 
 #[cfg(test)]

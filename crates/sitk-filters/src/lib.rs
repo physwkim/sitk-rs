@@ -98,6 +98,7 @@ pub mod morphology_reconstruction;
 pub mod n4_bias_field;
 pub mod noise;
 pub mod noise_estimate;
+pub mod normalized_correlation;
 pub mod object_morphology;
 pub mod objectness;
 pub mod overlap;
@@ -133,7 +134,8 @@ pub use anisotropic_diffusion::{
 };
 pub use attribute_morphology::{area_closing, area_opening};
 pub use binary_morphology::{
-    binary_fillhole, binary_grind_peak, binary_median, binary_thinning, voting_binary,
+    VotingBinaryHoleFillingResult, binary_fillhole, binary_grind_peak, binary_median,
+    binary_thinning, voting_binary, voting_binary_hole_filling,
     voting_binary_iterative_hole_filling,
 };
 pub use bspline_decomposition::{bspline_decomposition, bspline_spline_poles};
@@ -187,7 +189,7 @@ pub use fast_marching_upwind_gradient::{
     fast_marching_upwind_gradient,
 };
 pub use fft_correlation::{fft_normalized_correlation, masked_fft_normalized_correlation};
-pub use fft_shift::fft_shift;
+pub use fft_shift::{cyclic_shift, fft_shift};
 pub use functor::{BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 pub use geodesic_morphology::{grayscale_geodesic_dilate, grayscale_geodesic_erode};
 pub use geometry::{
@@ -201,9 +203,9 @@ pub use gradient::{
 pub use grid_utility::{checker_board, paste, tile};
 pub use histogram_matching::histogram_matching;
 pub use intensity::{
-    intensity_windowing, intensity_windowing_in_place, invert_intensity, invert_intensity_in_place,
-    normalize, otsu_multiple_thresholds, otsu_threshold, sigmoid, sigmoid_in_place,
-    triangle_threshold,
+    ShiftScaleResult, intensity_windowing, intensity_windowing_in_place, invert_intensity,
+    invert_intensity_in_place, normalize, normalize_to_constant, otsu_multiple_thresholds,
+    otsu_threshold, shift_scale, sigmoid, sigmoid_in_place, triangle_threshold,
 };
 pub use kmeans::{KmeansResult, scalar_image_kmeans};
 pub use label::{LabelStatistics, connected_component, label_statistics, relabel_component};
@@ -218,11 +220,11 @@ pub use level_set::{
     threshold_segmentation_level_set,
 };
 pub use logic::{
-    and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place,
-    greater_equal, less_equal, mask, mask_in_place, mask_negated, mask_negated_in_place,
-    masked_assign, masked_assign_constant, masked_assign_constant_in_place, masked_assign_in_place,
-    maximum, maximum_in_place, minimum, minimum_in_place, not, not_equal, not_in_place, or,
-    or_in_place, xor, xor_in_place,
+    and, and_in_place, binary_not, binary_not_in_place, bitwise_not, bitwise_not_in_place, equal,
+    greater, greater_equal, less, less_equal, mask, mask_in_place, mask_negated,
+    mask_negated_in_place, masked_assign, masked_assign_constant, masked_assign_constant_in_place,
+    masked_assign_in_place, maximum, maximum_in_place, minimum, minimum_in_place, not, not_equal,
+    not_in_place, or, or_in_place, xor, xor_in_place,
 };
 pub use math::{
     abs, abs_in_place, absolute_value_difference, absolute_value_difference_in_place, acos,
@@ -230,8 +232,8 @@ pub use math::{
     binary_magnitude, binary_magnitude_in_place, bounded_reciprocal, bounded_reciprocal_in_place,
     cos, cos_in_place, divide_floor, divide_floor_in_place, divide_real, exp, exp_in_place,
     exp_negative, exp_negative_in_place, log, log_in_place, log10, log10_in_place, nary_add,
-    nary_maximum, pow, pow_in_place, sin, sin_in_place, sqrt, sqrt_in_place, square,
-    square_in_place, squared_difference, squared_difference_in_place, tan, tan_in_place,
+    nary_maximum, pow, pow_in_place, round, round_in_place, sin, sin_in_place, sqrt, sqrt_in_place,
+    square, square_in_place, squared_difference, squared_difference_in_place, tan, tan_in_place,
     ternary_add, ternary_add_in_place, ternary_magnitude, ternary_magnitude_in_place,
     ternary_magnitude_squared, ternary_magnitude_squared_in_place,
 };
@@ -253,6 +255,7 @@ pub use n4_bias_field::{
 };
 pub use noise::{additive_gaussian_noise, salt_and_pepper_noise, shot_noise, speckle_noise};
 pub use noise_estimate::noise;
+pub use normalized_correlation::normalized_correlation;
 pub use overlap::{
     DirectedHausdorffMeasures, HausdorffMeasures, LabelOverlapMeasures, OverlapMeasures,
     directed_hausdorff_distance, hausdorff_distance, label_overlap_measures, similarity_index,
@@ -262,7 +265,7 @@ pub use projection::{
     binary_projection, binary_threshold_projection, maximum_projection, mean_projection,
     median_projection, minimum_projection, standard_deviation_projection, sum_projection,
 };
-pub use rank::fast_approximate_rank;
+pub use rank::{fast_approximate_rank, rank};
 pub use reconstruction::{
     double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
     h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
