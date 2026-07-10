@@ -60,26 +60,25 @@
 //! private. [`read`] and [`read_information`] both refuse a palette TIFF.
 //! Ledger §4.100, §5.28.
 //!
-//! # `MINISWHITE` is not inverted upstream, and is by the `tiff` crate
+//! # `MINISWHITE` is read out un-inverted upstream — this port returns the true value
 //!
 //! `GetFormat` maps both `PHOTOMETRIC_MINISWHITE` and `PHOTOMETRIC_MINISBLACK`
 //! to `GRAYSCALE` (itkTIFFImageIO.cxx:111-114), and `ReadGenericImage`'s
 //! `GRAYSCALE` arm is `PutGrayscale`, a plain `std::copy_n` under a
 //! `// check inverted` comment that never grew a body
 //! (`:1399-1402`, `:1467-1482`). A white-is-zero TIFF therefore reads out with
-//! its raw samples, tone-inverted relative to what a viewer shows. Ledger
-//! §2.139.
+//! its raw samples, tone-inverted relative to what a viewer shows — a silently
+//! wrong value, not a format quirk to reproduce. Ledger §2.139.
 //!
-//! The `tiff` crate *does* invert, calling `invert_colors` whenever
-//! `photometric_interpretation == WhiteIsZero` (decoder/image.rs:948). Its
-//! transform is an involution for the unsigned integer arms it supports
-//! (`!x`, `0xffff - v`, `0xffff_ffff - v`, decoder/mod.rs:718-748), so
-//! [`undo_minis_white_inversion`] applies it a second time and lands exactly on
-//! the file's raw samples — upstream's output. The float arm (`1.0 - v`) is
-//! *not* an involution under rounding, so a 32-bit-float `MINISWHITE` image is
-//! refused rather than round-tripped approximately (ledger §4.101); the signed
-//! and multi-sample arms the crate has no code for surface as its own
-//! `UnknownInterpretation` error.
+//! The `tiff` crate already inverts correctly, calling `invert_colors`
+//! whenever `photometric_interpretation == WhiteIsZero` (decoder/image.rs:948)
+//! for every arm it supports (unsigned 8/16/32-bit and `f32`,
+//! decoder/mod.rs:718-748). **Fixed §2.139** — [`read`] no longer reverses
+//! that correction back to upstream's raw, tone-inverted value; the crate's
+//! own output is used as-is, which also means a 32-bit-float `MINISWHITE`
+//! image is no longer refused (that refusal existed solely to avoid
+//! round-tripping back through a non-invertible `1.0 - v`, a concern that
+//! does not arise when the corrected value is kept rather than undone).
 //!
 //! # A multi-sample `MINISBLACK` image reads its first half-row, twice over
 //!
@@ -527,14 +526,6 @@ fn layout_for(decoder: &mut TiffDecoder, tags: &FileTags) -> Result<Layout> {
 
     let component = component_type(page0.bits_per_sample, page0.sample_format)?;
 
-    if photometric == PhotometricInterpretation::WhiteIsZero && component == PixelId::Float32 {
-        return unsupported(
-            "the `tiff` crate inverts a 32-bit-float MINISWHITE image with `1.0 - v`, which \
-             rounding makes non-invertible, so upstream's un-inverted samples cannot be \
-             recovered — doc/upstream-findings.md §4.101",
-        );
-    }
-
     // `GetFormat() == RGB_` takes `SetNumberOfComponents(m_SamplesPerPixel)` and
     // copies `m_SamplesPerPixel * width` components per row, whatever that count
     // is, because the scanline path never interprets the channels. The `tiff`
@@ -636,21 +627,6 @@ pub fn read_information(path: &Path) -> Result<ImageInformation> {
         direction: identity(layout.dimension),
         metadata: BTreeMap::new(),
     })
-}
-
-/// Re-apply the `tiff` crate's `invert_colors` involution so a `MINISWHITE`
-/// page comes out with the raw samples upstream's `PutGrayscale` copies
-/// (decoder/mod.rs:713-748). Every arm here is exactly `max - v`, its own
-/// inverse.
-fn undo_minis_white_inversion(buffer: &mut PixelBuffer) {
-    match buffer {
-        PixelBuffer::UInt8(v) => v.iter_mut().for_each(|x| *x = !*x),
-        PixelBuffer::UInt16(v) => v.iter_mut().for_each(|x| *x = 0xffff - *x),
-        PixelBuffer::UInt32(v) => v.iter_mut().for_each(|x| *x = 0xffff_ffff - *x),
-        // The crate has no `invert_colors` arm for the signed types, and the
-        // float arm is refused in `layout_for`, so nothing else can reach here.
-        _ => {}
-    }
 }
 
 /// Pull `height` rows of `width * inc` components out of a page decoded as
@@ -769,10 +745,7 @@ fn read_current_page(
         ));
     }
 
-    let mut decoded = decoded_to_buffer(decoder.read_image()?, layout.component)?;
-    if page.photometric == Some(PhotometricInterpretation::WhiteIsZero.to_u16()) {
-        undo_minis_white_inversion(&mut decoded);
-    }
+    let decoded = decoded_to_buffer(decoder.read_image()?, layout.component)?;
 
     let ctx = (width, height, samples_per_pixel, inc, top_left);
     let placed = place_page!(decoded, out, UInt8, pixel_offset, page_len, ctx)
@@ -1267,6 +1240,7 @@ mod tests {
     const TAG_RESOLUTION_UNIT: u16 = 296;
     const TAG_COLOR_MAP: u16 = 320;
     const TAG_SUBFILE_TYPE: u16 = 254;
+    const TAG_SAMPLE_FORMAT: u16 = 339;
 
     fn short(v: u16) -> Vec<u8> {
         v.to_le_bytes().to_vec()
@@ -1377,23 +1351,50 @@ mod tests {
     }
 
     /// `PutGrayscale` is a plain `std::copy_n` — the `// check inverted`
-    /// comment (itkTIFFImageIO.cxx:1400) never grew a body — so a
-    /// `PHOTOMETRIC_MINISWHITE` page reads out with its raw samples. The `tiff`
-    /// crate inverts; [`undo_minis_white_inversion`] takes the inversion back
-    /// out. Ledger §2.139.
+    /// comment (itkTIFFImageIO.cxx:1400) never grew a body — so upstream reads
+    /// a `PHOTOMETRIC_MINISWHITE` page out with its raw, tone-inverted samples.
+    /// The `tiff` crate already inverts correctly; **fixed §2.139** — this
+    /// port keeps that correction (`!x` for `u8`) instead of reversing it back
+    /// to upstream's raw value.
     #[test]
-    fn minis_white_reads_its_raw_samples_uninverted() {
+    fn minis_white_reads_the_true_photometric_value_not_the_raw_sample() {
         let pixels = vec![0u8, 1, 254, 255];
         let bytes = build_tiff(vec![Page {
             entries: base_entries(2, 2, 8, 1, 0), // photometric 0 == MINISWHITE
-            pixels: pixels.clone(),
+            pixels,
         }]);
         let path = write_fixture("sitk_io_tiff_minis_white.tif", &bytes);
         let image = read(&path).expect("MINISWHITE reads");
         std::fs::remove_file(&path).ok();
 
         assert_eq!(image.pixel_id(), PixelId::UInt8);
-        assert_eq!(image.buffer(), &PixelBuffer::UInt8(pixels));
+        // `!raw`: 0 (white) inverts to 255 (max intensity), 255 (black) to 0.
+        assert_eq!(image.buffer(), &PixelBuffer::UInt8(vec![255, 254, 1, 0]));
+    }
+
+    /// Fixed §2.139, 32-bit-float counterpart: keeping the crate's correction
+    /// rather than undoing it removes the reason `layout_for` used to refuse a
+    /// `WhiteIsZero` + `Float32` page (formerly ledger §4.101, whose rationale
+    /// was that the crate's `1.0 - v` is not invertible under rounding) — that
+    /// concern only applied to reversing the correction, not to keeping it.
+    #[test]
+    fn minis_white_float32_reads_the_crates_own_inverted_value() {
+        let pixels: Vec<u8> = [0.0f32, 0.25, 0.75, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut entries = base_entries(2, 2, 32, 1, 0); // photometric 0 == MINISWHITE
+        entries.push((TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, short(3))); // IEEE float
+        let bytes = build_tiff(vec![Page { entries, pixels }]);
+        let path = write_fixture("sitk_io_tiff_minis_white_float32.tif", &bytes);
+        let image = read(&path).expect("float32 MINISWHITE reads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(image.pixel_id(), PixelId::Float32);
+        match image.buffer() {
+            PixelBuffer::Float32(v) => assert_eq!(v, &[1.0, 0.75, 0.25, 0.0]),
+            other => panic!("expected Float32, got {other:?}"),
+        }
     }
 
     /// `GetFormat` calls a two-sample `MINISBLACK` page `GRAYSCALE`, so
@@ -1684,20 +1685,5 @@ mod tests {
         let mut out = vec![0u8; 6];
         page_rows(&decoded, &mut out, 3, 2, 1, 1, false);
         assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
-    }
-
-    /// The `tiff` crate's `invert_colors` is `max - v` on every arm this module
-    /// can reach, so applying it twice is the identity.
-    #[test]
-    fn minis_white_inversion_is_its_own_inverse() {
-        let mut b = PixelBuffer::UInt8(vec![0, 1, 0x7f, 0xff]);
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt8(vec![0xff, 0xfe, 0x80, 0x00]));
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt8(vec![0, 1, 0x7f, 0xff]));
-
-        let mut b = PixelBuffer::UInt16(vec![0, 1, 0xfffe, 0xffff]);
-        undo_minis_white_inversion(&mut b);
-        assert_eq!(b, PixelBuffer::UInt16(vec![0xffff, 0xfffe, 1, 0]));
     }
 }
