@@ -51,6 +51,7 @@ name = "sitk-io"
 version = "0.0.1"
 dependencies = [
  "sitk-core",
+ "sitk-transform",
  "thiserror",
 ]
 
