@@ -370,6 +370,25 @@ fn gaussian_kernel(x: f64) -> f64 {
 ///   upstream's own optimization. [`FilterError::NonDiagonalGridDirection`]
 ///   rejects it instead of silently producing an axis-aligned pattern for a
 ///   caller's rotated or sheared request.
+/// - **The two "extra functions in the front" actually contribute here
+///   (signedness divergence, §1.6).** Upstream sums `numberOfGaussians`
+///   pulses at offsets `(j − 2) · grid_spacing` for `j = 0 .. numberOfGaussians`,
+///   its comment "Add two extra functions in the front and one in the back to
+///   ensure coverage" intending the front two at offsets `−2` and `−1`
+///   grid-spacings. But `j` is `unsigned int` and `static_cast<RealType>(j − 2)`
+///   is taken on the *unsigned* subtraction (`itkGridImageSource.hxx:77`), so
+///   for `j = 0, 1` it wraps to `~4.29e9` (`2³² − 2`, `2³² − 1`) instead of
+///   `−2, −1`: upstream's two front pulses land ~4.29e9 grid-spacings away and
+///   their Gaussian weight anywhere near the image is identically zero — the
+///   intended front coverage never happens. This port forms the subtraction in
+///   signed floating point (`j as f64 − 2.0`), placing those pulses at their
+///   intended `−2, −1` offsets so they do contribute. The divergence is only
+///   observable when `sigma` is on the order of `grid_spacing` (a kernel wide
+///   enough that a pulse two grid-spacings before the first sample still has
+///   nonzero weight at the boundary); for the yaml-default narrow kernel it is
+///   numerically invisible. Intentional divergence — the port is the
+///   mathematically correct version; tracked in the upstream-findings ledger,
+///   §1.6.
 ///
 /// The kernel is always `GaussianKernelFunction`, matching the constructor's
 /// hardcoded choice (`itkGridImageSource.hxx`; the class documents itself as
@@ -423,6 +442,10 @@ pub fn grid_source(
             let point_i = origin[i] + direction_diag * spacing[i] * idx as f64;
             let mut val = 0.0;
             for j in 0..number_of_gaussians {
+                // Signed `j as f64 - 2.0` (offsets -2, -1, 0, ...), not
+                // upstream's unsigned `static_cast<RealType>(j - 2)` which wraps
+                // to ~4.29e9 for j=0,1 — intentional §1.6 divergence, see the
+                // fn doc's "extra functions in the front" bullet.
                 let num = point_i - (j as f64 - 2.0) * settings.grid_spacing[i] - offset;
                 val += gaussian_kernel(num / settings.sigma[i]);
             }
