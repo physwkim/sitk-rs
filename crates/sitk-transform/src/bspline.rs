@@ -74,7 +74,9 @@
 use sitk_core::{Image, matrix};
 
 use crate::error::{Result, TransformError};
-use crate::interpolator::physical_to_index_matrix;
+use crate::interpolator::{
+    bspline_coefficients, bspline_value_and_gradient, physical_to_index_matrix,
+};
 use crate::transform::{ParametricTransform, TransformBase, check_len};
 
 /// The B-spline order. Fixed at 3 (cubic), ITK's default and the only order this
@@ -383,6 +385,102 @@ impl BSplineTransform {
     /// Number of control points (`Π grid_size`) = parameters per dimension.
     pub fn number_of_parameters_per_dimension(&self) -> usize {
         self.num_per_dim
+    }
+
+    /// The transform domain mesh size — B-spline polynomial patches per axis,
+    /// `gridSize − splineOrder` (`itk::BSplineTransform::GetTransformDomainMeshSize`).
+    pub fn transform_domain_mesh_size(&self) -> Vec<usize> {
+        self.grid_size.iter().map(|&s| s - SPLINE_ORDER).collect()
+    }
+
+    /// Physical point of control point `flat` (raster index, first axis
+    /// fastest): `gridOrigin + D · (gridSpacing ⊙ index)`.
+    fn grid_point(&self, flat: usize) -> Vec<f64> {
+        let dim = self.dim;
+        let scaled: Vec<f64> = (0..dim)
+            .map(|d| {
+                ((flat / self.grid_stride[d]) % self.grid_size[d]) as f64 * self.grid_spacing[d]
+            })
+            .collect();
+        let rotated = matrix::mat_vec(&self.grid_direction, &scaled, dim);
+        (0..dim).map(|i| self.grid_origin[i] + rotated[i]).collect()
+    }
+
+    /// Re-grid this transform onto a new transform domain, resampling the
+    /// coefficients so the deformation is (approximately) preserved — a port of
+    /// `itk::BSplineTransformParametersAdaptor`
+    /// (`itkBSplineTransformParametersAdaptor.hxx:196-273`).
+    ///
+    /// The required domain reaches the same control-point grid geometry that
+    /// [`new`](Self::new) derives, because the adaptor's
+    /// `UpdateRequiredFixedParameters` (`:145-193`) applies exactly the same
+    /// `gridSize = meshSize + splineOrder`, `gridSpacing = physicalDimensions /
+    /// meshSize`, `gridOrigin = domainOrigin + D · (−½·gridSpacing·(splineOrder−1))`.
+    ///
+    /// When the required grid geometry already equals this transform's, the
+    /// coefficients are left untouched and no resampling runs — ITK's early
+    /// return on `m_RequiredFixedParameters == m_Transform->GetFixedParameters()`
+    /// (`:203-206`), an exact `Array<double>` comparison, reproduced here as an
+    /// exact comparison of [`fixed_parameters`](ParametricTransform::fixed_parameters).
+    ///
+    /// Otherwise each of the `dim` coefficient grids is resampled onto the new
+    /// control-point grid and then run back through the B-spline decomposition
+    /// filter (`:229-266`). ITK does this with a `ResampleImageFilter` whose
+    /// interpolator is `BSplineResampleImageFunction` — a
+    /// `BSplineInterpolateImageFunction` whose `SetInputImage` override installs
+    /// the input *as* the coefficient array rather than decomposing it
+    /// (`itkBSplineResampleImageFunction.h:76-86`) — so each new control point
+    /// samples the **deformation field** the old coefficients encode, not the old
+    /// coefficients themselves. New control points that fall outside the old
+    /// coefficient grid's buffer take `ResampleImageFilter`'s default pixel value
+    /// of zero, since the filter gates every output voxel on
+    /// `interpolator->IsInsideBuffer(inputIndex)`.
+    ///
+    /// Fails if any argument's length is inconsistent with this transform's
+    /// dimension, a required mesh size is zero, or `required_domain_direction` is
+    /// singular.
+    pub fn adapt_transform_parameters(
+        &mut self,
+        required_domain_origin: &[f64],
+        required_domain_physical_dimensions: &[f64],
+        required_domain_direction: &[f64],
+        required_domain_mesh_size: &[usize],
+    ) -> Result<()> {
+        let mut required = Self::new(
+            self.dim,
+            required_domain_origin,
+            required_domain_physical_dimensions,
+            required_domain_direction,
+            required_domain_mesh_size,
+        )?;
+        if required.fixed_parameters() == self.fixed_parameters() {
+            return Ok(());
+        }
+
+        let dim = self.dim;
+        let new_count = required.num_per_dim;
+        let old_count = self.num_per_dim;
+        let mut coefficients = vec![0.0f64; dim * new_count];
+
+        for flat in 0..new_count {
+            let cindex = self.continuous_index(&required.grid_point(flat));
+            for d in 0..dim {
+                let old = &self.coefficients[d * old_count..(d + 1) * old_count];
+                coefficients[d * new_count + flat] =
+                    bspline_value_and_gradient(old, &self.grid_size, &self.grid_stride, &cindex)
+                        .map_or(0.0, |(value, _)| value);
+            }
+        }
+        for d in 0..dim {
+            let block = &mut coefficients[d * new_count..(d + 1) * new_count];
+            let decomposed =
+                bspline_coefficients(block, &required.grid_size, &required.grid_stride);
+            block.copy_from_slice(&decomposed);
+        }
+
+        required.coefficients = coefficients;
+        *self = required;
+        Ok(())
     }
 
     /// Continuous grid index of physical point `p`:
