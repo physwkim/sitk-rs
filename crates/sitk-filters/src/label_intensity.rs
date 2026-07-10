@@ -139,7 +139,11 @@ pub struct IntensityStatistics {
     /// (almost) zero.
     pub center_of_gravity: Vec<f64>,
     /// Eigenvalues of the intensity-weighted second-order central moments,
-    /// ascending. Not clamped to zero — see the [module docs](self).
+    /// ascending. Each is clamped to `>= 0` with `.max(0.0)` (mirroring
+    /// `ShapeLabelMapFilter`, `itkShapeLabelMapFilter.hxx:315`), since a signed
+    /// or float feature image can make the weighted covariance indefinite and a
+    /// negative eigenvalue is meaningless as a second-order moment — see the
+    /// [module docs](self) (§2.65 fix).
     pub weighted_principal_moments: Vec<f64>,
     /// Row-major `dim × dim`; row `i` is the eigenvector for
     /// `weighted_principal_moments[i]`, last row sign-flipped to make the matrix
