@@ -101,6 +101,11 @@ wrapping) is not yet reported.
 
 ## 3. SimpleITK wrapping issues
 
+All nine items re-verified against SimpleITK master `3e193179` / ITK master
+`e46eb723a5` and reported upstream 2026-07-10 as
+[SimpleITK/SimpleITK#2625](https://github.com/SimpleITK/SimpleITK/issues/2625)
+(issue items S1–S10; 3.7 filed as two items S4/S5).
+
 | # | Site | Finding | doc |
 |---|---|---|---|
 | 3.1 | `{Landweber,ProjectedLandweber,RichardsonLucy}DeconvolutionImageFilter.yaml` | Exposes `OutputRegionMode` although the ITK base discards it (§1.17) — a dead parameter in the public API. | `deconvolution.rs` |
