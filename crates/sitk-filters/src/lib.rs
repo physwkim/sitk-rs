@@ -61,6 +61,7 @@ pub mod edge;
 pub mod error;
 pub mod expand;
 pub mod fast_marching;
+pub mod fast_marching_base;
 pub mod fast_marching_upwind_gradient;
 mod fft;
 pub mod fft_correlation;
