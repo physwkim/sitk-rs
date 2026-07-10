@@ -46,11 +46,21 @@
 //!   this port computes `theta = acos(gradient[2] / r)`. `phi` needs no fix —
 //!   it is `atan(gradient[1] / gradient[0])`, and the length-`r` factor cancels
 //!   in the ratio. One note on the singular-`phi` branch: the `.hxx` overrides
-//!   `phi` to `π/2` when `Math::AlmostEquals(gradient[0], PixelType{})` (a
-//!   ~4-ULP / `0.1·eps` window around zero), whereas this port tests
-//!   `gradient[0] == 0.0` exactly; the two decide differently only for a
-//!   denormal (subnormal-magnitude nonzero) `gradient[0]`, so this is a
-//!   pre-existing, numerically-inconsequential divergence and the code stays.
+//!   `phi` to `π/2` when `Math::AlmostEquals(gradient[0], PixelType{})` is true,
+//!   whereas this port tests `gradient[0] == 0.0` exactly. `FloatAlmostEqual`'s
+//!   near-zero path (`itkMath.h:339-341`) returns true for any `|gradient[0]|
+//!   <= 0.1·eps(PixelType)` — `~1.19e-8` for an `f32` image, `~2.22e-17` for
+//!   `f64` (the `(double, float)` overload compares in the pixel type, not the
+//!   `double` `gradient[0]` carries). That is a *normal*-magnitude window,
+//!   ~290 orders of magnitude above the denormal floor — not "denormals only";
+//!   compare `intensity.rs`'s §2.69 characterization of the same `0.1·eps`
+//!   window. So the two branches decide differently for any nonzero
+//!   `|gradient[0]| <~ 0.1·eps(PixelType)`. The divergence is
+//!   numerically inconsequential *only when `gradient[1]` is not also tiny*:
+//!   in the near-`+z`-pole edge where both `gradient[0]` and `gradient[1]` are
+//!   `<~ 0.1·eps`, ITK forces `phi = π/2` while the port's
+//!   `atan(gradient[1] / gradient[0])` is an essentially arbitrary angle.
+//!   Pre-existing; the code stays.
 //!
 //! * **§1.8 — the derivative scaling.** `MinMaxCurvatureFlowFunction::
 //!   SetStencilRadius` widens the *finite difference function's* radius to
@@ -289,8 +299,12 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
     }
 
     let theta = (gradient[2] / radius as f64).clamp(-1.0, 1.0).acos();
-    // `Math::AlmostEquals(gradient[0], PixelType{})` is a 4-ULP window around
-    // zero, which for a zero reference means exact zero (or a denormal).
+    // ITK guards this with `Math::AlmostEquals(gradient[0], PixelType{})`,
+    // whose near-zero path (`itkMath.h:339-341`) returns true for any
+    // `|gradient[0]| <= 0.1·eps(PixelType)` (~1.19e-8 for f32, ~2.22e-17 for
+    // f64) — a normal-magnitude window, not just denormals. This port tests
+    // exact zero; the two differ for any nonzero `|gradient[0]| <~ 0.1·eps`.
+    // Pre-existing divergence (see the module doc's §1.7 note); code stays.
     let phi = if gradient[0] == 0.0 {
         std::f64::consts::PI * 0.5
     } else {
