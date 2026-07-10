@@ -87,6 +87,42 @@ fn diagonal(v: &[f64]) -> Vec<f64> {
     m
 }
 
+/// Reject a fixed-parameter array whose length is not `expected`, naming what
+/// the array should have held. ITK's `SetFixedParameters` overrides throw here.
+pub(crate) fn check_fixed_len(params: &[f64], expected: usize, what: &str) -> Result<()> {
+    if params.len() == expected {
+        Ok(())
+    } else {
+        Err(TransformError::InvalidFixedParameters {
+            got: params.len(),
+            expected: format!("{expected} ({what})"),
+        })
+    }
+}
+
+/// Fixed parameters of a matrix-offset transform: the center of rotation, and
+/// nothing else (`itk::MatrixOffsetTransformBase::Get/SetFixedParameters`).
+/// Expands inside `impl ParametricTransform for T` for any `T` with a `center`
+/// field and a `recompute()` that refreshes the cached matrix/offset.
+macro_rules! center_fixed_parameters {
+    ($dim:expr) => {
+        fn fixed_parameters(&self) -> Vec<f64> {
+            self.center.clone()
+        }
+
+        fn number_of_fixed_parameters(&self) -> usize {
+            $dim
+        }
+
+        fn set_fixed_parameters(&mut self, params: &[f64]) -> $crate::error::Result<()> {
+            $crate::transform::check_fixed_len(params, $dim, "the center of rotation")?;
+            self.center.copy_from_slice(params);
+            self.recompute();
+            Ok(())
+        }
+    };
+}
+
 /// `dT/dx` of a matrix-offset transform `T(x) = M·x + offset` is exactly `M`
 /// (`itk::MatrixOffsetTransformBase::ComputeJacobianWithRespectToPosition`).
 macro_rules! matrix_jacobian_wrt_position {
@@ -115,6 +151,34 @@ pub trait ParametricTransform: TransformBase {
     ///
     /// [`number_of_parameters`]: ParametricTransform::number_of_parameters
     fn set_parameters(&mut self, params: &[f64]);
+
+    /// The *fixed* (non-optimizable) parameters — ITK's
+    /// `Transform::GetFixedParameters`. These are the values the Insight legacy
+    /// transform file records on its `FixedParameters:` line: the center of
+    /// rotation for every matrix-offset transform, nothing at all for a pure
+    /// translation, and the grid geometry (size, origin, spacing, direction)
+    /// for a B-spline or displacement-field transform.
+    fn fixed_parameters(&self) -> Vec<f64>;
+
+    /// Replace the fixed parameters — ITK's `Transform::SetFixedParameters`.
+    /// Errors with [`TransformError::InvalidFixedParameters`] wherever ITK
+    /// throws.
+    ///
+    /// For [`BSplineTransform`] and [`DisplacementFieldTransform`] this
+    /// *re-allocates* the coefficient / displacement grid and zeroes it, exactly
+    /// as ITK's `SetCoefficientImageInformationFromFixedParameters` /
+    /// `DisplacementFieldTransform::SetFixedParameters` do — which is why the
+    /// Insight-legacy reader has to apply the fixed parameters before the
+    /// parameters (`itkTxtTransformIO.cxx:186-217`).
+    ///
+    /// [`BSplineTransform`]: crate::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()>;
+
+    /// Number of fixed parameters (`itk::Transform::GetNumberOfFixedParameters`).
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.fixed_parameters().len()
+    }
 
     /// Jacobian `∂(transform_point(point))ᵢ / ∂paramₖ`, row-major
     /// `dimension × number_of_parameters`, evaluated at `point`.
@@ -267,6 +331,27 @@ impl ParametricTransform for TranslationTransform {
         self.translation.copy_from_slice(params);
     }
 
+    /// A pure translation has **no** fixed parameters: `itk::TranslationTransform`
+    /// never resizes the `itk::Transform` base's `m_FixedParameters`, which is
+    /// default-constructed empty.
+    fn fixed_parameters(&self) -> Vec<f64> {
+        Vec::new()
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        0
+    }
+
+    /// ITK's base `Transform::SetFixedParameters` stores *whatever* it is given
+    /// (`itkTransform.h`: `m_FixedParameters = fixedParameters;`), so a
+    /// hand-written file with a non-empty `FixedParameters:` line silently
+    /// attaches dead values to an `itk::TranslationTransform` and echoes them
+    /// back on the next write. This port has nowhere to keep them and rejects a
+    /// non-empty array instead (ledger §4.46).
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_fixed_len(params, 0, "a translation has no fixed parameters")
+    }
+
     fn jacobian_wrt_parameters(&self, _point: &[f64]) -> Vec<f64> {
         // ∂(x + t)ᵢ / ∂tₖ = δᵢₖ — the identity.
         let dim = self.translation.len();
@@ -387,6 +472,23 @@ impl ParametricTransform for AffineTransform {
         self.matrix.copy_from_slice(&params[..n]);
         self.translation.copy_from_slice(&params[n..]);
         self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+    }
+
+    /// The center of rotation
+    /// (`itk::MatrixOffsetTransformBase::GetFixedParameters`).
+    fn fixed_parameters(&self) -> Vec<f64> {
+        self.center.clone()
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.dim
+    }
+
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_fixed_len(params, self.dim, "the center of rotation")?;
+        self.center.copy_from_slice(params);
+        self.offset = Self::compute_offset(self.dim, &self.matrix, &self.translation, &self.center);
+        Ok(())
     }
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
@@ -525,6 +627,8 @@ impl ParametricTransform for Euler2DTransform {
         self.translation[1] = params[2];
         self.recompute();
     }
+
+    center_fixed_parameters!(2);
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // y = R(θ)·(x − c) + c + t, parameters [θ, tx, ty]:
@@ -674,6 +778,8 @@ impl ParametricTransform for Similarity2DTransform {
         self.translation[1] = params[3];
         self.recompute();
     }
+
+    center_fixed_parameters!(2);
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // y = s·R(θ)·(x − c) + c + t, parameters [s, θ, tx, ty]:
@@ -882,6 +988,41 @@ impl ParametricTransform for Euler3DTransform {
         self.translation[1] = params[4];
         self.translation[2] = params[5];
         self.recompute();
+    }
+
+    /// `[cx, cy, cz, computeZYX]` — `itk::Euler3DTransform` appends its
+    /// `m_ComputeZYX` flag to the center as a fourth fixed parameter
+    /// (`itkEuler3DTransform.hxx:120-128`), so the rotation-composition order
+    /// survives a write/read round trip.
+    fn fixed_parameters(&self) -> Vec<f64> {
+        let mut fp = self.center.clone();
+        fp.push(if self.compute_zyx { 1.0 } else { 0.0 });
+        fp
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        4
+    }
+
+    /// Accepts 3 or 4 values: `itk::Euler3DTransform::SetFixedParameters` reads
+    /// the fourth only when the array has exactly 4 entries, "for backwards
+    /// compatibility: the m_ComputeZYX flag was not serialized so it may or may
+    /// not be included as part of the fixed parameters"
+    /// (`itkEuler3DTransform.hxx:131-154`). A 3-entry array therefore leaves
+    /// `compute_zyx` at its current value rather than resetting it.
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        if params.len() != 3 && params.len() != 4 {
+            return Err(TransformError::InvalidFixedParameters {
+                got: params.len(),
+                expected: "3 (the center of rotation) or 4 (center and computeZYX)".to_string(),
+            });
+        }
+        self.center.copy_from_slice(&params[..3]);
+        if params.len() == 4 {
+            self.compute_zyx = params[3] != 0.0;
+        }
+        self.recompute();
+        Ok(())
     }
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
@@ -1215,6 +1356,8 @@ impl ParametricTransform for VersorRigid3DTransform {
         self.recompute();
     }
 
+    center_fixed_parameters!(3);
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // Analytic ∂y/∂versor from itk::VersorRigid3DTransform (divided by vw),
         // plus the translation identity block. Row-major 3×6.
@@ -1457,6 +1600,8 @@ impl ParametricTransform for Similarity3DTransform {
         self.scale = params[6];
         self.recompute();
     }
+
+    center_fixed_parameters!(3);
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // itk::Similarity3DTransform::ComputeJacobianWithRespectToParameters:
@@ -1739,6 +1884,8 @@ impl ParametricTransform for ScaleVersor3DTransform {
         self.scale[2] = params[8];
         self.recompute();
     }
+
+    center_fixed_parameters!(3);
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // itk::ScaleVersor3DTransform::ComputeJacobianWithRespectToParameters:
@@ -2046,6 +2193,8 @@ impl ParametricTransform for ScaleSkewVersor3DTransform {
         self.skew.copy_from_slice(&params[9..15]);
         self.recompute();
     }
+
+    center_fixed_parameters!(3);
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // itk::ScaleSkewVersor3DTransform::ComputeJacobianWithRespectToParameters:
@@ -2361,6 +2510,8 @@ impl ParametricTransform for ComposeScaleSkewVersor3DTransform {
         self.recompute();
     }
 
+    center_fixed_parameters!(3);
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // itk::ComposeScaleSkewVersor3DTransform::ComputeJacobianWithRespectToParameters:
         // the sympy-derived expansion of ∂(R·S·K·(p−c)) with the versor scalar w
@@ -2618,6 +2769,8 @@ impl ParametricTransform for VersorTransform {
         self.recompute();
     }
 
+    center_fixed_parameters!(3);
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // Analytic ∂y/∂versor from itk::VersorTransform (divided by vw).
         // Row-major 3×3 — no translation columns since translation is not a
@@ -2748,6 +2901,22 @@ impl ParametricTransform for ScaleTransform {
         self.scale.copy_from_slice(params);
     }
 
+    /// The center of scaling — `itk::ScaleTransform` derives from
+    /// `MatrixOffsetTransformBase`, whose fixed parameters are the center.
+    fn fixed_parameters(&self) -> Vec<f64> {
+        self.center.clone()
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.dim
+    }
+
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        check_fixed_len(params, self.dim, "the center of scaling")?;
+        self.center.copy_from_slice(params);
+        Ok(())
+    }
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // ∂yᵢ/∂scale_k = δᵢₖ · (xᵢ − centerᵢ) — itk::ScaleTransform
         // ComputeJacobianWithRespectToParameters.
@@ -2851,6 +3020,19 @@ impl ParametricTransform for ScaleLogarithmicTransform {
         self.inner.set_parameters(&scale);
     }
 
+    /// Delegates to [`ScaleTransform`]: the center of scaling.
+    fn fixed_parameters(&self) -> Vec<f64> {
+        self.inner.fixed_parameters()
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.inner.number_of_fixed_parameters()
+    }
+
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        self.inner.set_fixed_parameters(params)
+    }
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         // ∂yᵢ/∂log(scale_k) = δᵢₖ · scale_i · (pᵢ − centerᵢ) — see the struct
         // docs for the ITK center-omission this corrects.
@@ -2873,6 +3055,80 @@ mod tests {
     fn translation_transforms_point() {
         let t = TranslationTransform::new(vec![2.0, -3.0]);
         assert_eq!(t.transform_point(&[10.0, 10.0]), vec![12.0, 7.0]);
+    }
+
+    #[test]
+    fn translation_has_no_fixed_parameters() {
+        let mut t = TranslationTransform::new(vec![2.0, -3.0]);
+        assert_eq!(t.fixed_parameters(), Vec::<f64>::new());
+        assert_eq!(t.number_of_fixed_parameters(), 0);
+        assert!(t.set_fixed_parameters(&[]).is_ok());
+        assert!(matches!(
+            t.set_fixed_parameters(&[1.0]),
+            Err(TransformError::InvalidFixedParameters { got: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn matrix_offset_fixed_parameters_are_the_center() {
+        let mut a = AffineTransform::identity(3);
+        assert_eq!(a.fixed_parameters(), vec![0.0; 3]);
+        a.set_fixed_parameters(&[1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(a.center(), [1.0, 2.0, 3.0]);
+        assert_eq!(a.fixed_parameters(), vec![1.0, 2.0, 3.0]);
+
+        let mut s = Similarity2DTransform::identity();
+        s.set_fixed_parameters(&[4.0, 5.0]).unwrap();
+        assert_eq!(s.center(), [4.0, 5.0]);
+
+        // A wrong-length array is where ITK's SetFixedParameters throws.
+        assert!(a.set_fixed_parameters(&[1.0, 2.0]).is_err());
+        assert!(a.set_fixed_parameters(&[1.0, 2.0, 3.0, 4.0]).is_err());
+    }
+
+    #[test]
+    fn setting_the_center_via_fixed_parameters_refreshes_the_offset() {
+        // A 90° rotation whose center moves to (1, 0): that point must stay put.
+        let mut e = Euler2DTransform::new(std::f64::consts::FRAC_PI_2, [0.0, 0.0], [0.0, 0.0]);
+        e.set_fixed_parameters(&[1.0, 0.0]).unwrap();
+        let mapped = e.transform_point(&[1.0, 0.0]);
+        assert!((mapped[0] - 1.0).abs() < 1e-12, "{mapped:?}");
+        assert!((mapped[1] - 0.0).abs() < 1e-12, "{mapped:?}");
+    }
+
+    #[test]
+    fn euler3d_fixed_parameters_carry_compute_zyx() {
+        let mut e = Euler3DTransform::new(0.1, 0.2, 0.3, [0.0; 3], [0.0; 3]);
+        assert_eq!(e.fixed_parameters(), vec![0.0, 0.0, 0.0, 0.0]);
+        e.set_compute_zyx(true);
+        assert_eq!(e.fixed_parameters(), vec![0.0, 0.0, 0.0, 1.0]);
+
+        // A 4-entry array restores both the center and the flag.
+        let mut f = Euler3DTransform::identity();
+        f.set_fixed_parameters(&[1.0, 2.0, 3.0, 1.0]).unwrap();
+        assert_eq!(f.center(), [1.0, 2.0, 3.0]);
+        assert!(f.compute_zyx());
+
+        // A 3-entry array is accepted (ITK's backwards-compatibility branch) and
+        // leaves the flag alone.
+        f.set_fixed_parameters(&[4.0, 5.0, 6.0]).unwrap();
+        assert_eq!(f.center(), [4.0, 5.0, 6.0]);
+        assert!(f.compute_zyx());
+
+        assert!(f.set_fixed_parameters(&[1.0, 2.0]).is_err());
+        assert!(f.set_fixed_parameters(&[1.0, 2.0, 3.0, 4.0, 5.0]).is_err());
+    }
+
+    #[test]
+    fn scale_fixed_parameters_are_the_center() {
+        let mut s = ScaleTransform::new(vec![2.0, 3.0], vec![0.0, 0.0]);
+        s.set_fixed_parameters(&[1.0, 1.0]).unwrap();
+        assert_eq!(s.fixed_parameters(), vec![1.0, 1.0]);
+        assert_eq!(s.transform_point(&[1.0, 1.0]), vec![1.0, 1.0]);
+
+        let mut l = ScaleLogarithmicTransform::new(vec![2.0, 3.0], vec![0.0, 0.0]);
+        l.set_fixed_parameters(&[1.0, 1.0]).unwrap();
+        assert_eq!(l.fixed_parameters(), vec![1.0, 1.0]);
     }
 
     #[test]

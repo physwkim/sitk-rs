@@ -19,6 +19,7 @@
 //!
 //! [`transform_point`]: TransformBase::transform_point
 
+use crate::error::{Result, TransformError};
 use crate::transform::{ParametricTransform, TransformBase};
 
 /// A stack of transforms composed by `y = T0(T1(...TN-1(x)...))`, where
@@ -191,6 +192,48 @@ impl ParametricTransform for CompositeTransform {
             t.set_parameters(&params[offset..offset + n]);
             offset += n;
         }
+    }
+
+    /// Each sub-transform's fixed parameters, concatenated in **reverse** queue
+    /// order — the same order as [`parameters`] — matching
+    /// `itk::CompositeTransform::GetFixedParameters`, which iterates
+    /// `transforms.rbegin()..rend()` (`itkCompositeTransform.hxx:694-713`).
+    /// Its base class `itk::MultiTransform` concatenates them in *forward* queue
+    /// order instead (`itkMultiTransform.hxx:134-153`); `CompositeTransform`
+    /// overrides that to agree with its own reverse-order `GetParameters`
+    /// (ledger §2.77).
+    ///
+    /// [`parameters`]: ParametricTransform::parameters
+    fn fixed_parameters(&self) -> Vec<f64> {
+        let mut out = Vec::with_capacity(self.number_of_fixed_parameters());
+        for t in self.transforms.iter().rev() {
+            out.extend(t.fixed_parameters());
+        }
+        out
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.transforms
+            .iter()
+            .map(|t| t.number_of_fixed_parameters())
+            .sum()
+    }
+
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        let expected = self.number_of_fixed_parameters();
+        if params.len() != expected {
+            return Err(TransformError::InvalidFixedParameters {
+                got: params.len(),
+                expected: format!("{expected} (the sub-transforms' fixed parameters)"),
+            });
+        }
+        let mut offset = 0;
+        for t in self.transforms.iter_mut().rev() {
+            let n = t.number_of_fixed_parameters();
+            t.set_fixed_parameters(&params[offset..offset + n])?;
+            offset += n;
+        }
+        Ok(())
     }
 
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {

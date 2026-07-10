@@ -191,7 +191,7 @@ fn bspline_initializer_domain(image: &Image) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 
 /// A cubic B-spline free-form deformation transform. See the [module
 /// docs](self).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BSplineTransform {
     dim: usize,
     /// Control points per axis (`meshSize + splineOrder`).
@@ -200,6 +200,10 @@ pub struct BSplineTransform {
     grid_origin: Vec<f64>,
     /// Physical spacing between adjacent control points, per axis.
     grid_spacing: Vec<f64>,
+    /// Orientation of the control-point grid, row-major `dim × dim` — the same
+    /// matrix as the transform-domain direction, and the trailing block of the
+    /// transform's fixed parameters.
+    grid_direction: Vec<f64>,
     /// `diag(1/gridSpacing) · gridDirection⁻¹`, row-major `dim × dim`: maps a
     /// physical displacement from `grid_origin` to a continuous grid index.
     phys_to_index: Vec<f64>,
@@ -248,7 +252,41 @@ impl BSplineTransform {
         let rotated = matrix::mat_vec(domain_direction, &shift, dim);
         let grid_origin: Vec<f64> = (0..dim).map(|i| domain_origin[i] + rotated[i]).collect();
 
-        let phys_to_index = physical_to_index_matrix(domain_direction, &grid_spacing, dim)
+        Self::from_grid_geometry(
+            dim,
+            &grid_size,
+            &grid_origin,
+            &grid_spacing,
+            domain_direction,
+        )
+    }
+
+    /// Build directly from the **control-point grid** geometry, with all
+    /// coefficients zero. This is what `itk::BSplineTransform`'s fixed
+    /// parameters encode, and what
+    /// `SetCoefficientImageInformationFromFixedParameters` reconstructs
+    /// (`itkBSplineTransform.hxx:62`); [`new`](Self::new) derives this geometry
+    /// from a transform domain and then calls through here.
+    ///
+    /// Fails if any argument's length is inconsistent with `dim`, a grid size is
+    /// zero, or `grid_direction` is singular.
+    fn from_grid_geometry(
+        dim: usize,
+        grid_size: &[usize],
+        grid_origin: &[f64],
+        grid_spacing: &[f64],
+        grid_direction: &[f64],
+    ) -> Result<Self> {
+        if grid_size.len() != dim
+            || grid_origin.len() != dim
+            || grid_spacing.len() != dim
+            || grid_direction.len() != dim * dim
+            || grid_size.contains(&0)
+        {
+            return Err(TransformError::InvalidBSplineDomain);
+        }
+
+        let phys_to_index = physical_to_index_matrix(grid_direction, grid_spacing, dim)
             .ok_or(TransformError::SingularDirection)?;
 
         // Raster strides, first axis fastest.
@@ -260,9 +298,10 @@ impl BSplineTransform {
 
         Ok(Self {
             dim,
-            grid_size,
-            grid_origin,
-            grid_spacing,
+            grid_size: grid_size.to_vec(),
+            grid_origin: grid_origin.to_vec(),
+            grid_spacing: grid_spacing.to_vec(),
+            grid_direction: grid_direction.to_vec(),
             phys_to_index,
             grid_stride,
             num_per_dim,
@@ -334,6 +373,11 @@ impl BSplineTransform {
     /// Physical origin of control point `(0,…,0)`.
     pub fn grid_origin(&self) -> &[f64] {
         &self.grid_origin
+    }
+
+    /// Orientation of the control-point grid, row-major `dim × dim`.
+    pub fn grid_direction(&self) -> &[f64] {
+        &self.grid_direction
     }
 
     /// Number of control points (`Π grid_size`) = parameters per dimension.
@@ -472,6 +516,53 @@ impl ParametricTransform for BSplineTransform {
         self.coefficients.copy_from_slice(params);
     }
 
+    /// `[gridSize, gridOrigin, gridSpacing, gridDirection]`, each block `dim`
+    /// long except the row-major `dim × dim` direction — `dim · (dim + 3)`
+    /// values in all, exactly as
+    /// `itk::BSplineBaseTransform::SetFixedParametersFromTransformDomainInformation`
+    /// lays them out (`itkBSplineBaseTransform.hxx:97-112`).
+    fn fixed_parameters(&self) -> Vec<f64> {
+        let dim = self.dim;
+        let mut fp = Vec::with_capacity(dim * (dim + 3));
+        fp.extend(self.grid_size.iter().map(|&s| s as f64));
+        fp.extend_from_slice(&self.grid_origin);
+        fp.extend_from_slice(&self.grid_spacing);
+        fp.extend_from_slice(&self.grid_direction);
+        fp
+    }
+
+    fn number_of_fixed_parameters(&self) -> usize {
+        self.dim * (self.dim + 3)
+    }
+
+    /// Rebuilds the control-point grid from `params` and zeroes every
+    /// coefficient, mirroring `SetCoefficientImageInformationFromFixedParameters`
+    /// (which re-allocates the coefficient images). Grid sizes are truncated
+    /// toward zero out of the `f64` block, as ITK's
+    /// `static_cast<SizeValueType>(m_FixedParameters[i])` does.
+    fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()> {
+        let dim = self.dim;
+        let expected = dim * (dim + 3);
+        if params.len() != expected {
+            return Err(TransformError::InvalidFixedParameters {
+                got: params.len(),
+                expected: format!("{expected} (grid size, origin, spacing, direction)"),
+            });
+        }
+        let grid_size: Vec<usize> = params[..dim]
+            .iter()
+            .map(|&s| if s >= 1.0 { s as usize } else { 0 })
+            .collect();
+        *self = Self::from_grid_geometry(
+            dim,
+            &grid_size,
+            &params[dim..2 * dim],
+            &params[2 * dim..3 * dim],
+            &params[3 * dim..],
+        )?;
+        Ok(())
+    }
+
     fn jacobian_wrt_parameters(&self, point: &[f64]) -> Vec<f64> {
         let dim = self.dim;
         let nparams = self.number_of_parameters();
@@ -519,6 +610,43 @@ impl ParametricTransform for BSplineTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_parameters_are_the_control_point_grid_geometry() {
+        let t = BSplineTransform::new(2, &[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
+            .unwrap();
+        // gridSize = meshSize + 3; gridSpacing = physDim / meshSize;
+        // gridOrigin = domainOrigin - gridSpacing (the order-3 border shift).
+        assert_eq!(t.grid_size(), [5, 7]);
+        assert_eq!(t.grid_spacing(), [2.0, 2.0]);
+        assert_eq!(t.grid_origin(), [-1.0, 0.0]);
+        assert_eq!(t.grid_direction(), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            t.fixed_parameters(),
+            vec![5.0, 7.0, -1.0, 0.0, 2.0, 2.0, 1.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(t.number_of_fixed_parameters(), 2 * (2 + 3));
+    }
+
+    #[test]
+    fn set_fixed_parameters_rebuilds_the_grid_and_zeroes_the_coefficients() {
+        let mut t =
+            BSplineTransform::new(2, &[0.0, 0.0], &[4.0, 4.0], &[1.0, 0.0, 0.0, 1.0], &[1, 1])
+                .unwrap();
+        t.set_parameters(&vec![1.0; t.number_of_parameters()]);
+
+        let target =
+            BSplineTransform::new(2, &[1.0, 2.0], &[4.0, 8.0], &[1.0, 0.0, 0.0, 1.0], &[2, 4])
+                .unwrap();
+        t.set_fixed_parameters(&target.fixed_parameters()).unwrap();
+
+        // Geometry adopted, coefficients re-allocated to zero (ITK re-allocates
+        // the coefficient images in SetCoefficientImageInformationFromFixedParameters).
+        assert_eq!(t, target);
+        assert!(t.parameters().iter().all(|&c| c == 0.0));
+
+        assert!(t.set_fixed_parameters(&[1.0, 2.0]).is_err());
+    }
 
     /// A unit-spacing, identity-direction 2-D image of the given size.
     fn image(w: usize, h: usize) -> Image {
