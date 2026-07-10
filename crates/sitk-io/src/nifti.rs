@@ -1428,7 +1428,13 @@ fn find_hdr_name(path: &Path) -> Option<PathBuf> {
     let mut hdr_first = false;
     if let Some(ext) = ext {
         if path.exists() {
-            if !ext.eq_ignore_ascii_case(".img") {
+            // `fileext_n_compare(ext, ".img", 4)` (nifti1_io.c:2770) looks at the
+            // first four characters only, so `.img.gz` is an image name too and
+            // sends the search to `.hdr`/`.hdr.gz` first. Upstream's compare
+            // matches all-lowercase or all-uppercase; `find_file_extension` has
+            // already rejected anything mixed, so ASCII-insensitive is the same
+            // predicate over the reachable inputs.
+            if !ext[..4].eq_ignore_ascii_case(".img") {
                 return Some(path.to_path_buf());
             }
             hdr_first = true;
