@@ -154,6 +154,25 @@ pub enum RegistrationError {
         mask: Vec<usize>,
         image: Vec<usize>,
     },
+
+    /// `BSplineTransformInitializerFilter::execute` was asked for a B-spline
+    /// order other than 3 (cubic) — the only order
+    /// [`sitk_transform::BSplineTransform`] implements. SimpleITK's own
+    /// filter additionally supports orders 0-2 (and rejects anything outside
+    /// 0..=3); this port narrows further to cubic-only.
+    #[error(
+        "B-spline order {order} is not supported by this port (only cubic order 3 is implemented; SimpleITK also supports orders 0-2)"
+    )]
+    UnsupportedBSplineOrder { order: usize },
+
+    /// `BSplineTransformInitializerFilter::execute` was given a `mesh_size`
+    /// whose length does not match the image's dimension. SimpleITK's
+    /// `sitkSTLVectorToITK` truncates a too-long vector and only errors on
+    /// one that's too short; this port requires an exact length match,
+    /// matching [`sitk_transform::BSplineTransform::new`]'s own established
+    /// convention.
+    #[error("B-spline mesh size length {got} != image dimension {expected}")]
+    MeshSizeLength { got: usize, expected: usize },
 }
 
 /// Registration result alias.

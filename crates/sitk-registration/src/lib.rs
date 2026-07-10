@@ -116,6 +116,7 @@
 //! [`PhysicalShiftScales`]: crate::PhysicalShiftScales
 
 pub mod ants_correlation;
+pub mod bspline_initializer;
 pub mod convergence;
 pub mod correlation;
 pub mod demons;
@@ -133,6 +134,7 @@ pub mod optimizer;
 pub mod scales;
 
 pub use ants_correlation::AntsNeighborhoodCorrelationMetric;
+pub use bspline_initializer::BSplineTransformInitializer;
 pub use convergence::WindowConvergenceMonitor;
 pub use correlation::CorrelationMetric;
 pub use demons::DemonsMetric;
