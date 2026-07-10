@@ -55,11 +55,10 @@
 //!
 //! `axis mins` / `axis maxs` never touch the spacing. They feed
 //! `nrrdOriginCalculate` (simple.c:229-302), which is consulted only when
-//! `spaceDim == 0`, and which reproduces upstream bug [§1.47](
-//! ../../../doc/upstream-findings.md): its `gotMin` loop tests
-//! `axis[0]->min` rather than `axis[ai]->min`, so `axis mins: 0 nan` yields a
-//! NaN origin instead of the `NoMin` status that would have left the origin at
-//! zero.
+//! `spaceDim == 0`. Upstream bug [§1.47](../../../doc/upstream-findings.md) —
+//! its `gotMin` loop tests `axis[0]->min` rather than `axis[ai]->min` — is
+//! fixed in this port: each axis's own `min` is checked, so `axis mins: 0
+//! nan` correctly reports the `NoMin` status and leaves the origin at zero.
 //!
 //! # `space` and the conversion to LPS
 //!
@@ -2283,15 +2282,16 @@ enum OriginStatus {
 
 /// `nrrdOriginCalculate` (simple.c:229-302) with `defaultCenter = cell`.
 ///
-/// The `gotMin` loop reads `axis[0]->min` on every iteration — upstream bug
-/// §1.47, reproduced. A header with `axis mins: 0 nan` therefore reports
-/// `Okay` and hands ITK a NaN origin.
+/// Upstream's `gotMin` loop reads `axis[0]->min` on every iteration instead of
+/// `axis[ai]->min` (simple.c:274) — bug §1.47, fixed in this port: each axis's
+/// own `min` is tested, matching the `gotMaxOrSpacing` loop directly below it
+/// in upstream, which correctly indexes by `ai`.
 fn origin_calculate(nrrd: &Nrrd, domain: &[usize]) -> OriginStatus {
     let axes: Vec<&Axis> = domain.iter().map(|&a| &nrrd.axis[a]).collect();
     if axes.iter().any(|a| air_exists(a.space_direction[0])) && nrrd.space_dim > 0 {
         return OriginStatus::Bad;
     }
-    if !axes.iter().all(|_| air_exists(axes[0].min)) {
+    if !axes.iter().all(|a| air_exists(a.min)) {
         return OriginStatus::NoMin;
     }
     if !axes

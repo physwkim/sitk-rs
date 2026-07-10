@@ -2451,11 +2451,14 @@ mod tests {
         assert_eq!(img.origin(), &[0.0, 0.0]);
     }
 
-    /// Upstream bug §1.47: `nrrdOriginCalculate`'s `gotMin` loop reads
-    /// `axis[0]->min` on every iteration, so a NaN on axis 1 does not produce
-    /// the `NoMin` status it should — the NaN reaches the origin instead.
+    /// Fixed §1.47: upstream `nrrdOriginCalculate`'s `gotMin` loop read
+    /// `axis[0]->min` on every iteration instead of `axis[ai]->min`, so a NaN
+    /// on axis 1 did not produce the `NoMin` status it should have — the NaN
+    /// reached the origin instead. This port checks each axis's own `min`, so
+    /// a NaN on *any* axis reports `NoMin` and the origin — for every axis,
+    /// including the one with a real `min` — is left at zero.
     #[test]
-    fn nrrd_origin_calculate_only_checks_the_first_axis_min() {
+    fn nrrd_axis_mins_missing_on_any_axis_leaves_the_origin_at_zero() {
         let path = tmp_path("nanmin.nrrd");
         std::fs::write(
             &path,
@@ -2472,8 +2475,11 @@ mod tests {
         .unwrap();
         let img = read_image(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(img.origin()[0], 11.0);
-        assert!(img.origin()[1].is_nan(), "upstream leaks the NaN min");
+        assert_eq!(
+            img.origin(),
+            &[0.0, 0.0],
+            "a NaN min on axis 1 must void the whole origin, not just axis 1"
+        );
     }
 
     /// `encoding: ASCII` (whose header spelling is what teem's
