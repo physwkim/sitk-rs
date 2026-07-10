@@ -33,7 +33,7 @@
 //! zero pad is a real data point in the mean/variance below**, not just
 //! boundary filler for the image neighborhood — the `EvenKernel` yaml test
 //! tag exists because this is a deliberate, tested upstream behavior, not a
-//! degenerate accident. Tracked in the upstream-findings ledger, §2.70.
+//! degenerate accident. Tracked in the upstream-findings ledger, §2.71.
 //!
 //! `NeighborhoodOperator::Fill` copies `GenerateCoefficients()`'s buffer into
 //! the operator's storage via a `std::slice` over the *whole* neighborhood,
@@ -87,7 +87,7 @@
 //! This port reproduces both by doing the same `f64` arithmetic ITK does in
 //! `OutputPixelRealType` (`NumericTraits<OutputPixelType>::RealType`, itself
 //! always `f32`/`f64` since [`crate::real_pixel_id`] is `OutputPixelType`)
-//! with no extra guard. Tracked in the upstream-findings ledger, §1.42.
+//! with no extra guard. Tracked in the upstream-findings ledger, §1.43.
 //!
 //! # Output pixel type
 //!
@@ -124,7 +124,7 @@
 //! (`n4_bias_field`, `fft_correlation`, `scalar_connected_component`,
 //! `stochastic_fractal_dimension`) rather than SimpleITK's incidentally more
 //! restrictive generated signature. Tracked in the upstream-findings ledger,
-//! §3.19.
+//! §3.26.
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
@@ -417,6 +417,17 @@ mod tests {
         assert_eq!(
             err,
             sitk_core::Error::RequiresScalarPixelType(PixelId::VectorFloat32).into()
+        );
+    }
+
+    #[test]
+    fn complex_image_is_rejected() {
+        let image = Image::new(&[3, 1], PixelId::ComplexFloat32);
+        let template = img_f32(&[3, 1], vec![1.0, 0.0, 2.0]);
+        let err = normalized_correlation(&image, None, &template).unwrap_err();
+        assert_eq!(
+            err,
+            sitk_core::Error::RequiresScalarPixelType(PixelId::ComplexFloat32).into()
         );
     }
 

@@ -331,7 +331,7 @@ fn voting_binary_hole_filling_pass_typed<T: Scalar>(
             // `else { it.Set(foregroundValue); }`: any non-background center
             // is stamped to foreground_value, not just an exact-foreground
             // one, and this branch never contributes to the changed count.
-            // Tracked in the upstream-findings ledger, §2.69.
+            // Tracked in the upstream-findings ledger, §2.70.
             foreground
         };
         out.push(value);
@@ -884,6 +884,16 @@ mod tests {
         let image = Image::from_vec(&[3, 1], vec![1.0f32, 0.0, 1.0]).unwrap();
         let err = voting_binary_hole_filling(&image, &[1], 1, 1.0, 0.0).unwrap_err();
         assert_eq!(err, FilterError::RequiresIntegerPixelType(PixelId::Float32));
+    }
+
+    #[test]
+    fn voting_binary_hole_filling_rejects_a_complex_pixel_type() {
+        let image = Image::new(&[3, 1], PixelId::ComplexFloat32);
+        let err = voting_binary_hole_filling(&image, &[1], 1, 1.0, 0.0).unwrap_err();
+        assert_eq!(
+            err,
+            FilterError::RequiresIntegerPixelType(PixelId::ComplexFloat32)
+        );
     }
 
     // ---- voting_binary_iterative_hole_filling ----

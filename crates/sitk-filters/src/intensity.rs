@@ -302,7 +302,7 @@ pub fn shift_scale(
 /// numerator over a zero divisor here would naturally narrow to
 /// `NonpositiveMin()`, and a *zero* numerator to `NaN` narrowing to `0` —
 /// both would silently diverge from upstream's unconditional `max()` without
-/// this explicit branch. Tracked in the upstream-findings ledger, §2.68.
+/// this explicit branch. Tracked in the upstream-findings ledger, §2.69.
 ///
 /// Setting `constant = 0.0` on a *nonzero*-sum image is a different case:
 /// `divisor = sum / 0.0` is `±infinity`, not "almost zero", so `Div` takes

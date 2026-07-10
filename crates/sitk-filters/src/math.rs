@@ -107,7 +107,7 @@ use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 // `cvttss2si`/`cvttsd2si`). This port's `f64`-compute engine has no such
 // intermediate: [`Round::apply`] always returns the mathematically correct
 // rounded value, never that sentinel. Tracked as a deliberate divergence
-// (upstream UB, defined here) in the upstream-findings ledger, §4.31.
+// (upstream UB, defined here) in the upstream-findings ledger, §4.35.
 struct Round;
 impl UnaryFunctor for Round {
     fn apply(&self, x: f64) -> f64 {
@@ -727,6 +727,15 @@ mod round_tests {
         assert_eq!(
             round(&a),
             Err(FilterError::RequiresRealPixelType(PixelId::UInt8))
+        );
+    }
+
+    #[test]
+    fn round_rejects_a_complex_pixel_type() {
+        let a = Image::new(&[2, 1], PixelId::ComplexFloat32);
+        assert_eq!(
+            round(&a),
+            Err(FilterError::RequiresRealPixelType(PixelId::ComplexFloat32))
         );
     }
 

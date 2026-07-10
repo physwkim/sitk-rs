@@ -82,7 +82,9 @@ pub mod label;
 pub mod label_fusion;
 pub mod label_intensity;
 pub mod label_map;
+pub mod label_map_mask;
 pub mod label_map_overlay;
+pub mod label_map_to_binary;
 pub mod label_set_morphology;
 pub mod label_shape;
 pub mod label_to_rgb;
@@ -195,8 +197,8 @@ pub use geometry::{
     zero_flux_neumann_pad,
 };
 pub use gradient::{
-    derivative, gradient_magnitude, gradient_magnitude_recursive_gaussian, laplacian,
-    laplacian_recursive_gaussian, sobel_edge_detection,
+    derivative, gradient, gradient_magnitude, gradient_magnitude_recursive_gaussian,
+    gradient_recursive_gaussian, laplacian, laplacian_recursive_gaussian, sobel_edge_detection,
 };
 pub use grid_utility::{checker_board, paste, tile};
 pub use histogram_matching::histogram_matching;
@@ -268,7 +270,9 @@ pub use reconstruction::{
     double_threshold, grayscale_fillhole, grayscale_grindpeak, h_concave, h_convex, h_maxima,
     h_minima, reconstruction_by_dilation, reconstruction_by_erosion,
 };
-pub use recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
+pub use recursive_gaussian::{
+    GaussianOrder, recursive_gaussian, recursive_gaussian_with_order, smoothing_recursive_gaussian,
+};
 pub use region_growing::{
     IsolatedConnectedResult, VectorConfidenceConnectedResult, confidence_connected,
     connected_threshold, isolated_connected, neighborhood_connected, vector_confidence_connected,

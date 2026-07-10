@@ -78,6 +78,47 @@ pub enum Error {
         components_per_pixel: usize,
     },
 
+    /// A pixel accessor was given an index shorter than the image dimension.
+    ///
+    /// SimpleITK's `sitkSTLVectorToITK` (sitkTemplateFunctions.h:100-105) throws
+    /// "Expected vector of length D but only got N elements." when
+    /// `idx.size() < D`; a *longer* index is accepted and its extra elements are
+    /// ignored (`sitkImage.h:499-501`).
+    #[error("pixel index needs at least {dimension} elements, got {actual}")]
+    IndexDimensionMismatch { dimension: usize, actual: usize },
+
+    /// A pixel accessor was given an index outside the image.
+    ///
+    /// SimpleITK's `PimpleImage::GetIndex` (sitkPimpleImageBase.hxx:788-797)
+    /// throws "index out of bounds" when the index leaves the largest possible
+    /// region: "Boundary checking is performed on idx, if it is out of bounds an
+    /// exception will be thrown" (sitkImage.h:501-502).
+    #[error("pixel index {index:?} is outside an image of size {size:?}")]
+    IndexOutOfBounds { index: Vec<usize>, size: Vec<usize> },
+
+    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on an
+    /// image whose pixel type or dimension has no `ToVectorInternal`
+    /// instantiation — a complex image, or a scalar image of fewer than three
+    /// dimensions (sitkImageExplicit.cxx:119-131).
+    #[error("cannot convert a {dimension}-D {pixel_id:?} image to a vector image")]
+    CannotConvertToVectorImage { pixel_id: PixelId, dimension: usize },
+
+    /// [`Image::to_scalar_image`](crate::Image::to_scalar_image) was called on an
+    /// image whose pixel type has no `ToScalarInternal` instantiation — a
+    /// complex image (sitkImageExplicit.cxx:143-155).
+    #[error("cannot convert a {dimension}-D {pixel_id:?} image to a scalar image")]
+    CannotConvertToScalarImage { pixel_id: PixelId, dimension: usize },
+
+    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on a
+    /// scalar image whose direction cosine matrix does not have the first
+    /// dimension's row and column equal to the identity's. Upstream's
+    /// `sitkExceptionMacro("Cannot convert image with non-identity direction in
+    /// first dimension to a vector image")` (sitkImage.hxx:134-145).
+    #[error(
+        "cannot convert an image with a non-identity direction in the first dimension to a vector image"
+    )]
+    NonIdentityFirstDimensionDirection,
+
     /// A label-only operation was handed a floating-point or vector image.
     ///
     /// SimpleITK expresses the same restriction at compile time:

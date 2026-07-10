@@ -1,6 +1,8 @@
 //! The runtime-typed N-dimensional [`Image`] and its type-erased [`PixelBuffer`].
 
 use std::any::Any;
+use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::matrix;
@@ -210,6 +212,30 @@ impl PixelBuffer {
 /// [`Error::RequiresScalarPixelType`] rather than hand back an interleaved
 /// buffer that a scalar consumer would misread. That guard is a *whitelist* on
 /// [`PixelId::is_scalar`]: a pixel category added later is rejected by default.
+///
+/// # The meta-data dictionary
+///
+/// Every image carries a string-to-string dictionary, reached through
+/// [`Image::meta_data_keys`], [`Image::has_meta_data_key`],
+/// [`Image::meta_data`], [`Image::set_meta_data`] and
+/// [`Image::erase_meta_data`] — exactly the five methods SimpleITK exposes
+/// (sitkImage.h:401-432).
+///
+/// ITK's underlying `itk::MetaDataDictionary` is a
+/// `std::map<std::string, MetaDataObjectBase::Pointer>`
+/// (itkMetaDataDictionary.h:67), so an entry may hold *any* type. SimpleITK
+/// flattens that on both sides: `SetMetaData` always encapsulates a
+/// `std::string` (sitkImage.cxx:394-401), and `GetMetaData` returns a
+/// dictionary string as-is, falling back to `mdd.Get(key)->Print(ss)` for every
+/// other stored type (sitkImage.cxx:378-392). This port stores the flattened
+/// form directly and does not model the typed `MetaDataObject` hierarchy.
+///
+/// The dictionary is a [`BTreeMap`], so [`Image::meta_data_keys`] yields keys in
+/// ascending byte order. That is upstream's order too: `MetaDataDictionary::
+/// GetKeys` walks the `std::map` in iteration order (itkMetaDataDictionary.cxx:
+/// 100-112), and `std::map<std::string, _>` orders by `std::string`'s
+/// `char_traits::compare`, i.e. `memcmp` over unsigned bytes — the same total
+/// order Rust's `Ord for str` uses.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image {
     buffer: PixelBuffer,
@@ -222,6 +248,7 @@ pub struct Image {
     spacing: Vec<f64>,
     origin: Vec<f64>,
     direction: Vec<f64>,
+    metadata: BTreeMap<String, String>,
 }
 
 /// An [`Image`] borrow carrying static proof that the image is scalar (one
@@ -289,6 +316,14 @@ impl Image {
     /// report — not the buffer stride, which this seam is the sole owner of.
     /// `AllocateInternal` (sitkImage.hxx:60-67, :95-100) accepts only `1` for a
     /// basic pixel type, complex included, and any count for a vector one.
+    ///
+    /// The assembled image's meta-data dictionary is always empty. Every
+    /// upstream path that reaches this seam does the same: a freshly allocated
+    /// `itk::Image` has an empty dictionary, and both `GetVectorImageFromScalarImage`
+    /// and `GetScalarImageFromVectorImage` (sitkImageConvert.hxx:74-177) build a
+    /// new `itk::Image`, copying regions, spacing, origin and direction across
+    /// but never the dictionary. Metadata is therefore carried only by the
+    /// dedicated accessors, never inherited.
     fn assemble(
         buffer: PixelBuffer,
         pixel_id: PixelId,
@@ -335,6 +370,7 @@ impl Image {
             spacing,
             origin,
             direction,
+            metadata: BTreeMap::new(),
         })
     }
 
@@ -718,6 +754,10 @@ impl Image {
 
     /// Copy spacing, origin, and direction from another image of equal dimension.
     /// Used by filters that preserve input geometry.
+    ///
+    /// This is SimpleITK's `CopyInformation` (sitkImage.h:386-395,
+    /// sitkImage.cxx:349-357), which likewise sets only the origin, spacing and
+    /// direction: "The meta-data dictionary is **not** copied."
     pub fn copy_geometry_from(&mut self, other: &Image) {
         debug_assert_eq!(self.dimension(), other.dimension());
         self.spacing = other.spacing.clone();
@@ -871,6 +911,49 @@ impl Image {
         self.linear_index(index) * self.buffer_stride + component
     }
 
+    /// The single bounds-checking seam for the pixel accessors: the offset of
+    /// the pixel at `index`'s first component in the interleaved buffer.
+    ///
+    /// Every `get_*`/`set_*` pixel accessor reaches its buffer through this
+    /// function, so none of them can read or write a pixel other than the one
+    /// `index` names. [`Image::linear_index`] and [`Image::component_index`]
+    /// stay unchecked — they are the loop primitives filters use over indices
+    /// they have already constrained, and both say so.
+    ///
+    /// The two rejections mirror upstream exactly:
+    ///
+    /// - `index.len() < dimension()` — `sitkSTLVectorToITK`
+    ///   (sitkTemplateFunctions.h:100-105). A **longer** index is accepted and
+    ///   its extra elements ignored, as `sitkImage.h:499-501` promises
+    ///   ("additional elements will be ignored").
+    /// - any `index[d] >= size[d]` — `PimpleImage::GetIndex`
+    ///   (sitkPimpleImageBase.hxx:788-797), whose `IsInside` test against the
+    ///   largest possible region throws "index out of bounds". SimpleITK's
+    ///   indices are `uint32_t`, so its lower bound is met by the type; here
+    ///   `usize` does the same.
+    fn checked_pixel_start(&self, index: &[usize]) -> Result<usize> {
+        let dim = self.dimension();
+        if index.len() < dim {
+            return Err(Error::IndexDimensionMismatch {
+                dimension: dim,
+                actual: index.len(),
+            });
+        }
+        let mut offset = 0usize;
+        let mut stride = 1usize;
+        for d in 0..dim {
+            if index[d] >= self.size[d] {
+                return Err(Error::IndexOutOfBounds {
+                    index: index[..dim].to_vec(),
+                    size: self.size.clone(),
+                });
+            }
+            offset += index[d] * stride;
+            stride *= self.size[d];
+        }
+        Ok(offset * self.buffer_stride)
+    }
+
     /// The components of the pixel at `index`, as a `&[T]` of length
     /// [`Image::buffer_stride`] — SimpleITK's `GetPixelAsVector*`.
     ///
@@ -880,36 +963,41 @@ impl Image {
     /// complex image, and returning that image's single "component" would mean
     /// handing back half its pixel.
     ///
-    /// Errors on component-type mismatch.
+    /// Errors on component-type mismatch, on an `index` shorter than
+    /// [`Image::dimension`], and on an out-of-bounds `index` — the private
+    /// `checked_pixel_start` seam every pixel accessor shares.
+    ///
+    /// The guards run in upstream's order: `InternalGetPixelAs`
+    /// (sitkPimpleImageBase.hxx:800-823) selects its branch on the pixel type
+    /// first and only then calls `GetIndex`, so a wrong `T` is reported even
+    /// when `index` is also out of bounds.
     ///
     /// # Divergence
     ///
     /// SimpleITK's `GetPixelAsVectorFloat32` throws on a complex image — its
-    /// `InternalGetPixelAsVector` is gated on `IsVector<ImageType>::Value`
-    /// (sitkPimpleImageBase.hxx). One uniform "give me this pixel's components"
-    /// rule is preferred here over a fourth guard; [`Image::get_complex`] is
-    /// the typed accessor.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// `InternalGetPixelAs` is gated on `IsVector<ImageType>::Value`
+    /// (sitkPimpleImageBase.hxx:813). One uniform "give me this pixel's
+    /// components" rule is preferred here over a fourth guard;
+    /// [`Image::get_complex`] is the typed accessor.
     pub fn get_vector<T: Scalar>(&self, index: &[usize]) -> Result<&[T]> {
-        let start = self.component_index(index, 0);
-        let stride = self.buffer_stride;
         let all = self.component_slice::<T>()?;
-        Ok(&all[start..start + stride])
+        let start = self.checked_pixel_start(index)?;
+        Ok(&all[start..start + self.buffer_stride])
     }
 
     /// Overwrite the components of the pixel at `index` — SimpleITK's
     /// `SetPixelAsVector*`.
     ///
-    /// Errors on component-type mismatch, or if `values.len()` is not
-    /// [`Image::buffer_stride`]. Same divergence note as [`Image::get_vector`].
+    /// Errors as [`Image::get_vector`] does, and with
+    /// [`Error::InvalidComponentCount`] if `values.len()` is not
+    /// [`Image::buffer_stride`]. Same divergence note.
     ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// The length check comes last, as upstream's does: `InternalSetPixelAs`
+    /// (sitkPimpleImageBase.hxx:867-878) fetches `GetPixel(GetIndex(idx))`
+    /// before comparing `px.GetSize()` against `v.size()`.
     pub fn set_vector<T: Scalar>(&mut self, index: &[usize], values: &[T]) -> Result<()> {
+        self.component_slice::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         let stride = self.buffer_stride;
         if values.len() != stride {
             return Err(Error::InvalidComponentCount {
@@ -917,7 +1005,6 @@ impl Image {
                 components_per_pixel: values.len(),
             });
         }
-        let start = self.component_index(index, 0);
         let all = self.component_vec_mut::<T>()?;
         all[start..start + stride].copy_from_slice(values);
         Ok(())
@@ -936,16 +1023,13 @@ impl Image {
     /// The complex pixel at `index` — SimpleITK's
     /// `GetPixelAsComplexFloat32`/`64` (sitkImage.cxx:596-608).
     ///
-    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image
-    /// and [`Error::PixelTypeMismatch`] if `T` is not the component type.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image,
+    /// [`Error::PixelTypeMismatch`] if `T` is not the component type, and
+    /// [`Error::IndexOutOfBounds`] / [`Error::IndexDimensionMismatch`] on a bad
+    /// `index`. Guard order is upstream's: pixel type before index.
     pub fn get_complex<T: Real>(&self, index: &[usize]) -> Result<Complex<T>> {
-        self.require_complex()?;
-        let start = self.component_index(index, 0);
         let all = self.complex_components::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         Ok(Complex::new(all[start], all[start + 1]))
     }
 
@@ -953,13 +1037,9 @@ impl Image {
     /// `SetPixelAsComplexFloat32`/`64`.
     ///
     /// Errors exactly as [`Image::get_complex`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
     pub fn set_complex<T: Real>(&mut self, index: &[usize], value: Complex<T>) -> Result<()> {
-        self.require_complex()?;
-        let start = self.component_index(index, 0);
+        self.complex_components::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         let all = self.complex_components_mut::<T>()?;
         all[start] = value.re;
         all[start + 1] = value.im;
@@ -1012,6 +1092,444 @@ impl Image {
         let diff: Vec<f64> = (0..dim).map(|d| point[d] - self.origin[d]).collect();
         let unrotated = matrix::mat_vec(&inv, &diff, dim);
         Ok((0..dim).map(|d| unrotated[d] / self.spacing[d]).collect())
+    }
+
+    /// Map an integer index to a physical point — SimpleITK's
+    /// `TransformIndexToPhysicalPoint` (sitkImage.h:291, sitkImage.cxx:420-425).
+    ///
+    /// ITK computes `p_i = origin_i + Σ_j IndexToPhysicalPoint[i][j] · index_j`
+    /// with `IndexToPhysicalPoint = Direction · diag(spacing)`
+    /// (itkImageBase.hxx:164-175), which is exactly
+    /// [`Image::continuous_index_to_physical_point`] on the widened index; ITK's
+    /// own `TransformIndexToPhysicalPoint` and
+    /// `TransformContinuousIndexToPhysicalPoint` share that matrix.
+    pub fn transform_index_to_physical_point(&self, index: &[i64]) -> Vec<f64> {
+        debug_assert_eq!(index.len(), self.dimension());
+        let continuous: Vec<f64> = index.iter().map(|&i| i as f64).collect();
+        self.continuous_index_to_physical_point(&continuous)
+    }
+
+    /// Map a physical point to the integer index of the pixel containing it —
+    /// SimpleITK's `TransformPhysicalPointToIndex` (sitkImage.h:295,
+    /// sitkImage.cxx:412-417).
+    ///
+    /// ITK rounds the continuous index with
+    /// `Math::RoundHalfIntegerUp<IndexValueType>` (itkImageBase.h:465-479),
+    /// whose base implementation is `floor(x + 0.5)`
+    /// (itkMathDetail.h:108-116): halfway cases go **up**, so `1.5 -> 2` and
+    /// `-1.5 -> -1`. Both `TransformPhysicalPointToIndex` and
+    /// `TransformPhysicalPointToContinuousIndex` read the same
+    /// `m_PhysicalPointToIndex` matrix (itkImageBase.h:474, :525), so rounding
+    /// [`Image::physical_point_to_continuous_index`] reproduces it.
+    ///
+    /// Errors with [`Error::SingularDirection`] if the direction matrix cannot
+    /// be inverted. (ITK cannot reach that state here: `SetDirection` refuses a
+    /// singular matrix, so its precomputed inverse always exists.)
+    ///
+    /// # Divergence
+    ///
+    /// ITK's cast to `IndexValueType` is C++-undefined when the rounded value
+    /// leaves the integer's range — `RoundHalfIntegerUp`'s own doc warns the
+    /// argument's magnitude must stay below `max()/2`. Rust's `as` saturates,
+    /// which is defined; in-range values agree exactly.
+    pub fn transform_physical_point_to_index(&self, point: &[f64]) -> Result<Vec<i64>> {
+        let continuous = self.physical_point_to_continuous_index(point)?;
+        Ok(continuous
+            .into_iter()
+            .map(|x| (x + 0.5).floor() as i64)
+            .collect())
+    }
+
+    /// Whether the pixels of `self` and `other` at the same index occupy the
+    /// same physical space — SimpleITK's `IsCongruentImageGeometry`
+    /// (sitkImage.h:347, sitkImage.cxx:233-244), which delegates to
+    /// `itk::ImageBase::IsCongruentImageGeometry` (itkImageBase.hxx:390-406).
+    ///
+    /// Origin, spacing and direction are compared element-wise with
+    /// `vnl_vector::is_equal` / `vnl_matrix::is_equal` semantics
+    /// (vnl_vector.hxx:793-805, vnl_matrix.hxx:1134-1148): a pair is equal iff
+    /// `!(|a - b| <= tol)` is false, so the tolerance is **inclusive** and any
+    /// `NaN` makes the images unequal. Sizes are not compared; use
+    /// [`Image::is_same_image_geometry_as`] for that.
+    ///
+    /// Images of different [`Image::dimension`] are never congruent
+    /// (sitkImage.cxx:236-239).
+    ///
+    /// # Upstream quirk: the tolerance is asymmetric
+    ///
+    /// The origin and spacing tolerance is scaled by `self`'s **first-dimension
+    /// spacing only** — `coordinateTol = |coordinateTolerance * GetSpacing()[0]|`,
+    /// with the inline comment "use first dimension spacing"
+    /// (itkImageBase.hxx:400-401). So the relation is not symmetric when the two
+    /// images differ in `spacing[0]`, and axes 1.. are judged against axis 0's
+    /// scale. The direction tolerance is not scaled at all. Reproduced, and
+    /// pinned by `congruent_geometry_tolerance_is_asymmetric`.
+    pub fn is_congruent_image_geometry(
+        &self,
+        other: &Image,
+        coordinate_tolerance: f64,
+        direction_tolerance: f64,
+    ) -> bool {
+        fn all_within(a: &[f64], b: &[f64], tol: f64) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
+        }
+
+        if self.dimension() != other.dimension() {
+            return false;
+        }
+        let coordinate_tol = (coordinate_tolerance * self.spacing[0]).abs();
+        all_within(&self.origin, &other.origin, coordinate_tol)
+            && all_within(&self.spacing, &other.spacing, coordinate_tol)
+            && all_within(&self.direction, &other.direction, direction_tolerance)
+    }
+
+    /// Whether `self` and `other` have the same grid in physical space —
+    /// SimpleITK's `IsSameImageGeometryAs` (sitkImage.h:357,
+    /// sitkImage.cxx:246-257).
+    ///
+    /// [`Image::is_congruent_image_geometry`] plus equality of the largest
+    /// possible region (itkImageBase.hxx:410-417). Every image in this port has
+    /// a zero start index — SimpleITK's do too, since `Image::Allocate` builds
+    /// the region from a size alone — so the region test reduces to
+    /// [`Image::size`] equality.
+    ///
+    /// Upstream's C++ defaults for the two tolerances are
+    /// [`Image::DEFAULT_IMAGE_COORDINATE_TOLERANCE`] and
+    /// [`Image::DEFAULT_IMAGE_DIRECTION_TOLERANCE`]; Rust has no default
+    /// arguments, so they are passed explicitly.
+    pub fn is_same_image_geometry_as(
+        &self,
+        other: &Image,
+        coordinate_tolerance: f64,
+        direction_tolerance: f64,
+    ) -> bool {
+        self.is_congruent_image_geometry(other, coordinate_tolerance, direction_tolerance)
+            && self.size == other.size
+    }
+
+    /// Bytes per pixel component — SimpleITK's `GetSizeOfPixelComponent()`
+    /// (sitkImage.h:253, sitkImage.cxx:162-217).
+    ///
+    /// # Upstream quirk: complex reports the whole pixel
+    ///
+    /// Upstream documents "Returns the `sizeof` the pixel component type", and
+    /// for the scalar and vector pixel types it does. For the two complex pixel
+    /// types its `switch` returns `2 * sizeof(float)` / `2 * sizeof(double)`
+    /// (sitkImage.cxx:206-212) — the size of the whole `std::complex` pixel, not
+    /// of its component. `sitkImageTests.cxx:1166` pins that as intended:
+    /// `EXPECT_EQ(sizeof(std::complex<float>), img.GetSizeOfPixelComponent())`.
+    /// Reproduced. [`PixelId::size_in_bytes`] is the un-quirked component size.
+    pub fn size_of_pixel_component(&self) -> usize {
+        let component = self.pixel_id.size_in_bytes();
+        if self.pixel_id.is_complex() {
+            2 * component
+        } else {
+            component
+        }
+    }
+
+    /// The pixel type as a human-readable string — SimpleITK's
+    /// `GetPixelIDTypeAsString()` (sitkImage.h:216, sitkImage.cxx:220-224),
+    /// which forwards to `GetPixelIDValueAsString`. See [`PixelId::as_str`].
+    pub fn pixel_id_type_as_string(&self) -> &'static str {
+        self.pixel_id.as_str()
+    }
+
+    /// The keys of the meta-data dictionary, in ascending byte order —
+    /// SimpleITK's `GetMetaDataKeys()` (sitkImage.h:401-408,
+    /// sitkImage.cxx:361-367). See the [`Image`] type docs for why that order is
+    /// upstream's.
+    pub fn meta_data_keys(&self) -> Vec<&str> {
+        self.metadata.keys().map(String::as_str).collect()
+    }
+
+    /// Whether `key` is in the meta-data dictionary — SimpleITK's
+    /// `HasMetaDataKey` (sitkImage.h:412, sitkImage.cxx:369-375).
+    pub fn has_meta_data_key(&self, key: &str) -> bool {
+        self.metadata.contains_key(key)
+    }
+
+    /// The value stored under `key`, or `None` — SimpleITK's `GetMetaData`
+    /// (sitkImage.h:421, sitkImage.cxx:377-392).
+    ///
+    /// # Divergence
+    ///
+    /// Upstream throws for an absent key: `GetMetaData` falls through to
+    /// `mdd.Get(key)->Print(ss)`, and `MetaDataDictionary::Get` raises
+    /// "Requesting invalid key ..." (itkMetaDataDictionary.cxx:150-158).
+    /// `None` carries the same information without an error type, and
+    /// [`Image::has_meta_data_key`] is the explicit pre-check upstream callers
+    /// use.
+    pub fn meta_data(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Create or replace the entry under `key` — SimpleITK's `SetMetaData`
+    /// (sitkImage.h:427, sitkImage.cxx:393-401), which always encapsulates a
+    /// `std::string`.
+    pub fn set_meta_data(&mut self, key: &str, value: &str) {
+        self.metadata.insert(key.to_owned(), value.to_owned());
+    }
+
+    /// Remove the entry under `key`, reporting whether it was there —
+    /// SimpleITK's `EraseMetaData` (sitkImage.h:432, sitkImage.cxx:402-409),
+    /// which returns `itk::MetaDataDictionary::Erase`'s bool
+    /// (itkMetaDataDictionary.cxx:180-197).
+    pub fn erase_meta_data(&mut self, key: &str) -> bool {
+        self.metadata.remove(key).is_some()
+    }
+
+    /// Reinterpret the first dimension as this image's pixel components —
+    /// SimpleITK's `ToVectorImage` (sitkImage.h:455,
+    /// sitkImageExplicit.cxx:113-133, sitkImage.hxx:104-162).
+    ///
+    /// The buffer is unchanged: ITK's `GetVectorImageFromScalarImage`
+    /// (sitkImageConvert.hxx:127-177) hands the very same `PixelContainer` to
+    /// the new `itk::VectorImage`, because a scalar image with its first index
+    /// varying fastest already stores each output pixel's components adjacently.
+    /// The new image has `size[0]` components per pixel; its size, spacing and
+    /// origin drop element 0, and its direction is the trailing
+    /// `(d-1) x (d-1)` submatrix.
+    ///
+    /// A vector image is returned unchanged (`ToVectorInternal`'s
+    /// `if constexpr (IsVector<TImageType>::Value) return *this`,
+    /// sitkImage.hxx:107-110) — with no direction check.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::CannotConvertToVectorImage`] for a **complex** image and for a
+    ///   scalar image of fewer than three dimensions. Upstream's member-function
+    ///   factory registers `ScalarPixelIDTypeList ++ VectorPixelIDTypeList` only
+    ///   over dimensions `3..=SITK_MAX_DIMENSION` (sitkImageExplicit.cxx:
+    ///   119-124), and `ScalarPixelIDTypeList` is `BasicPixelIDTypeList`, the ten
+    ///   scalars — complex is not in it (sitkPixelIDTypeLists.h:40-57). Missing
+    ///   registrations throw "Unable to convert an image with pixel type ... to a
+    ///   vector image!".
+    /// - [`Error::NonIdentityFirstDimensionDirection`] when the direction
+    ///   matrix's first row or column differs from the identity's
+    ///   (sitkImage.hxx:134-145). The comparison is exact, as upstream's is.
+    ///
+    /// # Divergences
+    ///
+    /// Upstream's `inPlace` flag decides whether the *receiver* is also rebound
+    /// to the converted image; the converted image is returned either way. An
+    /// owned Rust `Image` has no such aliasing, so this method always takes
+    /// `&self` and the caller writes `img = img.to_vector_image()?` for the
+    /// in-place effect. Upstream's `SITK_MAX_DIMENSION` ceiling (a build option,
+    /// default 5 — `CMake/sitkMaxDimensionOption.cmake:6`) has no analogue here.
+    ///
+    /// Origin element 0 and spacing element 0 are **dropped**, and the meta-data
+    /// dictionary with them; upstream does the same, silently. See the note on
+    /// the private `assemble` seam.
+    pub fn to_vector_image(&self) -> Result<Image> {
+        if self.pixel_id.is_vector() {
+            return Ok(self.clone());
+        }
+        let dim = self.dimension();
+        if !self.pixel_id.is_scalar() || dim < 3 {
+            return Err(Error::CannotConvertToVectorImage {
+                pixel_id: self.pixel_id,
+                dimension: dim,
+            });
+        }
+
+        // direction[i][0] and direction[0][i] must be the identity's.
+        for i in 1..dim {
+            if self.direction[i * dim] != 0.0 || self.direction[i] != 0.0 {
+                return Err(Error::NonIdentityFirstDimensionDirection);
+            }
+        }
+        if self.direction[0] != 1.0 {
+            return Err(Error::NonIdentityFirstDimensionDirection);
+        }
+
+        let out_dim = dim - 1;
+        let mut direction = vec![0.0; out_dim * out_dim];
+        for i in 0..out_dim {
+            for j in 0..out_dim {
+                direction[i * out_dim + j] = self.direction[(i + 1) * dim + (j + 1)];
+            }
+        }
+        Self::assemble(
+            self.buffer.clone(),
+            self.pixel_id.vector_id(),
+            self.size[0],
+            self.size[1..].to_vec(),
+            self.spacing[1..].to_vec(),
+            self.origin[1..].to_vec(),
+            direction,
+        )
+    }
+
+    /// Reinterpret this vector image's pixel components as a new leading
+    /// dimension — SimpleITK's `ToScalarImage` (sitkImage.h:476,
+    /// sitkImageExplicit.cxx:135-160, sitkImage.hxx:165-205), the inverse of
+    /// [`Image::to_vector_image`].
+    ///
+    /// The buffer is again shared unchanged
+    /// (`GetScalarImageFromVectorImage`, sitkImageConvert.hxx:74-125). The new
+    /// leading axis has `number_of_components_per_pixel()` pixels; upstream sets
+    /// its spacing to `1.0`, its origin to `0.0`, and the new row and column of
+    /// the direction matrix to the identity's (sitkImageConvert.hxx:96-124).
+    ///
+    /// A scalar image is returned unchanged (`ToScalarInternal`'s
+    /// `if constexpr (IsBasic<TImageType>::Value) return *this`,
+    /// sitkImage.hxx:169-172).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CannotConvertToScalarImage`] for a **complex** image. `IsBasic`
+    /// is true for `itk::Image<std::complex<T>, N>` (sitkPixelIDTokens.h:39-49),
+    /// so that `return *this` branch would take it — but upstream's factory
+    /// registers only `ScalarPixelIDTypeList ++ VectorPixelIDTypeList`
+    /// (sitkImageExplicit.cxx:143-148), neither of which holds a complex pixel
+    /// id, so `HasMemberFunction` fails and it throws first. The whitelist here
+    /// reproduces the reachable behavior.
+    ///
+    /// # Divergences
+    ///
+    /// `inPlace` and `SITK_MAX_DIMENSION` as in [`Image::to_vector_image`].
+    /// Upstream additionally throws for a vector image *at* `SITK_MAX_DIMENSION`
+    /// (its factory covers vectors only up to `SITK_MAX_DIMENSION - 1`); with no
+    /// dimension ceiling here, that rejection has nothing to key on.
+    pub fn to_scalar_image(&self) -> Result<Image> {
+        if self.pixel_id.is_scalar() {
+            return Ok(self.clone());
+        }
+        let dim = self.dimension();
+        if !self.pixel_id.is_vector() {
+            return Err(Error::CannotConvertToScalarImage {
+                pixel_id: self.pixel_id,
+                dimension: dim,
+            });
+        }
+
+        let out_dim = dim + 1;
+        let mut size = Vec::with_capacity(out_dim);
+        size.push(self.number_of_components_per_pixel());
+        size.extend_from_slice(&self.size);
+
+        let mut spacing = Vec::with_capacity(out_dim);
+        spacing.push(1.0);
+        spacing.extend_from_slice(&self.spacing);
+
+        let mut origin = Vec::with_capacity(out_dim);
+        origin.push(0.0);
+        origin.extend_from_slice(&self.origin);
+
+        let mut direction = matrix::identity(out_dim);
+        for i in 0..dim {
+            for j in 0..dim {
+                direction[(i + 1) * out_dim + (j + 1)] = self.direction[i * dim + j];
+            }
+        }
+        Self::assemble(
+            self.buffer.clone(),
+            self.pixel_id.component_id(),
+            1,
+            size,
+            spacing,
+            origin,
+            direction,
+        )
+    }
+
+    /// The scalar pixel at `index` — SimpleITK's `GetPixelAsInt8` and the nine
+    /// other `GetPixelAs*` scalar overloads (sitkImage.h:494-513,
+    /// sitkPimpleImageBase.hxx:452-501).
+    ///
+    /// `T` must be the image's pixel type **exactly**: upstream's
+    /// `InternalGetPixelAs<TReturn>` takes its `GetPixel` branch only under
+    /// `IsBasic<ImageType>::Value && std::is_same<ValuePixelType, TReturn>`
+    /// (sitkPimpleImageBase.hxx:805-811) and otherwise throws "The image is of
+    /// type: ... but the GetPixel access method does not match the type!". There
+    /// is no conversion — `GetPixelAsInt8` on a `sitkFloat32` image throws.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::RequiresScalarPixelType`] on a vector or complex image. The
+    ///   guard is [`Image::scalar_slice`]'s whitelist on [`PixelId::is_scalar`],
+    ///   so a pixel category added later is rejected by default. A complex image
+    ///   is rejected here as upstream rejects it — `ValuePixelType` is
+    ///   `std::complex<float>`, never `float` — even though `IsBasic` holds for
+    ///   it; [`Image::get_complex`] is its accessor.
+    /// - [`Error::PixelTypeMismatch`] when `T` is not the image's pixel type.
+    /// - [`Error::IndexDimensionMismatch`] / [`Error::IndexOutOfBounds`] on a bad
+    ///   `index`, checked after the pixel type, as upstream checks it.
+    pub fn get_pixel_as<T: Scalar>(&self, index: &[usize]) -> Result<T> {
+        let pixels = self.scalar_slice::<T>()?;
+        let offset = self.checked_pixel_start(index)?;
+        Ok(pixels[offset])
+    }
+
+    /// Overwrite the scalar pixel at `index` — SimpleITK's `SetPixelAsInt8` and
+    /// the nine other scalar overloads (sitkImage.h:557-576,
+    /// sitkPimpleImageBase.hxx:674-720).
+    ///
+    /// Errors exactly as [`Image::get_pixel_as`]; `InternalSetPixelAs`
+    /// (sitkPimpleImageBase.hxx:855-865) applies the same `is_same` gate and
+    /// throws "... does not match the type of SetPixel method called."
+    pub fn set_pixel_as<T: Scalar>(&mut self, index: &[usize], value: T) -> Result<()> {
+        self.scalar_slice::<T>()?;
+        let offset = self.checked_pixel_start(index)?;
+        self.scalar_vec_mut::<T>()?[offset] = value;
+        Ok(())
+    }
+}
+
+impl Image {
+    /// SimpleITK's `Image::DefaultImageCoordinateTolerance` (sitkImage.h:694),
+    /// the default `coordinateTolerance` of [`Image::is_same_image_geometry_as`].
+    pub const DEFAULT_IMAGE_COORDINATE_TOLERANCE: f64 = 1e-6;
+
+    /// SimpleITK's `Image::DefaultImageDirectionTolerance` (sitkImage.h:695),
+    /// the default `directionTolerance` of [`Image::is_same_image_geometry_as`].
+    pub const DEFAULT_IMAGE_DIRECTION_TOLERANCE: f64 = 1e-6;
+}
+
+/// A human-readable dump of the image's pixel type, geometry and meta-data —
+/// the role SimpleITK's `ToString()` (sitkImage.h:435, sitkImage.cxx:226-231)
+/// plays, reachable as `image.to_string()`.
+///
+/// # Divergence
+///
+/// Upstream's `ToString()` is `itk::Image::Print(os)`, i.e. the `PrintSelf`
+/// chain `Object` -> `DataObject` -> `ImageBase` -> `Image`
+/// (itkImageBase.hxx:501-531, itkImage.hxx:146-155, itkDataObject.cxx:258-283).
+/// That text is not reproducible outside ITK's object system, and would not be
+/// worth reproducing if it were: it embeds the RTTI type name, the reference
+/// count, the pipeline and update `MTime`s, a `RealTimeStamp`, the observer
+/// list, and the raw pointer addresses of the source `ProcessObject` and the
+/// `PixelContainer`. The fields below are the subset that names the image
+/// rather than the process that made it, ordered as `ImageBase::PrintSelf`
+/// orders them.
+impl fmt::Display for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Image ({})", self.pixel_id_type_as_string())?;
+        writeln!(f, "  Dimension: {}", self.dimension())?;
+        writeln!(
+            f,
+            "  NumberOfComponentsPerPixel: {}",
+            self.number_of_components_per_pixel()
+        )?;
+        writeln!(f, "  LargestPossibleRegion:")?;
+        writeln!(f, "    Index: {:?}", vec![0usize; self.dimension()])?;
+        writeln!(f, "    Size: {:?}", self.size)?;
+        writeln!(f, "  Spacing: {:?}", self.spacing)?;
+        writeln!(f, "  Origin: {:?}", self.origin)?;
+        writeln!(f, "  Direction:")?;
+        for row in self.direction.chunks(self.dimension()) {
+            writeln!(f, "    {row:?}")?;
+        }
+        writeln!(f, "  MetaDataDictionary:")?;
+        if self.metadata.is_empty() {
+            writeln!(f, "    (empty)")?;
+        } else {
+            for (key, value) in &self.metadata {
+                writeln!(f, "    {key}: {value}")?;
+            }
+        }
+        Ok(())
     }
 }
 
