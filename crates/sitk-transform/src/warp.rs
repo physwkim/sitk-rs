@@ -45,10 +45,14 @@ use crate::resample::{InterpolatedImage, Interpolator, build_output, increment};
 /// [`set_output_parameters_from_image`](Self::set_output_parameters_from_image)
 /// is how a caller opts into a reference image's geometry.
 ///
-/// ITK keys "size unset" on `m_OutputSize[0] == 0`
-/// (itkWarpImageFilter.hxx:428) — only the *first* axis — so an explicit
-/// `[0, 5, 5]` also falls back to the field's whole size. That quirk is
-/// reproduced.
+/// ITK keys "size unset" on `m_OutputSize[0] == 0` (itkWarpImageFilter.hxx:428)
+/// — only the *first* axis — so an explicit `[0, 5, 5]` silently discards the
+/// `5`s and falls back to the field's whole size. This port instead keys
+/// "unset" on [`set_output_size`](Self::set_output_size) never having been
+/// called (`Option::None`): an explicitly-set size is honored verbatim, and a
+/// size with a genuinely zero-extent axis is rejected with
+/// [`TransformError::InvalidOutputSize`] rather than silently ignored
+/// (ledger §2.37).
 ///
 /// # Out-of-domain points
 ///
@@ -179,11 +183,15 @@ impl WarpImageFilter {
             return Err(TransformError::InvalidDisplacementFieldDomain);
         }
 
-        // `m_OutputSize[0] == 0` — the first axis alone — means "inherit the
-        // field's LargestPossibleRegion" (itkWarpImageFilter.hxx:426-436).
+        // `None` is this port's "size unset, inherit the field's" state. Upstream
+        // instead keys "unset" on `m_OutputSize[0] == 0` — the first axis alone
+        // (itkWarpImageFilter.hxx:426-436) — so an explicit `[0, 5, 5]` silently
+        // discards the `5`s. Here an explicitly-set size is honored verbatim, and
+        // a genuinely zero-extent axis is rejected below rather than ignored
+        // (ledger §2.37).
         let out_size = match &self.output_size {
-            Some(s) if s.first() != Some(&0) => s.clone(),
-            _ => field.size().to_vec(),
+            Some(s) => s.clone(),
+            None => field.size().to_vec(),
         };
         let out_spacing = self
             .output_spacing
@@ -201,6 +209,9 @@ impl WarpImageFilter {
             || out_direction.len() != dim * dim
         {
             return Err(TransformError::DimensionMismatch);
+        }
+        if out_size.contains(&0) {
+            return Err(TransformError::InvalidOutputSize(out_size));
         }
 
         let out_index_to_phys = index_to_physical_matrix(&out_direction, &out_spacing, dim);
@@ -521,15 +532,43 @@ mod tests {
         );
     }
 
-    /// ITK keys "unset" on `m_OutputSize[0] == 0` alone, so `[0, 5]` also falls
-    /// back to the field's size — the `5` is silently discarded.
+    /// Fix (§2.37): ITK keys "unset" on `m_OutputSize[0] == 0` alone, so an
+    /// explicit `[0, 5]` silently discards the `5` and falls back to the field's
+    /// size. This port honors an explicitly-set size and rejects a zero-extent
+    /// axis with a typed error instead of silently ignoring it.
     #[test]
-    fn a_zero_first_axis_output_size_falls_back_to_the_field_size() {
+    fn a_zero_extent_output_size_is_rejected_not_silently_discarded() {
+        let img = ramp();
+        let field = constant_field(&[2, 3], &[0.0, 0.0]);
+
+        // Zero on the first axis: previously fell back to the field's [2, 3].
+        let mut f = WarpImageFilter::new();
+        f.set_output_size(vec![0, 5]);
+        assert_eq!(
+            f.execute(&img, &field),
+            Err(TransformError::InvalidOutputSize(vec![0, 5]))
+        );
+
+        // Zero on a non-first axis is rejected too (upstream would have honored
+        // the [4, 0] and produced a zero-pixel image or read out of bounds).
+        let mut f = WarpImageFilter::new();
+        f.set_output_size(vec![4, 0]);
+        assert_eq!(
+            f.execute(&img, &field),
+            Err(TransformError::InvalidOutputSize(vec![4, 0]))
+        );
+    }
+
+    /// The other half of the §2.37 fix: an explicit non-zero size that differs
+    /// from the field's is honored (it was already, but this pins that a size
+    /// whose *first* axis is non-zero is not affected by the sentinel removal).
+    #[test]
+    fn an_explicit_output_size_is_honored() {
         let img = ramp();
         let field = constant_field(&[2, 3], &[0.0, 0.0]);
         let mut f = WarpImageFilter::new();
-        f.set_output_size(vec![0, 5]);
-        assert_eq!(f.execute(&img, &field).unwrap().size(), &[2, 3]);
+        f.set_output_size(vec![3, 2]);
+        assert_eq!(f.execute(&img, &field).unwrap().size(), &[3, 2]);
     }
 
     /// An explicit output size larger than the field: the field's geometry

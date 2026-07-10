@@ -113,7 +113,7 @@
 //! guard as a defect, not a design. Pinned by
 //! `a_border_seed_propagates_along_the_border_normal_axis`.
 //!
-//! ## Upstream defect: `NoHandles` is `Strict`
+//! ## `NoHandles`: honored here, inert upstream (§2.50)
 //!
 //! `CheckTopology` (`.hxx:306-391`) computes two predicates and dispatches:
 //!
@@ -128,22 +128,35 @@
 //!   distinct components merge, which is allowed, and the labels are unified
 //!   (`.hxx:371-380`).
 //!
-//! `m_ConnectedComponentImage` is seeded **only** from `m_AlivePoints`
-//! (`.hxx:449-452`) and is never written again as the front advances — the one
-//! remaining write is the label-unification loop above, which is downstream of
-//! the comparison. `FastMarchingBaseImageFilter.yaml` declares no `AlivePoints`
-//! member, so through SimpleITK the image is allocated zero-initialized
-//! (`.hxx:418-423`), passed through `ConnectedComponentImageFilter` +
-//! `RelabelComponentImageFilter` on an all-background input (`.hxx:489-507`),
-//! and stays identically zero for the whole march.
+//! Upstream that second branch is dead: `m_ConnectedComponentImage` is seeded
+//! **only** from `m_AlivePoints` (`.hxx:449-452`) and is never written again as
+//! the front advances — the one remaining write is the label-unification loop
+//! above, which is downstream of the comparison. `FastMarchingBaseImageFilter.yaml`
+//! declares no `AlivePoints` member, so through SimpleITK the image is allocated
+//! zero-initialized (`.hxx:418-423`), passed through a
+//! `ConnectedComponentImageFilter` and `RelabelComponentImageFilter` on an
+//! all-background input (`.hxx:489-507`), and stays identically zero for the
+//! whole march. Therefore
+//! `ItC.GetNext(d) == ItC.GetPrevious(d)` is always `0 == 0`,
+//! `doesChangeCreateHandle` is unconditionally true, and upstream's `NoHandles`
+//! rejects exactly the nodes `Strict` rejects — the mode SimpleITK exposes is a
+//! silent no-op relative to `Strict`.
 //!
-//! Therefore `ItC.GetNext(d) == ItC.GetPrevious(d)` is always `0 == 0`,
-//! `doesChangeCreateHandle` is unconditionally true, and `NoHandles` rejects
-//! exactly the nodes `Strict` rejects. This port implements the two modes with
-//! the one predicate `wellComposednessViolation || strictTopologyViolation`
-//! rather than transcribing an unreachable branch, and pins the equality with
-//! `no_handles_matches_strict_on_a_merge` and
-//! `no_handles_matches_strict_in_3d`.
+//! Per the port's honor-or-reject policy this crate makes `NoHandles` **live**:
+//! it maintains the connected-component labels from the advancing front instead
+//! of from the (never-set) `m_AlivePoints`. [`Marcher::components`] is a
+//! union-find over pixel indices; each node that goes alive is unioned with its
+//! alive face neighbors ([`Marcher::join_alive_neighbors`]), so at a junction the
+//! two facing neighbors carry the real component labels the upstream algorithm
+//! meant to compare. `NoHandles` then rejects a strict violation only when those
+//! labels are equal ([`Marcher::change_creates_handle`]) — a same-component
+//! self-closure is a handle and is rejected, while two distinct fronts are
+//! allowed to merge. Pinned by `no_handles_allows_a_distinct_component_merge`
+//! (distinct fronts merge, unlike `Strict`),
+//! `no_handles_rejects_a_same_component_closure` (a front wrapping a barrier and
+//! closing on itself is rejected), and `no_handles_matches_strict_in_3d` /
+//! `no_handles_matches_strict_on_a_diagonal_contact` (a well-composedness
+//! violation is rejected by both modes).
 //!
 //! ## Topology: what the two predicates test
 //!
@@ -266,8 +279,11 @@ const FLOAT_ALMOST_EQUAL_ZERO: f64 = 0.1 * f64::EPSILON;
 
 /// `FastMarchingTraitsEnums::TopologyCheck` (`itkFastMarchingBase.h:43-48`).
 ///
-/// `NoHandles` and `Strict` behave identically through this API; see the
-/// module doc's "`NoHandles` is `Strict`".
+/// Unlike upstream — where `NoHandles` silently collapses onto `Strict` because
+/// its component image is never seeded — this port honors `NoHandles` as a
+/// distinct mode: it lets two *distinct* fronts merge but rejects a
+/// same-component self-closure. See the module doc's "`NoHandles`: honored here,
+/// inert upstream".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TopologyCheck {
     /// No constraint: every popped node is accepted.
@@ -532,6 +548,7 @@ pub fn fast_marching_base(
         output: vec![LARGE_VALUE; n],
         labels: vec![Label::Far; n],
         heap: BinaryHeap::new(),
+        components: (0..n).collect(),
     };
 
     for (i, point) in trial_points.iter().enumerate() {
@@ -569,6 +586,15 @@ struct Marcher {
     output: Vec<f64>,
     labels: Vec<Label>,
     heap: BinaryHeap<TrialNode>,
+    /// `NoHandles` only: a union-find over pixel indices giving the connected
+    /// component each *alive* pixel belongs to. `m_ConnectedComponentImage` in
+    /// ITK, but seeded and maintained from the advancing front (see the module
+    /// doc's "`NoHandles` is `Strict`" — upstream seeds it only from
+    /// `m_AlivePoints`, which SimpleITK never sets, collapsing the mode; this
+    /// port seeds it from the front so the two facing neighbors of a junction
+    /// carry real component labels). Only touched when `topology_check ==
+    /// NoHandles`.
+    components: Vec<usize>,
 }
 
 impl Marcher {
@@ -606,6 +632,11 @@ impl Marcher {
             }
             if self.check_topology(node.index) {
                 self.labels[node.index] = Label::Alive;
+                if self.topology_check == TopologyCheck::NoHandles {
+                    // The newly-alive node joins the component(s) of its alive
+                    // face neighbors, so later junctions compare real labels.
+                    self.join_alive_neighbors(node.index);
+                }
                 self.update_neighbors(node.index)?;
             }
         }
@@ -737,8 +768,16 @@ impl Marcher {
         self.label_at(coords, &offset[..self.dim()]) == Label::Alive
     }
 
-    /// `CheckTopology` (`itkFastMarchingImageFilterBase.hxx:306-391`), with
-    /// `NoHandles` folded onto `Strict`; see the module doc.
+    /// `CheckTopology` (`itkFastMarchingImageFilterBase.hxx:306-391`).
+    ///
+    /// `Strict` rejects on either a well-composedness or a strict-topology
+    /// violation. `NoHandles` rejects a well-composedness violation, but on a
+    /// strict-topology violation only rejects when the two facing alive fronts
+    /// belong to the **same** connected component (joining them would create a
+    /// handle); two *distinct* fronts are allowed to merge. Upstream's handle
+    /// test is inert through SimpleITK (the component image is never seeded from
+    /// the front), collapsing `NoHandles` onto `Strict`; this port maintains the
+    /// component labels from the advancing front so the mode is live (§2.50).
     fn check_topology(&mut self, index: usize) -> bool {
         if self.topology_check == TopologyCheck::Nothing {
             return true;
@@ -753,12 +792,91 @@ impl Marcher {
         let well_composedness_violation = !self.is_change_well_composed(&coords);
         let strict_topology_violation = self.violates_strict_topology(&coords);
 
-        if well_composedness_violation || strict_topology_violation {
+        let reject = match self.topology_check {
+            TopologyCheck::Nothing => false,
+            TopologyCheck::Strict => well_composedness_violation || strict_topology_violation,
+            TopologyCheck::NoHandles => {
+                well_composedness_violation
+                    || (strict_topology_violation && self.change_creates_handle(&coords))
+            }
+        };
+
+        if reject {
             self.output[index] = LARGE_VALUE; // `m_TopologyValue`
             self.labels[index] = Label::Topology;
             return false;
         }
         true
+    }
+
+    /// The `NoHandles` handle test (`itkFastMarchingImageFilterBase.hxx:346-369`):
+    /// on the first axis whose two face neighbors are both alive, the change
+    /// creates a handle iff those neighbors are in the same connected component.
+    /// Distinct components are allowed to merge (the merge happens when the node
+    /// goes alive and [`join_alive_neighbors`](Self::join_alive_neighbors)
+    /// unifies them, matching upstream's relabel loop).
+    fn change_creates_handle(&mut self, coords: &[usize]) -> bool {
+        for d in 0..self.dim() {
+            if self.is_alive_along(coords, d, 1) && self.is_alive_along(coords, d, -1) {
+                let next = self.index_along(coords, d, 1);
+                let prev = self.index_along(coords, d, -1);
+                return self.comp_find(next) == self.comp_find(prev);
+            }
+        }
+        false
+    }
+
+    /// Union the newly-alive `index` with each of its alive face neighbors, so
+    /// its connected component tracks the front.
+    fn join_alive_neighbors(&mut self, index: usize) {
+        let coords = self.coords_of(index);
+        for d in 0..self.dim() {
+            for s in [-1i64, 1] {
+                if self.is_alive_along(&coords, d, s) {
+                    let ni = self.index_along(&coords, d, s);
+                    self.comp_union(index, ni);
+                }
+            }
+        }
+    }
+
+    /// The in-image pixel index at `coords` stepped by `step` along `axis`,
+    /// clamped like [`label_at`](Self::label_at)'s zero-flux neighbor read.
+    fn index_along(&self, coords: &[usize], axis: usize, step: i64) -> usize {
+        (0..self.dim())
+            .map(|d| {
+                let c = if d == axis {
+                    (coords[d] as i64 + step).clamp(0, self.size[d] as i64 - 1)
+                } else {
+                    coords[d] as i64
+                };
+                c as usize * self.strides[d]
+            })
+            .sum()
+    }
+
+    /// Union-find root of pixel `x`'s connected component, with path
+    /// compression.
+    fn comp_find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.components[root] != root {
+            root = self.components[root];
+        }
+        let mut cur = x;
+        while cur != root {
+            let next = self.components[cur];
+            self.components[cur] = root;
+            cur = next;
+        }
+        root
+    }
+
+    fn comp_union(&mut self, a: usize, b: usize) {
+        let ra = self.comp_find(a);
+        let rb = self.comp_find(b);
+        if ra != rb {
+            self.components[ra] = rb;
+        }
     }
 
     /// `DoesVoxelChangeViolateStrictTopology`
@@ -1150,12 +1268,59 @@ mod tests {
         assert_eq!(out[5 + 3], 0.0);
     }
 
+    /// The two seeds `(1, 1)` and `(3, 1)` grow as *distinct* connected
+    /// components, so joining them at `(2, 1)` cannot create a handle. Unlike
+    /// `Strict`, `NoHandles` accepts the merge (§2.50): the handle test compares
+    /// the two facing alive neighbors' component labels, finds them different,
+    /// and allows the junction — exactly the value `Nothing` produces.
     #[test]
-    fn no_handles_matches_strict_on_a_merge() {
-        assert_eq!(
-            merging_fronts(TopologyCheck::NoHandles),
-            merging_fronts(TopologyCheck::Strict)
-        );
+    fn no_handles_allows_a_distinct_component_merge() {
+        let out = merging_fronts(TopologyCheck::NoHandles);
+        assert_eq!(out[5 + 2], 1.0);
+        // Strict rejects the very same junction.
+        assert_eq!(merging_fronts(TopologyCheck::Strict)[5 + 2], LARGE_VALUE);
+    }
+
+    /// A single front routed around a zero-speed barrier at `(2, 2)` in a 5×5
+    /// grid: the two arms of the *same* component wrap the hole and meet head-on
+    /// at `(2, 3)`. Its `x`-faces `(1, 3)` and `(3, 3)` are both alive and share
+    /// one component, so closing there would create a handle — `NoHandles`
+    /// rejects it, while `Nothing` (which does no topology test at all) accepts.
+    ///
+    /// The two arms reach `(1, 3)` and `(3, 3)` at time `3.0`, so `(2, 3)`'s
+    /// upwind arrival is `3.0 + 1.0 = 4.0`. `stopping_value = 4.05` lets `(2, 3)`
+    /// be judged (its `4.0 < 4.05`) then halts before any later node — the next
+    /// front pixel is `(2, 4)` at `≈5.0` — can overwrite the rejection.
+    fn barrier_closure(topology_check: TopologyCheck) -> Vec<f64> {
+        // Uniform speed 1.0 except a zero-speed barrier at (2, 2).
+        let mut pixels = vec![1.0f64; 25];
+        pixels[2 * 5 + 2] = 0.0;
+        let image = Image::from_vec(&[5, 5], pixels).unwrap();
+        fast_marching_base(
+            &image,
+            &[vec![2, 1]],
+            &[],
+            &FastMarchingBaseSettings {
+                stopping_value: 4.05,
+                topology_check,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .to_f64_vec()
+        .unwrap()
+    }
+
+    #[test]
+    fn nothing_lets_a_front_close_around_a_barrier() {
+        let out = barrier_closure(TopologyCheck::Nothing);
+        assert!(out[3 * 5 + 2] < LARGE_VALUE, "{}", out[3 * 5 + 2]);
+    }
+
+    #[test]
+    fn no_handles_rejects_a_same_component_closure() {
+        let out = barrier_closure(TopologyCheck::NoHandles);
+        assert_eq!(out[3 * 5 + 2], LARGE_VALUE);
     }
 
     /// `(2, 2)` touches the alive `(1, 1)` and `(3, 3)` only through their
@@ -1265,6 +1430,7 @@ mod tests {
             output: vec![LARGE_VALUE; n],
             labels,
             heap: BinaryHeap::new(),
+            components: (0..n).collect(),
         }
     }
 

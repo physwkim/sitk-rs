@@ -19,24 +19,32 @@
 //! flat `1e-6`). This crate has no vector/multi-component pixel type, so the
 //! component check is always vacuously satisfied and isn't ported as code.
 //!
-//! **Mismatched input sizes are not checked directly.** `GenerateOutputInformation`
-//! reads the output's size only from the first input; every other input is
-//! read through `GenerateInputRequestedRegion`, which copies the *output*
-//! region (sized from the first input, truncated to the input dimension by
+//! **Mismatched input sizes (§2.33 — fixed here).** Upstream never checks input
+//! sizes directly. `GenerateOutputInformation` reads the output's size only from
+//! the first input; every other input is read through
+//! `GenerateInputRequestedRegion`, which copies the *output* region (sized from
+//! the first input, truncated to the input dimension by
 //! `CallCopyOutputRegionToInputRegion`) onto *every* indexed input unchanged
-//! (`itkJoinSeriesImageFilter.hxx:180-218`). So:
+//! (`itkJoinSeriesImageFilter.hxx:180-218`). That produced an undocumented,
+//! *asymmetric* handling of a size mismatch:
 //! - an input **smaller** than the first along any axis gets a requested
 //!   region that doesn't fit inside its own `LargestPossibleRegion`, which
 //!   ITK's pipeline rejects with `InvalidRequestedRegionError` before
 //!   `GenerateData` ever runs;
 //! - an input **larger** than the first is *not* rejected: only its
-//!   `[0, primary_size)` corner sub-region is copied (`DynamicThreadedGenerateData`'s
+//!   `[0, primary_size)` corner sub-region is copied
+//!   (`DynamicThreadedGenerateData`'s
 //!   `ImageAlgorithm::Copy(GetInput(idx), output, inputRegion, outputRegion)`,
-//!   where `inputRegion` is the same first-input-sized region for every
-//!   input), and the rest of that larger input is silently ignored.
+//!   where `inputRegion` is the same first-input-sized region for every input),
+//!   and the rest of that larger input is **silently discarded**.
 //!
-//! This port reproduces both halves of that asymmetry: [`FilterError::InputSmallerThanPrimary`]
-//! for the first case, and a plain corner-crop (no error) for the second.
+//! The class doc's "all the inputs should have the same information" makes
+//! equal sizes a precondition, and there is no single rectangular output that
+//! can hold differently-sized slabs without cropping or padding. So rather than
+//! reproduce the silent data loss, this port enforces the precondition: any
+//! input whose size differs from the primary's — larger or smaller — is
+//! rejected with [`FilterError::InputSizeMismatch`]. Equal-sized inputs (the
+//! only well-formed case) join exactly as before.
 //!
 //! Empty input list: `VerifyInputInformation` reads `this->GetInput()` (the
 //! primary/first indexed input) and throws "Input not set as expected!" if
@@ -56,15 +64,6 @@ use sitk_core::{Image, Scalar, dispatch_scalar};
 /// which `JoinSeriesImageFilter` overrides.
 const COORDINATE_TOLERANCE: f64 = 1e-6;
 const DIRECTION_TOLERANCE: f64 = 1e-6;
-
-/// First-axis-fastest strides for a size vector.
-fn strides(size: &[usize]) -> Vec<usize> {
-    let mut s = vec![1usize; size.len()];
-    for d in 1..size.len() {
-        s[d] = s[d - 1] * size[d - 1];
-    }
-    s
-}
 
 /// `ImageBase::IsCongruentImageGeometry` (`itkImageBase.hxx:391-406`): origin
 /// and spacing compared with a tolerance scaled by `primary`'s first-axis
@@ -132,8 +131,8 @@ pub fn join_series(images: &[&Image], origin: f64, spacing: f64) -> Result<Image
     for (offset, other) in rest.iter().enumerate() {
         let index = offset + 1;
         let other_size = other.size();
-        if (0..dim).any(|d| other_size[d] < primary_size[d]) {
-            return Err(FilterError::InputSmallerThanPrimary {
+        if other_size != primary_size.as_slice() {
+            return Err(FilterError::InputSizeMismatch {
                 index,
                 size: other_size.to_vec(),
                 primary_size: primary_size.clone(),
@@ -168,25 +167,16 @@ pub fn join_series(images: &[&Image], origin: f64, spacing: f64) -> Result<Image
         }
     }
 
-    // Copy each image's `[0, primary_size)` corner sub-region into its slab
-    // along the new axis. The new axis is the output's slowest-varying, so
-    // slab `k` occupies the flat range `[k * slab_len, (k + 1) * slab_len)`.
+    // Every input now has exactly the primary's size (any mismatch was
+    // rejected above), so its buffer is one slab of the output, laid out
+    // identically. The new axis is the output's slowest-varying, so slab `k`
+    // occupies the flat range `[k * slab_len, (k + 1) * slab_len)`.
     let slab_len: usize = primary_size.iter().product();
     let mut out_vals = vec![0.0f64; slab_len * images.len()];
     for (slab_index, img) in images.iter().enumerate() {
         let img_vals = img.to_f64_vec()?;
-        let img_strides = strides(img.size());
         let out_offset = slab_index * slab_len;
-        for flat in 0..slab_len {
-            let mut src_flat = 0usize;
-            let mut rem = flat;
-            for d in 0..dim {
-                let coord = rem % primary_size[d];
-                rem /= primary_size[d];
-                src_flat += coord * img_strides[d];
-            }
-            out_vals[out_offset + flat] = img_vals[src_flat];
-        }
+        out_vals[out_offset..out_offset + slab_len].copy_from_slice(&img_vals);
     }
 
     let mut out_image = dispatch_scalar!(pixel_id, build_image, &out_size, &out_vals)?;
@@ -344,15 +334,16 @@ mod tests {
         );
     }
 
-    /// A later input smaller than the primary along any axis cannot supply
-    /// the requested corner region -- ITK's `InvalidRequestedRegionError`.
+    /// A later input smaller than the primary along any axis is rejected
+    /// (§2.33). Upstream this surfaced as ITK's `InvalidRequestedRegionError`;
+    /// this port reports it as a typed [`FilterError::InputSizeMismatch`].
     #[test]
     fn rejects_input_smaller_than_primary() {
         let a = img(&[3, 3], vec![0.0f64; 9]);
         let b = img(&[2, 3], vec![0.0f64; 6]);
         assert_eq!(
             join_series(&[&a, &b], 0.0, 1.0),
-            Err(FilterError::InputSmallerThanPrimary {
+            Err(FilterError::InputSizeMismatch {
                 index: 1,
                 size: vec![2, 3],
                 primary_size: vec![3, 3],
@@ -360,26 +351,23 @@ mod tests {
         );
     }
 
-    /// A later input *larger* than the primary is not an error: only its
-    /// `[0, primary_size)` corner is copied, and the rest is dropped
-    /// silently, exactly as `itkJoinSeriesImageFilter.hxx` does.
+    /// A later input *larger* than the primary is rejected too (§2.33). Upstream
+    /// silently corner-cropped it to `[0, primary_size)` and discarded the rest;
+    /// this port refuses the size mismatch rather than lose data.
     #[test]
-    fn larger_input_is_corner_cropped_not_rejected() {
+    fn rejects_input_larger_than_primary() {
         let a = img(&[2, 2], vec![1.0f64, 2.0, 3.0, 4.0]);
-        // 3x3, row-major-ish values 10..90 in this crate's axis-0-fastest
-        // layout: column-major-looking when printed, but linear_index([x,y])
-        // = x + 3*y.
         let b = img(
             &[3, 3],
             vec![10.0f64, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0],
         );
-        let out = join_series(&[&a, &b], 0.0, 1.0).unwrap();
-        assert_eq!(out.size(), &[2, 2, 2]);
-        // Slab 1 is b's top-left 2x2 corner: indices (0,0)=10, (1,0)=20,
-        // (0,1)=40, (1,1)=50.
         assert_eq!(
-            out.to_f64_vec().unwrap(),
-            vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 40.0, 50.0]
+            join_series(&[&a, &b], 0.0, 1.0),
+            Err(FilterError::InputSizeMismatch {
+                index: 1,
+                size: vec![3, 3],
+                primary_size: vec![2, 2],
+            })
         );
     }
 }

@@ -100,6 +100,19 @@ pub enum TransformError {
     #[error("transform has no inverse: {0}")]
     NoInverse(&'static str),
 
+    /// [`WarpImageFilter::set_output_size`] was given a size with a zero extent
+    /// on some axis. Upstream `WarpImageFilter` treats `m_OutputSize[0] == 0` as
+    /// the "size unset, inherit the field's" sentinel — on the *first* axis
+    /// alone — so an explicit `[0, 5, 5]` silently discards the `5`s
+    /// (itkWarpImageFilter.hxx:428). This port keys "unset" on the `Option`
+    /// being `None` instead, so an explicitly-set size is honored; a size that
+    /// actually has a zero-pixel axis is a malformed request and is rejected
+    /// here rather than silently ignored (ledger §2.37).
+    ///
+    /// [`WarpImageFilter::set_output_size`]: crate::WarpImageFilter::set_output_size
+    #[error("invalid output size {0:?}: every axis must have a non-zero extent")]
+    InvalidOutputSize(Vec<usize>),
+
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] sitk_core::Error),

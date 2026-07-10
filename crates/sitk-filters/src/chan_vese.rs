@@ -118,20 +118,25 @@
 //!   iterations) and essentially never drops below the `0.02` default
 //!   `maximum_rms_error`. The convergence criterion is effectively inert.
 //!
-//! * **`use_image_spacing` only reaches the distance map.**
+//! * **`use_image_spacing` reaches the PDE here (§2.30 — fixed).** Upstream the
+//!   flag only reached the distance map:
 //!   `MultiphaseFiniteDifferenceImageFilter::GenerateData` uses it to build
 //!   `coeffs` for `SetScaleCoefficients`, but no class in the Chan–Vese chain
-//!   ever reads `m_ScaleCoefficients` or `ComputeNeighborhoodScales()`.
+//!   ever reads `m_ScaleCoefficients` or `ComputeNeighborhoodScales()`, and
 //!   `ComputeHessian` divides by `m_InvSpacing`, which
-//!   `RegionBasedLevelSetFunction::SetFeatureImage` sets unconditionally from the
-//!   **feature** image's spacing. So the derivatives are always in physical
-//!   units, taken from the feature image, and the flag's only live use is
+//!   `RegionBasedLevelSetFunction::SetFeatureImage` sets *unconditionally* from
+//!   the feature image's spacing. So upstream the PDE's derivatives were always
+//!   in physical units regardless of the flag, whose only live use was
 //!   `maurer->SetUseImageSpacing(m_UseImageSpacing)`
-//!   (itkMultiphaseDenseFiniteDifferenceImageFilter.hxx:227). The distance map's
-//!   own spacing comes from the *level set* image (the threshold filter
-//!   `CopyInformation`s from it), so a level set and a feature image with
-//!   different spacings drive the two halves of one iteration with different
-//!   metrics.
+//!   (itkMultiphaseDenseFiniteDifferenceImageFilter.hxx:227) — leaving
+//!   `use_image_spacing = false` a silent no-op for the PDE. This port keys the
+//!   Hessian's inverse spacing ([`pde_inv_spacing`]) on the flag too: `true`
+//!   keeps the feature image's physical spacing (as upstream), `false` uses unit
+//!   (pixel-unit) spacing, so the flag's documented "use image spacing" meaning
+//!   holds for the whole iteration. The distance map's own spacing still comes
+//!   from the *level set* image (the threshold filter `CopyInformation`s from
+//!   it); for the co-registered inputs SimpleITK produces — feature ROI-cropped
+//!   to the level set's footprint — the two halves share one metric.
 //!
 //! * **The advection term is dead.** `m_AdvectionWeight` is zero-initialised,
 //!   nothing in the Chan–Vese chain sets it, and SimpleITK exposes no setter, so
@@ -241,8 +246,10 @@ pub struct ChanAndVeseParams {
     /// Which Heaviside variant to use. Default
     /// [`HeavisideStepFunction::AtanRegularized`].
     pub heaviside_step_function: HeavisideStepFunction,
-    /// Default `true`. Only reaches the per-iteration signed distance map; the
-    /// PDE's derivatives always use the feature image's spacing.
+    /// Default `true`. When set, the PDE's derivatives and the per-iteration
+    /// signed distance map both use physical spacing; when clear, both use
+    /// pixel-unit spacing (§2.30 — upstream the flag reached only the distance
+    /// map, never the PDE).
     pub use_image_spacing: bool,
 }
 
@@ -447,6 +454,21 @@ fn strides(size: &[usize]) -> Vec<usize> {
         s[d] = s[d - 1] * size[d - 1];
     }
     s
+}
+
+/// The `m_InvSpacing` the PDE's `ComputeHessian` divides by, honoring
+/// `use_image_spacing` (§2.30). When the flag is set the derivatives are in
+/// physical units, taken (as `SetFeatureImage` does) from the feature image;
+/// when it is clear they are in pixel units — matching the flag's documented
+/// "use image spacing" meaning and the distance map, which already keys its own
+/// `SetUseImageSpacing` on the same flag. Upstream `ComputeHessian` reads
+/// `m_InvSpacing` unconditionally, so the flag never reached the PDE there.
+fn pde_inv_spacing(feature_spacing: &[f64], use_image_spacing: bool) -> Vec<f64> {
+    if use_image_spacing {
+        feature_spacing.iter().map(|s| 1.0 / s).collect()
+    } else {
+        vec![1.0; feature_spacing.len()]
+    }
 }
 
 /// `RegionBasedLevelSetFunction::ComputeCurvature` (hxx:161-190).
@@ -704,8 +726,7 @@ pub fn scalar_chan_and_vese_dense_level_set(
     let mut phi = initial_level_set.to_f64_vec()?;
     let feature = feature_image.to_f64_vec()?;
 
-    // SetFeatureImage() takes m_InvSpacing from the *feature* image, always.
-    let inv_spacing: Vec<f64> = feature_image.spacing().iter().map(|s| 1.0 / s).collect();
+    let inv_spacing = pde_inv_spacing(feature_image.spacing(), params.use_image_spacing);
 
     let mut heaviside = vec![0.0; n];
     let mut constants = initialize_iteration(&phi, &feature, domain, &mut heaviside);
@@ -1036,6 +1057,29 @@ mod tests {
         let expected = (5.0 * SQRT_2 / 8.0 - 56.0) * DH;
         let got = update_at(&[1, 1], &params, &[0.5, 0.5]);
         assert!((got - expected).abs() < 1e-12, "{got} vs {expected}");
+    }
+
+    #[test]
+    fn use_image_spacing_gates_the_pde_metric() {
+        // §2.30: the flag now reaches the Hessian. On a 2x2-spaced feature
+        // image, `true` gives inv_spacing 0.5 (physical units) and `false` gives
+        // inv_spacing 1.0 (pixel units).
+        let spacing = [2.0, 2.0];
+        let on = pde_inv_spacing(&spacing, true);
+        let off = pde_inv_spacing(&spacing, false);
+        assert_eq!(on, vec![0.5, 0.5]);
+        assert_eq!(off, vec![1.0, 1.0]);
+
+        let params = ChanAndVeseParams::default();
+        // Flag off => the update is exactly the unit-spacing update.
+        let unit = update_at(&[1, 1], &params, &[1.0, 1.0]);
+        assert_eq!(update_at(&[1, 1], &params, &off), unit);
+        // Flag on => the curvature term halves (5√2/8 vs 5√2/4), so the update
+        // differs; the global term (-56·dh) is spacing-free.
+        let on_update = update_at(&[1, 1], &params, &on);
+        let expected_on = (5.0 * SQRT_2 / 8.0 - 56.0) * DH;
+        assert!((on_update - expected_on).abs() < 1e-12, "{on_update}");
+        assert!((on_update - unit).abs() > 1e-9);
     }
 
     #[test]

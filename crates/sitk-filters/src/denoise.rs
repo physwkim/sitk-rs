@@ -43,9 +43,10 @@
 //! functions with [`discrete_gaussian`] — the Gaussian construction, the
 //! truncation rule, and the Bessel recurrence seed all differ between
 //! `GaussianOperator` and `GaussianDerivativeOperator`. Three upstream
-//! behaviours (negated odd derivatives, spacing affecting only the variance,
-//! and intermediate images typed as the *output* pixel type) are documented on
-//! [`discrete_gaussian_derivative`] itself.
+//! behaviours are documented on [`discrete_gaussian_derivative`] itself; two of
+//! them — upstream's negated odd derivatives and its output-typed (truncating)
+//! intermediate images — are **corrected at source** in this port (§2.2), while
+//! spacing-affects-only-the-variance is kept as the operator's defined meaning.
 //!
 //! [`binomial_blur`] reproduces `BinomialBlurImageFilter`'s imperative
 //! forward+reverse index-walk (not a closed-form convolution) exactly:
@@ -92,7 +93,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::gradient::derivative_operator_coefficients;
-use crate::{image_from_f64, quantize_to_pixel_type};
+use crate::image_from_f64;
 use sitk_core::{
     Image, Neighborhood, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
     dispatch_scalar,
@@ -656,12 +657,14 @@ fn gaussian_derivative_gaussian_coefficients(
 /// Two sign/scale facts, both load-bearing:
 ///
 /// * The inner loop indexes the stencil *reversed* (`derivOp[Size - 1 - j]`),
-///   making this a convolution. `DiscreteGaussianDerivativeImageFilter` then
-///   *correlates* the image with the result and — unlike `DerivativeImageFilter`
-///   and `GradientImageFilter` — never calls `NeighborhoodOperator::FlipAxes`.
-///   The two flips do not cancel, so for **odd** `order` the filter's output is
-///   the negation of the usual central-difference derivative. See
-///   [`discrete_gaussian_derivative`]'s docs.
+///   making this a convolution. Upstream `DiscreteGaussianDerivativeImageFilter`
+///   then *correlates* the image with the result and — unlike
+///   `DerivativeImageFilter` and `GradientImageFilter` — never calls
+///   `NeighborhoodOperator::FlipAxes`, so the two flips do not cancel and every
+///   **odd** `order` comes out negated. This port **fixes that at the filter**:
+///   [`discrete_gaussian_derivative`] applies `FlipAxes` (reverses the taps)
+///   before correlating, so odd orders carry the conventional sign, matching the
+///   sibling filters. This function still returns the *unreversed* operator.
 /// * `norm = variance^(order/2)` under `normalize_across_scale`, then
 ///   `norm /= spacing^order`. But the operator's own `m_Spacing` is left at its
 ///   default `1.0` by `DiscreteGaussianDerivativeImageFilter::GenerateData`
@@ -741,29 +744,33 @@ fn gaussian_derivative_operator_coefficients(
 /// `DiscreteGaussianImageFilter.yaml` — `MaximumError` is *not* `dim_vec`).
 /// Output keeps `img`'s pixel type.
 ///
-/// Three upstream behaviours worth stating outright, because each will look
-/// like a bug to a caller who expects the textbook filter:
+/// Three upstream behaviours, two of which this port **corrects at source**
+/// because upstream silently loses signal or emits the wrong sign on
+/// well-formed input (doc/upstream-findings.md §2.2):
 ///
-/// 1. **Odd orders come out negated.** `order = [1, 0]` on a ramp rising in `+x`
-///    returns `-slope`, not `+slope`. `GaussianDerivativeOperator` builds its
-///    coefficients as a convolution kernel, and the filter applies them by
-///    correlation without the `FlipAxes()` call that `DerivativeImageFilter`
-///    makes. Even orders are unaffected (their stencils are symmetric).
+/// 1. **Odd orders carry the conventional sign (fixed).** `order = [1, 0]` on a
+///    ramp rising in `+x` returns `+slope`. `GaussianDerivativeOperator` builds
+///    its coefficients as a convolution kernel; upstream applies them by
+///    correlation *without* the `FlipAxes()` call that `DerivativeImageFilter`
+///    makes, so every odd order came out negated. This port applies `FlipAxes`
+///    (reverses the taps) before correlating, restoring the textbook sign. Even
+///    orders are unaffected either way (their stencils are symmetric).
 /// 2. **`use_image_spacing` rescales the variance but not the derivative.**
 ///    ITK divides `variance[d]` by `spacing[d]²` and stops there; the
 ///    `norm /= spacing^order` line inside the operator divides by the operator's
 ///    own `m_Spacing`, which `GenerateData` never sets away from `1.0`. So the
 ///    result is a derivative per *index* step, never per physical unit, and
-///    `use_image_spacing` only changes how wide the Gaussian is.
-/// 3. **Intermediate images carry the *output* pixel type, not a real type.**
-///    `GenerateData` declares `RealOutputImageType = Image<OutputPixelType, …>`
-///    — `RealOutputPixelType` is used for the operator's value type but never
-///    for the intermediate image. Each axis's result is therefore
-///    `static_cast` back to the pixel type before the next axis reads it. On an
-///    integer image that truncates every partial derivative toward zero, which
-///    typically annihilates the whole result. The axes are convolved last-first
-///    (`oper[0]` has direction `ImageDimension - 1`), so the truncation is not
-///    even order-symmetric. This port reproduces the round-trip exactly.
+///    `use_image_spacing` only changes how wide the Gaussian is. Kept: this is
+///    the operator's defined per-index-step meaning, not a silent no-op.
+/// 3. **Intermediates carry a real pixel type (fixed).** Upstream `GenerateData`
+///    declares `RealOutputImageType = Image<OutputPixelType, …>` — the alias is
+///    named "Real" but instantiated on `OutputPixelType`, so each axis's result
+///    is `static_cast` back to the pixel type before the next axis reads it. On
+///    an integer image that truncates every partial derivative toward zero and
+///    typically annihilates the whole result (silent data loss). This port
+///    accumulates every separable pass in `f64` and quantizes to the output
+///    pixel type exactly once, at the end — an integer result now equals the
+///    real-arithmetic result rounded a single time.
 ///
 /// `maximum_error` is clamped to `[0.00001, 0.99999]` rather than rejected (see
 /// [`clamp_maximum_error`]). Errors if `variance.len()` or `order.len()` differ
@@ -808,13 +815,20 @@ pub fn discrete_gaussian_derivative(
         } else {
             variance[d]
         };
-        let kernel = gaussian_derivative_operator_coefficients(
+        let mut kernel = gaussian_derivative_operator_coefficients(
             pixel_variance,
             maximum_error,
             maximum_kernel_width,
             order[d],
             normalize_across_scale,
         );
+        // `NeighborhoodOperator::FlipAxes()` (reverse the taps), matching
+        // `DerivativeImageFilter`/`GradientImageFilter`. `GaussianDerivative-
+        // Operator` builds its coefficients as a convolution kernel; applying
+        // them by correlation without this flip negates every odd-order
+        // derivative. The flip is a no-op on even orders (symmetric stencils).
+        // See this port's fix note in doc/upstream-findings.md §2.2.
+        kernel.reverse();
         let half = kernel.len() / 2;
         let mut radius = vec![0usize; dim];
         radius[d] = half;
@@ -835,8 +849,12 @@ pub fn discrete_gaussian_derivative(
                         c * nb.get(&off)
                     })
                     .sum();
-                // `Image<OutputPixelType, …>` intermediate: static_cast every stage.
-                quantize_to_pixel_type(pixel_id, acc)
+                // Real-valued intermediate: the separable passes accumulate in
+                // f64 and quantize to `pixel_id` exactly once, at the end (via
+                // `image_from_f64`). ITK's `RealOutputImageType` alias is
+                // misdeclared `Image<OutputPixelType>`, truncating every partial
+                // derivative on integer images; this port carries the real type.
+                acc
             })
             .collect();
 
@@ -1438,8 +1456,9 @@ mod tests {
 
     /// With a zero variance the Gaussian collapses to `[0, 1, 0]`, so the
     /// operator is exactly `DerivativeOperator`'s own stencil -- and the
-    /// convolution in `GenerateCoefficients` leaves it *unreversed*, which is
-    /// where the odd-order sign flip comes from.
+    /// convolution in `GenerateCoefficients` leaves it *unreversed*. The filter
+    /// [`discrete_gaussian_derivative`] reverses it (`FlipAxes`) before
+    /// correlating; this operator-level helper still returns the raw stencil.
     #[test]
     fn gaussian_derivative_operator_at_zero_variance_is_the_bare_stencil() {
         assert_eq!(
@@ -1516,10 +1535,10 @@ mod tests {
 
     /// At `variance == 0` the Gaussian collapses to `[0, 1, 0]`, `G(s) = 0`, and
     /// the stencil moments are exact -- so the first derivative of a ramp of
-    /// slope 3 is exactly `-3` on every interior pixel. Negative, because the
-    /// operator is never flipped.
+    /// slope 3 is exactly `+3` on every interior pixel. Positive: the filter
+    /// applies `FlipAxes`, matching `DerivativeImageFilter` (fix, §2.2).
     #[test]
-    fn first_derivative_of_a_ramp_is_the_negated_slope_at_zero_variance() {
+    fn first_derivative_of_a_ramp_is_the_slope_at_zero_variance() {
         let img = linear_ramp(3.0, 0.0, 21, 5);
         let out = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[1, 0], 0.01, 32, false, false)
             .unwrap();
@@ -1528,8 +1547,8 @@ mod tests {
             for x in 1..20 {
                 let got = v[y * 21 + x];
                 assert!(
-                    (got - -3.0).abs() < 1e-12,
-                    "({x},{y}): expected -3.0, got {got}"
+                    (got - 3.0).abs() < 1e-12,
+                    "({x},{y}): expected 3.0, got {got}"
                 );
             }
         }
@@ -1555,9 +1574,9 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
 
-        // The shared value is the attenuated slope: neither -3.0 nor -1.5.
-        let expected = -3.0 * clamped_padding_attenuation(1.0, 0.01);
-        assert!((expected - -2.828_355_531_478_728).abs() < 1e-12);
+        // The shared value is the attenuated slope: neither +3.0 nor +1.5.
+        let expected = 3.0 * clamped_padding_attenuation(1.0, 0.01);
+        assert!((expected - 2.828_355_531_478_728).abs() < 1e-12);
         assert!((a[2 * 21 + 10] - expected).abs() < 1e-12);
     }
 
@@ -1593,9 +1612,10 @@ mod tests {
         );
     }
 
-    /// On `f(x, y) = 3x + 5y` the x-order picks out `-3` and the y-order `-5`:
+    /// On `f(x, y) = 3x + 5y` the x-order picks out `+3` and the y-order `+5`:
     /// `order` really is indexed per axis, and the smoothed axis annihilates the
-    /// other term (a derivative kernel sums to zero).
+    /// other term (a derivative kernel sums to zero). Positive after the
+    /// `FlipAxes` fix (§2.2).
     #[test]
     fn order_selects_the_axis_it_is_indexed_on() {
         let img = linear_ramp(3.0, 5.0, 21, 21);
@@ -1605,13 +1625,13 @@ mod tests {
             .unwrap()
             .to_f64_vec()
             .unwrap()[center];
-        assert!((dx - -3.0).abs() < 1e-12, "expected -3.0, got {dx}");
+        assert!((dx - 3.0).abs() < 1e-12, "expected 3.0, got {dx}");
 
         let dy = discrete_gaussian_derivative(&img, &[0.0, 0.0], &[0, 1], 0.01, 32, false, false)
             .unwrap()
             .to_f64_vec()
             .unwrap()[center];
-        assert!((dy - -5.0).abs() < 1e-12, "expected -5.0, got {dy}");
+        assert!((dy - 5.0).abs() < 1e-12, "expected 5.0, got {dy}");
     }
 
     /// `NormalizeAcrossScale` end to end: pixel variance 4 scales the
@@ -1631,7 +1651,7 @@ mod tests {
                 .to_f64_vec()
                 .unwrap()[center];
 
-        let expected = -3.0 * clamped_padding_attenuation(4.0, 0.01);
+        let expected = 3.0 * clamped_padding_attenuation(4.0, 0.01);
         assert!(
             (plain - expected).abs() < 1e-12,
             "expected {expected}, got {plain}"
@@ -1643,27 +1663,56 @@ mod tests {
         );
     }
 
-    /// The `Image<OutputPixelType, …>` intermediate (module docs, quirk 3):
-    /// smoothing a unit impulse in an `Int32` image annihilates it, because the
-    /// peak tap of a normalized Gaussian is `< 1` and the *intermediate* is
-    /// `static_cast` back to `Int32` after the first axis. The same data as
-    /// `Float64` keeps a nonzero centre.
+    /// Fix (§2.2, quirk 3): the separable passes accumulate in `f64` and the
+    /// output pixel type is applied exactly once, at the end — so an integer
+    /// result equals the real-arithmetic result rounded a single time, not the
+    /// per-axis truncation that upstream's `Image<OutputPixelType>` intermediate
+    /// produced.
+    ///
+    /// Hand-derived at `variance = 0`, `order = [1, 1]`, where the smoothing
+    /// kernel is the identity `[0, 1, 0]` and the (flipped) first-derivative
+    /// kernel is the central difference `[-0.5, 0, 0.5]`. The axes run y then x.
+    /// Only four pixels feed the output at `(x, y) = (2, 2)`:
+    /// `f(1,1)=0, f(1,3)=1, f(3,1)=0, f(3,3)=8`. The y-pass gives
+    /// `g(1,2) = (1 - 0)/2 = 0.5` and `g(3,2) = (8 - 0)/2 = 4.0`; the x-pass
+    /// gives `(4.0 - 0.5)/2 = 1.75`, which truncates to `1` in `Int32`.
+    /// Upstream's per-pass cast would floor `g` first (`0.5 → 0`, `4.0 → 4`),
+    /// giving `(4 - 0)/2 = 2` — off by one, and for smaller signals annihilated
+    /// entirely.
     #[test]
-    fn integer_intermediates_are_truncated_between_axes() {
+    fn integer_intermediates_are_carried_at_full_precision() {
+        let idx = |x: usize, y: usize| y * 5 + x;
         let mut data = vec![0i32; 25];
-        data[2 * 5 + 2] = 1;
-        let integral = Image::from_vec(&[5, 5], data).unwrap();
-        let out =
-            discrete_gaussian_derivative(&integral, &[1.0, 1.0], &[0, 0], 0.01, 32, false, false)
+        data[idx(1, 1)] = 0;
+        data[idx(1, 3)] = 1;
+        data[idx(3, 1)] = 0;
+        data[idx(3, 3)] = 8;
+        let integral = Image::from_vec(&[5, 5], data.clone()).unwrap();
+        let int_out =
+            discrete_gaussian_derivative(&integral, &[0.0, 0.0], &[1, 1], 0.01, 32, false, false)
                 .unwrap();
-        assert_eq!(out.scalar_slice::<i32>().unwrap(), &[0i32; 25]);
+        assert_eq!(
+            int_out.scalar_slice::<i32>().unwrap()[2 * 5 + 2],
+            1,
+            "corrected: real (4.0-0.5)/2 = 1.75 rounded once to Int32; the \
+             per-pass-truncation quirk gave 2"
+        );
 
-        let mut real = vec![0.0f64; 25];
-        real[2 * 5 + 2] = 1.0;
-        let real = Image::from_vec(&[5, 5], real).unwrap();
-        let out = discrete_gaussian_derivative(&real, &[1.0, 1.0], &[0, 0], 0.01, 32, false, false)
-            .unwrap();
-        assert!(out.to_f64_vec().unwrap()[2 * 5 + 2] > 0.0);
+        // The invariant that states the corrected semantics: the integer result
+        // equals the same data computed in `Float64` and quantized to `Int32`
+        // exactly once. (Under the per-pass cast the two diverge.)
+        let real = Image::from_vec(&[5, 5], data.iter().map(|&v| f64::from(v)).collect()).unwrap();
+        let real_out =
+            discrete_gaussian_derivative(&real, &[0.0, 0.0], &[1, 1], 0.01, 32, false, false)
+                .unwrap();
+        let int_vals = int_out.scalar_slice::<i32>().unwrap();
+        for (i, &r) in real_out.to_f64_vec().unwrap().iter().enumerate() {
+            assert_eq!(
+                f64::from(int_vals[i]),
+                crate::quantize_to_pixel_type(PixelId::Int32, r),
+                "pixel {i}: Int32 path must equal Float64 quantized once"
+            );
+        }
     }
 
     /// `GaussianDerivativeOperator::SetMaximumError` clamps to
