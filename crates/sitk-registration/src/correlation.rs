@@ -82,7 +82,7 @@ use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{FixedSamples, MetricValue, MovingImage};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// The normalized cross-correlation metric. Holds the precomputed fixed
 /// samples and moving image; [`evaluate`](Self::evaluate) returns
@@ -123,14 +123,14 @@ impl CorrelationMetric {
         self.fixed.len()
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform`
-    /// over this metric's fixed sample points (shared with the other
-    /// metrics).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (shared with the other metrics).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// This metric's transform-category precondition: it is global-transform
@@ -441,7 +441,7 @@ mod tests {
 
         let initial = vec![0.0f64, 0.0];
         let t0 = TranslationTransform::new(initial.clone());
-        let scales_est = metric.physical_shift_scales(&t0);
+        let scales_est = metric.scales_estimator(&t0, ScalesEstimatorKind::default());
         let m0 = metric.evaluate(&t0);
         // Estimate the learning rate once from the initial gradient (ITK's
         // EstimateLearningRate::Once), then hold it fixed.

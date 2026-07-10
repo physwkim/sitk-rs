@@ -84,7 +84,7 @@ use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{FixedSamples, MetricValue, MovingImage};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Bins of padding at each histogram-axis end, reserved so the cubic B-spline
 /// Parzen window never needs a boundary condition. ITK's `padding`.
@@ -247,13 +247,14 @@ impl MattesMutualInformationMetric {
         self.fixed.len()
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform` over
-    /// this metric's fixed sample points (shared with the mean-squares metric).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (shared with the mean-squares metric).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// The Parzen-window bin index of a pixel `value` on the axis with bin size

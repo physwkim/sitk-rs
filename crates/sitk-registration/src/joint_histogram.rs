@@ -171,7 +171,7 @@ use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
 use crate::metric::{FixedSamples, MetricValue, MovingImage};
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Bins of padding at each histogram-axis end. ITK's `m_Padding(2)` ctor
 /// initializer in `itkJointHistogramMutualInformationImageToImageMetricv4`.
@@ -473,13 +473,14 @@ impl JointHistogramMutualInformationMetric {
         self.fixed.len()
     }
 
-    /// Build a physical-shift scale/learning-rate estimator for `transform`
-    /// over this metric's fixed sample points (shared with the other metrics).
-    pub fn physical_shift_scales(
+    /// Build a scale/learning-rate estimator of `kind` for `transform` over
+    /// this metric's virtual domain (shared with the other metrics).
+    pub fn scales_estimator(
         &self,
         transform: &dyn ParametricTransform,
-    ) -> PhysicalShiftScales {
-        self.fixed.physical_shift_scales(transform)
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        self.fixed.scales_estimator(transform, &self.moving, kind)
     }
 
     /// Normalized joint-PDF-point coordinate of a raw intensity `value` on the

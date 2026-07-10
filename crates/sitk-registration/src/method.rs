@@ -83,7 +83,10 @@ use crate::optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
     GradientDescentOptimizer, Objective, RegularStepGradientDescentOptimizer, StopReason,
 };
-use crate::scales::PhysicalShiftScales;
+use crate::scales::{
+    DEFAULT_CENTRAL_REGION_RADIUS, DEFAULT_SMALL_PARAMETER_VARIATION, ScalesEstimator,
+    ScalesEstimatorKind,
+};
 
 /// When the gradient-descent learning rate is estimated from physical shift,
 /// mirroring SimpleITK's `estimateLearningRate` option
@@ -102,15 +105,30 @@ pub enum EstimateLearningRate {
     EachIteration,
 }
 
-/// How optimizer parameter scales are chosen.
+/// ITK's `m_WeightsAreIdentity` tolerance
+/// (`itkObjectToObjectOptimizerBase.cxx:157`).
+const WEIGHTS_IDENTITY_TOLERANCE: f64 = 1e-4;
+
+/// ITK's `m_WeightsAreIdentity` test (`itkObjectToObjectOptimizerBase.cxx:143-166`):
+/// an unset (empty) weights array is identity, and so is one whose every entry
+/// is within [`WEIGHTS_IDENTITY_TOLERANCE`] of `1.0`. An identity array is never
+/// multiplied into the gradient — a weight of `1.00005` is discarded, not
+/// applied (ledger §2.111).
+fn weights_are_identity(weights: &[f64]) -> bool {
+    weights
+        .iter()
+        .all(|w| (1.0 - w).abs() <= WEIGHTS_IDENTITY_TOLERANCE)
+}
+
+/// How optimizer parameter scales are chosen — SimpleITK's
+/// `m_OptimizerScalesType` plus this crate's [`Unit`](Self::Unit) default.
 enum ScalesMode {
     /// All-ones (no balancing).
     Unit,
-    /// Caller-supplied scales.
+    /// Caller-supplied scales (SimpleITK `Manual`, set by `SetOptimizerScales`).
     Manual(Vec<f64>),
-    /// Estimated from physical shift
-    /// (`RegistrationParameterScalesFromPhysicalShift`).
-    PhysicalShift,
+    /// Estimated by one of ITK's `RegistrationParameterScales*` estimators.
+    Estimated(ScalesEstimatorKind),
 }
 
 /// How the learning rate is chosen.
@@ -427,15 +445,19 @@ impl ActiveMetric {
         }
     }
 
-    /// Physical-shift scale/learning-rate estimator over the fixed samples.
-    fn physical_shift_scales(&self, transform: &dyn ParametricTransform) -> PhysicalShiftScales {
+    /// Scale/learning-rate estimator of `kind` over the virtual domain.
+    fn scales_estimator(
+        &self,
+        transform: &dyn ParametricTransform,
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
         match self {
-            ActiveMetric::MeanSquares(m) => m.physical_shift_scales(transform),
-            ActiveMetric::Mattes(m) => m.physical_shift_scales(transform),
-            ActiveMetric::Correlation(m) => m.physical_shift_scales(transform),
-            ActiveMetric::AntsNeighborhoodCorrelation(m) => m.physical_shift_scales(transform),
-            ActiveMetric::JointHistogram(m) => m.physical_shift_scales(transform),
-            ActiveMetric::Demons(m) => m.physical_shift_scales(transform),
+            ActiveMetric::MeanSquares(m) => m.scales_estimator(transform, kind),
+            ActiveMetric::Mattes(m) => m.scales_estimator(transform, kind),
+            ActiveMetric::Correlation(m) => m.scales_estimator(transform, kind),
+            ActiveMetric::AntsNeighborhoodCorrelation(m) => m.scales_estimator(transform, kind),
+            ActiveMetric::JointHistogram(m) => m.scales_estimator(transform, kind),
+            ActiveMetric::Demons(m) => m.scales_estimator(transform, kind),
         }
     }
 }
@@ -595,6 +617,9 @@ pub struct ImageRegistrationMethod {
     optimizer: OptimizerKind,
     metric_kind: MetricKind,
     scales_mode: ScalesMode,
+    /// Per-local-parameter optimizer weights (SimpleITK `SetOptimizerWeights`).
+    /// Empty means identity, as ITK's own empty `m_Weights` array does.
+    optimizer_weights: Vec<f64>,
     learning_rate_mode: LearningRateMode,
     backend: Box<dyn MetricBackend>,
     /// Interpolator used to read the moving image at a mapped fixed point
@@ -647,6 +672,7 @@ impl Default for ImageRegistrationMethod {
             optimizer: OptimizerKind::GradientDescent(GradientDescentOptimizer::new(1.0, 100)),
             metric_kind: MetricKind::MeanSquares,
             scales_mode: ScalesMode::Unit,
+            optimizer_weights: Vec::new(),
             learning_rate_mode: LearningRateMode::Manual,
             backend: Box::new(CpuBackend),
             interpolator: Interpolator::Linear,
@@ -1048,9 +1074,109 @@ impl ImageRegistrationMethod {
     /// Estimate optimizer scales automatically from physical shift
     /// (`itk::RegistrationParameterScalesFromPhysicalShift`), so matrix and
     /// translation parameters are balanced without hand-tuning.
+    ///
+    /// Upstream's `SetOptimizerScalesFromPhysicalShift(centralRegionRadius = 5,
+    /// smallParameterVariation = 0.01)` takes both estimator knobs as default
+    /// arguments; this method uses those defaults (ledger §5.18).
     pub fn set_optimizer_scales_from_physical_shift(&mut self) -> &mut Self {
-        self.scales_mode = ScalesMode::PhysicalShift;
+        self.scales_mode = ScalesMode::Estimated(ScalesEstimatorKind::PhysicalShift {
+            central_region_radius: DEFAULT_CENTRAL_REGION_RADIUS,
+            small_parameter_variation: DEFAULT_SMALL_PARAMETER_VARIATION,
+        });
         self
+    }
+
+    /// Estimate optimizer scales from the mean squared transform-Jacobian
+    /// column norm over the sampled virtual domain — SimpleITK
+    /// `SetOptimizerScalesFromJacobian(centralRegionRadius = 5)` /
+    /// `itk::RegistrationParameterScalesFromJacobian`.
+    ///
+    /// Unlike the two shift estimators, this one *averages* over the sample
+    /// points instead of taking the worst one, so it is less sensitive to a
+    /// single distant voxel and produces smaller scales for the matrix
+    /// parameters of a rotation or affine transform.
+    ///
+    /// `central_region_radius` is carried faithfully but has no observable
+    /// effect for any transform this crate registers — see [`crate::scales`]
+    /// and ledger §2.110. Pass [`DEFAULT_CENTRAL_REGION_RADIUS`] for upstream's
+    /// default.
+    pub fn set_optimizer_scales_from_jacobian(
+        &mut self,
+        central_region_radius: usize,
+    ) -> &mut Self {
+        self.scales_mode = ScalesMode::Estimated(ScalesEstimatorKind::Jacobian {
+            central_region_radius,
+        });
+        self
+    }
+
+    /// Estimate optimizer scales from the shift a small parameter variation
+    /// produces in the **moving image's continuous-index** units — SimpleITK
+    /// `SetOptimizerScalesFromIndexShift(centralRegionRadius = 5,
+    /// smallParameterVariation = 0.01)` /
+    /// `itk::RegistrationParameterScalesFromIndexShift`.
+    ///
+    /// This is [`set_optimizer_scales_from_physical_shift`] with the shift
+    /// divided through by the moving image's spacing and direction, so an
+    /// anisotropic moving image weights the parameters that move samples along
+    /// its fine axis more heavily.
+    ///
+    /// `central_region_radius` is carried faithfully but has no observable
+    /// effect for any transform this crate registers — see [`crate::scales`]
+    /// and ledger §2.110. Pass [`DEFAULT_CENTRAL_REGION_RADIUS`] and
+    /// [`DEFAULT_SMALL_PARAMETER_VARIATION`] for upstream's defaults.
+    ///
+    /// [`set_optimizer_scales_from_physical_shift`]: Self::set_optimizer_scales_from_physical_shift
+    pub fn set_optimizer_scales_from_index_shift(
+        &mut self,
+        central_region_radius: usize,
+        small_parameter_variation: f64,
+    ) -> &mut Self {
+        self.scales_mode = ScalesMode::Estimated(ScalesEstimatorKind::IndexShift {
+            central_region_radius,
+            small_parameter_variation,
+        });
+        self
+    }
+
+    /// Set the per-local-parameter optimizer **weights** — SimpleITK
+    /// `SetOptimizerWeights` / `itk::ObjectToObjectOptimizerBase::SetWeights`.
+    ///
+    /// Weights multiply the gradient at the same point scales divide it
+    /// (`gradient[j] *= weights[j % n] / scales[j % n]`,
+    /// `itkGradientDescentOptimizerv4.hxx:205-239`), and are the documented way
+    /// to hold a parameter constant: a zero weight freezes it.
+    ///
+    /// Three upstream behaviors this reproduces:
+    ///
+    /// - The length must equal the transform's
+    ///   [`number_of_local_parameters`], **not** its parameter count. For a
+    ///   displacement field that is just `dim`; the array is then tiled across
+    ///   every pixel's parameter block. A mismatch raises
+    ///   [`RegistrationError::OptimizerWeightsLength`] when the registration
+    ///   runs, not here.
+    /// - Weights within `1e-4` of `1.0` are treated as exactly identity and
+    ///   never multiplied in (`m_WeightsAreIdentity`,
+    ///   `itkObjectToObjectOptimizerBase.cxx:143-166`; ledger §2.111).
+    /// - The length is validated for **every** optimizer, but only the
+    ///   gradient-descent family applies the weights; both L-BFGS optimizers
+    ///   and the gradient-free ones validate and then ignore them (ledger
+    ///   §2.112).
+    ///
+    /// An empty vector (the default) means identity.
+    ///
+    /// [`number_of_local_parameters`]: sitk_transform::ParametricTransform::number_of_local_parameters
+    pub fn set_optimizer_weights(&mut self, weights: Vec<f64>) -> &mut Self {
+        self.optimizer_weights = weights;
+        self
+    }
+
+    /// The optimizer weights set by [`set_optimizer_weights`], empty when unset
+    /// — SimpleITK `GetOptimizerWeights`.
+    ///
+    /// [`set_optimizer_weights`]: Self::set_optimizer_weights
+    pub fn optimizer_weights(&self) -> &[f64] {
+        &self.optimizer_weights
     }
 
     /// Set the minimum scaled-step length below which the optimizer stops early.
@@ -1976,19 +2102,40 @@ impl ImageRegistrationMethod {
 
         metric.check_transform(&composed!())?;
 
+        // ITK validates the weights' length in
+        // `ObjectToObjectOptimizerBase::StartOptimization`, which every v4
+        // optimizer calls — including the ones that go on to ignore the weights
+        // entirely (ledger §2.112). So this check precedes the `ignores_scales`
+        // split, and the length is the transform's *local* parameter count.
+        let num_local = transform.number_of_local_parameters();
+        if !self.optimizer_weights.is_empty() && self.optimizer_weights.len() != num_local {
+            return Err(RegistrationError::OptimizerWeightsLength {
+                got: self.optimizer_weights.len(),
+                expected: num_local,
+            });
+        }
+
         // Both L-BFGS variants ignore parameter scales and the learning-rate
         // estimator (ITK's LBFGSBOptimizerv4/LBFGS2Optimizerv4 force identity
         // scales), so neither is built for them — they drive the raw metric
         // gradient directly.
         let ignores_scales = self.optimizer.ignores_scales();
 
-        // A physical-shift estimator is needed if scales or the learning rate
-        // are estimated. Jacobians are parameter-independent for these
-        // transforms, so building it once at the initial transform is exact.
+        // An estimator is needed if scales or the learning rate are estimated.
+        // When only the learning rate is, ITK still runs an estimator — the one
+        // the optimizer was given — so the kind follows `scales_mode` and falls
+        // back to the physical-shift default. Jacobians are parameter-independent
+        // for these transforms, so building it once at the initial transform is
+        // exact.
+        let estimator_kind = match &self.scales_mode {
+            ScalesMode::Estimated(kind) => *kind,
+            ScalesMode::Unit | ScalesMode::Manual(_) => ScalesEstimatorKind::default(),
+        };
         let needs_estimator = !ignores_scales
-            && (matches!(self.scales_mode, ScalesMode::PhysicalShift)
+            && (matches!(self.scales_mode, ScalesMode::Estimated(_))
                 || matches!(self.learning_rate_mode, LearningRateMode::Estimate(_)));
-        let estimator = needs_estimator.then(|| metric.physical_shift_scales(&composed!()));
+        let estimator =
+            needs_estimator.then(|| metric.scales_estimator(&composed!(), estimator_kind));
 
         let scales: Vec<f64> = if ignores_scales {
             vec![1.0; nparams]
@@ -2004,8 +2151,30 @@ impl ImageRegistrationMethod {
                     }
                     s.clone()
                 }
-                ScalesMode::PhysicalShift => estimator.as_ref().unwrap().estimate_scales(),
+                ScalesMode::Estimated(_) => estimator.as_ref().unwrap().estimate_scales(),
             }
+        };
+
+        // ITK modifies the gradient in place by `weights[j % n] / scales[j % n]`
+        // (`ModifyGradientByScalesOverSubRange`). This crate's optimizers instead
+        // *divide* the gradient by a per-parameter array, so the driver hands
+        // them the reciprocal of that factor, `scales[j] / weights[j % n]`.
+        // A zero weight — upstream's documented way to hold a parameter constant
+        // — becomes an infinite divisor, and `g / ∞ == 0` is exactly the frozen
+        // parameter `g * 0 == 0` gives ITK.
+        //
+        // The optimizers that ignore scales ignore the weights with them: only
+        // the gradient-descent family owns `ModifyGradientByScalesOverSubRange`
+        // (ledger §2.112).
+        let weights = &self.optimizer_weights;
+        let scales: Vec<f64> = if ignores_scales || weights_are_identity(weights) {
+            scales
+        } else {
+            scales
+                .iter()
+                .enumerate()
+                .map(|(j, &s)| s / weights[j % weights.len()])
+                .collect()
         };
 
         let scaled = |grad: &[f64]| -> Vec<f64> {
@@ -4610,6 +4779,425 @@ mod tests {
             matches!(
                 err,
                 RegistrationError::RequiresLocalSupportTransform { metric: "Demons" }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    // ---- SetOptimizerScalesFrom{Jacobian,IndexShift} ---------------------
+
+    /// A 5×5 fixed image and a moving image shifted by one voxel, with an
+    /// affine transform centred at `(1,1)`. On this domain the estimators'
+    /// scales are hand-derivable (see `scales.rs`):
+    ///
+    /// | parameter | PhysicalShift | Jacobian |
+    /// |---|---|---|
+    /// | the four matrix entries | `max|x−1|² = 9` | `mean (x−1)² = 5` |
+    /// | the two translations | `1` | `1` |
+    ///
+    /// One gradient-descent iteration from the identity moves parameter `k` by
+    /// `−lr·g[k]/scale[k]`, so the *ratio* of the two runs' first steps is
+    /// `9/5` on the matrix entries and `1` on the translations — independent of
+    /// the metric gradient `g`, which never has to be computed by hand.
+    fn one_affine_step(scales: impl Fn(&mut ImageRegistrationMethod)) -> Vec<f64> {
+        use sitk_transform::AffineTransform;
+        let fixed = gaussian(5, 5, 2.0, 2.0, 1.5, 1.0);
+        let moving = gaussian(5, 5, 3.0, 2.0, 1.5, 1.0);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_gradient_descent(1.0, 1);
+        scales(&mut reg);
+        let init =
+            AffineTransform::new(2, vec![1.0, 0.0, 0.0, 1.0], vec![0.0, 0.0], vec![1.0, 1.0]);
+        let result = reg.execute(&fixed, &moving, init).unwrap();
+        // Report the *step*: the identity affine starts at [1,0,0,1,0,0].
+        let start = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        result
+            .transform
+            .parameters()
+            .iter()
+            .zip(start)
+            .map(|(&p, s)| p - s)
+            .collect()
+    }
+
+    #[test]
+    fn jacobian_scales_step_nine_fifths_further_than_physical_shift_scales() {
+        let phys = one_affine_step(|r| {
+            r.set_optimizer_scales_from_physical_shift();
+        });
+        let jac = one_affine_step(|r| {
+            r.set_optimizer_scales_from_jacobian(DEFAULT_CENTRAL_REGION_RADIUS);
+        });
+
+        // Matrix entries: scale 9 vs 5, so the Jacobian step is 9/5 = 1.8× larger.
+        for k in 0..4 {
+            assert!(
+                phys[k].abs() > 1e-12,
+                "step[{k}] = {} is too small to form a ratio",
+                phys[k]
+            );
+            let ratio = jac[k] / phys[k];
+            assert!(
+                (ratio - 9.0 / 5.0).abs() < 1e-9,
+                "matrix step ratio[{k}] = {ratio} != 9/5"
+            );
+        }
+        // Translations: scale 1 under both estimators, so the steps coincide.
+        for k in 4..6 {
+            assert!(
+                (jac[k] - phys[k]).abs() < 1e-12,
+                "translation step[{k}]: jacobian {} != physical shift {}",
+                jac[k],
+                phys[k]
+            );
+        }
+    }
+
+    #[test]
+    fn index_shift_scales_divide_the_step_by_the_squared_moving_spacing() {
+        // Moving image spacing (2, 1): its physical-to-index matrix is
+        // diag(½, 1), so a unit translation along x moves the moving-image
+        // continuous index by only ½.
+        //   PhysicalShift: scale = (δ·1/δ)² = 1   on both axes.
+        //   IndexShift:    scale = (δ·½/δ)² = ¼   on x, 1 on y.
+        // One gradient-descent step is −lr·g[k]/scale[k], so the index-shift
+        // run steps exactly 1/0.25 = 4× further along x and identically along y.
+        let step = |anisotropic_scales: bool| -> Vec<f64> {
+            let fixed = gaussian(9, 9, 4.0, 4.0, 2.0, 1.0);
+            let mut moving = gaussian(9, 9, 5.0, 4.0, 2.0, 1.0);
+            moving.set_spacing(&[2.0, 1.0]).unwrap();
+
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_gradient_descent(1.0, 1);
+            if anisotropic_scales {
+                reg.set_optimizer_scales_from_index_shift(
+                    DEFAULT_CENTRAL_REGION_RADIUS,
+                    DEFAULT_SMALL_PARAMETER_VARIATION,
+                );
+            } else {
+                reg.set_optimizer_scales_from_physical_shift();
+            }
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .transform
+                .parameters()
+        };
+
+        let phys = step(false);
+        let idx = step(true);
+        assert!(phys[0].abs() > 1e-12, "x step {} too small", phys[0]);
+        let ratio = idx[0] / phys[0];
+        assert!((ratio - 4.0).abs() < 1e-9, "x step ratio {ratio} != 4");
+        assert!(
+            (idx[1] - phys[1]).abs() < 1e-12,
+            "y step: index shift {} != physical shift {}",
+            idx[1],
+            phys[1]
+        );
+    }
+
+    #[test]
+    fn jacobian_scales_recover_a_translation_through_an_affine_transform() {
+        use sitk_transform::AffineTransform;
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_jacobian(DEFAULT_CENTRAL_REGION_RADIUS)
+            .set_optimizer_as_gradient_descent_estimated(2000, EstimateLearningRate::Once);
+        let init = AffineTransform::new(
+            2,
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0],
+            vec![20.0, 20.0],
+        );
+        let result = reg.execute(&fixed, &moving, init).unwrap();
+        let p = result.transform.parameters();
+        assert!(
+            (p[4] - tx).abs() < 5e-2 && (p[5] - ty).abs() < 5e-2,
+            "recovered translation [{}, {}], expected [{tx}, {ty}]",
+            p[4],
+            p[5]
+        );
+    }
+
+    #[test]
+    fn index_shift_scales_recover_a_translation() {
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 20.0 + tx, 20.0 + ty, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_index_shift(
+            DEFAULT_CENTRAL_REGION_RADIUS,
+            DEFAULT_SMALL_PARAMETER_VARIATION,
+        )
+        .set_optimizer_as_gradient_descent_estimated(500, EstimateLearningRate::Once);
+        let result = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+        let p = result.transform.parameters();
+        assert!(
+            (p[0] - tx).abs() < 1e-3 && (p[1] - ty).abs() < 1e-3,
+            "recovered {p:?}, expected [{tx}, {ty}]"
+        );
+    }
+
+    #[test]
+    fn the_central_region_radius_does_not_change_any_estimator_for_a_linear_transform() {
+        // Upstream reaches CentralRegionSampling only for a local-support
+        // transform, so the radius cannot move a linear transform's scales.
+        // Pinned end-to-end through the setters (ledger §2.110).
+        let jac0 = one_affine_step(|r| {
+            r.set_optimizer_scales_from_jacobian(0);
+        });
+        let jac9 = one_affine_step(|r| {
+            r.set_optimizer_scales_from_jacobian(9);
+        });
+        assert_eq!(jac0, jac9);
+
+        let idx0 = one_affine_step(|r| {
+            r.set_optimizer_scales_from_index_shift(0, DEFAULT_SMALL_PARAMETER_VARIATION);
+        });
+        let idx9 = one_affine_step(|r| {
+            r.set_optimizer_scales_from_index_shift(9, DEFAULT_SMALL_PARAMETER_VARIATION);
+        });
+        assert_eq!(idx0, idx9);
+    }
+
+    #[test]
+    fn a_smaller_small_parameter_variation_leaves_the_index_shift_scales_unchanged() {
+        // scaleᵢ = (maxShiftᵢ/δ)² and maxShiftᵢ = δ·‖Jᵢ‖ exactly for the linear
+        // transforms this crate registers, so δ cancels analytically. It is
+        // carried because upstream's shift is a re-transform rather than a
+        // Jacobian product, where δ would not cancel for a nonlinear transform.
+        //
+        // The cancellation is exact in ℝ but not in binary floating point:
+        // squaring δ = 1e-6 and dividing by δ² rounds differently than at
+        // δ = 0.01, so the two runs agree to a relative 1e-9, not bit-for-bit.
+        let coarse = one_affine_step(|r| {
+            r.set_optimizer_scales_from_index_shift(DEFAULT_CENTRAL_REGION_RADIUS, 0.01);
+        });
+        let fine = one_affine_step(|r| {
+            r.set_optimizer_scales_from_index_shift(DEFAULT_CENTRAL_REGION_RADIUS, 1e-6);
+        });
+        for (k, (&c, &f)) in coarse.iter().zip(fine.iter()).enumerate() {
+            assert!(
+                (c - f).abs() <= 1e-9 * c.abs().max(f.abs()),
+                "step[{k}]: δ=0.01 gives {c}, δ=1e-6 gives {f}"
+            );
+        }
+    }
+
+    // ---- Set/GetOptimizerWeights -----------------------------------------
+
+    #[test]
+    fn optimizer_weights_round_trip_and_default_to_empty() {
+        let mut reg = ImageRegistrationMethod::new();
+        assert!(reg.optimizer_weights().is_empty());
+        reg.set_optimizer_weights(vec![1.0, 0.0]);
+        assert_eq!(reg.optimizer_weights(), &[1.0, 0.0]);
+    }
+
+    #[test]
+    fn weights_are_identity_within_one_ten_thousandth_inclusive() {
+        // ITK: `if (Absolute(1 - w) > tolerance) { identity = false; }` with
+        // tolerance 1e-4 — so a difference of exactly 1e-4 is still identity.
+        assert!(weights_are_identity(&[]));
+        assert!(weights_are_identity(&[1.0, 1.0]));
+        assert!(weights_are_identity(&[1.0 + 1e-4, 1.0 - 1e-4]));
+        assert!(!weights_are_identity(&[1.0, 1.0 + 1.01e-4]));
+        assert!(!weights_are_identity(&[0.0, 1.0]));
+    }
+
+    #[test]
+    fn a_weight_within_the_identity_tolerance_is_discarded_not_applied() {
+        // 1.00005 is within 1e-4 of 1, so ITK never multiplies it in and the
+        // run is bit-identical to an unweighted one. 1.001 is outside, so it is
+        // applied and the trajectory changes.
+        let run = |weights: Vec<f64>| -> Vec<f64> {
+            let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
+            let moving = gaussian(40, 40, 23.0, 18.0, 7.0, 1.0);
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_gradient_descent(100.0, 5)
+                .set_optimizer_weights(weights);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .transform
+                .parameters()
+        };
+
+        let unweighted = run(Vec::new());
+        assert_eq!(run(vec![1.00005, 1.00005]), unweighted);
+        assert_ne!(run(vec![1.001, 1.001]), unweighted);
+    }
+
+    #[test]
+    fn a_zero_weight_freezes_its_parameter() {
+        // Upstream's documented use of weights: "may be used to easily mask out
+        // a particular parameter during optimization to hold it constant"
+        // (itkObjectToObjectOptimizerBase.h:97-103). The gradient is multiplied
+        // by 0, so y never moves off its initial value while x still converges.
+        let (tx, ty) = (3.0f64, -2.0f64);
+        let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
+        let moving = gaussian(40, 40, 20.0 + tx, 20.0 + ty, 7.0, 1.0);
+
+        let run = |weights: Vec<f64>| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_gradient_descent(100.0, 300)
+                .set_optimizer_weights(weights);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+                .unwrap()
+                .transform
+                .parameters()
+        };
+
+        // Unweighted, both parameters converge to the true translation.
+        let free = run(Vec::new());
+        assert!(
+            (free[0] - tx).abs() < 1e-3 && (free[1] - ty).abs() < 1e-3,
+            "unweighted run recovered {free:?}, expected [{tx}, {ty}]"
+        );
+
+        // Weight 0 on y: it never leaves its initial value, exactly. x still
+        // converges, though not to `tx` — it converges to the best x under the
+        // constraint y = 0, which the y-mismatch pulls slightly off 3.
+        let frozen = run(vec![1.0, 0.0]);
+        assert_eq!(
+            frozen[1], 0.0,
+            "the zero-weighted parameter moved to {}",
+            frozen[1]
+        );
+        assert!(
+            (frozen[0] - tx).abs() < 5e-2,
+            "the unfrozen parameter recovered {} not ≈{tx}",
+            frozen[0]
+        );
+    }
+
+    #[test]
+    fn weights_of_the_wrong_length_are_rejected_with_itks_message() {
+        use sitk_transform::AffineTransform;
+        let fixed = gaussian(20, 20, 10.0, 10.0, 4.0, 1.0);
+        let moving = gaussian(20, 20, 11.0, 10.0, 4.0, 1.0);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_gradient_descent(1.0, 1)
+            .set_optimizer_weights(vec![1.0; 5]);
+        let init = AffineTransform::new(
+            2,
+            vec![1.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0],
+            vec![10.0, 10.0],
+        );
+        let err = reg.execute(&fixed, &moving, init).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::OptimizerWeightsLength {
+                    got: 5,
+                    expected: 6
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Size of weights (5) must equal number of local parameters (6)."
+        );
+    }
+
+    #[test]
+    fn displacement_field_weights_are_sized_by_the_local_parameter_count() {
+        // ITK validates against metric->GetNumberOfLocalParameters(), which for
+        // a displacement field is just `dim` — not its (huge) parameter count.
+        // The short array is then tiled across every pixel's parameter block.
+        use sitk_transform::DisplacementFieldTransform;
+        let fixed = gaussian(12, 12, 6.0, 6.0, 3.0, 1.0);
+        let moving = gaussian(12, 12, 7.0, 6.0, 3.0, 1.0);
+        let field = DisplacementFieldTransform::from_image_domain(&fixed).unwrap();
+        let nparams = field.number_of_parameters();
+        assert_eq!(nparams, 12 * 12 * 2);
+
+        // Length `dim` is accepted, and the zero y-weight freezes the y
+        // component of *every* pixel's displacement.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_gradient_descent(1.0, 5)
+            .set_optimizer_weights(vec![1.0, 0.0]);
+        let result = reg
+            .execute(
+                &fixed,
+                &moving,
+                DisplacementFieldTransform::from_image_domain(&fixed).unwrap(),
+            )
+            .unwrap();
+        let p = result.transform.parameters();
+        for pixel in 0..nparams / 2 {
+            assert_eq!(p[2 * pixel + 1], 0.0, "pixel {pixel} moved along y");
+        }
+        assert!(
+            p.iter().step_by(2).any(|&v| v.abs() > 1e-6),
+            "no pixel moved along x"
+        );
+
+        // Length `nparams` — the whole-transform count — is rejected.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_as_gradient_descent(1.0, 1)
+            .set_optimizer_weights(vec![1.0; nparams]);
+        let err = reg
+            .execute(
+                &fixed,
+                &moving,
+                DisplacementFieldTransform::from_image_domain(&fixed).unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::OptimizerWeightsLength {
+                    got: 288,
+                    expected: 2
+                }
+            ),
+            "unexpected error {err:?}"
+        );
+    }
+
+    #[test]
+    fn lbfgsb_validates_the_weights_length_and_then_ignores_the_weights() {
+        // ObjectToObjectOptimizerBase::StartOptimization validates m_Weights for
+        // every v4 optimizer, but only the gradient-descent family owns
+        // ModifyGradientByScalesOverSubRange. So L-BFGS-B rejects a mis-sized
+        // array and silently discards a well-sized one (ledger §2.112).
+        let fixed = gaussian(40, 40, 20.0, 20.0, 7.0, 1.0);
+        let moving = gaussian(40, 40, 23.0, 18.0, 7.0, 1.0);
+        let run = |weights: Vec<f64>| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_optimizer_as_lbfgsb(1e-5, 100, 5, 2000, 1e7, -1e3, 1e3)
+                .set_optimizer_weights(weights);
+            reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+        };
+
+        // A zero weight would freeze y under gradient descent; L-BFGS-B ignores
+        // it and still recovers the full translation.
+        let weighted = run(vec![1.0, 0.0]).unwrap().transform.parameters();
+        let unweighted = run(Vec::new()).unwrap().transform.parameters();
+        assert_eq!(weighted, unweighted);
+        assert!((weighted[1] + 2.0).abs() < 1e-2, "y = {}", weighted[1]);
+
+        // The length is still validated.
+        let err = run(vec![1.0, 1.0, 1.0]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistrationError::OptimizerWeightsLength {
+                    got: 3,
+                    expected: 2
+                }
             ),
             "unexpected error {err:?}"
         );
