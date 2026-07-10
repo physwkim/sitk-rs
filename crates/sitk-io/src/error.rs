@@ -88,8 +88,8 @@ pub enum IoError {
 
     /// A GIPL feature this port does not implement, or that `GiplImageIO`
     /// itself refuses. Three sites, all upstream's own: gzip-compressed
-    /// `.gipl.gz` (which needs the zlib this workspace has no dependency on,
-    /// §5.8), the `"Pixel Type Unknown"` `SwapBytesIfNecessary` raises for a
+    /// `.gipl.gz` (not yet wired to [`crate::compression`], §5.8), the
+    /// `"Pixel Type Unknown"` `SwapBytesIfNecessary` raises for a
     /// 32-bit integer image (itkGiplImageIO.cxx:648-651), and the
     /// `"Invalid type"` `Write` raises for a 64-bit one (`:759-761`).
     #[error("unsupported GIPL feature: {0}")]
@@ -107,6 +107,13 @@ pub enum IoError {
     /// image of more than three dimensions (itkVTKImageIO.cxx:647-651).
     #[error("unsupported VTK feature: {0}")]
     UnsupportedVtkFeature(String),
+
+    /// A zlib or gzip stream could not be inflated. Upstream has no such error:
+    /// `MET_PerformUncompression` returns `true` after printing "Uncompress
+    /// failed" (metaUtils.cxx:883), leaving the caller's buffer uninitialised.
+    /// See [`crate::compression`] and ledger §4.75.
+    #[error("corrupt compressed stream: {0}")]
+    CorruptCompressedData(String),
 
     /// The pixel data was shorter than the header's declared size.
     #[error("pixel data is truncated")]

@@ -84,12 +84,24 @@
 //!
 //! # Encodings
 //!
-//! `raw` is read and written. `ascii` (whose canonical *name*, and therefore
-//! the string written into a header, is `ASCII` — encodingAscii.c) is read
-//! only, which loses nothing: ITK always writes binary and never sets
-//! `UseCompression` for NRRD, so `NrrdImageIO::Write` only ever emits `raw`.
-//! `gzip`, `bzip2`, `hex` and `zrl` are recognised and rejected — this
-//! workspace takes no compression dependency (ledger §5.8).
+//! `raw` and `gzip` are read and written; `gzip` is what
+//! `NrrdImageIO::Write` emits under `SetUseCompression(true)`, because
+//! `InternalSetCompressor("")` — the default compressor — resolves to
+//! `nrrdEncodingGzip` (itkNrrdImageIO.cxx:380-392, 1404-1409). `ascii` (whose
+//! canonical *name*, and therefore the string written into a header, is `ASCII`
+//! — encodingAscii.c) is read only, which loses nothing: `GetFileType()` is
+//! `Binary` for everything SimpleITK writes. `bzip2`, `hex` and `zrl` are
+//! recognised and rejected: `bzip2` needs a dependency this workspace does not
+//! take, and the other two have no ITK write path (ledger §5.8, §4.53).
+//!
+//! `line skip` and `byte skip` are *not* symmetric across encodings. For a
+//! non-compression encoding both are applied to the file stream. For `gzip`
+//! only `line skip` is (formatNRRD.c:579-585); the byte skip is performed by
+//! `encodingGzip_read` on the **decompressed** buffer, which is why a negative
+//! `byte skip` — rejected everywhere else but `raw` — is legal with `gzip` and
+//! means "the data is the tail of the inflated stream"
+//! (encodingGzip.c:81-140). A gzip stream without the two magic bytes is read
+//! transparently, as a byte copy (ledger §2.113).
 //!
 //! # Header grammar
 //!
@@ -124,10 +136,11 @@
 //!   measurement frame are therefore stringified on read and parsed back on
 //!   write. Ledger §4.52.
 //! * `encoding: ascii` (and its `text`/`txt` spellings) is read but never
-//!   written — ITK's writer hardcodes `nrrdEncodingTypeRaw`. `gzip` and
-//!   `bzip2` are recognised and rejected for want of a compression dependency
-//!   (ledger §5.8); `hex` and `zrl` likewise. `data file:` supports the
-//!   bare-filename and `LIST` forms only. Ledger §4.53.
+//!   written — ITK's writer reaches it only through `SetFileType(ASCII)`, which
+//!   SimpleITK never calls. `bzip2` is recognised and rejected for want of a
+//!   dependency (ledger §5.8); `hex` and `zrl` likewise, having no write path.
+//!   `data file:` supports the bare-filename and `LIST` forms only.
+//!   Ledger §4.53.
 //! * The `kinds`/`sizes` consistency check (`nrrdKindSize`) runs unconditionally
 //!   at the end of header parsing, where upstream reaches it later, by way of
 //!   `nrrdSpacingCalculate`. Same predicate, earlier. Ledger §4.54.
@@ -153,8 +166,10 @@ use std::path::{Path, PathBuf};
 
 use sitk_core::{Complex, Image, PixelBuffer, PixelId};
 
+use crate::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gzip_compress};
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
+use crate::writer::WriteOptions;
 
 /// `NRRD_DIM_MAX` (nrrdDefines.h).
 const DIM_MAX: usize = 16;
@@ -332,6 +347,36 @@ const ENC_EQV: &[(&str, u32)] = &[
 /// byte-order agnostic.
 fn encoding_endian_matters(enc: u32) -> bool {
     !matches!(enc, ENC_ASCII | ENC_HEX)
+}
+
+/// `NrrdEncoding::isCompression` (encoding*.c). `formatNRRD_read` skips the
+/// `line skip` / `byte skip` pair for these, because the byte skip happens
+/// *inside* the decompressed stream (formatNRRD.c:583-585).
+fn encoding_is_compression(enc: u32) -> bool {
+    matches!(enc, ENC_GZIP | ENC_BZIP2)
+}
+
+/// `NrrdEncoding::name`, the spelling `nrrd__FprintFieldInfo` writes.
+fn encoding_name(enc: u32) -> &'static str {
+    match enc {
+        ENC_RAW => "raw",
+        ENC_ASCII => "ascii",
+        ENC_HEX => "hex",
+        ENC_GZIP => "gzip",
+        ENC_BZIP2 => "bzip2",
+        ENC_ZRL => "zrl",
+        other => unreachable!("no encoding {other}"),
+    }
+}
+
+/// `NrrdEncoding::suffix`, the extension a detached `.nhdr` gives its data file
+/// (`"raw"`, encodingRaw.c:153; `"raw.gz"`, encodingGzip.c:302). It is glued on
+/// with a `.` by `formatNRRD_write` (formatNRRD.c:720-728).
+fn encoding_suffix(enc: u32) -> &'static str {
+    match enc {
+        ENC_GZIP => "raw.gz",
+        _ => "raw",
+    }
 }
 
 const ENDIAN_LITTLE: u32 = 1;
@@ -1712,18 +1757,12 @@ fn resolve_data_file(header_path: &Path, name: &str) -> PathBuf {
     }
 }
 
-/// `nrrdLineSkip` then `nrrd__ByteSkipSkip` (read.c:280-361), applied to one
-/// data file's bytes before the encoding's own `read` runs. Both skips happen
-/// for *every* non-compression encoding, ascii included
-/// (formatNRRD.c:577-605) — this is the single owner of `line skip` /
-/// `byte skip`, so no decoder re-derives them.
-///
-/// `want` is the byte count a raw decode will consume; it is used only by the
-/// negative `byte skip`, which seeks from the end of the file and which
-/// `nrrd__ByteSkipSkip` rejects for any encoding but raw (read.c:320-327).
-fn skip_to_data<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8]> {
+/// `nrrdLineSkip` (read.c:280-301): drop `line skip` lines from the *file*
+/// stream. It runs for every encoding, compressed ones included
+/// (formatNRRD.c:579-582).
+fn skip_lines(data: &[u8], line_skip: usize) -> Result<&[u8]> {
     let mut pos = 0usize;
-    for _ in 0..io.line_skip {
+    for _ in 0..line_skip {
         let Some(nl) = data[pos..].iter().position(|&b| b == b'\n' || b == b'\r') else {
             return Err(IoError::TruncatedData);
         };
@@ -1732,9 +1771,21 @@ fn skip_to_data<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8
             pos += 1;
         }
     }
+    Ok(&data[pos..])
+}
+
+/// `nrrd__ByteSkipSkip` (read.c:303-361): the `byte skip` that `formatNRRD_read`
+/// applies to the *file* stream, and only for a non-compression encoding — for
+/// a compressed one the skip belongs to the decompressed stream instead
+/// (formatNRRD.c:583-585), so [`byte_skip_decompressed`] owns it there.
+///
+/// `want` is the byte count the decode will consume; it is used only by the
+/// negative `byte skip`, which seeks from the end of the file and which
+/// upstream rejects for any encoding but raw (read.c:320-327).
+fn byte_skip_file<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8]> {
+    debug_assert!(!encoding_is_compression(io.encoding));
     let start = if io.byte_skip >= 0 {
-        pos.checked_add(io.byte_skip as usize)
-            .ok_or(IoError::TruncatedData)?
+        io.byte_skip as usize
     } else {
         if io.encoding != ENC_RAW {
             return Err(bad(
@@ -1744,10 +1795,12 @@ fn skip_to_data<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8
         let back = want + (-io.byte_skip - 1) as usize;
         data.len().checked_sub(back).ok_or(IoError::TruncatedData)?
     };
-    if start > data.len() {
-        return Err(IoError::TruncatedData);
-    }
-    Ok(&data[start..])
+    data.get(start..).ok_or(IoError::TruncatedData)
+}
+
+/// `nrrdLineSkip` then `nrrd__ByteSkipSkip`, for a non-compression encoding.
+fn skip_to_data<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8]> {
+    byte_skip_file(skip_lines(data, io.line_skip)?, io, want)
 }
 
 /// [`skip_to_data`] followed by the raw decode of exactly `want` bytes.
@@ -1759,6 +1812,29 @@ fn raw_slice<'a>(data: &'a [u8], io: &IoState, want: usize) -> Result<&'a [u8]> 
         return Err(IoError::TruncatedData);
     }
     Ok(&rest[..want])
+}
+
+/// The `byte skip` `encodingGzip_read` performs on its *decompressed* buffer
+/// (encodingGzip.c:81-181).
+///
+/// A non-negative skip drops that many bytes off the front and then requires
+/// `want` more; a short stream is the `sizeRed != sizeData` error (`:174-180`).
+///
+/// A negative skip is legal here — unlike for raw — because the gzip decoder
+/// implements it itself: `backwards = -byteSkip - 1` bytes are ignored *after*
+/// the data, and the data is the `want` bytes ending `backwards` from the end
+/// (`:132-140`). So `byte skip: -1` means "the data is the tail of the stream".
+fn byte_skip_decompressed(data: &[u8], byte_skip: i64, want: usize) -> Result<&[u8]> {
+    let start = if byte_skip >= 0 {
+        byte_skip as usize
+    } else {
+        let backwards = (-byte_skip - 1) as usize;
+        data.len()
+            .checked_sub(want + backwards)
+            .ok_or(IoError::TruncatedData)?
+    };
+    let end = start.checked_add(want).ok_or(IoError::TruncatedData)?;
+    data.get(start..end).ok_or(IoError::TruncatedData)
 }
 
 /// `nrrdIStore`-style parse of `values` whitespace-separated ASCII numbers
@@ -1807,15 +1883,10 @@ fn ascii_decode(text: &str, ntype: u32, values: usize) -> Result<Vec<u8>> {
 fn read_data(path: &Path, header_bytes: &[u8], parsed: &ParsedHeader) -> Result<Vec<u8>> {
     let ParsedHeader { nrrd, io, .. } = parsed;
     match io.encoding {
-        ENC_RAW | ENC_ASCII => {}
-        ENC_GZIP => {
-            return Err(unsupported(
-                "`encoding: gzip` — this build has no compression support (ledger §5.8)",
-            ));
-        }
+        ENC_RAW | ENC_ASCII | ENC_GZIP => {}
         ENC_BZIP2 => {
             return Err(unsupported(
-                "`encoding: bzip2` — this build has no compression support (ledger §5.8)",
+                "`encoding: bzip2` — this build has no bzip2 dependency (ledger §5.8)",
             ));
         }
         ENC_HEX => return Err(unsupported("`encoding: hex`")),
@@ -1845,19 +1916,31 @@ fn read_data(path: &Path, header_bytes: &[u8], parsed: &ParsedHeader) -> Result<
             owned = std::fs::read(resolve_data_file(path, name))?;
             &owned
         };
-        if io.encoding == ENC_RAW {
-            data.extend_from_slice(raw_slice(bytes, io, per_file_bytes)?);
-        } else {
-            let rest = skip_to_data(bytes, io, per_file_bytes)?;
-            let text =
-                std::str::from_utf8(rest).map_err(|_| bad("ascii data is not valid UTF-8"))?;
-            data.extend_from_slice(&ascii_decode(text, nrrd.ntype, per_file_values)?);
+        match io.encoding {
+            ENC_RAW => data.extend_from_slice(raw_slice(bytes, io, per_file_bytes)?),
+            ENC_GZIP => {
+                // `nrrdLineSkip` runs on the file stream; the gzip decoder then
+                // owns the byte skip inside what it inflates.
+                let stream = skip_lines(bytes, io.line_skip)?;
+                let inflated = gunzip_transparent(stream)?;
+                data.extend_from_slice(byte_skip_decompressed(
+                    &inflated,
+                    io.byte_skip,
+                    per_file_bytes,
+                )?);
+            }
+            _ => {
+                let rest = skip_to_data(bytes, io, per_file_bytes)?;
+                let text =
+                    std::str::from_utf8(rest).map_err(|_| bad("ascii data is not valid UTF-8"))?;
+                data.extend_from_slice(&ascii_decode(text, nrrd.ntype, per_file_values)?);
+            }
         }
     }
 
-    // `nrrdSwapEndian` after all data files (read.c). Only the raw encoding
-    // cares, and only for multi-byte types.
-    if io.encoding == ENC_RAW && io.endian == ENDIAN_BIG && element_size > 1 {
+    // `nrrdSwapEndian` after all data files (read.c). Only encodings whose
+    // `endianMatters` is set care, and only for multi-byte types.
+    if encoding_endian_matters(io.encoding) && io.endian == ENDIAN_BIG && element_size > 1 {
         for chunk in data.chunks_exact_mut(element_size) {
             chunk.reverse();
         }
@@ -2659,7 +2742,11 @@ fn build_header(nrrd: &Nrrd, io: &IoState) -> String {
     if encoding_endian_matters(io.encoding) && type_size(nrrd.ntype) > 1 {
         out.push_str(&format!("{}: little\n", field(F_ENDIAN)));
     }
-    out.push_str(&format!("{}: raw\n", field(F_ENCODING)));
+    out.push_str(&format!(
+        "{}: {}\n",
+        field(F_ENCODING),
+        encoding_name(io.encoding)
+    ));
     if nrrd.space_dim > 0 && air_exists(nrrd.space_origin[0]) {
         out.push_str(&format!(
             "{}: {}\n",
@@ -2807,15 +2894,23 @@ fn write_measurement_frame(nrrd: &mut Nrrd, key_field: &str, value: &str) -> Res
 /// `NrrdImageIO::Write` (itkNrrdImageIO.cxx:1259-1420).
 ///
 /// `.nhdr` selects the detached header `nrrdSave` produces: the data goes into
-/// a sibling `<stem>.raw` named by a header-relative `data file:` field
-/// (formatNRRD.c / `nrrdSave`). `.nrrd` embeds the data after the blank line.
+/// a sibling file named `<stem>.` plus the encoding's `suffix` — `raw`, or
+/// `raw.gz` when compressing (formatNRRD.c:720-728). `.nrrd` embeds the data
+/// after the blank line.
+///
+/// With [`WriteOptions::use_compression`] set, the encoding becomes `gzip`:
+/// `NrrdImageIO::Write` picks `m_NrrdCompressionEncoding`, which
+/// `InternalSetCompressor("")` resolved to `nrrdEncodingGzip` at construction
+/// (itkNrrdImageIO.cxx:380-392, 1404-1409), and passes the compression level
+/// down as `nio->zlibLevel`. Otherwise the encoding is `raw` — `GetFileType()`
+/// is `Binary` for everything SimpleITK writes, so the `ascii` arm is dead.
 ///
 /// The image's meta-data dictionary is written, as upstream's does: keys
 /// beginning with `NRRD_` are routed to the reserved-field handlers, and every
 /// other key becomes a `key:=value` pair. `NRRD_pixel_original_axis` — a key
 /// the reader itself sets — matches no reserved field and is silently dropped
 /// (ledger §2.85).
-pub fn write(image: &Image, path: &Path) -> Result<()> {
+pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
     let dimension = image.dimension();
     let components = image.buffer_stride();
     let pixel_axes = usize::from(components > 1);
@@ -2884,10 +2979,19 @@ pub fn write(image: &Image, path: &Path) -> Result<()> {
     }
 
     let mut io = IoState {
-        encoding: ENC_RAW,
+        encoding: if options.use_compression {
+            ENC_GZIP
+        } else {
+            ENC_RAW
+        },
         ..IoState::default()
     };
     let data = buffer_to_le_bytes(image.buffer());
+    let data = if io.encoding == ENC_GZIP {
+        gzip_compress(&data, options.resolved_level(ITK_DEFAULT_COMPRESSION_LEVEL))
+    } else {
+        data
+    };
 
     let detached = path
         .extension()
@@ -2897,7 +3001,7 @@ pub fn write(image: &Image, path: &Path) -> Result<()> {
             .file_stem()
             .ok_or_else(|| IoError::InvalidPath(path.to_path_buf()))?;
         let mut raw_name = stem.to_os_string();
-        raw_name.push(".raw");
+        raw_name.push(format!(".{}", encoding_suffix(io.encoding)));
         io.data_fn.push(raw_name.to_string_lossy().into_owned());
         std::fs::write(path, build_header(&nrrd, &io))?;
         std::fs::write(path.with_file_name(raw_name), data)?;
@@ -2954,8 +3058,8 @@ impl ImageIo for NrrdImageIo {
         read(path)
     }
 
-    fn write(&self, image: &Image, path: &Path) -> Result<()> {
-        write(image, path)
+    fn write(&self, image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
+        write(image, path, options)
     }
 }
 

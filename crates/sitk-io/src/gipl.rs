@@ -130,6 +130,7 @@ use sitk_core::{Image, PixelBuffer, PixelId};
 
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
+use crate::writer::WriteOptions;
 
 /// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write`] emits.
 pub const GIPL_MAGIC_NUMBER: u32 = 0xefff_e9b0;
@@ -585,7 +586,9 @@ impl ImageIo for GiplImageIo {
         read(path)
     }
 
-    fn write(&self, image: &Image, path: &Path) -> Result<()> {
+    /// `options` is ignored: `GiplImageIO` compresses iff the file name ends
+    /// in `.gipl.gz` (itkGiplImageIO.cxx:249-256), never from `m_UseCompression`.
+    fn write(&self, image: &Image, path: &Path, _options: &WriteOptions) -> Result<()> {
         write(image, path)
     }
 }

@@ -170,6 +170,7 @@ use sitk_core::{Image, PixelBuffer, PixelId};
 
 use crate::error::{IoError, Result};
 use crate::image_io::{ImageInformation, ImageIo};
+use crate::writer::WriteOptions;
 
 /// The first two header lines `WriteImageInformation` emits, verbatim.
 const HEADER_PREAMBLE: &str = "# vtk DataFile Version 3.0\n\
@@ -1026,7 +1027,8 @@ impl ImageIo for VtkImageIo {
         read(path)
     }
 
-    fn write(&self, image: &Image, path: &Path) -> Result<()> {
+    /// `options` is ignored: `VTKImageIO` has no compressed write path.
+    fn write(&self, image: &Image, path: &Path, _options: &WriteOptions) -> Result<()> {
         write(image, path)
     }
 }
