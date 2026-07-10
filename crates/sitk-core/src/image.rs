@@ -871,6 +871,52 @@ impl Image {
         self.linear_index(index) * self.buffer_stride + component
     }
 
+    /// The single bounds-checking seam for the pixel accessors: the offset of
+    /// the pixel at `index`'s first component in the interleaved buffer.
+    ///
+    /// Every `get_*`/`set_*` pixel accessor reaches its buffer through this
+    /// function, so none of them can read or write a pixel other than the one
+    /// `index` names. [`Image::linear_index`] and [`Image::component_index`]
+    /// stay unchecked — they are the loop primitives filters use over indices
+    /// they have already constrained, and both say so.
+    ///
+    /// The two rejections mirror upstream exactly:
+    ///
+    /// - `index.len() < dimension()` — `sitkSTLVectorToITK`
+    ///   (sitkTemplateFunctions.h:100-105). A **longer** index is accepted and
+    ///   its extra elements ignored, as `sitkImage.h:499-501` promises
+    ///   ("additional elements will be ignored").
+    /// - any `index[d] >= size[d]` — `PimpleImage::GetIndex`
+    ///   (sitkPimpleImageBase.hxx:788-797), whose `IsInside` test against the
+    ///   largest possible region throws "index out of bounds". SimpleITK's
+    ///   indices are `uint32_t`, so its lower bound is met by the type; here
+    ///   `usize` does the same.
+    ///
+    /// Without this seam an index past an axis but inside the buffer — `[3, 0]`
+    /// on a 3x3 image — resolved to a different pixel, silently.
+    fn checked_pixel_start(&self, index: &[usize]) -> Result<usize> {
+        let dim = self.dimension();
+        if index.len() < dim {
+            return Err(Error::IndexDimensionMismatch {
+                dimension: dim,
+                actual: index.len(),
+            });
+        }
+        let mut offset = 0usize;
+        let mut stride = 1usize;
+        for d in 0..dim {
+            if index[d] >= self.size[d] {
+                return Err(Error::IndexOutOfBounds {
+                    index: index[..dim].to_vec(),
+                    size: self.size.clone(),
+                });
+            }
+            offset += index[d] * stride;
+            stride *= self.size[d];
+        }
+        Ok(offset * self.buffer_stride)
+    }
+
     /// The components of the pixel at `index`, as a `&[T]` of length
     /// [`Image::buffer_stride`] — SimpleITK's `GetPixelAsVector*`.
     ///
@@ -880,36 +926,41 @@ impl Image {
     /// complex image, and returning that image's single "component" would mean
     /// handing back half its pixel.
     ///
-    /// Errors on component-type mismatch.
+    /// Errors on component-type mismatch, on an `index` shorter than
+    /// [`Image::dimension`], and on an out-of-bounds `index` — the private
+    /// `checked_pixel_start` seam every pixel accessor shares.
+    ///
+    /// The guards run in upstream's order: `InternalGetPixelAs`
+    /// (sitkPimpleImageBase.hxx:800-823) selects its branch on the pixel type
+    /// first and only then calls `GetIndex`, so a wrong `T` is reported even
+    /// when `index` is also out of bounds.
     ///
     /// # Divergence
     ///
     /// SimpleITK's `GetPixelAsVectorFloat32` throws on a complex image — its
-    /// `InternalGetPixelAsVector` is gated on `IsVector<ImageType>::Value`
-    /// (sitkPimpleImageBase.hxx). One uniform "give me this pixel's components"
-    /// rule is preferred here over a fourth guard; [`Image::get_complex`] is
-    /// the typed accessor.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// `InternalGetPixelAs` is gated on `IsVector<ImageType>::Value`
+    /// (sitkPimpleImageBase.hxx:813). One uniform "give me this pixel's
+    /// components" rule is preferred here over a fourth guard;
+    /// [`Image::get_complex`] is the typed accessor.
     pub fn get_vector<T: Scalar>(&self, index: &[usize]) -> Result<&[T]> {
-        let start = self.component_index(index, 0);
-        let stride = self.buffer_stride;
         let all = self.component_slice::<T>()?;
-        Ok(&all[start..start + stride])
+        let start = self.checked_pixel_start(index)?;
+        Ok(&all[start..start + self.buffer_stride])
     }
 
     /// Overwrite the components of the pixel at `index` — SimpleITK's
     /// `SetPixelAsVector*`.
     ///
-    /// Errors on component-type mismatch, or if `values.len()` is not
-    /// [`Image::buffer_stride`]. Same divergence note as [`Image::get_vector`].
+    /// Errors as [`Image::get_vector`] does, and with
+    /// [`Error::InvalidComponentCount`] if `values.len()` is not
+    /// [`Image::buffer_stride`]. Same divergence note.
     ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// The length check comes last, as upstream's does: `InternalSetPixelAs`
+    /// (sitkPimpleImageBase.hxx:867-878) fetches `GetPixel(GetIndex(idx))`
+    /// before comparing `px.GetSize()` against `v.size()`.
     pub fn set_vector<T: Scalar>(&mut self, index: &[usize], values: &[T]) -> Result<()> {
+        self.component_slice::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         let stride = self.buffer_stride;
         if values.len() != stride {
             return Err(Error::InvalidComponentCount {
@@ -917,7 +968,6 @@ impl Image {
                 components_per_pixel: values.len(),
             });
         }
-        let start = self.component_index(index, 0);
         let all = self.component_vec_mut::<T>()?;
         all[start..start + stride].copy_from_slice(values);
         Ok(())
@@ -936,16 +986,13 @@ impl Image {
     /// The complex pixel at `index` — SimpleITK's
     /// `GetPixelAsComplexFloat32`/`64` (sitkImage.cxx:596-608).
     ///
-    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image
-    /// and [`Error::PixelTypeMismatch`] if `T` is not the component type.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
+    /// Errors with [`Error::RequiresComplexPixelType`] on a non-complex image,
+    /// [`Error::PixelTypeMismatch`] if `T` is not the component type, and
+    /// [`Error::IndexOutOfBounds`] / [`Error::IndexDimensionMismatch`] on a bad
+    /// `index`. Guard order is upstream's: pixel type before index.
     pub fn get_complex<T: Real>(&self, index: &[usize]) -> Result<Complex<T>> {
-        self.require_complex()?;
-        let start = self.component_index(index, 0);
         let all = self.complex_components::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         Ok(Complex::new(all[start], all[start + 1]))
     }
 
@@ -953,13 +1000,9 @@ impl Image {
     /// `SetPixelAsComplexFloat32`/`64`.
     ///
     /// Errors exactly as [`Image::get_complex`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds, like indexing a slice.
     pub fn set_complex<T: Real>(&mut self, index: &[usize], value: Complex<T>) -> Result<()> {
-        self.require_complex()?;
-        let start = self.component_index(index, 0);
+        self.complex_components::<T>()?;
+        let start = self.checked_pixel_start(index)?;
         let all = self.complex_components_mut::<T>()?;
         all[start] = value.re;
         all[start + 1] = value.im;

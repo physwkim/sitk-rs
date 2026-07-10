@@ -703,4 +703,64 @@ mod tests {
         let img = Image::new(&[2, 2], PixelId::ComplexFloat64);
         assert_eq!(dispatch_scalar!(img.pixel_id(), pixel_size), 8);
     }
+
+    // ---- pixel index bounds: the `checked_pixel_start` seam -----------------
+
+    #[test]
+    fn pixel_accessors_reject_an_index_past_an_axis() {
+        // [3, 0] on a 3x3 image has linear index 3 — a valid *buffer* offset
+        // that names the pixel at [0, 1]. Every accessor must refuse it, as
+        // `PimpleImage::GetIndex`'s `IsInside` test does.
+        let mut img = Image::from_vec(&[3, 3], (0..9u8).collect::<Vec<u8>>()).unwrap();
+        let expected = || Error::IndexOutOfBounds {
+            index: vec![3, 0],
+            size: vec![3, 3],
+        };
+        assert_eq!(img.get_vector::<u8>(&[3, 0]), Err(expected()));
+        assert_eq!(img.set_vector::<u8>(&[3, 0], &[1]), Err(expected()));
+        // The last in-bounds index still resolves.
+        assert_eq!(img.get_vector::<u8>(&[2, 2]).unwrap(), &[8]);
+    }
+
+    #[test]
+    fn complex_accessors_bounds_check_the_index() {
+        let mut img = Image::new(&[2, 2], PixelId::ComplexFloat32);
+        let expected = || Error::IndexOutOfBounds {
+            index: vec![0, 2],
+            size: vec![2, 2],
+        };
+        assert_eq!(img.get_complex::<f32>(&[0, 2]), Err(expected()));
+        assert_eq!(
+            img.set_complex::<f32>(&[0, 2], Complex::new(1.0, 1.0)),
+            Err(expected())
+        );
+    }
+
+    #[test]
+    fn pixel_accessors_need_at_least_dimension_index_elements() {
+        let img = Image::from_vec(&[2, 2, 2], (0..8u8).collect::<Vec<u8>>()).unwrap();
+        assert_eq!(
+            img.get_vector::<u8>(&[1, 1]),
+            Err(Error::IndexDimensionMismatch {
+                dimension: 3,
+                actual: 2,
+            })
+        );
+        // "additional elements will be ignored" — sitkImage.h:499-501.
+        assert_eq!(img.get_vector::<u8>(&[1, 1, 1, 9]).unwrap(), &[7]);
+    }
+
+    #[test]
+    fn pixel_type_is_checked_before_the_index() {
+        // `InternalGetPixelAs` selects on the pixel type `if constexpr` and only
+        // then calls `GetIndex`, so a wrong `T` wins over an out-of-bounds index.
+        let img = Image::from_vec(&[2, 2], vec![0.0f32; 4]).unwrap();
+        assert_eq!(
+            img.get_vector::<u8>(&[99, 99]),
+            Err(Error::PixelTypeMismatch {
+                expected: PixelId::Float32,
+                requested: PixelId::UInt8,
+            })
+        );
+    }
 }

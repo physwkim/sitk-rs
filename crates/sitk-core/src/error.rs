@@ -78,6 +78,24 @@ pub enum Error {
         components_per_pixel: usize,
     },
 
+    /// A pixel accessor was given an index shorter than the image dimension.
+    ///
+    /// SimpleITK's `sitkSTLVectorToITK` (sitkTemplateFunctions.h:100-105) throws
+    /// "Expected vector of length D but only got N elements." when
+    /// `idx.size() < D`; a *longer* index is accepted and its extra elements are
+    /// ignored (`sitkImage.h:499-501`).
+    #[error("pixel index needs at least {dimension} elements, got {actual}")]
+    IndexDimensionMismatch { dimension: usize, actual: usize },
+
+    /// A pixel accessor was given an index outside the image.
+    ///
+    /// SimpleITK's `PimpleImage::GetIndex` (sitkPimpleImageBase.hxx:788-797)
+    /// throws "index out of bounds" when the index leaves the largest possible
+    /// region: "Boundary checking is performed on idx, if it is out of bounds an
+    /// exception will be thrown" (sitkImage.h:501-502).
+    #[error("pixel index {index:?} is outside an image of size {size:?}")]
+    IndexOutOfBounds { index: Vec<usize>, size: Vec<usize> },
+
     /// A label-only operation was handed a floating-point or vector image.
     ///
     /// SimpleITK expresses the same restriction at compile time:
