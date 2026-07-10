@@ -379,8 +379,10 @@ pub(crate) fn flip_negative_spacing(dim: usize, spacing: &mut [f64], direction: 
 }
 
 /// Space-separated shortest-round-trip decimals, the string form the reader
-/// stores the `ITK_original_*` geometry under.
-fn join_f64(values: &[f64]) -> String {
+/// stores the `ITK_original_*` geometry under. Shared with the series reader
+/// ([`crate::ImageSeriesReader`]) so its padded per-slice originals format
+/// byte-identically to the single-file path's.
+pub(crate) fn join_f64(values: &[f64]) -> String {
     values
         .iter()
         .map(|v| v.to_string())
