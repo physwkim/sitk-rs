@@ -171,6 +171,7 @@ All nine items re-verified against SimpleITK master `3e193179` / ITK master
 | 3.16 | `ComplexToPhaseImageFilter.yaml` `briefdescription` | Reads "Computes pixel-wise the modulus of a complex image" — copy-pasted from `ComplexToModulusImageFilter.yaml`. The filter computes `std::atan2(A.imag(), A.real())` (`itkComplexToPhaseImageFilter.h:50`). Documentation-only; the port implements the phase. Found after the #2625 report, not yet filed. | `complex.rs` |
 | 3.17 | `LabelIntensityStatisticsImageFilter.yaml` | `NumberOfBins` is defaulted to a flat `128` for every pixel type. ITK's own default is `GetDefaultNumberOfBins()`, which is `1 << (8 * sizeof(FeaturePixelType))` for integral types of at most 2 bytes and `128` otherwise (`itkStatisticsLabelMapFilter.h:136-140`) — the value that also switches on the integer-centred bin bounds `[min - 0.5, max + 0.5]` (`itkStatisticsLabelMapFilter.hxx:74-85`). So through SimpleITK an 8-bit or 16-bit feature image silently loses ITK's default integer-exact `Median`, and the padded-bounds branch is reachable only by explicitly asking for 256 (resp. 65536) bins. The yaml's `detaileddescriptionSet` (`LabelIntensityStatisticsImageFilter.yaml:55-61`) warns the option "may have an effect on the value of the median" without saying the default was changed. This port follows the yaml. | `sitk-filters` `label_intensity.rs` |
 | 3.18 | `LabelMapContourOverlayImageFilter.yaml` | Two members whose yaml default contradicts both ITK and the yaml's own prose. (a) `SliceDimension` defaults to `0u` where ITK's is `ImageDimension - 1` (`itkLabelMapContourOverlayImageFilter.hxx:43`), and the yaml's `detaileddescriptionSet` still reads "defaults to image dimension - 1". Because the generated code always calls the setter, and because of §1.41, **every SimpleITK `SLICE_CONTOUR` run at the default `SliceDimension` draws nothing** and returns the plain grey feature image. (b) `DilationRadius` defaults to `std::vector<unsigned int>(3, 1)` where ITK's is all-zero (`.hxx:48-49`), and the yaml's own `detaileddescriptionSet` says "Set/Get the object dilation radius - 0 by default" — so SimpleITK silently dilates every object by one pixel before contouring. This port follows the yaml for both. | `sitk-filters` `label_map_overlay.rs` |
+| 3.19 | `GradientImageFilter.yaml` / `GradientRecursiveGaussianImageFilter.yaml` `UseImageDirection` | Both yamls set `default: 'false'` (`GradientImageFilter.yaml:23-25`, `GradientRecursiveGaussianImageFilter.yaml:29-31`) while their own `detaileddescriptionSet`/`detaileddescriptionGet` prose says verbatim "The default value of this flag is On" (`GradientImageFilter.yaml:28-32/35-39`, `GradientRecursiveGaussianImageFilter.yaml:34-38/41-45`) — the yaml's default contradicts its own embedded documentation, and both also disagree with the ITK class default `true` (`itkGradientImageFilter.h:226`, `itkGradientRecursiveGaussianImageFilter.h:257`). Because generated SimpleITK code always calls the setter, every default-parameter SimpleITK call to either filter computes derivatives/gradients with respect to the **index grid**, not physical space, despite the class's own header and the yaml's own prose describing the opposite. This port follows the yaml default (`false`) for both `gradient` and `gradient_recursive_gaussian`, pinned by `gradient_yaml_default_use_image_direction_false_does_not_rotate` and `grg_yaml_default_use_image_direction_false_does_not_rotate`. | `sitk-filters` `gradient.rs` |
 
 ## 4. Deliberate divergences of this port (no upstream defect implied)
 
@@ -234,18 +235,20 @@ consumers (`LabelOverlay`, `LabelToRGB`, `ScalarToRGBColormap`,
 conversion filters (`sitk-filters::complex`, §2.58/§3.16/§4.23/§4.24), and the
 LabelMap object type with its manipulation/statistics filters
 (`sitk-core::label_map`, §4.25–4.29). Multi-channel (vector/complex) MetaImage
-read/write landed 2026-07-10 (§2.67/§4.30).
+read/write landed 2026-07-10 (§2.67/§4.30). The three near-mechanical
+recursive-Gaussian composites — `SmoothingRecursiveGaussian`,
+`GradientRecursiveGaussian`, `Gradient` — landed 2026-07-10 (§3.19).
 
 What actually remains unported:
 
-- **BasicFilters (yaml), 13 non-FFT**: `Equal`, `Greater`, `Less`, `Round`,
+- **BasicFilters (yaml), 10 non-FFT**: `Equal`, `Greater`, `Less`, `Round`,
   `CyclicShift`, `ShiftScale`, `NormalizeToConstant`, `Rank` (only
   `FastApproximateRank` is ported — upstream ships both as separate filters),
   `VotingBinaryHoleFilling` (only the iterative variant is ported),
   `NormalizedCorrelation` (image + mask + template kernel via
-  `sitkImageToKernel.hxx`); plus the near-mechanical composites
+  `sitkImageToKernel.hxx`). The near-mechanical composites
   `SmoothingRecursiveGaussian`, `GradientRecursiveGaussian`, `Gradient`
-  (vector output). *Assigned wave-16, 2026-07-10.*
+  (vector output) landed 2026-07-10 (wave-16, §3.19).
 - **LabelMap residue (2)**: `LabelMapMask`, `LabelMapToBinary`.
   *Assigned wave-16.*
 - **FFT family (5)**: `ForwardFFT`, `InverseFFT`,
