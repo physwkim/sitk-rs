@@ -2391,10 +2391,10 @@ impl ImageRegistrationMethod {
         // poison the scales (`scales / 0 = +∞`, then `0 · ∞ = NaN`). Reject
         // explicitly-set weights rather than expose an inert parameter.
         let family = self.optimizer.family();
-        if let OptimizerFamily::GradientFree(optimizer) = family {
-            if !self.optimizer_weights.is_empty() {
-                return Err(RegistrationError::OptimizerWeightsNotApplicable { optimizer });
-            }
+        if let OptimizerFamily::GradientFree(optimizer) = family
+            && !self.optimizer_weights.is_empty()
+        {
+            return Err(RegistrationError::OptimizerWeightsNotApplicable { optimizer });
         }
 
         // Both L-BFGS variants ignore parameter scales and the learning-rate

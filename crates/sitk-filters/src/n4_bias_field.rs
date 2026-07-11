@@ -426,7 +426,7 @@ impl<'a> N4<'a> {
             ff[n] = v;
             ff[padded - n] = v;
         }
-        if padded % 2 == 0 {
+        if padded.is_multiple_of(2) {
             // A no-op restatement of the `n == half` term above
             // (`0.25 * padded^2 == half^2`), kept for parity with upstream.
             ff[half] = Complex::new(

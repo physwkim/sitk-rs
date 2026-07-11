@@ -136,12 +136,12 @@ fn is_prime(n: usize) -> bool {
     if n == 2 || n == 3 {
         return true;
     }
-    if n % 2 == 0 || n % 3 == 0 {
+    if n.is_multiple_of(2) || n.is_multiple_of(3) {
         return false;
     }
     let mut x = 5usize;
     while x <= n / x {
-        if n % x == 0 || n % (x + 2) == 0 {
+        if n.is_multiple_of(x) || n.is_multiple_of(x + 2) {
             return false;
         }
         x += 6;
@@ -158,7 +158,7 @@ pub(crate) fn greatest_prime_factor(n: usize) -> usize {
     let mut n = n;
     let mut v = 2usize;
     while v <= n {
-        if n % v == 0 && is_prime(v) {
+        if n.is_multiple_of(v) && is_prime(v) {
             n /= v;
         } else {
             v += 1;
@@ -232,7 +232,7 @@ const MAX_RADIX: usize = 11;
 fn is_fast_length(n: usize) -> bool {
     let mut n = n;
     for r in FAST_RADICES {
-        while n % r == 0 {
+        while n.is_multiple_of(r) {
             n /= r;
         }
     }
@@ -373,7 +373,7 @@ fn fft_fast(inp: &[Complex], stride: usize, out: &mut [Complex], n: usize, sign:
 
     let radix = FAST_RADICES
         .into_iter()
-        .find(|r| n % r == 0)
+        .find(|r| n.is_multiple_of(*r))
         .expect("fft_fast called on a length with a prime factor above 11");
     let m = n / radix;
 

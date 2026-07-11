@@ -253,7 +253,7 @@ fn buffer_to_le_bytes(buf: &PixelBuffer) -> Vec<u8> {
 
 fn buffer_from_bytes(id: PixelId, bytes: &[u8], big_endian: bool) -> Result<PixelBuffer> {
     let expected = id.size_in_bytes();
-    if bytes.len() % expected != 0 {
+    if !bytes.len().is_multiple_of(expected) {
         return Err(IoError::TruncatedData);
     }
     macro_rules! unpack {
@@ -560,17 +560,17 @@ fn parse_header(bytes: &[u8]) -> Result<Header> {
     let mut origin = vec![0.0; dims];
     let mut direction = identity(dims);
     for key in ["Offset", "Position", "Origin"] {
-        if legacy || key == "Offset" {
-            if let Some(v) = last(&fields, key) {
-                origin = parse_f64_list(v)?;
-            }
+        if (legacy || key == "Offset")
+            && let Some(v) = last(&fields, key)
+        {
+            origin = parse_f64_list(v)?;
         }
     }
     for key in ["Orientation", "Rotation", "TransformMatrix"] {
-        if legacy || key == "TransformMatrix" {
-            if let Some(v) = last(&fields, key) {
-                direction = parse_f64_list(v)?;
-            }
+        if (legacy || key == "TransformMatrix")
+            && let Some(v) = last(&fields, key)
+        {
+            direction = parse_f64_list(v)?;
         }
     }
     if spacing.len() != dims || origin.len() != dims || direction.len() != dims * dims {

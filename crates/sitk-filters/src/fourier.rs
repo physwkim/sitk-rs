@@ -255,7 +255,7 @@ pub fn real_to_half_hermitian_forward_fft(img: &Image) -> Result<(Image, bool)> 
         PixelId::Float32 => real_to_half_hermitian_typed::<f32>(img),
         _ => real_to_half_hermitian_typed::<f64>(img),
     })?;
-    Ok((out, img.size()[0] % 2 != 0))
+    Ok((out, !img.size()[0].is_multiple_of(2)))
 }
 
 // ---- HalfHermitianToRealInverseFFTImageFilter ------------------------------
@@ -284,7 +284,7 @@ fn expand_hermitian_line(half: &[Complex], len: usize, out: &mut [Complex]) {
         out[k] = half[k];
         out[len - k] = half[k].conj();
     }
-    if len % 2 == 0 {
+    if len.is_multiple_of(2) {
         out[len / 2] = Complex::new(half[len / 2].re, 0.0);
     }
 }

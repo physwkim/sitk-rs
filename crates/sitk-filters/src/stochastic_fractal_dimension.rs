@@ -190,11 +190,11 @@ pub fn stochastic_fractal_dimension(
             rem /= size[d];
         }
 
-        if let Some(mask) = &mask_vals {
-            if mask[center] == 0 {
-                out[center] = 0.0;
-                continue;
-            }
+        if let Some(mask) = &mask_vals
+            && mask[center] == 0
+        {
+            out[center] = 0.0;
+            continue;
         }
 
         info.clear();
@@ -213,11 +213,11 @@ pub fn stochastic_fractal_dimension(
                 continue;
             }
             let lin = image.linear_index(&neighbor_idx);
-            if let Some(mask) = &mask_vals {
-                if mask[lin] == 0 {
-                    info.push(None);
-                    continue;
-                }
+            if let Some(mask) = &mask_vals
+                && mask[lin] == 0
+            {
+                info.push(None);
+                continue;
             }
             let point = image.continuous_index_to_physical_point(
                 &neighbor_idx.iter().map(|&v| v as f64).collect::<Vec<_>>(),

@@ -285,11 +285,11 @@ pub fn normalized_correlation(
         NeighborhoodIterator::<f64, _>::new(&widened, &radius, ZeroFluxNeumannBoundaryCondition)?;
     let mut out = Vec::with_capacity(image.number_of_pixels());
     for (i, (_, nb)) in iter.enumerate() {
-        if let Some(mask_values) = &mask_values {
-            if mask_values[i] == 0.0 {
-                out.push(0.0);
-                continue;
-            }
+        if let Some(mask_values) = &mask_values
+            && mask_values[i] == 0.0
+        {
+            out.push(0.0);
+            continue;
         }
         let values = nb.values();
         let numerator: f64 = values

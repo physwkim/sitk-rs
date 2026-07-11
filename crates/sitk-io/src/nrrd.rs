@@ -1740,7 +1740,7 @@ fn data_fn_check(nrrd: &Nrrd, io: &IoState) -> Result<()> {
         }
     } else {
         let last = nrrd.axis[nrrd.dim - 1].size;
-        if files > last || last % files != 0 {
+        if files > last || !last.is_multiple_of(files) {
             return Err(bad(format!(
                 "{files} data files don't evenly divide the slowest axis size {last}"
             )));

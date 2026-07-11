@@ -97,13 +97,13 @@ pub fn scalar_connected_component(
     distance_threshold: f64,
     fully_connected: bool,
 ) -> Result<Image> {
-    if let Some(m) = mask {
-        if m.size() != image.size() {
-            return Err(FilterError::SizeMismatch {
-                a: image.size().to_vec(),
-                b: m.size().to_vec(),
-            });
-        }
+    if let Some(m) = mask
+        && m.size() != image.size()
+    {
+        return Err(FilterError::SizeMismatch {
+            a: image.size().to_vec(),
+            b: m.size().to_vec(),
+        });
     }
 
     let size = image.size();

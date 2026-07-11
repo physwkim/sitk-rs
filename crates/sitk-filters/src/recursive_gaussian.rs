@@ -514,7 +514,7 @@ fn filter_axis(buf: &mut [f64], size: &[usize], strides: &[usize], d: usize, coe
 
     for p in 0..buf.len() {
         // Each line is identified by its first element (coordinate 0 on axis d).
-        if (p / stride) % ln != 0 {
+        if !(p / stride).is_multiple_of(ln) {
             continue;
         }
         for (k, slot) in line.iter_mut().enumerate() {

@@ -503,7 +503,7 @@ fn adjust_heap(heap: &mut [Merge], mut hole: usize, len: usize, value: Merge) {
         heap[hole] = heap[second_child];
         hole = second_child;
     }
-    if len % 2 == 0 && second_child == (len - 2) / 2 {
+    if len.is_multiple_of(2) && second_child == (len - 2) / 2 {
         second_child = 2 * (second_child + 1);
         heap[hole] = heap[second_child - 1];
         hole = second_child - 1;
@@ -1110,7 +1110,7 @@ fn extract_merge_hierarchy(
             counter = 0;
             prune_edge_lists(table, threshold);
         }
-        if counter % 10_000 == 0 {
+        if counter.is_multiple_of(10_000) {
             merged.flatten();
         }
 

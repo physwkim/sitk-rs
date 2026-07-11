@@ -375,16 +375,16 @@ pub(crate) fn write_transform(transform: &Transform, path: &Path) -> Result<()> 
     // the failure surfaces here instead of on a later read. An empty composite
     // still writes and round-trips. A *nested* composite is caught by the same
     // guard: the outer composite is non-empty (§2.145).
-    if let Transform::Composite(composite) = transform {
-        if !composite.transforms().is_empty() {
-            return Err(IoError::UnsupportedMatlabTransformFeature(format!(
-                "a non-empty CompositeTransform cannot be written to a .mat file and read \
+    if let Transform::Composite(composite) = transform
+        && !composite.transforms().is_empty()
+    {
+        return Err(IoError::UnsupportedMatlabTransformFeature(format!(
+            "a non-empty CompositeTransform cannot be written to a .mat file and read \
                  back — MatlabTransformIO records one concatenated parameter vector with no \
                  sub-transform boundary (doc/upstream-findings.md §2.144/§2.145), so the {} \
                  sub-transform(s) here would be unrecoverable",
-                composite.transforms().len()
-            )));
-        }
+            composite.transforms().len()
+        )));
     }
 
     let mut out = Vec::new();

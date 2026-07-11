@@ -219,11 +219,11 @@ impl GradientDescentOptimizer {
             // ITK's per-iteration convergence test.
             if let (Some(mon), Some((_, min_cv))) = (monitor.as_mut(), self.convergence) {
                 mon.add_energy_value(value);
-                if let Some(cv) = mon.convergence_value() {
-                    if cv <= min_cv {
-                        stop_reason = StopReason::Converged;
-                        break;
-                    }
+                if let Some(cv) = mon.convergence_value()
+                    && cv <= min_cv
+                {
+                    stop_reason = StopReason::Converged;
+                    break;
                 }
             }
 
@@ -731,11 +731,11 @@ impl GradientDescentLineSearchOptimizer {
             // Per-iteration value-plateau test, matching ITK's convergence check.
             if let (Some(mon), Some((_, min_cv))) = (monitor.as_mut(), self.convergence) {
                 mon.add_energy_value(value);
-                if let Some(cv) = mon.convergence_value() {
-                    if cv <= min_cv {
-                        stop_reason = StopReason::Converged;
-                        break;
-                    }
+                if let Some(cv) = mon.convergence_value()
+                    && cv <= min_cv
+                {
+                    stop_reason = StopReason::Converged;
+                    break;
                 }
             }
 
@@ -982,11 +982,11 @@ impl ConjugateGradientLineSearchOptimizer {
 
             if let (Some(mon), Some((_, min_cv))) = (monitor.as_mut(), self.convergence) {
                 mon.add_energy_value(value);
-                if let Some(cv) = mon.convergence_value() {
-                    if cv <= min_cv {
-                        stop_reason = StopReason::Converged;
-                        break;
-                    }
+                if let Some(cv) = mon.convergence_value()
+                    && cv <= min_cv
+                {
+                    stop_reason = StopReason::Converged;
+                    break;
                 }
             }
 

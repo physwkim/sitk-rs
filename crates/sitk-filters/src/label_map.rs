@@ -311,19 +311,19 @@ pub fn change_label_label_map(map: &LabelMap, change_map: &[(f64, f64)]) -> Resu
     // Pass 1: pull every object whose label is a key out of the map.
     let mut pulled: Vec<LabelObject> = Vec::new();
     for &old in cmap.keys() {
-        if old != out.background() {
-            if let Some(object) = out.remove_label(old) {
-                pulled.push(object);
-            }
+        if old != out.background()
+            && let Some(object) = out.remove_label(old)
+        {
+            pulled.push(object);
         }
     }
 
     // Pass 2: move the background, evicting whatever object already sat on the
     // new background value.
-    if let Some(&new_background) = cmap.get(&out.background()) {
-        if new_background != out.background() {
-            out.set_background(new_background)?;
-        }
+    if let Some(&new_background) = cmap.get(&out.background())
+        && new_background != out.background()
+    {
+        out.set_background(new_background)?;
     }
 
     // Pass 3: put the pulled objects back under their new labels.

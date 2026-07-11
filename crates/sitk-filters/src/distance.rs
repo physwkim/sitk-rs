@@ -276,7 +276,7 @@ fn maurer_voronoi_pass(
     let mut h = vec![0.0f64; nd];
 
     for p0 in 0..buf.len() {
-        if (p0 / stride) % nd != 0 {
+        if !(p0 / stride).is_multiple_of(nd) {
             continue;
         }
 

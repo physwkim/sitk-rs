@@ -899,7 +899,9 @@ impl Marcher {
             }
         }
 
-        critical_c3_configurations > 0 && faces % 2 == 0 && critical_c3_configurations * 2 == faces
+        critical_c3_configurations > 0
+            && faces.is_multiple_of(2)
+            && critical_c3_configurations * 2 == faces
     }
 
     /// `DoesVoxelChangeViolateWellComposedness`'s inner call

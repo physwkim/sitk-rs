@@ -216,7 +216,7 @@ fn coefficients_along_axis(
 
     for base in 0..data.len() {
         // Only the lines' starting voxels: coordinate along `axis` is 0.
-        if (base / stride) % n_len != 0 {
+        if !(base / stride).is_multiple_of(n_len) {
             continue;
         }
         for (j, v) in scratch.iter_mut().enumerate() {

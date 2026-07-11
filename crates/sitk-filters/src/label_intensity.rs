@@ -220,12 +220,10 @@ fn bin_index(mins: &[f64], maxs: &[f64], v: f64) -> usize {
 /// min/max, or a half-pixel-padded type range on the integer-bin branch.
 fn histogram_bounds(feature_id: PixelId, number_of_bins: u32, min: f64, max: f64) -> (f64, f64) {
     let integral_and_narrow = feature_id.is_integer_scalar() && feature_id.size_in_bytes() <= 2;
-    if integral_and_narrow {
-        if let Some((type_min, type_max)) = feature_id.integer_scalar_bounds() {
-            let bits_shift = 8 * feature_id.size_in_bytes();
-            if u64::from(number_of_bins) == 1u64 << bits_shift {
-                return (type_min as f64 - 0.5, type_max as f64 + 0.5);
-            }
+    if integral_and_narrow && let Some((type_min, type_max)) = feature_id.integer_scalar_bounds() {
+        let bits_shift = 8 * feature_id.size_in_bytes();
+        if u64::from(number_of_bins) == 1u64 << bits_shift {
+            return (type_min as f64 - 0.5, type_max as f64 + 0.5);
         }
     }
     (min, max)
@@ -516,7 +514,7 @@ fn median_of(frequency: &[u64], bin_mins: &[f64], bin_maxs: &[f64], total_freq: 
         // `(total_freq + 1) / 2`, integer division, as upstream.
         if count >= total_freq.div_ceil(2) {
             let mut median = center(i);
-            if total_freq % 2 == 0 && count == total_freq / 2 {
+            if total_freq.is_multiple_of(2) && count == total_freq / 2 {
                 for (j, &f) in frequency.iter().enumerate().skip(i + 1) {
                     if f > 0 {
                         median += center(j);

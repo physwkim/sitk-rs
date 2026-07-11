@@ -1086,11 +1086,11 @@ fn itk_override_spacing(obj: &Obj) -> Result<[f64; 3]> {
 /// `ImageHelper::GetOriginValue`'s default arm (gdcmImageHelper.cxx:602-623).
 fn origin(obj: &Obj) -> [f64; 3] {
     let mut ori = [0.0; 3];
-    if let Some(e) = find(obj, IMAGE_POSITION_PATIENT) {
-        if let Some(bytes) = value_bytes(e) {
-            for (slot, value) in ori.iter_mut().zip(parse_decimal_strings(&bytes, 3)) {
-                *slot = value;
-            }
+    if let Some(e) = find(obj, IMAGE_POSITION_PATIENT)
+        && let Some(bytes) = value_bytes(e)
+    {
+        for (slot, value) in ori.iter_mut().zip(parse_decimal_strings(&bytes, 3)) {
+            *slot = value;
         }
     }
     ori
@@ -1896,7 +1896,7 @@ fn decode_pixels(h: &ImageHeader) -> Result<PixelBuffer> {
 /// (gdcmBitmap.cxx:288-294). Reproducing that would read the wrong bytes for a
 /// padded row, so a non-byte-aligned width is refused. Ledger §1.72.
 fn decode_single_bit(raw: &[u8], cols: usize, rows: usize, frames: usize) -> Result<PixelBuffer> {
-    if cols % 8 != 0 {
+    if !cols.is_multiple_of(8) {
         return Err(IoError::UnsupportedDicomFeature(format!(
             "SINGLEBIT image with Columns = {cols} (not a multiple of 8): ITK's bit-expansion \
              loop ignores the per-row byte padding"
@@ -2139,7 +2139,7 @@ impl LookupTable {
                 out.extend_from_slice(&self.rgb[base..base + 3]);
             }
         } else {
-            if index.len() % 2 != 0 {
+            if !index.len().is_multiple_of(2) {
                 return Err(IoError::MalformedDicom(
                     "16-bit palette index buffer has an odd byte length".into(),
                 ));
@@ -2158,7 +2158,7 @@ impl LookupTable {
 /// `ImageChangePhotometricInterpretation::YBR2RGB` with `storedbits = 8`
 /// (gdcmImageChangePhotometricInterpretation.h:93-106).
 fn ycbcr_to_rgb(bytes: &mut [u8]) -> Result<()> {
-    if bytes.len() % 3 != 0 {
+    if !bytes.len().is_multiple_of(3) {
         return Err(IoError::MalformedDicom(format!(
             "Buffer size {} is not valid for a 3-sample YBR image",
             bytes.len()

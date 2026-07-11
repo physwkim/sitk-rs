@@ -591,10 +591,10 @@ fn search_neighborhood(
     let radius: Vec<i64> = grid.iter().map(|&g| (g / 2) as i64).collect();
     let mut p: Vec<i64> = (0..lat.dim()).map(|d| centre[d] - radius[d]).collect();
     loop {
-        if let Some(flat) = lat.flatten_signed(&p) {
-            if labels[flat] == label {
-                return Some(flat);
-            }
+        if let Some(flat) = lat.flatten_signed(&p)
+            && labels[flat] == label
+        {
+            return Some(flat);
         }
         let mut d = 0;
         loop {

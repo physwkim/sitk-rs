@@ -371,7 +371,7 @@ fn label_runs(lab_buf: &[f64]) -> Vec<(usize, usize)> {
 /// odometer over the other axes, lowest axis fastest).
 fn line_starts(size: &[usize], strides: &[usize], axis: usize, n_pixels: usize) -> Vec<usize> {
     (0..n_pixels)
-        .filter(|lin| (lin / strides[axis]) % size[axis] == 0)
+        .filter(|lin| (lin / strides[axis]).is_multiple_of(size[axis]))
         .collect()
 }
 

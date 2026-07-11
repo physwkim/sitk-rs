@@ -165,7 +165,7 @@ fn factorize_number(n: usize) -> usize {
     let mut n = n;
     let mut ifac = 2usize;
     for offset in 1..=3usize {
-        while n % ifac == 0 {
+        while n.is_multiple_of(ifac) {
             n /= ifac;
         }
         ifac += offset;
@@ -543,7 +543,7 @@ mod tests {
     fn find_closest_valid_dimension_accepts_only_two_three_and_five() {
         fn five_smooth(mut n: usize) -> bool {
             for f in [2usize, 3, 5] {
-                while n % f == 0 {
+                while n.is_multiple_of(f) {
                     n /= f;
                 }
             }

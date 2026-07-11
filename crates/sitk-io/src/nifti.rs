@@ -1475,19 +1475,19 @@ fn find_hdr_name(path: &Path) -> Option<PathBuf> {
     let upper = ext.map(is_uppercase).unwrap_or(false);
 
     let mut hdr_first = false;
-    if let Some(ext) = ext {
-        if path.exists() {
-            // `fileext_n_compare(ext, ".img", 4)` (nifti1_io.c:2770) looks at the
-            // first four characters only, so `.img.gz` is an image name too and
-            // sends the search to `.hdr`/`.hdr.gz` first. Upstream's compare
-            // matches all-lowercase or all-uppercase; `find_file_extension` has
-            // already rejected anything mixed, so ASCII-insensitive is the same
-            // predicate over the reachable inputs.
-            if !ext[..4].eq_ignore_ascii_case(".img") {
-                return Some(path.to_path_buf());
-            }
-            hdr_first = true;
+    if let Some(ext) = ext
+        && path.exists()
+    {
+        // `fileext_n_compare(ext, ".img", 4)` (nifti1_io.c:2770) looks at the
+        // first four characters only, so `.img.gz` is an image name too and
+        // sends the search to `.hdr`/`.hdr.gz` first. Upstream's compare
+        // matches all-lowercase or all-uppercase; `find_file_extension` has
+        // already rejected anything mixed, so ASCII-insensitive is the same
+        // predicate over the reachable inputs.
+        if !ext[..4].eq_ignore_ascii_case(".img") {
+            return Some(path.to_path_buf());
         }
+        hdr_first = true;
     }
 
     let order: [&str; 2] = if hdr_first {
@@ -2820,10 +2820,10 @@ fn write_information(image: &Image, path: &Path) -> Result<WriteInfo> {
         }
         dim[0] = 5;
         intent_code = NIFTI_INTENT_VECTOR;
-        if let Some(v) = image.meta_data("intent_code") {
-            if v.trim().parse::<i32>().ok() == Some(NIFTI_INTENT_DISPVECT as i32) {
-                intent_code = NIFTI_INTENT_DISPVECT;
-            }
+        if let Some(v) = image.meta_data("intent_code")
+            && v.trim().parse::<i32>().ok() == Some(NIFTI_INTENT_DISPVECT as i32)
+        {
+            intent_code = NIFTI_INTENT_DISPVECT;
         }
         dim[5] = components as i16;
         for d in dims..4 {

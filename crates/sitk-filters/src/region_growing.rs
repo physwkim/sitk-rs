@@ -980,10 +980,10 @@ fn window_mean_and_covariance(
 /// [`matrix::invert`] in the nonsingular branch also falls back here.
 fn mahalanobis_inverse(covariance: &[f64], n: usize) -> Vec<f64> {
     let det_mag = matrix::determinant_magnitude(covariance, n);
-    if det_mag > SINGULAR_COVARIANCE_THRESHOLD {
-        if let Some(inv) = matrix::invert(covariance, n) {
-            return inv;
-        }
+    if det_mag > SINGULAR_COVARIANCE_THRESHOLD
+        && let Some(inv) = matrix::invert(covariance, n)
+    {
+        return inv;
     }
     let a_large_double = f64::MAX.powf(1.0 / 3.0) / n as f64;
     let mut inv = matrix::identity(n);
