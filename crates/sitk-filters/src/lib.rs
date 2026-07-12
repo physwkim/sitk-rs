@@ -293,7 +293,7 @@ pub use scalar_connected_component::scalar_connected_component;
 pub use scalar_to_rgb_colormap::{Colormap, scalar_to_rgb_colormap};
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::{bin_shrink, shrink};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar, parallel};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
 pub use smoothing::smooth_gaussian;
@@ -380,7 +380,9 @@ impl_binary_functor_float!(f32, f64);
 // ---- shared helpers -------------------------------------------------------
 
 fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Result<Image> {
-    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
+    // The narrowing exit path of most filters: an elementwise `T::from_f64`
+    // cast, bit-identical to the sequential map at any thread count.
+    let out: Vec<T> = parallel::map_slice(vals, |&v| T::from_f64(v));
     let mut img = Image::from_vec(size, out)?;
     img.copy_geometry_from(geom);
     Ok(img)
@@ -785,19 +787,15 @@ pub fn rescale_intensity_cpu(img: &Image, output_min: f64, output_max: f64) -> R
     if vals.is_empty() {
         return Err(FilterError::DegenerateRange);
     }
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &v in &vals {
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
+    // `min`/`max` select an element of the input set, so the chunked scan in
+    // `parallel::min_max` returns the same `f64` bits as this filter's former
+    // sequential `lo.min(v)` / `hi.max(v)` fold, at any thread count.
+    let (lo, hi) = parallel::min_max(&vals).ok_or(FilterError::DegenerateRange)?;
     if lo == hi {
         return Err(FilterError::DegenerateRange);
     }
     let scale = (output_max - output_min) / (hi - lo);
-    let out: Vec<f64> = vals
-        .iter()
-        .map(|&v| (v - lo) * scale + output_min)
-        .collect();
+    let out: Vec<f64> = parallel::map_slice(&vals, |&v| (v - lo) * scale + output_min);
     image_from_f64(img.pixel_id(), img.size(), img, &out)
 }
 

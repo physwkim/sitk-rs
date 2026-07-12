@@ -47,6 +47,8 @@
 use std::f64::consts::PI;
 use std::ops::{Add, Div, Mul, Sub};
 
+use sitk_core::parallel;
+
 /// A complex number. Crate-private: the public complex-pixel surface is
 /// [`sitk_core::Complex`], and no value of this type escapes `sitk-filters`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -504,11 +506,6 @@ fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
     }
 }
 
-/// The stride of each axis of a first-index-fastest buffer of extent `size`.
-fn axis_stride(size: &[usize], axis: usize) -> usize {
-    size[..axis].iter().product()
-}
-
 /// Unscaled separable transform of `data` along `axes` only, laid out
 /// first-index-fastest with extent `size`.
 ///
@@ -523,26 +520,33 @@ pub(crate) fn transform_axes(data: &mut [Complex], size: &[usize], axes: &[usize
         return;
     }
 
+    // Parallel over lines ([`parallel::for_each_line_mut`]). Each 1-D transform
+    // reads and writes only its own line, so lines are independent; the
+    // butterflies *within* a line — the only place complex arithmetic
+    // accumulates — run in their unchanged sequential radix order. Output is
+    // bit-identical to the sequential pass. The axes stay sequential (each
+    // consumes the previous axis's result), and the gather/scatter line buffer
+    // is per-task rather than shared.
     for &axis in axes {
         let len = size[axis];
         if len < 2 {
             continue;
         }
-        let stride = axis_stride(size, axis);
-        let outer = total / (stride * len);
-        let mut line = vec![Complex::default(); len];
-        for o in 0..outer {
-            for k in 0..stride {
-                let start = o * stride * len + k;
-                for (t, slot) in line.iter_mut().enumerate() {
-                    *slot = data[start + t * stride];
+        parallel::for_each_line_mut(
+            data,
+            size,
+            axis,
+            || vec![Complex::default(); len],
+            |line, mut slot| {
+                for (t, v) in line.iter_mut().enumerate() {
+                    *v = slot.get(t);
                 }
-                transform_1d_unscaled(&mut line, !forward);
+                transform_1d_unscaled(line, !forward);
                 for (t, &v) in line.iter().enumerate() {
-                    data[start + t * stride] = v;
+                    slot.set(t, v);
                 }
-            }
-        }
+            },
+        );
     }
 }
 
@@ -561,9 +565,7 @@ pub(crate) fn transform_nd(data: &mut [Complex], size: &[usize], inverse: bool) 
     transform_axes(data, size, &axes, !inverse);
     if inverse {
         let scale = 1.0 / total as f64;
-        for x in data.iter_mut() {
-            *x = x.scale(scale);
-        }
+        parallel::for_each_mut(data, |_, x| *x = x.scale(scale));
     }
 }
 

@@ -17,6 +17,7 @@ pub mod label_map;
 pub mod matrix;
 pub mod neighborhood;
 pub mod ops;
+pub mod parallel;
 pub mod pixel;
 
 pub use boundary::{

@@ -5,11 +5,12 @@
 //! walk that produces one such window per pixel, with an interior fast path
 //! that skips boundary checks entirely, itkConstNeighborhoodIterator.h).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::boundary::BoundaryCondition;
 use crate::error::{Error, Result};
 use crate::image::{Image, ScalarView};
+use crate::parallel;
 use crate::pixel::Scalar;
 
 /// A snapshot of pixel values in an N-dimensional neighborhood window.
@@ -19,8 +20,8 @@ use crate::pixel::Scalar;
 /// and [`Image`]'s own pixel layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Neighborhood<T> {
-    radius: Rc<[usize]>,
-    size: Rc<[usize]>,
+    radius: Arc<[usize]>,
+    size: Arc<[usize]>,
     values: Vec<T>,
 }
 
@@ -80,8 +81,8 @@ impl<T: Copy> Neighborhood<T> {
 #[derive(Debug)]
 pub struct NeighborhoodIterator<'a, T: Scalar, B: BoundaryCondition<T>> {
     view: ScalarView<'a, T>,
-    radius: Rc<[usize]>,
-    window_size: Rc<[usize]>,
+    radius: Arc<[usize]>,
+    window_size: Arc<[usize]>,
     // Per-neighbor ND offset from the center, dimension-0-fastest.
     neighbor_offsets: Vec<Vec<i64>>,
     // Per-neighbor linear delta from the center's linear index; valid only
@@ -186,52 +187,91 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     /// so tests can prove it agrees with [`Self::neighborhood_at_checked`]
     /// everywhere it's valid.
     pub fn neighborhood_at_fast(&self, center: &[usize]) -> Neighborhood<T> {
-        debug_assert!(
-            self.is_interior(center),
-            "neighborhood_at_fast requires an interior center"
-        );
-        let center_linear = self.view.image().linear_index(center) as i64;
-        let values = self
-            .neighbor_deltas
-            .iter()
-            .map(|&delta| self.view.pixels()[(center_linear + delta) as usize])
-            .collect();
-        Neighborhood {
-            radius: Rc::clone(&self.radius),
-            size: Rc::clone(&self.window_size),
-            values,
-        }
+        let mut values = Vec::with_capacity(self.len());
+        self.push_values_fast(center, &mut values);
+        self.wrap(values)
     }
 
     /// Fetches the window at `center`, checking each neighbor individually
     /// and falling back to the boundary condition for any that spill off the
     /// image (itkConstNeighborhoodIterator.h:194-209, `GetPixel`).
     pub fn neighborhood_at_checked(&self, center: &[usize]) -> Neighborhood<T> {
+        let mut values = Vec::with_capacity(self.len());
+        self.push_values_checked(center, &mut values);
+        self.wrap(values)
+    }
+
+    fn wrap(&self, values: Vec<T>) -> Neighborhood<T> {
+        Neighborhood {
+            radius: Arc::clone(&self.radius),
+            size: Arc::clone(&self.window_size),
+            values,
+        }
+    }
+
+    /// Appends the window at `center` by direct offset arithmetic. `out` must be
+    /// empty. Only valid when `is_interior(center)`.
+    fn push_values_fast(&self, center: &[usize], out: &mut Vec<T>) {
+        debug_assert!(
+            self.is_interior(center),
+            "the fast path requires an interior center"
+        );
+        let center_linear = self.view.image().linear_index(center) as i64;
+        let pixels = self.view.pixels();
+        out.extend(
+            self.neighbor_deltas
+                .iter()
+                .map(|&delta| pixels[(center_linear + delta) as usize]),
+        );
+    }
+
+    /// Appends the window at `center`, consulting the boundary condition for any
+    /// neighbor that spills off the image. `out` must be empty.
+    fn push_values_checked(&self, center: &[usize], out: &mut Vec<T>) {
         let dim = self.view.image().dimension();
         let size = self.view.image().size();
-        let values = self
-            .neighbor_offsets
-            .iter()
-            .map(|offset| {
-                let mut nd = vec![0i64; dim];
-                let mut inside = true;
-                for d in 0..dim {
-                    let v = center[d] as i64 + offset[d];
-                    nd[d] = v;
-                    inside &= v >= 0 && (v as usize) < size[d];
+        let mut nd = vec![0i64; dim];
+        let mut idx = vec![0usize; dim];
+        for offset in &self.neighbor_offsets {
+            let mut inside = true;
+            for d in 0..dim {
+                let v = center[d] as i64 + offset[d];
+                nd[d] = v;
+                inside &= v >= 0 && (v as usize) < size[d];
+            }
+            let value = if inside {
+                for (i, &v) in idx.iter_mut().zip(nd.iter()) {
+                    *i = v as usize;
                 }
-                if inside {
-                    let idx: Vec<usize> = nd.iter().map(|&v| v as usize).collect();
-                    self.view.pixels()[self.view.image().linear_index(&idx)]
-                } else {
-                    self.boundary.get_pixel(&nd, &self.view)
-                }
-            })
-            .collect();
-        Neighborhood {
-            radius: Rc::clone(&self.radius),
-            size: Rc::clone(&self.window_size),
-            values,
+                self.view.pixels()[self.view.image().linear_index(&idx)]
+            } else {
+                self.boundary.get_pixel(&nd, &self.view)
+            };
+            out.push(value);
+        }
+    }
+
+    /// An empty window carrying this iterator's radius and window size, to be
+    /// refilled at many centers by [`Self::refill`].
+    ///
+    /// The window's value buffer and its two `Arc`s are the per-pixel cost a
+    /// sliding-window filter cannot afford to pay 16.7 M times over: reusing one
+    /// buffer per worker task turns a per-voxel heap allocation and a pair of
+    /// atomic refcount bumps on a shared cache line into one of each per task.
+    pub fn window_buffer(&self) -> Neighborhood<T> {
+        self.wrap(Vec::with_capacity(self.len()))
+    }
+
+    /// Refills `window` — which must come from [`Self::window_buffer`] on this
+    /// same iterator — with the values at `center`, reusing its buffer.
+    ///
+    /// Leaves `window` exactly as [`Self::neighborhood_at`] would have built it.
+    pub fn refill(&self, center: &[usize], window: &mut Neighborhood<T>) {
+        window.values.clear();
+        if self.is_interior(center) {
+            self.push_values_fast(center, &mut window.values);
+        } else {
+            self.push_values_checked(center, &mut window.values);
         }
     }
 
@@ -244,6 +284,69 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         } else {
             self.neighborhood_at_checked(center)
         }
+    }
+
+    /// Applies `f` to every pixel's `(center, window)` in parallel, collecting
+    /// the results in the same dimension-0-fastest order this type's [`Iterator`]
+    /// walks — so `it.par_map(f)` and `it.map(|(c, nb)| f(&c, &nb)).collect()`
+    /// agree element for element.
+    ///
+    /// This is the sliding-window seam for the whole port: the window at pixel
+    /// `i` is a pure function of `i` and the input image, and result `i` lands in
+    /// slot `i`, so no accumulator crosses pixels and nothing is re-associated.
+    /// Whatever `f` computes *within* one window (a kernel dot product, a
+    /// median selection, a structuring-element test) runs in `f`'s own sequential
+    /// order, untouched. The output is therefore bit-identical to the sequential
+    /// walk for any thread count — see [`crate::parallel`].
+    ///
+    /// The window and the center index are per-task scratch, refilled in place
+    /// for each pixel ([`Self::window_buffer`], [`Self::refill`]) — `f` sees the
+    /// same window contents it would have seen, but the walk does not allocate
+    /// per pixel.
+    pub fn par_map<R, F>(&self, f: F) -> Vec<R>
+    where
+        T: Send + Sync,
+        B: Sync,
+        R: Send,
+        F: Fn(&[usize], &Neighborhood<T>) -> R + Sync + Send,
+    {
+        self.par_map_init(|| (), |(), center, window| f(center, window))
+    }
+
+    /// [`Self::par_map`] with a per-task scratch value of the caller's own, for a
+    /// window function that needs working storage — a median's mutable copy of
+    /// the window, say — and would otherwise allocate it per pixel.
+    ///
+    /// Same bit-for-bit guarantee, and the same contract as
+    /// [`parallel::map_indexed_init`]: `scratch` is working storage that `f`
+    /// fully overwrites per pixel, never an accumulator carried between pixels.
+    pub fn par_map_init<R, S, I, F>(&self, init: I, f: F) -> Vec<R>
+    where
+        T: Send + Sync,
+        B: Sync,
+        R: Send,
+        S: Send,
+        I: Fn() -> S + Sync + Send,
+        F: Fn(&mut S, &[usize], &Neighborhood<T>) -> R + Sync + Send,
+    {
+        let size = self.view.image().size();
+        let dim = size.len();
+        parallel::map_indexed_init(
+            self.view.image().number_of_pixels(),
+            || (init(), vec![0usize; dim], self.window_buffer()),
+            |(scratch, center, window), i| {
+                // Unrank the linear index into an ND center, dimension 0 fastest
+                // — the inverse of `Image::linear_index`, and the same order
+                // `next` advances the cursor in.
+                let mut rest = i;
+                for (c, &s) in center.iter_mut().zip(size) {
+                    *c = rest % s;
+                    rest /= s;
+                }
+                self.refill(center, window);
+                f(scratch, center, window)
+            },
+        )
     }
 }
 

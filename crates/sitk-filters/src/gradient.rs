@@ -48,6 +48,7 @@ use crate::recursive_gaussian::{
 };
 use sitk_core::{
     Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition, matrix,
+    parallel,
 };
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry (spacing in
@@ -98,22 +99,26 @@ pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) ->
     let iter =
         NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
 
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
+    // Parallel over output voxels. The `acc += g * g` sum runs over the axes of
+    // one voxel's own window, in axis order, exactly as before — nothing
+    // accumulates across voxels, so the output bits are unchanged.
+    // The offset vector is per-task scratch, not a per-voxel allocation.
+    let out: Vec<f64> = iter.par_map_init(
+        || vec![0i64; dim],
+        |off, _, nb| {
             let mut acc = 0.0;
-            let mut off = vec![0i64; dim];
             for d in 0..dim {
                 off[d] = 1;
-                let plus = nb.get(&off);
+                let plus = nb.get(off);
                 off[d] = -1;
-                let minus = nb.get(&off);
+                let minus = nb.get(off);
                 off[d] = 0;
                 let g = 0.5 * (plus - minus) / scales[d];
                 acc += g * g;
             }
             acc.sqrt()
-        })
-        .collect();
+        },
+    );
 
     Ok(out)
 }
@@ -380,12 +385,16 @@ pub fn gradient_magnitude_recursive_gaussian(
         orders[d] = GaussianOrder::FirstOrder;
         let deriv =
             recursive_gaussian_with_order(&scratch, &sigma_array, &orders, normalize_across_scale)?;
-        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()?) {
-            let g = v / spacing[d];
-            *a += g * g;
-        }
+        // The axis loop stays sequential, so `acc[i]` still accumulates its
+        // `dim` terms in axis order — only the elementwise step within one axis
+        // is spread across threads, and each element's arithmetic is untouched.
+        let values = deriv.to_f64_vec()?;
+        acc = parallel::map_indexed(acc.len(), |i| {
+            let g = values[i] / spacing[d];
+            acc[i] + g * g
+        });
     }
-    let out: Vec<f64> = acc.into_iter().map(f64::sqrt).collect();
+    let out: Vec<f64> = parallel::map_slice(&acc, |v| v.sqrt());
 
     image_from_f64(PixelId::Float32, img.size(), img, &out)
 }

@@ -61,7 +61,7 @@
 
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, NeighborhoodIterator,
-    PeriodicBoundaryCondition, ScalarView, ZeroFluxNeumannBoundaryCondition,
+    PeriodicBoundaryCondition, ScalarView, ZeroFluxNeumannBoundaryCondition, parallel,
 };
 
 use crate::error::{FilterError, Result};
@@ -214,7 +214,7 @@ pub(crate) fn output_region(
 /// Read `size` pixels of `img` starting at the (possibly negative) `index`,
 /// routing every sample — in-bounds or not — through the boundary condition.
 /// All three conditions read straight through for an in-bounds index.
-fn sample_region<B: BoundaryCondition<f64>>(
+fn sample_region<B: BoundaryCondition<f64> + Sync>(
     img: &ScalarView<'_, f64>,
     index: &[i64],
     size: &[usize],
@@ -222,17 +222,18 @@ fn sample_region<B: BoundaryCondition<f64>>(
 ) -> Vec<f64> {
     let dim = size.len();
     let count: usize = size.iter().product();
-    let mut out = Vec::with_capacity(count);
-    let mut offset = vec![0usize; dim];
-    let mut nd = vec![0i64; dim];
-    for i in 0..count {
-        unravel(i, size, &mut offset);
-        for ((n, &base), &o) in nd.iter_mut().zip(index).zip(&offset) {
-            *n = base + o as i64;
-        }
-        out.push(boundary.get_pixel(&nd, img));
-    }
-    out
+    // Per-output-element map: sample `i` depends only on `i` and the input.
+    parallel::map_indexed_init(
+        count,
+        || (vec![0usize; dim], vec![0i64; dim]),
+        |(offset, nd), i| {
+            unravel(i, size, offset);
+            for ((n, &base), &o) in nd.iter_mut().zip(index).zip(offset.iter()) {
+                *n = base + o as i64;
+            }
+            boundary.get_pixel(nd, img)
+        },
+    )
 }
 
 // ---- direct spatial convolution -------------------------------------------
@@ -377,7 +378,7 @@ pub(crate) struct PaddedInput {
     pub(crate) lower: Vec<usize>,
 }
 
-fn pad_input_with<B: BoundaryCondition<f64>>(
+fn pad_input_with<B: BoundaryCondition<f64> + Sync>(
     img: &Image,
     radius: &[usize],
     out_index: &[usize],
@@ -475,20 +476,24 @@ pub(crate) fn kernel_spectrum(
     let dim = padded_size.len();
     let total: usize = padded_size.iter().product();
 
-    // `shifted[j] = padded[(j + radius) mod paddedSize]`.
-    let mut spectrum = vec![Complex::default(); total];
-    let mut m = vec![0usize; dim];
-    let mut source = vec![0usize; dim];
-    for (j, slot) in spectrum.iter_mut().enumerate() {
-        unravel(j, padded_size, &mut m);
-        for (((s, &mi), &r), &p) in source.iter_mut().zip(&m).zip(radius).zip(padded_size) {
-            *s = (mi + r) % p;
-        }
-        // Outside the kernel's own extent the upper zero pad supplies a zero.
-        if source.iter().zip(kernel_size).all(|(&s, &k)| s < k) {
-            *slot = Complex::new(kernel_values[ravel(&source, kernel_size)], 0.0);
-        }
-    }
+    // `shifted[j] = padded[(j + radius) mod paddedSize]` — a per-element gather.
+    let mut spectrum: Vec<Complex> = parallel::map_indexed_init(
+        total,
+        || (vec![0usize; dim], vec![0usize; dim]),
+        |(m, source), j| {
+            unravel(j, padded_size, m);
+            for (((s, &mi), &r), &p) in source.iter_mut().zip(m.iter()).zip(radius).zip(padded_size)
+            {
+                *s = (mi + r) % p;
+            }
+            // Outside the kernel's own extent the upper zero pad supplies a zero.
+            if source.iter().zip(kernel_size).all(|(&s, &k)| s < k) {
+                Complex::new(kernel_values[ravel(source, kernel_size)], 0.0)
+            } else {
+                Complex::default()
+            }
+        },
+    );
     fft::transform_nd(&mut spectrum, padded_size, false);
     spectrum
 }
@@ -507,17 +512,18 @@ pub(crate) fn crop_output(
 ) -> Vec<f64> {
     let dim = padded_size.len();
     let count: usize = out_size.iter().product();
-    let mut values = Vec::with_capacity(count);
-    let mut m = vec![0usize; dim];
-    let mut index = vec![0usize; dim];
-    for i in 0..count {
-        unravel(i, out_size, &mut m);
-        for (((x, &l), &r), &o) in index.iter_mut().zip(lower).zip(radius).zip(&m) {
-            *x = l + r + o;
-        }
-        values.push(padded[ravel(&index, padded_size)]);
-    }
-    values
+    // Per-output-element gather from the padded buffer.
+    parallel::map_indexed_init(
+        count,
+        || (vec![0usize; dim], vec![0usize; dim]),
+        |(m, index), i| {
+            unravel(i, out_size, m);
+            for (((x, &l), &r), &o) in index.iter_mut().zip(lower).zip(radius).zip(m.iter()) {
+                *x = l + r + o;
+            }
+            padded[ravel(index, padded_size)]
+        },
+    )
 }
 
 /// The Fourier half of `FFTConvolutionImageFilter::GenerateData`
@@ -537,18 +543,13 @@ fn convolve_fft(
     let padded = pad_input(img, radius, out_index, out_size, boundary_condition)?;
     let transfer = kernel_spectrum(kernel_values, kernel_size, radius, &padded.size);
 
-    let mut spectrum: Vec<Complex> = padded
-        .values
-        .iter()
-        .map(|&v| Complex::new(v, 0.0))
-        .collect();
+    let mut spectrum: Vec<Complex> = parallel::map_slice(&padded.values, |&v| Complex::new(v, 0.0));
     fft::transform_nd(&mut spectrum, &padded.size, false);
-    for (x, &k) in spectrum.iter_mut().zip(&transfer) {
-        *x = *x * k;
-    }
+    // Elementwise spectrum product: each bin's one complex multiply, in place.
+    parallel::for_each_mut(&mut spectrum, |i, x| *x = *x * transfer[i]);
     fft::transform_nd(&mut spectrum, &padded.size, true);
 
-    let real: Vec<f64> = spectrum.iter().map(|x| x.re).collect();
+    let real: Vec<f64> = parallel::map_slice(&spectrum, |x| x.re);
     Ok(crop_output(
         &real,
         &padded.size,

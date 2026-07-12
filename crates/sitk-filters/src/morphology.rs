@@ -532,22 +532,23 @@ fn binary_erode_typed<T: Bounds>(
         kernel.radius(),
         ConstantBoundaryCondition::new(boundary_value),
     )?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
+    // Parallel over output voxels: the structuring-element test is a pure
+    // function of one window, in the pixel type `T` with no float arithmetic.
+    let out: Vec<T> = iter.par_map(|_, nb| {
         let survives = kernel
             .on()
             .iter()
             .zip(nb.values())
             .all(|(&on, &v)| !on || v == foreground);
         let input_value = nb.center_value();
-        out.push(if survives {
+        if survives {
             foreground
         } else if input_value != foreground {
             input_value
         } else {
             background
-        });
-    }
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -572,22 +573,23 @@ fn binary_dilate_typed<T: Bounds>(
         kernel.radius(),
         ConstantBoundaryCondition::new(boundary_value),
     )?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
+    // Parallel over output voxels: the structuring-element test is a pure
+    // function of one window, in the pixel type `T` with no float arithmetic.
+    let out: Vec<T> = iter.par_map(|_, nb| {
         let painted = kernel
             .on()
             .iter()
             .zip(nb.values())
             .any(|(&on, &v)| on && v == foreground);
         let input_value = nb.center_value();
-        out.push(if painted {
+        if painted {
             foreground
         } else if input_value == foreground {
             background
         } else {
             input_value
-        });
-    }
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)

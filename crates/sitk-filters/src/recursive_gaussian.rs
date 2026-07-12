@@ -75,7 +75,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use sitk_core::{Image, PixelId};
+use sitk_core::{Image, PixelId, parallel};
 
 /// Order of the Gaussian derivative approximated by the recursive filter,
 /// matching ITK's `RecursiveGaussianImageFilterEnums::GaussianOrder`.
@@ -505,26 +505,36 @@ fn compute_n_coefficients(
 
 /// Filter every line of `buf` along axis `d` in place, gathering each line into
 /// a contiguous buffer, running the recursion, and scattering it back.
+///
+/// **Parallel over lines** ([`parallel::for_each_line_mut`]). A line along axis
+/// `d` reads and writes only its own elements, so lines are independent and the
+/// pass is bit-identical to the sequential line loop: [`filter_line`]'s
+/// fourth-order recursion — the only place floats accumulate — runs in its own
+/// unchanged sequential order *within* each line, and no value crosses lines.
+/// The three scratch buffers are per-task, not per-line, so the recursion still
+/// allocates once rather than once per line.
+///
+/// `strides` is unused by the decomposition (the primitive derives the line
+/// stride from `size` and `d` itself); it stays in the signature because the
+/// callers already carry it.
 fn filter_axis(buf: &mut [f64], size: &[usize], strides: &[usize], d: usize, coeff: &Coefficients) {
-    let stride = strides[d];
+    debug_assert_eq!(strides[d], size[..d].iter().product::<usize>());
     let ln = size[d];
-    let mut line = vec![0.0f64; ln];
-    let mut outs = vec![0.0f64; ln];
-    let mut scratch = vec![0.0f64; ln];
-
-    for p in 0..buf.len() {
-        // Each line is identified by its first element (coordinate 0 on axis d).
-        if !(p / stride).is_multiple_of(ln) {
-            continue;
-        }
-        for (k, slot) in line.iter_mut().enumerate() {
-            *slot = buf[p + k * stride];
-        }
-        filter_line(&line, coeff, &mut outs, &mut scratch);
-        for (k, &v) in outs.iter().enumerate() {
-            buf[p + k * stride] = v;
-        }
-    }
+    parallel::for_each_line_mut(
+        buf,
+        size,
+        d,
+        || (vec![0.0f64; ln], vec![0.0f64; ln], vec![0.0f64; ln]),
+        |(line, outs, scratch), mut slot| {
+            for (k, v) in line.iter_mut().enumerate() {
+                *v = slot.get(k);
+            }
+            filter_line(line, coeff, outs, scratch);
+            for (k, &v) in outs.iter().enumerate() {
+                slot.set(k, v);
+            }
+        },
+    );
 }
 
 /// One line through the fourth-order causal + anti-causal recursion, porting

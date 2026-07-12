@@ -130,9 +130,10 @@ pub fn mean(img: &Image, radius: &[usize]) -> Result<Image> {
         NeighborhoodIterator::<f64, _>::new(&scratch, radius, ZeroFluxNeumannBoundaryCondition)?;
     let neighborhood_size = iter.len() as f64;
 
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| nb.values().iter().sum::<f64>() / neighborhood_size)
-        .collect();
+    // Parallel over output voxels. The per-window `sum` keeps its sequential
+    // dimension-0-fastest order, so each output value is the same `f64` it was
+    // before; only whole windows are distributed across threads.
+    let out: Vec<f64> = iter.par_map(|_, nb| nb.values().iter().sum::<f64>() / neighborhood_size);
 
     image_from_f64(img.pixel_id(), img.size(), img, &out)
 }
@@ -152,11 +153,16 @@ fn select_median<T: Copy + PartialOrd>(values: &mut [T]) -> T {
 
 fn median_typed<T: Scalar>(img: &Image, radius: &[usize]) -> Result<Image> {
     let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
-        let mut values = nb.values().to_vec();
-        out.push(select_median(&mut values));
-    }
+    // Parallel over output voxels. `select_median` is a deterministic selection
+    // in the pixel type `T` — no float arithmetic at all — over one window's
+    // own copy of its values, so the result cannot depend on the thread count.
+    // The mutable copy `select_nth_unstable` needs is per-task scratch, refilled
+    // per voxel rather than allocated per voxel.
+    let out: Vec<T> = iter.par_map_init(Vec::new, |values, _, nb| {
+        values.clear();
+        values.extend_from_slice(nb.values());
+        select_median(values)
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -548,19 +554,24 @@ pub(crate) fn discrete_gaussian_f64(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        let out: Vec<f64> = iter
-            .map(|(_, nb)| {
-                let mut off = vec![0i64; dim];
+        // Parallel over output voxels, one separable axis at a time (the axes
+        // stay sequential — each consumes the previous pass's image). The tap
+        // sum inside a window still runs in kernel order, so every output value
+        // keeps its exact former bits.
+        // The offset vector is per-task scratch, not a per-voxel allocation.
+        let out: Vec<f64> = iter.par_map_init(
+            || vec![0i64; dim],
+            |off, _, nb| {
                 kernel
                     .iter()
                     .enumerate()
                     .map(|(k, &c)| {
                         off[d] = k as i64 - half as i64;
-                        c * nb.get(&off)
+                        c * nb.get(off)
                     })
                     .sum()
-            })
-            .collect();
+            },
+        );
 
         current = Image::from_vec(&size, out)?;
         current.copy_geometry_from(img);
