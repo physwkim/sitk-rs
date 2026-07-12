@@ -66,15 +66,6 @@ const PREFAULT_MIN_BYTES: usize = 4 << 20;
 
 #[cfg(target_os = "linux")]
 mod huge {
-    /// `MADV_HUGEPAGE`. Linux `asm-generic/mman-common.h`.
-    const MADV_HUGEPAGE: i32 = 14;
-
-    // libc, which std already links. No new crate, no build script, no C
-    // compiled — this is a declaration, not a binding layer.
-    unsafe extern "C" {
-        fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
-    }
-
     /// Ask the kernel to back `buf` with 2 MiB pages.
     ///
     /// `madvise` requires a page-aligned address, and a `Vec`'s pointer is not
@@ -85,10 +76,12 @@ mod huge {
     /// Worth 109 ms against 185 ms on this machine at 512 MiB (THP `defrag` =
     /// `madvise`, so the collapse happens synchronously under the fault).
     ///
-    /// Advisory: a kernel with transparent huge pages disabled, or a mapping it
-    /// declines to collapse, simply ignores this. The caller still touches every
-    /// page afterwards, so the buffer is resident either way and the result is
-    /// identical — only slower. Nothing here is load-bearing for correctness.
+    /// **Advisory, and deliberately infallible.** A kernel with transparent huge
+    /// pages disabled, a mapping it declines to collapse, an `EINVAL` — all are
+    /// ignored. The caller touches every page afterwards regardless, so the
+    /// buffer ends up resident either way and the result is identical, only
+    /// slower. Nothing here may turn a working call into a failing one to save
+    /// 76 ms.
     pub fn advise(buf: &mut [impl Sized]) {
         let base = buf.as_mut_ptr() as usize;
         let end = base + std::mem::size_of_val(buf);
@@ -96,10 +89,11 @@ mod huge {
         let stop = end & !4095;
         if stop > start {
             // SAFETY: `[start, stop)` is a page-aligned subrange of a live
-            // allocation this thread owns. `madvise` with MADV_HUGEPAGE only
-            // changes the kernel's page-size policy for that range; it neither
-            // moves nor writes the memory, and its failure is ignorable.
-            unsafe { madvise(start as *mut _, stop - start, MADV_HUGEPAGE) };
+            // allocation this thread owns. `MADV_HUGEPAGE` only changes the
+            // kernel's page-size policy for that range; it neither moves nor
+            // writes the memory. The return value is intentionally discarded —
+            // see the doc comment.
+            unsafe { libc::madvise(start as *mut _, stop - start, libc::MADV_HUGEPAGE) };
         }
     }
 }

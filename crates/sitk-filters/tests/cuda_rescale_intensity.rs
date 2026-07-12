@@ -141,16 +141,52 @@ fn gpu_matches_cpu_on_the_medium_volume() {
     );
 }
 
-/// Task 0: the published claim was that `rescale_intensity`'s GPU time is
-/// "essentially all PCIe", so per-pixel GPU offload can never pay. This walks
-/// the bench-spec sizes and reports the phase split, including the CPU
-/// single-thread reference, so the claim is decided by measurement.
+/// `MemFree` and `Cached`, in MiB, from `/proc/meminfo`. A CPU timing on this box
+/// moved 4.7× between sessions with no code change, because the CPU path's own
+/// fresh-output-`Vec` faults get dearer as free memory shrinks. So the machine
+/// state is part of the measurement, not context for it.
+#[cfg(target_os = "linux")]
+fn mem_state() -> String {
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else {
+        return "unavailable".into();
+    };
+    let field = |k: &str| -> u64 {
+        s.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 1024
+    };
+    format!(
+        "MemFree {} MiB, Cached {} MiB, MemAvailable {} MiB",
+        field("MemFree:"),
+        field("Cached:"),
+        field("MemAvailable:")
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mem_state() -> String {
+    "unavailable".into()
+}
+
+/// The CPU-vs-GPU baseline for `rescale_intensity`, both paths in one process,
+/// one session, **interleaved** — CPU, GPU, CPU, GPU — so that any drift in the
+/// machine hits both arms equally. Two numbers measured minutes apart on a box
+/// whose free memory is moving are not comparable, and that is exactly the error
+/// this test exists to prevent.
 ///
-/// Not an assertion of a timing bound — timings are not a test contract, and a
-/// loaded machine would make one flaky. It asserts *correctness* (the output is
-/// still bit-identical to the CPU's at every size) and prints the numbers.
+/// Reports CPU **t1** only: there is no rayon and no threading anywhere in this
+/// workspace, so a CPU tN path does not exist on this branch to be measured.
+///
+/// Asserts correctness (bit-identity with the CPU at every size), never a timing
+/// bound — a timing assertion on a shared box is a flaky test, not a contract.
 #[test]
-fn transfer_split_across_the_bench_spec_sizes() {
+fn rescale_intensity_baseline_cpu_vs_gpu_interleaved() {
+    const REPS: usize = 3;
+    println!("machine at start: {}", mem_state());
+
     for (label, n) in [("small", 64usize), ("medium", 256), ("large", 512)] {
         let size = [n, n, n];
         let img = match Image::from_vec(&size, synth(0x1234_5678_9abc_def0, size)) {
@@ -158,6 +194,8 @@ fn transfer_split_across_the_bench_spec_sizes() {
             Err(e) => panic!("building the {label} volume failed: {e}"),
         };
 
+        // Warm-up, outside the timed reps: the first GPU call pays NVRTC compile
+        // and module load, and billing that to the steady state would be a lie.
         let (gpu, cold) = match sitk_cuda::rescale_intensity_gpu(&img, 0.0, 255.0) {
             Ok(v) => v,
             Err(e @ sitk_cuda::CudaError::NoDevice(_)) => {
@@ -166,18 +204,28 @@ fn transfer_split_across_the_bench_spec_sizes() {
             }
             Err(e) => panic!("GPU present but {label} failed: {e}"),
         };
-        let warm: Vec<sitk_cuda::GpuTimings> = (0..3)
-            .map(|_| {
+
+        let mut cpu_ms = Vec::new();
+        let mut gpu_t = Vec::new();
+        let mut cpu_out = None;
+        for _ in 0..REPS {
+            let t = std::time::Instant::now();
+            let c = rescale_intensity_cpu(&img, 0.0, 255.0).unwrap();
+            cpu_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            cpu_out = Some(c);
+
+            gpu_t.push(
                 sitk_cuda::rescale_intensity_gpu(&img, 0.0, 255.0)
                     .expect("the device answered once already")
-                    .1
-            })
-            .collect();
-        let med = |f: fn(&sitk_cuda::GpuTimings) -> f64| {
-            let mut v: Vec<f64> = warm.iter().map(f).collect();
+                    .1,
+            );
+        }
+
+        let median = |mut v: Vec<f64>| {
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
+        let med = |f: fn(&sitk_cuda::GpuTimings) -> f64| median(gpu_t.iter().map(f).collect());
         let (h2d, alloc, kernel, d2h) = (
             med(|t| t.h2d_ms),
             med(|t| t.alloc_ms),
@@ -185,30 +233,31 @@ fn transfer_split_across_the_bench_spec_sizes() {
             med(|t| t.d2h_ms),
         );
         let total = h2d + alloc + kernel + d2h;
-
-        let t = std::time::Instant::now();
-        let cpu = rescale_intensity_cpu(&img, 0.0, 255.0).unwrap();
-        let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+        let cpu_t1 = median(cpu_ms);
 
         let bytes = (n * n * n * 4) as f64;
         let gbs = |ms: f64| bytes / 1e9 / (ms / 1e3);
 
         println!(
-            "--- {label} {n}^3 ({} MiB each way) ---",
+            "--- {label} {n}^3 ({} MiB each way, {REPS} interleaved reps, median) ---",
             (bytes / 1048576.0) as usize
         );
-        println!("  h2d    {h2d:8.2} ms  ({:5.2} GB/s)", gbs(h2d));
-        println!("  alloc  {alloc:8.2} ms  (host: make the output resident)");
-        println!("  kernel {kernel:8.2} ms");
+        println!("  gpu h2d    {h2d:8.2} ms  ({:5.2} GB/s)", gbs(h2d));
+        println!("  gpu alloc  {alloc:8.2} ms  (host: make the output resident)");
+        println!("  gpu kernel {kernel:8.2} ms");
         println!(
-            "  d2h    {d2h:8.2} ms  ({:5.2} GB/s, DMA into a resident dst)",
+            "  gpu d2h    {d2h:8.2} ms  ({:5.2} GB/s, DMA into a resident dst)",
             gbs(d2h)
         );
         println!(
-            "  TOTAL  {total:8.2} ms   (cold, incl. NVRTC: {:.2} ms)",
+            "  gpu TOTAL  {total:8.2} ms   (cold, incl. NVRTC: {:.2} ms)",
             cold.total_ms()
         );
-        println!("  cpu t1 {cpu_ms:8.2} ms");
+        println!("  cpu t1     {cpu_t1:8.2} ms");
+        println!("  cpu tN         --      (no rayon on this branch: no tN path exists)");
+        println!("  gpu vs cpu t1  {:.2}x", cpu_t1 / total);
+
+        let cpu = cpu_out.unwrap();
 
         // The point of Task 0 was to make the op faster without moving a single
         // bit of the result. Bit-identity, at every size.
@@ -218,6 +267,7 @@ fn transfer_split_across_the_bench_spec_sizes() {
             "{label}: GPU output must stay bit-identical to the CPU"
         );
     }
+    println!("machine at end:   {}", mem_state());
 }
 
 /// The fallback contract: an unsupported pixel type must not fail, it must run
