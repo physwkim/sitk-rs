@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "Image filters for sitk-rs"
 
+[features]
+# Default OFF. On, every op with a GPU kernel tries the GPU first and falls
+# back to the CPU implementation whenever the GPU declines (no driver, no
+# device, NVRTC failure, out of memory, unsupported pixel type). Off, this
+# crate is exactly what it was before `sitk-cuda` existed.
+default = []
+cuda = ["dep:sitk-cuda", "sitk-cuda/cuda"]
+
 [dependencies]
 sitk-core.workspace = true
+sitk-cuda = { workspace = true, optional = true }
 thiserror.workspace = true
