@@ -100,6 +100,28 @@ impl SplitMix64 {
     }
 }
 
+/// A process-unique identity for one prepared [`FixedSamples`] / [`MovingImage`].
+///
+/// A compute backend that keeps a *device-resident* copy of these buffers — the
+/// CUDA backend uploads them once and reuses them across hundreds of optimizer
+/// iterations — needs to answer "is this the same data I already have?" on every
+/// call. The [`MetricBackend`] trait hands it a `&FixedSamples` with no identity,
+/// and a pointer address is not an identity (a freed allocation's address can be
+/// handed back to a different one). So each prepared buffer carries a serial
+/// number, minted once at construction and never reused within the process.
+///
+/// Costs one relaxed increment per `FixedSamples`/`MovingImage` built, which is
+/// per pyramid level, not per iteration. The CPU path never reads it — so the
+/// counter and the fields that hold it are compiled out entirely when the `cuda`
+/// feature is off, and a CPU-only build carries neither the atomic nor the extra
+/// eight bytes per buffer.
+#[cfg(feature = "cuda")]
+fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The physical point at multi-index `index`, via `origin + idx_to_phys ·
 /// index`. Shared by every [`FixedSamples`] sampling strategy.
 fn point_at(idx_to_phys: &[f64], origin: &[f64], dim: usize, index: &[usize]) -> Vec<f64> {
@@ -129,6 +151,9 @@ fn linear_to_multi(mut flat: usize, size: &[usize]) -> Vec<usize> {
 /// domain*): every pixel's value and its physical point, precomputed once.
 pub struct FixedSamples {
     pub(crate) dim: usize,
+    /// Identity for a device-resident copy of these buffers — see [`next_id`].
+    #[cfg(feature = "cuda")]
+    pub(crate) id: u64,
     /// One value per sample, length `N`.
     pub(crate) values: Vec<f64>,
     /// Physical points, row-major `N × dim`.
@@ -182,6 +207,8 @@ impl FixedSamples {
 
         Ok(Self {
             dim,
+            #[cfg(feature = "cuda")]
+            id: next_id(),
             values,
             points,
             min_spacing,
@@ -291,6 +318,8 @@ impl FixedSamples {
 
         Ok(Self {
             dim,
+            #[cfg(feature = "cuda")]
+            id: next_id(),
             values,
             points,
             min_spacing,
@@ -349,11 +378,29 @@ impl FixedSamples {
     }
 }
 
+/// Everything a device-resident metric backend needs to reproduce the moving
+/// image's sampling, borrowed from a [`MovingImage`]. See
+/// [`MovingImage::device_view`].
+#[cfg(feature = "cuda")]
+pub(crate) struct MovingView<'a> {
+    pub(crate) id: u64,
+    pub(crate) buf: &'a [f64],
+    pub(crate) size: &'a [usize],
+    pub(crate) strides: &'a [usize],
+    pub(crate) origin: &'a [f64],
+    pub(crate) phys_to_index: &'a [f64],
+    pub(crate) interpolator: Interpolator,
+    pub(crate) mask: Option<&'a [bool]>,
+}
+
 /// The moving image as an `f64` buffer plus the geometry needed to map a
 /// physical point to a continuous index and to convert an index-space gradient
 /// to a physical-space gradient.
 pub struct MovingImage {
     dim: usize,
+    /// Identity for a device-resident copy of this buffer — see [`next_id`].
+    #[cfg(feature = "cuda")]
+    pub(crate) id: u64,
     buf: Vec<f64>,
     size: Vec<usize>,
     strides: Vec<usize>,
@@ -395,6 +442,8 @@ impl MovingImage {
             .then(|| bspline_coefficients(&buf, &size, &strides_v));
         Ok(Self {
             dim,
+            #[cfg(feature = "cuda")]
+            id: next_id(),
             buf,
             strides: strides_v,
             size,
@@ -427,6 +476,24 @@ impl MovingImage {
     /// Spatial dimension.
     pub(crate) fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The moving-image buffer and the geometry a device-resident backend needs
+    /// to reproduce [`value_and_physical_gradient`](Self::value_and_physical_gradient)
+    /// on its own. `pub(crate)`: the CUDA backend lives in this crate, so none of
+    /// this widens the public API.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_view(&self) -> MovingView<'_> {
+        MovingView {
+            id: self.id,
+            buf: &self.buf,
+            size: &self.size,
+            strides: &self.strides,
+            origin: &self.origin,
+            phys_to_index: &self.phys_to_index,
+            interpolator: self.interpolator,
+            mask: self.mask.as_deref(),
+        }
     }
 
     /// Continuous index of physical point `p`: `M · (p − origin)`.

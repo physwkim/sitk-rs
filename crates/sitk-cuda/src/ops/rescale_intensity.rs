@@ -99,7 +99,9 @@ extern "C" __global__ void rescale_f32(
 /// `GpuTimings::kernel_ms` covers both kernel launches *and* the 8 KiB copy of
 /// the reduction's per-block partials back to the host, which is where the
 /// final min/max fold happens (an exact, order-independent fold over ≤ 1024
-/// values).
+/// values). `alloc_ms` is the host-side cost of making the output buffer
+/// resident, and `d2h_ms` is then the DMA alone — see [`crate::host`] for why
+/// those two must not be reported as one number.
 pub fn rescale_intensity_gpu(
     img: &Image,
     output_min: f64,
@@ -123,14 +125,28 @@ pub fn rescale_intensity_gpu(
     backend.synchronize()?;
     timings.h2d_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    // ---- kernels ---------------------------------------------------------
+    // ---- kernel 1: min/max reduction -------------------------------------
+    // Ahead of the output allocation, so a degenerate image declines without
+    // paying for a buffer it will never fill.
     let t = Instant::now();
     let (lo, hi) = device_min_max(backend, &d_in, n)?;
     if lo == hi {
         return Err(CudaError::DegenerateInput);
     }
     let scale = (output_max - output_min) / (hi - lo);
+    timings.kernel_ms = t.elapsed().as_secs_f64() * 1e3;
 
+    // ---- output allocation -----------------------------------------------
+    // Made resident *before* the D2H, so the DMA lands on mapped pages instead
+    // of faulting in 131,072 of them. This is the whole of Task 0: the op used
+    // to hand `clone_dtoh` a fresh `Vec` and bill the resulting fault storm to
+    // the PCIe link.
+    let t = Instant::now();
+    let mut host_out = crate::host::resident_vec::<f32>(n);
+    timings.alloc_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    // ---- kernel 2: the map -----------------------------------------------
+    let t = Instant::now();
     let mut d_out = DeviceBuffer::<f32>::zeros(backend, n)?;
     let f = backend.function(KERNELS, "rescale_f32")?;
     let n_i64 = n as i64;
@@ -153,11 +169,11 @@ pub fn rescale_intensity_gpu(
     // `i < n`.
     unsafe { launch.launch(cfg)? };
     backend.synchronize()?;
-    timings.kernel_ms = t.elapsed().as_secs_f64() * 1e3;
+    timings.kernel_ms += t.elapsed().as_secs_f64() * 1e3;
 
     // ---- D2H -------------------------------------------------------------
     let t = Instant::now();
-    let host_out = d_out.to_host(backend)?;
+    d_out.copy_to_host(backend, &mut host_out)?;
     backend.synchronize()?;
     timings.d2h_ms = t.elapsed().as_secs_f64() * 1e3;
 

@@ -12,11 +12,16 @@ description = "Optional CUDA backend for sitk-rs"
 # dependencies, so a feature-off workspace build is the build it was before the
 # crate existed: no cudarc, no sitk-core edge, no tests.
 default = []
-cuda = ["dep:cudarc", "dep:sitk-core", "dep:thiserror"]
+cuda = ["dep:cudarc", "dep:libc", "dep:sitk-core", "dep:thiserror"]
 
 [dependencies]
 sitk-core = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+# `madvise(MADV_HUGEPAGE)` for the output-buffer prefault (`host.rs`). A
+# pure-Rust crate of `extern "C"` declarations against the libc `std` already
+# links — not a C build dependency, and admitted under §5.8 on the same footing
+# as cudarc. Advisory-only: every failure is ignored.
+libc = { version = "0.2", optional = true }
 # `dynamic-loading`: cudarc dlopens libcuda / libnvrtc at *runtime*. No
 # build-time C linkage, no *-sys crate, no nvcc build step — the only exception
 # to the pure-Rust policy (ledger §5.8), and a missing driver degrades to "no

@@ -12,3 +12,11 @@ sitk-core.workspace = true
 sitk-filters.workspace = true
 sitk-transform.workspace = true
 thiserror.workspace = true
+sitk-cuda = { workspace = true, optional = true }
+
+[features]
+# Default OFF. With it on, `CudaMetricBackend` becomes available and can be
+# installed via `set_metric_backend`; the default backend stays `CpuBackend`, so
+# the CPU path and every existing test are untouched either way.
+default = []
+cuda = ["dep:sitk-cuda", "sitk-cuda/cuda"]

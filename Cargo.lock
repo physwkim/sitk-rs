@@ -855,6 +855,7 @@ name = "sitk-cuda"
 version = "0.0.1"
 dependencies = [
  "cudarc",
+ "libc",
  "sitk-core",
  "thiserror",
 ]
@@ -895,6 +896,7 @@ name = "sitk-registration"
 version = "0.0.1"
 dependencies = [
  "sitk-core",
+ "sitk-cuda",
  "sitk-filters",
  "sitk-transform",
  "thiserror",

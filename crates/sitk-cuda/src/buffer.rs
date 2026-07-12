@@ -21,20 +21,36 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
         })
     }
 
+    /// Copy `src` into this already-allocated device buffer (H2D), which must be
+    /// at least as long.
+    ///
+    /// The counterpart to [`copy_to_host`](Self::copy_to_host): no allocation, so
+    /// a caller that pushes to the same buffer every iteration — the
+    /// resident-volume registration loop pushing a transform each step — pays one
+    /// `cuMemAlloc` for the run rather than one per iteration.
+    pub fn copy_from_host(&mut self, backend: &Backend, src: &[T]) -> Result<(), CudaError> {
+        Ok(backend.stream().memcpy_htod(src, &mut self.slice)?)
+    }
+
     /// Copy the device buffer back down into a fresh `Vec` (D2H).
     ///
-    /// The `Vec` is freshly mapped, so the DMA write faults in every one of its
-    /// pages: on this machine a 64 MiB D2H costs ~35 ms this way versus ~5 ms
-    /// into an already-resident destination. The page-fault cost is the
-    /// allocation's, not the PCIe link's. Callers that can reuse a destination
-    /// across calls want [`DeviceBuffer::copy_to_host`].
+    /// **Slow, and kept only for callers with nowhere to put the result.** The
+    /// `Vec` is freshly mapped, so the DMA faults in every one of its pages, and
+    /// that fault cost — not the PCIe link — dominates: a 512 MiB D2H this way
+    /// measures 481 ms (1.1 GB/s) against a link that runs at ~12–13 GB/s.
+    ///
+    /// Prefer, in order: [`copy_to_host`](Self::copy_to_host) into a destination
+    /// reused across calls; or, when the result must be owned, a destination from
+    /// [`crate::host::resident_vec`], which is ~6× faster than this.
     pub fn to_host(&self, backend: &Backend) -> Result<Vec<T>, CudaError> {
         Ok(backend.stream().clone_dtoh(&self.slice)?)
     }
 
     /// Copy the device buffer into an existing host slice (D2H), which must be
-    /// the same length. Reusing a destination across calls avoids the
-    /// first-touch page-fault cost described on [`DeviceBuffer::to_host`].
+    /// at least as long. A destination that is already resident — reused across
+    /// calls, a [`crate::PinnedBuffer`], or a [`crate::host::resident_vec`] —
+    /// avoids the fault cost described on [`DeviceBuffer::to_host`] and runs at
+    /// link speed.
     pub fn copy_to_host(&self, backend: &Backend, dst: &mut [T]) -> Result<(), CudaError> {
         Ok(backend.stream().memcpy_dtoh(&self.slice, dst)?)
     }
