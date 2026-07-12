@@ -43,8 +43,48 @@ fn synth(seed: u64, size: [usize; 3]) -> Vec<f32>
     //   value = ((state.wrapping_mul(0x2545F4914F6CDD1D) >> 33) % 1000) as f32
 ```
 
+**Seed is fixed at `42`** for every volume, every size, every harness.
+(Amended after the first C++ run: the original spec defined the
+generator but left the seed unstated, which would have voided the
+`input_checksum` equality it depends on.)
+
 Binary/label inputs derive from the same volume by thresholding at
 `>= 500.0` (so they are also identical across harnesses).
+
+### The three input variants, and which op takes which
+
+An op's `input_checksum` is only comparable across harnesses if both
+feed it the *same variant*. Ops do not all take the base volume:
+
+| variant | content | pixel type | hashed as |
+|---|---|---|---|
+| `base_f32` | raw generator output, `[0, 1000)` | Float32 | f32 LE bytes |
+| `mask_u8` | `base >= 500.0 ? 1 : 0` | UInt8 | u8 bytes |
+| `mask_f32` | `base >= 500.0 ? 1.0 : 0.0` | Float32 | f32 LE bytes |
+
+- `base_f32` — ops 1, 2, 3, 4, 5, 6, 7, 11, 12
+- `mask_u8` — ops 8 (`binary_dilate`), 10 (`connected_component`)
+- `mask_f32` — op 9 (`signed_maurer_distance_map`). A signed distance
+  map is only meaningful on binary content, but the port's filter takes
+  a Float32 image, so the input is binary *content* in a Float32 *type*,
+  with `background_value = 0.0`. This resolves the original spec's
+  contradiction (it said "Float32 unless inherently integral" and then
+  listed only ops 8/10 as integral, leaving op 9 undefined).
+
+Reference checksums, seed 42 (produced by the C++ harness, verified
+against an independent Python implementation with exact u64 arithmetic;
+first five voxels are `59, 641, 384, 121, 923`). **Every harness must
+reproduce these. A mismatch voids the comparison — report it, do not
+work around it.**
+
+| size | `base_f32` | `mask_u8` | `mask_f32` |
+|---|---|---|---|
+| small 64³ | `0xa60a081f21af857e` | `0x5fb1f4b900bd027a` | `0x13c82d199e0a5b88` |
+| medium 256³ | `0xb04930cda0bbce53` | `0x4d2b8759782954c6` | `0x4bb5460e5493a3e8` |
+
+FNV-1a 64: offset `0xcbf29ce484222325`, prime `0x100000001b3`, hashed
+one byte at a time over the little-endian bytes of the buffer **as
+handed to the filter**.
 
 Volume sizes (3-D, isotropic spacing `[1.0, 1.0, 1.0]`, identity
 direction, origin `[0,0,0]`):
@@ -139,3 +179,21 @@ The comparison table is generated from the merged `.ndjson`, one row per
 
 `ratio > 1.0` means the port is **slower** than ITK. State it plainly;
 do not round a 2.3× regression into "comparable".
+
+## Known properties of the ITK baseline (measured, not assumed)
+
+These are facts about *this ITK build*, established by the first C++ run.
+They must be carried into the comparison table, because a ratio against
+a degraded baseline is a misleading ratio:
+
+- **Threader is `Pool`**, not TBB (`Module_ITKTBB=OFF`).
+- **`binary_dilate` and `connected_component` are SLOWER in ITK at 96
+  threads than at 1** (0.67× and 0.15× respectively — i.e. a 1.5× and
+  6.7× multithreading *regression* in ITK itself). A port that beats
+  ITK's `tN` on those two ops has beaten a regression, not a baseline.
+  Quote both `t1` and `tN` for them and say so.
+- **No FFTW** (`ITK_USE_FFTWF/D=OFF`), so `fft_convolution` runs ITK's
+  VNL backend at `double` precision. That is ITK-as-built, not
+  ITK-at-its-best; note it rather than claiming a clean FFT win.
+- Every C++ sample constructs a fresh filter so `GenerateData()` cannot
+  be served from cache; per-sample times are flat, confirming this.
