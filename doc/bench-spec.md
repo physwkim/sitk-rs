@@ -157,9 +157,17 @@ One JSON object per (op, size, config) measurement, newline-delimited
   "samples": 10,
   "input_checksum": "0x9f3c…",
   "output_checksum": "0x1a2b…",
+  "max_abs_err": null,
+  "max_rel_err": null,
   "skipped": null
 }
 ```
+
+- `max_abs_err` / `max_rel_err` — the GPU correctness gate's two numbers,
+  measured against the CPU f64 result. Non-null only on `config: "gpu"`
+  rows; `null` on CPU rows. (Added after the first GPU run: the
+  correctness-gate section above mandated these numbers but this schema
+  block did not carry fields for them.)
 
 - `input_checksum` — FNV-1a 64 over the input buffer's little-endian
   bytes. **Both harnesses must produce the same value** for the same
@@ -170,7 +178,20 @@ One JSON object per (op, size, config) measurement, newline-delimited
   divergences in the ledger), but a per-harness change across commits
   signals a regression.
 - `skipped` — non-null reason string instead of timings when an op/size
-  is not run. Never omit the row.
+  is not run. Never omit the row. **The reason must name the actual
+  cause.** A reason that names the wrong cause is worse than no row: a
+  reader who sees "feature not present" concludes the backend is
+  missing, when in fact the *kernel* for that op was never written. The
+  two are different facts and must not be collapsed. Concretely, a GPU
+  row is skipped for one of two distinct reasons — "no GPU kernel
+  implemented yet for this op" (true regardless of build flags) or
+  "the `cuda` feature is off in this build" (the kernel exists; this
+  build excludes it) — and the row says which.
+
+- A CPU-labeled row (`t1`/`tN`) must call the CPU implementation
+  **explicitly**, never the feature-sensitive public dispatcher. In a
+  `cuda`-enabled build the dispatcher would route to the GPU, and the
+  harness would silently report GPU timings in a CPU column.
 
 ## Reporting
 
