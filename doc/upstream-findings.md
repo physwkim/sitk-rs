@@ -744,3 +744,20 @@ What actually remains unported:
   `ResampleImageFilter::execute` is generic over that trait. No top-level
   `Warp` free function yet (`transform::WarpImageFilter` is class-based
   only) — out of scope for this pass.
+
+## 7. ITK performance defects (measured, not correctness)
+
+Kept out of §1 deliberately: these produce *correct* output, so they are not
+bugs by §1's definition (wrong results, NaN, or UB). They are recorded because
+they distort any benchmark that treats ITK's multithreaded time as the
+baseline, and a port that "beats ITK" on these ops is partly beating an ITK
+defect rather than demonstrating its own speed.
+
+Measured on 96 logical cores against ITK 6.0 (release, default Pool threader,
+no TBB). Method, inputs and raw rows: [`bench-spec.md`](bench-spec.md),
+[`bench-results.md`](bench-results.md), `bench/results/cpp.ndjson`.
+
+| # | Filter | Finding | Status |
+|---|---|---|---|
+| 7.1 | `itk::BinaryDilateImageFilter` | **Negative scaling**: ITK is *slower* with 96 threads than with 1. Medium (256³): `t1` 1702.9 ms → `tN` 2549.7 ms (**0.67×**, i.e. 1.5× slower for 96× the cores). Large (512³): `t1` 15033.8 ms → `tN` 17726.5 ms (0.85×). Reproducible across sizes, so not a warm-up artifact. Not investigated to root cause — the measurement is the finding. | recorded; the port's own `binary_dilate` scales positively (medium `t1` 5781.1 → `tN` 544.6, 10.6×), so its 0.21× medium `tN` ratio vs ITK is **partly** ITK's regression and not a pure win: against ITK's *own best* time (`t1` 1702.9) the port's 544.6 ms is a 3.1× win, not 4.7×. |
+| 7.2 | `itk::ConnectedComponentImageFilter` | **Severe negative scaling**: medium (256³) `t1` 684.2 ms → `tN` 4564.5 ms (**0.15×** — 6.7× *worse* when given 96 cores). Large (512³): `t1` 5483.5 ms → `tN` 32008.6 ms (0.17×). The 96-thread time is the worst number ITK produces for this op at any thread count. | recorded; the port's `connected_component` is itself effectively serial (medium `t1` 997.2 → `tN` 959.8, 1.04×), so its 0.21× medium `tN` ratio is **entirely** an artifact of ITK's regression: against ITK's best (`t1` 684.2 ms) the port at 959.8 ms is 1.4× **slower**. Do not cite the `tN` ratio for this op without this caveat. |
