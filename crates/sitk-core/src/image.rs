@@ -148,9 +148,13 @@ impl PixelBuffer {
     }
 
     /// Widen every stored component to `f64`, preserving interleaved order.
+    ///
+    /// Nearly every filter starts here, so the widening runs through
+    /// [`crate::parallel::map_slice`]: a pure elementwise cast, bit-identical
+    /// to the sequential map at any thread count.
     pub fn to_f64_vec(&self) -> Vec<f64> {
         fn widen<T: Scalar>(v: &[T]) -> Vec<f64> {
-            v.iter().map(|&x| x.as_f64()).collect()
+            crate::parallel::map_slice(v, |&x| x.as_f64())
         }
         match self {
             PixelBuffer::UInt8(v) => widen(v),

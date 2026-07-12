@@ -394,7 +394,10 @@ impl PixelId {
 /// [`Image::scalar_view`]: crate::Image::scalar_view
 /// [`Image::component_slice`]: crate::Image::component_slice
 /// [`Image::component_vec_mut`]: crate::Image::component_vec_mut
-pub trait Scalar: Copy + PartialOrd + 'static {
+/// `Send + Sync` is part of the contract because every filter's inner loop may
+/// be run through [`crate::parallel`]; the ten implementors are primitives, for
+/// which it holds trivially.
+pub trait Scalar: Copy + PartialOrd + Send + Sync + 'static {
     /// The runtime tag for this Rust type. Always a scalar variant: `Scalar` is
     /// implemented only for the ten component types, and a vector image's
     /// buffer stores those components.
