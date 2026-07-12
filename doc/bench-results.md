@@ -101,27 +101,93 @@ Where the port already wins at `t1` it wins on algorithm, not on constant
 factor: `median` (0.47×), `signed_maurer_distance_map` (0.68×),
 `connected_component` (0.72× small).
 
-### 2. GPU offload of per-pixel ops is not worth it — PCIe dominates
+### 2. The GPU was never PCIe-bound — it was page-faulting. (Conclusion retracted 2026-07-13)
 
-`rescale_intensity` is the one op with a CUDA kernel. It is bit-exact against
-the CPU path (`max_abs_err = max_rel_err = 0.0` at every size).
+**This section previously read "GPU offload of per-pixel ops is not worth it —
+PCIe dominates," and concluded that a per-pixel op can never win on the GPU
+because the bus is the floor. That conclusion was wrong and is retracted.** It
+is preserved here as a worked example of how a plausible scaling argument can
+launder an allocation cost into a hardware limit.
 
-| size | gpu | cpu tN | verdict |
+The reasoning was: GPU time scales exactly linearly with voxel count
+(72.8 ms at 256³ → 538.9 ms at 512³, i.e. 8× the data for 7.4× the time) while
+the kernel is only ~1.3 ms, therefore the time is the PCIe round-trip,
+therefore it is irreducible. Every step of that is true except the last, and
+the arithmetic that breaks it is one division: 512³ moves 1.074 GB round-trip
+in 538.9 ms, which is **2.0 GB/s** — about a *tenth* of what this machine's
+link actually does.
+
+Measured on this machine: **the link does 13.0 GB/s. The op was running its D2H
+at 1.1 GB/s.** The gap was not the bus. `rescale_intensity_gpu` copied the
+result into a **freshly allocated `Vec`**, so the DMA faulted in all 131,072 of
+that buffer's pages as it wrote them, and the kernel's page-zeroing cost was
+being billed to the transfer. The crate's own `buffer.rs` had already recorded
+the effect ("the page-fault cost is the allocation's, not the PCIe link's") and
+the op was calling the slow path anyway.
+
+Copying into a resident destination instead: **512³ D2H 476 ms → 41 ms
+(1.1 → 13.0 GB/s), and the whole op 538.9 ms → 213.8 ms**, with the output
+still bit-identical to the CPU at every size (`max_abs_err = max_rel_err = 0.0`,
+0 of 16,777,216 voxels differ at 256³).
+
+Phase split after the fix (median of 3 warm runs, ms):
+
+| | 64³ | 256³ | 512³ |
 |---|---|---|---|
-| small | 0.5 | 0.6 | tie |
-| medium | 72.8 | 72.7 | dead tie |
-| large | 538.9 | 243.0 | **GPU 2.2× slower** |
+| h2d | 0.17 | 6.93 | 56.80 |
+| **alloc** (host output) | 0.07 | 23.31 | **108.12** |
+| kernel | 0.10 | 1.33 | 6.09 |
+| d2h | 0.21 | 5.45 | 41.40 |
+| **total** | **0.54** | **37.02** | **213.8** |
 
-GPU time scales exactly linearly with voxel count (72.8 → 538.9 ms for 8× the
-data), which means it is *entirely* the PCIe round-trip; the kernel itself is
-~1.3 ms at medium. A per-pixel op cannot win on the GPU when the host must ship
-the volume across the bus to get one arithmetic operation done to it.
+**The real wall is now the output allocation** — at 512³ it is 108 ms, larger
+than H2D, D2H and the kernel *combined*. It is inherent to returning a freshly
+owned buffer: Linux must zero every anonymous page before handing it over. Only
+a **reused** destination removes it, which a one-shot `fn(&Image) -> Image` API
+cannot express.
 
-This closes the question of expanding GPU coverage to the other 11 ops as a
-per-op offload. The only shapes that could pay for the transfer are the
-compute-dense ones — `median`, `discrete_gaussian`, `fft_convolution` — or a
-design where the volume stays resident on the device across a *chain* of ops so
-the transfer is amortized. Neither is implemented.
+Two things measurement contradicted, recorded so they are not retried:
+
+- **Pinning the H2D source is a net loss** for a one-shot op (99 ms vs 56 ms at
+  512³): staging the caller's `Vec` into pinned memory costs a full host-to-host
+  copy, more than the faster DMA saves.
+- **Pinning the D2H destination is worse than doing nothing** (817 ms): the
+  pinned→fresh-`Vec` copy faults every page anyway.
+
+Pinning pays only for a **reused** buffer. That is the resident-volume shape
+(registration's inner loop), not the one-shot filter shape.
+
+This does *not* reinstate "expand the GPU to all 12 ops". It says the reason to
+be selective is arithmetic intensity, not a bus floor — and it says the highest
+-value GPU work is wherever a buffer can stay resident across many passes.
+
+### 2b. The same defect, on the other side of the bus
+
+The CPU path is sick with the identical disease. `rescale_intensity_cpu`
+materializes ~335 MB of intermediate `f64` buffers per call (widen → min/max →
+map → narrow), and the cost is not `malloc` — `vec![0f64; n]` on its own
+measures 0.0 ms, because the pages are lazy. The cost is the kernel **zeroing
+every page on first touch**: 438,829 minor faults for the staged shape versus
+98,403 for a fused one, 210 ms versus 86 ms at 256³ (ITK: 71 ms).
+
+So the port's dominant performance defect, on **both** sides of the bus, is
+**first-touch page faults on freshly-allocated intermediate buffers**. Two
+symptoms, one cause.
+
+### 2c. Measurement stability — read before trusting any number above
+
+The `t1`/`tN` columns in the tables above were measured across **different
+sessions**, and that is not currently safe on this machine. The identical CPU
+function measured **184 ms in one session and 863 ms in another — a 4.7× drift
+with no code change**, because the box runs with ~10 GB free against ~473 GB of
+page cache, so a large anonymous allocation must reclaim page cache rather than
+take free pages, and the first-touch cost above swings with it. (Long-running
+agent processes on the box contribute to that pressure.)
+
+Consequence: **a GPU-vs-CPU verdict requires both paths measured in one session,
+on one branch, back to back.** The 213.8 ms GPU figure is *not* compared against
+the 243.0 ms CPU `tN` above, because those two numbers come from different
+machine states. Do not restate that comparison until both are re-run together.
 
 ### 3. Two ITK multithreading regressions, found by this benchmark
 
