@@ -12,6 +12,7 @@
 
 pub mod boundary;
 pub mod error;
+pub mod fused;
 pub mod image;
 pub mod label_map;
 pub mod matrix;
@@ -25,9 +26,10 @@ pub use boundary::{
     PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
 };
 pub use error::{Error, Result};
+pub use fused::map_pixels;
 pub use image::{Image, PixelBuffer, ScalarView};
 pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
-pub use neighborhood::{Neighborhood, NeighborhoodIterator};
+pub use neighborhood::{Neighborhood, NeighborhoodIterator, WindowView};
 pub use pixel::{Complex, PixelId, Real, Scalar};
 
 #[cfg(test)]

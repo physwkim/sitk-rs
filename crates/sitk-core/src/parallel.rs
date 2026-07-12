@@ -51,6 +51,8 @@
 
 use rayon::prelude::*;
 
+use crate::pixel::Scalar;
+
 /// Target elements per worker task. Only a scheduling knob: every primitive
 /// here is exact, so changing it cannot change a result.
 const GRAIN: usize = 4096;
@@ -204,11 +206,17 @@ where
         });
 }
 
-/// The minimum and maximum of `vals`, or `None` if empty.
+/// The minimum and maximum of `vals` widened to `f64`, or `None` if empty.
 ///
 /// Equals the sequential `lo = lo.min(v); hi = hi.max(v)` scan bit-for-bit: see
 /// the module docs' associativity argument.
-pub fn min_max(vals: &[f64]) -> Option<(f64, f64)> {
+///
+/// Generic over the *stored* type so a caller can scan an image's native buffer
+/// directly. `Scalar::as_f64` is the same lossless widening `Image::to_f64_vec`
+/// applies, so `min_max(img.scalar_slice::<f32>()?)` returns the identical bits
+/// to `min_max(&img.to_f64_vec()?)` — without materializing the `f64` copy. (See
+/// [`crate::fused`] for why that copy was the port's dominant cost.)
+pub fn min_max<T: Scalar>(vals: &[T]) -> Option<(f64, f64)> {
     if vals.is_empty() {
         return None;
     }
@@ -231,10 +239,11 @@ pub fn min_max(vals: &[f64]) -> Option<(f64, f64)> {
     )
 }
 
-fn fold_min_max(vals: &[f64]) -> (f64, f64) {
+fn fold_min_max<T: Scalar>(vals: &[T]) -> (f64, f64) {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for &v in vals {
+        let v = v.as_f64();
         lo = lo.min(v);
         hi = hi.max(v);
     }
@@ -589,7 +598,7 @@ mod tests {
             .collect();
         let want = fold_min_max(&vals);
         assert_eq!(min_max(&vals), Some(want));
-        assert_eq!(min_max(&[]), None);
+        assert_eq!(min_max::<f64>(&[]), None);
     }
 
     /// A NaN in the data must not poison the accumulator on either path — the
