@@ -34,6 +34,7 @@ mod pinned;
 pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
+pub use ops::mean_squares::{DIM, Moments, MovingGeometry, ResidentMetric};
 pub use ops::rescale_intensity::{rescale_intensity_gpu, try_rescale_intensity};
 pub use pinned::PinnedBuffer;
 

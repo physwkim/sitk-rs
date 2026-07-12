@@ -578,6 +578,7 @@ name = "sitk-registration"
 version = "0.0.1"
 dependencies = [
  "sitk-core",
+ "sitk-cuda",
  "sitk-filters",
  "sitk-transform",
  "thiserror",
