@@ -1,5 +1,18 @@
 # Benchmark results: sitk-rs vs ITK 6.0 (C++)
 
+> **STALE — re-measurement in progress (2026-07-13).** The tables below were
+> measured *before* `sitk_core::fused::map_pixels` / `WindowView` landed, and
+> before `sitk-cuda`'s D2H page-fault fix. Five of the twelve `t1` numbers are
+> known to be wrong now (`rescale_intensity` 3.40× faster, `gradient_magnitude`
+> 1.79×, `discrete_gaussian` 1.71×, `binary_dilate` 1.66×, `mean` 1.20×), and
+> the `rescale_intensity` GPU row is wrong at every size. The ITK columns are
+> unaffected — ITK did not change.
+>
+> Beyond that, §2c below explains why the `t1` and `tN` columns should not be
+> compared to each other *at all* right now: they were measured in different
+> sessions on a box whose first-touch allocation cost swings ~4.7× with memory
+> pressure. Do not quote a ratio from this file until it is regenerated.
+
 Measured under the contract in [`bench-spec.md`](bench-spec.md). Raw rows are
 frozen in [`../bench/results/`](../bench/results/); regenerate the tables with
 
