@@ -783,20 +783,34 @@ pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Resul
 /// against the CPU result, and with the `cuda` feature on
 /// [`rescale_intensity`] itself no longer reaches this code.
 pub fn rescale_intensity_cpu(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
-    let vals = img.to_f64_vec()?;
-    if vals.is_empty() {
+    if img.number_of_pixels() == 0 {
         return Err(FilterError::DegenerateRange);
     }
-    // `min`/`max` select an element of the input set, so the chunked scan in
-    // `parallel::min_max` returns the same `f64` bits as this filter's former
-    // sequential `lo.min(v)` / `hi.max(v)` fold, at any thread count.
-    let (lo, hi) = parallel::min_max(&vals).ok_or(FilterError::DegenerateRange)?;
+    // Two passes over the *native* buffer, with no `f64` copy of the volume in
+    // between. `min`/`max` select an element of the input set, so the chunked
+    // scan returns the same `f64` bits as the former sequential
+    // `lo.min(v)` / `hi.max(v)` fold, at any thread count; and the map widens,
+    // scales and narrows in-register, so every stored value is the `from_f64` of
+    // the same `f64` the staged form computed. See `sitk_core::fused`.
+    let (lo, hi) = min_max_pixels(img)?.ok_or(FilterError::DegenerateRange)?;
     if lo == hi {
         return Err(FilterError::DegenerateRange);
     }
     let scale = (output_max - output_min) / (hi - lo);
-    let out: Vec<f64> = parallel::map_slice(&vals, |&v| (v - lo) * scale + output_min);
-    image_from_f64(img.pixel_id(), img.size(), img, &out)
+    Ok(sitk_core::map_pixels(img, img.pixel_id(), |v| {
+        (v - lo) * scale + output_min
+    })?)
+}
+
+/// `parallel::min_max` over an image's own pixel buffer — no `f64` copy.
+///
+/// `scalar_slice` is the scalar-only seam: a vector or complex image errors here
+/// rather than being silently read as its component type.
+fn min_max_pixels(img: &Image) -> Result<Option<(f64, f64)>> {
+    fn scan<T: Scalar>(img: &Image) -> Result<Option<(f64, f64)>> {
+        Ok(parallel::min_max(img.scalar_slice::<T>()?))
+    }
+    dispatch_scalar!(img.pixel_id(), scan, img)
 }
 
 // ---- reductions -----------------------------------------------------------

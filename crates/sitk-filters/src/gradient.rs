@@ -47,8 +47,8 @@ use crate::recursive_gaussian::{
     GaussianOrder, recursive_gaussian_f64, recursive_gaussian_with_order,
 };
 use sitk_core::{
-    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition, matrix,
-    parallel,
+    Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
+    dispatch_scalar, matrix, parallel,
 };
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry (spacing in
@@ -84,6 +84,46 @@ pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image>
 /// through [`gradient_magnitude`] would quantize the watershed's height
 /// function to `f32` for `u8`/`u16`/... inputs, which ITK does not do.
 pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) -> Result<Vec<f64>> {
+    /// The stencil, over the image's **native** pixel type.
+    ///
+    /// Reading `T` and widening per access, instead of first materializing an
+    /// `f64` copy of the whole volume, is lossless — so every value the
+    /// arithmetic sees is the `f64` the copy would have held — and it halves the
+    /// bytes the stencil streams. The window itself is borrowed, not copied; see
+    /// [`sitk_core::WindowView`].
+    fn compute<T: Scalar>(img: &Image, scales: &[f64]) -> Result<Vec<f64>> {
+        let dim = img.dimension();
+        let radius = vec![1usize; dim];
+        let iter =
+            NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+        // Window strides, so a neighbor can be addressed by its linear slot
+        // rather than by re-deriving an ND index per access. Every axis of this
+        // window has extent 3, so the stride along axis `d` is `3^d` — exactly
+        // what `Neighborhood::get` computed, once per call, in a loop.
+        let center = iter.len() / 2;
+        let mut window_stride = vec![0usize; dim];
+        let mut stride = 1usize;
+        for s in window_stride.iter_mut() {
+            *s = stride;
+            stride *= 3;
+        }
+
+        // Parallel over output voxels. The `acc += g * g` sum runs over the axes
+        // of one voxel's own window, in axis order, exactly as before — nothing
+        // accumulates across voxels, so the output bits are unchanged.
+        Ok(iter.par_map_window(|_, w| {
+            let mut acc = 0.0;
+            for d in 0..dim {
+                let plus = w.get_f64(center + window_stride[d]);
+                let minus = w.get_f64(center - window_stride[d]);
+                let g = 0.5 * (plus - minus) / scales[d];
+                acc += g * g;
+            }
+            acc.sqrt()
+        }))
+    }
+
     let dim = img.dimension();
     let scales: Vec<f64> = (0..dim)
         .map(|d| {
@@ -94,33 +134,7 @@ pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) ->
             }
         })
         .collect();
-    let scratch = scratch_f64(img)?;
-    let radius = vec![1usize; dim];
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
-
-    // Parallel over output voxels. The `acc += g * g` sum runs over the axes of
-    // one voxel's own window, in axis order, exactly as before — nothing
-    // accumulates across voxels, so the output bits are unchanged.
-    // The offset vector is per-task scratch, not a per-voxel allocation.
-    let out: Vec<f64> = iter.par_map_init(
-        || vec![0i64; dim],
-        |off, _, nb| {
-            let mut acc = 0.0;
-            for d in 0..dim {
-                off[d] = 1;
-                let plus = nb.get(off);
-                off[d] = -1;
-                let minus = nb.get(off);
-                off[d] = 0;
-                let g = 0.5 * (plus - minus) / scales[d];
-                acc += g * g;
-            }
-            acc.sqrt()
-        },
-    );
-
-    Ok(out)
+    dispatch_scalar!(img.pixel_id(), compute, img, &scales)
 }
 
 // ---- derivative -------------------------------------------------------------
