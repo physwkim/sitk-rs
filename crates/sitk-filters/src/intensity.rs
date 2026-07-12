@@ -32,7 +32,7 @@ use crate::error::{FilterError, Result};
 use crate::functor;
 use crate::functor::UnaryFunctor;
 use crate::histogram::Histogram;
-use sitk_core::{Image, PixelId};
+use sitk_core::{Image, PixelId, parallel};
 
 // ---- Sigmoid ----------------------------------------------------------
 
@@ -576,16 +576,17 @@ pub fn otsu_threshold(
     let idx = otsu_multiple_threshold_indices(&hist, 1, false)[0];
     let threshold = threshold_value(&hist, idx, return_bin_midpoint);
 
-    let out: Vec<u8> = vals
-        .iter()
-        .map(|&v| {
-            if v <= threshold {
-                inside_value
-            } else {
-                outside_value
-            }
-        })
-        .collect();
+    // Parallel per-pixel binarize. The threshold *search* above stays sequential:
+    // it folds `f64` class variances over the bins, and re-associating that fold
+    // would change its bits — but it is O(bins), not O(voxels), so there is
+    // nothing to win by touching it.
+    let out: Vec<u8> = parallel::map_slice(&vals, |&v| {
+        if v <= threshold {
+            inside_value
+        } else {
+            outside_value
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))
@@ -740,16 +741,17 @@ pub fn triangle_threshold(
     let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
     let threshold = triangle_threshold_value(&hist);
 
-    let out: Vec<u8> = vals
-        .iter()
-        .map(|&v| {
-            if v <= threshold {
-                inside_value
-            } else {
-                outside_value
-            }
-        })
-        .collect();
+    // Parallel per-pixel binarize. The threshold *search* above stays sequential:
+    // it folds `f64` class variances over the bins, and re-associating that fold
+    // would change its bits — but it is O(bins), not O(voxels), so there is
+    // nothing to win by touching it.
+    let out: Vec<u8> = parallel::map_indexed(vals.len(), |i| {
+        if vals[i] <= threshold {
+            inside_value
+        } else {
+            outside_value
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))

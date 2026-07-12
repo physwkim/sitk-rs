@@ -31,6 +31,7 @@
 //! `f64` uniformly for every caller, matching that rule exactly.
 
 use crate::error::{FilterError, Result};
+use sitk_core::parallel;
 
 /// See the module docs for the construction convention. Single dimension
 /// only (this crate's images are scalar-pixel, so the 1-D case is all
@@ -52,11 +53,9 @@ impl Histogram {
         }
         let bins = bins as usize;
 
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for &v in vals {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
+        // `min`/`max` select an element of the input set: exactly associative, so
+        // the chunked scan returns the same bits as the sequential one.
+        let (lo, hi) = parallel::min_max(vals).ok_or(FilterError::DegenerateRange)?;
 
         // `itkImageToHistogramFilter.hxx`'s `ApplyMarginalScale` /
         // `itkSampleToHistogramFilter.hxx`'s equivalent: margin added only to
@@ -84,10 +83,9 @@ impl Histogram {
             frequency: vec![0; bins],
             total: vals.len() as u64,
         };
-        for &v in vals {
-            let idx = hist.bin_index(v);
-            hist.frequency[idx] += 1;
-        }
+        // Parallel integer counting — see `from_bounds` for the argument. Here
+        // every value is binned (clipped at the ends), so `total` is `vals.len()`.
+        hist.frequency = parallel::bin_counts(vals, bins, |v| Some(hist.bin_index(v)));
         Ok(hist)
     }
 
@@ -137,13 +135,16 @@ impl Histogram {
             frequency: vec![0; bins],
             total: 0,
         };
-        for &v in vals {
-            if v >= lower && v <= upper {
-                let idx = hist.bin_index(v);
-                hist.frequency[idx] += 1;
-                hist.total += 1;
-            }
-        }
+        // Parallel integer counting: `bin_index` is a pure function of one value
+        // against the bin edges fixed above, and `u64` addition is exactly
+        // associative, so the chunk-combined counts equal the sequential ones.
+        // `total` is the number actually inserted — the values the range guard
+        // rejects land in no bin at all.
+        let frequency = parallel::bin_counts(vals, bins, |v| {
+            (v >= lower && v <= upper).then(|| hist.bin_index(v))
+        });
+        hist.total = frequency.iter().sum();
+        hist.frequency = frequency;
         Ok(hist)
     }
 
