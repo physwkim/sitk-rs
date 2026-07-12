@@ -27,36 +27,43 @@
 mod backend;
 mod buffer;
 mod error;
+pub mod host;
 mod ops;
+mod pinned;
 
 pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use ops::rescale_intensity::{rescale_intensity_gpu, try_rescale_intensity};
+pub use pinned::PinnedBuffer;
 
 /// Wall-clock split of one GPU op, in milliseconds.
 ///
 /// Measured with a stream synchronize between phases, so `kernel_ms` excludes
 /// transfer time rather than hiding behind it. For a per-pixel op the transfer
-/// terms are expected to dominate; reporting them separately is the point.
+/// terms dominate; reporting them separately is the point.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuTimings {
     /// Host-to-device copy of the input buffer.
     pub h2d_ms: f64,
+    /// Preparing the output allocation so the D2H does not fault under the DMA
+    /// (see [`host::resident_vec`]).
+    ///
+    /// This is a *host* cost, and it is broken out rather than folded into
+    /// `d2h_ms` because folding it there is precisely the mistake that made a
+    /// page-fault storm look like a slow PCIe link.
+    pub alloc_ms: f64,
     /// All kernel launches (for `rescale_intensity`: the min/max reduction and
     /// the map), synchronized.
     pub kernel_ms: f64,
-    /// Device-to-host copy of the output buffer, **including** the first-touch
-    /// page faults on the freshly allocated output `Vec` the op must return.
-    /// On this machine those faults are ~6× the copy itself for a 64 MiB
-    /// output (~35 ms vs ~5 ms); see [`DeviceBuffer::copy_to_host`] for the
-    /// pooled-destination path that avoids them.
+    /// Device-to-host copy of the output buffer into an already-resident
+    /// destination — the DMA alone, at link speed.
     pub d2h_ms: f64,
 }
 
 impl GpuTimings {
-    /// Sum of the three phases.
+    /// Sum of the four phases: the op's whole wall-clock cost.
     pub fn total_ms(&self) -> f64 {
-        self.h2d_ms + self.kernel_ms + self.d2h_ms
+        self.h2d_ms + self.alloc_ms + self.kernel_ms + self.d2h_ms
     }
 }

@@ -141,6 +141,85 @@ fn gpu_matches_cpu_on_the_medium_volume() {
     );
 }
 
+/// Task 0: the published claim was that `rescale_intensity`'s GPU time is
+/// "essentially all PCIe", so per-pixel GPU offload can never pay. This walks
+/// the bench-spec sizes and reports the phase split, including the CPU
+/// single-thread reference, so the claim is decided by measurement.
+///
+/// Not an assertion of a timing bound — timings are not a test contract, and a
+/// loaded machine would make one flaky. It asserts *correctness* (the output is
+/// still bit-identical to the CPU's at every size) and prints the numbers.
+#[test]
+fn transfer_split_across_the_bench_spec_sizes() {
+    for (label, n) in [("small", 64usize), ("medium", 256), ("large", 512)] {
+        let size = [n, n, n];
+        let img = match Image::from_vec(&size, synth(0x1234_5678_9abc_def0, size)) {
+            Ok(i) => i,
+            Err(e) => panic!("building the {label} volume failed: {e}"),
+        };
+
+        let (gpu, cold) = match sitk_cuda::rescale_intensity_gpu(&img, 0.0, 255.0) {
+            Ok(v) => v,
+            Err(e @ sitk_cuda::CudaError::NoDevice(_)) => {
+                println!("SKIPPED: no CUDA device ({e})");
+                return;
+            }
+            Err(e) => panic!("GPU present but {label} failed: {e}"),
+        };
+        let warm: Vec<sitk_cuda::GpuTimings> = (0..3)
+            .map(|_| {
+                sitk_cuda::rescale_intensity_gpu(&img, 0.0, 255.0)
+                    .expect("the device answered once already")
+                    .1
+            })
+            .collect();
+        let med = |f: fn(&sitk_cuda::GpuTimings) -> f64| {
+            let mut v: Vec<f64> = warm.iter().map(f).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (h2d, alloc, kernel, d2h) = (
+            med(|t| t.h2d_ms),
+            med(|t| t.alloc_ms),
+            med(|t| t.kernel_ms),
+            med(|t| t.d2h_ms),
+        );
+        let total = h2d + alloc + kernel + d2h;
+
+        let t = std::time::Instant::now();
+        let cpu = rescale_intensity_cpu(&img, 0.0, 255.0).unwrap();
+        let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+
+        let bytes = (n * n * n * 4) as f64;
+        let gbs = |ms: f64| bytes / 1e9 / (ms / 1e3);
+
+        println!(
+            "--- {label} {n}^3 ({} MiB each way) ---",
+            (bytes / 1048576.0) as usize
+        );
+        println!("  h2d    {h2d:8.2} ms  ({:5.2} GB/s)", gbs(h2d));
+        println!("  alloc  {alloc:8.2} ms  (host: make the output resident)");
+        println!("  kernel {kernel:8.2} ms");
+        println!(
+            "  d2h    {d2h:8.2} ms  ({:5.2} GB/s, DMA into a resident dst)",
+            gbs(d2h)
+        );
+        println!(
+            "  TOTAL  {total:8.2} ms   (cold, incl. NVRTC: {:.2} ms)",
+            cold.total_ms()
+        );
+        println!("  cpu t1 {cpu_ms:8.2} ms");
+
+        // The point of Task 0 was to make the op faster without moving a single
+        // bit of the result. Bit-identity, at every size.
+        assert_eq!(
+            gpu.scalar_slice::<f32>().unwrap(),
+            cpu.scalar_slice::<f32>().unwrap(),
+            "{label}: GPU output must stay bit-identical to the CPU"
+        );
+    }
+}
+
 /// The fallback contract: an unsupported pixel type must not fail, it must run
 /// on the CPU. `UInt8` has no GPU kernel.
 #[test]
