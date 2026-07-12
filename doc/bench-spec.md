@@ -81,6 +81,7 @@ work around it.**
 |---|---|---|---|
 | small 64³ | `0xa60a081f21af857e` | `0x5fb1f4b900bd027a` | `0x13c82d199e0a5b88` |
 | medium 256³ | `0xb04930cda0bbce53` | `0x4d2b8759782954c6` | `0x4bb5460e5493a3e8` |
+| large 512³ | `0xfbf1951b8b4b69aa` | `0x25cdf3c6351a03ae` | `0x4b1fb2c019bb1d68` |
 
 FNV-1a 64: offset `0xcbf29ce484222325`, prime `0x100000001b3`, hashed
 one byte at a time over the little-endian bytes of the buffer **as
@@ -197,3 +198,26 @@ a degraded baseline is a misleading ratio:
   ITK-at-its-best; note it rather than claiming a clean FFT win.
 - Every C++ sample constructs a fresh filter so `GenerateData()` cannot
   be served from cache; per-sample times are flat, confirming this.
+- **No ITK op needs the `> 120 s` skip.** The `large` (512³) `tN` run
+  completes all 12 ops; the slowest are `connected_component` (35.0 s)
+  and `binary_dilate` (14.9 s). So a `skipped` row on the Rust side can
+  never cite ITK's runtime as the reason — if the port skips a
+  (op, size, config), the reason string must state the port's own
+  reason honestly (e.g. serial `t1` cost), not borrow this rule.
+
+### Measured ITK `large` (512³) `tN` baseline, median of 5
+
+| op | ms |
+|---|---|
+| rescale_intensity | 270.8 |
+| smoothing_recursive_gaussian | 214.2 |
+| discrete_gaussian | 479.4 |
+| median | 4061.5 |
+| mean | 484.4 |
+| gradient_magnitude | 96.5 |
+| gradient_magnitude_recursive_gaussian | 766.7 |
+| binary_dilate | 14864.1 |
+| signed_maurer_distance_map | 1609.7 |
+| connected_component | 35000.6 |
+| otsu_threshold | 157.4 |
+| fft_convolution | 2094.5 |
