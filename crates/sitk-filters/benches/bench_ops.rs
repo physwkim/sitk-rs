@@ -31,6 +31,8 @@ mod synth;
 use checksum::{checksum_buffer, checksum_hex};
 use criterion::Criterion;
 use ops::{InputKind, OPS};
+#[cfg(feature = "cuda")]
+use ops::{RESCALE_OUTPUT_MAX, RESCALE_OUTPUT_MIN};
 use schema::Row;
 use serde::Deserialize;
 use sitk_core::Image;
@@ -127,6 +129,35 @@ fn write_row(out: &mut File, row: &Row) {
     writeln!(out, "{line}").expect("write NDJSON row");
 }
 
+/// `doc/bench-spec.md` §"Correctness gate — not optional": GPU bit-for-bit is
+/// not required, so the gate compares the GPU output against the CPU
+/// reference with `max_abs_err`/`max_rel_err` instead of checksum equality.
+#[cfg(feature = "cuda")]
+fn max_abs_rel_err(cpu: &Image, gpu: &Image) -> (f64, f64) {
+    let cpu = cpu
+        .scalar_slice::<f32>()
+        .expect("cpu rescale_intensity reference is scalar f32");
+    let gpu = gpu
+        .scalar_slice::<f32>()
+        .expect("gpu rescale_intensity output is scalar f32");
+    assert_eq!(
+        cpu.len(),
+        gpu.len(),
+        "gpu output length does not match the cpu reference"
+    );
+    let mut max_abs = 0.0_f64;
+    let mut max_rel = 0.0_f64;
+    for (&c, &g) in cpu.iter().zip(gpu.iter()) {
+        let c = f64::from(c);
+        let g = f64::from(g);
+        let abs = (c - g).abs();
+        max_abs = f64::max(max_abs, abs);
+        let rel = if c != 0.0 { abs / c.abs() } else { abs };
+        max_rel = f64::max(max_rel, rel);
+    }
+    (max_abs, max_rel)
+}
+
 fn main() {
     let root = workspace_root();
     let criterion_dir = root.join("target").join("criterion");
@@ -215,6 +246,8 @@ fn main() {
                             samples: None,
                             input_checksum: Some(input_checksum.clone()),
                             output_checksum: Some(output_checksum.clone()),
+                            max_abs_err: None,
+                            max_rel_err: None,
                             skipped: Some(format!(
                                 "rust t1 large not run this session: serial by definition \
                                  (measured medium t1 {medium_ms:.0} ms/call; 512^3 is 8x the \
@@ -255,31 +288,149 @@ fn main() {
                         samples: Some(SAMPLE_SIZE as u32),
                         input_checksum: Some(input_checksum.clone()),
                         output_checksum: Some(output_checksum.clone()),
+                        max_abs_err: None,
+                        max_rel_err: None,
                         skipped: None,
                     },
                 );
             }
 
-            // `doc/bench-spec.md` §"Thread configurations": `gpu` needs the
-            // `sitk-cuda` feature, which does not exist in this workspace yet.
-            write_row(
-                &mut out,
-                &Row {
-                    harness: "rust",
-                    op: op.key,
-                    size: size_name,
-                    voxels,
-                    config: "gpu",
-                    threads: 0,
-                    ms_mean: None,
-                    ms_median: None,
-                    ms_stddev: None,
-                    samples: None,
-                    input_checksum: Some(input_checksum),
-                    output_checksum: None,
-                    skipped: Some("sitk-cuda feature not present in this workspace".to_string()),
-                },
-            );
+            // `doc/bench-spec.md` §"Thread configurations": `gpu` means
+            // "`sitk-cuda` feature on, device 0". Two distinct, honest
+            // reasons apply when this isn't a real measurement -- collapsing
+            // them into one string was the bug this replaced. Only
+            // `rescale_intensity` has a GPU kernel at all (the other 11 ops
+            // have none, feature on or off); for `rescale_intensity` itself,
+            // the feature may simply be off for this build.
+            if op.key == "rescale_intensity" {
+                #[cfg(feature = "cuda")]
+                {
+                    match sitk_cuda::rescale_intensity_gpu(
+                        input,
+                        RESCALE_OUTPUT_MIN,
+                        RESCALE_OUTPUT_MAX,
+                    ) {
+                        Ok((gpu_output, _timings)) => {
+                            let (max_abs_err, max_rel_err) =
+                                max_abs_rel_err(&reference_output, &gpu_output);
+                            let gpu_output_checksum =
+                                checksum_hex(checksum_buffer(gpu_output.buffer()));
+
+                            let bench_id = format!("{}_{}_gpu", op.key, size_name);
+                            criterion.bench_function(&bench_id, |b| {
+                                b.iter(|| {
+                                    sitk_cuda::rescale_intensity_gpu(
+                                        black_box(input),
+                                        RESCALE_OUTPUT_MIN,
+                                        RESCALE_OUTPUT_MAX,
+                                    )
+                                    .expect("gpu op call")
+                                });
+                            });
+                            let (ms_mean, ms_median, ms_stddev) =
+                                read_estimates_ms(&criterion_dir, &bench_id);
+
+                            write_row(
+                                &mut out,
+                                &Row {
+                                    harness: "rust",
+                                    op: op.key,
+                                    size: size_name,
+                                    voxels,
+                                    config: "gpu",
+                                    threads: 0,
+                                    ms_mean: Some(ms_mean),
+                                    ms_median: Some(ms_median),
+                                    ms_stddev: Some(ms_stddev),
+                                    samples: Some(SAMPLE_SIZE as u32),
+                                    input_checksum: Some(input_checksum),
+                                    output_checksum: Some(gpu_output_checksum),
+                                    max_abs_err: Some(max_abs_err),
+                                    max_rel_err: Some(max_rel_err),
+                                    skipped: None,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            write_row(
+                                &mut out,
+                                &Row {
+                                    harness: "rust",
+                                    op: op.key,
+                                    size: size_name,
+                                    voxels,
+                                    config: "gpu",
+                                    threads: 0,
+                                    ms_mean: None,
+                                    ms_median: None,
+                                    ms_stddev: None,
+                                    samples: None,
+                                    input_checksum: Some(input_checksum),
+                                    output_checksum: None,
+                                    max_abs_err: None,
+                                    max_rel_err: None,
+                                    skipped: Some(format!(
+                                        "rust gpu rescale_intensity did not run: {e}"
+                                    )),
+                                },
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    write_row(
+                        &mut out,
+                        &Row {
+                            harness: "rust",
+                            op: op.key,
+                            size: size_name,
+                            voxels,
+                            config: "gpu",
+                            threads: 0,
+                            ms_mean: None,
+                            ms_median: None,
+                            ms_stddev: None,
+                            samples: None,
+                            input_checksum: Some(input_checksum),
+                            output_checksum: None,
+                            max_abs_err: None,
+                            max_rel_err: None,
+                            skipped: Some(
+                                "sitk-cuda feature not enabled for this build (rebuild \
+                                 with `--features sitk-filters/cuda` to measure the GPU \
+                                 kernel; the kernel itself exists, only this build \
+                                 excludes it)"
+                                    .to_string(),
+                            ),
+                        },
+                    );
+                }
+            } else {
+                write_row(
+                    &mut out,
+                    &Row {
+                        harness: "rust",
+                        op: op.key,
+                        size: size_name,
+                        voxels,
+                        config: "gpu",
+                        threads: 0,
+                        ms_mean: None,
+                        ms_median: None,
+                        ms_stddev: None,
+                        samples: None,
+                        input_checksum: Some(input_checksum),
+                        output_checksum: None,
+                        max_abs_err: None,
+                        max_rel_err: None,
+                        skipped: Some(
+                            "no GPU kernel implemented yet (only rescale_intensity is ported)"
+                                .to_string(),
+                        ),
+                    },
+                );
+            }
         }
     }
 }
