@@ -33,10 +33,13 @@
 
 use std::sync::Mutex;
 
+use sitk_core::parallel;
 use sitk_cuda::{FixedPoints, MovingGeometry, ResidentMetric};
 use sitk_transform::{Interpolator, ParametricTransform};
 
-use crate::metric::{CpuBackend, FixedSamples, MetricBackend, MetricValue, MovingImage};
+use crate::metric::{
+    CpuBackend, FixedSamples, MetricBackend, MetricValue, MovingImage, SamplePoints,
+};
 
 /// Relative tolerance for the probes that decide whether a transform's point map
 /// and Jacobian really are affine in the point.
@@ -66,15 +69,15 @@ struct Resident {
 
 /// The affine point map `x ↦ A·x + b` plus the Jacobian's affine decomposition,
 /// all recovered from the transform through its public trait.
-struct AffineForm {
+pub(crate) struct AffineForm {
     /// Row-major 3 × 3.
-    a: [f64; 9],
-    b: [f64; 3],
+    pub(crate) a: [f64; 9],
+    pub(crate) b: [f64; 3],
     /// `J(0)`, row-major `dim × nparams`.
-    j0: Vec<f64>,
+    pub(crate) j0: Vec<f64>,
     /// `C_e = J(e_e) − J(0)` for each basis direction `e`, same layout as `j0`.
-    c: [Vec<f64>; 3],
-    nparams: usize,
+    pub(crate) c: [Vec<f64>; 3],
+    pub(crate) nparams: usize,
 }
 
 /// The CUDA mean-squares backend. See the [module docs](self).
@@ -133,7 +136,7 @@ impl CudaMetricBackend {
             // This is the only large transfer in the run.
             *guard = None;
             let geom = MovingGeometry {
-                buf: view.buf,
+                len: view.buf.len(),
                 size: view.size,
                 strides: view.strides,
                 origin: view.origin,
@@ -142,19 +145,36 @@ impl CudaMetricBackend {
             };
             // When the sample set is the whole fixed grid in traversal order, the
             // points are a pure function of the sample index: send the grid (24
-            // numbers) instead of the points (402 MB at 256³). A sampled or masked
-            // set has no such closed form, so it uploads its points.
-            let points = if fixed.full_grid {
-                let (size, origin, idx_to_phys) = fixed.grid.parts();
-                FixedPoints::Grid {
-                    size,
-                    origin,
-                    idx_to_phys,
+            // numbers) instead of the points (402 MB at 256³). The host does not
+            // hold them either — `SamplePoints::Grid` derives them — so this is
+            // the same closed form on both sides of the bus. A sampled or masked
+            // set has no such form, so it uploads the points it materialized.
+            let points = match &fixed.points {
+                SamplePoints::Grid => {
+                    let (size, origin, idx_to_phys) = fixed.grid.parts();
+                    FixedPoints::Grid {
+                        size,
+                        origin,
+                        idx_to_phys,
+                    }
                 }
-            } else {
-                FixedPoints::Explicit(&fixed.points)
+                SamplePoints::Explicit(p) => FixedPoints::Explicit(p),
             };
-            let metric = ResidentMetric::new(&fixed.values, points, &geom).ok()?;
+            // Both volumes are held in their image's native type, so each is
+            // widened straight into its upload, a chunk at a time — there is no
+            // `f64` volume on the host to hand over.
+            let metric = ResidentMetric::new(
+                fixed.len(),
+                |start, out| {
+                    parallel::for_each_mut(out, |i, o| *o = fixed.value(start + i));
+                },
+                points,
+                &geom,
+                |start, out| {
+                    parallel::for_each_mut(out, |i, o| *o = view.buf.get(start + i));
+                },
+            )
+            .ok()?;
             *guard = Some(Resident {
                 fixed_id: fixed.id,
                 moving_id: view.id,
@@ -181,7 +201,7 @@ impl Default for CudaMetricBackend {
 /// column satisfies `J(x) = J(0) + Σ_e x_e·(J(e_e) − J(0))`. Both reconstructions
 /// are then checked against the transform itself at two probe points. This is the
 /// whole of the GPU's transform support: pass the check, run on the device.
-fn affine_form(transform: &dyn ParametricTransform) -> Option<AffineForm> {
+pub(crate) fn affine_form(transform: &dyn ParametricTransform) -> Option<AffineForm> {
     let dim = sitk_cuda::DIM;
     let nparams = transform.number_of_parameters();
     if nparams == 0 {
@@ -272,7 +292,7 @@ fn close(a: f64, b: f64) -> bool {
 /// Exact: this is the same sum the CPU accumulates per-sample, re-associated. The
 /// only difference from the CPU's result is the *order* the millions of per-sample
 /// terms were added in, which is a rounding difference, not a modelling one.
-fn contract(moments: &sitk_cuda::Moments, form: &AffineForm) -> MetricValue {
+pub(crate) fn contract(moments: &sitk_cuda::Moments, form: &AffineForm) -> MetricValue {
     let dim = sitk_cuda::DIM;
     let nparams = form.nparams;
 

@@ -13,7 +13,7 @@
 //! (`itkLinearInterpolateImageFunction.hxx`); nearest-neighbour rounds half up
 //! (`Math::RoundHalfIntegerUp`, `itkImageBase.h`).
 
-use sitk_core::matrix;
+use sitk_core::{Scalar, matrix};
 
 /// First-index-fastest strides for a size vector.
 pub fn strides(size: &[usize]) -> Vec<usize> {
@@ -34,7 +34,12 @@ pub fn is_inside(cindex: &[f64], size: &[usize]) -> bool {
 }
 
 /// Nearest-neighbour sample, or `None` if `cindex` is outside the buffer.
-pub fn nearest_at(buf: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -> Option<f64> {
+pub fn nearest_at<T: Scalar>(
+    buf: &[T],
+    size: &[usize],
+    strides: &[usize],
+    cindex: &[f64],
+) -> Option<f64> {
     if !is_inside(cindex, size) {
         return None;
     }
@@ -45,12 +50,17 @@ pub fn nearest_at(buf: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]
         i = i.clamp(0, size[d] as isize - 1);
         offset += i as usize * strides[d];
     }
-    Some(buf[offset])
+    Some(buf[offset].as_f64())
 }
 
 /// N-linear sample, or `None` if `cindex` is outside the buffer. Neighbour
 /// indices are clamped into `[0, size − 1]` at the boundary, matching ITK.
-pub fn linear_at(buf: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -> Option<f64> {
+pub fn linear_at<T: Scalar>(
+    buf: &[T],
+    size: &[usize],
+    strides: &[usize],
+    cindex: &[f64],
+) -> Option<f64> {
     if !is_inside(cindex, size) {
         return None;
     }
@@ -74,7 +84,7 @@ pub fn linear_at(buf: &[f64], size: &[usize], strides: &[usize], cindex: &[f64])
             offset += idx * strides[d];
         }
         if weight != 0.0 {
-            acc += weight * buf[offset];
+            acc += weight * buf[offset].as_f64();
         }
     }
     Some(acc)
@@ -90,8 +100,8 @@ pub fn linear_at(buf: &[f64], size: &[usize], strides: &[usize], cindex: &[f64])
 /// pixels). Neighbour indices are clamped into `[0, size − 1]`, matching
 /// [`linear_at`]; the gradient is piecewise-constant within a grid cell and
 /// jumps at cell boundaries, as any linear-interpolant gradient does.
-pub fn linear_value_and_gradient(
-    buf: &[f64],
+pub fn linear_value_and_gradient<T: Scalar>(
+    buf: &[T],
     size: &[usize],
     strides: &[usize],
     cindex: &[f64],
@@ -119,7 +129,7 @@ pub fn linear_value_and_gradient(
             let idx = (base[d] + bit as isize).clamp(0, size[d] as isize - 1) as usize;
             offset += idx * strides[d];
         }
-        let b = buf[offset];
+        let b = buf[offset].as_f64();
         value += weight * b;
         // ∂value/∂cindex[j]: swap axis j's weight factor for its ±1 derivative.
         for (j, gj) in grad.iter_mut().enumerate() {
@@ -144,8 +154,8 @@ pub fn linear_value_and_gradient(
 /// interpolant, which is zero almost everywhere (it is formally undefined
 /// exactly at the round-half-up cell boundary, where this still returns the
 /// interior zero gradient rather than a delta).
-pub fn nearest_value_and_gradient(
-    buf: &[f64],
+pub fn nearest_value_and_gradient<T: Scalar>(
+    buf: &[T],
     size: &[usize],
     strides: &[usize],
     cindex: &[f64],
@@ -166,8 +176,8 @@ pub fn nearest_value_and_gradient(
 /// the fast path for long ones.
 ///
 /// [`Interpolator::BSpline`]: crate::resample::Interpolator::BSpline
-pub fn bspline_coefficients(buf: &[f64], size: &[usize], strides: &[usize]) -> Vec<f64> {
-    let mut coeffs = buf.to_vec();
+pub fn bspline_coefficients<T: Scalar>(buf: &[T], size: &[usize], strides: &[usize]) -> Vec<f64> {
+    let mut coeffs: Vec<f64> = buf.iter().map(|v| v.as_f64()).collect();
     let pole = 3.0_f64.sqrt() - 2.0;
     for axis in 0..size.len() {
         if size[axis] == 1 {
@@ -388,8 +398,8 @@ fn erf(x: f64) -> f64 {
 /// is in continuous-index space. Unlike the other three kernels, this one is
 /// **not interpolating** — it is a local weighted average, so it does not in
 /// general reproduce the original samples exactly at integer indices.
-pub fn gaussian_value_and_gradient(
-    buf: &[f64],
+pub fn gaussian_value_and_gradient<T: Scalar>(
+    buf: &[T],
     size: &[usize],
     strides: &[usize],
     cindex: &[f64],
@@ -443,7 +453,7 @@ pub fn gaussian_value_and_gradient(
             w *= erf_arrays[d][ridx[d]];
             offset += (lo[d] + ridx[d]) * strides[d];
         }
-        let v = buf[offset];
+        let v = buf[offset].as_f64();
         sum_me += v * w;
         sum_m += w;
         for q in 0..dim {
@@ -628,8 +638,8 @@ fn dsinc(x: f64) -> f64 {
 /// ITK's default `ZeroFluxNeumannBoundaryCondition` (`GetPixel`, edge
 /// replication — verified against `itkZeroFluxNeumannBoundaryCondition.hxx`),
 /// the same convention [`linear_at`] and [`linear_value_and_gradient`] use.
-pub fn windowed_sinc_value_and_gradient(
-    buf: &[f64],
+pub fn windowed_sinc_value_and_gradient<T: Scalar>(
+    buf: &[T],
     size: &[usize],
     strides: &[usize],
     cindex: &[f64],
@@ -688,7 +698,7 @@ pub fn windowed_sinc_value_and_gradient(
             offset += idx * strides[d];
             wprod *= w[d][tap[d]];
         }
-        let pixel = buf[offset];
+        let pixel = buf[offset].as_f64();
         value += wprod * pixel;
         for (q, gq) in grad.iter_mut().enumerate() {
             let mut gprod = 1.0;

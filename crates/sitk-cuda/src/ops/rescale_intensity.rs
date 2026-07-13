@@ -251,6 +251,62 @@ fn run(
     Ok(timings)
 }
 
+/// `rescale_intensity` with **both buffers already on the device**, and neither
+/// leaving it: no H2D, no D2H, no host allocation. Returns the kernel wall-clock
+/// in milliseconds (synchronized).
+///
+/// This is the op stripped of the bus. Every GPU-vs-CPU number the port has
+/// published for a filter was measured through the one-shot `fn(&Image) -> Image`
+/// forms above, which pay a round trip *per call* — 67 MB each way at 256³ for
+/// `f32`. That measures the **API**, not the kernel, and the two answers are not
+/// the same question: a pipeline that keeps the volume resident across several
+/// ops pays the crossing once for the whole chain, not once per op.
+///
+/// `d_out` must be at least as long as `d_in`. Declines a degenerate image
+/// exactly as the one-shot forms do, so the fallback contract is unchanged.
+pub fn rescale_intensity_resident(
+    backend: &Backend,
+    d_in: &DeviceBuffer<f32>,
+    d_out: &mut DeviceBuffer<f32>,
+    output_min: f64,
+    output_max: f64,
+) -> Result<f64, CudaError> {
+    let n = d_in.len();
+    if n == 0 || d_out.len() < n {
+        return Err(CudaError::DegenerateInput);
+    }
+    let t = Instant::now();
+
+    let (lo, hi) = device_min_max(backend, d_in, n)?;
+    if lo == hi {
+        return Err(CudaError::DegenerateInput);
+    }
+    let scale = (output_max - output_min) / (hi - lo);
+
+    let f = backend.function(KERNELS, "rescale_f32")?;
+    let n_i64 = n as i64;
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(BLOCK as usize) as u32, 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launch = backend.stream().launch_builder(&f);
+    launch
+        .arg(d_in.device())
+        .arg(d_out.device_mut())
+        .arg(&n_i64)
+        .arg(&lo)
+        .arg(&scale)
+        .arg(&output_min);
+    // SAFETY: identical to the launch in `run` — six parameters matching six
+    // arguments in order and type, both buffers hold at least `n` `f32`s, every
+    // access guarded by `i < n`.
+    unsafe { launch.launch(cfg)? };
+    backend.synchronize()?;
+
+    Ok(t.elapsed().as_secs_f64() * 1e3)
+}
+
 /// Exact min/max of the device buffer, folded on the host over the reduction's
 /// per-block partials. `min`/`max` are exact and associative, so this equals
 /// the CPU's sequential scan bit-for-bit.

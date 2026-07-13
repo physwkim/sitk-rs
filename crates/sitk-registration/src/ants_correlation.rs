@@ -105,7 +105,7 @@ use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{physical_to_index_matrix, strides};
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{FixedSamples, MetricValue, MovingImage, local_support_block};
+use crate::metric::{FixedSamples, MetricValue, MovingImage, PointScratch, local_support_block};
 use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Per-point windowed statistics: the local correlation and (when defined)
@@ -264,8 +264,9 @@ impl AntsNeighborhoodCorrelationMetric {
 
         let n = fixed.len();
         let mut sample_index = vec![0usize; n * dim];
+        let mut scratch = fixed.scratch();
         for s in 0..n {
-            let p = &fixed.points[s * dim..(s + 1) * dim];
+            let p = fixed.point(s, &mut scratch);
             for d in 0..dim {
                 let row = &phys_to_index[d * dim..(d + 1) * dim];
                 let c: f64 = row
@@ -355,9 +356,14 @@ impl AntsNeighborhoodCorrelationMetric {
     /// image — mirroring ITK, which requires the center's own
     /// `TransformAndEvaluateMovingPoint` to succeed regardless of how many
     /// other window voxels are valid.
-    fn point_result(&self, transform: &dyn ParametricTransform, s: usize) -> Option<PointResult> {
-        let dim = self.fixed.dim;
-        let (s_ff, s_mm, s_fm, fixed_mean, moving_mean) = self.window_stats(transform, s)?;
+    fn point_result(
+        &self,
+        transform: &dyn ParametricTransform,
+        s: usize,
+        scratch: &mut PointScratch,
+    ) -> Option<PointResult> {
+        let (s_ff, s_mm, s_fm, fixed_mean, moving_mean) =
+            self.window_stats(transform, s, scratch)?;
 
         // The center voxel itself, evaluated again exactly as ITK's
         // `ComputeInformationFromQueues` re-evaluates `oindex = scanIt.GetIndex()`.
@@ -365,8 +371,8 @@ impl AntsNeighborhoodCorrelationMetric {
         // the window neighbours above, regardless of whether `fixed` is a
         // sparse sample set.
         let center_lin = self.sample_linear_index(s);
-        let fp_center = &self.raster.points[center_lin * dim..(center_lin + 1) * dim];
-        let fv_center = self.raster.values[center_lin];
+        let fp_center = self.raster.point(center_lin, scratch);
+        let fv_center = self.raster.value(center_lin);
         let mp_center = transform.transform_point(fp_center);
         let (mv_center, grad_phys) = self.moving.value_and_physical_gradient(&mp_center)?;
 
@@ -396,12 +402,16 @@ impl AntsNeighborhoodCorrelationMetric {
     /// inside the moving image.
     ///
     /// [`point_result`]: Self::point_result
-    fn point_local_cc(&self, transform: &dyn ParametricTransform, s: usize) -> Option<f64> {
-        let dim = self.fixed.dim;
-        let (s_ff, s_mm, s_fm, _, _) = self.window_stats(transform, s)?;
+    fn point_local_cc(
+        &self,
+        transform: &dyn ParametricTransform,
+        s: usize,
+        scratch: &mut PointScratch,
+    ) -> Option<f64> {
+        let (s_ff, s_mm, s_fm, _, _) = self.window_stats(transform, s, scratch)?;
 
         let center_lin = self.sample_linear_index(s);
-        let fp_center = &self.raster.points[center_lin * dim..(center_lin + 1) * dim];
+        let fp_center = self.raster.point(center_lin, scratch);
         let mp_center = transform.transform_point(fp_center);
         self.moving.value_at(&mp_center)?;
 
@@ -415,6 +425,7 @@ impl AntsNeighborhoodCorrelationMetric {
         &self,
         transform: &dyn ParametricTransform,
         s: usize,
+        scratch: &mut PointScratch,
     ) -> Option<(f64, f64, f64, f64, f64)> {
         let dim = self.fixed.dim;
         let idx = &self.sample_index[s * dim..(s + 1) * dim];
@@ -441,8 +452,8 @@ impl AntsNeighborhoodCorrelationMetric {
                 continue;
             }
 
-            let fv = self.raster.values[lin];
-            let fp = &self.raster.points[lin * dim..(lin + 1) * dim];
+            let fv = self.raster.value(lin);
+            let fp = self.raster.point(lin, scratch);
             let mp = transform.transform_point(fp);
             let Some(mv) = self.moving.value_at(&mp) else {
                 continue;
@@ -479,8 +490,9 @@ impl AntsNeighborhoodCorrelationMetric {
     pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
         let mut value_sum = 0.0f64;
         let mut valid = 0usize;
+        let mut scratch = self.raster.scratch();
         for s in 0..self.fixed.len() {
-            let Some(cc) = self.point_local_cc(transform, s) else {
+            let Some(cc) = self.point_local_cc(transform, s, &mut scratch) else {
                 continue;
             };
             value_sum -= cc;
@@ -508,12 +520,13 @@ impl AntsNeighborhoodCorrelationMetric {
         let mut value_sum = 0.0f64;
         let mut valid = 0usize;
 
+        let mut scratch = self.raster.scratch();
         for s in 0..n {
             let Some(PointResult {
                 local_cc,
                 deriv_wrt_image,
                 center_point,
-            }) = self.point_result(transform, s)
+            }) = self.point_result(transform, s, &mut scratch)
             else {
                 continue;
             };
@@ -919,8 +932,9 @@ mod tests {
         let mut dense = vec![0.0f64; nparams];
         let mut value_sum = 0.0f64;
         let mut valid = 0usize;
+        let mut scratch = metric.raster.scratch();
         for s in 0..metric.sample_count() {
-            let Some(pr) = metric.point_result(&field, s) else {
+            let Some(pr) = metric.point_result(&field, s, &mut scratch) else {
                 continue;
             };
             value_sum -= pr.local_cc;

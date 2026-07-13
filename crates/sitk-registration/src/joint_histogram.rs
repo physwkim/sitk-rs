@@ -601,16 +601,16 @@ impl JointHistogramMutualInformationMetric {
         &self,
         transform: &dyn ParametricTransform,
     ) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize) {
-        let dim = self.fixed.dim;
         let bins = self.num_bins;
         let n = self.fixed.len();
 
         let mut hist = vec![0.0f64; bins * bins];
         let mut valid = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
-            let fv = self.fixed.values[s];
+            let fp = self.fixed.point(s, &mut scratch);
+            let fv = self.fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
@@ -726,13 +726,13 @@ impl JointHistogramMutualInformationMetric {
         // `NumericTraits<double>::epsilon()` use in `ComputeValue`).
         const DERIVATIVE_VALUE_EPS: f64 = 1.0e-16;
 
-        let dim = self.fixed.dim;
         let n = self.fixed.len();
         let mut derivative = vec![0.0f64; nparams];
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
-            let fv = self.fixed.values[s];
+            let fp = self.fixed.point(s, &mut scratch);
+            let fv = self.fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
@@ -1173,14 +1173,14 @@ mod tests {
 
         let (jp, _fixed_marginal, moving_marginal, valid) = metric.compute_joint_pdf(&transform);
         let nparams = transform.number_of_parameters();
-        let dim = metric.fixed.dim;
         let n = metric.fixed.len();
         let mut derivative = vec![0.0f64; nparams];
         const DERIVATIVE_VALUE_EPS: f64 = 1.0e-16;
 
+        let mut scratch = metric.fixed.scratch();
         for s in 0..n {
-            let fp = &metric.fixed.points[s * dim..(s + 1) * dim];
-            let fv = metric.fixed.values[s];
+            let fp = metric.fixed.point(s, &mut scratch);
+            let fv = metric.fixed.value(s);
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match metric.moving.value_and_physical_gradient(&mp) {
                 Some(vg) => vg,

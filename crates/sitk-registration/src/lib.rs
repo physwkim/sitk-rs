@@ -132,6 +132,8 @@ pub mod correlation;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod demons;
+#[cfg(feature = "cuda")]
+pub mod device;
 mod eigen;
 pub mod error;
 pub mod gradient_free;
@@ -154,6 +156,8 @@ pub use correlation::CorrelationMetric;
 #[cfg(feature = "cuda")]
 pub use cuda::CudaMetricBackend;
 pub use demons::DemonsMetric;
+#[cfg(feature = "cuda")]
+pub use device::{DeviceMeanSquaresMetric, DeviceMetricError};
 pub use error::{RegistrationError, Result};
 pub use gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
