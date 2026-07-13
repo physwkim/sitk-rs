@@ -82,10 +82,6 @@ pub enum DeviceRegistrationError {
     #[error("the device metric samples every voxel; sampling strategies are host-only")]
     UnsupportedSampling,
 
-    /// A device image carries no mask.
-    #[error("the device metric has no mask support; masked registration is host-only")]
-    UnsupportedMask,
-
     /// Building a resolution level on the device failed: no device, an NVRTC
     /// failure, out of memory, or a geometry the pyramid ops have no kernel for (a
     /// non-3-D image, a shrink factor of zero, an axis too short for the recursive
@@ -94,28 +90,31 @@ pub enum DeviceRegistrationError {
     #[error("building a resolution level on the device failed: {0}")]
     Pyramid(#[source] CudaError),
 
-    /// A virtual domain or a fixed-initial transform needs a **mask** the device
-    /// metric does not have — this is [`UnsupportedMask`](Self::UnsupportedMask)
-    /// under another name.
+    /// A **fixed-initial transform** relocates the fixed image's sample points, so
+    /// the level's fixed image and its in-buffer predicate must be resampled *through*
+    /// that transform — and the device has no resample that can.
     ///
-    /// Not a grid limitation: `sitk_cuda::resample_linear` takes an arbitrary
-    /// geometry and `DeviceImage::with_geometry` builds one, so a device metric can
-    /// be built on a virtual grid — that is how the device pyramid's coarse levels
-    /// are made. What blocks it is the *in-buffer predicate*: whenever a virtual
-    /// domain or a fixed-initial transform is configured, the host's `prepare_level`
-    /// resamples an all-ones image over the fixed grid to learn which virtual points
-    /// map inside the fixed buffer at all, and folds that predicate into the level's
-    /// fixed mask. A virtual point outside the buffer is *not a sample*, and a
-    /// [`DeviceImage`] carries no mask with which to drop it.
+    /// Both device resamples (`sitk_cuda::resample_linear`, `sitk_cuda::resample_nearest`)
+    /// map an output voxel's physical point straight to the input's continuous index.
+    /// There is no transform in that path, and adding one is not the hard part: the
+    /// hard part is the **pin**. Bit-identity with `ResampleImageFilter` needs the
+    /// device to reproduce `Transform::transform_point`'s arithmetic for each transform
+    /// class, and the closest thing it has is the metric's affine form, which is ~1e-12
+    /// away. That is harmless for the level *image* (it feeds a metric already gated at
+    /// 1e-9) and **not** harmless for the *predicate*, which is a 0/1 field whose value
+    /// at the buffer border is decided by rounding a continuous index: one ulp there
+    /// flips a shell of voxels, changes the valid-point count, and breaks the one
+    /// property the device path pins as *exactly* equal to the host's.
     ///
-    /// So device mask support closes this refusal and
-    /// [`UnsupportedMask`](Self::UnsupportedMask) together — one capability, two
-    /// refusals, and the highest-leverage gap left in this boundary.
+    /// So this refuses rather than matching a predicate to a tolerance. A virtual
+    /// domain **without** a fixed-initial transform is taken: the level's grid can be
+    /// any geometry, and the in-buffer predicate is a nearest-neighbour resample of an
+    /// all-ones volume through the identity, which is pinned bit-identical.
     #[error(
-        "a virtual domain or a fixed-initial transform needs a fixed mask (the \
-             in-buffer predicate), and the device metric has no mask support"
+        "a fixed-initial transform needs the fixed image and its in-buffer predicate \
+         resampled *through* the transform, and the device has no transformed resample"
     )]
-    UnsupportedVirtualDomain,
+    UnsupportedFixedInitialTransform,
 
     /// The metric itself refused — a non-affine transform, a non-3-D problem, no
     /// device, or a CUDA failure.
@@ -159,7 +158,7 @@ impl DeviceMeanSquaresMetric {
         fixed: &DeviceImage,
         moving: &DeviceImage,
     ) -> Result<Self, DeviceMetricError> {
-        Self::from_device_masked(fixed, moving, None)
+        Self::from_device_masked(fixed, moving, None, None)
     }
 
     /// [`from_device`](Self::from_device) with a **fixed mask** on the fixed image's
@@ -181,6 +180,7 @@ impl DeviceMeanSquaresMetric {
         fixed: &DeviceImage,
         moving: &DeviceImage,
         fixed_mask: Option<&sitk_cuda::DeviceMask>,
+        moving_mask: Option<&[bool]>,
     ) -> Result<Self, DeviceMetricError> {
         let f = fixed.geometry();
         let m = moving.geometry();
@@ -206,9 +206,13 @@ impl DeviceMeanSquaresMetric {
             strides: &mstrides,
             origin: &m.origin,
             phys_to_index: &phys_to_index,
-            // A device image carries no mask. When masked registration comes to the
-            // device it arrives as a device mask, not as a host one smuggled in here.
-            mask: None,
+            // The moving mask, on the moving image's own grid. It is *not* resampled
+            // and *not* smoothed — the host does not resample it either
+            // (`MovingImage::with_moving_mask` takes the mask the user set, and the
+            // moving image is never shrunk), and a level's moving volume is the
+            // uploaded one smoothed, so the grid is the same at every level and the
+            // indices line up.
+            mask: moving_mask,
         };
         let points = FixedPoints::Grid {
             size: &f.size,

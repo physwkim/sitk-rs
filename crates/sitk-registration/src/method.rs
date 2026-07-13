@@ -336,6 +336,24 @@ fn with_geometry_of(reference: &Image, values: Vec<f64>) -> Result<Image> {
     Ok(image)
 }
 
+/// A mask's predicate as a 0/1 `Float64` volume on the mask's own grid — the same
+/// `nonzero → inside` rule `FixedSamples::from_image_with` applies, applied early.
+///
+/// The device path uploads this rather than the raw mask. Nearest-neighbour resampling
+/// picks a voxel's value or the default, so thresholding before or after the pick is
+/// the same predicate — and thresholding on the host keeps a mask whose nonzero values
+/// underflow `f32` (an `f64` mask holding 1e-320) from silently becoming empty on a
+/// device that stores `f32`.
+#[cfg(feature = "cuda")]
+fn binary_volume(mask: &Image) -> Result<Image> {
+    let values = mask
+        .to_f64_vec()?
+        .iter()
+        .map(|&v| f64::from(v != 0.0))
+        .collect();
+    with_geometry_of(mask, values)
+}
+
 /// The pointwise AND of two binary masks on one grid, `None` when neither is
 /// present. A voxel survives only if it is nonzero in every mask given.
 fn intersect_masks(a: Option<Image>, b: Option<Image>) -> Result<Option<Image>> {
@@ -657,6 +675,20 @@ impl VirtualDomain {
         image.set_spacing(&self.spacing)?;
         image.set_direction(&self.direction)?;
         Ok(image)
+    }
+
+    /// The same grid as [`grid`](Self::grid), as a geometry and **without the
+    /// volume** — what the device path needs. `grid` allocates one `f64` per virtual
+    /// voxel (134 MB at 256³) purely to carry a few dozen numbers; on the device
+    /// those numbers are all that is ever read.
+    #[cfg(feature = "cuda")]
+    fn device_geometry(&self) -> sitk_cuda::Geometry {
+        sitk_cuda::Geometry {
+            size: self.size.clone(),
+            spacing: self.spacing.clone(),
+            origin: self.origin.clone(),
+            direction: self.direction.clone(),
+        }
     }
 }
 
@@ -2528,29 +2560,34 @@ impl ImageRegistrationMethod {
     /// - a **globally affine** transform (translation, rigid, Euler, versor,
     ///   similarity, affine) — the moment identity the kernel evaluates holds for
     ///   exactly those, and a B-spline or displacement field is refused by name;
-    /// - **linear** interpolation, no masks, and the default sampling *strategy*
+    /// - **linear** interpolation and the default sampling *strategy*
     ///   ([`SamplingStrategy::None`](crate::metric::SamplingStrategy::None), every
     ///   voxel of the fixed grid). A configured sampling *percentage* is accepted:
     ///   the `None` strategy ignores it on the host too, so refusing it would have
     ///   cost the caller this path for a value that changes nothing;
     /// - a **multi-resolution pyramid**: each level is built on the device by the
-    ///   same three ops in the same order [`prepare_level`](Self::prepare_level)
-    ///   uses — `recursive_gaussian`, `shrink` for the coarse grid, `resample_linear`
-    ///   onto it — and each of the three is bit-identical to the CPU filter it
-    ///   transcribes (`pyramid_parity.rs`);
-    /// - no virtual domain and no fixed-initial transform — not because the device
-    ///   cannot build the grid (`resample_linear` takes an arbitrary geometry; that
-    ///   is how the pyramid's coarse levels are made) but because either one makes
-    ///   `prepare_level` fold an *in-buffer predicate* into the level's fixed mask,
-    ///   and a device image carries no mask. A moving-initial transform *is*
-    ///   supported (it composes with the optimized transform and the composition is
-    ///   probed for affineness like any other).
+    ///   same ops in the same order [`prepare_level`](Self::prepare_level) uses —
+    ///   `recursive_gaussian`, the shrunk grid, `resample_linear` onto it — and each
+    ///   is bit-identical to the CPU filter it transcribes (`pyramid_parity.rs`);
+    /// - a **fixed mask** and a **moving mask**. The fixed mask is nearest-neighbour
+    ///   resampled onto each level's grid and folded with the in-buffer predicate
+    ///   exactly as `prepare_level` folds them; the level's mask is pinned *byte for
+    ///   byte* against the host's and the level's valid-point count *exactly*
+    ///   (`method::device_level_tests`);
+    /// - a **virtual domain**: the level's grid is the shrunk virtual grid, and the
+    ///   in-buffer predicate that a virtual grid requires — which virtual points map
+    ///   inside the fixed buffer at all — is a nearest-neighbour resample of an
+    ///   all-ones volume, built on the device and never uploaded;
+    /// - a **moving-initial** transform (it composes with the optimized transform and
+    ///   the composition is probed for affineness like any other).
     ///
-    /// **The one capability that would move this boundary is a device mask.** It
-    /// closes [`UnsupportedMask`](DeviceRegistrationError::UnsupportedMask) and
-    /// [`UnsupportedVirtualDomain`](DeviceRegistrationError::UnsupportedVirtualDomain)
-    /// together — they are two refusals for one missing thing — and nothing else on
-    /// this list is a single capability away.
+    /// The one thing left is a **fixed-initial transform**, refused by name as
+    /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform).
+    /// It needs the fixed image *and its in-buffer predicate* resampled **through** the
+    /// transform, and both device resamples go through the identity only. That refusal
+    /// documents why the missing piece is not merely a kernel: a transformed resample
+    /// whose point map is 1e-12 from the host's would move the predicate's boundary by
+    /// a voxel, and the predicate is what makes the valid-point count exactly equal.
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
@@ -2633,26 +2670,71 @@ impl ImageRegistrationMethod {
         if !matches!(self.sampling_strategy, SamplingStrategy::None) {
             return Err(DeviceRegistrationError::UnsupportedSampling);
         }
-        if self.fixed_mask.is_some() || self.moving_mask.is_some() {
-            return Err(DeviceRegistrationError::UnsupportedMask);
-        }
-        if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
-            return Err(DeviceRegistrationError::UnsupportedVirtualDomain);
+        // Masks and virtual domains are no longer refused: the level carries a device
+        // fixed mask (`level_mask_on_device`), the metric takes a moving mask, and the
+        // level's grid can be the virtual one (`level_grid`).
+        //
+        // A **fixed-initial transform** is still refused, and it is the last one. It
+        // would need the fixed image *and the in-buffer predicate* resampled through
+        // the transform, and neither device resample can resample through anything but
+        // the identity. See `UnsupportedFixedInitialTransform`: the blocker is not the
+        // kernel, it is that a predicate matched only to a tolerance would break the
+        // valid-point count this path pins as exactly equal to the host's.
+        if self.fixed_initial_transform.is_some() {
+            return Err(DeviceRegistrationError::UnsupportedFixedInitialTransform);
         }
 
         let geom = fixed.geometry();
         let schedule = self.level_schedule(geom.dimension())?;
 
+        // The user's fixed mask crosses the bus **once**, for the whole run, as a 0/1
+        // volume — thresholded here rather than on the device so that a mask whose
+        // nonzero values underflow `f32` does not silently become empty (see
+        // `level_mask_on_device`). Each level then resamples it onto that level's grid
+        // without touching the bus again.
+        let fixed_mask = match &self.fixed_mask {
+            Some(m) => Some(
+                sitk_cuda::DeviceImage::upload(&binary_volume(m)?)
+                    .map_err(DeviceRegistrationError::Pyramid)?,
+            ),
+            None => None,
+        };
+
+        // The moving mask is **not** resampled and **not** smoothed, on either path:
+        // `build_metric` hands `MovingImage::with_moving_mask` the mask the user set,
+        // and the moving volume is only ever smoothed, never shrunk — so its grid is
+        // the same at every level and the mask's indices line up throughout. It becomes
+        // a predicate once, here, by the same `nonzero → inside` rule the host uses.
+        let moving_mask: Option<Vec<bool>> = match &self.moving_mask {
+            Some(m) => Some(
+                m.to_f64_vec()
+                    .map_err(|e| DeviceRegistrationError::Registration(e.into()))?
+                    .iter()
+                    .map(|&v| v != 0.0)
+                    .collect(),
+            ),
+            None => None,
+        };
+
         let mut transform = initial;
         let mut levels = Vec::with_capacity(schedule.len());
         for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
-            let (fl, ml) = Self::prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
+            let (fl, ml) = self.prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
             let fixed_level = fl.as_ref().unwrap_or(fixed);
             let moving_level = ml.as_ref().unwrap_or(moving);
 
+            let grid = self.level_grid(geom, level_factors)?;
+            let level_mask =
+                self.level_mask_on_device(fixed, fixed_mask.as_ref(), grid.as_ref())?;
+
             let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
-                DeviceMeanSquaresMetric::from_device(fixed_level, moving_level)?,
+                DeviceMeanSquaresMetric::from_device_masked(
+                    fixed_level,
+                    moving_level,
+                    level_mask.as_ref(),
+                    moving_mask.as_deref(),
+                )?,
             )));
 
             // The boundary probe: one evaluation at this level's starting transform,
@@ -2713,8 +2795,14 @@ impl ImageRegistrationMethod {
     ///   nothing — the same `native_grid` short-circuit `prepare_level` takes, and
     ///   for the same reason (at factor 1 the resample is provably the identity).
     ///
-    /// There is no mask branch and no virtual-domain branch because
-    /// [`execute_on_device`](Self::execute_on_device) refuses both at the boundary.
+    /// The level's grid is [`level_grid`](Self::level_grid): the shrunk **virtual**
+    /// grid when a virtual domain is configured, and the shrunk fixed grid otherwise
+    /// — the same choice `prepare_level` makes.
+    ///
+    /// There is no fixed-initial-transform branch because
+    /// [`execute_on_device`](Self::execute_on_device) refuses one at the boundary:
+    /// both device resamples map an output point straight to the input's continuous
+    /// index, and neither can resample *through* a transform.
     ///
     /// `None` means *the uploaded volume already is this level* — the level neither
     /// smooths nor shrinks — so the caller registers against the volume it was
@@ -2724,6 +2812,7 @@ impl ImageRegistrationMethod {
     /// mistake to make by accident), so it says it with an `Option` instead.
     #[cfg(feature = "cuda")]
     fn prepare_level_on_device(
+        &self,
         fixed: &sitk_cuda::DeviceImage,
         moving: &sitk_cuda::DeviceImage,
         sigma: &[f64],
@@ -2754,16 +2843,113 @@ impl ImageRegistrationMethod {
         let smoothed_fixed = smooth(fixed)?;
         let moving_level = smooth(moving)?;
 
-        if factors.iter().all(|&f| f == 1) {
+        let Some(grid) = self.level_grid(fixed.geometry(), factors)? else {
             return Ok((smoothed_fixed, moving_level));
-        }
+        };
 
         let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
-        let coarse = sitk_cuda::shrink(sf, factors).map_err(DeviceRegistrationError::Pyramid)?;
-        let fixed_level = sitk_cuda::resample_linear(sf, coarse.geometry(), 0.0)
-            .map_err(DeviceRegistrationError::Pyramid)?;
+        let fixed_level =
+            sitk_cuda::resample_linear(sf, &grid, 0.0).map_err(DeviceRegistrationError::Pyramid)?;
 
         Ok((Some(fixed_level), moving_level))
+    }
+
+    /// The grid this level's samples live on, as a geometry — `prepare_level`'s
+    /// `coarse_grid` (`shrink` of the virtual grid when one is configured, of the
+    /// fixed grid otherwise), and `None` for the `native_grid` short-circuit where
+    /// the fixed image's own grid *is* the level's.
+    ///
+    /// A geometry, not a volume: a virtual domain has no voxels to shrink (ITK
+    /// allocates `m_VirtualDomainImage` and never reads its pixels), and
+    /// materializing one on the device to read its geometry back would allocate a
+    /// volume nothing samples.
+    #[cfg(feature = "cuda")]
+    fn level_grid(
+        &self,
+        fixed: &sitk_cuda::Geometry,
+        factors: &[usize],
+    ) -> std::result::Result<Option<sitk_cuda::Geometry>, DeviceRegistrationError> {
+        // The same gate `prepare_level` uses, for the same reason: with no virtual
+        // domain, no fixed-initial transform and no shrink, nothing moves relative to
+        // the fixed grid and the whole pipeline is the identity.
+        if self.virtual_domain.is_none()
+            && self.fixed_initial_transform.is_none()
+            && factors.iter().all(|&f| f == 1)
+        {
+            return Ok(None);
+        }
+        let base = match &self.virtual_domain {
+            Some(v) => v.device_geometry(),
+            None => fixed.clone(),
+        };
+        Ok(Some(
+            sitk_cuda::shrunk_geometry(&base, factors).map_err(DeviceRegistrationError::Pyramid)?,
+        ))
+    }
+
+    /// This level's fixed mask, built **on the device** — the device twin of the
+    /// `inside_fixed` / `user_mask` / `intersect_masks` block of
+    /// [`prepare_level`](Self::prepare_level), following it term for term.
+    ///
+    /// Two masks are folded, and each is nearest-neighbour resampled onto the level's
+    /// grid because that is what the host does — and what ITK does, once per point
+    /// instead of once per level: `IsInsideInWorldSpace` →
+    /// `ImageMaskSpatialObject::IsInsideInObjectSpace`
+    /// (`itkImageMaskSpatialObject.hxx:36-47`) → `TransformPhysicalPointToIndex`, which
+    /// rounds with `Math::RoundHalfIntegerUp` (`itkImageBase.h:476`) and then tests the
+    /// voxel for nonzero. `sitk_cuda::resample_nearest` implements exactly that rounding
+    /// rule, and is pinned bit-identical to `ResampleImageFilter` before anything used
+    /// it. Linear here would be a *different predicate*, not a smoother one.
+    ///
+    /// - **the in-buffer predicate**: an all-ones volume over the fixed grid,
+    ///   resampled onto the level's grid with a default of 0 — so a level voxel is 1
+    ///   exactly when it maps inside the fixed buffer at all. Present only when a
+    ///   virtual domain or a fixed-initial transform makes the level's grid something
+    ///   other than the fixed grid, which is the same gate `prepare_level` uses. The
+    ///   ones are built with [`DeviceImage::filled`], never uploaded: they are a
+    ///   constant, and at 256³ uploading them would cost 67 MB *per level*.
+    /// - **the user's fixed mask**, resampled the same way.
+    ///
+    /// `fixed_mask` arrives as an already-thresholded 0/1 volume (see
+    /// [`execute_on_device`](Self::execute_on_device)) rather than as the raw mask the
+    /// host resamples. The two give the *same* predicate — nearest-neighbour picks a
+    /// voxel's value or the default, so thresholding before or after picking commutes
+    /// exactly — and thresholding on the host keeps a mask whose nonzero values
+    /// underflow `f32` (an `f64` mask holding 1e-320) from silently becoming empty on a
+    /// device that stores `f32`.
+    #[cfg(feature = "cuda")]
+    fn level_mask_on_device(
+        &self,
+        fixed: &sitk_cuda::DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceImage>,
+        grid: Option<&sitk_cuda::Geometry>,
+    ) -> std::result::Result<Option<sitk_cuda::DeviceMask>, DeviceRegistrationError> {
+        use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
+
+        let grid_ref = grid.unwrap_or(fixed.geometry());
+        let onto_level = |img: &DeviceImage| -> std::result::Result<DeviceMask, CudaError> {
+            DeviceMask::from_device_image(&sitk_cuda::resample_nearest(img, grid_ref, 0.0)?)
+        };
+
+        let inside_fixed =
+            if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
+                let ones = DeviceImage::filled(fixed.geometry().clone(), 1.0)
+                    .map_err(DeviceRegistrationError::Pyramid)?;
+                Some(onto_level(&ones).map_err(DeviceRegistrationError::Pyramid)?)
+            } else {
+                None
+            };
+        let user_mask = match fixed_mask {
+            Some(m) => Some(onto_level(m).map_err(DeviceRegistrationError::Pyramid)?),
+            None => None,
+        };
+
+        // `intersect_masks`, in the same three cases: neither, one, or both.
+        Ok(match (inside_fixed, user_mask) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (Some(a), Some(b)) => Some(a.intersect(&b).map_err(DeviceRegistrationError::Pyramid)?),
+        })
     }
 
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair
@@ -6536,6 +6722,373 @@ mod tests {
                 reg.execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
                     .is_ok(),
                 "{name}: unweighted gradient-free run should succeed"
+            );
+        }
+    }
+}
+
+/// The device pyramid level against the host pyramid level — the *actual* functions,
+/// not a transcription of them.
+///
+/// `tests/pyramid_parity.rs` compares the device ops against the CPU filters by
+/// re-implementing `prepare_level`'s steps in the test. That pins the **ops**, and it
+/// is what pinned them before anything was wired to them. It cannot pin the
+/// **wiring**: a `prepare_level_on_device` that chose the wrong grid, or dropped the
+/// mask, would still agree with a test that made the same choice. These tests call
+/// `prepare_level` and `prepare_level_on_device` themselves and compare what the two
+/// return, so a divergence between them fails here whatever the ops do.
+#[cfg(all(test, feature = "cuda"))]
+mod device_level_tests {
+    use super::*;
+    use sitk_cuda::{DeviceImage, DeviceMask};
+    use sitk_transform::Euler3DTransform;
+
+    fn no_device() -> bool {
+        matches!(sitk_cuda::backend(), Err(sitk_cuda::CudaError::NoDevice(_)))
+    }
+
+    /// A textured `f32` volume with a non-trivial spacing and origin, so a grid that
+    /// is *nearly* right is still wrong.
+    fn volume(n: usize, shift: f64) -> Image {
+        let c = n as f64 / 2.0;
+        let mut v = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (i as f64 - c + shift, j as f64 - c, k as f64 - c);
+                    let r = (x * x + y * y + z * z).sqrt();
+                    v.push(
+                        (300.0 * (-(r * r) / (0.2 * n as f64).powi(2)).exp()
+                            + 40.0 * (0.7 * x).sin() * (0.5 * y).cos()
+                            + 17.0 * (0.3 * z).sin()) as f32,
+                    );
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+        img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+        img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+        img
+    }
+
+    /// A mask on the fixed grid that drops voxels in the interior as well as at the
+    /// border, and is asymmetric in every axis, so a flipped or swapped axis shows up.
+    fn slab_mask(n: usize) -> Image {
+        let v: Vec<f32> = (0..n * n * n)
+            .map(|s| {
+                let (i, j, k) = (s % n, (s / n) % n, s / (n * n));
+                f32::from(u8::from(
+                    2 * i + j + 3 * k > n && i < 3 * n / 4 && j > n / 8,
+                ))
+            })
+            .collect();
+        let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+        img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+        img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+        img
+    }
+
+    fn assert_same_image(host: &Image, device: &Image, what: &str) {
+        assert_eq!(host.size(), device.size(), "{what}: size");
+        assert_eq!(host.spacing(), device.spacing(), "{what}: spacing");
+        assert_eq!(host.origin(), device.origin(), "{what}: origin");
+        assert_eq!(host.direction(), device.direction(), "{what}: direction");
+        let (a, b) = (
+            host.scalar_slice::<f32>().unwrap(),
+            device.scalar_slice::<f32>().unwrap(),
+        );
+        let differing = a
+            .iter()
+            .zip(b.iter())
+            .filter(|&(&x, &y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "{what}: {differing} of {} voxels differ",
+            a.len()
+        );
+    }
+
+    /// The host's level mask as a byte predicate in grid order — `nonzero → inside`,
+    /// the rule `FixedSamples::from_image_with` applies to it.
+    fn host_mask_bytes(mask: &Image) -> Vec<u8> {
+        mask.to_f64_vec()
+            .unwrap()
+            .iter()
+            .map(|&v| u8::from(v != 0.0))
+            .collect()
+    }
+
+    fn device_mask_bytes(mask: &DeviceMask) -> Vec<u8> {
+        mask.to_host()
+            .unwrap()
+            .scalar_slice::<u8>()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// C2: with a **virtual domain**, the device level image is the host level image
+    /// — bit for bit, on the grid the host chose.
+    ///
+    /// Failure mode this catches: the device silently builds the level on the *fixed*
+    /// grid instead of the shrunk virtual one. The run would still converge; it would
+    /// just be optimizing a different objective than `execute` optimizes. (Checked by
+    /// deleting the virtual-domain arm of `level_grid`: this test fails.)
+    #[test]
+    fn the_device_level_image_is_the_host_level_image_on_a_virtual_grid() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+
+        // A virtual grid that is neither image's: different size, spacing, origin.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_virtual_domain(
+            vec![24, 20, 28],
+            vec![-8.0, -4.0, -6.0],
+            vec![1.5, 2.0, 2.0],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        for (factors, level_sigma) in [(vec![2usize; 3], 1.0f64), (vec![1usize; 3], 0.0)] {
+            let sigma: Vec<f64> = fixed.spacing().iter().map(|&s| level_sigma * s).collect();
+            let (host_fixed, host_moving, host_mask) = reg
+                .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                .unwrap();
+            let (dev_fixed, dev_moving) = reg
+                .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                .unwrap();
+
+            let what = format!("virtual domain, factors {factors:?}, sigma {level_sigma}");
+            assert_same_image(
+                &host_fixed,
+                &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                &format!("{what}: fixed level"),
+            );
+            assert_same_image(
+                &host_moving,
+                &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                &format!("{what}: moving level"),
+            );
+            // The level is on the virtual grid, not the fixed one — otherwise the
+            // comparison above would be comparing two wrong images to each other.
+            assert_ne!(
+                host_fixed.size(),
+                fixed.size(),
+                "{what}: the level was built on the fixed grid; the test proves nothing"
+            );
+            // A virtual domain always makes the host build an in-buffer predicate.
+            assert!(host_mask.is_some(), "{what}: the host built no level mask");
+        }
+    }
+
+    /// C3: the device level mask is the host's `fixed_mask_level`, **byte for byte**,
+    /// in every configuration that produces one.
+    ///
+    /// Four configurations, because each folds a different set of terms: a user mask
+    /// alone (no predicate), a virtual domain alone (predicate only), both (the
+    /// intersection), and neither (both `None`).
+    ///
+    /// Byte equality is the pin and a tolerance would be meaningless here: the level
+    /// mask decides *which voxels are samples*, so a wrong mask does not produce a
+    /// wrong number, it produces a right number over the wrong sample set — the value
+    /// stays plausible, the gradient stays smooth, and every value comparison passes.
+    /// The anti-vacuity assertions below are what stop this test from passing against a
+    /// host that also dropped the mask: the host mask must exist, and it must actually
+    /// contain zeros.
+    #[test]
+    fn the_device_level_mask_is_the_host_level_mask_byte_for_byte() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        let virtual_domain = |reg: &mut ImageRegistrationMethod| {
+            reg.set_virtual_domain(
+                vec![24, 20, 28],
+                vec![-8.0, -4.0, -6.0],
+                vec![1.5, 2.0, 2.0],
+                vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        };
+
+        for (name, with_mask, with_domain) in [
+            ("user mask only", true, false),
+            ("virtual domain only", false, true),
+            ("mask and virtual domain", true, true),
+            ("neither", false, false),
+        ] {
+            let mut reg = ImageRegistrationMethod::new();
+            if with_mask {
+                reg.set_metric_fixed_mask(&mask);
+            }
+            if with_domain {
+                virtual_domain(&mut reg);
+            }
+
+            for factors in [vec![2usize; 3], vec![1usize; 3]] {
+                let sigma = vec![0.0; 3];
+                let what = format!("{name}, factors {factors:?}");
+
+                let (host_fixed, _, host_mask) = reg
+                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                    .unwrap();
+                let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+                let dev_mask = reg
+                    .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
+                    .unwrap();
+
+                match (&host_mask, &dev_mask) {
+                    (None, None) => {
+                        assert!(
+                            !with_mask && !with_domain,
+                            "{what}: no level mask, but one was configured"
+                        );
+                        continue;
+                    }
+                    (Some(h), Some(d)) => {
+                        assert_eq!(
+                            d.geometry().size,
+                            host_fixed.size(),
+                            "{what}: the mask is not on the level's grid"
+                        );
+                        let (hb, db) = (host_mask_bytes(h), device_mask_bytes(d));
+                        let zeros = hb.iter().filter(|&&x| x == 0).count();
+                        let ones = hb.len() - zeros;
+                        assert!(
+                            zeros > 0 && ones > 0,
+                            "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); \
+                             a device that ignored the mask would pass this test"
+                        );
+                        let differing = hb.iter().zip(db.iter()).filter(|&(a, b)| a != b).count();
+                        assert_eq!(
+                            differing,
+                            0,
+                            "{what}: {differing} of {} mask voxels differ from the host's",
+                            hb.len()
+                        );
+                    }
+                    (h, d) => panic!(
+                        "{what}: one path built a level mask and the other did not \
+                         (host {}, device {})",
+                        h.is_some(),
+                        d.is_some()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// C3, the other half: a masked **device metric** at a level walks exactly the
+    /// sample set the masked **host metric** walks — `valid_points` equal, not close —
+    /// and the mask actually drops samples.
+    #[test]
+    fn a_masked_level_walks_the_same_valid_points_on_both_paths() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_fixed_mask(&mask);
+
+        let c = n as f64 / 2.0;
+        let t = Euler3DTransform::new(0.05, -0.03, 0.02, [1.5, -0.9, 0.4], [c, c, c]);
+
+        for factors in [vec![2usize; 3], vec![1usize; 3]] {
+            let sigma = vec![0.0; 3];
+            let what = format!("factors {factors:?}");
+
+            let (host_fixed, host_moving, host_mask) = reg
+                .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                .unwrap();
+            let host = MeanSquaresMetric::from_samples(
+                FixedSamples::from_image_with(
+                    &host_fixed,
+                    SamplingStrategy::None,
+                    1.0,
+                    0,
+                    host_mask.as_ref(),
+                )
+                .unwrap(),
+                MovingImage::from_image(&host_moving).unwrap(),
+            )
+            .unwrap();
+            let cpu = host.evaluate(&t, &CpuBackend);
+
+            let (fl, ml) = reg
+                .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                .unwrap();
+            let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+            let level_mask = reg
+                .level_mask_on_device(&d_fixed, Some(&d_mask), grid.as_ref())
+                .unwrap();
+            let device = DeviceMeanSquaresMetric::from_device_masked(
+                fl.as_ref().unwrap_or(&d_fixed),
+                ml.as_ref().unwrap_or(&d_moving),
+                level_mask.as_ref(),
+                None,
+            )
+            .unwrap();
+            let gpu = device.evaluate(&t).unwrap();
+
+            // Anti-vacuity: the mask must bite. An unmasked run at this level walks
+            // strictly more points, so a device that ignored the mask fails here.
+            let unmasked = DeviceMeanSquaresMetric::from_device(
+                fl.as_ref().unwrap_or(&d_fixed),
+                ml.as_ref().unwrap_or(&d_moving),
+            )
+            .unwrap()
+            .evaluate(&t)
+            .unwrap();
+            assert!(
+                gpu.valid_points < unmasked.valid_points,
+                "{what}: the mask dropped no samples ({} vs {} unmasked)",
+                gpu.valid_points,
+                unmasked.valid_points
+            );
+
+            assert_eq!(
+                gpu.valid_points, cpu.valid_points,
+                "{what}: the masked device level walked a different sample set"
+            );
+            let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+            let v_err = rel(gpu.value, cpu.value);
+            let d_err = gpu
+                .derivative
+                .iter()
+                .zip(cpu.derivative.iter())
+                .map(|(&g, &c)| rel(g, c))
+                .fold(0.0f64, f64::max);
+            println!(
+                "{what}: valid_points {} (both) | value rel err {v_err:e} | deriv rel err {d_err:e}",
+                cpu.valid_points
+            );
+            assert!(
+                v_err <= 1e-9,
+                "{what}: value rel err {v_err:e} exceeds 1e-9"
+            );
+            assert!(
+                d_err <= 1e-9,
+                "{what}: deriv rel err {d_err:e} exceeds 1e-9"
             );
         }
     }

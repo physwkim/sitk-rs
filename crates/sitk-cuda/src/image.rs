@@ -76,6 +76,18 @@ extern "C" __global__ void widen_f32_f64(
 }
 "#;
 
+/// Fill a volume with a constant — see [`DeviceImage::filled`].
+const FILL: &str = r#"
+extern "C" __global__ void fill_f32(
+    float* __restrict__ y,
+    const float v,
+    const long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = v;
+}
+"#;
+
 /// The device cast, with the source element type left open as `CTYPE`.
 ///
 /// `(float)(double)x` — through `double`, deliberately. See the [module docs](self):
@@ -277,6 +289,38 @@ impl DeviceImage {
             geom: self.geom.clone(),
             id: next_id(),
         })
+    }
+
+    /// A device image on `geom` with every voxel set to `value` — allocated and
+    /// filled **on the device**, with nothing crossing the bus.
+    ///
+    /// This exists for the registration pyramid's *in-buffer predicate*, which the
+    /// host builds by resampling an all-ones image over the fixed grid
+    /// (`prepare_level`). Uploading such a volume would push 67 MB at 256³ **per
+    /// level** to carry a single bit of information — the ones are not data, they
+    /// are a constant, and a constant belongs on the device.
+    ///
+    /// Refuses an empty grid with [`CudaError::DegenerateInput`], as
+    /// [`upload`](Self::upload) does.
+    pub fn filled(geom: Geometry, value: f32) -> Result<Self, CudaError> {
+        let mut img = Self::with_geometry(geom)?;
+        let backend: &Backend = backend()?;
+        let n = img.buf.len();
+        let n_i64 = n as i64;
+
+        let f = backend.function(FILL, "fill_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(BLOCK as usize) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = backend.stream().launch_builder(&f);
+        launch.arg(img.buf.device_mut()).arg(&value).arg(&n_i64);
+        // SAFETY: three parameters, three arguments, matching in order and type; the
+        // buffer holds `n` elements and the kernel guards every write on `i < n`.
+        unsafe { launch.launch(cfg)? };
+        backend.synchronize()?;
+        Ok(img)
     }
 
     /// A zeroed device image on an arbitrary grid — the destination of an op whose
