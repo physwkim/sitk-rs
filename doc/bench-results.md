@@ -414,13 +414,15 @@ than it is.
 - **Device coverage.** Cast (all 10 scalar types), `rescale_intensity`,
   `smooth_gaussian`, `recursive_gaussian`, `shrink`, `resample_linear`,
   `resample_nearest`, a constant fill, two mask kernels behind `DeviceMask`, and a
-  mean-squares metric with fixed and moving masks. Masks, the nearest-neighbour
-  resample and the virtual domain landed, and **both** of the boundary's
-  mask/virtual-domain refusals are closed — the device level mask is byte-equal to
-  the host's and the two paths walk exactly the same valid points. Still missing:
-  device Mattes/correlation/ANTS and sampling strategies. What the boundary still
-  refuses, by name, is a **fixed-initial transform**: it needs a device resample
-  *through* a transform, and the transform slot in `cindex_of` is empty.
+  mean-squares metric with fixed and moving masks, and a resample that carries a
+  **point map** — so a fixed-initial transform works for the nine matrix-offset
+  transform classes, bit-identically to `ResampleImageFilter`. Masks, the
+  nearest-neighbour resample, the virtual domain and the fixed-initial transform all
+  landed; the device level mask is byte-equal to the host's. Still missing: device
+  Mattes/correlation/ANTS and sampling strategies. Still refused **by name**:
+  `Scale` and `ScaleLogarithmic` (they evaluate `(p−c)·s + c`, a different rounding
+  from `M·p + b` — refused, not approximated), `Composite`, `BSpline`,
+  `DisplacementField`.
 - **Multi-GPU.** Device 0 only. Four are present.
 - **`connected_component` at large** is the port's own worst absolute number
   (8.6 s). It beats ITK only because ITK's threaded path is broken.

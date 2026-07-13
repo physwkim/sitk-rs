@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,342 tests** on the CPU, **3,398** with the CUDA
+> implemented and tested — **3,348 tests** on the CPU, **3,412** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -172,20 +172,33 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   exactly the same valid points — fixed mask 59,647 on both, moving mask 59,617 on
   both, virtual domain 31,124 on both, both together 12,489 on both, 25 iterations
   either way. No device Mattes/correlation/ANTS, no sampling strategies.
-- **A fixed-initial transform is still refused by name** (`UnsupportedFixedInitialTransform`)
-  and that configuration falls back to the host, at the host's cost. The device
-  would have to resample the fixed image *and* its in-buffer predicate **through**
-  that transform, and its resample has no transform slot yet. The predicate is the
-  hard half: it is a 0/1 field whose boundary is decided by a rounding rule, so an
-  affine that differs by 1e-12 flips a shell of voxels and the exactly-equal
-  valid-point count above degrades to a tolerance band.
+- A **fixed-initial transform** works for the nine matrix-offset transform classes
+  (`Affine`, `Euler3D`, the versor/similarity family, `Translation`): the device
+  resample carries a point map and is bit-identical to `ResampleImageFilter` through
+  every one of them. **`Scale` and `ScaleLogarithmic` are refused, not approximated**
+  — they evaluate `(p−c)·s + c`, which is a *different rounding* from `M·p + b`, so
+  folding them into a matrix would be wrong in the fifteenth digit and the in-buffer
+  predicate is a 0/1 field that would notice. `Composite`, `BSpline` and
+  `DisplacementField` are refused too, by name, and fall to the host.
+- **With a fixed-initial transform, the exactly-equal valid-point count above does
+  not survive a converged run** — host 152,383 against device 152,385 at 25
+  iterations — and the cause is not the transform. The device reduces residuals in a
+  different order than the host (~1e-13 relative, present with or without the
+  transform); a fixed-initial transform puts a hard zero shell at the resampled
+  border; and `RegularStepGradientDescentOptimizer` **halves its step on overshoot**,
+  which is a discontinuous branch. One flipped overshoot test sends the two runs to
+  two different — both valid — poses, where two border samples of 152,383 fall on
+  opposite sides of the moving buffer. The counts are exactly equal when both paths
+  are evaluated at the *same parameters*, which is where equality is a real property
+  rather than the optimizer's luck; the converged run is pinned to the same iteration
+  count, the same stop reason, and the same pose to 1e-3 (worst measured 2.4e-5).
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.
 - ITK itself has no CUDA path (its only GPU registration is an OpenCL Demons
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,342), with it **on** (3,398), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,398) — a machine with no GPU is a supported configuration, not a crash.
+(3,348), with it **on** (3,412), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,412) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -275,11 +288,9 @@ each one you can trust.
    un-parallelized stencils next to the ones just fixed — `derivative`, `laplacian`,
    `sobel_edge_detection` still run a serial `iter().map().collect()`. They are not
    in the benchmarked twelve, so no number is claimed for them.
-3. **Device coverage.** The fixed-initial transform — the device resample's
-   transform slot is empty, not hard, and the point map is bitwise reproducible for
-   the nine matrix-offset transform variants (`Scale` is *not* one of them: it
-   evaluates `(p−c)·s + c`, which is a different rounding from `M·p + b`, so it gets
-   refused rather than approximated). Then Mattes/correlation/ANTS, then multi-GPU.
+3. **Device coverage.** Mattes/correlation/ANTS metrics — mean-squares is the only
+   device metric. Then sampling strategies, then multi-GPU (four GPUs are present;
+   device 0 is the only one used).
 4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
@@ -289,8 +300,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,342 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,398, needs CUDA 13
+cargo nextest run --workspace                        # 3,348 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,412, needs CUDA 13
 ```
 
 License: Apache-2.0.
