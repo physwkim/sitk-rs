@@ -23,6 +23,38 @@ pub trait BoundaryCondition<T: Scalar> {
     fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T;
 }
 
+/// The pixel `index` lands on when each axis is remapped by `map` — the one
+/// primitive every condition below is written in terms of.
+///
+/// A boundary condition is a per-axis rule, and the pixel it names sits at a
+/// single linear index. Accumulating that index directly — dimension-0-fastest,
+/// exactly as [`Image::linear_index`](crate::Image::linear_index) does — means
+/// no implementation ever materializes the remapped ND index, and materializing
+/// it is the only reason any of them would allocate.
+///
+/// That matters because `get_pixel` runs once per out-of-bounds *neighbor*, not
+/// once per filter: a 256³ `mean` at radius 2 calls it tens of millions of
+/// times. A `Vec` in each call is what [`crate::parallel`]'s module docs warn
+/// about — it serializes every core on the allocator, and measurably did: the
+/// window walk ran 13.8 of 48 cores, against 43 for the same kernel with no
+/// window.
+///
+/// `map(i, size)` must return an in-bounds coordinate for that axis; the caller
+/// of this function, not this function, is what makes that true.
+pub(crate) fn remapped<T: Scalar>(
+    index: &[i64],
+    image: &ScalarView<'_, T>,
+    map: impl Fn(i64, usize) -> usize,
+) -> T {
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+    for (&i, &size) in index.iter().zip(image.size()) {
+        offset += map(i, size) * stride;
+        stride *= size;
+    }
+    image.pixels()[offset]
+}
+
 /// ITK's default boundary condition: clamps the out-of-bounds index to the
 /// nearest in-bounds voxel along each axis independently.
 ///
@@ -32,12 +64,7 @@ pub struct ZeroFluxNeumannBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for ZeroFluxNeumannBoundaryCondition {
     fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
-        let clamped: Vec<usize> = index
-            .iter()
-            .zip(image.size())
-            .map(|(&i, &size)| i.clamp(0, size as i64 - 1) as usize)
-            .collect();
-        image.at(&clamped)
+        remapped(index, image, |i, size| i.clamp(0, size as i64 - 1) as usize)
     }
 }
 
@@ -75,8 +102,9 @@ impl<T: Scalar> BoundaryCondition<T> for ConstantBoundaryCondition<T> {
         if !inside {
             return self.constant;
         }
-        let idx: Vec<usize> = index.iter().map(|&i| i as usize).collect();
-        image.at(&idx)
+        // `inside` proves every axis is already in bounds, so the identity map
+        // is the in-bounds coordinate.
+        remapped(index, image, |i, _| i as usize)
     }
 }
 
@@ -88,12 +116,7 @@ pub struct PeriodicBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for PeriodicBoundaryCondition {
     fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
-        let wrapped: Vec<usize> = index
-            .iter()
-            .zip(image.size())
-            .map(|(&i, &size)| i.rem_euclid(size as i64) as usize)
-            .collect();
-        image.at(&wrapped)
+        remapped(index, image, |i, size| i.rem_euclid(size as i64) as usize)
     }
 }
 
@@ -114,16 +137,11 @@ pub struct MirrorBoundaryCondition;
 
 impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
     fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T {
-        let mapped: Vec<usize> = index
-            .iter()
-            .zip(image.size())
-            .map(|(&i, &size)| {
-                let period = 2 * size as i64;
-                let m = i.rem_euclid(period);
-                (if m < size as i64 { m } else { period - 1 - m }) as usize
-            })
-            .collect();
-        image.at(&mapped)
+        remapped(index, image, |i, size| {
+            let period = 2 * size as i64;
+            let m = i.rem_euclid(period);
+            (if m < size as i64 { m } else { period - 1 - m }) as usize
+        })
     }
 }
 
