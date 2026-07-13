@@ -549,18 +549,88 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         I: Fn() -> S + Sync + Send,
         F: Fn(&mut S, &[usize], WindowView<'_, T>) -> R + Sync + Send,
     {
-        let size = self.view.image().size();
         parallel::map_indexed_init(
             self.view.image().number_of_pixels(),
-            // Both scratches are allocated once per task, not per pixel — and on
-            // the interior path the boundary buffer is never even written.
-            || (init(), Cursor::new(size), Vec::with_capacity(self.len())),
-            |(scratch, cursor, boundary), i| {
-                let center = cursor.seek(i, size);
-                let window = self.window_view(center, i, boundary);
-                f(scratch, center, window)
-            },
+            || self.window_state(init()),
+            |state, i| self.window_at(state, i, &f),
         )
+    }
+
+    /// [`Self::par_map_window`] writing into a destination the **caller owns**.
+    ///
+    /// The stencil half of the reusable-output story: a caller that runs the
+    /// same window pass in a loop — a multi-resolution pyramid, an iterative
+    /// denoiser, a per-axis separable sweep — allocates `dst` once and pays for
+    /// its pages once, instead of once per call. The allocating forms are this
+    /// function plus an allocation, so there is one window loop in this type,
+    /// not two that can drift apart.
+    ///
+    /// # Panics
+    ///
+    /// If `dst.len()` is not the image's pixel count. That is a caller bug, not
+    /// a runtime condition: `dst` is the output volume, and an output volume of
+    /// the wrong size has no meaning to fall back on.
+    pub fn par_map_window_into<R, F>(&self, dst: &mut [R], f: F)
+    where
+        T: Send + Sync,
+        B: Sync,
+        R: Send + Copy,
+        F: Fn(&[usize], WindowView<'_, T>) -> R + Sync + Send,
+    {
+        self.par_map_window_init_into(dst, || (), |(), center, window| f(center, window));
+    }
+
+    /// [`Self::par_map_window_init`] writing into a caller-owned destination —
+    /// and the one window loop the whole family is built from.
+    ///
+    /// # Panics
+    ///
+    /// If `dst.len()` is not the image's pixel count.
+    pub fn par_map_window_init_into<R, S, I, F>(&self, dst: &mut [R], init: I, f: F)
+    where
+        T: Send + Sync,
+        B: Sync,
+        R: Send + Copy,
+        S: Send,
+        I: Fn() -> S + Sync + Send,
+        F: Fn(&mut S, &[usize], WindowView<'_, T>) -> R + Sync + Send,
+    {
+        assert_eq!(
+            dst.len(),
+            self.view.image().number_of_pixels(),
+            "par_map_window_into: the destination must hold one element per pixel"
+        );
+        parallel::map_indexed_init_into(
+            dst,
+            || self.window_state(init()),
+            |state, i| self.window_at(state, i, &f),
+        );
+    }
+
+    /// The per-task scratch both window passes hand to the fill loop.
+    ///
+    /// Allocated once per task, never per pixel — and on the interior path the
+    /// boundary buffer is never even written.
+    fn window_state<S>(&self, scratch: S) -> (S, Cursor, Vec<T>) {
+        (
+            scratch,
+            Cursor::new(self.view.image().size()),
+            Vec::with_capacity(self.len()),
+        )
+    }
+
+    /// **The window loop body** — the single place that turns a linear pixel
+    /// index into `f`'s value, shared by the allocating pass and the `_into`
+    /// one, so the two cannot drift apart.
+    #[inline]
+    fn window_at<R, S, F>(&self, state: &mut (S, Cursor, Vec<T>), i: usize, f: &F) -> R
+    where
+        F: Fn(&mut S, &[usize], WindowView<'_, T>) -> R,
+    {
+        let (scratch, cursor, boundary) = state;
+        let center = cursor.seek(i, self.view.image().size());
+        let window = self.window_view(center, i, boundary);
+        f(scratch, center, window)
     }
 
     /// Applies `f` to every pixel's `(center, window)` in parallel, collecting
@@ -1085,5 +1155,28 @@ mod tests {
         let edge = iter.neighborhood_at(&[1, 0, 0]);
         assert_eq!(edge.get(&[0, -1, -1]), 221); // y,z wrap -> (1,2,2)
         assert_eq!(edge.get(&[-1, -1, -1]), 220); // x=0,y,z wrap -> (0,2,2)
+    }
+
+    /// The allocating window pass and the `_into` one must be the same loop.
+    /// They are, by construction — one delegates to the other — and this is the
+    /// regression test that keeps it that way.
+    #[test]
+    fn the_into_window_form_and_the_allocating_form_agree_bit_for_bit() {
+        let n = 40usize; // 3-D, past the parallel threshold, with real boundaries
+        let img = Image::from_vec(
+            &[n, n, n],
+            (0..n * n * n).map(|i| (i % 97) as f64 * 0.5).collect(),
+        )
+        .unwrap();
+        let iter =
+            NeighborhoodIterator::new(&img, &[1, 1, 1], ZeroFluxNeumannBoundaryCondition).unwrap();
+
+        let sum = |_: &[usize], w: WindowView<'_, f64>| w.iter_f64().sum::<f64>();
+        let allocated: Vec<f64> = iter.par_map_window(sum);
+
+        let mut dst = vec![0.0f64; img.number_of_pixels()];
+        iter.par_map_window_into(&mut dst, sum);
+
+        assert_eq!(dst, allocated);
     }
 }

@@ -49,6 +49,8 @@
 //! [`SERIAL_THRESHOLD`] returns the same bits as the parallel path — the
 //! threshold is a speed knob, never a correctness one.
 
+use std::mem::MaybeUninit;
+
 use rayon::prelude::*;
 
 use crate::pixel::Scalar;
@@ -98,19 +100,37 @@ pub fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R 
 ///
 /// The bit-for-bit result of `(0..len).map(f).collect()`: `f` sees only `i`, and
 /// element `i` lands in slot `i` whatever the decomposition.
+///
+/// The buffer comes from [`crate::alloc::resident_vec`], so its pages are
+/// faulted in on the pool rather than one 4 KiB page at a time by the loop that
+/// fills it. That is invisible in the result — see [`map_indexed_into`], which
+/// is the loop body this runs.
 pub fn map_indexed<R, F>(len: usize, f: F) -> Vec<R>
 where
     R: Send,
     F: Fn(usize) -> R + Sync + Send,
 {
-    if len < SERIAL_THRESHOLD {
-        return (0..len).map(f).collect();
-    }
-    (0..len)
-        .into_par_iter()
-        .with_min_len(GRAIN)
-        .map(f)
-        .collect()
+    map_indexed_init(len, || (), |(), i| f(i))
+}
+
+/// `dst[i] = f(i)` for every element of `dst`, in parallel — [`map_indexed`]
+/// writing into a destination the **caller owns**.
+///
+/// This is the form that closes the page-fault bill rather than merely making it
+/// cheaper: a caller that runs the same pass in a loop allocates `dst` once, and
+/// pays for its pages once, instead of once per iteration. [`map_indexed`] is
+/// this function plus an allocation, so there is one loop body, not two that can
+/// drift.
+///
+/// Element `i` is written by exactly one task, from `i` alone, so the result is
+/// bit-identical to the sequential `for i in 0..dst.len() { dst[i] = f(i) }` at
+/// any thread count.
+pub fn map_indexed_into<R, F>(dst: &mut [R], f: F)
+where
+    R: Send + Copy,
+    F: Fn(usize) -> R + Sync + Send,
+{
+    map_indexed_init_into(dst, || (), |(), i| f(i));
 }
 
 /// `src.iter().map(f).collect()`, in parallel — the elementwise transform of a
@@ -143,10 +163,37 @@ where
     R: Send,
     F: Fn(&T) -> R + Sync + Send,
 {
-    if src.len() < SERIAL_THRESHOLD {
-        return src.iter().map(f).collect();
-    }
-    src.par_iter().with_min_len(GRAIN).map(f).collect()
+    collect_filled(src.len(), |slots| fill_zip(src, slots, &f))
+}
+
+/// `dst[i] = f(&src[i])` for every element, in parallel — [`map_slice`] writing
+/// into a destination the **caller owns**, so a caller in a loop pays for the
+/// output pages once rather than once per call.
+///
+/// [`map_slice`] is this function plus an allocation: one loop body, not two.
+///
+/// Both slices are walked as contiguous chunks, so the pass keeps the
+/// vectorizable, bounds-check-free inner loop [`map_slice`] documents. Element
+/// `i` is written by exactly one task from `src[i]` alone.
+///
+/// # Panics
+///
+/// If `src.len() != dst.len()`. This is the caller passing the wrong buffer, not
+/// a runtime condition to recover from — the image-level entry points
+/// ([`crate::map_pixels_into`]) turn a size mismatch into a typed error before
+/// it can reach here.
+pub fn map_slice_into<T, R, F>(src: &[T], dst: &mut [R], f: F)
+where
+    T: Sync,
+    R: Send + Copy,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "map_slice_into: source and destination must have the same length"
+    );
+    fill_zip(src, as_uninit_mut(dst), &f);
 }
 
 /// [`map_indexed`] with a per-task scratch value: `init` runs once per worker
@@ -170,15 +217,124 @@ where
     I: Fn() -> S + Sync + Send,
     F: Fn(&mut S, usize) -> R + Sync + Send,
 {
-    if len < SERIAL_THRESHOLD {
+    collect_filled(len, |slots| fill_indexed(slots, init, f))
+}
+
+/// [`map_indexed_init`] writing into a destination the **caller owns** — and the
+/// single loop body every map in this module is built from ([`map_indexed`],
+/// [`map_indexed_into`], [`map_indexed_init`] and, through
+/// [`crate::NeighborhoodIterator::par_map_window_into`], the whole stencil
+/// family).
+///
+/// Element `i` is written by exactly one task, from `i` and per-task scratch
+/// that `f` fully overwrites per element (the [`map_indexed_init`] contract), so
+/// the result is bit-identical to the sequential loop at any thread count.
+pub fn map_indexed_init_into<R, S, I, F>(dst: &mut [R], init: I, f: F)
+where
+    R: Send + Copy,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    fill_indexed(as_uninit_mut(dst), init, f);
+}
+
+// ---------------------------------------------------------------------------
+// The two fill loops every map above is built from, and the allocation that
+// turns a fill into a `Vec`. Each `_into` form and its allocating twin call the
+// SAME loop, so they cannot drift.
+// ---------------------------------------------------------------------------
+
+/// `slots[i] = f(&mut scratch, i)` for every slot — the indexed fill.
+///
+/// Element `i` is written by exactly one task from `i` alone, so the result
+/// equals the sequential loop bit-for-bit at any thread count. Every slot is
+/// written exactly once: `par_chunks_mut` partitions the slice.
+fn fill_indexed<R, S, I, F>(slots: &mut [MaybeUninit<R>], init: I, f: F)
+where
+    R: Send,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    if slots.len() < SERIAL_THRESHOLD {
         let mut scratch = init();
-        return (0..len).map(|i| f(&mut scratch, i)).collect();
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.write(f(&mut scratch, i));
+        }
+        return;
     }
-    (0..len)
-        .into_par_iter()
-        .with_min_len(GRAIN)
-        .map_init(init, |scratch, i| f(scratch, i))
-        .collect()
+    slots
+        .par_chunks_mut(GRAIN)
+        .enumerate()
+        .for_each_init(init, |scratch, (c, chunk)| {
+            let base = c * GRAIN;
+            for (j, slot) in chunk.iter_mut().enumerate() {
+                slot.write(f(scratch, base + j));
+            }
+        });
+}
+
+/// `slots[i] = f(&src[i])` for every slot — the zipped fill, which keeps both
+/// sides contiguous so the inner loop stays vectorizable and bounds-check-free
+/// (see [`map_slice`]).
+fn fill_zip<T, R, F>(src: &[T], slots: &mut [MaybeUninit<R>], f: &F)
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    debug_assert_eq!(src.len(), slots.len());
+    if src.len() < SERIAL_THRESHOLD {
+        for (slot, x) in slots.iter_mut().zip(src) {
+            slot.write(f(x));
+        }
+        return;
+    }
+    slots
+        .par_chunks_mut(GRAIN)
+        .zip(src.par_chunks(GRAIN))
+        .for_each(|(dst_chunk, src_chunk)| {
+            for (slot, x) in dst_chunk.iter_mut().zip(src_chunk) {
+                slot.write(f(x));
+            }
+        });
+}
+
+/// Allocate `len` slots — advised as huge-page candidates, untouched — let
+/// `fill` write every one of them, and hand back the `Vec`.
+///
+/// The buffer is deliberately **not** prefaulted: `fill` is a parallel pass, so
+/// its own workers fault their own pages concurrently. There is no serial fault
+/// to hoist, and a prefault would only write the buffer twice — measured, and
+/// rejected, in [`crate::alloc::resident_vec`]'s docs.
+fn collect_filled<R, G>(len: usize, fill: G) -> Vec<R>
+where
+    G: FnOnce(&mut [MaybeUninit<R>]),
+{
+    let mut v = crate::alloc::resident_capacity::<R>(len);
+    fill(&mut v.spare_capacity_mut()[..len]);
+    // SAFETY: `resident_capacity(len)` reserved at least `len` slots, and `fill`
+    // — every implementation of which lives in this module — writes each of the
+    // first `len` exactly once. The elements are therefore initialized.
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// View an initialized `&mut [R]` as uninitialized slots, so the `_into` forms
+/// can run the same fill loop the allocating ones do.
+///
+/// `R: Copy` is what makes this sound to *expose*, not just to write: a `Copy`
+/// type has no destructor, so overwriting a live element without dropping it
+/// leaks nothing. (The bound is why `_into` takes `R: Copy` while the allocating
+/// forms do not.)
+fn as_uninit_mut<R: Copy>(dst: &mut [R]) -> &mut [MaybeUninit<R>] {
+    let len = dst.len();
+    // SAFETY: `MaybeUninit<R>` is guaranteed to have the same size, alignment
+    // and ABI as `R`. Every element of `dst` is initialized, and an initialized
+    // value is a valid `MaybeUninit<R>`, so the cast exposes no uninit memory.
+    // The borrow is exclusive and `len` is unchanged.
+    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<R>>(), len) }
 }
 
 /// `f(i, &mut out[i])` for every element of `out`, in parallel — the in-place
@@ -204,6 +360,105 @@ where
                 f(base + j, x);
             }
         });
+}
+
+/// Rows per staging chunk in [`map_rows_fold_in_order`]. Bounds the staging
+/// buffer, nothing else: `combine` sees `0..n` in order whatever this is, so it
+/// cannot change a single bit of the result.
+const FOLD_CHUNK_ROWS: usize = 1 << 16;
+
+/// **Parallel per-element compute, sequential in-order combine** — a float
+/// reduction that is bit-identical to the sequential loop it replaces.
+///
+/// # The problem this solves
+///
+/// A float sum cannot be parallelized by splitting it: `+` is not associative,
+/// so any re-bracketing changes the bits, and this module refuses to offer such
+/// a reduction ([see the module docs](self)). But an expensive per-element
+/// *computation* whose result is merely *added* to an accumulator is a different
+/// shape. Split it in two:
+///
+/// - `compute(scratch, i, row)` — the expensive part (a coordinate transform, an
+///   interpolation, a Jacobian). It sees only element `i`, touches no
+///   accumulator, and writes its contribution into `row`. **Runs in parallel.**
+/// - `combine(i, row)` — the cheap part: the additions. **Runs on one thread, for
+///   `i = 0, 1, 2, … n-1`, in order.**
+///
+/// So the accumulator sees exactly the sequence of values, in exactly the order,
+/// that the original serial loop fed it. It is not a fold over per-chunk
+/// partials — that *would* be a re-association. It is the *same fold*, over the
+/// same elements, in the same order, with only the work that feeds it moved off
+/// the critical path. The result is bit-identical to the sequential loop, at any
+/// thread count, and identical to it — not merely reproducible.
+///
+/// `compute` returns `false` to mark element `i` invalid; `combine` is then not
+/// called for it, exactly as a `continue` would have skipped it.
+///
+/// # Why a non-deterministic reduction stays unwritable
+///
+/// `combine` is `FnMut` and is never handed to rayon. A caller cannot get its
+/// accumulator into a worker thread, so it cannot re-associate anything even by
+/// accident. The parallel half (`compute`) is `Fn` and cannot own the
+/// accumulator. The determinism is in the *shape* of the API.
+///
+/// # Cost
+///
+/// Amdahl, not accuracy: the combine stays serial, so the speedup is bounded by
+/// how much of the per-element work sits in `compute`. That is the right trade
+/// exactly when the compute dwarfs the additions — which is the case this exists
+/// for.
+pub fn map_rows_fold_in_order<S, I, C, F>(
+    n: usize,
+    width: usize,
+    init: I,
+    compute: C,
+    mut combine: F,
+) where
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    C: Fn(&mut S, usize, &mut [f64]) -> bool + Sync + Send,
+    F: FnMut(usize, &[f64]),
+{
+    assert!(width > 0, "a staged row needs at least one column");
+    if n == 0 {
+        return;
+    }
+    if n < SERIAL_THRESHOLD {
+        let mut scratch = init();
+        let mut row = vec![0.0; width];
+        for i in 0..n {
+            if compute(&mut scratch, i, &mut row) {
+                combine(i, &row);
+            }
+        }
+        return;
+    }
+
+    let chunk_rows = FOLD_CHUNK_ROWS.min(n);
+    let mut rows = vec![0.0f64; chunk_rows * width];
+    let mut valid = vec![false; chunk_rows];
+
+    let mut start = 0usize;
+    while start < n {
+        let count = chunk_rows.min(n - start);
+
+        // Parallel: every row is written by exactly one task, from its own index.
+        rows[..count * width]
+            .par_chunks_mut(width)
+            .zip(valid[..count].par_iter_mut())
+            .enumerate()
+            .for_each_init(&init, |scratch, (r, (row, ok))| {
+                *ok = compute(scratch, start + r, row);
+            });
+
+        // Sequential, in index order — the original loop's fold, untouched.
+        for r in 0..count {
+            if valid[r] {
+                combine(start + r, &rows[r * width..(r + 1) * width]);
+            }
+        }
+        start += count;
+    }
 }
 
 /// The minimum and maximum of `vals` widened to `f64`, or `None` if empty.
@@ -640,5 +895,105 @@ mod tests {
         let got = bin_counts(&vals, bins, |v| (v < 4.0).then_some(v as usize));
         assert_eq!(got, vec![(n / 8) as u64; 4]);
         assert_eq!(got.iter().sum::<u64>(), (n / 2) as u64);
+    }
+
+    /// The reason the primitive exists: the accumulator must see the same
+    /// additions in the same order as the loop it replaces, at *any* thread
+    /// count. The values make re-association visible in the bits — the leading
+    /// `1.0` swallows every subsequent `1e-17` by rounding, so a sum that
+    /// brackets the tail separately (a chunked fold, a tree reduce) lands on a
+    /// different `f64`. The sequential sum here is 1.0 exactly; any parallel
+    /// re-association gets 1.0 + something.
+    #[test]
+    fn map_rows_fold_in_order_is_bit_identical_to_the_sequential_fold() {
+        let sample = |i: usize| if i == 0 { 1.0f64 } else { 1e-17 };
+        // 0 and 1 are the empty/degenerate paths, 999 takes the serial path,
+        // and the last straddles two staging chunks with a partial tail.
+        for n in [0usize, 1, 999, FOLD_CHUNK_ROWS * 2 + 137] {
+            let mut want = 0.0f64;
+            for i in 0..n {
+                want += sample(i);
+            }
+            if n > 1 {
+                assert_eq!(want, 1.0, "the tail must vanish into the leading 1.0");
+            }
+
+            for threads in [1usize, 2, 3, 7, 16, 64] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut got = 0.0f64;
+                let mut order = Vec::with_capacity(n);
+                pool.install(|| {
+                    map_rows_fold_in_order(
+                        n,
+                        1,
+                        || (),
+                        |(), i, row| {
+                            row[0] = sample(i);
+                            true
+                        },
+                        |i, row| {
+                            order.push(i);
+                            got += row[0];
+                        },
+                    );
+                });
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "n={n}, {threads} threads moved the bits"
+                );
+                assert_eq!(
+                    order,
+                    (0..n).collect::<Vec<_>>(),
+                    "combine ran out of order"
+                );
+            }
+        }
+    }
+
+    /// An invalid element must be skipped entirely, exactly as `continue` would
+    /// have skipped it — not combined as a zero row.
+    #[test]
+    fn map_rows_fold_in_order_skips_invalid_rows_and_carries_every_column() {
+        let n = SERIAL_THRESHOLD * 4 + 3;
+        let width = 3;
+        let ok = |i: usize| !i.is_multiple_of(3);
+
+        let mut got = vec![0.0f64; width];
+        let mut combined = 0usize;
+        map_rows_fold_in_order(
+            n,
+            width,
+            || (),
+            |(), i, row| {
+                if !ok(i) {
+                    return false;
+                }
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = (i * (c + 1)) as f64;
+                }
+                true
+            },
+            |_, row| {
+                combined += 1;
+                for (acc, &v) in got.iter_mut().zip(row) {
+                    *acc += v;
+                }
+            },
+        );
+
+        let mut want = vec![0.0f64; width];
+        let mut want_combined = 0usize;
+        for i in (0..n).filter(|&i| ok(i)) {
+            want_combined += 1;
+            for (c, acc) in want.iter_mut().enumerate() {
+                *acc += (i * (c + 1)) as f64;
+            }
+        }
+        assert_eq!(combined, want_combined);
+        assert_eq!(got, want);
     }
 }

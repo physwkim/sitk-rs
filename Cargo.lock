@@ -846,6 +846,7 @@ dependencies = [
 name = "sitk-core"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "rayon",
  "thiserror",
 ]
