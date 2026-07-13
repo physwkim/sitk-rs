@@ -228,6 +228,23 @@ fn op11_otsu_threshold_value_is_thread_count_independent() {
     }
 }
 
+/// The pin below survived a *sanctioned* algorithm change, and that is worth
+/// recording rather than leaving for the next reader to rediscover.
+///
+/// The FFT was rewritten twice under this checksum: first to a half-Hermitian
+/// R2C/C2R pair, then to the `rustfft`/`realfft` kernels. The second moves the
+/// `f64` spectrum by a few ulps (rustfft computes the roots of unity that
+/// pocketfft hardcodes — see `fft::LineKernel`), so the pin was released for
+/// op12, and op12 only, to be re-pinned at whatever the new kernel produced.
+/// It did not need re-pinning: this op's output is `Float32`, and a relative
+/// perturbation of ~1e-14 in `f64` is ~7 orders of magnitude below the gap
+/// between neighbouring `f32`, so every pixel rounds to the bits it had.
+///
+/// The checksum is therefore still the one harvested from the pre-parallel
+/// scalar implementation, and it still means what the module doc says it means.
+/// What it does *not* do is gate the FFT's accuracy — it cannot see a change
+/// this far down. `fft_matches_spatial_convolution` does that, and it is the
+/// stronger of the two: it gates against being *wrong*, not against changing.
 #[test]
 fn op12_fft_convolution() {
     let img = float_volume();
@@ -243,4 +260,79 @@ fn op12_fft_convolution() {
         )
         .unwrap()
     });
+}
+
+/// op12 against the definition it is an implementation of.
+///
+/// `fft_convolution` and `convolution` take the same image, the same kernel and
+/// the same boundary condition, and differ only in *how* they compute the sum —
+/// one multiplies spectra, the other adds 343 products per voxel. So the FFT is
+/// wrong exactly insofar as it disagrees with the direct sum, and no checksum
+/// can tell us that: a checksum pins the bits an implementation happens to
+/// produce, and both of these implementations were rewritten under it.
+///
+/// In `f64`, where nothing is lost to the pixel type on the way out, the two
+/// agree to `1.8e-12` absolute on values of order `1e3` — about `2e-15`
+/// relative, which is the round-off of the transform itself and not something a
+/// better implementation would improve on. The gate is set at `1e-10` absolute,
+/// ~55x that, so it fires on a real defect and not on a kernel swap; the run
+/// prints the figure it actually reached.
+///
+/// The extent is chosen so that the *odd* path is the one under test. A 27³
+/// volume with a 7³ kernel gives a padded extent of `padded_length(27 + 6) = 33`
+/// (`33 = 3·11`, so it needs no padding at all), which is odd — the half-spectrum
+/// has no Nyquist bin, and C2R must reconstruct the top bin from the conjugate
+/// symmetry rather than read it. Every other FFT test here lands on an even
+/// extent, so without this one the odd parity would go ungated. 27³ also clears
+/// `parallel`'s serial threshold, so this is the parallel path.
+#[test]
+fn fft_matches_spatial_convolution() {
+    const TOL: f64 = 1e-10;
+    let n = 27usize;
+    let img = Image::from_vec(
+        &[n, n, n],
+        synth(0x5EED, n * n * n)
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<f64>>(),
+    )
+    .unwrap();
+    let kernel = Image::from_vec(&[7usize, 7, 7], vec![1.0f64 / 343.0; 343]).unwrap();
+
+    let spectral = f::fft_convolution(
+        &img,
+        &kernel,
+        true,
+        f::ConvolutionBoundaryCondition::ZeroFluxNeumannPad,
+        f::OutputRegionMode::Same,
+    )
+    .unwrap();
+    let spatial = f::convolution(
+        &img,
+        &kernel,
+        true,
+        f::ConvolutionBoundaryCondition::ZeroFluxNeumannPad,
+        f::OutputRegionMode::Same,
+    )
+    .unwrap();
+
+    assert_eq!(spectral.size(), spatial.size());
+    let (a, b) = (
+        spectral.scalar_slice::<f64>().unwrap(),
+        spatial.scalar_slice::<f64>().unwrap(),
+    );
+    let (worst, at) = a
+        .iter()
+        .zip(b)
+        .enumerate()
+        .map(|(i, (&x, &y))| ((x - y).abs(), i))
+        .fold((0.0f64, 0usize), |acc, d| if d.0 > acc.0 { d } else { acc });
+    println!("max |fft - spatial| = {worst:.3e} at voxel {at}");
+    assert!(
+        worst <= TOL,
+        "fft_convolution disagrees with the direct spatial sum by {worst:.3e} at voxel {at} \
+         (spectral {}, spatial {}), tolerance {TOL:.0e}",
+        a[at],
+        b[at],
+    );
 }

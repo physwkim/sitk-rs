@@ -185,6 +185,11 @@ allocation noise:
   half-Hermitian **R2C** transform — half the arithmetic, half the memory.
   Recorded as ledger §4.116. Closing it means implementing R2C/C2R; scoped as its
   own task, deliberately not attempted.
+  **Closed 2026-07-13** (§4.116): the R2C/C2R pair plus a `rustfft`/`realfft`
+  kernel. `t1` 16 889 → 2 476 ms vs ITK's 1 883 (**1.31×**, from 6.6–7.3×), and
+  `t96` ~380 ms vs ITK's 553 — **the port is now faster than ITK at thread
+  count**. The numbers above this line are the pre-fix run and are left as
+  recorded.
 - **`mean` (2.0–2.4×), `gradient_magnitude` (1.5–2.1×)** — the stencil ops that
   gained the least from `WindowView`. Next candidates, but note both are inside
   or near the noise band at `t1`; the `tN` gap (5.5× and 3.8×) is the real one.

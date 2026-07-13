@@ -16,6 +16,8 @@ default = []
 cuda = ["dep:sitk-cuda", "sitk-cuda/cuda"]
 
 [dependencies]
+realfft = "3.5.0"
+rustfft = "6.4.1"
 sitk-core.workspace = true
 sitk-cuda = { workspace = true, optional = true }
 thiserror.workspace = true
