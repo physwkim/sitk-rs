@@ -7,10 +7,13 @@
 //!
 //! Two things are pinned, and an op must satisfy both:
 //!
-//! 1. **Bit-parity with the scalar port.** The expected checksums were harvested
-//!    from the pre-parallel implementation of this crate, so a change of a single
-//!    output bit — the thing a re-associated float reduction would cause — fails
-//!    here. This is `doc/bench-spec.md`'s "Correctness gate", the Rust half.
+//! 1. **Bit-parity with the scalar port.** Ops 01-12's expected checksums were
+//!    harvested from the pre-parallel implementation of this crate, so a change of
+//!    a single output bit — the thing a re-associated float reduction would cause
+//!    — fails here. This is `doc/bench-spec.md`'s "Correctness gate", the Rust
+//!    half. Ops 13-16 are the *integer-output* companions of four of them; their
+//!    checksums were harvested later, at `6c35862`, and their provenance is
+//!    recorded where they are defined.
 //! 2. **Independence from the thread count.** Each op runs on rayon pools of 1,
 //!    3, 8 and 32 threads, and every run must return the identical bit pattern.
 //!    A decomposition that varied with the thread count (or with steal order)
@@ -51,6 +54,12 @@ fn checksum(img: &Image) -> u64 {
             .flat_map(|v| v.to_le_bytes())
             .collect(),
         PixelId::UInt8 => img.scalar_slice::<u8>().unwrap().to_vec(),
+        PixelId::UInt16 => img
+            .scalar_slice::<u16>()
+            .unwrap()
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect(),
         PixelId::UInt32 => img
             .scalar_slice::<u32>()
             .unwrap()
@@ -78,6 +87,24 @@ fn float_volume() -> Image {
     Image::from_vec(&SIZE, synth(0x2545_F491_4F6C_DD1D, voxels)).unwrap()
 }
 
+/// The **integer** input for ops 13-16, carrying `synth`'s values verbatim.
+///
+/// `UInt16`, not `UInt8`, and the choice is the point of these pins. `synth`
+/// produces `[0, 1000)`, so a `u8` volume would saturate at 255 on 3/4 of its
+/// voxels (`Scalar::from_f64` clamps, §4.7) — and a saturated voxel is pinned
+/// against the *clamp*, not against the narrowing. `u16` holds every value with
+/// room to spare, so what these checksums see is exactly the float→integer
+/// truncation of §2.155 and nothing else. The values are the same ones the
+/// float pins run on, which is what makes the two comparable.
+fn uint16_volume() -> Image {
+    let voxels = SIZE.iter().product();
+    let data: Vec<u16> = synth(0x2545_F491_4F6C_DD1D, voxels)
+        .iter()
+        .map(|&v| v as u16)
+        .collect();
+    Image::from_vec(&SIZE, data).unwrap()
+}
+
 /// The binary/label input, thresholded at `>= 500.0` per `doc/bench-spec.md`.
 fn binary_volume() -> Image {
     let voxels = SIZE.iter().product();
@@ -89,8 +116,8 @@ fn binary_volume() -> Image {
 }
 
 /// Runs `op` on pools of 1, 3, 8 and 32 threads, asserts every run agrees
-/// bit-for-bit, and asserts that value is `expected` — the checksum the
-/// pre-parallel scalar implementation produced.
+/// bit-for-bit, and asserts that value is `expected` — the op's pinned checksum
+/// (see the module doc for where each was harvested).
 fn assert_bit_parity(name: &str, expected: u64, op: impl Fn() -> Image + Sync + Send + Copy) {
     let mut seen: Option<u64> = None;
     for threads in [1usize, 3, 8, 32] {
@@ -108,8 +135,8 @@ fn assert_bit_parity(name: &str, expected: u64, op: impl Fn() -> Image + Sync + 
     assert_eq!(
         seen.unwrap(),
         expected,
-        "{name}: output differs from the pre-parallel scalar implementation \
-         (got {:#018x}, want {expected:#018x}) — parallelizing this op changed its bits",
+        "{name}: output differs from its pinned checksum \
+         (got {:#018x}, want {expected:#018x}) — this op's bits changed",
         seen.unwrap()
     );
 }
@@ -335,4 +362,112 @@ fn fft_matches_spatial_convolution() {
         a[at],
         b[at],
     );
+}
+
+// ---- ops 13-16: the integer-output companions -------------------------------
+//
+// These are **not** benchmark ops. `doc/bench-spec.md` has twelve, and it keeps
+// twelve; ops 13-16 exist only here, and only because of a defect that shipped.
+//
+// # What went wrong, and why nothing caught it
+//
+// Four of the twelve filters — 01 `rescale_intensity`, 03 `discrete_gaussian`,
+// 05 `mean`, 12 `fft_convolution` — compute in `f64` and write the result back
+// into the *input's* pixel type. Every one of them is pinned above on a
+// `Float32` volume, so all four pins run the float instantiation and none of
+// them runs the integer one. That is a whole limb of each filter — the
+// `Scalar::from_f64` narrowing, which truncates toward zero (§2.155) — with no
+// pin on it at all.
+//
+// It is not hypothetical. Commit `0abba0f` swapped `fft_convolution`'s 1-D
+// kernel for `rustfft`'s, whose twiddles differ from pocketfft's in the last two
+// ulps. On a `Float32` output that is invisible: a ~1e-14 relative change is
+// seven orders below the gap between neighbouring `f32`, and op12's checksum did
+// not move. On an *integer* output it truncated up to 55% of voxels a whole
+// level low — and the entire suite stayed green, through review and through a
+// merge to main, because no pin was looking. `6c35862` fixed the filter; these
+// four pins are what stop the next one, whether it comes from the kernel, the
+// padding search, or `Scalar::from_f64` itself.
+//
+// # Provenance of these four checksums, stated exactly
+//
+// Harvested at `6c35862`. Not from the pre-parallel implementation: that code is
+// gone, and no integer instantiation was ever pinned under it — which is the
+// whole complaint.
+//
+// For 13, 14 and 15 that distinction is empty. Nothing has ever been rewritten
+// on the paths they cover, so the value harvested now is the value the scalar
+// port produced.
+//
+// For **op16 it is not empty, and the gap is worth naming.** `6c35862` restored
+// the exact 1-D kernel on integer output, and a delta-kernel probe confirmed the
+// result is bit-identical to `ea3fe9c`'s — the commit before `rustfft`. But
+// `ea3fe9c` already carried the half-Hermitian R2C/C2R rewrite, which lands the
+// top half of each spectrum by conjugating the bottom half rather than
+// transforming it. Whether *that* rewrite moved an integer-output bit relative to
+// the original full-complex port is **unverified**, and now unverifiable from the
+// tree: the full-complex path no longer exists, and no pin was watching when it
+// was removed. So this checksum pins the R2C-era exact-kernel output, which is
+// the strongest claim the evidence supports. `fft_matches_spatial_convolution`
+// is what stands behind its correctness; this pin is what stops it moving again.
+//
+// The other eight ops are not in this family, and it is worth saying why rather
+// than leaving the absence to be re-derived: 02, 06, 07 and 09 fix their output
+// at a float type regardless of input, so they have no integer instantiation to
+// pin; 08, 10 and 11 already pin an integer output (`u8`, `u32`, `u8`); 04
+// `median` does dispatch over the integer types, but it *selects* an existing
+// input value rather than computing one, so no float→integer narrowing exists on
+// its path to escape a pin. 04 is therefore the one member of the "output
+// follows input" set that is genuinely safe, not merely unpinned.
+
+/// op01's integer instantiation: the rescale's linear map, truncated back into
+/// `u16`.
+#[test]
+fn op13_rescale_intensity_uint16() {
+    let img = uint16_volume();
+    assert_bit_parity("rescale_intensity_uint16", 0x250f_3c1a_f42a_dade, || {
+        f::rescale_intensity(&img, 0.0, 255.0).unwrap()
+    });
+}
+
+/// op03's integer instantiation: the separable Gaussian's `f64` field, truncated
+/// back into `u16`.
+#[test]
+fn op14_discrete_gaussian_uint16() {
+    let img = uint16_volume();
+    assert_bit_parity("discrete_gaussian_uint16", 0x7c69_9050_314c_07eb, || {
+        f::discrete_gaussian(&img, &[4.0; 3], &[0.01; 3], 32, true).unwrap()
+    });
+}
+
+/// op05's integer instantiation: the box average — a genuine `f64` mean of
+/// integers — truncated back into `u16`.
+#[test]
+fn op15_mean_uint16() {
+    let img = uint16_volume();
+    assert_bit_parity("mean_uint16", 0xd19c_c2da_bd65_75c8, || {
+        f::mean(&img, &[2, 2, 2]).unwrap()
+    });
+}
+
+/// op12's integer instantiation, and the one that actually shipped broken: the
+/// same 7³ normalized box kernel and the same values as op12, with the spectrum
+/// truncated back into `u16` instead of rounded into `f32`.
+///
+/// This pin is what op12 could not be. It sees the FFT's last bits, because the
+/// truncation puts a pixel-level boundary directly under them.
+#[test]
+fn op16_fft_convolution_uint16() {
+    let img = uint16_volume();
+    let kernel = Image::from_vec(&[7usize, 7, 7], vec![1.0f32 / 343.0; 343]).unwrap();
+    assert_bit_parity("fft_convolution_uint16", 0x3c20_f7b7_85af_70b8, || {
+        f::fft_convolution(
+            &img,
+            &kernel,
+            true,
+            f::ConvolutionBoundaryCondition::ZeroFluxNeumannPad,
+            f::OutputRegionMode::Same,
+        )
+        .unwrap()
+    });
 }
