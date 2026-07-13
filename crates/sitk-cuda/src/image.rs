@@ -279,6 +279,25 @@ impl DeviceImage {
         })
     }
 
+    /// A zeroed device image on an arbitrary grid — the destination of an op whose
+    /// output geometry is **not** its input's (a shrink, a resample onto a coarse
+    /// grid). Allocates on the device only; nothing crosses the bus.
+    ///
+    /// Refuses an empty grid with [`CudaError::DegenerateInput`], as
+    /// [`upload`](Self::upload) does.
+    pub(crate) fn with_geometry(geom: Geometry) -> Result<Self, CudaError> {
+        let n = geom.len();
+        if n == 0 {
+            return Err(CudaError::DegenerateInput);
+        }
+        let backend = backend()?;
+        Ok(Self {
+            buf: DeviceBuffer::zeros(backend, n)?,
+            geom,
+            id: next_id(),
+        })
+    }
+
     /// This image's geometry.
     pub fn geometry(&self) -> &Geometry {
         &self.geom

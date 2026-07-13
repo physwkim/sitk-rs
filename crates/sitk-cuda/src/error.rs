@@ -29,6 +29,13 @@ pub enum CudaError {
     #[error("no CUDA kernel for pixel type {0:?}")]
     UnsupportedPixelType(PixelId),
 
+    /// The op has a kernel for this pixel type but not for this image's *shape*:
+    /// the pyramid ops are 3-D, a shrink factor must be at least 1, and the
+    /// recursive Gaussian's fourth-order recursion needs at least four voxels on
+    /// every axis it smooths (the same requirement the CPU filter states).
+    #[error("no CUDA kernel for this geometry: {0}")]
+    UnsupportedGeometry(String),
+
     /// The op's input is degenerate on its own terms (for
     /// `rescale_intensity`: an empty image, or one whose min equals its max).
     /// The CPU path defines the error the user sees, so the GPU path declines
