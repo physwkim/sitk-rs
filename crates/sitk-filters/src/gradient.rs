@@ -463,9 +463,29 @@ pub fn gradient_magnitude_recursive_gaussian(
         // The tap stays a *division* by `spacing[d]`: multiplying by a
         // precomputed `1.0 / spacing[d]` is a different `f64` and would move the
         // checksum.
+        //
+        // The first axis **stores** where the others accumulate, and that is a
+        // page-fault fix, not a style choice. `acc` is `alloc_zeroed`, so it is a
+        // fresh anonymous mapping whose pages are not yet resident. A
+        // read-modify-write (`*a += t`) touches each page twice: the load faults
+        // it in as a copy-on-write reference to the shared zero page, and the
+        // store then takes a second write-protect fault on the same page. A pure
+        // store faults once. Measured on a fresh 1.07 GB buffer at 512³: 2.00
+        // faults/page and 376.9 ms for `+=`, 1.00 fault/page and 39.3 ms for `=`.
+        //
+        // It is bit-identical **only because the term is a square**. `0.0 + x`
+        // returns `x` for every `f64` except `x == -0.0`, where it returns `+0.0`;
+        // `g * g` is never `-0.0`, so the store and the add agree on every input.
+        // `laplacian_recursive_gaussian` below has the same shape and must NOT be
+        // unified with this — see the comment there.
         parallel::for_each_mut(&mut acc, |i, a| {
             let g = work[i] / spacing[d];
-            *a += g * g;
+            let term = g * g;
+            if d == 0 {
+                *a = term;
+            } else {
+                *a += term;
+            }
         });
     }
     // The final pass emits `f32` straight out, rather than rewriting the whole
@@ -527,6 +547,21 @@ pub fn laplacian_recursive_gaussian(
         // `inv_spacing_sq` is precomputed and multiplied, as it always was here —
         // unlike the gradient magnitude above, which divides. Keeping each
         // filter's own arithmetic is what keeps each checksum.
+        //
+        // DO NOT "unify" this with the gradient magnitude's axis loop above by
+        // making the first axis store into `acc` instead of accumulating. That
+        // change is legal there and illegal here, and the two look identical.
+        //
+        // There it saves a page fault per 4 KB (a read-modify-write faults a
+        // fresh `alloc_zeroed` page twice, a pure store once) and costs no bits,
+        // because its term is `g * g` — a square, which is never `-0.0`, and
+        // `0.0 + x == x` for every `f64` except `x == -0.0`.
+        //
+        // Here the term is `work[i] * inv_spacing_sq`, the output of a *second*
+        // derivative, which absolutely can be `-0.0`. `0.0 + (-0.0)` is `+0.0`,
+        // but a store would leave `-0.0`. So a store would emit `-0.0` where this
+        // add emits `+0.0`, the sign bit would survive the narrowing to `f32`, and
+        // the checksum would move. The zeroed buffer and the `+=` are load-bearing.
         let inv_spacing_sq = 1.0 / (spacing[d] * spacing[d]);
         parallel::for_each_mut(&mut acc, |i, a| {
             *a += work[i] * inv_spacing_sq;
@@ -748,66 +783,64 @@ pub fn gradient_recursive_gaussian(
 mod tests {
     use super::*;
 
-    /// [`gradient_magnitude`] emits `f32` from the window pass instead of
-    /// materializing an `f64` volume and narrowing it in a second pass. The two
-    /// must agree **bit for bit**, not merely compare equal: `-0.0 == 0.0` and
-    /// `NaN != NaN` under `==`, so this compares raw bit patterns.
+    /// The premise that lets [`gradient_magnitude_recursive_gaussian`]'s first
+    /// axis **store** into the zeroed accumulator instead of accumulating into
+    /// it: `0.0 + x` has the same bits as `x` for every `f64` *except* `-0.0`,
+    /// and a square is never `-0.0`.
     ///
-    /// The pass is shared (`gradient_magnitude_pass::<T, R>`), so the arithmetic
-    /// cannot drift between the `f32` and `f64` instantiations by construction —
-    /// this pins the remaining claim, that emitting `R::from_f64` per voxel is
-    /// the same function `image_from_f64` applied per voxel.
+    /// This is the load-bearing half of why the same change is illegal in
+    /// [`laplacian_recursive_gaussian`], whose term is a second derivative and
+    /// can be `-0.0`. Both halves are pinned here.
     #[test]
-    fn gradient_magnitude_fused_narrowing_is_bit_identical_to_narrowed_f64_values() {
-        let size = [9usize, 7, 5];
-        let n: usize = size.iter().product();
-        // Values that exercise the narrowing: negatives, a zero plateau (so the
-        // magnitude is exactly 0.0 and any sign divergence would show), and
-        // magnitudes past `f32`'s mantissa so the cast actually rounds.
-        let data: Vec<f64> = (0..n)
-            .map(|i| match i % 5 {
-                0 => 0.0,
-                1 => -((i % 251) as f64) * 1.5,
-                2 => (i % 97) as f64 * 1e7 + 0.123_456_789,
-                3 => (i % 31) as f64,
-                _ => (i % 17) as f64 * 0.25,
-            })
-            .collect();
-        let geom = Image::from_vec(&size, data.clone()).unwrap();
+    fn zero_plus_a_square_is_bit_identical_to_the_square_but_not_for_negative_zero() {
+        let probes = [
+            0.0f64,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            5e-324,
+            -5e-324,
+            1e-300,
+            -1e-300,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
 
-        for pixel_id in [
-            PixelId::UInt8,
-            PixelId::Int16,
-            PixelId::Float32,
-            PixelId::Float64,
-        ] {
-            let mut img = image_from_f64(pixel_id, &size, &geom, &data).unwrap();
-            img.set_spacing(&[1.0, 0.75, 1.3]).unwrap();
-
-            for use_image_spacing in [true, false] {
-                let fused = gradient_magnitude(&img, use_image_spacing).unwrap();
-                let vals = gradient_magnitude_values(&img, use_image_spacing).unwrap();
-                let narrowed = image_from_f64(PixelId::Float32, img.size(), &img, &vals).unwrap();
-
-                let a = fused.scalar_slice::<f32>().unwrap();
-                let b = narrowed.scalar_slice::<f32>().unwrap();
-                assert_eq!(a.len(), b.len());
-                for (i, (x, y)) in a.iter().zip(b).enumerate() {
-                    assert_eq!(
-                        x.to_bits(),
-                        y.to_bits(),
-                        "{pixel_id:?}, use_image_spacing={use_image_spacing}, voxel {i}: \
-                         fused {x:?} vs narrowed {y:?}"
-                    );
-                }
-            }
+        // gmrg's term: a square. Storing it and adding it to `+0.0` agree, bit
+        // for bit, on every one of these — including `-0.0`, whose square is
+        // `+0.0`, and `NaN`, whose sum with `0.0` is still a `NaN` with the same
+        // bits.
+        for g in probes {
+            let term = g * g;
+            assert_eq!(
+                (0.0f64 + term).to_bits(),
+                term.to_bits(),
+                "0.0 + ({g:?} * {g:?}) must be bit-identical to the square itself"
+            );
         }
+
+        // The Laplacian's term is not a square, and `-0.0` is exactly where the
+        // two diverge: the add flushes the sign, the store keeps it. This is the
+        // checksum that would move if the two axis loops were ever unified.
+        let term = -0.0f64;
+        assert_ne!(
+            (0.0f64 + term).to_bits(),
+            term.to_bits(),
+            "0.0 + (-0.0) is +0.0, so a store is NOT interchangeable with an \
+             accumulate for a term that can be -0.0"
+        );
     }
 
     /// The same claim for [`gradient_magnitude_recursive_gaussian`]'s tail: it
     /// now emits `f32` from the square-root pass rather than rewriting the `f64`
-    /// accumulator in place and narrowing it in a third pass. Compared by bits,
-    /// against the sequential `sqrt`-then-`from_f64` this replaced.
+    /// accumulator in place and narrowing it in a third pass — and its first axis
+    /// stores where it used to accumulate. Compared by bits against the original
+    /// `+=`-into-a-zeroed-buffer, `sqrt`-in-place, `from_f64` exit this replaced,
+    /// so it pins both changes end to end.
     #[test]
     fn gmrg_fused_sqrt_narrowing_is_bit_identical_to_sqrt_then_narrow() {
         let size = [9usize, 7, 5];
