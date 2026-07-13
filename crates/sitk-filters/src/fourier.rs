@@ -71,7 +71,7 @@ use sitk_core::{Complex as PixelComplex, Image, PixelId, Real};
 use crate::Result;
 use crate::convolution::ConvolutionBoundaryCondition;
 use crate::error::FilterError;
-use crate::fft::{self, Complex};
+use crate::fft::{self, Complex, LineKernel};
 use crate::geometry;
 
 /// `FFTPadImageFilter::DefaultSizeGreatestPrimeFactor()`
@@ -155,7 +155,12 @@ where
 fn forward_fft_typed<T: Real>(img: &Image) -> Result<Image> {
     let size = img.size().to_vec();
     let mut buf = embed_real::<T>(img)?;
-    fft::transform_nd(&mut buf, &size, false);
+    fft::transform_nd(
+        &mut buf,
+        &size,
+        false,
+        LineKernel::for_output(T::COMPLEX_ID),
+    );
     complex_image_like::<T>(img, &size, &buf)
 }
 
@@ -185,7 +190,7 @@ fn inverse_fft_typed<T: Real>(img: &Image) -> Result<Image> {
     let size = img.size().to_vec();
     let total: usize = size.iter().product();
     let mut buf = embed_complex::<T>(img)?;
-    fft::transform_nd(&mut buf, &size, true);
+    fft::transform_nd(&mut buf, &size, true, LineKernel::for_output(T::PIXEL_ID));
     debug_assert_eq!(buf.len(), total);
     let values: Vec<f64> = buf.iter().map(|c| c.re).collect();
     real_image_like::<T>(img, &size, &values)
@@ -224,7 +229,12 @@ fn real_to_half_hermitian_typed<T: Real>(img: &Image) -> Result<Image> {
     // over the rest (pocketfft_hdronly.h:3683-3691); on a real input that is
     // the full complex transform with the redundant x columns dropped.
     let mut buf = embed_real::<T>(img)?;
-    fft::transform_nd(&mut buf, &full, false);
+    fft::transform_nd(
+        &mut buf,
+        &full,
+        false,
+        LineKernel::for_output(T::COMPLEX_ID),
+    );
 
     let out: Vec<Complex> = crop_leading_axis(&buf, &full, half[0]);
     complex_image_like::<T>(img, &half, &out)
@@ -305,14 +315,15 @@ fn half_hermitian_to_real_typed<T: Real>(img: &Image, odd: bool) -> Result<Image
     // array (pocketfft_hdronly.h:3717-3731), and only then expands x.
     let mut buf = embed_complex::<T>(img)?;
     let other_axes: Vec<usize> = (1..half.len()).collect();
-    fft::transform_axes(&mut buf, &half, &other_axes, false);
+    let line_kernel = LineKernel::for_output(T::PIXEL_ID);
+    fft::transform_axes(&mut buf, &half, &other_axes, false, line_kernel);
 
     let scale = 1.0 / total as f64;
     let mut line = vec![Complex::default(); full[0]];
     let mut values = Vec::with_capacity(total);
     for chunk in buf.chunks_exact(half[0]) {
         expand_hermitian_line(chunk, full[0], &mut line);
-        fft::transform_axes(&mut line, &[full[0]], &[0], false);
+        fft::transform_axes(&mut line, &[full[0]], &[0], false, line_kernel);
         values.extend(line.iter().map(|c| c.re * scale));
     }
 

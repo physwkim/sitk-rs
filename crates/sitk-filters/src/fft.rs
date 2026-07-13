@@ -35,9 +35,10 @@
 //! rustfft is about 3x the speed of the scalar kernel and a few ulps less exact,
 //! because it computes the roots of unity that pocketfft hardcodes.
 //!
-//! Which one a pass runs is [`LineKernel`], chosen per call site and never by
-//! default; that type documents what the choice costs and why the real-input
-//! pair can afford the fast kernel while the complex-spectrum API cannot.
+//! Which one a pass runs is [`LineKernel`], and no call site chooses it: it is a
+//! function of the pixel type the result is narrowed into
+//! ([`LineKernel::for_output`]), because that is the only thing that can see the
+//! difference. That type documents what the choice costs and why.
 //!
 //! # Padding
 //!
@@ -66,7 +67,7 @@ use std::sync::Arc;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex64;
 use rustfft::{Fft, FftPlanner};
-use sitk_core::parallel;
+use sitk_core::{PixelId, parallel};
 
 /// A complex number. Crate-private: the public complex-pixel surface is
 /// [`sitk_core::Complex`], and no value of this type escapes `sitk-filters`.
@@ -513,8 +514,31 @@ fn fft_cyclic_convolve(a: &mut [Complex], b: &mut [Complex]) {
 /// inverse would, so a round trip comes back scaled by `N`. That scale cancels
 /// in the `E(u|v)` numerator/denominator ratio, which is the only thing
 /// `SharpenImage` reads out.
-pub(crate) fn transform_1d_unnormalized(buf: &mut [Complex], forward: bool) {
-    transform_1d_unscaled(buf, !forward);
+pub(crate) fn transform_1d_unnormalized(buf: &mut [Complex], forward: bool, kernel: LineKernel) {
+    match kernel {
+        LineKernel::Exact => transform_1d_unscaled(buf, !forward),
+        LineKernel::Planned => transform_1d_planned(buf, !forward),
+    }
+}
+
+/// One line on the planner, [`LineKernel::Planned`]'s single-line entry point.
+///
+/// The plan is built per call, which the bulk paths ([`transform_axes`],
+/// [`transform_r2c`], [`transform_c2r`]) never do — they plan once per axis and
+/// reuse it across every line. This one exists for
+/// [`transform_1d_unnormalized`]'s caller, `SharpenImage`, which transforms a
+/// handful of histogram-length vectors per iteration rather than a volume.
+fn transform_1d_planned(buf: &mut [Complex], positive_exponent: bool) {
+    let n = buf.len();
+    if n < 2 {
+        return;
+    }
+    let fft = plan_c2c(&mut FftPlanner::new(), n, positive_exponent);
+    let mut line: Vec<Complex64> = buf.iter().map(|&c| c.to_c64()).collect();
+    fft.process(&mut line);
+    for (dst, &src) in buf.iter_mut().zip(line.iter()) {
+        *dst = Complex::from_c64(src);
+    }
 }
 
 /// The unscaled kernel, with `positive_exponent` selecting the twiddle sign.
@@ -535,9 +559,10 @@ fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
     }
 }
 
-/// Which 1-D kernel a separable pass runs. The two agree to the last few ulps
-/// and disagree below that, so the choice is a bit-level commitment and is made
-/// per call site, never by default.
+/// Which 1-D kernel a transform runs. The two agree to the last few ulps and
+/// disagree below that, so the choice is a bit-level commitment — and it is
+/// **derived from the output pixel type**, by [`LineKernel::for_output`], not
+/// decided per filter.
 ///
 /// # Why there are two
 ///
@@ -549,34 +574,62 @@ fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
 /// correctly-rounded literals. `cos(2π/3)` is the standing example: rustfft gets
 /// `-0.4999999999999998`, two ulps from the exact `-0.5`.
 ///
-/// Two ulps of twiddle is nothing next to a transform's own round-off, and for
-/// [`transform_r2c`]/[`transform_c2r`] — whose only caller is
-/// `fft_convolution`, an approximation of a spatial convolution to begin with —
-/// it is invisible. It is *not* invisible to a filter that round-trips through
-/// the spectrum and casts back to an integer pixel type: with exact twiddles the
-/// delta-kernel round trip of `itkInverseDeconvolutionImageFilter` returns
-/// `20.0` and truncates to `20`, and with rustfft's it returns
-/// `19.99999999999999289` and truncates to `19`. That is a visible, wrong pixel,
-/// and it is what `deconvolution::tests::output_keeps_the_input_pixel_type_and_
-/// geometry` pins.
+/// # Why the output type is the predicate
 ///
-/// The truncation is not this port's choice to revisit: ITK narrows a float
-/// result into an integer pixel with a plain `static_cast` on exactly this path
-/// (`itkExtractImageFilter.hxx:270` → `itkImageAlgorithm.hxx:46`), and rounding
-/// is opt-in there (a separate `RoundImageFilter`). Ledger §2.155. So the last
-/// bits of a spectrum *are* load-bearing when the output is integral, and that
-/// is what confines the fast kernel to the real-input pair.
+/// Two ulps of twiddle is nothing beside a transform's own round-off, and a
+/// *floating-point* output cannot see either: the transform runs in `f64`, and a
+/// ~1e-14 relative perturbation is ~7 orders of magnitude below the gap between
+/// neighbouring `f32`. (op12's pinned checksum did not move when this kernel
+/// changed under it — that is the same fact, measured.) An `f64` output *can*
+/// see it in its last bits, but nothing downstream magnifies a 1e-15 relative
+/// change into a visible one.
 ///
-/// So: the complex-spectrum API that filters round-trip through keeps the exact
-/// kernel, and the real-input pair — the one that carries the volume-sized cost
-/// — takes the fast one. Speed where the bits do not reach the output, exactness
-/// where they do.
+/// An **integer** output can, and does. The narrowing truncates toward zero
+/// (ITK's `static_cast`, ledger §2.155), so a value that lands a hair below an
+/// integer loses a whole level. That is not hypothetical: the delta-kernel round
+/// trip of `itkInverseDeconvolutionImageFilter` returns `20.0` under the exact
+/// twiddles and `19.99999999999999289` under rustfft's — `20` versus `19` after
+/// the cast, from an error of 1e-14, and it is what
+/// `deconvolution::tests::output_keeps_the_input_pixel_type_and_geometry` pins.
+///
+/// # What [`Exact`](LineKernel::Exact) does and does not buy
+///
+/// It does **not** make an integer-output FFT exact. Measured on a delta kernel
+/// (the identity, so every output voxel must equal its input) with `u8` pixels,
+/// `fft_convolution` drops a level on a large fraction of voxels under *either*
+/// kernel — 28/49 voxels at 7², 58/121 at 11² under `Exact`, 24/49 and 42/121
+/// under `Planned`. The transform's own round-off is enough; the twiddles only
+/// change which voxels. Ledger §2.156.
+///
+/// What `Exact` buys is that it is *materially better* at it — about half the
+/// dropped levels across that sweep, and exactly zero at the 2/3-smooth lengths
+/// the padding search usually lands on, where its hardcoded twiddles are exact
+/// rationals and the round trip cancels. And it is the kernel this port's
+/// integer-output behaviour was pinned with. So integer outputs keep it, and the
+/// float outputs — which cannot see the difference — take the fast one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LineKernel {
     /// This port's own butterflies on pocketfft's hardcoded twiddles.
     Exact,
     /// `rustfft`'s planner: SIMD butterflies on computed twiddles.
     Planned,
+}
+
+impl LineKernel {
+    /// The kernel a transform whose result lands in `output` must run.
+    ///
+    /// **This is the whole rule, and it lives only here.** A caller states the
+    /// pixel type it will narrow into and is handed the kernel; it does not get
+    /// to choose one. `is_floating_point` is component-wise, so a complex-float
+    /// spectrum is a float output — its components are `f32`/`f64` and neither
+    /// truncates.
+    pub(crate) const fn for_output(output: PixelId) -> Self {
+        if output.is_floating_point() {
+            Self::Planned
+        } else {
+            Self::Exact
+        }
+    }
 }
 
 /// `rustfft`'s plan for a length-`n` complex transform, `positive_exponent`
@@ -595,19 +648,16 @@ fn plan_c2c(planner: &mut FftPlanner<f64>, n: usize, positive_exponent: bool) ->
 }
 
 /// Unscaled separable transform of `data` along `axes` only, laid out
-/// first-index-fastest with extent `size`, on the [`LineKernel::Exact`] kernel.
+/// first-index-fastest with extent `size`.
 ///
 /// `forward` selects the `exp(-2πi …)` kernel. This is pocketfft's `c2c` with
 /// `fct = 1` over a subset of axes — the shape `general_c2r` uses when it
 /// transforms every axis but the halved one
 /// (`pocketfft_hdronly.h:3728`).
-pub(crate) fn transform_axes(data: &mut [Complex], size: &[usize], axes: &[usize], forward: bool) {
-    transform_axes_with(data, size, axes, forward, LineKernel::Exact);
-}
-
-/// [`transform_axes`], with the 1-D kernel named. See [`LineKernel`] for what
-/// the choice costs.
-fn transform_axes_with(
+///
+/// `kernel` comes from [`LineKernel::for_output`] — the caller passes the pixel
+/// type its result will land in, not a preference.
+pub(crate) fn transform_axes(
     data: &mut [Complex],
     size: &[usize],
     axes: &[usize],
@@ -685,14 +735,21 @@ fn transform_axes_with(
 ///
 /// The inverse pass divides by the total pixel count, as ITK's inverse FFT
 /// filters do (`itkPocketFFTInverseFFTImageFilter.hxx:57`).
-pub(crate) fn transform_nd(data: &mut [Complex], size: &[usize], inverse: bool) {
+///
+/// `kernel` comes from [`LineKernel::for_output`].
+pub(crate) fn transform_nd(
+    data: &mut [Complex],
+    size: &[usize],
+    inverse: bool,
+    kernel: LineKernel,
+) {
     let total: usize = size.iter().product();
     debug_assert_eq!(data.len(), total);
     if total == 0 {
         return;
     }
     let axes: Vec<usize> = (0..size.len()).collect();
-    transform_axes(data, size, &axes, !inverse);
+    transform_axes(data, size, &axes, !inverse, kernel);
     if inverse {
         let scale = 1.0 / total as f64;
         parallel::for_each_mut(data, |_, x| *x = x.scale(scale));
@@ -731,7 +788,13 @@ pub(crate) fn half_size(size: &[usize]) -> Vec<usize> {
 /// Pairs with [`transform_c2r`]. The product of two half-spectra is the
 /// half-spectrum of the product, because the multiply is elementwise: the halving
 /// costs the caller nothing but the extent it indexes with.
-pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
+///
+/// `kernel` comes from [`LineKernel::for_output`]. Only the *planner* has a true
+/// real-input transform: [`LineKernel::Exact`] reaches the same half-spectrum by
+/// transforming the real line as a complex one and keeping the low half, which
+/// costs axis 0 twice what the planner spends. That is the price of the exact
+/// twiddles an integer output needs, and it is paid only by integer outputs.
+pub(crate) fn transform_r2c(real: &[f64], size: &[usize], kernel: LineKernel) -> Vec<Complex> {
     let total: usize = size.iter().product();
     debug_assert_eq!(real.len(), total);
     let hsize = half_size(size);
@@ -744,46 +807,69 @@ pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
     let n0 = size[0];
     let h = hsize[0];
 
-    // Axis 0, on the real input: a real-to-complex transform, which *produces*
-    // the `h = n0 / 2 + 1` bins rather than computing all `n0` of them and
-    // discarding half. Lines along axis 0 are contiguous in both buffers, so a
-    // line of `half` starting at `start` mirrors the line of `real` starting at
-    // `start / h * n0` — see `Line::start`.
+    // Axis 0, on the real input. Lines along axis 0 are contiguous in both
+    // buffers, so a line of `half` starting at `start` mirrors the line of `real`
+    // starting at `start / h * n0` — see `Line::start`.
     //
     // A length-1 axis has no transform to take: the single bin is the sample,
     // which is also what the complex kernel's `n < 2` early return gave.
-    if n0 < 2 {
-        parallel::for_each_mut(&mut half, |i, v| *v = Complex::new(real[i], 0.0));
-    } else {
-        let r2c = RealFftPlanner::<f64>::new().plan_fft_forward(n0);
-        let scratch_len = r2c.get_scratch_len();
-        parallel::for_each_line_mut(
-            &mut half,
-            &hsize,
-            0,
-            || {
-                (
-                    vec![0.0f64; n0],
-                    vec![Complex64::default(); h],
-                    vec![Complex64::default(); scratch_len],
-                )
-            },
-            |(line, spectrum, scratch), mut slot| {
-                let base = slot.start() / h * n0;
-                line.copy_from_slice(&real[base..base + n0]);
-                r2c.process_with_scratch(line, spectrum, scratch)
-                    .expect("r2c: the buffers are the planner's own lengths");
-                for (t, &v) in spectrum.iter().enumerate() {
-                    slot.set(t, Complex::from_c64(v));
-                }
-            },
-        );
+    match kernel {
+        _ if n0 < 2 => {
+            parallel::for_each_mut(&mut half, |i, v| *v = Complex::new(real[i], 0.0));
+        }
+        // A real-to-complex transform, which *produces* the `h = n0 / 2 + 1` bins
+        // rather than computing all `n0` of them and discarding half.
+        LineKernel::Planned => {
+            let r2c = RealFftPlanner::<f64>::new().plan_fft_forward(n0);
+            let scratch_len = r2c.get_scratch_len();
+            parallel::for_each_line_mut(
+                &mut half,
+                &hsize,
+                0,
+                || {
+                    (
+                        vec![0.0f64; n0],
+                        vec![Complex64::default(); h],
+                        vec![Complex64::default(); scratch_len],
+                    )
+                },
+                |(line, spectrum, scratch), mut slot| {
+                    let base = slot.start() / h * n0;
+                    line.copy_from_slice(&real[base..base + n0]);
+                    r2c.process_with_scratch(line, spectrum, scratch)
+                        .expect("r2c: the buffers are the planner's own lengths");
+                    for (t, &v) in spectrum.iter().enumerate() {
+                        slot.set(t, Complex::from_c64(v));
+                    }
+                },
+            );
+        }
+        // Widen the real line to complex, transform it in full, keep the low half.
+        // The discarded half is the conjugate mirror of the kept one.
+        LineKernel::Exact => {
+            parallel::for_each_line_mut(
+                &mut half,
+                &hsize,
+                0,
+                || vec![Complex::default(); n0],
+                |line, mut slot| {
+                    let base = slot.start() / h * n0;
+                    for (t, v) in line.iter_mut().enumerate() {
+                        *v = Complex::new(real[base + t], 0.0);
+                    }
+                    transform_1d_unscaled(line, false);
+                    for (t, &v) in line.iter().take(h).enumerate() {
+                        slot.set(t, v);
+                    }
+                },
+            );
+        }
     }
 
     // The remaining axes, on the halved array: the same transform the full
     // spectrum would get, over half as many lines.
     let axes: Vec<usize> = (1..size.len()).collect();
-    transform_axes_with(&mut half, &hsize, &axes, true, LineKernel::Planned);
+    transform_axes(&mut half, &hsize, &axes, true, kernel);
     half
 }
 
@@ -814,7 +900,7 @@ pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
 /// even `n0`'s Nyquist bin is the last bin of the half either way. The one thing
 /// the caller owes it is a DC bin (and Nyquist, when `n0` is even) with no
 /// imaginary part; see the note at the call.
-pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize]) -> Vec<f64> {
+pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize], kernel: LineKernel) -> Vec<f64> {
     let total: usize = size.iter().product();
     let hsize = half_size(size);
     let htotal: usize = hsize.iter().product();
@@ -829,55 +915,88 @@ pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize]) -> Vec<f64> {
 
     // Every axis but the halved one: half as many lines as the full spectrum has.
     let axes: Vec<usize> = (1..size.len()).collect();
-    transform_axes_with(half, &hsize, &axes, false, LineKernel::Planned);
+    transform_axes(half, &hsize, &axes, false, kernel);
 
     let scale = 1.0 / total as f64;
     let half = &*half;
 
-    // Axis 0: a complex-to-real transform of the line's own half. Lines are
-    // contiguous along axis 0 in both buffers, so the line of `real` at `start`
-    // is the line of `half` at `start / n0 * h`.
-    if n0 < 2 {
-        parallel::for_each_mut(&mut real, |i, v| *v = half[i].re * scale);
-        return real;
+    // Axis 0: the line's own half back to a real line. Lines are contiguous along
+    // axis 0 in both buffers, so the line of `real` at `start` is the line of
+    // `half` at `start / n0 * h`.
+    match kernel {
+        _ if n0 < 2 => {
+            parallel::for_each_mut(&mut real, |i, v| *v = half[i].re * scale);
+        }
+        // A true complex-to-real transform: the planner reconstructs the mirrored
+        // bins internally, and dispatches on `n0`'s parity itself.
+        LineKernel::Planned => {
+            let c2r = RealFftPlanner::<f64>::new().plan_fft_inverse(n0);
+            let scratch_len = c2r.get_scratch_len();
+            parallel::for_each_line_mut(
+                &mut real,
+                size,
+                0,
+                || {
+                    (
+                        vec![Complex64::default(); h],
+                        vec![0.0f64; n0],
+                        vec![Complex64::default(); scratch_len],
+                    )
+                },
+                |(spectrum, line, scratch), mut slot| {
+                    let base = slot.start() / n0 * h;
+                    for (t, v) in spectrum.iter_mut().enumerate() {
+                        *v = half[base + t].to_c64();
+                    }
+                    // The DC bin — and the Nyquist bin, when `n0` is even — are
+                    // their own conjugate, so they are real in exact arithmetic.
+                    // Round-off leaves an imaginary residue there, and C2R refuses a
+                    // spectrum that carries one. Zero it: `realfft` clears both
+                    // itself before transforming and reports the clearing as an
+                    // `Err` afterwards (`ComplexToRealEven::process_with_scratch`),
+                    // so doing it here moves no output bit and turns a spurious `Err`
+                    // into the `Ok` the lengths already guarantee.
+                    spectrum[0].im = 0.0;
+                    if n0.is_multiple_of(2) {
+                        spectrum[h - 1].im = 0.0;
+                    }
+                    c2r.process_with_scratch(spectrum, line, scratch).expect(
+                        "c2r: the buffers are the planner's own lengths, DC and Nyquist are real",
+                    );
+                    for (t, &v) in line.iter().enumerate() {
+                        slot.set(t, v * scale);
+                    }
+                },
+            );
+        }
+        // Rebuild the line's full spectrum from its own half — `G[n0 - x] =
+        // conj(G[x])`, the symmetry described above — invert it as a complex line,
+        // and keep the real part. `n0 - x` lands strictly inside `0 .. h` for every
+        // `x` at or above the half, so an even `n0`'s Nyquist bin is read straight
+        // out of `half` and an odd `n0` has none: neither parity is special-cased.
+        LineKernel::Exact => {
+            parallel::for_each_line_mut(
+                &mut real,
+                size,
+                0,
+                || vec![Complex::default(); n0],
+                |line, mut slot| {
+                    let base = slot.start() / n0 * h;
+                    for (x, v) in line.iter_mut().enumerate() {
+                        *v = if x < h {
+                            half[base + x]
+                        } else {
+                            half[base + (n0 - x)].conj()
+                        };
+                    }
+                    transform_1d_unscaled(line, true);
+                    for (t, &v) in line.iter().enumerate() {
+                        slot.set(t, v.re * scale);
+                    }
+                },
+            );
+        }
     }
-    let c2r = RealFftPlanner::<f64>::new().plan_fft_inverse(n0);
-    let scratch_len = c2r.get_scratch_len();
-    parallel::for_each_line_mut(
-        &mut real,
-        size,
-        0,
-        || {
-            (
-                vec![Complex64::default(); h],
-                vec![0.0f64; n0],
-                vec![Complex64::default(); scratch_len],
-            )
-        },
-        |(spectrum, line, scratch), mut slot| {
-            let base = slot.start() / n0 * h;
-            for (t, v) in spectrum.iter_mut().enumerate() {
-                *v = half[base + t].to_c64();
-            }
-            // The DC bin — and the Nyquist bin, when `n0` is even — are their own
-            // conjugate, so they are real in exact arithmetic. Round-off leaves an
-            // imaginary residue there, and C2R refuses a spectrum that carries one.
-            // Zero it: `realfft` clears both itself before transforming and reports
-            // the clearing as an `Err` afterwards
-            // (`ComplexToRealEven::process_with_scratch`), so doing it here moves no
-            // output bit and turns a spurious `Err` into the `Ok` the lengths already
-            // guarantee.
-            spectrum[0].im = 0.0;
-            if n0.is_multiple_of(2) {
-                spectrum[h - 1].im = 0.0;
-            }
-            c2r.process_with_scratch(spectrum, line, scratch)
-                .expect("c2r: the buffers are the planner's own lengths, DC and Nyquist are real");
-            for (t, &v) in line.iter().enumerate() {
-                slot.set(t, v * scale);
-            }
-        },
-    );
     real
 }
 
@@ -1205,20 +1324,50 @@ mod tests {
         }
     }
 
+    /// Both kernels are the same transform, so both must round-trip. Running the
+    /// loop over `KERNELS` is what keeps `Planned` gated against the definition
+    /// rather than merely reachable.
+    const KERNELS: [LineKernel; 2] = [LineKernel::Exact, LineKernel::Planned];
+
     #[test]
     fn round_trip_nd_restores_input() {
-        for size in [vec![4usize, 8, 2], vec![12, 5], vec![13, 3], vec![97]] {
-            let total: usize = size.iter().product();
-            let original = sample(total);
-            let mut buf = original.clone();
-            transform_nd(&mut buf, &size, false);
-            transform_nd(&mut buf, &size, true);
-            for (i, (a, b)) in buf.iter().zip(&original).enumerate() {
-                assert!(
-                    (a.re - b.re).abs() < 1e-10 && (a.im - b.im).abs() < 1e-10,
-                    "size = {size:?}, i = {i}"
-                );
+        for kernel in KERNELS {
+            for size in [vec![4usize, 8, 2], vec![12, 5], vec![13, 3], vec![97]] {
+                let total: usize = size.iter().product();
+                let original = sample(total);
+                let mut buf = original.clone();
+                transform_nd(&mut buf, &size, false, kernel);
+                transform_nd(&mut buf, &size, true, kernel);
+                for (i, (a, b)) in buf.iter().zip(&original).enumerate() {
+                    assert!(
+                        (a.re - b.re).abs() < 1e-10 && (a.im - b.im).abs() < 1e-10,
+                        "kernel = {kernel:?}, size = {size:?}, i = {i}"
+                    );
+                }
             }
+        }
+    }
+
+    /// Every kernel maps an integral output type to `Exact` and a floating-point
+    /// one — real or complex — to `Planned`. This is the rule the four FFT
+    /// filters share; it exists in exactly one place.
+    #[test]
+    fn kernel_follows_output_integrality() {
+        for id in [
+            PixelId::UInt8,
+            PixelId::Int16,
+            PixelId::UInt32,
+            PixelId::Int64,
+        ] {
+            assert_eq!(LineKernel::for_output(id), LineKernel::Exact, "{id:?}");
+        }
+        for id in [
+            PixelId::Float32,
+            PixelId::Float64,
+            PixelId::ComplexFloat32,
+            PixelId::ComplexFloat64,
+        ] {
+            assert_eq!(LineKernel::for_output(id), LineKernel::Planned, "{id:?}");
         }
     }
 
@@ -1249,7 +1398,7 @@ mod tests {
             }
             data
         };
-        transform_nd(&mut got, &size, false);
+        transform_nd(&mut got, &size, false, LineKernel::Exact);
         for (i, (a, b)) in got.iter().zip(&want).enumerate() {
             assert!(
                 (a.re - b.re).abs() < 1e-10 && (a.im - b.im).abs() < 1e-10,
@@ -1262,15 +1411,17 @@ mod tests {
     /// axis 1 alone, then axis 0 alone, equals transforming both.
     #[test]
     fn transform_axes_composes_one_axis_at_a_time() {
-        let size = [7usize, 4];
-        let original = sample(28);
-        let mut both = original.clone();
-        transform_axes(&mut both, &size, &[0, 1], true);
-        let mut split = original;
-        transform_axes(&mut split, &size, &[1], true);
-        transform_axes(&mut split, &size, &[0], true);
-        for (a, b) in split.iter().zip(&both) {
-            assert!((a.re - b.re).abs() < 1e-10 && (a.im - b.im).abs() < 1e-10);
+        for kernel in KERNELS {
+            let size = [7usize, 4];
+            let original = sample(28);
+            let mut both = original.clone();
+            transform_axes(&mut both, &size, &[0, 1], true, kernel);
+            let mut split = original;
+            transform_axes(&mut split, &size, &[1], true, kernel);
+            transform_axes(&mut split, &size, &[0], true, kernel);
+            for (a, b) in split.iter().zip(&both) {
+                assert!((a.re - b.re).abs() < 1e-10 && (a.im - b.im).abs() < 1e-10);
+            }
         }
     }
 
@@ -1287,14 +1438,16 @@ mod tests {
     /// at a Bluestein length as much as at a fast one.
     #[test]
     fn unnormalized_round_trip_scales_by_the_length() {
-        for n in [16usize, 13] {
-            let original = sample(n);
-            let mut buf = original.clone();
-            transform_1d_unnormalized(&mut buf, false);
-            transform_1d_unnormalized(&mut buf, true);
-            for (a, b) in buf.iter().zip(&original) {
-                let want = b.scale(n as f64);
-                assert!((a.re - want.re).abs() < 1e-9 && (a.im - want.im).abs() < 1e-9);
+        for kernel in KERNELS {
+            for n in [16usize, 13] {
+                let original = sample(n);
+                let mut buf = original.clone();
+                transform_1d_unnormalized(&mut buf, false, kernel);
+                transform_1d_unnormalized(&mut buf, true, kernel);
+                for (a, b) in buf.iter().zip(&original) {
+                    let want = b.scale(n as f64);
+                    assert!((a.re - want.re).abs() < 1e-9 && (a.im - want.im).abs() < 1e-9);
+                }
             }
         }
     }

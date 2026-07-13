@@ -96,7 +96,7 @@ use sitk_core::{Image, PixelId};
 
 use crate::convolution::{ravel, unravel};
 use crate::error::{FilterError, Result};
-use crate::fft::{self, Complex};
+use crate::fft::{self, Complex, LineKernel};
 use crate::image_from_f64;
 
 /// Output pixel-type mapping for both filters: `Float32` for a `Float32`
@@ -190,7 +190,12 @@ fn find_closest_valid_dimension(n: usize) -> usize {
 
 /// `CalculateForwardFFT` (hxx:375-403): zero-pad `values` on the upper side of
 /// every axis out to `fft_size`, then transform.
-fn forward_fft(values: &[f64], size: &[usize], fft_size: &[usize]) -> Vec<Complex> {
+fn forward_fft(
+    values: &[f64],
+    size: &[usize],
+    fft_size: &[usize],
+    line_kernel: LineKernel,
+) -> Vec<Complex> {
     let total: usize = fft_size.iter().product();
     let mut buf = vec![Complex::default(); total];
     let mut index = vec![0usize; size.len()];
@@ -198,7 +203,7 @@ fn forward_fft(values: &[f64], size: &[usize], fft_size: &[usize]) -> Vec<Comple
         unravel(i, size, &mut index);
         buf[ravel(&index, fft_size)] = Complex::new(v, 0.0);
     }
-    fft::transform_nd(&mut buf, fft_size, false);
+    fft::transform_nd(&mut buf, fft_size, false, line_kernel);
     buf
 }
 
@@ -209,8 +214,9 @@ fn inverse_fft_cropped(
     mut spectrum: Vec<Complex>,
     fft_size: &[usize],
     combined_size: &[usize],
+    line_kernel: LineKernel,
 ) -> Vec<f64> {
-    fft::transform_nd(&mut spectrum, fft_size, true);
+    fft::transform_nd(&mut spectrum, fft_size, true, line_kernel);
     let total: usize = combined_size.iter().product();
     let mut index = vec![0usize; combined_size.len()];
     (0..total)
@@ -232,8 +238,9 @@ fn correlate(
     b: &[Complex],
     fft_size: &[usize],
     combined_size: &[usize],
+    line_kernel: LineKernel,
 ) -> Vec<f64> {
-    inverse_fft_cropped(spectrum_product(a, b), fft_size, combined_size)
+    inverse_fft_cropped(spectrum_product(a, b), fft_size, combined_size, line_kernel)
 }
 
 // ---- pre-processing -------------------------------------------------------
@@ -359,19 +366,47 @@ fn generate_data(
         .map(|&n| find_closest_valid_dimension(n))
         .collect();
 
-    let fixed_fft = forward_fft(&fixed_image, fixed.size(), &fft_size);
-    let fixed_mask_fft = forward_fft(&fixed_mask, fixed.size(), &fft_size);
-    let moving_fft = forward_fft(&moving_image, moving.size(), &fft_size);
-    let moving_mask_fft = forward_fft(&moving_mask, moving.size(), &fft_size);
+    // The pixel type these correlations are narrowed into at the end decides the
+    // kernel ([`LineKernel::for_output`]); this filter does not.
+    let line_kernel = LineKernel::for_output(real_type(fixed.pixel_id()));
+
+    let fixed_fft = forward_fft(&fixed_image, fixed.size(), &fft_size, line_kernel);
+    let fixed_mask_fft = forward_fft(&fixed_mask, fixed.size(), &fft_size, line_kernel);
+    let moving_fft = forward_fft(&moving_image, moving.size(), &fft_size, line_kernel);
+    let moving_mask_fft = forward_fft(&moving_mask, moving.size(), &fft_size, line_kernel);
 
     // How many voxels overlap at each shift. Exact integers up to round-off.
-    let mut overlap = correlate(&fixed_mask_fft, &moving_mask_fft, &fft_size, &combined_size);
+    let mut overlap = correlate(
+        &fixed_mask_fft,
+        &moving_mask_fft,
+        &fft_size,
+        &combined_size,
+        line_kernel,
+    );
     element_round(&mut overlap);
     element_positive(&mut overlap);
 
-    let fixed_cumulative_sum = correlate(&fixed_fft, &moving_mask_fft, &fft_size, &combined_size);
-    let moving_cumulative_sum = correlate(&fixed_mask_fft, &moving_fft, &fft_size, &combined_size);
-    let cross = correlate(&fixed_fft, &moving_fft, &fft_size, &combined_size);
+    let fixed_cumulative_sum = correlate(
+        &fixed_fft,
+        &moving_mask_fft,
+        &fft_size,
+        &combined_size,
+        line_kernel,
+    );
+    let moving_cumulative_sum = correlate(
+        &fixed_mask_fft,
+        &moving_fft,
+        &fft_size,
+        &combined_size,
+        line_kernel,
+    );
+    let cross = correlate(
+        &fixed_fft,
+        &moving_fft,
+        &fft_size,
+        &combined_size,
+        line_kernel,
+    );
     let products: Vec<f64> = fixed_cumulative_sum
         .iter()
         .zip(&moving_cumulative_sum)
@@ -384,13 +419,14 @@ fn generate_data(
         .collect();
 
     let fixed_squared: Vec<f64> = fixed_image.iter().map(|&v| v * v).collect();
-    let fixed_squared_fft = forward_fft(&fixed_squared, fixed.size(), &fft_size);
+    let fixed_squared_fft = forward_fft(&fixed_squared, fixed.size(), &fft_size, line_kernel);
     let fixed_squares: Vec<f64> = fixed_cumulative_sum.iter().map(|&v| v * v).collect();
     let mut fixed_denom: Vec<f64> = correlate(
         &fixed_squared_fft,
         &moving_mask_fft,
         &fft_size,
         &combined_size,
+        line_kernel,
     )
     .iter()
     .zip(element_quotient(&fixed_squares, &overlap))
@@ -399,13 +435,14 @@ fn generate_data(
     element_positive(&mut fixed_denom);
 
     let moving_squared: Vec<f64> = moving_image.iter().map(|&v| v * v).collect();
-    let moving_squared_fft = forward_fft(&moving_squared, moving.size(), &fft_size);
+    let moving_squared_fft = forward_fft(&moving_squared, moving.size(), &fft_size, line_kernel);
     let moving_squares: Vec<f64> = moving_cumulative_sum.iter().map(|&v| v * v).collect();
     let mut moving_denom: Vec<f64> = correlate(
         &fixed_mask_fft,
         &moving_squared_fft,
         &fft_size,
         &combined_size,
+        line_kernel,
     )
     .iter()
     .zip(element_quotient(&moving_squares, &overlap))
