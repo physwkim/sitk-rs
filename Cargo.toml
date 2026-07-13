@@ -29,6 +29,10 @@ thiserror = "2.0"
 # admits no float reduction, so no filter crate can reach `par_iter().sum()` and
 # re-associate a float fold. See `crates/sitk-core/src/parallel.rs`.
 rayon = "1.10"
+# `madvise` only. A dependency of `sitk-core` ONLY, and used at exactly one call
+# site (`sitk_core::alloc`), whose advice is advisory: every failure path there
+# falls back to the plain allocation. See `crates/sitk-core/src/alloc.rs`.
+libc = "0.2"
 # Pure-Rust zlib/gzip. `default-features = false` + `rust_backend` pins the
 # miniz_oxide implementation and keeps every C-binding backend (`zlib-sys`,
 # `zlib-ng`, `libz-rs`) out of the tree — ledger §5.8, §5.17.

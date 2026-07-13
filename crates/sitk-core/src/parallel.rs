@@ -49,6 +49,8 @@
 //! [`SERIAL_THRESHOLD`] returns the same bits as the parallel path — the
 //! threshold is a speed knob, never a correctness one.
 
+use std::mem::MaybeUninit;
+
 use rayon::prelude::*;
 
 use crate::pixel::Scalar;
@@ -98,19 +100,37 @@ pub fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R 
 ///
 /// The bit-for-bit result of `(0..len).map(f).collect()`: `f` sees only `i`, and
 /// element `i` lands in slot `i` whatever the decomposition.
+///
+/// The buffer comes from [`crate::alloc::resident_vec`], so its pages are
+/// faulted in on the pool rather than one 4 KiB page at a time by the loop that
+/// fills it. That is invisible in the result — see [`map_indexed_into`], which
+/// is the loop body this runs.
 pub fn map_indexed<R, F>(len: usize, f: F) -> Vec<R>
 where
     R: Send,
     F: Fn(usize) -> R + Sync + Send,
 {
-    if len < SERIAL_THRESHOLD {
-        return (0..len).map(f).collect();
-    }
-    (0..len)
-        .into_par_iter()
-        .with_min_len(GRAIN)
-        .map(f)
-        .collect()
+    map_indexed_init(len, || (), |(), i| f(i))
+}
+
+/// `dst[i] = f(i)` for every element of `dst`, in parallel — [`map_indexed`]
+/// writing into a destination the **caller owns**.
+///
+/// This is the form that closes the page-fault bill rather than merely making it
+/// cheaper: a caller that runs the same pass in a loop allocates `dst` once, and
+/// pays for its pages once, instead of once per iteration. [`map_indexed`] is
+/// this function plus an allocation, so there is one loop body, not two that can
+/// drift.
+///
+/// Element `i` is written by exactly one task, from `i` alone, so the result is
+/// bit-identical to the sequential `for i in 0..dst.len() { dst[i] = f(i) }` at
+/// any thread count.
+pub fn map_indexed_into<R, F>(dst: &mut [R], f: F)
+where
+    R: Send + Copy,
+    F: Fn(usize) -> R + Sync + Send,
+{
+    map_indexed_init_into(dst, || (), |(), i| f(i));
 }
 
 /// `src.iter().map(f).collect()`, in parallel — the elementwise transform of a
@@ -143,10 +163,37 @@ where
     R: Send,
     F: Fn(&T) -> R + Sync + Send,
 {
-    if src.len() < SERIAL_THRESHOLD {
-        return src.iter().map(f).collect();
-    }
-    src.par_iter().with_min_len(GRAIN).map(f).collect()
+    collect_filled(src.len(), |slots| fill_zip(src, slots, &f))
+}
+
+/// `dst[i] = f(&src[i])` for every element, in parallel — [`map_slice`] writing
+/// into a destination the **caller owns**, so a caller in a loop pays for the
+/// output pages once rather than once per call.
+///
+/// [`map_slice`] is this function plus an allocation: one loop body, not two.
+///
+/// Both slices are walked as contiguous chunks, so the pass keeps the
+/// vectorizable, bounds-check-free inner loop [`map_slice`] documents. Element
+/// `i` is written by exactly one task from `src[i]` alone.
+///
+/// # Panics
+///
+/// If `src.len() != dst.len()`. This is the caller passing the wrong buffer, not
+/// a runtime condition to recover from — the image-level entry points
+/// ([`crate::map_pixels_into`]) turn a size mismatch into a typed error before
+/// it can reach here.
+pub fn map_slice_into<T, R, F>(src: &[T], dst: &mut [R], f: F)
+where
+    T: Sync,
+    R: Send + Copy,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "map_slice_into: source and destination must have the same length"
+    );
+    fill_zip(src, as_uninit_mut(dst), &f);
 }
 
 /// [`map_indexed`] with a per-task scratch value: `init` runs once per worker
@@ -170,15 +217,124 @@ where
     I: Fn() -> S + Sync + Send,
     F: Fn(&mut S, usize) -> R + Sync + Send,
 {
-    if len < SERIAL_THRESHOLD {
+    collect_filled(len, |slots| fill_indexed(slots, init, f))
+}
+
+/// [`map_indexed_init`] writing into a destination the **caller owns** — and the
+/// single loop body every map in this module is built from ([`map_indexed`],
+/// [`map_indexed_into`], [`map_indexed_init`] and, through
+/// [`crate::NeighborhoodIterator::par_map_window_into`], the whole stencil
+/// family).
+///
+/// Element `i` is written by exactly one task, from `i` and per-task scratch
+/// that `f` fully overwrites per element (the [`map_indexed_init`] contract), so
+/// the result is bit-identical to the sequential loop at any thread count.
+pub fn map_indexed_init_into<R, S, I, F>(dst: &mut [R], init: I, f: F)
+where
+    R: Send + Copy,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    fill_indexed(as_uninit_mut(dst), init, f);
+}
+
+// ---------------------------------------------------------------------------
+// The two fill loops every map above is built from, and the allocation that
+// turns a fill into a `Vec`. Each `_into` form and its allocating twin call the
+// SAME loop, so they cannot drift.
+// ---------------------------------------------------------------------------
+
+/// `slots[i] = f(&mut scratch, i)` for every slot — the indexed fill.
+///
+/// Element `i` is written by exactly one task from `i` alone, so the result
+/// equals the sequential loop bit-for-bit at any thread count. Every slot is
+/// written exactly once: `par_chunks_mut` partitions the slice.
+fn fill_indexed<R, S, I, F>(slots: &mut [MaybeUninit<R>], init: I, f: F)
+where
+    R: Send,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    if slots.len() < SERIAL_THRESHOLD {
         let mut scratch = init();
-        return (0..len).map(|i| f(&mut scratch, i)).collect();
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.write(f(&mut scratch, i));
+        }
+        return;
     }
-    (0..len)
-        .into_par_iter()
-        .with_min_len(GRAIN)
-        .map_init(init, |scratch, i| f(scratch, i))
-        .collect()
+    slots
+        .par_chunks_mut(GRAIN)
+        .enumerate()
+        .for_each_init(init, |scratch, (c, chunk)| {
+            let base = c * GRAIN;
+            for (j, slot) in chunk.iter_mut().enumerate() {
+                slot.write(f(scratch, base + j));
+            }
+        });
+}
+
+/// `slots[i] = f(&src[i])` for every slot — the zipped fill, which keeps both
+/// sides contiguous so the inner loop stays vectorizable and bounds-check-free
+/// (see [`map_slice`]).
+fn fill_zip<T, R, F>(src: &[T], slots: &mut [MaybeUninit<R>], f: &F)
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync + Send,
+{
+    debug_assert_eq!(src.len(), slots.len());
+    if src.len() < SERIAL_THRESHOLD {
+        for (slot, x) in slots.iter_mut().zip(src) {
+            slot.write(f(x));
+        }
+        return;
+    }
+    slots
+        .par_chunks_mut(GRAIN)
+        .zip(src.par_chunks(GRAIN))
+        .for_each(|(dst_chunk, src_chunk)| {
+            for (slot, x) in dst_chunk.iter_mut().zip(src_chunk) {
+                slot.write(f(x));
+            }
+        });
+}
+
+/// Allocate `len` slots — advised as huge-page candidates, untouched — let
+/// `fill` write every one of them, and hand back the `Vec`.
+///
+/// The buffer is deliberately **not** prefaulted: `fill` is a parallel pass, so
+/// its own workers fault their own pages concurrently. There is no serial fault
+/// to hoist, and a prefault would only write the buffer twice — measured, and
+/// rejected, in [`crate::alloc::resident_vec`]'s docs.
+fn collect_filled<R, G>(len: usize, fill: G) -> Vec<R>
+where
+    G: FnOnce(&mut [MaybeUninit<R>]),
+{
+    let mut v = crate::alloc::resident_capacity::<R>(len);
+    fill(&mut v.spare_capacity_mut()[..len]);
+    // SAFETY: `resident_capacity(len)` reserved at least `len` slots, and `fill`
+    // — every implementation of which lives in this module — writes each of the
+    // first `len` exactly once. The elements are therefore initialized.
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// View an initialized `&mut [R]` as uninitialized slots, so the `_into` forms
+/// can run the same fill loop the allocating ones do.
+///
+/// `R: Copy` is what makes this sound to *expose*, not just to write: a `Copy`
+/// type has no destructor, so overwriting a live element without dropping it
+/// leaks nothing. (The bound is why `_into` takes `R: Copy` while the allocating
+/// forms do not.)
+fn as_uninit_mut<R: Copy>(dst: &mut [R]) -> &mut [MaybeUninit<R>] {
+    let len = dst.len();
+    // SAFETY: `MaybeUninit<R>` is guaranteed to have the same size, alignment
+    // and ABI as `R`. Every element of `dst` is initialized, and an initialized
+    // value is a valid `MaybeUninit<R>`, so the cast exposes no uninit memory.
+    // The borrow is exclusive and `len` is unchanged.
+    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<R>>(), len) }
 }
 
 /// `f(i, &mut out[i])` for every element of `out`, in parallel — the in-place

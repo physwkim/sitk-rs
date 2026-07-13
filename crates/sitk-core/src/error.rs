@@ -9,6 +9,18 @@ pub enum Error {
     #[error("buffer size mismatch: expected {expected} pixels, got {actual}")]
     BufferSizeMismatch { expected: usize, actual: usize },
 
+    /// A caller-owned destination image does not have the size the operation
+    /// requires (`map_pixels_into` and friends). Deliberately an error and never
+    /// a silent resize: the destination exists to be *reused*, so a call that
+    /// reallocated it would reintroduce exactly the per-call allocation the
+    /// `_into` forms exist to remove — and a wrong size is far more likely a
+    /// wrong buffer than a resize request.
+    #[error("destination size mismatch: expected {expected:?}, got {actual:?}")]
+    DestinationSizeMismatch {
+        expected: Vec<usize>,
+        actual: Vec<usize>,
+    },
+
     /// A geometry vector (spacing/origin/direction) had the wrong length for the
     /// image dimension.
     #[error("geometry vector length does not match image dimension {dimension}")]

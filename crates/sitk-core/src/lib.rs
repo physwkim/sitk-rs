@@ -10,6 +10,7 @@
 //! trait like `std::ops::Add` for it, so that arithmetic has to live here
 //! rather than in `sitk-filters` — see the [`ops`] module docs.
 
+pub mod alloc;
 pub mod boundary;
 pub mod error;
 pub mod fused;
@@ -26,7 +27,7 @@ pub use boundary::{
     PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
 };
 pub use error::{Error, Result};
-pub use fused::map_pixels;
+pub use fused::{map_pixels, map_pixels_into};
 pub use image::{Image, PixelBuffer, ScalarView};
 pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
 pub use neighborhood::{Neighborhood, NeighborhoodIterator, WindowView};
