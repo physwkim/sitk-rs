@@ -407,6 +407,17 @@ const FOLD_CHUNK_ROWS: usize = 1 << 16;
 /// how much of the per-element work sits in `compute`. That is the right trade
 /// exactly when the compute dwarfs the additions — which is the case this exists
 /// for.
+///
+/// The serial half is *overlapped*, not merely small: the rows are staged in
+/// chunks, and while this thread combines chunk `k` the pool is already computing
+/// chunk `k + 1`. So the combine costs nothing on the critical path as long as it
+/// is shorter than one chunk's compute. That is worth doing rather than just
+/// counting on the combine being cheap, because it is the one part of the fold
+/// that gets *more* expensive as cores are added: it reads staged rows that every
+/// core has just dirtied, and pulls each one back across the interconnect.
+/// Measured on a 48-core box, a 262 144-sample × 7-column fold: 1.2 ms of combine
+/// on one thread, 2.6 ms on 48 — 26% of the whole evaluation, against a parallel
+/// half that had shrunk to 7.4 ms.
 pub fn map_rows_fold_in_order<S, I, C, F>(
     n: usize,
     width: usize,
@@ -435,29 +446,83 @@ pub fn map_rows_fold_in_order<S, I, C, F>(
     }
 
     let chunk_rows = FOLD_CHUNK_ROWS.min(n);
-    let mut rows = vec![0.0f64; chunk_rows * width];
-    let mut valid = vec![false; chunk_rows];
+    let mut cur = Stage::new(chunk_rows, width);
+    let mut ahead = Stage::new(chunk_rows, width);
 
     let mut start = 0usize;
-    while start < n {
-        let count = chunk_rows.min(n - start);
+    let mut count = chunk_rows.min(n);
+    cur.fill(width, start, count, &init, &compute);
 
-        // Parallel: every row is written by exactly one task, from its own index.
-        rows[..count * width]
+    while start < n {
+        let ahead_start = start + count;
+        let ahead_count = chunk_rows.min(n - ahead_start); // 0 on the last chunk
+
+        // The pool computes the NEXT chunk while this thread combines the
+        // CURRENT one. Two costs vanish at once, and neither is a tuning
+        // constant:
+        //
+        // - the pool no longer parks for the length of the combine and pay a
+        //   fresh ramp afterwards, once per chunk;
+        // - the combine is no longer *added* to the critical path, it is hidden
+        //   behind the compute. That matters because the combine gets more
+        //   expensive as cores are added — it reads rows that every core just
+        //   dirtied — so on the old shape it grew exactly as the parallel half
+        //   shrank.
+        //
+        // `combine` still runs here, on this thread, for `i` ascending: this is
+        // `in_place_scope` precisely so the scope body stays on the caller and
+        // `combine` needs no `Send`. It cannot reach a worker thread, so the
+        // non-deterministic reduction stays unwritable, and the addition
+        // sequence is the one the serial loop performs.
+        rayon::in_place_scope(|s| {
+            if ahead_count > 0 {
+                let (ahead, init, compute) = (&mut ahead, &init, &compute);
+                s.spawn(move |_| ahead.fill(width, ahead_start, ahead_count, init, compute));
+            }
+            for r in 0..count {
+                if cur.valid[r] {
+                    combine(start + r, &cur.rows[r * width..(r + 1) * width]);
+                }
+            }
+        });
+
+        std::mem::swap(&mut cur, &mut ahead);
+        start = ahead_start;
+        count = ahead_count;
+    }
+}
+
+/// One chunk of staged rows: `count × width` contributions plus the flag
+/// `compute` set for each row. Two of these alternate, so the pool can be filling
+/// one while the caller's thread combines the other.
+struct Stage {
+    rows: Vec<f64>,
+    valid: Vec<bool>,
+}
+
+impl Stage {
+    fn new(chunk_rows: usize, width: usize) -> Self {
+        Self {
+            rows: vec![0.0; chunk_rows * width],
+            valid: vec![false; chunk_rows],
+        }
+    }
+
+    /// Compute rows `start .. start + count` in parallel. Every row is written by
+    /// exactly one task, from its own index, so this cannot depend on the split.
+    fn fill<S, I, C>(&mut self, width: usize, start: usize, count: usize, init: &I, compute: &C)
+    where
+        S: Send,
+        I: Fn() -> S + Sync + Send,
+        C: Fn(&mut S, usize, &mut [f64]) -> bool + Sync + Send,
+    {
+        self.rows[..count * width]
             .par_chunks_mut(width)
-            .zip(valid[..count].par_iter_mut())
+            .zip(self.valid[..count].par_iter_mut())
             .enumerate()
-            .for_each_init(&init, |scratch, (r, (row, ok))| {
+            .for_each_init(init, |scratch, (r, (row, ok))| {
                 *ok = compute(scratch, start + r, row);
             });
-
-        // Sequential, in index order — the original loop's fold, untouched.
-        for r in 0..count {
-            if valid[r] {
-                combine(start + r, &rows[r * width..(r + 1) * width]);
-            }
-        }
-        start += count;
     }
 }
 
