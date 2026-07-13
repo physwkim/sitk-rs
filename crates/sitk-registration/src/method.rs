@@ -1964,7 +1964,7 @@ impl ImageRegistrationMethod {
         self.check_dimensions(fixed, moving)?;
 
         let dim = fixed.dimension();
-        let schedule = self.level_schedule(fixed)?;
+        let schedule = self.level_schedule(dim)?;
 
         if let Some(mask) = &self.fixed_mask
             && mask.size() != fixed.size()
@@ -1989,7 +1989,7 @@ impl ImageRegistrationMethod {
         let mut diagnostics = None;
         for (level, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             adapt(level, level_factors, &mut transform)?;
-            let sigma = self.physical_sigma(fixed, *level_sigma);
+            let sigma = self.physical_sigma(fixed.spacing(), *level_sigma);
             let (fixed_level, moving_level, fixed_mask_level) =
                 self.prepare_level(fixed, moving, &sigma, level_factors, dim)?;
             let r = self.run_single_level(
@@ -2060,7 +2060,7 @@ impl ImageRegistrationMethod {
         // null adaptor; this port rejects both so the caller's per-level intent
         // is unambiguous (ledger §2.146). An empty list runs no adaptation.
         if !scale_factors.is_empty() {
-            let num_levels = self.level_schedule(fixed)?.len();
+            let num_levels = self.level_schedule(fixed.dimension())?.len();
             if scale_factors.len() != num_levels {
                 return Err(RegistrationError::BSplineScaleFactorLength {
                     got: scale_factors.len(),
@@ -2214,8 +2214,7 @@ impl ImageRegistrationMethod {
     /// The per-level `(shrink_factors, sigma)` schedule, coarsest first. With no
     /// schedule configured this is one full-resolution level (factor 1, sigma 0).
     /// Errors if the shrink and smoothing schedules differ in length.
-    fn level_schedule(&self, fixed: &Image) -> Result<Vec<(Vec<usize>, f64)>> {
-        let dim = fixed.dimension();
+    fn level_schedule(&self, dim: usize) -> Result<Vec<(Vec<usize>, f64)>> {
         if self.shrink_factors_per_level.is_empty() && self.smoothing_sigmas_per_level.is_empty() {
             return Ok(vec![(vec![1; dim], 0.0)]);
         }
@@ -2236,11 +2235,15 @@ impl ImageRegistrationMethod {
     /// Per-dimension physical smoothing sigma for a scalar level sigma. When the
     /// schedule is given in voxel units, scale by the fixed image's spacing
     /// (matching ITK, whose smoother always works in physical units).
-    fn physical_sigma(&self, fixed: &Image, sigma: f64) -> Vec<f64> {
+    ///
+    /// Takes the fixed image's `spacing` rather than the image, so the device path
+    /// — which holds a geometry, not an `Image` — computes the same sigma through
+    /// the same function instead of a parallel one that could drift from it.
+    fn physical_sigma(&self, spacing: &[f64], sigma: f64) -> Vec<f64> {
         if self.smoothing_sigmas_in_physical_units {
-            vec![sigma; fixed.dimension()]
+            vec![sigma; spacing.len()]
         } else {
-            fixed.spacing().iter().map(|&sp| sigma * sp).collect()
+            spacing.iter().map(|&sp| sigma * sp).collect()
         }
     }
 
@@ -2421,12 +2424,26 @@ impl ImageRegistrationMethod {
     ///   similarity, affine) — the moment identity the kernel evaluates holds for
     ///   exactly those, and a B-spline or displacement field is refused by name;
     /// - **linear** interpolation, no masks, no sampling strategy (every voxel of
-    ///   the fixed grid), and a **single resolution level** — a device pyramid needs
-    ///   a device shrink, which does not exist yet;
+    ///   the fixed grid);
+    /// - a **multi-resolution pyramid**: each level is built on the device by the
+    ///   same three ops in the same order [`prepare_level`](Self::prepare_level)
+    ///   uses — `recursive_gaussian`, `shrink` for the coarse grid, `resample_linear`
+    ///   onto it — and each of the three is bit-identical to the CPU filter it
+    ///   transcribes (`pyramid_parity.rs`);
     /// - no virtual domain and no fixed-initial transform: the fixed image's own
     ///   grid is the sampling grid. A moving-initial transform *is* supported (it
     ///   composes with the optimized transform and the composition is probed for
     ///   affineness like any other).
+    ///
+    /// # The images this reproduces are the ones you uploaded
+    ///
+    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so the device pyramid
+    /// smooths in `f64` and stores `f32`. `sitk_filters::recursive_gaussian` narrows
+    /// back to its *input's* pixel type, so `execute` on a `UInt16` CT re-quantizes
+    /// every level to `UInt16` and this path does not. What this path reproduces,
+    /// bit for bit, is `execute` run on the **`Float32` casts** of the two volumes —
+    /// which is exactly what [`upload`](sitk_cuda::DeviceImage::upload) put on the
+    /// device.
     ///
     /// If a device failure occurs *during* the run, the run is discarded and the
     /// error returned — see [`DeviceActive`].
@@ -2494,46 +2511,137 @@ impl ImageRegistrationMethod {
         if self.fixed_mask.is_some() || self.moving_mask.is_some() {
             return Err(DeviceRegistrationError::UnsupportedMask);
         }
-        if self.shrink_factors_per_level.iter().any(|&f| f != 1)
-            || self.smoothing_sigmas_per_level.iter().any(|&s| s != 0.0)
-            || self.shrink_factors_per_level.len() > 1
-            || self.smoothing_sigmas_per_level.len() > 1
-        {
-            return Err(DeviceRegistrationError::UnsupportedPyramid);
-        }
         if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
             return Err(DeviceRegistrationError::UnsupportedVirtualDomain);
         }
 
-        let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
-            DeviceMeanSquaresMetric::from_device(fixed, moving)?,
-        )));
+        let geom = fixed.geometry();
+        let schedule = self.level_schedule(geom.dimension())?;
 
-        // The boundary probe: one evaluation at the initial transform, composed
-        // exactly as the optimizer will compose it. This is what turns "the device
-        // cannot take this transform" from a mid-run surprise into a named refusal
-        // the caller can act on.
-        let mut probe = initial;
-        {
-            let composed = Composed {
-                optimized: &mut probe,
-                moving_initial: self.moving_initial_transform.as_ref(),
-            };
-            if let ActiveMetric::Device(d) = &metric {
-                d.metric_evaluate_probe(&composed)?;
+        let mut transform = initial;
+        let mut diagnostics = None;
+        for (level_factors, level_sigma) in &schedule {
+            let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
+            let (fl, ml) = Self::prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
+            let fixed_level = fl.as_ref().unwrap_or(fixed);
+            let moving_level = ml.as_ref().unwrap_or(moving);
+
+            let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
+                DeviceMeanSquaresMetric::from_device(fixed_level, moving_level)?,
+            )));
+
+            // The boundary probe: one evaluation at this level's starting transform,
+            // composed exactly as the optimizer will compose it. This is what turns
+            // "the device cannot take this transform" from a mid-run surprise into a
+            // named refusal the caller can act on.
+            {
+                let composed = Composed {
+                    optimized: &mut transform,
+                    moving_initial: self.moving_initial_transform.as_ref(),
+                };
+                if let ActiveMetric::Device(d) = &metric {
+                    d.metric_evaluate_probe(&composed)?;
+                }
             }
+
+            let r = self.drive(&metric, transform)?;
+
+            // A device failure during the run invalidates the run, not just the
+            // iteration it happened in.
+            if let ActiveMetric::Device(d) = &metric
+                && let Some(e) = d.take_failure()
+            {
+                return Err(e.into());
+            }
+
+            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
+            transform = r.transform;
         }
 
-        let result = self.drive(&metric, probe)?;
+        let (metric_value, iterations, stop_reason, valid_points) =
+            diagnostics.expect("level schedule always has at least one level");
+        Ok(RegistrationResult {
+            transform,
+            metric_value,
+            iterations,
+            stop_reason,
+            valid_points,
+        })
+    }
 
-        // A device failure during the run invalidates the run, not just the
-        // iteration it happened in.
-        if let ActiveMetric::Device(d) = &metric
-            && let Some(e) = d.take_failure()
-        {
-            return Err(e.into());
+    /// One resolution level's `(fixed, moving)` pair, built **on the device** — the
+    /// device twin of [`prepare_level`](Self::prepare_level), following it step for
+    /// step so the two land on the same images.
+    ///
+    /// The steps, and why each is the one it is:
+    ///
+    /// - both volumes are smoothed at full resolution with the **recursive (IIR)**
+    ///   Gaussian — not the FIR `smooth_gaussian` this crate also has on the device;
+    ///   `prepare_level` calls the recursive one, and a level smoothed by a different
+    ///   filter is a different level;
+    /// - the moving volume is *only* smoothed (the metric interpolates it through the
+    ///   transform, so it is never shrunk);
+    /// - the coarse grid comes from **shrinking** the smoothed fixed volume, and the
+    ///   fixed level's *values* come from **resampling** the smoothed fixed volume
+    ///   onto that grid. Not from the shrink's values: the shrink samples at the
+    ///   center shift *rounded to an integer* while the grid's origin carries the
+    ///   unrounded shift, so reusing them would bias the fixed image by up to half a
+    ///   voxel against the grid the metric samples on;
+    /// - a level that neither smooths nor shrinks copies nothing and resamples
+    ///   nothing — the same `native_grid` short-circuit `prepare_level` takes, and
+    ///   for the same reason (at factor 1 the resample is provably the identity).
+    ///
+    /// There is no mask branch and no virtual-domain branch because
+    /// [`execute_on_device`](Self::execute_on_device) refuses both at the boundary.
+    ///
+    /// `None` means *the uploaded volume already is this level* — the level neither
+    /// smooths nor shrinks — so the caller registers against the volume it was
+    /// handed rather than a copy of it. `prepare_level` says the same thing with a
+    /// `Cow::Borrowed`; a [`DeviceImage`](sitk_cuda::DeviceImage) is not `Clone`
+    /// (cloning one is a device allocation and a device-to-device copy, not a cheap
+    /// mistake to make by accident), so it says it with an `Option` instead.
+    #[cfg(feature = "cuda")]
+    fn prepare_level_on_device(
+        fixed: &sitk_cuda::DeviceImage,
+        moving: &sitk_cuda::DeviceImage,
+        sigma: &[f64],
+        factors: &[usize],
+    ) -> std::result::Result<
+        (
+            Option<sitk_cuda::DeviceImage>,
+            Option<sitk_cuda::DeviceImage>,
+        ),
+        DeviceRegistrationError,
+    > {
+        use sitk_cuda::DeviceImage;
+
+        let no_smoothing = sigma.iter().all(|&s| s == 0.0);
+        let smooth = |img: &DeviceImage| -> std::result::Result<
+            Option<DeviceImage>,
+            DeviceRegistrationError,
+        > {
+            if no_smoothing {
+                return Ok(None);
+            }
+            Ok(Some(
+                sitk_cuda::recursive_gaussian(img, sigma)
+                    .map_err(DeviceRegistrationError::Pyramid)?,
+            ))
+        };
+
+        let smoothed_fixed = smooth(fixed)?;
+        let moving_level = smooth(moving)?;
+
+        if factors.iter().all(|&f| f == 1) {
+            return Ok((smoothed_fixed, moving_level));
         }
-        Ok(result)
+
+        let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
+        let coarse = sitk_cuda::shrink(sf, factors).map_err(DeviceRegistrationError::Pyramid)?;
+        let fixed_level = sitk_cuda::resample_linear(sf, coarse.geometry(), 0.0)
+            .map_err(DeviceRegistrationError::Pyramid)?;
+
+        Ok((Some(fixed_level), moving_level))
     }
 
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair

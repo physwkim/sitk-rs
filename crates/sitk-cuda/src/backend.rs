@@ -4,13 +4,24 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
 
 use crate::error::CudaError;
 
 /// Device 0. Multi-GPU is a later wave; every path in this crate names the
 /// device through this constant so the widening is one edit.
 const DEVICE_ORDINAL: usize = 0;
+
+/// How a kernel source is allowed to round: with NVRTC's default multiply-add
+/// contraction, or without it. Part of the module cache key — see
+/// [`Backend::function_exact`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Arith {
+    /// NVRTC's default: `a*b + c` may become one FMA, rounding once.
+    Fused,
+    /// `--fmad=false`: every multiply and every add rounds, as on the host.
+    Exact,
+}
 
 /// A CUDA device, its context, its stream, and its compiled-module cache.
 ///
@@ -71,8 +82,35 @@ impl Backend {
     /// Load `name` from `src`, compiling `src` with NVRTC on first use and
     /// serving the cached module afterwards.
     pub fn function(&self, src: &str, name: &str) -> Result<CudaFunction, CudaError> {
+        self.compile(src, name, Arith::Fused)
+    }
+
+    /// [`function`](Self::function), but compiled with **no
+    /// multiply-add contraction** (`--fmad=false`).
+    ///
+    /// By default NVRTC fuses `a*b + c` into a single FMA, which rounds *once*
+    /// where the host rounds twice. That is more accurate and entirely fine for a
+    /// kernel whose contract is a tolerance — the metric's is ~1e-12 — but it makes
+    /// bit-identity to a host expression impossible.
+    ///
+    /// The pyramid ops need bit-identity, not accuracy: their job is to land a
+    /// level's fixed image where `execute` lands it. With contraction off, a
+    /// `double` expression on the device performs the same multiplies and the same
+    /// adds, in the same order, with the same rounding as the Rust it was
+    /// transcribed from — so `sitk_filters::recursive_gaussian` and its kernel
+    /// agree to the last bit rather than to a tolerance that would then have to be
+    /// argued about level by level.
+    pub fn function_exact(&self, src: &str, name: &str) -> Result<CudaFunction, CudaError> {
+        self.compile(src, name, Arith::Exact)
+    }
+
+    fn compile(&self, src: &str, name: &str, arith: Arith) -> Result<CudaFunction, CudaError> {
         let mut hasher = DefaultHasher::new();
         src.hash(&mut hasher);
+        // Part of the key: the same source compiled both ways is two different
+        // modules, and serving one for the other would silently undo the contract
+        // `function_exact` exists to provide.
+        arith.hash(&mut hasher);
         let key = hasher.finish();
 
         // Two threads racing on the same uncached source both compile; the
@@ -87,7 +125,16 @@ impl Backend {
         {
             return Ok(module.load_function(name)?);
         }
-        let ptx = compile_ptx(src)?;
+        let ptx = match arith {
+            Arith::Fused => compile_ptx(src)?,
+            Arith::Exact => compile_ptx_with_opts(
+                src,
+                CompileOptions {
+                    fmad: Some(false),
+                    ..Default::default()
+                },
+            )?,
+        };
         let module = self.ctx.load_module(ptx)?;
         self.modules
             .lock()

@@ -152,6 +152,160 @@ fn every_scalar_type_casts_on_the_device_exactly_as_the_host_filter_casts() {
     );
 }
 
+/// What `upload` must do with a pixel type. Exactly two outcomes — there is no
+/// third, and in particular no "converts it on the host for you".
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Expect {
+    /// A device cast exists, and it is bit-identical to `sitk_filters::cast`.
+    Casts,
+    /// No device path: `upload` fails with the pixel type in the error.
+    RefusedByName,
+}
+
+/// The **exhaustive** verdict. A `PixelId` variant added upstream stops this
+/// match — and therefore this test — from compiling, which is the point: someone
+/// has to decide which of the two outcomes it gets, in this file, on purpose.
+fn expect(id: PixelId) -> Expect {
+    match id {
+        PixelId::UInt8
+        | PixelId::Int8
+        | PixelId::UInt16
+        | PixelId::Int16
+        | PixelId::UInt32
+        | PixelId::Int32
+        | PixelId::UInt64
+        | PixelId::Int64
+        | PixelId::Float32
+        | PixelId::Float64 => Expect::Casts,
+
+        // A `DeviceImage` is one `f32` per voxel; a complex or multi-component
+        // pixel does not fit in it, and no device op consumes one.
+        PixelId::ComplexFloat32
+        | PixelId::ComplexFloat64
+        | PixelId::VectorUInt8
+        | PixelId::VectorInt8
+        | PixelId::VectorUInt16
+        | PixelId::VectorInt16
+        | PixelId::VectorUInt32
+        | PixelId::VectorInt32
+        | PixelId::VectorUInt64
+        | PixelId::VectorInt64
+        | PixelId::VectorFloat32
+        | PixelId::VectorFloat64 => Expect::RefusedByName,
+    }
+}
+
+/// Every `PixelId`, in discriminant order. Kept beside [`expect`] so the compile
+/// error a new variant produces there lands next to the list it also belongs in;
+/// `every_pixel_id_is_either_uploadable_or_refused_by_name` checks the alignment.
+const ALL: [PixelId; 22] = [
+    PixelId::UInt8,
+    PixelId::Int8,
+    PixelId::UInt16,
+    PixelId::Int16,
+    PixelId::UInt32,
+    PixelId::Int32,
+    PixelId::UInt64,
+    PixelId::Int64,
+    PixelId::Float32,
+    PixelId::Float64,
+    PixelId::ComplexFloat32,
+    PixelId::ComplexFloat64,
+    PixelId::VectorUInt8,
+    PixelId::VectorInt8,
+    PixelId::VectorUInt16,
+    PixelId::VectorInt16,
+    PixelId::VectorUInt32,
+    PixelId::VectorInt32,
+    PixelId::VectorUInt64,
+    PixelId::VectorInt64,
+    PixelId::VectorFloat32,
+    PixelId::VectorFloat64,
+];
+
+/// One 4×4×4 image of pixel type `id`, values chosen only to be distinguishable.
+fn sample(id: PixelId) -> Image {
+    const N: usize = 64;
+    let size = [4usize, 4, 4];
+    let ramp = |i: usize| i as f64 - 7.0;
+    match id {
+        PixelId::UInt8 => Image::from_vec(&size, (0..N).map(|i| i as u8).collect()),
+        PixelId::Int8 => Image::from_vec(&size, (0..N).map(|i| ramp(i) as i8).collect()),
+        PixelId::UInt16 => Image::from_vec(&size, (0..N).map(|i| (i * 601) as u16).collect()),
+        PixelId::Int16 => Image::from_vec(&size, (0..N).map(|i| (ramp(i) * 91.0) as i16).collect()),
+        PixelId::UInt32 => Image::from_vec(&size, (0..N).map(|i| (i as u32) << 20).collect()),
+        PixelId::Int32 => Image::from_vec(&size, (0..N).map(|i| (ramp(i) as i32) << 20).collect()),
+        PixelId::UInt64 => Image::from_vec(&size, (0..N).map(|i| (i as u64) << 50).collect()),
+        PixelId::Int64 => Image::from_vec(&size, (0..N).map(|i| (ramp(i) as i64) << 50).collect()),
+        PixelId::Float32 => Image::from_vec(&size, (0..N).map(|i| ramp(i) as f32 / 3.0).collect()),
+        PixelId::Float64 => Image::from_vec(&size, (0..N).map(|i| ramp(i) / 3.0).collect()),
+
+        PixelId::ComplexFloat32 => Image::from_vec_complex(
+            &size,
+            (0..N)
+                .map(|i| sitk_core::Complex::new(i as f32, -(i as f32)))
+                .collect(),
+        ),
+        PixelId::ComplexFloat64 => Image::from_vec_complex(
+            &size,
+            (0..N)
+                .map(|i| sitk_core::Complex::new(i as f64, -(i as f64)))
+                .collect(),
+        ),
+        PixelId::VectorUInt8 => Image::from_vec_vector(&size, 2, vec![1u8; 2 * N]),
+        PixelId::VectorInt8 => Image::from_vec_vector(&size, 2, vec![1i8; 2 * N]),
+        PixelId::VectorUInt16 => Image::from_vec_vector(&size, 2, vec![1u16; 2 * N]),
+        PixelId::VectorInt16 => Image::from_vec_vector(&size, 2, vec![1i16; 2 * N]),
+        PixelId::VectorUInt32 => Image::from_vec_vector(&size, 2, vec![1u32; 2 * N]),
+        PixelId::VectorInt32 => Image::from_vec_vector(&size, 2, vec![1i32; 2 * N]),
+        PixelId::VectorUInt64 => Image::from_vec_vector(&size, 2, vec![1u64; 2 * N]),
+        PixelId::VectorInt64 => Image::from_vec_vector(&size, 2, vec![1i64; 2 * N]),
+        PixelId::VectorFloat32 => Image::from_vec_vector(&size, 2, vec![1.0f32; 2 * N]),
+        PixelId::VectorFloat64 => Image::from_vec_vector(&size, 2, vec![1.0f64; 2 * N]),
+    }
+    .unwrap_or_else(|e| panic!("{id:?}: could not build a sample image: {e}"))
+}
+
+/// The closure property, over the whole type list: for **every** `PixelId` a user
+/// can hold in an `Image`, `upload` either produces the host cast exactly or names
+/// the type it will not take. Nothing is silently converted, and nothing is
+/// silently refused.
+///
+/// The refused half needs no GPU (the refusal precedes the driver); the cast half
+/// is skipped when there is no device.
+#[test]
+fn every_pixel_id_is_either_uploadable_or_refused_by_name() {
+    for (i, &id) in ALL.iter().enumerate() {
+        assert_eq!(id as i8 as usize, i, "{id:?} is out of discriminant order");
+    }
+
+    let have_device = !no_device();
+    if !have_device {
+        println!("no CUDA device: the cast half is skipped, the refusal half still runs");
+    }
+
+    for &id in &ALL {
+        let img = sample(id);
+        assert_eq!(img.pixel_id(), id, "sample({id:?}) built the wrong type");
+
+        match expect(id) {
+            Expect::Casts => {
+                if have_device {
+                    assert_device_cast_matches_host(&img, id.as_str());
+                }
+            }
+            Expect::RefusedByName => match DeviceImage::upload(&img) {
+                Err(CudaError::UnsupportedPixelType(named)) => {
+                    assert_eq!(named, id, "refused, but named the wrong type");
+                    println!("{}: refused by name", id.as_str());
+                }
+                Err(e) => panic!("{id:?}: refused, but not by name: {e}"),
+                Ok(_) => panic!("{id:?}: uploaded; a type with no device path got through"),
+            },
+        }
+    }
+}
+
 /// Needs no GPU: the refusal precedes the driver, as it always did.
 #[test]
 fn a_pixel_type_with_no_device_path_is_still_refused_by_name() {
