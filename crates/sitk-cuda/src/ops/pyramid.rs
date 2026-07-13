@@ -37,17 +37,20 @@
 //! the images, which is precisely what
 //! [`DeviceImage::upload`](crate::DeviceImage::upload) put on the device.
 //!
-//! # The coefficient duplication
+//! # The coefficients
 //!
-//! [`Coefficients`] is a second copy of the Deriche/Farnebäck coefficient math
-//! that `sitk-filters` computes privately. It is duplicated, not shared, because
-//! `sitk-filters` depends on *this* crate — the dependency cannot be reversed, and
-//! the shared home would be `sitk-core`. The duplicate is not trusted on
-//! inspection: `the_device_recursive_gaussian_is_bit_identical_to_the_host_filter`
-//! pins it against the real filter's output, so a drift in either copy is a test
-//! failure and not a silent numerical difference.
+//! The Deriche/Farnebäck coefficient math is [`sitk_core::deriche`] — the one
+//! implementation, shared with `sitk-filters`' host recursion rather than copied.
+//! `sitk-filters` depends on *this* crate, so the edge cannot run the other way;
+//! `sitk-core` is below both. `to_array()` hands the kernel the flat `[f64; 20]`
+//! it names `N0 = c[0] … BM4 = c[19]` — that array is the seam a Rust struct
+//! cannot cross. `the_device_recursive_gaussian_is_bit_identical_to_the_host_filter`
+//! still pins the device output against the real filter, so the two paths cannot
+//! drift apart silently.
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+use sitk_core::deriche::{Coefficients, GaussianOrder};
 
 use crate::backend::{Backend, backend};
 use crate::buffer::DeviceBuffer;
@@ -198,88 +201,6 @@ extern "C" __global__ void narrow_f64_f32(
 }
 "#;
 
-/// The Deriche/Farnebäck `ZeroOrder` (smoothing) coefficients of the fourth-order
-/// recursion, for one index-space sigma.
-///
-/// Only `ZeroOrder` is ported: the pyramid smooths, it does not differentiate. A
-/// device op that needs a derivative adds the other two Farnebäck columns; it does
-/// not get them for free from this type. See the [module docs](self) on why this
-/// is a duplicate of `sitk-filters`' private copy and how the duplicate is pinned.
-#[derive(Clone, Copy, Debug)]
-struct Coefficients([f64; 20]);
-
-impl Coefficients {
-    fn new(sigmad: f64) -> Self {
-        const W1: f64 = 0.6681;
-        const L1: f64 = -1.3932;
-        const W2: f64 = 2.0787;
-        const L2: f64 = -1.3732;
-        // The ZeroOrder column of Farnebäck & Westin 2006, Table 3.
-        const A1: f64 = 1.3530;
-        const B1: f64 = 1.8151;
-        const A2: f64 = -0.3531;
-        const B2: f64 = 0.0902;
-
-        let cos1 = (W1 / sigmad).cos();
-        let cos2 = (W2 / sigmad).cos();
-        let sin1 = (W1 / sigmad).sin();
-        let sin2 = (W2 / sigmad).sin();
-        let exp1 = (L1 / sigmad).exp();
-        let exp2 = (L2 / sigmad).exp();
-
-        // ComputeDCoefficients.
-        let d4 = exp1 * exp1 * exp2 * exp2;
-        let d3 = -2.0 * cos1 * exp1 * exp2 * exp2 - 2.0 * cos2 * exp2 * exp1 * exp1;
-        let d2 = 4.0 * cos2 * cos1 * exp1 * exp2 + exp1 * exp1 + exp2 * exp2;
-        let d1 = -2.0 * (exp2 * cos2 + exp1 * cos1);
-        let sd = 1.0 + d1 + d2 + d3 + d4;
-
-        // ComputeNCoefficients.
-        let n0 = A1 + A2;
-        let n1 = exp2 * (B2 * sin2 - (A2 + 2.0 * A1) * cos2)
-            + exp1 * (B1 * sin1 - (A1 + 2.0 * A2) * cos1);
-        let n2 =
-            ((A1 + A2) * cos2 * cos1 - B1 * cos2 * sin1 - B2 * cos1 * sin2) * 2.0 * exp1 * exp2
-                + A2 * exp1 * exp1
-                + A1 * exp2 * exp2;
-        let n3 = exp2 * exp1 * exp1 * (B2 * sin2 - A2 * cos2)
-            + exp1 * exp2 * exp2 * (B1 * sin1 - A1 * cos1);
-        let sn = n0 + n1 + n2 + n3;
-
-        // ZeroOrder normalization: unity DC gain.
-        let alpha0 = 2.0 * sn / sd - n0;
-        let (n0, n1, n2, n3) = (n0 / alpha0, n1 / alpha0, n2 / alpha0, n3 / alpha0);
-
-        // ComputeRemainingCoefficients(symmetric = true).
-        let (m1, m2, m3, m4) = (n1 - d1 * n0, n2 - d2 * n0, n3 - d3 * n0, -d4 * n0);
-        let sn = n0 + n1 + n2 + n3;
-        let sm = m1 + m2 + m3 + m4;
-
-        Self([
-            n0,
-            n1,
-            n2,
-            n3,
-            d1,
-            d2,
-            d3,
-            d4,
-            m1,
-            m2,
-            m3,
-            m4,
-            d1 * sn / sd,
-            d2 * sn / sd,
-            d3 * sn / sd,
-            d4 * sn / sd,
-            d1 * sm / sd,
-            d2 * sm / sd,
-            d3 * sm / sd,
-            d4 * sm / sd,
-        ])
-    }
-}
-
 /// Gaussian-smooth a resident volume with the recursive (IIR) filter — the device
 /// form of [`sitk_filters::recursive_gaussian`], bit for bit.
 ///
@@ -328,8 +249,16 @@ pub fn recursive_gaussian(src: &DeviceImage, sigma: &[f64]) -> Result<DeviceImag
                 size[d]
             )));
         }
-        let c = Coefficients::new(sigma[d] / geom.spacing[d]);
-        let coeff = DeviceBuffer::from_host(backend, &c.0)?;
+        // `ZeroOrder` ignores the physical `sigma` and `normalize_across_scale`
+        // (ITK never rescales the zero order), so those two arguments are inert
+        // here; the kernel names the flat array `N0 = c[0] … BM4 = c[19]`.
+        let c = Coefficients::new(
+            GaussianOrder::ZeroOrder,
+            sigma[d] / geom.spacing[d],
+            sigma[d],
+            false,
+        );
+        let coeff = DeviceBuffer::from_host(backend, &c.to_array())?;
 
         let ln = size[d] as i64;
         let stride = st[d];
