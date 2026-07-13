@@ -118,10 +118,20 @@ really does win, by **16×** over the port's CPU and **37×** over ITK — and i
 output is **bit-exact** against the CPU reference (`max_abs_err = 0.0`), not
 merely inside a tolerance. Both facts live in the same row.
 
-End to end, `load → cast → rescale → smooth → register` at 256³ is
-**17,880 ms on 96 CPU threads against 240.5 ms device-resident, 74×**. A real
-`ImageRegistrationMethod::execute()` at 256³ is **16.2–17.7 s host against
-148.6–151.0 ms on the device — 107–119×**. The device Gaussian is
+A real `ImageRegistrationMethod::execute()` — not an evaluate loop, both paths free
+to pick their own iteration count, and every run agreeing on iterations, valid
+points, stop reason, and parameters to 3e-14:
+
+| | host | device | speedup |
+|---|---|---|---|
+| single level, 256³ | 18.5–23.2 s | 209–210 ms | **88–111×** |
+| pyramid `[4,2,1]`, 256³ | 25.8–28.2 s | 291–297 ms | **87–97×** |
+| pyramid `[4,2,1]`, 128³ | 2.7 s | 42 ms | **63×** |
+
+**The pyramid is not what costs you — the volume is.** The device pays 83 ms to
+build the extra levels; the ratio barely moves. But at 128³ the GPU's fixed costs
+stop being amortized, so a reader running a small registration should expect ~60×,
+not ~100×. The device Gaussian is
 *bit-identical* to the CPU filter (`f64` weights and intermediates,
 `__dmul_rn`/`__dadd_rn` to forbid FMA contraction — an FMA would be *more*
 accurate and therefore *different*).
@@ -138,16 +148,18 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
 
 **The caveats, stated plainly:**
 
-- **The 74× and 107–119× numbers above are single-level, and they predate a
-  metric-kernel fix.** The kernel's continuous index was being formed with FMA
-  contraction and with the transform offset seeded into the accumulator, where
-  the host adds it last; a 1-ULP difference flips `floor()` for a sample sitting
-  exactly on a voxel plane, and the trilinear gradient is discontinuous there, so
-  the kernel took the *opposite one-sided derivative* — `d/d(angle_y)` off by
-  **34%** while the *value* agreed to 1e-15, which is why every value-only check
-  passed it. Fixed at source (`__dmul_rn`/`__dadd_rn`/`__dsub_rn` in the host's
-  exact order, 3.2e-14 after). The timings have **not** been re-taken on the
-  fixed kernel; a pyramid run has not been timed at all.
+- **Those numbers are 22% worse than the ones this file used to publish, and the
+  22% is a bug fix.** The kernel's continuous index was being formed with FMA
+  contraction and with the transform offset seeded into the accumulator, where the
+  host adds it last; a 1-ULP difference flips `floor()` for a sample sitting exactly
+  on a voxel plane, and the trilinear gradient is discontinuous there, so the kernel
+  took the *opposite one-sided derivative* — `d/d(angle_y)` off by **34%** while the
+  *value* agreed to 1e-15, which is why every value-only check passed it. Fixed at
+  source (`__dmul_rn`/`__dadd_rn`/`__dsub_rn` in the host's exact order, 3.2e-14
+  after), and the per-iteration cost rose from 6.9 ms to 8.4 ms. The old 107–119×
+  was the number for a derivative that was wrong.
+- `RegistrationResult` reports only the **last** pyramid level's iteration count and
+  stop reason; the coarse levels' are not observable through the public API.
 - The device metric is mean-squares, full grid, linear interpolation. No device
   Mattes/correlation/ANTS, no masks, no sampling strategies.
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.

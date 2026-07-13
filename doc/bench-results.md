@@ -110,32 +110,50 @@ crossed *once*, not once per filter. Measured at 256³, `UInt16` input, 20 itera
 | 20 iterations | 15469.3 | 138.0 |
 | **total** | **17,880 ms** | **240.5 ms** — **74×** |
 
-A real `ImageRegistrationMethod::execute()` at 256³ — not an evaluate loop —
-is **16.2–17.7 s on the host against 148.6–151.0 ms on the device, 107–119×**.
+> **The `registration setup` and `20 iterations` rows predate a metric-kernel fix**
+> and have not been re-taken. The kernel was forming the continuous index with FMA
+> contraction and with the transform offset seeded into the accumulator (the host
+> adds it last). A 1-ULP index difference flips `floor()` for a sample lying exactly
+> on a voxel plane, where the trilinear gradient is discontinuous — so the kernel
+> took the *opposite one-sided derivative*: `d/d(angle_y)` off by 34% while the
+> value agreed to 1e-15, which is why every value-only check passed it. Fixed at
+> source; 3.2e-14 after. The blast radius is that one kernel, `mean_squares.cu`:
+> `cast`, `rescale`, and `smooth` are untouched code, as is every row of §1 and §3.
+> **The fix costs 22% per iteration** (§2.1) — that is the price of a derivative
+> that is not 34% wrong.
 
-> **Both of those numbers are single-level, and both predate a metric-kernel fix.**
-> The device kernel was forming the continuous index with FMA contraction and with
-> the transform offset seeded into the accumulator (the host adds it last). A 1-ULP
-> index difference flips `floor()` for a sample lying exactly on a voxel plane,
-> where the trilinear gradient is discontinuous — so the kernel took the *opposite
-> one-sided derivative*: `d/d(angle_y)` off by 34% while the value agreed to 1e-15.
-> Fixed at source; 3.2e-14 after. **The timings above have not been re-taken on the
-> fixed kernel**, and no pyramid run has been timed at all.
->
-> **The blast radius is one kernel, `mean_squares.cu`.** Of the six rows in the
-> table, only `registration setup` and `20 iterations` sit downstream of it; `cast`,
-> `rescale`, and `smooth` are untouched code and still describe what runs today, as
-> does every row of §1 and §3.
->
-> **But the 107–119× row can move for a reason that is not kernel speed.** It is a
-> real `execute()`, so the optimizer picks its own iteration count; a corrected
-> derivative changes the descent trajectory, and the wall clock can move in either
-> direction with the per-iteration cost unchanged. The `20 iterations` row is immune
-> (its count is pinned); that one is not. `execute_on_device` also now accepts a
-> pyramid (bit-identical level images, identical iteration counts on both paths).
->
-> These rows are left in place and marked, not deleted and not quietly re-labelled,
-> until the re-measurement lands.
+### 2.1 A real `execute()`, re-measured on the fixed kernel
+
+Not an evaluate loop: `ImageRegistrationMethod::execute()` against
+`execute_on_device()`, same input, same convergence criteria, both paths free to
+pick their own iteration count. Two runs each, gated on **real utilization from
+`/proc/stat`** (1.92 busy cores of 96) — `/proc/loadavg` reads 18–21 on this box
+with four runnable tasks and no cargo alive, and is not usable as a gate.
+
+| | host `execute` | `execute_on_device` | registration stage | iterations, both paths |
+|---|---|---|---|---|
+| single level, 256³ | 23,219 / 18,513 ms | 209 / 210 ms | **111× / 88×** | 24, `StepTooSmall` |
+| pyramid `[4,2,1]`, 256³ | 28,224 / 25,819 ms | 291 / 297 ms | **97× / 87×** | 22, `StepTooSmall` |
+| pyramid `[4,2,1]`, 128³ | 2,672 / 2,695 ms | 42.1 / 42.3 ms | **63× / 64×** | 20, `StepTooSmall` |
+
+Every run: identical iteration count, identical valid-point count, identical stop
+reason on both paths, worst parameter disagreement **3.0e-14 to 2.3e-13**.
+
+Three things a reader should take from this table, two of which contradict what
+this document previously implied:
+
+- **The published 107–119× was measured on the broken kernel. It is 88–111×.** The
+  device now costs 8.4 ms per iteration against 6.9 ms before — **+22%**, paid for
+  the correct derivative.
+- **The pyramid is not what costs you the speedup — 87–97× with, 88–111× without.**
+  The device pays 83 ms to build the extra levels (209 → 292); the host pays 5–7
+  *seconds* and gets nothing back on this input, because a 3-voxel misalignment
+  converges fine without a pyramid. A pyramid buys **capture range, not speed**, and
+  this synthetic input needs no capture range. Read the host's pyramid row as a fact
+  about the input, not as evidence that pyramids are a pessimization.
+- **The volume is what costs you: 63× at 128³ against 87–97× at 256³.** The GPU's
+  fixed costs stop being amortized. A reader running a 128³ registration should
+  expect ~60×, not ~100×.
 
 The Gaussian is where the CPU bleeds: 2,250.7 ms on 96 threads against 9.7 ms on
 the device. The device Gaussian is **bit-identical** to the CPU filter, not close
@@ -260,8 +278,11 @@ headline ratio is not read as more than it is.
   Ruled out by measurement: bandwidth, false sharing, the allocator, NUMA
   placement, and the cost of bit-exactness. This is the largest unexplained number
   in the project.
-- **The device timings are owed a re-measurement.** See the box in §2: the metric
-  kernel changed under them, and the pyramid path they said was refused now exists.
+- **Per-level diagnostics are not observable.** `RegistrationResult` keeps only the
+  last level's iteration count and stop reason (`method.rs:2002`), so a pyramid run
+  cannot report what its coarse levels did.
+- **The §2 pipeline table's `setup` / `20 iterations` rows** still predate the metric
+  fix. §2.1 is re-measured; those two rows are not.
 - **Device coverage.** Cast (all 10 scalar types), `rescale_intensity`,
   `smooth_gaussian`, `recursive_gaussian`, `shrink`, `resample_linear`, and a
   mean-squares metric. Still missing: device Mattes/correlation/ANTS, masks, and
