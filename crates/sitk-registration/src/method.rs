@@ -81,7 +81,7 @@ use crate::lbfgsb::LBFGSBOptimizer;
 use crate::mattes::MattesMutualInformationMetric;
 use crate::metric::{
     CpuBackend, FixedSamples, MeanSquaresMetric, MetricBackend, MetricValue, MovingImage,
-    SamplingStrategy, draw_samples,
+    SamplingStrategy,
 };
 use crate::optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,
@@ -2761,7 +2761,7 @@ impl ImageRegistrationMethod {
             // grid voxel, which an index list still knows, and the host filters the same
             // draw by the same mask. A masked-out draw contributes nothing on either
             // side, so the two evaluate the same samples.
-            let samples = draw_samples(
+            let samples = crate::metric::draw_samples(
                 fixed_level.len(),
                 self.sampling_strategy,
                 self.sampling_percentage(index),
