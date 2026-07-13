@@ -254,7 +254,8 @@ fn a_masked_device_metric_matches_the_masked_host_metric() {
     let d_moving = DeviceImage::upload(&moving).unwrap();
     let d_mask = DeviceMask::upload(&mask).unwrap();
     let device =
-        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask)).unwrap();
+        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask), None)
+            .unwrap();
     let gpu = device.evaluate(&t).unwrap();
 
     // The mask drops samples inside the walk; it does not shrink the grid.
@@ -311,7 +312,8 @@ fn a_mask_changes_the_answer() {
         .evaluate(&t)
         .unwrap();
     let masked =
-        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask)).unwrap();
+        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask), None)
+            .unwrap();
     let first = masked.evaluate(&t).unwrap();
 
     assert!(
@@ -1143,4 +1145,102 @@ fn the_device_metric_agrees_with_the_host_on_a_sample_that_lands_on_a_voxel_plan
         h.derivative.iter().any(|x| x.abs() > 1e-6),
         "the derivative is ~zero here, so the comparison proves nothing"
     );
+}
+
+/// A **moving** mask on the device metric agrees with the host's, exactly.
+///
+/// The kernel has had a moving mask since it was written (`mmask`/`has_mask`, with
+/// `MovingImage::mask_allows`'s round-to-nearest test); the device metric simply never
+/// passed one. So this is plumbing, and what it must not do is plumb a *different*
+/// predicate: `valid_points` is asserted **equal**, not close, because a moving mask
+/// decides which mapped points count, and a rounding rule that disagreed with the
+/// host's would shift a shell of points in or out while leaving the value plausible.
+///
+/// Anti-vacuity: the mask must drop points relative to the unmasked run. A `None` that
+/// slipped through the plumbing would otherwise pass every comparison here.
+#[test]
+fn a_moving_mask_on_the_device_metric_matches_the_host() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let mask = ellipsoid_mask(n);
+    let t = probe_transform(n);
+
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image(&fixed).unwrap(),
+        MovingImage::from_image(&moving)
+            .unwrap()
+            .with_moving_mask(&mask)
+            .unwrap(),
+    )
+    .unwrap();
+    let cpu = host.evaluate(&t, &CpuBackend);
+
+    let bits: Vec<bool> = mask
+        .scalar_slice::<f32>()
+        .unwrap()
+        .iter()
+        .map(|&v| v != 0.0)
+        .collect();
+    let d_fixed = DeviceImage::upload(&fixed).unwrap();
+    let d_moving = DeviceImage::upload(&moving).unwrap();
+    let masked =
+        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, None, Some(&bits))
+            .unwrap();
+    let gpu = masked.evaluate(&t).unwrap();
+
+    let unmasked = DeviceMeanSquaresMetric::from_device(&d_fixed, &d_moving)
+        .unwrap()
+        .evaluate(&t)
+        .unwrap();
+    assert!(
+        gpu.valid_points < unmasked.valid_points,
+        "the moving mask dropped no points ({} vs {} unmasked)",
+        gpu.valid_points,
+        unmasked.valid_points
+    );
+
+    assert_eq!(
+        gpu.valid_points, cpu.valid_points,
+        "the moving-masked device metric walked a different sample set than the host"
+    );
+    let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+    let v_err = rel(gpu.value, cpu.value);
+    let d_err = gpu
+        .derivative
+        .iter()
+        .zip(cpu.derivative.iter())
+        .map(|(&g, &c)| rel(g, c))
+        .fold(0.0f64, f64::max);
+    println!(
+        "moving mask: valid_points {} (both) | value rel err {v_err:e} | deriv rel err {d_err:e}",
+        cpu.valid_points
+    );
+    assert!(v_err <= 1e-9, "value rel err {v_err:e} exceeds 1e-9");
+    assert!(d_err <= 1e-9, "derivative rel err {d_err:e} exceeds 1e-9");
+}
+
+/// A moving mask that is not the moving image's grid is refused, not indexed into.
+/// The kernel reads it by the moving grid's flat index; a shorter one would read past
+/// the buffer, and an equal-length one on another shape would gate the wrong voxels.
+#[test]
+fn a_moving_mask_of_the_wrong_size_is_refused() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 32;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [1.0, 0.0, 0.0]));
+    let d_fixed = DeviceImage::upload(&fixed).unwrap();
+    let d_moving = DeviceImage::upload(&moving).unwrap();
+
+    let short = vec![true; n * n * n - 1];
+    match DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, None, Some(&short)) {
+        Err(DeviceMetricError::Cuda(CudaError::DegenerateInput)) => {}
+        Err(e) => panic!("refused, but by the wrong name: {e}"),
+        Ok(_) => panic!("a moving mask shorter than the moving image built a metric"),
+    }
 }

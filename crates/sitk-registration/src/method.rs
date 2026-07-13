@@ -2688,6 +2688,22 @@ impl ImageRegistrationMethod {
             None => None,
         };
 
+        // The moving mask is **not** resampled and **not** smoothed, on either path:
+        // `build_metric` hands `MovingImage::with_moving_mask` the mask the user set,
+        // and the moving volume is only ever smoothed, never shrunk — so its grid is
+        // the same at every level and the mask's indices line up throughout. It becomes
+        // a predicate once, here, by the same `nonzero → inside` rule the host uses.
+        let moving_mask: Option<Vec<bool>> = match &self.moving_mask {
+            Some(m) => Some(
+                m.to_f64_vec()
+                    .map_err(|e| DeviceRegistrationError::Registration(e.into()))?
+                    .iter()
+                    .map(|&v| v != 0.0)
+                    .collect(),
+            ),
+            None => None,
+        };
+
         let mut transform = initial;
         let mut levels = Vec::with_capacity(schedule.len());
         for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
@@ -2705,6 +2721,7 @@ impl ImageRegistrationMethod {
                     fixed_level,
                     moving_level,
                     level_mask.as_ref(),
+                    moving_mask.as_deref(),
                 )?,
             )));
 
@@ -7016,6 +7033,7 @@ mod device_level_tests {
                 fl.as_ref().unwrap_or(&d_fixed),
                 ml.as_ref().unwrap_or(&d_moving),
                 level_mask.as_ref(),
+                None,
             )
             .unwrap();
             let gpu = device.evaluate(&t).unwrap();

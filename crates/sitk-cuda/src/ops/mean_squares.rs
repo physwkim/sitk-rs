@@ -620,7 +620,15 @@ impl ResidentMetric {
             // A zero-length allocation is not a valid kernel pointer, so the
             // no-mask case still allocates one byte and gates on `has_mask`.
             None => (vec![0u8; 1], 0),
-            Some(m) => (m.iter().map(|&b| u8::from(b)).collect(), 1),
+            Some(m) => {
+                // The kernel indexes this by the *moving* grid's flat index, so a mask
+                // that is not that grid would gate the wrong voxels — or read past the
+                // buffer. Refused, not clamped.
+                if m.len() != moving.len {
+                    return Err(CudaError::DegenerateInput);
+                }
+                (m.iter().map(|&b| u8::from(b)).collect(), 1)
+            }
         };
 
         // `has_fmask ⟹ !has_pts`, enforced here so the kernel never has to ask. The

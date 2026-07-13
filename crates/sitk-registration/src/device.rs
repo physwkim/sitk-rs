@@ -159,7 +159,7 @@ impl DeviceMeanSquaresMetric {
         fixed: &DeviceImage,
         moving: &DeviceImage,
     ) -> Result<Self, DeviceMetricError> {
-        Self::from_device_masked(fixed, moving, None)
+        Self::from_device_masked(fixed, moving, None, None)
     }
 
     /// [`from_device`](Self::from_device) with a **fixed mask** on the fixed image's
@@ -181,6 +181,7 @@ impl DeviceMeanSquaresMetric {
         fixed: &DeviceImage,
         moving: &DeviceImage,
         fixed_mask: Option<&sitk_cuda::DeviceMask>,
+        moving_mask: Option<&[bool]>,
     ) -> Result<Self, DeviceMetricError> {
         let f = fixed.geometry();
         let m = moving.geometry();
@@ -206,9 +207,13 @@ impl DeviceMeanSquaresMetric {
             strides: &mstrides,
             origin: &m.origin,
             phys_to_index: &phys_to_index,
-            // A device image carries no mask. When masked registration comes to the
-            // device it arrives as a device mask, not as a host one smuggled in here.
-            mask: None,
+            // The moving mask, on the moving image's own grid. It is *not* resampled
+            // and *not* smoothed — the host does not resample it either
+            // (`MovingImage::with_moving_mask` takes the mask the user set, and the
+            // moving image is never shrunk), and a level's moving volume is the
+            // uploaded one smoothed, so the grid is the same at every level and the
+            // indices line up.
+            mask: moving_mask,
         };
         let points = FixedPoints::Grid {
             size: &f.size,
