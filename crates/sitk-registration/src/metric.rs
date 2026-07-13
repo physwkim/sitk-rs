@@ -42,8 +42,29 @@
 //! `wgpu`/Metal backend implements the same trait — marshalling the sample
 //! arrays, moving buffer, and transform parameters to the device — without any
 //! change to [`MeanSquaresMetric`] or the registration method above it.
+//!
+//! ## Parallelism, and why the numbers do not move
+//!
+//! [`CpuBackend`] evaluates the samples on every core, and returns **the same
+//! bits it returned when it was serial**, at any thread count. It gets that by
+//! construction, from [`sitk_core::parallel::map_rows_fold_in_order`]: the
+//! expensive per-sample work (transform, interpolation, Jacobian) never touches
+//! an accumulator, so it runs in parallel; the accumulators are then fed the
+//! per-sample contributions on a single thread, in sample order, executing the
+//! identical sequence of additions the serial loop did. Nothing is
+//! re-associated, so no float sum is re-rounded — which matters because the
+//! optimizer is a feedback loop, and a metric value that shifted by one ulp
+//! would walk to a different registration result.
+//!
+//! One path stays serial: the derivative of a transform with a **sparse**
+//! Jacobian (B-spline, displacement field). Its per-sample contribution is a
+//! scattered, variable-length entry list; staging that into a fixed-width row
+//! would cost `O(nparams)` per sample and defeat the sparsity. Its value-only
+//! reduction ([`MetricBackend::mean_squares_value`]) is parallel like every
+//! other transform's.
 
 use sitk_core::Image;
+use sitk_core::parallel;
 use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
@@ -707,47 +728,91 @@ impl MetricBackend for CpuBackend {
         let mut deriv = vec![0.0; nparams];
         let mut valid = 0usize;
 
-        for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
-            let fv = fixed.values[s];
+        // Sparseness is a property of the transform *type*, not of a point: a
+        // transform that has a sparse Jacobian returns `Some` at every point,
+        // empty where the point contributes nothing (see
+        // `ParametricTransform::sparse_jacobian_wrt_parameters`). So this reads
+        // it once, on the first sample, and picks the loop.
+        let sparse = n > 0
+            && transform
+                .sparse_jacobian_wrt_parameters(&fixed.points[..dim])
+                .is_some();
 
-            let mp = transform.transform_point(fp);
-            let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
-                Some(vg) => vg,
-                None => continue,
-            };
+        if sparse {
+            // Sequential. A sample's sparse contribution is a scattered,
+            // variable-length list of (parameter, column) entries; staging it
+            // as a dense `nparams`-wide row for the parallel fold would cost
+            // O(nparams) per sample and destroy the very sparsity this path
+            // exists for. Left serial deliberately — see the metric's parallel
+            // note in the module docs.
+            for s in 0..n {
+                let fp = &fixed.points[s * dim..(s + 1) * dim];
+                let mp = transform.transform_point(fp);
+                let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
+                    Some(vg) => vg,
+                    None => continue,
+                };
 
-            let diff = mv - fv;
-            value_sum += diff * diff;
+                let diff = mv - fixed.values[s];
+                value_sum += diff * diff;
 
-            // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k]. A transform with
-            // a sparse Jacobian (BSpline, DisplacementField) touches only its
-            // affected parameters; every other transform falls back to the
-            // dense Jacobian, unchanged from before.
-            match transform.sparse_jacobian_wrt_parameters(fp) {
-                Some(entries) => {
-                    for (idx, col) in &entries {
-                        let g: f64 = col
-                            .iter()
-                            .zip(grad_phys.iter())
-                            .map(|(&c, &gp)| c * gp)
-                            .sum();
-                        deriv[*idx] += 2.0 * diff * g;
-                    }
+                // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k], over the
+                // affected parameters only.
+                let entries = transform
+                    .sparse_jacobian_wrt_parameters(fp)
+                    .expect("a sparse transform returns Some at every point");
+                for (idx, col) in &entries {
+                    let g: f64 = col
+                        .iter()
+                        .zip(grad_phys.iter())
+                        .map(|(&c, &gp)| c * gp)
+                        .sum();
+                    deriv[*idx] += 2.0 * diff * g;
                 }
-                None => {
+
+                valid += 1;
+            }
+        } else {
+            // Parallel, and bit-identical to the loop above. Every sample's
+            // contribution — the transform, the interpolation, the dense
+            // Jacobian, the `2·diff·g` product for each parameter — is computed
+            // in parallel into its own row and touches no accumulator. The
+            // accumulators are then fed those rows on one thread, in sample
+            // order, performing the exact sequence of `+=` a serial loop would.
+            // No float sum is re-associated, so the result does not depend on
+            // the thread count. See `sitk_core::parallel::map_rows_fold_in_order`.
+            parallel::map_rows_fold_in_order(
+                n,
+                1 + nparams,
+                || (),
+                |(), s, row| {
+                    let fp = &fixed.points[s * dim..(s + 1) * dim];
+                    let mp = transform.transform_point(fp);
+                    let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                        return false;
+                    };
+
+                    let diff = mv - fixed.values[s];
+                    row[0] = diff * diff;
+
                     let jac = transform.jacobian_wrt_parameters(fp);
-                    for (k, dk) in deriv.iter_mut().enumerate() {
+                    for (k, slot) in row[1..].iter_mut().enumerate() {
                         let mut g = 0.0;
                         for (d, &gp) in grad_phys.iter().enumerate() {
                             g += gp * jac[d * nparams + k];
                         }
-                        *dk += 2.0 * diff * g;
+                        *slot = 2.0 * diff * g;
                     }
-                }
-            }
-
-            valid += 1;
+                    true
+                },
+                |_, row| {
+                    value_sum += row[0];
+                    for (dk, &contribution) in deriv.iter_mut().zip(&row[1..]) {
+                        *dk += contribution;
+                    }
+                    valid += 1;
+                },
+            );
         }
 
         if valid == 0 {
@@ -777,20 +842,32 @@ impl MetricBackend for CpuBackend {
         let mut value_sum = 0.0;
         let mut valid = 0usize;
 
-        for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
-            let mp = transform.transform_point(fp);
-            // No gradient, no Jacobian: `value_at` decides validity by exactly
-            // the same predicate `value_and_physical_gradient` does, so this
-            // walks the identical sample set as `mean_squares`.
-            let mv = match moving.value_at(&mp) {
-                Some(v) => v,
-                None => continue,
-            };
-            let diff = mv - fixed.values[s];
-            value_sum += diff * diff;
-            valid += 1;
-        }
+        // Parallel per sample, accumulated on one thread in sample order — the
+        // same additions in the same order as a serial loop, so the value is
+        // bit-identical at any thread count. No Jacobian here, so this needs no
+        // dense/sparse split: it covers every transform.
+        parallel::map_rows_fold_in_order(
+            n,
+            1,
+            || (),
+            |(), s, row| {
+                let fp = &fixed.points[s * dim..(s + 1) * dim];
+                let mp = transform.transform_point(fp);
+                // No gradient, no Jacobian: `value_at` decides validity by exactly
+                // the same predicate `value_and_physical_gradient` does, so this
+                // walks the identical sample set as `mean_squares`.
+                let Some(mv) = moving.value_at(&mp) else {
+                    return false;
+                };
+                let diff = mv - fixed.values[s];
+                row[0] = diff * diff;
+                true
+            },
+            |_, row| {
+                value_sum += row[0];
+                valid += 1;
+            },
+        );
 
         if valid == 0 {
             return f64::MAX;
@@ -932,7 +1009,7 @@ fn increment(index: &mut [usize], size: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::TranslationTransform;
+    use sitk_transform::{Euler3DTransform, TransformBase, TranslationTransform};
 
     // A separable ramp f(x,y) = 3x + 5y makes the mean-squares gradient exactly
     // analytic, so we can check the derivative sign and magnitude precisely.
@@ -944,6 +1021,139 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// The parallel metric must return the **bits** of the serial loop it
+    /// replaced, at every thread count — not a value within some tolerance. The
+    /// optimizer is a feedback loop, so a metric that shifted by one ulp would
+    /// walk to a different registration result. The reference here is the serial
+    /// loop itself, written out, not a `with_threads(1)` run of the same code:
+    /// that would only prove thread-independence, not that the sum is still the
+    /// sequential sum.
+    #[test]
+    fn mean_squares_is_bit_identical_to_the_serial_loop_at_every_thread_count() {
+        // 40³ = 64 000 samples, well past the parallel threshold, with an
+        // intensity pattern whose sum is rounding-sensitive (any re-association
+        // of the accumulation shows up in the low bits).
+        let n = 40usize;
+        let wave = |phase: f64| {
+            let mut v = vec![0.0f64; n * n * n];
+            for z in 0..n {
+                for y in 0..n {
+                    for x in 0..n {
+                        let (fx, fy, fz) = (x as f64, y as f64, z as f64);
+                        v[(z * n + y) * n + x] =
+                            137.0 * (0.7 * fx + 1.3 * fy + 2.1 * fz + phase).sin() + 0.001 * fx;
+                    }
+                }
+            }
+            Image::from_vec(&[n, n, n], v).unwrap()
+        };
+        let metric = MeanSquaresMetric::new(&wave(0.0), &wave(0.35)).unwrap();
+        // Rigid Euler3D: 6 dense parameters, the benchmark's transform.
+        let t = Euler3DTransform::new(0.11, -0.07, 0.05, [20.0, 20.0, 20.0], [1.5, -2.5, 0.75]);
+
+        // The serial loop, verbatim — the code the parallel path replaced.
+        let (fixed, moving) = (&metric.fixed, &metric.moving);
+        let (dim, nparams) = (fixed.dim, t.number_of_parameters());
+        let mut want_value = 0.0f64;
+        let mut want_deriv = vec![0.0f64; nparams];
+        let mut want_valid = 0usize;
+        for s in 0..fixed.values.len() {
+            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let mp = t.transform_point(fp);
+            let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                continue;
+            };
+            let diff = mv - fixed.values[s];
+            want_value += diff * diff;
+            let jac = t.jacobian_wrt_parameters(fp);
+            for (k, dk) in want_deriv.iter_mut().enumerate() {
+                let mut g = 0.0;
+                for (d, &gp) in grad_phys.iter().enumerate() {
+                    g += gp * jac[d * nparams + k];
+                }
+                *dk += 2.0 * diff * g;
+            }
+            want_valid += 1;
+        }
+        // The primitive runs serially below 1<<14 *samples* (valid or not), so
+        // the parallel path must actually be the one under test here — and
+        // enough samples must survive the transform to make the sum nontrivial.
+        assert!(
+            fixed.values.len() > (1 << 14),
+            "the parallel path must be taken: only {} samples",
+            fixed.values.len()
+        );
+        assert!(want_valid > 1000, "only {want_valid} valid samples");
+        let inv = 1.0 / want_valid as f64;
+        let want_value = want_value * inv;
+        let want_deriv: Vec<f64> = want_deriv.iter().map(|d| d * inv).collect();
+        let mut want_only = 0.0f64;
+        let mut only_valid = 0usize;
+        for s in 0..fixed.values.len() {
+            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let Some(mv) = moving.value_at(&t.transform_point(fp)) else {
+                continue;
+            };
+            let diff = mv - fixed.values[s];
+            want_only += diff * diff;
+            only_valid += 1;
+        }
+        let want_only = want_only / only_valid as f64;
+
+        // This fixture has teeth: re-associating the very same contributions
+        // into 64-wide chunks and folding the partials in order — a textbook
+        // "deterministic" chunked reduction, and exactly what this metric must
+        // *not* do — lands on different bits. So the assertions below would
+        // catch a re-association, rather than passing because the sum happens to
+        // be exact.
+        let mut contributions = Vec::new();
+        for s in 0..fixed.values.len() {
+            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            if let Some(mv) = moving.value_at(&t.transform_point(fp)) {
+                let diff = mv - fixed.values[s];
+                contributions.push(diff * diff);
+            }
+        }
+        let chunked: f64 = contributions
+            .chunks(64)
+            .map(|c| c.iter().sum::<f64>())
+            .sum::<f64>()
+            / only_valid as f64;
+        assert_ne!(
+            chunked.to_bits(),
+            want_only.to_bits(),
+            "fixture is not rounding-sensitive, so the bit assertions prove nothing"
+        );
+
+        for threads in [1usize, 2, 3, 8, 32] {
+            let (got, got_only) = sitk_core::parallel::with_threads(threads, || {
+                (
+                    metric.evaluate(&t, &CpuBackend),
+                    metric.value(&t, &CpuBackend),
+                )
+            });
+            assert_eq!(got.valid_points, want_valid, "{threads} threads");
+            assert_eq!(
+                got.value.to_bits(),
+                want_value.to_bits(),
+                "{threads} threads moved the value: {} vs {want_value}",
+                got.value
+            );
+            for (k, (&g, &w)) in got.derivative.iter().zip(&want_deriv).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{threads} threads moved derivative[{k}]: {g} vs {w}"
+                );
+            }
+            assert_eq!(
+                got_only.to_bits(),
+                want_only.to_bits(),
+                "{threads} threads moved the value-only reduction: {got_only} vs {want_only}"
+            );
+        }
     }
 
     #[test]

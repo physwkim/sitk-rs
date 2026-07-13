@@ -153,7 +153,12 @@ macro_rules! matrix_jacobian_wrt_position {
 /// exposes the Jacobian of the mapped point with respect to those parameters.
 /// This is the interface registration optimizes over, mirroring ITK's
 /// `Transform::GetJacobianWithRespectToParameters`.
-pub trait ParametricTransform: TransformBase {
+///
+/// `Sync` is required: a metric evaluates the transform at every fixed sample,
+/// and those evaluations run in parallel over a shared `&dyn
+/// ParametricTransform`. Every transform here is plain data with no interior
+/// mutability, so the bound is free — it exists to keep it that way.
+pub trait ParametricTransform: TransformBase + Sync {
     /// Number of free parameters.
     fn number_of_parameters(&self) -> usize;
 
