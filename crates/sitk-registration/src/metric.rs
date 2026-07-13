@@ -1051,7 +1051,7 @@ mod tests {
         };
         let metric = MeanSquaresMetric::new(&wave(0.0), &wave(0.35)).unwrap();
         // Rigid Euler3D: 6 dense parameters, the benchmark's transform.
-        let t = Euler3DTransform::new(0.11, -0.07, 0.05, [20.0, 20.0, 20.0], [1.5, -2.5, 0.75]);
+        let t = Euler3DTransform::new(0.11, -0.07, 0.05, [1.5, -2.5, 0.75], [20.0, 20.0, 20.0]);
 
         // The serial loop, verbatim — the code the parallel path replaced.
         let (fixed, moving) = (&metric.fixed, &metric.moving);
