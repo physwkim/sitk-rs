@@ -107,16 +107,97 @@ pub fn rescale_intensity_gpu(
     output_min: f64,
     output_max: f64,
 ) -> Result<(Image, GpuTimings), CudaError> {
+    let n = check_input(img)?;
+
+    // Made resident *before* the D2H, so the DMA lands on mapped pages instead
+    // of faulting in 131,072 of them. This is the whole of Task 0: the op used
+    // to hand `clone_dtoh` a fresh `Vec` and bill the resulting fault storm to
+    // the PCIe link.
+    //
+    // Even so, this allocation is the largest single term left in the op — 108 ms
+    // at 512³, because Linux must still zero every one of those pages before it
+    // hands them over. The only way to *not* pay it is to not allocate, which a
+    // function returning a fresh `Image` cannot express. That is what
+    // [`rescale_intensity_gpu_into`] is for.
+    let t = Instant::now();
+    let mut host_out = crate::host::resident_vec::<f32>(n);
+    let alloc_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let mut timings = run(img, output_min, output_max, &mut host_out)?;
+    timings.alloc_ms = alloc_ms;
+
+    let mut out = Image::from_vec(img.size(), host_out)?;
+    out.copy_geometry_from(img);
+    Ok((out, timings))
+}
+
+/// GPU `rescale_intensity` writing into a destination the caller already owns —
+/// the zero-allocation form.
+///
+/// `dst` must be a `Float32` scalar image with the same voxel count as `img`; it
+/// is overwritten in full, and its geometry is copied from `img`. Nothing on the
+/// host is allocated, so `GpuTimings::alloc_ms` is 0.
+///
+/// This exists because the allocation, not the bus, is the cost. A caller that
+/// loops — a pipeline stage, a per-slice sweep, an optimizer — can hand the same
+/// destination back on every call and pay the page faults exactly once, for the
+/// life of the buffer, instead of once per call. At 512³ that is 108 ms per call
+/// that simply stops being spent.
+///
+/// The one-shot [`rescale_intensity_gpu`] / [`try_rescale_intensity`] pair is
+/// unchanged: a caller with no destination to reuse keeps the API it has.
+pub fn rescale_intensity_gpu_into(
+    img: &Image,
+    output_min: f64,
+    output_max: f64,
+    dst: &mut Image,
+) -> Result<GpuTimings, CudaError> {
+    let n = check_input(img)?;
+    if dst.pixel_id() != PixelId::Float32 {
+        return Err(CudaError::UnsupportedPixelType(dst.pixel_id()));
+    }
+    if dst.size() != img.size() {
+        return Err(CudaError::DegenerateInput);
+    }
+    let size = img.size().to_vec();
+    let host_out = dst.scalar_vec_mut::<f32>()?;
+    if host_out.len() != n {
+        return Err(CudaError::DegenerateInput);
+    }
+    debug_assert_eq!(size.iter().product::<usize>(), n);
+
+    let timings = run(img, output_min, output_max, host_out)?;
+    dst.copy_geometry_from(img);
+    Ok(timings)
+}
+
+/// The input contract both forms share: `Float32`, scalar, non-empty. Returns the
+/// voxel count.
+fn check_input(img: &Image) -> Result<usize, CudaError> {
     if img.pixel_id() != PixelId::Float32 {
         return Err(CudaError::UnsupportedPixelType(img.pixel_id()));
     }
-    let host_in = img.scalar_slice::<f32>()?;
-    let n = host_in.len();
+    let n = img.scalar_slice::<f32>()?.len();
     if n == 0 {
         return Err(CudaError::DegenerateInput);
     }
-    let backend = backend()?;
+    Ok(n)
+}
 
+/// H2D → reduce → map → D2H into `host_out`, which the caller owns. The only
+/// difference between the two public forms is where `host_out` came from, so it
+/// is the only thing this does not decide.
+///
+/// `timings.alloc_ms` is left at 0: this function allocates nothing on the host.
+fn run(
+    img: &Image,
+    output_min: f64,
+    output_max: f64,
+    host_out: &mut [f32],
+) -> Result<GpuTimings, CudaError> {
+    let host_in = img.scalar_slice::<f32>()?;
+    let n = host_in.len();
+    let backend = backend()?;
     let mut timings = GpuTimings::default();
 
     // ---- H2D -------------------------------------------------------------
@@ -126,8 +207,7 @@ pub fn rescale_intensity_gpu(
     timings.h2d_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- kernel 1: min/max reduction -------------------------------------
-    // Ahead of the output allocation, so a degenerate image declines without
-    // paying for a buffer it will never fill.
+    // Ahead of the map, so a degenerate image declines before it is mapped.
     let t = Instant::now();
     let (lo, hi) = device_min_max(backend, &d_in, n)?;
     if lo == hi {
@@ -135,15 +215,6 @@ pub fn rescale_intensity_gpu(
     }
     let scale = (output_max - output_min) / (hi - lo);
     timings.kernel_ms = t.elapsed().as_secs_f64() * 1e3;
-
-    // ---- output allocation -----------------------------------------------
-    // Made resident *before* the D2H, so the DMA lands on mapped pages instead
-    // of faulting in 131,072 of them. This is the whole of Task 0: the op used
-    // to hand `clone_dtoh` a fresh `Vec` and bill the resulting fault storm to
-    // the PCIe link.
-    let t = Instant::now();
-    let mut host_out = crate::host::resident_vec::<f32>(n);
-    timings.alloc_ms = t.elapsed().as_secs_f64() * 1e3;
 
     // ---- kernel 2: the map -----------------------------------------------
     let t = Instant::now();
@@ -173,13 +244,11 @@ pub fn rescale_intensity_gpu(
 
     // ---- D2H -------------------------------------------------------------
     let t = Instant::now();
-    d_out.copy_to_host(backend, &mut host_out)?;
+    d_out.copy_to_host(backend, host_out)?;
     backend.synchronize()?;
     timings.d2h_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let mut out = Image::from_vec(img.size(), host_out)?;
-    out.copy_geometry_from(img);
-    Ok((out, timings))
+    Ok(timings)
 }
 
 /// Exact min/max of the device buffer, folded on the host over the reduction's
