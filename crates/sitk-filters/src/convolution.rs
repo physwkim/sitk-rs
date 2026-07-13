@@ -65,7 +65,7 @@ use sitk_core::{
 };
 
 use crate::error::{FilterError, Result};
-use crate::fft::{self, Complex};
+use crate::fft::{self, Complex, LineKernel};
 use crate::image_from_f64;
 
 /// Out-of-bounds pixel rule applied while the kernel overhangs the image edge.
@@ -505,9 +505,10 @@ pub(crate) fn kernel_spectrum_half(
     kernel_size: &[usize],
     radius: &[usize],
     padded_size: &[usize],
+    line_kernel: LineKernel,
 ) -> Vec<Complex> {
     let padded = kernel_padded(kernel_values, kernel_size, radius, padded_size);
-    fft::transform_r2c(&padded, padded_size)
+    fft::transform_r2c(&padded, padded_size, line_kernel)
 }
 
 pub(crate) fn kernel_spectrum(
@@ -515,12 +516,13 @@ pub(crate) fn kernel_spectrum(
     kernel_size: &[usize],
     radius: &[usize],
     padded_size: &[usize],
+    line_kernel: LineKernel,
 ) -> Vec<Complex> {
     let mut spectrum: Vec<Complex> = parallel::map_slice(
         &kernel_padded(kernel_values, kernel_size, radius, padded_size),
         |&v| Complex::new(v, 0.0),
     );
-    fft::transform_nd(&mut spectrum, padded_size, false);
+    fft::transform_nd(&mut spectrum, padded_size, false, line_kernel);
     spectrum
 }
 
@@ -552,22 +554,39 @@ pub(crate) fn crop_output(
     )
 }
 
+/// Everything `fft_convolution` settles before a single transform runs: the
+/// prepared kernel, the region to produce, and the 1-D kernel the output's pixel
+/// type entitles it to.
+struct FftPlan<'a> {
+    kernel_values: &'a [f64],
+    kernel_size: &'a [usize],
+    radius: &'a [usize],
+    out_index: &'a [usize],
+    out_size: &'a [usize],
+    boundary_condition: ConvolutionBoundaryCondition,
+    line_kernel: LineKernel,
+}
+
 /// The Fourier half of `FFTConvolutionImageFilter::GenerateData`
 /// (itkFFTConvolutionImageFilter.hxx:80-112): transform the padded input and
 /// the kernel, multiply, invert, crop.
 ///
 /// Agrees with [`convolve_spatial`] up to round-off.
-fn convolve_fft(
-    img: &Image,
-    kernel_values: &[f64],
-    kernel_size: &[usize],
-    radius: &[usize],
-    out_index: &[usize],
-    out_size: &[usize],
-    boundary_condition: ConvolutionBoundaryCondition,
-) -> Result<Vec<f64>> {
-    let padded = pad_input(img, radius, out_index, out_size, boundary_condition)?;
-    let transfer = kernel_spectrum_half(kernel_values, kernel_size, radius, &padded.size);
+fn convolve_fft(img: &Image, plan: &FftPlan<'_>) -> Result<Vec<f64>> {
+    let padded = pad_input(
+        img,
+        plan.radius,
+        plan.out_index,
+        plan.out_size,
+        plan.boundary_condition,
+    )?;
+    let transfer = kernel_spectrum_half(
+        plan.kernel_values,
+        plan.kernel_size,
+        plan.radius,
+        &padded.size,
+        plan.line_kernel,
+    );
 
     // Both operands are REAL, so both spectra are conjugate-symmetric and only
     // half of each carries information (`fft::transform_r2c`). The multiply is
@@ -575,15 +594,15 @@ fn convolve_fft(
     // half of the product. Transforming, storing and multiplying the other half
     // would be twice the flops and twice the memory traffic for a result already
     // determined by the half in hand.
-    let mut spectrum = fft::transform_r2c(&padded.values, &padded.size);
+    let mut spectrum = fft::transform_r2c(&padded.values, &padded.size, plan.line_kernel);
     parallel::for_each_mut(&mut spectrum, |i, x| *x = *x * transfer[i]);
-    let real = fft::transform_c2r(&mut spectrum, &padded.size);
+    let real = fft::transform_c2r(&mut spectrum, &padded.size, plan.line_kernel);
     Ok(crop_output(
         &real,
         &padded.size,
         &padded.lower,
-        radius,
-        out_size,
+        plan.radius,
+        plan.out_size,
     ))
 }
 
@@ -616,12 +635,17 @@ pub fn fft_convolution(
     let widened = as_f64_image(image)?;
     let values = convolve_fft(
         &widened,
-        &kernel_values,
-        kernel_size,
-        &radius,
-        &out_index,
-        &out_size,
-        boundary_condition,
+        &FftPlan {
+            kernel_values: &kernel_values,
+            kernel_size,
+            radius: &radius,
+            out_index: &out_index,
+            out_size: &out_size,
+            boundary_condition,
+            // The kernel is the output pixel type's to choose, not this filter's:
+            // `image.pixel_id()` is what these values are narrowed into below.
+            line_kernel: LineKernel::for_output(image.pixel_id()),
+        },
     )?;
 
     image_from_f64(image.pixel_id(), &out_size, image, &values)

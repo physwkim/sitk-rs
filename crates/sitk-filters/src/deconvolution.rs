@@ -75,7 +75,7 @@ use crate::convolution::{
     kernel_radius, kernel_spectrum, output_region, pad_input, prepare_kernel,
 };
 use crate::error::Result;
-use crate::fft::{self, Complex};
+use crate::fft::{self, Complex, LineKernel};
 use crate::image_from_f64;
 
 /// `InverseDeconvolutionImageFilter`'s `m_KernelZeroMagnitudeThreshold` default
@@ -128,6 +128,10 @@ struct Prepared {
     padded: PaddedInput,
     /// `H`: the discrete Fourier transform of the shifted, padded kernel.
     transfer: Vec<Complex>,
+    /// The 1-D kernel every transform in this deconvolution runs, fixed by the
+    /// pixel type the estimate is narrowed back into ([`LineKernel::for_output`]).
+    /// Carried here so the iterative steps cannot pick a different one halfway.
+    line_kernel: LineKernel,
 }
 
 impl Plan {
@@ -144,13 +148,19 @@ impl Plan {
             &self.out_size,
             boundary_condition,
         )?;
+        let line_kernel = LineKernel::for_output(image.pixel_id());
         let transfer = kernel_spectrum(
             &self.kernel_values,
             &self.kernel_size,
             &self.radius,
             &padded.size,
+            line_kernel,
         );
-        Ok(Prepared { padded, transfer })
+        Ok(Prepared {
+            padded,
+            transfer,
+            line_kernel,
+        })
     }
 
     /// `CropOutput` followed by the narrowing back to the input's pixel type.
@@ -172,18 +182,18 @@ fn empty_output(image: &Image, out_size: &[usize]) -> Result<Image> {
     image_from_f64(image.pixel_id(), out_size, image, &[])
 }
 
-fn forward(real: &[f64], size: &[usize]) -> Vec<Complex> {
+fn forward(real: &[f64], size: &[usize], line_kernel: LineKernel) -> Vec<Complex> {
     let mut spectrum: Vec<Complex> = real.iter().map(|&v| Complex::new(v, 0.0)).collect();
-    fft::transform_nd(&mut spectrum, size, false);
+    fft::transform_nd(&mut spectrum, size, false, line_kernel);
     spectrum
 }
 
 /// The inverse transform, of a spectrum this module's functors have kept
 /// conjugate-symmetric; ITK's `HalfHermitianToRealInverseFFTImageFilter`
 /// produces the same real image by construction.
-fn inverse_real(spectrum: &[Complex], size: &[usize]) -> Vec<f64> {
+fn inverse_real(spectrum: &[Complex], size: &[usize], line_kernel: LineKernel) -> Vec<f64> {
     let mut buf = spectrum.to_vec();
-    fft::transform_nd(&mut buf, size, true);
+    fft::transform_nd(&mut buf, size, true, line_kernel);
     buf.into_iter().map(|x| x.re).collect()
 }
 
@@ -203,13 +213,17 @@ fn spectral_deconvolution(
     if plan.out_size.contains(&0) {
         return empty_output(image, &plan.out_size);
     }
-    let Prepared { padded, transfer } = plan.prepare(image, boundary_condition)?;
+    let Prepared {
+        padded,
+        transfer,
+        line_kernel,
+    } = plan.prepare(image, boundary_condition)?;
 
-    let mut spectrum = forward(&padded.values, &padded.size);
+    let mut spectrum = forward(&padded.values, &padded.size, line_kernel);
     for (x, &h) in spectrum.iter_mut().zip(&transfer) {
         *x = functor(*x, h);
     }
-    let estimate = inverse_real(&spectrum, &padded.size);
+    let estimate = inverse_real(&spectrum, &padded.size, line_kernel);
 
     plan.finish(image, &padded, &estimate)
 }
@@ -383,7 +397,7 @@ fn landweber_step(
     estimate: Vec<f64>,
 ) -> Vec<f64> {
     let size = &prepared.padded.size;
-    let mut spectrum = forward(&estimate, size);
+    let mut spectrum = forward(&estimate, size, prepared.line_kernel);
     for ((x, &h), &g) in spectrum
         .iter_mut()
         .zip(&prepared.transfer)
@@ -391,7 +405,7 @@ fn landweber_step(
     {
         *x = h.conj().scale(alpha) * g + x.scale(1.0 - alpha * h.norm());
     }
-    inverse_real(&spectrum, size)
+    inverse_real(&spectrum, size, prepared.line_kernel)
 }
 
 /// `ThresholdImageFilter::ThresholdBelow(0)` as
@@ -442,7 +456,11 @@ pub fn landweber_deconvolution(
         output_region_mode,
         |prepared, estimate| {
             if input_spectrum.is_empty() {
-                input_spectrum = forward(&prepared.padded.values, &prepared.padded.size);
+                input_spectrum = forward(
+                    &prepared.padded.values,
+                    &prepared.padded.size,
+                    prepared.line_kernel,
+                );
             }
             landweber_step(prepared, &input_spectrum, alpha, estimate)
         },
@@ -482,7 +500,11 @@ pub fn projected_landweber_deconvolution(
         output_region_mode,
         |prepared, estimate| {
             if input_spectrum.is_empty() {
-                input_spectrum = forward(&prepared.padded.values, &prepared.padded.size);
+                input_spectrum = forward(
+                    &prepared.padded.values,
+                    &prepared.padded.size,
+                    prepared.line_kernel,
+                );
             }
             let mut next = landweber_step(prepared, &input_spectrum, alpha, estimate);
             project_to_nonnegative(&mut next);
@@ -530,11 +552,11 @@ pub fn richardson_lucy_deconvolution(
             let size = &prepared.padded.size;
 
             // `x̂ₖ ⊗ h`, the current estimate re-blurred.
-            let mut spectrum = forward(&estimate, size);
+            let mut spectrum = forward(&estimate, size, prepared.line_kernel);
             for (x, &h) in spectrum.iter_mut().zip(&prepared.transfer) {
                 *x = *x * h;
             }
-            let blurred = inverse_real(&spectrum, size);
+            let blurred = inverse_real(&spectrum, size, prepared.line_kernel);
 
             // `g / (x̂ₖ ⊗ h)`, or zero where the denominator has collapsed.
             let quotient: Vec<f64> = prepared
@@ -552,11 +574,11 @@ pub fn richardson_lucy_deconvolution(
                 .collect();
 
             // `h ⋆ quotient`, the correlation with the flipped kernel.
-            let mut spectrum = forward(&quotient, size);
+            let mut spectrum = forward(&quotient, size, prepared.line_kernel);
             for (x, &h) in spectrum.iter_mut().zip(&prepared.transfer) {
                 *x = *x * h.conj();
             }
-            let correction = inverse_real(&spectrum, size);
+            let correction = inverse_real(&spectrum, size, prepared.line_kernel);
 
             estimate
                 .iter()
@@ -1268,9 +1290,11 @@ mod tests {
     /// (`cos(2π/3) == -0.5` exactly — see `fft::radix_twiddles`), which this port
     /// transcribes. Swapping in a kernel that *computes* its roots of unity —
     /// rustfft gets `-0.4999999999999998` — fails this test. That is the test
-    /// working, not the kernel being broken: see `fft::LineKernel` for why the
-    /// complex-spectrum path therefore keeps the exact kernel while the
-    /// real-input pair takes the fast one.
+    /// working, not the kernel being broken: it is exactly the twiddle trap that
+    /// makes `LineKernel::for_output` send an *integral* output type — this one —
+    /// to the exact kernel. A `Float32` output has no pixel gap to fall through,
+    /// and takes the fast kernel; `float_output_takes_the_planned_kernel` below
+    /// is the same delta-kernel round trip on that branch.
     #[test]
     fn output_keeps_the_input_pixel_type_and_geometry() {
         let mut image = Image::from_vec(&[3, 2], vec![10u8, 20, 30, 40, 50, 60]).unwrap();
@@ -1291,6 +1315,42 @@ mod tests {
         assert_eq!(out.spacing(), image.spacing());
         assert_eq!(out.origin(), image.origin());
         assert_eq!(out.scalar_slice::<u8>().unwrap(), &[10, 20, 30, 40, 50, 60]);
+    }
+
+    /// The other half of the rule, and the gate on the fast branch: the same
+    /// delta-kernel round trip, on the same values, with a *floating-point*
+    /// output type.
+    ///
+    /// Two things are asserted, and the first is the one that matters. The
+    /// `line_kernel` the plan carries must be `Planned` — the branch is selected,
+    /// not merely reachable, and reverting `for_output` to send everything to
+    /// `Exact` fails here rather than passing quietly and costing 3x. The second
+    /// is that the fast kernel is accurate enough for the type it was handed: the
+    /// identity comes back to within 1e-12, four orders below the `f64` mantissa's
+    /// reach at this magnitude and, unlike a `u8`, with no pixel gap under it to
+    /// fall through.
+    #[test]
+    fn float_output_takes_the_planned_kernel() {
+        let image = img(&[3, 2], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let kernel = img(&[1, 1], vec![1.0]);
+
+        let prepared = plan(&image, &kernel, false, Same)
+            .unwrap()
+            .prepare(&image, ZeroPad)
+            .unwrap();
+        assert_eq!(prepared.line_kernel, LineKernel::Planned);
+
+        let out = inverse_deconvolution(
+            &image,
+            &kernel,
+            KERNEL_ZERO_MAGNITUDE_THRESHOLD,
+            false,
+            ZeroPad,
+            Same,
+        )
+        .unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::Float64);
+        assert_close(&values(&out), &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], 1e-12);
     }
 
     // ---- error paths --------------------------------------------------------

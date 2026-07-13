@@ -36,7 +36,7 @@
 mod bspline;
 
 use crate::error::{FilterError, Result};
-use crate::fft::{Complex, transform_1d_unnormalized};
+use crate::fft::{Complex, LineKernel, transform_1d_unnormalized};
 use crate::{image_from_f64, quantize_to_pixel_type};
 use bspline::{FitInput, Lattice};
 use sitk_core::{Image, PixelId};
@@ -404,11 +404,16 @@ impl<'a> N4<'a> {
         let padded = padded_histogram_size(bins);
         let histogram_offset = (0.5 * (padded - bins) as f64) as usize;
 
+        // `SharpenImage`'s transforms feed the intensity map that produces the
+        // corrected image, which is narrowed back into the input's pixel type —
+        // so that type, not this function, picks the kernel.
+        let line_kernel = LineKernel::for_output(self.image.pixel_id());
+
         let mut vf = vec![Complex::new(0.0, 0.0); padded];
         for (n, &h) in histogram.iter().enumerate() {
             vf[n + histogram_offset] = Complex::new(h, 0.0);
         }
-        transform_1d_unnormalized(&mut vf, false);
+        transform_1d_unnormalized(&mut vf, false, line_kernel);
 
         // The Gaussian, sampled symmetrically about bin 0.
         let scaled_fwhm = self.settings.bias_field_full_width_at_half_maximum / histogram_slope;
@@ -434,7 +439,7 @@ impl<'a> N4<'a> {
                 0.0,
             );
         }
-        transform_1d_unnormalized(&mut ff, false);
+        transform_1d_unnormalized(&mut ff, false, line_kernel);
 
         // Wiener deconvolution: `Gf = conj(Ff) / (conj(Ff) * Ff + noise)`.
         let noise = self.settings.wiener_filter_noise;
@@ -445,7 +450,7 @@ impl<'a> N4<'a> {
                 Complex::new(vf[n].re * gf.re, vf[n].im * gf.re)
             })
             .collect();
-        transform_1d_unnormalized(&mut u, true);
+        transform_1d_unnormalized(&mut u, true, line_kernel);
         for x in u.iter_mut() {
             *x = Complex::new(x.re.max(0.0), 0.0);
         }
@@ -460,11 +465,11 @@ impl<'a> N4<'a> {
             .collect();
         let mut denominator = u;
         for buf in [&mut numerator, &mut denominator] {
-            transform_1d_unnormalized(buf, false);
+            transform_1d_unnormalized(buf, false, line_kernel);
             for (n, x) in buf.iter_mut().enumerate() {
                 *x = *x * ff[n];
             }
-            transform_1d_unnormalized(buf, true);
+            transform_1d_unnormalized(buf, true, line_kernel);
         }
 
         let expectation: Vec<f64> = (0..bins)
