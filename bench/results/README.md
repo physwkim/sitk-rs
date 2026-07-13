@@ -13,8 +13,17 @@ Taken on the post-allocator-fix, post-GMRG-fix, post-`with_max_len(1)` tree
 | `cpp-tN-r1.ndjson` | 36 | valid |
 | `cpp-t1-r1.DISCARDED.ndjson` | 36 | **DISCARDED — do not use. See below.** |
 | `cpp-r2.ndjson` | 72 | valid (`t1` + `tN`) |
+| `rust-cuda.ndjson` | 144 | valid — the **only** source of `gpu` / `gpu_resident` rows |
 | `load-trace-foreign.txt` | — | foreign load, 5 s samples: `total`, `bench`, `foreign` |
+| `load-trace-foreign-gpu.txt` | — | same, for the cuda leg |
 | `load-trace-total.txt` | — | total busy cores, 5 s samples (first sampler; see below) |
+
+`rust-r{1,2}.ndjson` are default-features builds, so every `gpu` row in them
+reads `skipped: the cuda feature is off in this build`. The GPU columns come
+from `rust-cuda.ndjson` — the same tree, rebuilt with `--features
+sitk-filters/cuda` and re-run on the same quiet box. Its 60 CPU rows carry the
+same output checksums as `rust-r2.ndjson`, zero moved, so the cuda build does
+not perturb the CPU path and the GPU rows are on the same footing as the rest.
 
 The valid pairs, and the only ones `compare.py` should be given:
 
@@ -76,3 +85,12 @@ a full-machine benchmark; the total-only trace would have called it a burst.
 
 `loadavg` is not used anywhere and must not be: it reads 18-21 on this box
 with nothing running.
+
+### One artefact in the foreign traces, so nobody re-derives it
+
+A sample reading `foreign=2345.6` appears once, in `load-trace-foreign-gpu.txt`,
+at the instant the benchmark process exits. It is an accounting bug in the
+sampler, not load: when the process vanishes, its `/proc/<pid>/stat` disappears,
+the cumulative-CPU delta for `bench` goes negative, and `total - bench` blows up.
+A value above 96 on a 96-core box is impossible, which is how it is recognisable.
+Every other sample in that leg is under 4 cores, p50 0.8.
