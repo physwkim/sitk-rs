@@ -94,10 +94,26 @@ pub enum DeviceRegistrationError {
     #[error("building a resolution level on the device failed: {0}")]
     Pyramid(#[source] CudaError),
 
-    /// The device metric samples the fixed image's own grid.
+    /// A virtual domain or a fixed-initial transform needs a **mask** the device
+    /// metric does not have — this is [`UnsupportedMask`](Self::UnsupportedMask)
+    /// under another name.
+    ///
+    /// Not a grid limitation: `sitk_cuda::resample_linear` takes an arbitrary
+    /// geometry and `DeviceImage::with_geometry` builds one, so a device metric can
+    /// be built on a virtual grid — that is how the device pyramid's coarse levels
+    /// are made. What blocks it is the *in-buffer predicate*: whenever a virtual
+    /// domain or a fixed-initial transform is configured, the host's `prepare_level`
+    /// resamples an all-ones image over the fixed grid to learn which virtual points
+    /// map inside the fixed buffer at all, and folds that predicate into the level's
+    /// fixed mask. A virtual point outside the buffer is *not a sample*, and a
+    /// [`DeviceImage`] carries no mask with which to drop it.
+    ///
+    /// So device mask support closes this refusal and
+    /// [`UnsupportedMask`](Self::UnsupportedMask) together — one capability, two
+    /// refusals, and the highest-leverage gap left in this boundary.
     #[error(
-        "the device metric samples the fixed image's grid; a virtual domain or a \
-             fixed-initial transform is host-only"
+        "a virtual domain or a fixed-initial transform needs a fixed mask (the \
+             in-buffer predicate), and the device metric has no mask support"
     )]
     UnsupportedVirtualDomain,
 
