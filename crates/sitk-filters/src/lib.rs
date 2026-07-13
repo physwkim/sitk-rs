@@ -761,28 +761,23 @@ pub fn binary_threshold(
 /// `RescaleIntensityImageFilter`: linearly remap the actual `[min, max]` of the
 /// image onto `[output_min, output_max]`. Output pixel type follows input.
 ///
-/// With the `cuda` feature on, this tries `sitk-cuda` first and falls back to
-/// the CPU implementation below whenever the GPU declines — which includes
-/// every environmental failure (no driver, no device, NVRTC failure, out of
-/// memory) as well as an unsupported pixel type or a degenerate input. The GPU
-/// is therefore never able to turn a working call into a failing one, and the
-/// user-visible error for a degenerate image stays [`FilterError::DegenerateRange`],
-/// raised below.
-pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
-    #[cfg(feature = "cuda")]
-    if let Some(gpu) = sitk_cuda::try_rescale_intensity(img, output_min, output_max) {
-        return Ok(gpu);
-    }
-    rescale_intensity_cpu(img, output_min, output_max)
-}
-
-/// The CPU implementation of [`rescale_intensity`]; also the fallback the GPU
-/// path defers to.
+/// # CPU-only, by decision — not by omission
 ///
-/// Public because the GPU correctness gate in `doc/bench-spec.md` is defined
-/// against the CPU result, and with the `cuda` feature on
-/// [`rescale_intensity`] itself no longer reaches this code.
-pub fn rescale_intensity_cpu(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
+/// This filter had a CUDA kernel and dispatched to it when the `cuda` feature
+/// was on. Both are gone. The kernel was correct and it still lost: with the
+/// host output allocation driven to literally zero (a caller-owned destination,
+/// no page faults left to pay) it measured **1.4× slower than the CPU at 256³
+/// and 2.2× slower at 512³**. A per-pixel op has to cross PCIe twice to do one
+/// pass of arithmetic the CPU does at memory bandwidth without moving anything,
+/// so there is no size at which the GPU catches up — the bigger the volume, the
+/// worse it loses.
+///
+/// A dispatch branch that always loses is dead code that still has to be
+/// maintained, and this one silently doubled the surface of every pixel-type
+/// and error path. `doc/bench-results.md` keeps the measurement. `sitk-cuda`
+/// keeps exactly one op, the registration metric, where the *same* buffers are
+/// evaluated hundreds of times and the transfer amortizes to nothing.
+pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
     if img.number_of_pixels() == 0 {
         return Err(FilterError::DegenerateRange);
     }

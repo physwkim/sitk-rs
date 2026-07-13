@@ -869,7 +869,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sitk-core",
- "sitk-cuda",
  "thiserror",
 ]
 
