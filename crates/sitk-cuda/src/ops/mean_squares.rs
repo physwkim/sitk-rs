@@ -76,6 +76,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use crate::backend::{Backend, backend};
 use crate::buffer::DeviceBuffer;
 use crate::error::CudaError;
+use crate::image::DeviceImage;
 
 /// Threads per block. The kernel's shared-memory tree is exactly this wide.
 const BLOCK: u32 = 256;
@@ -341,7 +342,63 @@ impl ResidentMetric {
         moving_values: impl FnMut(usize, &mut [f64]),
     ) -> Result<Self, CudaError> {
         let backend = backend()?;
-        if n == 0 || moving.size.len() != DIM || moving.size.iter().product::<usize>() != moving.len
+        Self::build(
+            n,
+            DeviceBuffer::from_chunks(backend, n, fixed_values)?,
+            DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
+            fixed_points,
+            moving,
+        )
+    }
+
+    /// Build the metric from volumes that are **already on the device** — the
+    /// registration half of the residency pipeline.
+    ///
+    /// This is the transfer that residency deletes. The host-side [`new`](Self::new)
+    /// uploads the fixed samples and the moving volume, and when those volumes came
+    /// out of a device filter chain seconds earlier, it is re-uploading voxels that
+    /// were *already on the device*: 113.7 ms at 256³, the largest single item in
+    /// the chain. Here nothing crosses the bus. The `f64` copies the kernel reduces
+    /// in are made device-to-device ([`DeviceImage::widen_f64`], ~1 ms), and
+    /// `(double)x` is exact for every `f32`, so the metric sees exactly the numbers
+    /// the uploading path gave it.
+    ///
+    /// `fixed_points` is normally [`FixedPoints::Grid`] — a device-resident image is
+    /// a full grid with no sampling and no mask — and `moving` carries the moving
+    /// image's geometry (its `mask` must be `None`; a device image has no mask).
+    pub fn from_device(
+        fixed: &DeviceImage,
+        fixed_points: FixedPoints<'_>,
+        moving: &DeviceImage,
+        moving_geometry: &MovingGeometry<'_>,
+    ) -> Result<Self, CudaError> {
+        if moving.len() != moving_geometry.len {
+            return Err(CudaError::DegenerateInput);
+        }
+        Self::build(
+            fixed.len(),
+            fixed.widen_f64()?,
+            moving.widen_f64()?,
+            fixed_points,
+            moving_geometry,
+        )
+    }
+
+    /// The construction both constructors share: everything except where the two
+    /// `f64` volumes came from, which is the only thing they disagree about.
+    fn build(
+        n: usize,
+        d_fvals: DeviceBuffer<f64>,
+        d_mbuf: DeviceBuffer<f64>,
+        fixed_points: FixedPoints<'_>,
+        moving: &MovingGeometry<'_>,
+    ) -> Result<Self, CudaError> {
+        let backend = backend()?;
+        if n == 0
+            || d_fvals.len() != n
+            || d_mbuf.len() != moving.len
+            || moving.size.len() != DIM
+            || moving.size.iter().product::<usize>() != moving.len
         {
             return Err(CudaError::DegenerateInput);
         }
@@ -388,13 +445,13 @@ impl ResidentMetric {
 
         Ok(Self {
             n,
-            d_fvals: DeviceBuffer::from_chunks(backend, n, fixed_values)?,
+            d_fvals,
             d_fpts: DeviceBuffer::from_host(backend, pts)?,
             has_pts,
             d_fsize: DeviceBuffer::from_host(backend, &fsize)?,
             d_forigin: DeviceBuffer::from_host(backend, &forigin)?,
             d_fmat: DeviceBuffer::from_host(backend, &fmat)?,
-            d_mbuf: DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
+            d_mbuf,
             d_msize: DeviceBuffer::from_host(backend, &as_i64(moving.size))?,
             d_mstride: DeviceBuffer::from_host(backend, &as_i64(moving.strides))?,
             d_morigin: DeviceBuffer::from_host(backend, moving.origin)?,
