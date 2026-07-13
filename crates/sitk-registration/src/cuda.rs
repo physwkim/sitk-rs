@@ -69,15 +69,15 @@ struct Resident {
 
 /// The affine point map `x ↦ A·x + b` plus the Jacobian's affine decomposition,
 /// all recovered from the transform through its public trait.
-struct AffineForm {
+pub(crate) struct AffineForm {
     /// Row-major 3 × 3.
-    a: [f64; 9],
-    b: [f64; 3],
+    pub(crate) a: [f64; 9],
+    pub(crate) b: [f64; 3],
     /// `J(0)`, row-major `dim × nparams`.
-    j0: Vec<f64>,
+    pub(crate) j0: Vec<f64>,
     /// `C_e = J(e_e) − J(0)` for each basis direction `e`, same layout as `j0`.
-    c: [Vec<f64>; 3],
-    nparams: usize,
+    pub(crate) c: [Vec<f64>; 3],
+    pub(crate) nparams: usize,
 }
 
 /// The CUDA mean-squares backend. See the [module docs](self).
@@ -201,7 +201,7 @@ impl Default for CudaMetricBackend {
 /// column satisfies `J(x) = J(0) + Σ_e x_e·(J(e_e) − J(0))`. Both reconstructions
 /// are then checked against the transform itself at two probe points. This is the
 /// whole of the GPU's transform support: pass the check, run on the device.
-fn affine_form(transform: &dyn ParametricTransform) -> Option<AffineForm> {
+pub(crate) fn affine_form(transform: &dyn ParametricTransform) -> Option<AffineForm> {
     let dim = sitk_cuda::DIM;
     let nparams = transform.number_of_parameters();
     if nparams == 0 {
@@ -292,7 +292,7 @@ fn close(a: f64, b: f64) -> bool {
 /// Exact: this is the same sum the CPU accumulates per-sample, re-associated. The
 /// only difference from the CPU's result is the *order* the millions of per-sample
 /// terms were added in, which is a rounding difference, not a modelling one.
-fn contract(moments: &sitk_cuda::Moments, form: &AffineForm) -> MetricValue {
+pub(crate) fn contract(moments: &sitk_cuda::Moments, form: &AffineForm) -> MetricValue {
     let dim = sitk_cuda::DIM;
     let nparams = form.nparams;
 
