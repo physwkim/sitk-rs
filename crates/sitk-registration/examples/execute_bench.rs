@@ -76,6 +76,9 @@ fn main() {
     let iters: usize = std::env::args()
         .nth(3)
         .map_or(20, |s| s.parse().expect("iterations"));
+    let min_step: f64 = std::env::args()
+        .nth(4)
+        .map_or(1e-4, |s| s.parse().expect("min step"));
 
     let fixed = volume(n, 0.0);
     let moving = volume(n, 3.0);
@@ -87,7 +90,14 @@ fn main() {
         // built inside the pool's scope rather than moved into it.
         let mut reg = ImageRegistrationMethod::new();
         reg.set_metric_as_mean_squares();
-        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, iters, 1e-8);
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, min_step, iters, 1e-8);
+        // Optional 5th arg: condition the optimizer's step in physical units, which
+        // is what a caller registering a rotation *should* do. Without it a
+        // 1-radian rotation step is the same size as a 1-mm translation step.
+        if std::env::args().nth(5).as_deref() == Some("scales") {
+            reg.set_optimizer_scales_from_physical_shift();
+            println!("  (optimizer scales from physical shift)");
+        }
 
         // Burn NVRTC (once per process, size-independent) on a tiny volume — and on
         // the NATIVE type, so the device cast's kernel is compiled too and its
@@ -106,7 +116,7 @@ fn main() {
 
         println!(
             "== {n}^3 UInt16 in, {threads} CPU threads, sigma {SIGMA:?}, real execute(), \
-             max {iters} iterations\n"
+             max {iters} iterations, min step {min_step:e}\n"
         );
 
         // ---- host: cast -> rescale -> smooth -> execute -----------------------
@@ -171,17 +181,19 @@ fn main() {
             host_total / device_total
         );
         println!(
-            "\n  host   : {} iters, {} valid, metric {:.9}, params {:?}",
+            "\n  host   : {} iters, {} valid, metric {:.9}, stop {:?}, params {:?}",
             host.iterations,
             host.valid_points,
             host.metric_value,
+            host.stop_reason,
             host.transform.parameters()
         );
         println!(
-            "  device : {} iters, {} valid, metric {:.9}, params {:?}",
+            "  device : {} iters, {} valid, metric {:.9}, stop {:?}, params {:?}",
             device.iterations,
             device.valid_points,
             device.metric_value,
+            device.stop_reason,
             device.transform.parameters()
         );
         let worst = device

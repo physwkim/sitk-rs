@@ -445,12 +445,20 @@ fn the_full_resident_pipeline_agrees_with_the_host_pipeline() {
 }
 
 /// The optimizer drives the device metric through the **public API**, and lands
-/// where the host `execute` lands.
+/// where the host `execute` lands — *at this size, from this start*.
 ///
-/// This is the number that matters: `execute_on_device` runs the same optimizer,
-/// the same scales estimator and the same convergence test as `execute` — it is
-/// literally the same driver — so agreement here says the device metric steers the
-/// feedback loop the same way, not merely that one evaluation agrees.
+/// `execute_on_device` runs the same optimizer, the same scales estimator and the
+/// same convergence test as `execute` — it is literally the same driver — so
+/// agreement here says the device metric steers the feedback loop the same way, not
+/// merely that one evaluation agrees.
+///
+/// **Do not read this as a promise that the endpoints always match.** They do not.
+/// A 1e-12 difference in the derivative can flip a step-halving decision, and at
+/// 256³ with unit scales the two runs converge to different local minima 7.5e-3
+/// apart — see `execute_on_device`'s docs. What *is* guaranteed is pinned by
+/// `the_device_metric_is_the_same_objective_as_the_host_metric` below, and what a
+/// well-conditioned run does is pinned by
+/// `a_well_conditioned_run_lands_in_the_same_place_on_both_paths`.
 #[test]
 fn execute_on_device_lands_where_execute_lands() {
     if no_device() {
@@ -590,4 +598,143 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         ))
     ));
     println!("six refusals, each by name, all before the first iteration");
+}
+
+/// **The guarantee**, pinned: the device metric is the *same objective* as the host
+/// metric — not "the same optimizer endpoint", which is a different and weaker claim
+/// (see `execute_on_device`'s docs).
+///
+/// At any transform, the value and the derivative must agree to reduction-rounding
+/// (~1e-12 measured; the band is 1e-9) and the valid-sample count must agree
+/// *exactly*. This is the property every other guarantee rests on, and it is the one
+/// a future kernel change must not break — a derivative that drifts to 1e-6 would
+/// still pass a trajectory test on a benign case while quietly steering real
+/// registrations somewhere else.
+#[test]
+fn the_device_metric_is_the_same_objective_as_the_host_metric() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image(&fixed).unwrap(),
+        MovingImage::from_image(&moving).unwrap(),
+    )
+    .unwrap();
+    let d_fixed = DeviceImage::upload(&fixed).unwrap();
+    let d_moving = DeviceImage::upload(&moving).unwrap();
+    let device = DeviceMeanSquaresMetric::from_device(&d_fixed, &d_moving).unwrap();
+
+    let c = n as f64 / 2.0;
+    // Spread across the space the optimizer actually walks: the identity, a pure
+    // translation, a pure rotation, a mixed pose, and a pose far enough out that a
+    // large part of the fixed grid maps outside the moving image.
+    let transforms = [
+        Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]),
+        Euler3DTransform::new(0.0, 0.0, 0.0, [3.0, -2.0, 1.5], [c, c, c]),
+        Euler3DTransform::new(0.11, -0.07, 0.05, [0.0; 3], [c, c, c]),
+        Euler3DTransform::new(0.06, -0.04, 0.03, [2.5, -1.5, 0.75], [c, c, c]),
+        Euler3DTransform::new(-0.25, 0.18, -0.12, [9.0, -7.0, 5.0], [c, c, c]),
+    ];
+
+    let mut worst_v = 0.0f64;
+    let mut worst_d = 0.0f64;
+    for (k, t) in transforms.iter().enumerate() {
+        let cpu = host.evaluate(t, &CpuBackend);
+        let gpu = device.evaluate(t).unwrap();
+
+        assert_eq!(
+            gpu.valid_points, cpu.valid_points,
+            "transform {k}: the two metrics disagree about which samples are inside \
+             ({} vs {})",
+            gpu.valid_points, cpu.valid_points
+        );
+        assert!(cpu.valid_points > 0, "transform {k}: nothing mapped inside");
+        assert!(
+            cpu.derivative.iter().any(|d| d.abs() > 1e-6),
+            "transform {k}: the CPU derivative is ~zero, so the comparison proves nothing"
+        );
+
+        let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+        let v = rel(gpu.value, cpu.value);
+        let d = gpu
+            .derivative
+            .iter()
+            .zip(cpu.derivative.iter())
+            .map(|(&g, &c)| rel(g, c))
+            .fold(0.0f64, f64::max);
+        println!("transform {k}: value rel {v:e}, derivative rel {d:e}");
+        worst_v = worst_v.max(v);
+        worst_d = worst_d.max(d);
+    }
+    println!(
+        "worst over {} transforms: value {worst_v:e}, derivative {worst_d:e}",
+        transforms.len()
+    );
+    assert!(worst_v <= 1e-9, "value rel err {worst_v:e} exceeds 1e-9");
+    assert!(
+        worst_d <= 1e-9,
+        "derivative rel err {worst_d:e} exceeds 1e-9"
+    );
+}
+
+/// A **well-conditioned** run lands in the same place on both paths.
+///
+/// With unit scales, a 1-radian rotation step is the same size as a 1-mm translation
+/// step; the descent is chaotic, and host and device converge to different local
+/// minima (measured 7.5e-3 apart at 256³ — for the host too: it is the conditioning,
+/// not the device). Scale the parameters by their physical effect, as a caller
+/// registering a rotation should, and the amplification is gone: same iteration
+/// count, same valid points, parameters at the rounding floor.
+#[test]
+fn a_well_conditioned_run_lands_in_the_same_place_on_both_paths() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-6, 100, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .unwrap();
+
+    println!(
+        "host   : {} iters, {} valid, metric {:.12}",
+        host.iterations, host.valid_points, host.metric_value
+    );
+    println!(
+        "device : {} iters, {} valid, metric {:.12}",
+        device.iterations, device.valid_points, device.metric_value
+    );
+    assert_eq!(device.iterations, host.iterations, "different walk lengths");
+    assert_eq!(device.valid_points, host.valid_points);
+
+    let worst = device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .map(|(&d, &h)| (d - h).abs() / (1.0 + h.abs()))
+        .fold(0.0f64, f64::max);
+    println!("worst parameter disagreement: {worst:e}");
+    assert!(
+        worst <= 1e-9,
+        "a well-conditioned run must land in the same place; worst {worst:e}"
+    );
 }
