@@ -2528,17 +2528,29 @@ impl ImageRegistrationMethod {
     /// - a **globally affine** transform (translation, rigid, Euler, versor,
     ///   similarity, affine) — the moment identity the kernel evaluates holds for
     ///   exactly those, and a B-spline or displacement field is refused by name;
-    /// - **linear** interpolation, no masks, no sampling strategy (every voxel of
-    ///   the fixed grid);
+    /// - **linear** interpolation, no masks, and the default sampling *strategy*
+    ///   ([`SamplingStrategy::None`](crate::metric::SamplingStrategy::None), every
+    ///   voxel of the fixed grid). A configured sampling *percentage* is accepted:
+    ///   the `None` strategy ignores it on the host too, so refusing it would have
+    ///   cost the caller this path for a value that changes nothing;
     /// - a **multi-resolution pyramid**: each level is built on the device by the
     ///   same three ops in the same order [`prepare_level`](Self::prepare_level)
     ///   uses — `recursive_gaussian`, `shrink` for the coarse grid, `resample_linear`
     ///   onto it — and each of the three is bit-identical to the CPU filter it
     ///   transcribes (`pyramid_parity.rs`);
-    /// - no virtual domain and no fixed-initial transform: the fixed image's own
-    ///   grid is the sampling grid. A moving-initial transform *is* supported (it
-    ///   composes with the optimized transform and the composition is probed for
-    ///   affineness like any other).
+    /// - no virtual domain and no fixed-initial transform — not because the device
+    ///   cannot build the grid (`resample_linear` takes an arbitrary geometry; that
+    ///   is how the pyramid's coarse levels are made) but because either one makes
+    ///   `prepare_level` fold an *in-buffer predicate* into the level's fixed mask,
+    ///   and a device image carries no mask. A moving-initial transform *is*
+    ///   supported (it composes with the optimized transform and the composition is
+    ///   probed for affineness like any other).
+    ///
+    /// **The one capability that would move this boundary is a device mask.** It
+    /// closes [`UnsupportedMask`](DeviceRegistrationError::UnsupportedMask) and
+    /// [`UnsupportedVirtualDomain`](DeviceRegistrationError::UnsupportedVirtualDomain)
+    /// together — they are two refusals for one missing thing — and nothing else on
+    /// this list is a single capability away.
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
@@ -2611,9 +2623,14 @@ impl ImageRegistrationMethod {
                 self.interpolator,
             ));
         }
-        if !matches!(self.sampling_strategy, SamplingStrategy::None)
-            || self.sampling_percentage_per_level.iter().any(|&p| p != 1.0)
-        {
+        // The strategy alone, not the percentage. `SamplingStrategy::None` samples
+        // every voxel and **ignores** the percentage entirely — the `None` arm of
+        // `FixedSamples::from_image_with` never reads it (`metric.rs`, and its doc
+        // says so) — so a configured percentage under the default strategy changes
+        // nothing on the host either. Refusing it sent a caller to the CPU for a run
+        // this path computes identically, voxel for voxel: the gate was broader than
+        // the limit it names.
+        if !matches!(self.sampling_strategy, SamplingStrategy::None) {
             return Err(DeviceRegistrationError::UnsupportedSampling);
         }
         if self.fixed_mask.is_some() || self.moving_mask.is_some() {

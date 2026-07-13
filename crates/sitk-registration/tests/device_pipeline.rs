@@ -592,6 +592,60 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
     println!("five refusals, each by name, all before the first iteration");
 }
 
+/// The boundary refuses a sampling **strategy**, not a sampling **percentage**.
+///
+/// `SamplingStrategy::None` samples every voxel and ignores the percentage — the
+/// `None` arm of `FixedSamples::from_image_with` never reads it — so a percentage
+/// set under the default strategy changes nothing on the host. The boundary used to
+/// refuse it anyway, sending the caller to the CPU for a run this path computes
+/// voxel for voxel. Nothing caught that, so this does: the run must be *taken*, and
+/// it must land where the host lands.
+#[test]
+fn a_sampling_percentage_under_the_default_strategy_does_not_lose_the_device_path() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 32;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-5, 50, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+    // The strategy stays at its default (`None`); only the percentage is set.
+    reg.set_metric_sampling_percentage(0.25, 7);
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .expect("a percentage the host itself ignores must not cost the device path");
+
+    // Every voxel is a sample on both paths — the percentage changed nothing, which
+    // is the whole point.
+    assert_eq!(
+        host.valid_points, device.valid_points,
+        "the percentage was honored by one path and ignored by the other"
+    );
+    assert_eq!(host.iterations, device.iterations);
+
+    let worst = device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .map(|(&d, &h)| (d - h).abs() / (1.0 + h.abs()))
+        .fold(0.0f64, f64::max);
+    println!("worst parameter disagreement: {worst:e}");
+    assert!(worst <= 1e-9, "worst {worst:e}");
+}
+
 /// **The guarantee**, pinned: the device metric is the *same objective* as the host
 /// metric — not "the same optimizer endpoint", which is a different and weaker claim
 /// (see `execute_on_device`'s docs).
