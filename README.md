@@ -214,34 +214,34 @@ NDJSON frozen in [`bench/results/`](bench/results/) and the contract in
 [`doc/bench-spec.md`](doc/bench-spec.md). `bench/compare.py` proves both
 harnesses received a byte-identical input before any timing is compared.
 
-The headline: the port wins on `binary_dilate` (0.20×), `connected_component`
-(0.22×), `rescale_intensity` (0.45×), `signed_maurer_distance_map` (0.39×), is
-level on `otsu`/`median`/`fft_convolution`, and **loses on the separable/stencil
-family** — `mean` 4.4×, `gradient_magnitude` 4.3×. That loss was a *scaling* gap,
-not a constant-factor one, and its cause turned out to be **glibc's allocator**:
-`mean` was making **30,910,860 heap allocations per call** on the neighborhood
-boundary path, so at 48 threads the window walk ran 13.8 busy cores — blocked, not
-stalled. Fixed structurally (`push_values_checked` now takes a `&mut [i64]`, and a
-slice cannot grow, so the function *has no way* to allocate); `mean` at t48 went
-338.6 → 185.1 ms with all 16 `bit_parity` checksums unmoved. **The published table
-still shows the pre-fix numbers** — a clean sweep is owed, and the doc says so
-rather than quietly re-labelling.
+At 256³, all cores, `rust/itk` (below 1.00 means the port is faster): the port wins
+on `binary_dilate` **0.03×**, `connected_component` 0.25×, `signed_maurer_distance_map`
+0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `otsu` 0.57×, `discrete_gaussian`
+0.76×, `mean` 0.80×, `fft_convolution` 0.87×; and **loses on `gradient_magnitude`
+(1.51×) and `gmrg` (1.22×)**, both of which get worse at 512³ (2.00× and 2.93×).
+
+The interesting one is `mean`. It used to lose by **4.39×**, and the cause was not
+the kernel, the decomposition, bandwidth, or NUMA — each eliminated by measurement.
+It was **glibc's allocator**: `mean` made **30,910,860 heap allocations per call** on
+the neighborhood boundary path, so at 48 threads the window walk ran 13.8 busy cores.
+The threads were not stalled, they were *blocked*. Fixed structurally —
+`push_values_checked` now takes a `&mut [i64]`, and **a slice cannot grow, so the
+function has no way to allocate** — and `mean` went from 4.39× slower than ITK to
+**0.80×**, faster, with all 16 `bit_parity` checksums unmoved.
 
 Read §0 of that document before quoting any number from it; it says how much of
 each one you can trust.
 
 ## Roadmap
 
-1. **Finish the CPU scaling work.** The allocator was the dominant cause and is
-   fixed, but two things remain: `mean` now scales perfectly to 16 threads and
-   then stops dead (196 ms at t16, 185 at t48, ~20 busy cores — cause unknown,
-   chunk granularity ruled out), and `gradient_magnitude_recursive_gaussian`'s
-   1.88× loss is a *different* defect (44,429 allocations, never touches the
-   boundary path; most likely its per-axis full-volume `to_f64_vec()` copies).
-2. **Re-measure.** The published tables predate both the allocator fix and the
-   device metric-kernel fix.
-3. **Device coverage.** Mattes/correlation/ANTS on the device; masks and sampling
-   strategies. Then multi-GPU.
+1. **The two ops that still lose.** `gradient_magnitude` (1.51× at medium, 2.00× at
+   large) and `gmrg` (1.22× / 2.93×). The buffer fix that answered `gmrg`'s medium
+   case did not touch its large case at all.
+2. **Small-volume overhead.** `otsu` is 6.62× and `mean` 4.52× at 64³ — a fixed
+   per-call cost the reference size amortizes away and the headline hides.
+3. **Device coverage.** A nearest-neighbour resample, which is what a device mask
+   needs, and a device mask is what closes two of the boundary's refusals at once.
+   Then Mattes/correlation/ANTS, then multi-GPU.
 4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
