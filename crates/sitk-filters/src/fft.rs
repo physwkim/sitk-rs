@@ -24,6 +24,21 @@
 //!
 //! Both are exact DFTs; they differ only in operation count and round-off.
 //!
+//! # Two kernels
+//!
+//! The scalar butterflies above are one of the two 1-D kernels here. The other
+//! is `rustfft` (`MIT OR Apache-2.0`) — the same class of implementation as
+//! pocketfft, a planner over hand-written SIMD butterflies with Bluestein for
+//! the lengths that do not factor — with `realfft` (`MIT`) on top of it for
+//! real-valued input, which is what lets [`transform_r2c`]/[`transform_c2r`]
+//! spend a *half-length* complex transform on axis 0 instead of a full one.
+//! rustfft is about 3x the speed of the scalar kernel and a few ulps less exact,
+//! because it computes the roots of unity that pocketfft hardcodes.
+//!
+//! Which one a pass runs is [`LineKernel`], chosen per call site and never by
+//! default; that type documents what the choice costs and why the real-input
+//! pair can afford the fast kernel while the complex-spectrum API cannot.
+//!
 //! # Padding
 //!
 //! [`padded_length`] is `itkFFTPadImageFilter`'s next-size search
@@ -46,7 +61,11 @@
 
 use std::f64::consts::PI;
 use std::ops::{Add, Div, Mul, Sub};
+use std::sync::Arc;
 
+use realfft::RealFftPlanner;
+use rustfft::num_complex::Complex64;
+use rustfft::{Fft, FftPlanner};
 use sitk_core::parallel;
 
 /// A complex number. Crate-private: the public complex-pixel surface is
@@ -90,6 +109,16 @@ impl Complex {
     #[cfg(test)]
     fn unit(theta: f64) -> Self {
         Self::new(theta.cos(), theta.sin())
+    }
+
+    /// `rustfft`'s complex type. The same two `f64` in the same order, so the
+    /// conversion is a move and cannot perturb a value.
+    fn to_c64(self) -> Complex64 {
+        Complex64::new(self.re, self.im)
+    }
+
+    const fn from_c64(c: Complex64) -> Self {
+        Self::new(c.re, c.im)
     }
 }
 
@@ -506,14 +535,78 @@ fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
     }
 }
 
+/// Which 1-D kernel a separable pass runs. The two agree to the last few ulps
+/// and disagree below that, so the choice is a bit-level commitment and is made
+/// per call site, never by default.
+///
+/// # Why there are two
+///
+/// [`Planned`](LineKernel::Planned) is `rustfft`, and it is the faster kernel by
+/// roughly 3x: SIMD butterflies against this port's scalar ones. But rustfft
+/// derives its roots of unity from `cos`/`sin` of `-2π·j/n`
+/// (`rustfft::twiddles::compute_twiddle`), where pocketfft — and therefore
+/// [`Exact`](LineKernel::Exact), see [`radix_twiddles`] — hardcodes the
+/// correctly-rounded literals. `cos(2π/3)` is the standing example: rustfft gets
+/// `-0.4999999999999998`, two ulps from the exact `-0.5`.
+///
+/// Two ulps of twiddle is nothing next to a transform's own round-off, and for
+/// [`transform_r2c`]/[`transform_c2r`] — whose only caller is
+/// `fft_convolution`, an approximation of a spatial convolution to begin with —
+/// it is invisible. It is *not* invisible to a filter that round-trips through
+/// the spectrum and casts back to an integer pixel type: with exact twiddles the
+/// delta-kernel round trip of `itkInverseDeconvolutionImageFilter` returns
+/// `20.0` and truncates to `20`, and with rustfft's it returns
+/// `19.99999999999999289` and truncates to `19`. That is a visible, wrong pixel,
+/// and it is what `deconvolution::tests::output_keeps_the_input_pixel_type_and_
+/// geometry` pins.
+///
+/// So: the complex-spectrum API that filters round-trip through keeps the exact
+/// kernel, and the real-input pair — the one that carries the volume-sized cost
+/// — takes the fast one. Speed where the bits do not reach the output, exactness
+/// where they do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LineKernel {
+    /// This port's own butterflies on pocketfft's hardcoded twiddles.
+    Exact,
+    /// `rustfft`'s planner: SIMD butterflies on computed twiddles.
+    Planned,
+}
+
+/// `rustfft`'s plan for a length-`n` complex transform, `positive_exponent`
+/// selecting the sign.
+///
+/// rustfft calls `exp(-2πi jk/n)` *forward* and `exp(+2πi jk/n)` *inverse*, and
+/// normalizes neither — the convention this module already had. The plan is
+/// `Send + Sync` and transforms behind `&self`, so one plan serves every line of
+/// an axis on every worker.
+fn plan_c2c(planner: &mut FftPlanner<f64>, n: usize, positive_exponent: bool) -> Arc<dyn Fft<f64>> {
+    if positive_exponent {
+        planner.plan_fft_inverse(n)
+    } else {
+        planner.plan_fft_forward(n)
+    }
+}
+
 /// Unscaled separable transform of `data` along `axes` only, laid out
-/// first-index-fastest with extent `size`.
+/// first-index-fastest with extent `size`, on the [`LineKernel::Exact`] kernel.
 ///
 /// `forward` selects the `exp(-2πi …)` kernel. This is pocketfft's `c2c` with
 /// `fct = 1` over a subset of axes — the shape `general_c2r` uses when it
 /// transforms every axis but the halved one
 /// (`pocketfft_hdronly.h:3728`).
 pub(crate) fn transform_axes(data: &mut [Complex], size: &[usize], axes: &[usize], forward: bool) {
+    transform_axes_with(data, size, axes, forward, LineKernel::Exact);
+}
+
+/// [`transform_axes`], with the 1-D kernel named. See [`LineKernel`] for what
+/// the choice costs.
+fn transform_axes_with(
+    data: &mut [Complex],
+    size: &[usize],
+    axes: &[usize],
+    forward: bool,
+    kernel: LineKernel,
+) {
     let total: usize = size.iter().product();
     debug_assert_eq!(data.len(), total);
     if total == 0 {
@@ -523,30 +616,60 @@ pub(crate) fn transform_axes(data: &mut [Complex], size: &[usize], axes: &[usize
     // Parallel over lines ([`parallel::for_each_line_mut`]). Each 1-D transform
     // reads and writes only its own line, so lines are independent; the
     // butterflies *within* a line — the only place complex arithmetic
-    // accumulates — run in their unchanged sequential radix order. Output is
-    // bit-identical to the sequential pass. The axes stay sequential (each
-    // consumes the previous axis's result), and the gather/scatter line buffer
-    // is per-task rather than shared.
+    // accumulates — run in an order fixed by the length alone, whichever kernel
+    // it is. Output is bit-identical to the sequential pass at any worker count.
+    // The axes stay sequential (each consumes the previous axis's result), and
+    // the line and scratch buffers are per-task rather than shared.
+    let mut planner = FftPlanner::<f64>::new();
     for &axis in axes {
         let len = size[axis];
         if len < 2 {
             continue;
         }
-        parallel::for_each_line_mut(
-            data,
-            size,
-            axis,
-            || vec![Complex::default(); len],
-            |line, mut slot| {
-                for (t, v) in line.iter_mut().enumerate() {
-                    *v = slot.get(t);
-                }
-                transform_1d_unscaled(line, !forward);
-                for (t, &v) in line.iter().enumerate() {
-                    slot.set(t, v);
-                }
-            },
-        );
+        match kernel {
+            LineKernel::Exact => parallel::for_each_line_mut(
+                data,
+                size,
+                axis,
+                || vec![Complex::default(); len],
+                |line, mut slot| {
+                    for (t, v) in line.iter_mut().enumerate() {
+                        *v = slot.get(t);
+                    }
+                    transform_1d_unscaled(line, !forward);
+                    for (t, &v) in line.iter().enumerate() {
+                        slot.set(t, v);
+                    }
+                },
+            ),
+            // The plan holds this length's twiddle tables: built once per axis,
+            // shared across every line of it, because planning it per line would
+            // cost more than the transform.
+            LineKernel::Planned => {
+                let fft = plan_c2c(&mut planner, len, !forward);
+                let scratch_len = fft.get_inplace_scratch_len();
+                parallel::for_each_line_mut(
+                    data,
+                    size,
+                    axis,
+                    || {
+                        (
+                            vec![Complex64::default(); len],
+                            vec![Complex64::default(); scratch_len],
+                        )
+                    },
+                    |(line, scratch), mut slot| {
+                        for (t, v) in line.iter_mut().enumerate() {
+                            *v = slot.get(t).to_c64();
+                        }
+                        fft.process_with_scratch(line, scratch);
+                        for (t, &v) in line.iter().enumerate() {
+                            slot.set(t, Complex::from_c64(v));
+                        }
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -614,31 +737,46 @@ pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
     let n0 = size[0];
     let h = hsize[0];
 
-    // Axis 0, on the real input: transform each line in full and keep the bins
-    // below the half. Lines along axis 0 are contiguous in both buffers, so a
+    // Axis 0, on the real input: a real-to-complex transform, which *produces*
+    // the `h = n0 / 2 + 1` bins rather than computing all `n0` of them and
+    // discarding half. Lines along axis 0 are contiguous in both buffers, so a
     // line of `half` starting at `start` mirrors the line of `real` starting at
     // `start / h * n0` — see `Line::start`.
-    parallel::for_each_line_mut(
-        &mut half,
-        &hsize,
-        0,
-        || vec![Complex::default(); n0],
-        |line, mut slot| {
-            let base = slot.start() / h * n0;
-            for (t, v) in line.iter_mut().enumerate() {
-                *v = Complex::new(real[base + t], 0.0);
-            }
-            transform_1d_unscaled(line, false);
-            for (t, &v) in line.iter().take(h).enumerate() {
-                slot.set(t, v);
-            }
-        },
-    );
+    //
+    // A length-1 axis has no transform to take: the single bin is the sample,
+    // which is also what the complex kernel's `n < 2` early return gave.
+    if n0 < 2 {
+        parallel::for_each_mut(&mut half, |i, v| *v = Complex::new(real[i], 0.0));
+    } else {
+        let r2c = RealFftPlanner::<f64>::new().plan_fft_forward(n0);
+        let scratch_len = r2c.get_scratch_len();
+        parallel::for_each_line_mut(
+            &mut half,
+            &hsize,
+            0,
+            || {
+                (
+                    vec![0.0f64; n0],
+                    vec![Complex64::default(); h],
+                    vec![Complex64::default(); scratch_len],
+                )
+            },
+            |(line, spectrum, scratch), mut slot| {
+                let base = slot.start() / h * n0;
+                line.copy_from_slice(&real[base..base + n0]);
+                r2c.process_with_scratch(line, spectrum, scratch)
+                    .expect("r2c: the buffers are the planner's own lengths");
+                for (t, &v) in spectrum.iter().enumerate() {
+                    slot.set(t, Complex::from_c64(v));
+                }
+            },
+        );
+    }
 
     // The remaining axes, on the halved array: the same transform the full
     // spectrum would get, over half as many lines.
     let axes: Vec<usize> = (1..size.len()).collect();
-    transform_axes(&mut half, &hsize, &axes, true);
+    transform_axes_with(&mut half, &hsize, &axes, true, LineKernel::Planned);
     half
 }
 
@@ -658,16 +796,17 @@ pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
 ///
 /// Once the full axes are inverted, a line along axis 0 is the spectrum of a
 /// *real* signal in `x` alone — for each spatial `(y, z, …)` separately — so its
-/// missing bins are `G[n0 - x] = conj(G[x])` **on that same line**. The mirror in
-/// the other axes belongs to the untransformed spectrum, and inverting those axes
-/// is exactly what consumes it; applying it here as well would conjugate the
-/// wrong bin.
+/// missing bins are `G[n0 - x] = conj(G[x])` **on that same line**. That is
+/// exactly the hypothesis a C2R transform is entitled to make, and it is why the
+/// full axes must be inverted *first*: the mirror in the other axes belongs to
+/// the untransformed spectrum, and inverting those axes is what consumes it.
+/// Handing C2R a half-spectrum whose other axes are still in the frequency domain
+/// would reconstruct the wrong bins.
 ///
-/// Both parities fall out of one expression: `n0 - x` lands strictly inside
-/// `0 .. n0 / 2 + 1` for every `x` at or above the half. An even `n0`'s Nyquist
-/// bin (`x == n0 / 2`) sits *below* the half's end, so it is read straight out of
-/// `half` and never reconstructed; an odd `n0` has no such bin. Neither is
-/// special-cased.
+/// Both parities are the planner's business — it dispatches on `n0`'s — and an
+/// even `n0`'s Nyquist bin is the last bin of the half either way. The one thing
+/// the caller owes it is a DC bin (and Nyquist, when `n0` is even) with no
+/// imaginary part; see the note at the call.
 pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize]) -> Vec<f64> {
     let total: usize = size.iter().product();
     let hsize = half_size(size);
@@ -683,31 +822,52 @@ pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize]) -> Vec<f64> {
 
     // Every axis but the halved one: half as many lines as the full spectrum has.
     let axes: Vec<usize> = (1..size.len()).collect();
-    transform_axes(half, &hsize, &axes, false);
+    transform_axes_with(half, &hsize, &axes, false, LineKernel::Planned);
 
     let scale = 1.0 / total as f64;
     let half = &*half;
 
-    // Axis 0: rebuild the line's full spectrum from its own half, invert it, and
-    // keep the real part. Lines are contiguous along axis 0 in both buffers, so
-    // the line of `real` at `start` is the line of `half` at `start / n0 * h`.
+    // Axis 0: a complex-to-real transform of the line's own half. Lines are
+    // contiguous along axis 0 in both buffers, so the line of `real` at `start`
+    // is the line of `half` at `start / n0 * h`.
+    if n0 < 2 {
+        parallel::for_each_mut(&mut real, |i, v| *v = half[i].re * scale);
+        return real;
+    }
+    let c2r = RealFftPlanner::<f64>::new().plan_fft_inverse(n0);
+    let scratch_len = c2r.get_scratch_len();
     parallel::for_each_line_mut(
         &mut real,
         size,
         0,
-        || vec![Complex::default(); n0],
-        |line, mut slot| {
+        || {
+            (
+                vec![Complex64::default(); h],
+                vec![0.0f64; n0],
+                vec![Complex64::default(); scratch_len],
+            )
+        },
+        |(spectrum, line, scratch), mut slot| {
             let base = slot.start() / n0 * h;
-            for (x, v) in line.iter_mut().enumerate() {
-                *v = if x < h {
-                    half[base + x]
-                } else {
-                    half[base + (n0 - x)].conj()
-                };
+            for (t, v) in spectrum.iter_mut().enumerate() {
+                *v = half[base + t].to_c64();
             }
-            transform_1d_unscaled(line, true);
+            // The DC bin — and the Nyquist bin, when `n0` is even — are their own
+            // conjugate, so they are real in exact arithmetic. Round-off leaves an
+            // imaginary residue there, and C2R refuses a spectrum that carries one.
+            // Zero it: `realfft` clears both itself before transforming and reports
+            // the clearing as an `Err` afterwards
+            // (`ComplexToRealEven::process_with_scratch`), so doing it here moves no
+            // output bit and turns a spurious `Err` into the `Ok` the lengths already
+            // guarantee.
+            spectrum[0].im = 0.0;
+            if n0.is_multiple_of(2) {
+                spectrum[h - 1].im = 0.0;
+            }
+            c2r.process_with_scratch(spectrum, line, scratch)
+                .expect("c2r: the buffers are the planner's own lengths, DC and Nyquist are real");
             for (t, &v) in line.iter().enumerate() {
-                slot.set(t, v.re * scale);
+                slot.set(t, v * scale);
             }
         },
     );
