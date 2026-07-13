@@ -41,14 +41,14 @@ impl<T: DeviceRepr> DeviceBuffer<T> {
     ///
     /// Prefer, in order: [`copy_to_host`](Self::copy_to_host) into a destination
     /// reused across calls; or, when the result must be owned, a destination from
-    /// [`crate::host::resident_vec`], which is ~6× faster than this.
+    /// [`sitk_core::alloc::resident_vec`], which is ~6× faster than this.
     pub fn to_host(&self, backend: &Backend) -> Result<Vec<T>, CudaError> {
         Ok(backend.stream().clone_dtoh(&self.slice)?)
     }
 
     /// Copy the device buffer into an existing host slice (D2H), which must be
     /// at least as long. A destination that is already resident — reused across
-    /// calls, a [`crate::PinnedBuffer`], or a [`crate::host::resident_vec`] —
+    /// calls, a [`crate::PinnedBuffer`], or a [`sitk_core::alloc::resident_vec`] —
     /// avoids the fault cost described on [`DeviceBuffer::to_host`] and runs at
     /// link speed.
     pub fn copy_to_host(&self, backend: &Backend, dst: &mut [T]) -> Result<(), CudaError> {

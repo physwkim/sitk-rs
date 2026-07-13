@@ -22,7 +22,7 @@
 //! So this type earns its keep exactly where the buffer is **reused across
 //! calls**: the resident-volume registration loop, where the fixed and moving
 //! volumes are uploaded once and the per-iteration traffic is a few hundred
-//! bytes. For a one-shot op's output, use [`crate::host::resident_vec`] instead.
+//! bytes. For a one-shot op's output, use [`sitk_core::alloc::resident_vec`] instead.
 //!
 //! # Cacheable, not write-combined
 //!
