@@ -17,17 +17,35 @@ other. If a parameter must change, change it here first.
 
 ## Thread configurations
 
-Every op is measured in **three** configurations, because ITK's filters
-are multithreaded by default and a 1-vs-96 comparison would be a lie:
+Every op is measured in **four** configurations, because ITK's filters
+are multithreaded by default and a 1-vs-96 comparison would be a lie —
+and because a GPU number that includes the bus and one that does not are
+different facts, both true, and neither one usable without the other:
 
 | config | Rust | ITK C++ |
 |---|---|---|
 | `t1` | rayon pool pinned to 1 thread | `MultiThreaderBase::SetGlobalDefaultNumberOfThreads(1)` |
 | `tN` | rayon default pool (96) | ITK default (96) |
-| `gpu` | `sitk-cuda` feature on, device 0 | (not applicable — recorded as `null`) |
+| `gpu` | `sitk-cuda` feature on, device 0; the **one-shot** API `fn(&Image) -> Image` — H2D, kernel, D2H, every call | (not applicable — recorded as `null`) |
+| `gpu_resident` | same device, the **device-resident** API `fn(&DeviceImage) -> DeviceImage` — the volume is already on the device and the result stays there; upload and download happen once, outside the timed region | (not applicable — recorded as `null`) |
 
 `t1` is the honest scalar-vs-scalar number and the one that proves the
 port's *algorithmic* parity. `tN` is the number users actually feel.
+
+`gpu` and `gpu_resident` measure the same kernel and differ only in what
+surrounds it, which is the point: `gpu` prices a round-trip API, and
+`gpu_resident` prices the op. A pipeline of `k` ops pays the crossing once
+if it stays resident and `k` times if it does not, so **the difference
+between these two columns is the cost of the API shape, stated in
+milliseconds** rather than argued. Neither number may be quoted without the
+other.
+
+`gpu_resident` is Rust-only and, today, `rescale_intensity`-only. `sitk-cuda`
+has exactly two device-resident ops; the other is `smooth_gaussian`, which is
+**not** one of the twelve — it is a different filter from `discrete_gaussian`
+(a truncated `exp(-k²/2σ²)` FIR against ITK's `DiscreteGaussianImageFilter`),
+not a device port of it. Every other (op, size) still emits a `gpu_resident`
+row saying exactly that, per the never-omit-the-row rule below.
 
 ## Inputs — deterministic, identical across harnesses
 
@@ -149,7 +167,7 @@ One JSON object per (op, size, config) measurement, newline-delimited
   "op": "median",
   "size": "medium",
   "voxels": 16777216,
-  "config": "t1" | "tN" | "gpu",
+  "config": "t1" | "tN" | "gpu" | "gpu_resident",
   "threads": 96,
   "ms_mean": 812.4,
   "ms_median": 809.1,
@@ -165,9 +183,13 @@ One JSON object per (op, size, config) measurement, newline-delimited
 
 - `max_abs_err` / `max_rel_err` — the GPU correctness gate's two numbers,
   measured against the CPU f64 result. Non-null only on `config: "gpu"`
-  rows; `null` on CPU rows. (Added after the first GPU run: the
-  correctness-gate section above mandated these numbers but this schema
-  block did not carry fields for them.)
+  and `config: "gpu_resident"` rows; `null` on CPU rows. (Added after the
+  first GPU run: the correctness-gate section above mandated these numbers
+  but this schema block did not carry fields for them.) A `gpu_resident`
+  row is graded the same way and to the same tolerance as its `gpu` row:
+  the resident result is brought home **once**, outside the timed region,
+  purely to be checked. A residency measurement that skipped the check
+  would be measuring an unverified kernel.
 
 - `input_checksum` — FNV-1a 64 over the input buffer's little-endian
   bytes. **Both harnesses must produce the same value** for the same

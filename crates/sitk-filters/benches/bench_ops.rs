@@ -343,7 +343,7 @@ fn main() {
                                     ms_median: Some(ms_median),
                                     ms_stddev: Some(ms_stddev),
                                     samples: Some(SAMPLE_SIZE as u32),
-                                    input_checksum: Some(input_checksum),
+                                    input_checksum: Some(input_checksum.clone()),
                                     output_checksum: Some(gpu_output_checksum),
                                     max_abs_err: Some(max_abs_err),
                                     max_rel_err: Some(max_rel_err),
@@ -365,7 +365,7 @@ fn main() {
                                     ms_median: None,
                                     ms_stddev: None,
                                     samples: None,
-                                    input_checksum: Some(input_checksum),
+                                    input_checksum: Some(input_checksum.clone()),
                                     output_checksum: None,
                                     max_abs_err: None,
                                     max_rel_err: None,
@@ -392,7 +392,7 @@ fn main() {
                             ms_median: None,
                             ms_stddev: None,
                             samples: None,
-                            input_checksum: Some(input_checksum),
+                            input_checksum: Some(input_checksum.clone()),
                             output_checksum: None,
                             max_abs_err: None,
                             max_rel_err: None,
@@ -420,7 +420,7 @@ fn main() {
                         ms_median: None,
                         ms_stddev: None,
                         samples: None,
-                        input_checksum: Some(input_checksum),
+                        input_checksum: Some(input_checksum.clone()),
                         output_checksum: None,
                         max_abs_err: None,
                         max_rel_err: None,
@@ -431,6 +431,194 @@ fn main() {
                     },
                 );
             }
+
+            gpu_resident_row(
+                &mut out,
+                &mut criterion,
+                &criterion_dir,
+                &Measurement {
+                    op_key: op.key,
+                    size_name,
+                    voxels,
+                    input,
+                    reference_output: &reference_output,
+                    input_checksum: &input_checksum,
+                },
+            );
         }
+    }
+}
+
+/// The `gpu_resident` row: the op with the volume **already on the device** and
+/// the result **left there**, so no byte crosses the bus inside the timed region.
+///
+/// This is a third column, not a replacement for either of the other two, and the
+/// distinction is the entire point of the row:
+///
+/// - `gpu` measures the one-shot API `fn(&Image) -> Image` — H2D, kernel, D2H,
+///   every call. That is the honest cost of a round-trip API, and it is why the
+///   resident one was built. It keeps measuring exactly what it always measured.
+/// - `gpu_resident` measures the op. Upload and download happen once, outside the
+///   timer, as they would in a pipeline that keeps the volume resident across
+///   several ops.
+///
+/// A reader comparing the two sees the bus, priced. A reader comparing
+/// `gpu_resident` against `tN` sees the kernel against the CPU. Neither number is
+/// meaningful without the other, which is why they go in one table produced by one
+/// run on one machine state.
+///
+/// **Only `rescale_intensity` gets a real row here**, and the skip reasons below
+/// name why for everything else rather than collapsing into one string. `sitk-cuda`
+/// has exactly two device-resident ops: `rescale_intensity`, which *is* a benchmark
+/// op, and `smooth_gaussian`, which is **not** — it is `sitk_filters::smooth_gaussian`
+/// (an `exp(-k²/2σ²)` FIR truncated at `⌈4σ⌉`, σ in physical units), a different
+/// filter from this spec's `discrete_gaussian` (ITK's `DiscreteGaussianImageFilter`:
+/// variance, maximum error, kernel-width cap) and absent from the twelve.
+struct Measurement<'a> {
+    op_key: &'static str,
+    size_name: &'static str,
+    voxels: u64,
+    input: &'a Image,
+    /// The CPU result this op's GPU output is graded against.
+    reference_output: &'a Image,
+    input_checksum: &'a str,
+}
+
+fn gpu_resident_row(
+    out: &mut File,
+    criterion: &mut Criterion,
+    criterion_dir: &Path,
+    m: &Measurement<'_>,
+) {
+    let &Measurement {
+        op_key,
+        size_name,
+        voxels,
+        input,
+        reference_output,
+        input_checksum,
+    } = m;
+
+    let mut row = |ms: Option<(f64, f64, f64)>,
+                   output_checksum: Option<String>,
+                   errs: Option<(f64, f64)>,
+                   skipped: Option<String>| {
+        write_row(
+            out,
+            &Row {
+                harness: "rust",
+                op: op_key,
+                size: size_name,
+                voxels,
+                config: "gpu_resident",
+                threads: 0,
+                ms_mean: ms.map(|m| m.0),
+                ms_median: ms.map(|m| m.1),
+                ms_stddev: ms.map(|m| m.2),
+                samples: ms.map(|_| SAMPLE_SIZE as u32),
+                input_checksum: Some(input_checksum.to_string()),
+                output_checksum,
+                max_abs_err: errs.map(|e| e.0),
+                max_rel_err: errs.map(|e| e.1),
+                skipped,
+            },
+        );
+    };
+
+    if op_key != "rescale_intensity" {
+        row(
+            None,
+            None,
+            None,
+            Some(
+                "no device-resident kernel for this op. `sitk-cuda` has two \
+                 (`rescale_intensity` and `smooth_gaussian`), and `smooth_gaussian` is not \
+                 one of this spec's twelve ops -- it is a different filter from \
+                 `discrete_gaussian`, not a device port of it"
+                    .to_string(),
+            ),
+        );
+        return;
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (criterion, criterion_dir, input, reference_output);
+        row(
+            None,
+            None,
+            None,
+            Some(
+                "sitk-cuda feature not enabled for this build (the resident kernel exists; \
+                 only this build excludes it)"
+                    .to_string(),
+            ),
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        // Upload once, outside the timer. This is the residency premise: the volume
+        // is already here because some earlier op in the pipeline left it here.
+        let device_input = match sitk_cuda::DeviceImage::upload(input) {
+            Ok(d) => d,
+            Err(e) => {
+                row(
+                    None,
+                    None,
+                    None,
+                    Some(format!("rust gpu_resident upload did not run: {e}")),
+                );
+                return;
+            }
+        };
+
+        // Correctness, before timing: the resident result, brought home once, must
+        // match the CPU reference to the same tolerance the one-shot row is held to.
+        let (output_checksum, errs) = match sitk_cuda::rescale_intensity(
+            &device_input,
+            RESCALE_OUTPUT_MIN,
+            RESCALE_OUTPUT_MAX,
+        )
+        .and_then(|d| d.to_host())
+        {
+            Ok(host) => (
+                Some(checksum_hex(checksum_buffer(host.buffer()))),
+                Some(max_abs_rel_err(reference_output, &host)),
+            ),
+            Err(e) => {
+                row(
+                    None,
+                    None,
+                    None,
+                    Some(format!(
+                        "rust gpu_resident rescale_intensity did not run: {e}"
+                    )),
+                );
+                return;
+            }
+        };
+
+        // The timed region: device in, device out. The returned `DeviceImage` is
+        // dropped inside the loop, which frees device memory — the same allocation
+        // the one-shot form also pays, so the two remain comparable. What is *not*
+        // in here is the bus.
+        let bench_id = format!("{op_key}_{size_name}_gpu_resident");
+        criterion.bench_function(&bench_id, |b| {
+            b.iter(|| {
+                sitk_cuda::rescale_intensity(
+                    black_box(&device_input),
+                    RESCALE_OUTPUT_MIN,
+                    RESCALE_OUTPUT_MAX,
+                )
+                .expect("gpu resident op call")
+            });
+        });
+        row(
+            Some(read_estimates_ms(criterion_dir, &bench_id)),
+            output_checksum,
+            errs,
+            None,
+        );
     }
 }
