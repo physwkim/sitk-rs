@@ -100,8 +100,8 @@ extern "C" __global__ void rescale_f32(
 /// the reduction's per-block partials back to the host, which is where the
 /// final min/max fold happens (an exact, order-independent fold over ≤ 1024
 /// values). `alloc_ms` is the host-side cost of making the output buffer
-/// resident, and `d2h_ms` is then the DMA alone — see [`crate::host`] for why
-/// those two must not be reported as one number.
+/// resident, and `d2h_ms` is then the DMA alone — see
+/// [`sitk_core::alloc`] for why those two must not be reported as one number.
 pub fn rescale_intensity_gpu(
     img: &Image,
     output_min: f64,
@@ -120,7 +120,7 @@ pub fn rescale_intensity_gpu(
     // function returning a fresh `Image` cannot express. That is what
     // [`rescale_intensity_gpu_into`] is for.
     let t = Instant::now();
-    let mut host_out = crate::host::resident_vec::<f32>(n);
+    let mut host_out = sitk_core::alloc::resident_vec::<f32>(n);
     let alloc_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let mut timings = run(img, output_min, output_max, &mut host_out)?;

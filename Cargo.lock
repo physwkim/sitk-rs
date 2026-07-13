@@ -856,7 +856,6 @@ name = "sitk-cuda"
 version = "0.0.1"
 dependencies = [
  "cudarc",
- "libc",
  "sitk-core",
  "thiserror",
 ]
