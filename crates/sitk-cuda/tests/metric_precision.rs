@@ -1,18 +1,21 @@
-//! The metric's volumes are `f32` on the device-resident path and `f64` on the
-//! host-producer path, and the claim is that this changes **nothing**.
+//! The metric reads its **fixed** samples as `f32` and its **moving** image as `f64`
+//! on the device-resident path, against `f64`/`f64` on the host-producer path, and
+//! the claim is that this changes **nothing**.
 //!
-//! `ResidentMetric::from_device` used to widen both volumes to `f64` before the
-//! kernel ran — a device-to-device pass costing ~11 ms at 256³ and doubling the
-//! volumes' device memory. It no longer does: the kernel loads `float` and widens
-//! each load where it reduces, and every multiply, add and accumulator stays
-//! `double`.
+//! `ResidentMetric::from_device` narrows the fixed volume (one load per sample) and
+//! leaves the moving volume wide (eight loads per sample, the trilinear corners),
+//! which banks half the memory saving for a conversion cost that does not show above
+//! the noise — see `from_device`'s docs for the three-way measurement. Whatever the
+//! layout, the kernel widens each load where it reduces, and every multiply, add and
+//! accumulator stays `double`.
 //!
 //! That is only sound if `(double)x` is exact for every `f32`, which it is: `f64`
 //! has strictly more exponent range and mantissa bits than `f32`, so the widening
 //! is a lossless re-encoding of the same real number and the arithmetic that
 //! follows sees the identical operands. This test asserts it rather than trusting
 //! it — the same voxels, through both instantiations of the kernel, must produce
-//! moments that agree **to the last bit**.
+//! moments that agree **to the last bit**. This is the gate on the layout: any
+//! future change to which volume is narrowed has to keep passing it.
 #![cfg(feature = "cuda")]
 
 use sitk_core::{Image, PixelId};
@@ -112,7 +115,7 @@ fn moments_f64(fixed: &Image, moving: &Image, n: usize) -> Moments {
     m.evaluate(&A, &B).unwrap()
 }
 
-fn moments_f32(fixed: &Image, moving: &Image, n: usize) -> Moments {
+fn moments_split(fixed: &Image, moving: &Image, n: usize) -> Moments {
     let (size, strides, origin, mat) = geometry(n);
     let mg = MovingGeometry {
         len: n * n * n,
@@ -137,7 +140,7 @@ fn moments_f32(fixed: &Image, moving: &Image, n: usize) -> Moments {
 }
 
 #[test]
-fn the_f32_volumes_give_bit_identical_moments_to_the_f64_volumes() {
+fn the_split_volumes_give_bit_identical_moments_to_the_f64_volumes() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -146,10 +149,13 @@ fn the_f32_volumes_give_bit_identical_moments_to_the_f64_volumes() {
     let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
 
     let wide = moments_f64(&fixed, &moving, n);
-    let narrow = moments_f32(&fixed, &moving, n);
+    let narrow = moments_split(&fixed, &moving, n);
 
     println!("f64 volumes: sq {:.17e}  count {}", wide.sq, wide.count);
-    println!("f32 volumes: sq {:.17e}  count {}", narrow.sq, narrow.count);
+    println!(
+        "f32 fixed / f64 moving: sq {:.17e}  count {}",
+        narrow.sq, narrow.count
+    );
     assert_eq!(
         wide.count, narrow.count,
         "the two kernels disagreed about which samples are inside"
@@ -157,7 +163,7 @@ fn the_f32_volumes_give_bit_identical_moments_to_the_f64_volumes() {
     assert_eq!(
         wide.sq.to_bits(),
         narrow.sq.to_bits(),
-        "Σdiff² moved: f64 {:.17e} vs f32 {:.17e}",
+        "Σdiff² moved: f64/f64 {:.17e} vs split {:.17e}",
         wide.sq,
         narrow.sq
     );
@@ -182,7 +188,7 @@ fn the_f32_volumes_give_bit_identical_moments_to_the_f64_volumes() {
 }
 
 #[test]
-fn the_f32_metric_is_bit_identical_run_to_run() {
+fn the_split_metric_is_bit_identical_run_to_run() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -190,9 +196,9 @@ fn the_f32_metric_is_bit_identical_run_to_run() {
     let n = 48;
     let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
 
-    let first = moments_f32(&fixed, &moving, n);
+    let first = moments_split(&fixed, &moving, n);
     for run in 1..4 {
-        let again = moments_f32(&fixed, &moving, n);
+        let again = moments_split(&fixed, &moving, n);
         assert_eq!(first.sq.to_bits(), again.sq.to_bits(), "run {run}: Σdiff²");
         assert_eq!(first.count, again.count, "run {run}: count");
         for d in 0..3 {

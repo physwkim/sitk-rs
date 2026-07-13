@@ -2430,6 +2430,40 @@ impl ImageRegistrationMethod {
     ///
     /// If a device failure occurs *during* the run, the run is discarded and the
     /// error returned — see [`DeviceActive`].
+    ///
+    /// # This does not always land where [`execute`](Self::execute) lands
+    ///
+    /// **What is guaranteed:** the device metric computes the *same objective* as the
+    /// host metric. At any given transform, value and derivative agree to ~1e-12
+    /// relative and the valid-sample count agrees exactly (`the_device_metric_is_the_
+    /// same_objective_as_the_host_metric` pins this). The residual is reduction
+    /// rounding: the CPU sums N terms left to right, and no parallel reduction
+    /// reproduces that order.
+    ///
+    /// **What is not:** the *optimizer's endpoint*. A gradient descent is a feedback
+    /// loop, and this one branches discretely — `RegularStepGradientDescent` halves
+    /// its step whenever the gradient direction reverses. A 1e-12 difference in the
+    /// derivative can flip such a decision, after which the two runs are on different
+    /// trajectories. Measured at 256³ against `execute`, starting from the same
+    /// transform: the parameters agree to 4e-13 after one iteration, 2e-10 after two,
+    /// 5e-8 after three — growing ~500× per step — and the two runs converge (both
+    /// `StepTooSmall`) to *different local minima*, 7.5e-3 apart in the worst
+    /// parameter. Converging harder does not fix it: the gap is the same at a step
+    /// tolerance of 1e-8 as at 1e-4.
+    ///
+    /// **What makes it go away:** that amplification is a property of an
+    /// ill-conditioned parameter space, not of the device. With unit scales, a
+    /// 1-radian rotation step is the same size as a 1-mm translation step, and the
+    /// descent is chaotic *for the host too* — the host run is simply the one you
+    /// happened to see first. Call
+    /// [`set_optimizer_scales_from_physical_shift`](Self::set_optimizer_scales_from_physical_shift)
+    /// (or set scales yourself), and at 256³ the two paths take the **same 33
+    /// iterations** to the **same 16 580 608 valid points** and the same metric, with
+    /// the worst parameter disagreeing by **7.7e-14** — the rounding floor.
+    ///
+    /// So: a well-conditioned registration lands in the same place on both paths. An
+    /// ill-conditioned one lands in *a* minimum on both paths, but not necessarily the
+    /// same one, and that is worth knowing before you diff two result files.
     #[cfg(feature = "cuda")]
     pub fn execute_on_device<T: ParametricTransform>(
         &self,

@@ -92,16 +92,22 @@ const NSLOT: usize = 14;
 /// is written for `dim = 3` and a 2-D caller falls back to the CPU.
 pub const DIM: usize = 3;
 
-/// The kernel body, with the *volume* element type left open as `SCALAR`. It is
-/// instantiated twice — `double` and `float` — and nothing else about the two
-/// differs.
+/// The kernel body, with the two volumes' element types left open — `FSCALAR` for
+/// the fixed samples, `MSCALAR` for the moving image. Nothing else about the
+/// instantiations differs.
 ///
-/// The volumes are the only `SCALAR`: every load widens to `double` on the spot
+/// The volumes are the only scalars: every load widens to `double` on the spot
 /// (`(double)x` is exact for every `f32`) and every multiply, add and accumulator
-/// below is `double` in both instantiations. That is what makes the `float`
-/// instantiation bit-identical to the `double` one **when the voxels came from an
-/// `f32` image** — which is exactly when it is used. It halves the volumes'
-/// device memory and deletes the widening pass that used to precede the metric.
+/// below is `double` in every instantiation. That is what makes a narrowed volume
+/// bit-identical to a wide one **when the voxels came from an `f32` image** —
+/// which is exactly when it is narrowed.
+///
+/// The two are separate because they are not symmetric. The fixed value is **one**
+/// load per sample; the moving image is **eight** (the trilinear corners). Each
+/// `f32` load costs an `f32 → f64` conversion, which issues on the FP64 pipe that
+/// Ada runs at 1:64 — so narrowing the moving image buys half the memory at eight
+/// ninths of the conversion cost, while narrowing the fixed samples buys the other
+/// half of the memory at one ninth of it. See [`Volumes`].
 const KERNEL_BODY: &str = r#"
 #define BLOCK 256
 #define NSLOT 14
@@ -116,14 +122,14 @@ __device__ __forceinline__ bool is_inside(const double* c, const long long* size
 }
 
 extern "C" __global__ void ms_moments(
-    const SCALAR* __restrict__ fvals,     // fixed sample values, n
+    const FSCALAR* __restrict__ fvals,    // fixed sample values, n
     const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); unused if !has_pts
     const int has_pts,
     const long long* __restrict__ fsize,  // 3, fixed grid size (used if !has_pts)
     const double* __restrict__ forigin,   // 3
     const double* __restrict__ fmat,      // 3x3 index_to_physical, row-major
     const long long n,
-    const SCALAR* __restrict__ mbuf,      // moving image buffer
+    const MSCALAR* __restrict__ mbuf,     // moving image buffer
     const long long* __restrict__ msize,  // 3
     const long long* __restrict__ mstride,// 3
     const double* __restrict__ morigin,   // 3
@@ -255,30 +261,40 @@ extern "C" __global__ void ms_moments(
 
 /// The kernel source for a volume element type, compiled once per process (the
 /// backend caches modules by source).
-fn kernel_src(scalar: &str) -> &'static str {
-    static F64: OnceLock<String> = OnceLock::new();
-    static F32: OnceLock<String> = OnceLock::new();
-    let cell = if scalar == "float" { &F32 } else { &F64 };
-    cell.get_or_init(|| format!("#define SCALAR {scalar}\n{KERNEL_BODY}"))
+fn kernel_src(fixed: &str, moving: &str) -> &'static str {
+    static WIDE: OnceLock<String> = OnceLock::new();
+    static SPLIT: OnceLock<String> = OnceLock::new();
+    static NARROW: OnceLock<String> = OnceLock::new();
+    let cell = match (fixed, moving) {
+        ("float", "float") => &NARROW,
+        ("float", _) => &SPLIT,
+        _ => &WIDE,
+    };
+    cell.get_or_init(|| format!("#define FSCALAR {fixed}\n#define MSCALAR {moving}\n{KERNEL_BODY}"))
         .as_str()
 }
 
-/// The fixed samples and the moving volume, in the precision they arrived in.
+/// The fixed samples and the moving volume, in the precision the kernel reads them.
 ///
-/// The element type is not a tuning knob — it is the precision of the source. A
-/// [`DeviceImage`] is `f32`, so [`ResidentMetric::from_device`] keeps `f32` and
-/// the kernel widens each load; the host-producer path
-/// ([`ResidentMetric::new`]) accepts *any* pixel type, including `Float64` and
-/// `Int64`, so it stays `f64` and narrowing there would silently lose bits the
-/// caller handed us.
+/// Not a tuning knob for the caller: the *host-producer* path
+/// ([`ResidentMetric::new`]) accepts any pixel type, including `Float64` and
+/// `Int64`, so it stays [`F64`](Volumes::F64) — narrowing there would drop bits the
+/// caller handed us. The *device* path ([`ResidentMetric::from_device`]) reads `f32`
+/// images, so narrowing is lossless and the only question is which volume to narrow.
+///
+/// It narrows the **fixed** samples and leaves the moving image wide, because the
+/// two are not symmetric: one fixed load per sample against eight moving loads (the
+/// trilinear corners), while the memory splits evenly between them. See
+/// [`from_device`](ResidentMetric::from_device) for the measurement.
 enum Volumes {
     F64 {
         fvals: DeviceBuffer<f64>,
         mbuf: DeviceBuffer<f64>,
     },
-    F32 {
+    /// Fixed narrow, moving wide.
+    Split {
         fvals: DeviceBuffer<f32>,
-        mbuf: DeviceBuffer<f32>,
+        mbuf: DeviceBuffer<f64>,
     },
 }
 
@@ -286,7 +302,15 @@ impl Volumes {
     fn lens(&self) -> (usize, usize) {
         match self {
             Volumes::F64 { fvals, mbuf } => (fvals.len(), mbuf.len()),
-            Volumes::F32 { fvals, mbuf } => (fvals.len(), mbuf.len()),
+            Volumes::Split { fvals, mbuf } => (fvals.len(), mbuf.len()),
+        }
+    }
+
+    /// Device bytes held by the two volumes.
+    fn bytes(&self) -> usize {
+        match self {
+            Volumes::F64 { fvals, mbuf } => 8 * fvals.len() + 8 * mbuf.len(),
+            Volumes::Split { fvals, mbuf } => 4 * fvals.len() + 8 * mbuf.len(),
         }
     }
 }
@@ -409,14 +433,32 @@ impl ResidentMetric {
     /// uploads the fixed samples and the moving volume, and when those volumes came
     /// out of a device filter chain seconds earlier, it is re-uploading voxels that
     /// were *already on the device*: 113.7 ms at 256³, the largest single item in
-    /// the chain. Here nothing crosses the bus — and nothing is widened either: the
-    /// volumes stay `f32`, as the images are, and the kernel widens each load to
-    /// `double` where it reduces. `(double)x` is exact for every `f32`, so the
-    /// moments are the same numbers to the last bit as the widened path produced,
-    /// at half the device memory.
+    /// the chain. Here nothing crosses the bus.
     ///
-    /// The two `f32` buffers are private device-to-device copies: the caller may
-    /// drop or reuse the images afterwards.
+    /// # Which volume is narrowed, and why only one
+    ///
+    /// The images are `f32`, so keeping either volume `f32` is lossless
+    /// (`(double)x` is exact) — but each `f32` load costs a conversion on the FP64
+    /// pipe, and the two volumes are read at very different rates: **one** fixed
+    /// load per sample against **eight** moving loads (the trilinear corners), while
+    /// the memory splits evenly. Measured at 256³ on an RTX 5000 Ada:
+    ///
+    /// ```text
+    ///   256^3, mean of 3        per evaluation           volume bytes
+    ///   f64 fixed / f64 moving     5.755 ms                 268 MB
+    ///   f32 fixed / f32 moving     6.088 ms   (+5.8%)       134 MB
+    ///   f32 fixed / f64 moving     5.747 ms   (-0.1%)       201 MB   <- this
+    ///
+    ///   128^3                      0.816 / 0.873 (+7.0%) / 0.826 (+1.2%) ms
+    /// ```
+    ///
+    /// So the fixed samples are narrowed and the moving image is left wide: half the
+    /// memory saving for a conversion cost that does not show above the noise at 256³
+    /// and is ~1% at 128³. Narrowing *both* pays eight more conversions per sample for
+    /// the other half of the memory, and costs 6–7%.
+    ///
+    /// The buffers are private device-to-device copies, so the caller may drop or
+    /// reuse the images.
     ///
     /// `fixed_points` is normally [`FixedPoints::Grid`] — a device-resident image is
     /// a full grid with no sampling and no mask — and `moving` carries the moving
@@ -433,9 +475,11 @@ impl ResidentMetric {
         let backend = backend()?;
         Self::build(
             fixed.len(),
-            Volumes::F32 {
+            Volumes::Split {
+                // The fixed samples: narrow, one load per sample.
                 fvals: DeviceBuffer::copy_of(backend, fixed.buffer().device())?,
-                mbuf: DeviceBuffer::copy_of(backend, moving.buffer().device())?,
+                // The moving image: wide, eight loads per sample.
+                mbuf: moving.widen_f64()?,
             },
             fixed_points,
             moving_geometry,
@@ -527,6 +571,12 @@ impl ResidentMetric {
         self.n
     }
 
+    /// Device bytes held by the two volumes — what the precision choice above is
+    /// spending.
+    pub fn volume_bytes(&self) -> usize {
+        self.vols.bytes()
+    }
+
     /// Evaluate the moments for the point map `x ↦ A·x + b`.
     ///
     /// `a` is row-major `3 × 3`, `b` is length 3. Deterministic: the same inputs
@@ -570,8 +620,8 @@ impl ResidentMetric {
         // The two instantiations differ in the element type of `fvals`/`mbuf` and
         // in nothing else — same sixteen arguments, same order, same grid.
         macro_rules! launch_moments {
-            ($scalar:expr, $fvals:expr, $mbuf:expr) => {{
-                let f = backend.function(kernel_src($scalar), "ms_moments")?;
+            ($fscalar:expr, $mscalar:expr, $fvals:expr, $mbuf:expr) => {{
+                let f = backend.function(kernel_src($fscalar, $mscalar), "ms_moments")?;
                 let mut launch = backend.stream().launch_builder(&f);
                 launch
                     .arg($fvals.device())
@@ -591,8 +641,9 @@ impl ResidentMetric {
                     .arg(d_ab.device())
                     .arg(d_partials.device_mut());
                 // SAFETY: the sixteen arguments match the kernel's sixteen
-                // parameters in order and type — `fvals` and `mbuf` are `SCALAR`,
-                // which is the element type of the buffers this arm matched.
+                // parameters in order and type — `fvals` is `FSCALAR` and `mbuf` is
+                // `MSCALAR`, which are the element types of the buffers this arm
+                // matched.
                 // `fvals` holds `n` elements, read only under `s < n`. `d_fpts`
                 // holds `n*3` and is read only when `has_pts != 0`; otherwise it is
                 // a one-element dummy and the kernel reads `d_fsize`/`d_forigin`/
@@ -610,8 +661,8 @@ impl ResidentMetric {
             }};
         }
         match vols {
-            Volumes::F64 { fvals, mbuf } => launch_moments!("double", fvals, mbuf),
-            Volumes::F32 { fvals, mbuf } => launch_moments!("float", fvals, mbuf),
+            Volumes::F64 { fvals, mbuf } => launch_moments!("double", "double", fvals, mbuf),
+            Volumes::Split { fvals, mbuf } => launch_moments!("float", "double", fvals, mbuf),
         }
 
         d_partials.copy_to_host(backend, h_partials)?;
