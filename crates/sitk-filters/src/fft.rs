@@ -569,6 +569,151 @@ pub(crate) fn transform_nd(data: &mut [Complex], size: &[usize], inverse: bool) 
     }
 }
 
+/// Extent of the halved axis in a half-spectrum: `n / 2 + 1` bins.
+///
+/// Both parities in one expression, deliberately. For even `n` the last bin is
+/// Nyquist (`n / 2`); for odd `n` there is no Nyquist bin and the last is
+/// `(n - 1) / 2`. Nothing downstream special-cases the two — see
+/// [`transform_c2r`], whose mirror `n - x` lands inside `0 .. n / 2 + 1` for
+/// every `x` above the half either way.
+pub(crate) fn half_extent(n: usize) -> usize {
+    n / 2 + 1
+}
+
+/// The extent of the half-spectrum of an image of extent `size`: axis 0 halved,
+/// every other axis full.
+pub(crate) fn half_size(size: &[usize]) -> Vec<usize> {
+    let mut half = size.to_vec();
+    if let Some(n0) = half.first_mut() {
+        *n0 = half_extent(*n0);
+    }
+    half
+}
+
+/// Forward transform of **real** data, keeping only the half of the spectrum that
+/// is not redundant: extent `n0 / 2 + 1` along axis 0, full along the rest.
+///
+/// A real signal's spectrum is conjugate-symmetric, so the discarded half is
+/// determined by the half that is kept — computing, storing and multiplying it is
+/// work for a result already in hand. This is what ITK's R2C does, and it halves
+/// both the flops and the memory traffic of every axis after the first.
+///
+/// Pairs with [`transform_c2r`]. The product of two half-spectra is the
+/// half-spectrum of the product, because the multiply is elementwise: the halving
+/// costs the caller nothing but the extent it indexes with.
+pub(crate) fn transform_r2c(real: &[f64], size: &[usize]) -> Vec<Complex> {
+    let total: usize = size.iter().product();
+    debug_assert_eq!(real.len(), total);
+    let hsize = half_size(size);
+    let htotal: usize = hsize.iter().product();
+    let mut half = vec![Complex::default(); htotal];
+    if total == 0 {
+        return half;
+    }
+
+    let n0 = size[0];
+    let h = hsize[0];
+
+    // Axis 0, on the real input: transform each line in full and keep the bins
+    // below the half. Lines along axis 0 are contiguous in both buffers, so a
+    // line of `half` starting at `start` mirrors the line of `real` starting at
+    // `start / h * n0` — see `Line::start`.
+    parallel::for_each_line_mut(
+        &mut half,
+        &hsize,
+        0,
+        || vec![Complex::default(); n0],
+        |line, mut slot| {
+            let base = slot.start() / h * n0;
+            for (t, v) in line.iter_mut().enumerate() {
+                *v = Complex::new(real[base + t], 0.0);
+            }
+            transform_1d_unscaled(line, false);
+            for (t, &v) in line.iter().take(h).enumerate() {
+                slot.set(t, v);
+            }
+        },
+    );
+
+    // The remaining axes, on the halved array: the same transform the full
+    // spectrum would get, over half as many lines.
+    let axes: Vec<usize> = (1..size.len()).collect();
+    transform_axes(&mut half, &hsize, &axes, true);
+    half
+}
+
+/// Inverse of [`transform_r2c`]: the real signal whose half-spectrum is `half`.
+///
+/// Equals the real part of the full inverse transform of the conjugate-symmetric
+/// extension of `half`, scaled by `1 / total` exactly as [`transform_nd`] scales
+/// its inverse.
+///
+/// The axes must be inverted in this order — every full axis first, the halved
+/// one last — because only the halved axis is stored in half, and it is the last
+/// pass that turns complex into real. That reordering is also why this is not
+/// bit-identical to inverting a full spectrum: the same additions happen in a
+/// different order.
+///
+/// # The symmetry this reads, and when it holds
+///
+/// Once the full axes are inverted, a line along axis 0 is the spectrum of a
+/// *real* signal in `x` alone — for each spatial `(y, z, …)` separately — so its
+/// missing bins are `G[n0 - x] = conj(G[x])` **on that same line**. The mirror in
+/// the other axes belongs to the untransformed spectrum, and inverting those axes
+/// is exactly what consumes it; applying it here as well would conjugate the
+/// wrong bin.
+///
+/// Both parities fall out of one expression: `n0 - x` lands strictly inside
+/// `0 .. n0 / 2 + 1` for every `x` at or above the half. An even `n0`'s Nyquist
+/// bin (`x == n0 / 2`) sits *below* the half's end, so it is read straight out of
+/// `half` and never reconstructed; an odd `n0` has no such bin. Neither is
+/// special-cased.
+pub(crate) fn transform_c2r(half: &mut [Complex], size: &[usize]) -> Vec<f64> {
+    let total: usize = size.iter().product();
+    let hsize = half_size(size);
+    let htotal: usize = hsize.iter().product();
+    debug_assert_eq!(half.len(), htotal);
+    let mut real = vec![0.0f64; total];
+    if total == 0 {
+        return real;
+    }
+
+    let n0 = size[0];
+    let h = hsize[0];
+
+    // Every axis but the halved one: half as many lines as the full spectrum has.
+    let axes: Vec<usize> = (1..size.len()).collect();
+    transform_axes(half, &hsize, &axes, false);
+
+    let scale = 1.0 / total as f64;
+    let half = &*half;
+
+    // Axis 0: rebuild the line's full spectrum from its own half, invert it, and
+    // keep the real part. Lines are contiguous along axis 0 in both buffers, so
+    // the line of `real` at `start` is the line of `half` at `start / n0 * h`.
+    parallel::for_each_line_mut(
+        &mut real,
+        size,
+        0,
+        || vec![Complex::default(); n0],
+        |line, mut slot| {
+            let base = slot.start() / n0 * h;
+            for (x, v) in line.iter_mut().enumerate() {
+                *v = if x < h {
+                    half[base + x]
+                } else {
+                    half[base + (n0 - x)].conj()
+                };
+            }
+            transform_1d_unscaled(line, true);
+            for (t, &v) in line.iter().enumerate() {
+                slot.set(t, v.re * scale);
+            }
+        },
+    );
+    real
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
