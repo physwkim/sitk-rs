@@ -166,63 +166,58 @@ fn write_point_at(
     }
 }
 
-/// How many threads [`fill_grid_points`] splits the fill across.
+/// The physical point of every voxel of `size`, row-major `N × dim`, in the
+/// dim-0-fastest traversal order [`increment`] produces.
 ///
-/// The buffer is `N × dim` `f64` — 402 MB at 256³ — and it is freshly allocated,
-/// so *the fill is also the first touch*: Linux faults and zeroes a page per 4 KB
-/// as it is written. Spreading the fill across threads spreads the fault storm
-/// with it, which is the whole of the win here; the arithmetic was never the cost.
-const FILL_THREADS: usize = 16;
-
-/// Below this, the thread spawn costs more than the fill.
-const FILL_MIN_SAMPLES: usize = 1 << 16;
-
-/// Fill `points` (`N × dim`, row-major) with the physical point of every voxel of
-/// `size`, in the dim-0-fastest traversal order [`increment`] produces.
+/// The buffer is 402 MB at 256³ and freshly allocated, so *the fill is also the
+/// first touch*: Linux faults and zeroes one page per 4 KB as it is written.
+/// [`sitk_core::parallel::map_indexed_init`] spreads that fault storm across the
+/// pool and, because it writes into uninitialized capacity, it writes each page
+/// exactly once — the `vec![0.0; n * dim]` this replaces faulted the whole buffer
+/// serially first and then overwrote it.
 ///
-/// Each element is a pure function of its own sample index, so splitting the fill
-/// across threads changes nothing about the values — every point is computed by
-/// the same [`write_point_at`] in the same order within itself. This is bit-for-bit
-/// what the serial loop produced.
-fn fill_grid_points(
-    points: &mut [f64],
+/// Every element is a pure function of its own index — the same `origin[r] + Σ_c
+/// idx_to_phys[r][c] · index[c]` accumulated in the same order as
+/// [`write_point_at`] — so this is bit-for-bit the serial loop's output at any
+/// thread count, and it now honors the caller's rayon pool rather than spawning a
+/// hardcoded 16 threads behind [`sitk_core::parallel::with_threads`]'s back.
+fn grid_points(
+    n: usize,
     size: &[usize],
     idx_to_phys: &[f64],
     origin: &[f64],
     dim: usize,
-) {
-    let n = points.len() / dim;
-
-    let fill = |chunk: &mut [f64], first_sample: usize| {
-        let mut index = linear_to_multi(first_sample, size);
-        for out in chunk.chunks_mut(dim) {
-            write_point_at(out, idx_to_phys, origin, dim, &index);
-            increment(&mut index, size);
-        }
-    };
-
-    if n < FILL_MIN_SAMPLES {
-        fill(points, 0);
-        return;
-    }
-
-    let per_thread = n.div_ceil(FILL_THREADS);
-    std::thread::scope(|scope| {
-        for (t, chunk) in points.chunks_mut(per_thread * dim).enumerate() {
-            let fill = &fill;
-            scope.spawn(move || fill(chunk, t * per_thread));
-        }
-    });
+) -> Vec<f64> {
+    parallel::map_indexed_init(
+        n * dim,
+        || vec![0usize; dim],
+        |index, i| {
+            write_multi_index(index, i / dim, size);
+            let r = i % dim;
+            let mut acc = origin[r];
+            for (c, &idx) in index.iter().enumerate() {
+                acc += idx_to_phys[r * dim + c] * idx as f64;
+            }
+            acc
+        },
+    )
 }
 
-/// The multi-index (dim-0-fastest) of flat voxel index `flat`, the inverse of
-/// the traversal order [`increment`] produces.
-fn linear_to_multi(mut flat: usize, size: &[usize]) -> Vec<usize> {
-    let mut index = vec![0usize; size.len()];
-    for (d, id) in index.iter_mut().enumerate() {
+/// The multi-index (dim-0-fastest) of flat voxel index `flat`, written into
+/// `out` (length `size.len()`) — the inverse of the traversal order
+/// [`increment`] produces.
+fn write_multi_index(out: &mut [usize], mut flat: usize, size: &[usize]) {
+    for (d, id) in out.iter_mut().enumerate() {
         *id = flat % size[d];
         flat /= size[d];
     }
+}
+
+/// [`write_multi_index`] into a fresh `Vec`, for the sampling strategies that
+/// need one index at a time rather than all of them.
+fn linear_to_multi(flat: usize, size: &[usize]) -> Vec<usize> {
+    let mut index = vec![0usize; size.len()];
+    write_multi_index(&mut index, flat, size);
     index
 }
 
@@ -278,8 +273,7 @@ impl FixedSamples {
         let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
         let origin = fixed.origin();
 
-        let mut points = vec![0.0; n * dim];
-        fill_grid_points(&mut points, &size, &idx_to_phys, origin, dim);
+        let points = grid_points(n, &size, &idx_to_phys, origin, dim);
 
         let min_spacing = fixed
             .spacing()
@@ -370,8 +364,7 @@ impl FixedSamples {
             // grid order. There is nothing to filter, so nothing needs pushing —
             // take the values buffer whole and fill the points in parallel.
             SamplingStrategy::None if mask_buf.is_none() => {
-                points = vec![0.0; n * dim];
-                fill_grid_points(&mut points, &size, &idx_to_phys, origin, dim);
+                points = grid_points(n, &size, &idx_to_phys, origin, dim);
                 values = values_all;
             }
             SamplingStrategy::None => {
