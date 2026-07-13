@@ -43,9 +43,16 @@
 //! double rounding disagree — and the device must reproduce what the host filter
 //! produces, not what is more accurate. A test asserts bit-identity for every type.
 //!
-//! A pixel type with **no** device path — a vector, complex or label image — is
-//! still refused with [`CudaError::UnsupportedPixelType`] **naming the type**. The
-//! refusal is the point: the device never quietly converts something it was not
+//! All ten scalar types are covered. The types with **no** device path are the
+//! twelve non-scalar ones — `ComplexFloat32`/`64` and the ten `Vector*` — and they
+//! are refused with [`CudaError::UnsupportedPixelType`] **naming the type**. A
+//! `DeviceImage` is one `f32` per voxel; a complex or multi-component pixel has
+//! nowhere to land in it, and inventing a multi-component device image that no
+//! device op consumes would be a type with no users. The refusal arm lists those
+//! twelve by name instead of catching `_`, so a `PixelId` added upstream is a
+//! compile error here rather than a new silent refusal.
+//!
+//! The refusal is the point: the device never quietly converts something it was not
 //! asked to convert, and never quietly decides to be a CPU path.
 
 use cudarc::driver::{DeviceRepr, LaunchConfig, PushKernelArg};
@@ -184,7 +191,24 @@ impl DeviceImage {
             PixelId::UInt64 => Self::upload_cast::<u64>(img, "unsigned long long"),
             PixelId::Int64 => Self::upload_cast::<i64>(img, "long long"),
             PixelId::Float64 => Self::upload_cast::<f64>(img, "double"),
-            other => Err(CudaError::UnsupportedPixelType(other)),
+
+            // No device path, and the arm is written out variant by variant rather
+            // than as a `_` catch-all **on purpose**: a `DeviceImage` holds one
+            // `f32` per voxel, so a complex or multi-component pixel has nowhere to
+            // land, and a new `PixelId` added upstream must be a compile error here
+            // — a decision someone makes — not a silent fall into a refusal.
+            other @ (PixelId::ComplexFloat32
+            | PixelId::ComplexFloat64
+            | PixelId::VectorUInt8
+            | PixelId::VectorInt8
+            | PixelId::VectorUInt16
+            | PixelId::VectorInt16
+            | PixelId::VectorUInt32
+            | PixelId::VectorInt32
+            | PixelId::VectorUInt64
+            | PixelId::VectorInt64
+            | PixelId::VectorFloat32
+            | PixelId::VectorFloat64) => Err(CudaError::UnsupportedPixelType(other)),
         }
     }
 
