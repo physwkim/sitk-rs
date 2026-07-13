@@ -372,7 +372,7 @@ impl AntsNeighborhoodCorrelationMetric {
         // sparse sample set.
         let center_lin = self.sample_linear_index(s);
         let fp_center = self.raster.point(center_lin, scratch);
-        let fv_center = self.raster.values[center_lin];
+        let fv_center = self.raster.value(center_lin);
         let mp_center = transform.transform_point(fp_center);
         let (mv_center, grad_phys) = self.moving.value_and_physical_gradient(&mp_center)?;
 
@@ -452,7 +452,7 @@ impl AntsNeighborhoodCorrelationMetric {
                 continue;
             }
 
-            let fv = self.raster.values[lin];
+            let fv = self.raster.value(lin);
             let fp = self.raster.point(lin, scratch);
             let mp = transform.transform_point(fp);
             let Some(mv) = self.moving.value_at(&mp) else {

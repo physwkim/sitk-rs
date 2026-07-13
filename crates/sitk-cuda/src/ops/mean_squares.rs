@@ -254,9 +254,13 @@ pub struct Moments {
     pub count: usize,
 }
 
-/// The moving image's geometry, as the kernel needs it.
+/// The moving image's geometry, as the kernel needs it. The voxels themselves
+/// arrive through the producer argument of [`ResidentMetric::new`], not here —
+/// the host holds them in their native pixel type, so there is no `f64` slice to
+/// borrow.
 pub struct MovingGeometry<'a> {
-    pub buf: &'a [f64],
+    /// Voxel count; must equal the product of `size`.
+    pub len: usize,
     pub size: &'a [usize],
     pub strides: &'a [usize],
     pub origin: &'a [f64],
@@ -323,14 +327,22 @@ pub struct ResidentMetric {
 impl ResidentMetric {
     /// Upload the fixed samples and the moving volume. This is the *only* large
     /// transfer in a registration run.
+    /// `fixed_values(start, out)` writes the fixed samples `start..start+out.len()`,
+    /// widened to `f64`; `moving_values` does the same for the moving volume's
+    /// voxels. Producers rather than slices: the host keeps both images in their
+    /// **native** pixel type, so there is no `f64` volume to borrow — the widening
+    /// is staged a chunk at a time straight into the upload (see
+    /// [`DeviceBuffer::from_chunks`]).
     pub fn new(
-        fixed_values: &[f64],
+        n: usize,
+        fixed_values: impl FnMut(usize, &mut [f64]),
         fixed_points: FixedPoints<'_>,
         moving: &MovingGeometry<'_>,
+        moving_values: impl FnMut(usize, &mut [f64]),
     ) -> Result<Self, CudaError> {
         let backend = backend()?;
-        let n = fixed_values.len();
-        if n == 0 || moving.size.len() != DIM {
+        if n == 0 || moving.size.len() != DIM || moving.size.iter().product::<usize>() != moving.len
+        {
             return Err(CudaError::DegenerateInput);
         }
 
@@ -376,13 +388,13 @@ impl ResidentMetric {
 
         Ok(Self {
             n,
-            d_fvals: DeviceBuffer::from_host(backend, fixed_values)?,
+            d_fvals: DeviceBuffer::from_chunks(backend, n, fixed_values)?,
             d_fpts: DeviceBuffer::from_host(backend, pts)?,
             has_pts,
             d_fsize: DeviceBuffer::from_host(backend, &fsize)?,
             d_forigin: DeviceBuffer::from_host(backend, &forigin)?,
             d_fmat: DeviceBuffer::from_host(backend, &fmat)?,
-            d_mbuf: DeviceBuffer::from_host(backend, moving.buf)?,
+            d_mbuf: DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
             d_msize: DeviceBuffer::from_host(backend, &as_i64(moving.size))?,
             d_mstride: DeviceBuffer::from_host(backend, &as_i64(moving.strides))?,
             d_morigin: DeviceBuffer::from_host(backend, moving.origin)?,

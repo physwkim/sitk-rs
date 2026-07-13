@@ -13,6 +13,44 @@ pub struct DeviceBuffer<T> {
     slice: CudaSlice<T>,
 }
 
+impl<T: DeviceRepr + Default + Clone + ValidAsZeroBits> DeviceBuffer<T> {
+    /// Allocate `len` elements and fill them from `produce`, **staged through a
+    /// small host buffer** — so the whole-volume host copy this would otherwise
+    /// need never exists.
+    ///
+    /// `produce(start, out)` writes the `out.len()` elements beginning at sample
+    /// `start`. It is called on successive chunks until `len` elements are up.
+    ///
+    /// This is what lets the registration metric keep its fixed samples in the
+    /// image's *native* pixel type on the host and still hand the kernel `f64`:
+    /// the widening happens a chunk at a time, into a buffer that is 2 MiB rather
+    /// than the 134 MB (at 256³) an eager `to_f64_vec` allocated and faulted.
+    pub fn from_chunks(
+        backend: &Backend,
+        len: usize,
+        mut produce: impl FnMut(usize, &mut [T]),
+    ) -> Result<Self, CudaError> {
+        /// Elements per staged chunk, sized so the copy is large enough to run at
+        /// link speed and small enough to stay in cache.
+        const CHUNK: usize = 1 << 18;
+
+        let mut buf = Self::zeros(backend, len)?;
+        let mut stage = vec![T::default(); CHUNK.min(len)];
+        let mut start = 0;
+        while start < len {
+            let take = CHUNK.min(len - start);
+            produce(start, &mut stage[..take]);
+            backend.stream().memcpy_htod(
+                &stage[..take],
+                &mut buf.slice.slice_mut(start..start + take),
+            )?;
+            start += take;
+        }
+        backend.synchronize()?;
+        Ok(buf)
+    }
+}
+
 impl<T: DeviceRepr> DeviceBuffer<T> {
     /// Allocate on the device and copy `host` up (H2D).
     pub fn from_host(backend: &Backend, host: &[T]) -> Result<Self, CudaError> {

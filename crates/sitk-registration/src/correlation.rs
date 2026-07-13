@@ -194,7 +194,7 @@ impl CorrelationMetric {
                 Some(v) => v,
                 None => continue,
             };
-            let f1 = self.fixed.values[s] - avg_fix;
+            let f1 = self.fixed.value(s) - avg_fix;
             let m1 = mv - avg_mov;
             f2 += f1 * f1;
             m2 += m1 * m1;
@@ -227,7 +227,7 @@ impl CorrelationMetric {
                 Some(v) => v,
                 None => continue, // maps outside the moving buffer
             };
-            fix_sum += self.fixed.values[s];
+            fix_sum += self.fixed.value(s);
             mov_sum += mv;
             valid += 1;
         }
@@ -269,7 +269,7 @@ impl CorrelationMetric {
         let mut scratch = self.fixed.scratch();
         for s in 0..n {
             let fp = self.fixed.point(s, &mut scratch);
-            let fv = self.fixed.values[s];
+            let fv = self.fixed.value(s);
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
                 Some(vg) => vg,

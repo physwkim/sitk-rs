@@ -315,7 +315,7 @@ impl MattesMutualInformationMetric {
         let mut scratch = self.fixed.scratch();
         for s in 0..n {
             let fp = self.fixed.point(s, &mut scratch);
-            let fv = self.fixed.values[s];
+            let fv = self.fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
@@ -431,7 +431,7 @@ impl MattesMutualInformationMetric {
         let mut scratch = self.fixed.scratch();
         for s in 0..n {
             let fp = self.fixed.point(s, &mut scratch);
-            let fv = self.fixed.values[s];
+            let fv = self.fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
@@ -676,7 +676,7 @@ impl MattesMutualInformationMetric {
         let mut scratch = self.fixed.scratch();
         for s in 0..n {
             let fp = self.fixed.point(s, &mut scratch);
-            let fv = self.fixed.values[s];
+            let fv = self.fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {

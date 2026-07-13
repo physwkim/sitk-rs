@@ -33,6 +33,7 @@
 
 use std::sync::Mutex;
 
+use sitk_core::parallel;
 use sitk_cuda::{FixedPoints, MovingGeometry, ResidentMetric};
 use sitk_transform::{Interpolator, ParametricTransform};
 
@@ -135,7 +136,7 @@ impl CudaMetricBackend {
             // This is the only large transfer in the run.
             *guard = None;
             let geom = MovingGeometry {
-                buf: view.buf,
+                len: view.buf.len(),
                 size: view.size,
                 strides: view.strides,
                 origin: view.origin,
@@ -159,7 +160,21 @@ impl CudaMetricBackend {
                 }
                 SamplePoints::Explicit(p) => FixedPoints::Explicit(p),
             };
-            let metric = ResidentMetric::new(&fixed.values, points, &geom).ok()?;
+            // Both volumes are held in their image's native type, so each is
+            // widened straight into its upload, a chunk at a time — there is no
+            // `f64` volume on the host to hand over.
+            let metric = ResidentMetric::new(
+                fixed.len(),
+                |start, out| {
+                    parallel::for_each_mut(out, |i, o| *o = fixed.value(start + i));
+                },
+                points,
+                &geom,
+                |start, out| {
+                    parallel::for_each_mut(out, |i, o| *o = view.buf.get(start + i));
+                },
+            )
+            .ok()?;
             *guard = Some(Resident {
                 fixed_id: fixed.id,
                 moving_id: view.id,
