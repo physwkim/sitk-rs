@@ -72,12 +72,18 @@ fn scratch_f64(img: &Image) -> Result<Image> {
 /// `scale_d = 1`. Output is always [`PixelId::Float32`] (SimpleITK's
 /// `output_pixel_type: float`).
 pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image> {
-    let out = gradient_magnitude_values(img, use_image_spacing)?;
-    image_from_f64(PixelId::Float32, img.size(), img, &out)
+    fn build<T: Scalar>(img: &Image, scales: &[f64]) -> Result<Image> {
+        let out: Vec<f32> = gradient_magnitude_pass::<T, f32>(img, scales)?;
+        let mut image = Image::from_vec(img.size(), out)?;
+        image.copy_geometry_from(img);
+        Ok(image)
+    }
+    let scales = gradient_magnitude_scales(img, use_image_spacing);
+    dispatch_scalar!(img.pixel_id(), build, img, &scales)
 }
 
-/// The raw `f64` gradient-magnitude values, before [`gradient_magnitude`]
-/// narrows them to `PixelId::Float32`.
+/// The raw `f64` gradient-magnitude values — the `R = f64` instantiation of the
+/// same pass [`gradient_magnitude`] runs at `R = f32`.
 ///
 /// `pub(crate)`: [`crate::watershed_classic::isolated_watershed`] needs them
 /// at full `RealType` precision. ITK instantiates the gradient magnitude as
@@ -88,48 +94,16 @@ pub fn gradient_magnitude(img: &Image, use_image_spacing: bool) -> Result<Image>
 /// through [`gradient_magnitude`] would quantize the watershed's height
 /// function to `f32` for `u8`/`u16`/... inputs, which ITK does not do.
 pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) -> Result<Vec<f64>> {
-    /// The stencil, over the image's **native** pixel type.
-    ///
-    /// Reading `T` and widening per access, instead of first materializing an
-    /// `f64` copy of the whole volume, is lossless — so every value the
-    /// arithmetic sees is the `f64` the copy would have held — and it halves the
-    /// bytes the stencil streams. The window itself is borrowed, not copied; see
-    /// [`sitk_core::WindowView`].
-    fn compute<T: Scalar>(img: &Image, scales: &[f64]) -> Result<Vec<f64>> {
-        let dim = img.dimension();
-        let radius = vec![1usize; dim];
-        let iter =
-            NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
-
-        // Window strides, so a neighbor can be addressed by its linear slot
-        // rather than by re-deriving an ND index per access. Every axis of this
-        // window has extent 3, so the stride along axis `d` is `3^d` — exactly
-        // what `Neighborhood::get` computed, once per call, in a loop.
-        let center = iter.len() / 2;
-        let mut window_stride = vec![0usize; dim];
-        let mut stride = 1usize;
-        for s in window_stride.iter_mut() {
-            *s = stride;
-            stride *= 3;
-        }
-
-        // Parallel over output voxels. The `acc += g * g` sum runs over the axes
-        // of one voxel's own window, in axis order, exactly as before — nothing
-        // accumulates across voxels, so the output bits are unchanged.
-        Ok(iter.par_map_window(|_, w| {
-            let mut acc = 0.0;
-            for d in 0..dim {
-                let plus = w.get_f64(center + window_stride[d]);
-                let minus = w.get_f64(center - window_stride[d]);
-                let g = 0.5 * (plus - minus) / scales[d];
-                acc += g * g;
-            }
-            acc.sqrt()
-        }))
+    fn values<T: Scalar>(img: &Image, scales: &[f64]) -> Result<Vec<f64>> {
+        gradient_magnitude_pass::<T, f64>(img, scales)
     }
+    let scales = gradient_magnitude_scales(img, use_image_spacing);
+    dispatch_scalar!(img.pixel_id(), values, img, &scales)
+}
 
-    let dim = img.dimension();
-    let scales: Vec<f64> = (0..dim)
+/// `scale_d` per axis: the spacing under `use_image_spacing`, else 1.
+fn gradient_magnitude_scales(img: &Image, use_image_spacing: bool) -> Vec<f64> {
+    (0..img.dimension())
         .map(|d| {
             if use_image_spacing {
                 img.spacing()[d]
@@ -137,8 +111,57 @@ pub(crate) fn gradient_magnitude_values(img: &Image, use_image_spacing: bool) ->
                 1.0
             }
         })
-        .collect();
-    dispatch_scalar!(img.pixel_id(), compute, img, &scales)
+        .collect()
+}
+
+/// The stencil: read `T`, compute in `f64`, emit `R`.
+///
+/// Reading `T` and widening per access, instead of first materializing an `f64`
+/// copy of the whole volume, is lossless — every value the arithmetic sees is
+/// the `f64` the copy would have held — and it halves the bytes the stencil
+/// streams. The window itself is borrowed, not copied; see
+/// [`sitk_core::WindowView`].
+///
+/// Generic in the **output** type for the same reason it is generic in the
+/// input: [`gradient_magnitude`] needs `f32` and
+/// [`gradient_magnitude_values`] needs `f64`, and the narrowing must not cost a
+/// second full-volume pass. Emitting `R` from the window pass applies exactly
+/// the `R::from_f64` that [`crate::image_from_f64`]'s narrowing map applied, to
+/// exactly the same `f64`, so the `f32` output is bit-identical to
+/// window-then-narrow *by construction* — while the `f64` volume that only ever
+/// existed to be narrowed is not allocated, not written, and not re-read. It was
+/// 1.07 GB of it at 512^3, and the narrowing pass that read it was measured at
+/// 22.4 ms of the filter's 109.2.
+fn gradient_magnitude_pass<T: Scalar, R: Scalar>(img: &Image, scales: &[f64]) -> Result<Vec<R>> {
+    let dim = img.dimension();
+    let radius = vec![1usize; dim];
+    let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    // Window strides, so a neighbor can be addressed by its linear slot
+    // rather than by re-deriving an ND index per access. Every axis of this
+    // window has extent 3, so the stride along axis `d` is `3^d` — exactly
+    // what `Neighborhood::get` computed, once per call, in a loop.
+    let center = iter.len() / 2;
+    let mut window_stride = vec![0usize; dim];
+    let mut stride = 1usize;
+    for s in window_stride.iter_mut() {
+        *s = stride;
+        stride *= 3;
+    }
+
+    // Parallel over output voxels. The `acc += g * g` sum runs over the axes
+    // of one voxel's own window, in axis order, exactly as before — nothing
+    // accumulates across voxels, so the output bits are unchanged.
+    Ok(iter.par_map_window(|_, w| {
+        let mut acc = 0.0;
+        for d in 0..dim {
+            let plus = w.get_f64(center + window_stride[d]);
+            let minus = w.get_f64(center - window_stride[d]);
+            let g = 0.5 * (plus - minus) / scales[d];
+            acc += g * g;
+        }
+        R::from_f64(acc.sqrt())
+    }))
 }
 
 // ---- derivative -------------------------------------------------------------
@@ -440,14 +463,41 @@ pub fn gradient_magnitude_recursive_gaussian(
         // The tap stays a *division* by `spacing[d]`: multiplying by a
         // precomputed `1.0 / spacing[d]` is a different `f64` and would move the
         // checksum.
+        //
+        // The first axis **stores** where the others accumulate, and that is a
+        // page-fault fix, not a style choice. `acc` is `alloc_zeroed`, so it is a
+        // fresh anonymous mapping whose pages are not yet resident. A
+        // read-modify-write (`*a += t`) touches each page twice: the load faults
+        // it in as a copy-on-write reference to the shared zero page, and the
+        // store then takes a second write-protect fault on the same page. A pure
+        // store faults once. Measured on a fresh 1.07 GB buffer at 512³: 2.00
+        // faults/page and 376.9 ms for `+=`, 1.00 fault/page and 39.3 ms for `=`.
+        //
+        // It is bit-identical **only because the term is a square**. `0.0 + x`
+        // returns `x` for every `f64` except `x == -0.0`, where it returns `+0.0`;
+        // `g * g` is never `-0.0`, so the store and the add agree on every input.
+        // `laplacian_recursive_gaussian` below has the same shape and must NOT be
+        // unified with this — see the comment there.
         parallel::for_each_mut(&mut acc, |i, a| {
             let g = work[i] / spacing[d];
-            *a += g * g;
+            let term = g * g;
+            if d == 0 {
+                *a = term;
+            } else {
+                *a += term;
+            }
         });
     }
-    parallel::for_each_mut(&mut acc, |_, a| *a = a.sqrt());
-
-    image_from_f64(PixelId::Float32, img.size(), img, &acc)
+    // The final pass emits `f32` straight out, rather than rewriting the whole
+    // `f64` volume in place with its own square root and then reading it back a
+    // third time to narrow. `f32::from_f64(acc[i].sqrt())` is the same
+    // `from_f64` applied to the same `f64` the narrowing map would have seen, in
+    // the same order, so no bit moves; what goes is a 1.07 GB read-write and a
+    // 1.07 GB re-read at 512^3.
+    let out: Vec<f32> = parallel::map_slice(&acc, |&a| f32::from_f64(a.sqrt()));
+    let mut image = Image::from_vec(img.size(), out)?;
+    image.copy_geometry_from(img);
+    Ok(image)
 }
 
 /// `LaplacianRecursiveGaussianImageFilter`: the Laplacian-of-Gaussian of
@@ -497,6 +547,21 @@ pub fn laplacian_recursive_gaussian(
         // `inv_spacing_sq` is precomputed and multiplied, as it always was here —
         // unlike the gradient magnitude above, which divides. Keeping each
         // filter's own arithmetic is what keeps each checksum.
+        //
+        // DO NOT "unify" this with the gradient magnitude's axis loop above by
+        // making the first axis store into `acc` instead of accumulating. That
+        // change is legal there and illegal here, and the two look identical.
+        //
+        // There it saves a page fault per 4 KB (a read-modify-write faults a
+        // fresh `alloc_zeroed` page twice, a pure store once) and costs no bits,
+        // because its term is `g * g` — a square, which is never `-0.0`, and
+        // `0.0 + x == x` for every `f64` except `x == -0.0`.
+        //
+        // Here the term is `work[i] * inv_spacing_sq`, the output of a *second*
+        // derivative, which absolutely can be `-0.0`. `0.0 + (-0.0)` is `+0.0`,
+        // but a store would leave `-0.0`. So a store would emit `-0.0` where this
+        // add emits `+0.0`, the sign bit would survive the narrowing to `f32`, and
+        // the checksum would move. The zeroed buffer and the `+=` are load-bearing.
         let inv_spacing_sq = 1.0 / (spacing[d] * spacing[d]);
         parallel::for_each_mut(&mut acc, |i, a| {
             *a += work[i] * inv_spacing_sq;
@@ -717,6 +782,115 @@ pub fn gradient_recursive_gaussian(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The premise that lets [`gradient_magnitude_recursive_gaussian`]'s first
+    /// axis **store** into the zeroed accumulator instead of accumulating into
+    /// it: `0.0 + x` has the same bits as `x` for every `f64` *except* `-0.0`,
+    /// and a square is never `-0.0`.
+    ///
+    /// This is the load-bearing half of why the same change is illegal in
+    /// [`laplacian_recursive_gaussian`], whose term is a second derivative and
+    /// can be `-0.0`. Both halves are pinned here.
+    #[test]
+    fn zero_plus_a_square_is_bit_identical_to_the_square_but_not_for_negative_zero() {
+        let probes = [
+            0.0f64,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            5e-324,
+            -5e-324,
+            1e-300,
+            -1e-300,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+
+        // gmrg's term: a square. Storing it and adding it to `+0.0` agree, bit
+        // for bit, on every one of these — including `-0.0`, whose square is
+        // `+0.0`, and `NaN`, whose sum with `0.0` is still a `NaN` with the same
+        // bits.
+        for g in probes {
+            let term = g * g;
+            assert_eq!(
+                (0.0f64 + term).to_bits(),
+                term.to_bits(),
+                "0.0 + ({g:?} * {g:?}) must be bit-identical to the square itself"
+            );
+        }
+
+        // The Laplacian's term is not a square, and `-0.0` is exactly where the
+        // two diverge: the add flushes the sign, the store keeps it. This is the
+        // checksum that would move if the two axis loops were ever unified.
+        let term = -0.0f64;
+        assert_ne!(
+            (0.0f64 + term).to_bits(),
+            term.to_bits(),
+            "0.0 + (-0.0) is +0.0, so a store is NOT interchangeable with an \
+             accumulate for a term that can be -0.0"
+        );
+    }
+
+    /// The same claim for [`gradient_magnitude_recursive_gaussian`]'s tail: it
+    /// now emits `f32` from the square-root pass rather than rewriting the `f64`
+    /// accumulator in place and narrowing it in a third pass — and its first axis
+    /// stores where it used to accumulate. Compared by bits against the original
+    /// `+=`-into-a-zeroed-buffer, `sqrt`-in-place, `from_f64` exit this replaced,
+    /// so it pins both changes end to end.
+    #[test]
+    fn gmrg_fused_sqrt_narrowing_is_bit_identical_to_sqrt_then_narrow() {
+        let size = [9usize, 7, 5];
+        let n: usize = size.iter().product();
+        let data: Vec<f64> = (0..n).map(|i| ((i * 37 % 251) as f64) * 0.5).collect();
+        let mut img = Image::from_vec(&size, data).unwrap();
+        img.set_spacing(&[1.0, 0.75, 1.3]).unwrap();
+
+        let fused = gradient_magnitude_recursive_gaussian(&img, 1.5, false).unwrap();
+        let a = fused.scalar_slice::<f32>().unwrap();
+
+        // The accumulator the filter builds, reproduced here, then taken through
+        // the old two-step exit: in-place `sqrt` over `f64`, then `from_f64`.
+        let dim = img.dimension();
+        let mut acc = vec![0.0f64; n];
+        let mut work = vec![0.0f64; n];
+        let src = img.to_f64_vec().unwrap();
+        for d in 0..dim {
+            let mut orders = vec![GaussianOrder::ZeroOrder; dim];
+            orders[d] = GaussianOrder::FirstOrder;
+            recursive_gaussian_f64_from_into(
+                &src,
+                &mut work,
+                &size,
+                img.spacing(),
+                &vec![1.5; dim],
+                &orders,
+                false,
+            )
+            .unwrap();
+            for (i, a) in acc.iter_mut().enumerate() {
+                let g = work[i] / img.spacing()[d];
+                *a += g * g;
+            }
+        }
+        for v in acc.iter_mut() {
+            *v = v.sqrt();
+        }
+        let narrowed = image_from_f64(PixelId::Float32, img.size(), &img, &acc).unwrap();
+        let b = narrowed.scalar_slice::<f32>().unwrap();
+
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "voxel {i}: fused {x:?} vs sqrt-then-narrow {y:?}"
+            );
+        }
+    }
 
     fn ramp_2d(w: usize, h: usize, slope: f64) -> Vec<f64> {
         let mut data = vec![0.0f64; w * h];
