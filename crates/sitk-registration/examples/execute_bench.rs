@@ -10,6 +10,14 @@
 //! ```text
 //! cargo run --release --features cuda -p sitk-registration --example execute_bench -- 256 96
 //! ```
+//!
+//! Arguments: `size threads iterations min_step [scales] [shrink] [sigmas]`. The last
+//! two turn the run into a **multi-resolution pyramid**, which is how a registration is
+//! really driven; without them the run is single-level:
+//!
+//! ```text
+//! ... --example execute_bench -- 256 96 200 1e-4 scales 4,2,1 2,1,0
+//! ```
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("this example needs the GPU: rebuild with --features cuda");
@@ -80,6 +88,17 @@ fn main() {
         .nth(4)
         .map_or(1e-4, |s| s.parse().expect("min step"));
 
+    // A pyramid is only run if BOTH lists are given, and they must be the same length:
+    // the schedule is one (shrink, sigma) pair per level.
+    let list = |i: usize| -> Vec<String> {
+        std::env::args()
+            .nth(i)
+            .map(|s| s.split(',').map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    let shrink: Vec<usize> = list(6).iter().map(|s| s.parse().expect("shrink")).collect();
+    let sigmas: Vec<f64> = list(7).iter().map(|s| s.parse().expect("sigma")).collect();
+
     let fixed = volume(n, 0.0);
     let moving = volume(n, 3.0);
     let c = n as f64 / 2.0;
@@ -98,11 +117,21 @@ fn main() {
             reg.set_optimizer_scales_from_physical_shift();
             println!("  (optimizer scales from physical shift)");
         }
+        if !shrink.is_empty() {
+            assert_eq!(
+                shrink.len(),
+                sigmas.len(),
+                "the schedule is one (shrink, sigma) pair per level"
+            );
+            reg.set_shrink_factors_per_level(shrink.clone());
+            reg.set_smoothing_sigmas_per_level(sigmas.clone());
+        }
 
         // Burn NVRTC (once per process, size-independent) on a tiny volume — and on
         // the NATIVE type, so the device cast's kernel is compiled too and its
         // one-time compile does not land inside the timed upload below.
-        match DeviceImage::upload(&volume(16, 0.0)) {
+        let burn = 8 * shrink.iter().copied().max().unwrap_or(2);
+        match DeviceImage::upload(&volume(burn, 0.0)) {
             Ok(d) => {
                 let r = device_rescale(&d, OUT_MIN, OUT_MAX).unwrap();
                 let s = device_smooth(&r, &SIGMA).unwrap();
@@ -114,9 +143,14 @@ fn main() {
             }
         }
 
+        let schedule = if shrink.is_empty() {
+            "single level".to_owned()
+        } else {
+            format!("pyramid shrink {shrink:?} sigma {sigmas:?}")
+        };
         println!(
             "== {n}^3 UInt16 in, {threads} CPU threads, sigma {SIGMA:?}, real execute(), \
-             max {iters} iterations, min step {min_step:e}\n"
+             {schedule}, max {iters} iterations per level, min step {min_step:e}\n"
         );
 
         // ---- host: cast -> rescale -> smooth -> execute -----------------------
