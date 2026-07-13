@@ -201,11 +201,17 @@ contraction, because an FMA would be *more* accurate and therefore *different*.
 | **mean** | **62.5 / 62.7** | 80.8 / 78.7 | **0.80×** | 1967 ᵗ | 1662 |
 | fft_convolution | 471 / 501 | 587 / 574 | 0.87× | 2148 | 1228 |
 | smoothing_recursive_gaussian | 64.6 / 67.2 | 52.3 / 66.0 | 1.02× | 1005 | 818 |
-| **gmrg** | 288 / 301 | 207 / 247 | **1.22×** | 2319 ᵗ | 2426 |
-| **gradient_magnitude** | 51.7 / 53.0 | 36.2 / 35.1 | **1.51×** | 511 | 314 |
+| **gmrg** | **116.9** ᶠ | 207 / 247 | **0.47×** | 2319 ᵗ | 2426 |
+| **gradient_magnitude** | **22.5** ᶠ | 36.2 / 35.1 | **0.64×** | 511 | 314 |
 
 ᵗ — this `t1` carries 15–21% sample stddev in both rounds, including the provably
 clean one. Soft; quote the `tN` figure.
+
+ᶠ — a **third** round, run 05:48–06:03 on `fd2b372` after the three `gradient.rs`
+fixes in §4.1, foreign load p50 1.0 / p90 1.4 cores. One column, not two, because
+it is one run; its 60 output checksums were compared against round 2's and **none
+moved**. It supersedes rounds 1–2 for these two rows *only* — every other row in
+this table is still rounds 1/2, which is why they still carry two columns.
 
 ### large (512³) — `rust t1` is not measured (serial by definition; the harness projects it)
 
@@ -220,9 +226,12 @@ clean one. Soft; quote the `tN` figure.
 | fft_convolution | 2700 / 2711 | 3327 / 3201 | 0.85× |
 | discrete_gaussian | 626 / 549 | 600 / 605 | 0.91× |
 | otsu_threshold | 260 / 260 | 189 / 190 | 1.37× |
+| gradient_magnitude | **100.8** ᶠ | 97.9 / 98.8 | 1.02× |
+| gmrg | **770.8** ᶠ | 772 / 761 | 1.01× |
 | **smoothing_recursive_gaussian** | 386 / 380 | 212 / 218 | **1.75×** |
-| **gradient_magnitude** | 201 / 198 | 97.9 / 98.8 | **2.00×** |
-| **gmrg** | 2181 / 2232 | 772 / 761 | **2.93×** |
+
+`gradient_magnitude` and `gmrg` are **ties at large, not wins** — 1.02× and 1.01×
+are parity and are not being claimed as anything else. They were 2.00× and 2.93×.
 
 ### small (64³) — where per-call overhead shows, and the medium table hides it
 
@@ -240,8 +249,8 @@ do — and the numbers below are what a reader should check the story against.
 | op, medium/tN | before | **after** |
 |---|---|---|
 | `mean` | 4.39× | **0.80×** — now *beats* ITK |
-| `gradient_magnitude` | 4.25× | **1.51×** — still loses |
-| `gmrg` | 1.99× | **1.22×** — still loses |
+| `gradient_magnitude` | 4.25× | 1.51× → **0.64×** — now beats ITK (§4.1) |
+| `gmrg` | 1.99× | 1.22× → **0.47×** — now beats ITK (§4.1) |
 | `discrete_gaussian` | 1.25× | **0.76×** — now beats ITK |
 
 The shape said what it was: the port's `t1` was competitive-to-better on several of
@@ -307,16 +316,70 @@ leaf task running the tail of the region alone, fixed by `with_max_len(1)` on
 `fill_indexed` — but that is a different defect from the one that was filed, and it
 is not being credited as its resolution.
 
+## 4.1 Three more fixes, and the two ops that used to lose no longer do
+
+The two rows above that still lost were **not** one defect either, and neither was
+what the allocator story predicted.
+
+**`gmrg` large, 2.93×.** The 15→3 buffer fix had swapped a **parallel** `f32→f64`
+widening for a **serial** `copy_from_slice`. `vec![0.0; n]` is a lazily-zeroed
+mmap, so the page-fault bill lands on whichever phase writes the buffer first —
+and that was the serial copy: **517 ms** on axis 0 at 512³, against **79.7 ms**
+for the parallel widening of a buffer of exactly the same size. Same bytes, same
+fresh pages, 6.5× apart, and the only difference is whether the first touch is
+parallel. That is why the fix won at 256³ and lost at 512³. **The copy was deleted,
+not parallelized** — the first filtered axis now reads `src` and writes `dst`
+out-of-place; parallelizing would have spread 6.4 GB of traffic instead of removing
+it.
+
+**`gradient_magnitude`, every size.** It materialized a full `f64` volume (1.07 GB
+at 512³) that existed only to be read back and narrowed to `f32` by the very next
+pass. ITK never materializes it: it writes the output pixel once. The window pass
+now emits the output type directly; `gradient_magnitude_values` is the *same
+kernel* instantiated at `f64` for `watershed_classic`, so the two cannot drift.
+
+**`gmrg`'s accumulator.** A `+=` into a fresh `alloc_zeroed` buffer costs **2.00
+page faults per page** — the read faults in the shared zero page copy-on-write, and
+the write then takes a second write-protect fault on the same page. A pure store
+costs **1.00** (376.9 ms → 39.3 ms on 1.07 GB). The first axis now stores.
+
+That last one is legal **only** because `gmrg`'s term is `g*g`, which can never be
+`-0.0`, and `(+0.0) + x == x` bitwise for every value a square can take. The
+Laplacian's term is a *second* derivative that **can** be `-0.0`, and
+`(+0.0) + (-0.0) == +0.0` — so converting its first accumulate to a store would
+emit `-0.0` where the add emitted `+0.0` and move a checksum. It keeps its zeroed
+buffer, and the `-0.0` divergence itself is pinned by a test rather than asserted
+in a comment. A blanket "same fix, three sites" sweep would have moved a checksum
+here.
+
+Measured, ITK at its best on both ops (neither is touched by the two ITK threading
+regressions in §5, so nothing here borrows credit from a degraded baseline):
+
+| op | size | ITK | rust before | rust after | after/ITK | was |
+|---|---|---|---|---|---|---|
+| `gradient_magnitude` | medium | 35.1 | 53.0 | **22.5** | **0.64×** | 1.51× |
+| `gradient_magnitude` | large | 98.8 | 197.6 | **100.8** | 1.02× | 2.00× |
+| `gmrg` | medium | 247.1 | 301.1 | **116.9** | **0.47×** | 1.22× |
+| `gmrg` | large | 761.4 | 2231.5 | **770.8** | 1.01× | 2.93× |
+
+Both beat ITK at medium; both are **ties at large**, and a tie is not a win.
+
 ### What still loses, stated plainly
 
-- **`gradient_magnitude`: 1.51× at medium, 2.00× at large.** The allocator fix took
-  it from 4.25×; it is still slower than ITK at every size, and worse as the volume
-  grows.
-- **`gmrg`: 1.22× at medium, 2.93× at large.** The buffer fix answered medium and
-  **did not answer large at all** — 2231 ms against ITK's 761.
+- **`gradient_magnitude`: 2.91× at small** (7.2 ms against ITK's 2.5) — now the
+  **worst cell in the whole table**, and the three fixes above did not move it at
+  all (7.0 → 7.2 ms, stddev 0.31 — flat, not a regression). At 64³ it is bound by
+  fixed per-call overhead, not by bandwidth, and none of the fixes targets that.
 - **`smoothing_recursive_gaussian`: 1.75× at large** (1.02× at medium).
 - **`otsu_threshold`: 1.37× at large, 6.62× at small.**
 - **`mean`: 4.52× at small**, which its medium crossover hides completely.
+- **`gmrg` at small: 1.09×**, improved from 1.45× but still a loss.
+- Not benchmarked and not measured, but sitting next to the code just fixed:
+  `derivative`, `laplacian` and `sobel_edge_detection` still run a **serial**
+  `iter().map().collect()` over the old copying neighborhood path, plus a full
+  `f64` scratch copy of the input. None of the three is in the benchmarked twelve,
+  so no number is claimed for them — they are named because they are un-parallelized
+  stencils, not because they are known to be slow.
 
 `fft_convolution` **is closed**: it was 6.5× slower than ITK at `t1` before
 rustfft/realfft landed and the real-input half-Hermitian path replaced three full
@@ -341,11 +404,11 @@ than it is.
 
 ## 6. What is still open
 
-- **`gradient_magnitude` (2.00× at large) and `gmrg` (2.93× at large).** The two
-  fixes in §4 did not close these; `gmrg`'s large case in particular is untouched by
-  the buffer fix that answered its medium case.
-- **`otsu_threshold` at small (6.62×) and `mean` at small (4.52×)** — per-call
-  overhead that the reference size amortizes away.
+- **Small volumes (64³) are where the port loses now.** `gradient_magnitude` 2.91×,
+  `otsu_threshold` 6.62×, `mean` 4.52× — fixed per-call overhead that the reference
+  size amortizes away and the headline hides. `gradient_magnitude` at small is the
+  worst cell in the table and none of the §4/§4.1 fixes touched it.
+- **`smoothing_recursive_gaussian` at large (1.75×)**, not investigated.
 - **The §2 pipeline table's `setup` / `20 iterations` rows** are re-measured; the
   `cast` / `rescale` / `smooth` rows still carry their original numbers.
 - **Device coverage.** Cast (all 10 scalar types), `rescale_intensity`,

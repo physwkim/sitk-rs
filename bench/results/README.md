@@ -10,6 +10,7 @@ Taken on the post-allocator-fix, post-GMRG-fix, post-`with_max_len(1)` tree
 |---|---|---|
 | `rust-r1.ndjson` | 144 | valid at `tN`; see the `t1` caveat below |
 | `rust-r2.ndjson` | 144 | valid |
+| `rust-r3-postfix.ndjson` | 144 | valid. A **third** Rust round on `fd2b372`, after the three `gradient.rs` fixes (out-of-place first pass, fused narrowing, store-don't-accumulate). Run 05:48–06:03, foreign load p50 1.0 / p90 1.4 cores. **Supersedes r1/r2 for `gradient_magnitude` and `gmrg` only** — every other op is unchanged code, and its 60 output checksums were compared against r2's with **none moved**, so the two sets are consistent and either may be quoted for the other ten ops. No C++ round was re-run against it: the ITK numbers it is compared to are `cpp-r2`'s, which is correct — ITK's code did not change. |
 | `cpp-tN-r1.ndjson` | 36 | valid |
 | `cpp-t1-r1.DISCARDED.ndjson` | 36 | **DISCARDED — do not use. See below.** |
 | `cpp-r2.ndjson` | 72 | valid (`t1` + `tN`) |

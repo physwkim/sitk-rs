@@ -232,9 +232,14 @@ harnesses received a byte-identical input before any timing is compared.
 
 At 256³, all cores, `rust/itk` (below 1.00 means the port is faster): the port wins
 on `binary_dilate` **0.03×**, `connected_component` 0.25×, `signed_maurer_distance_map`
-0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `otsu` 0.57×, `discrete_gaussian`
-0.76×, `mean` 0.80×, `fft_convolution` 0.87×; and **loses on `gradient_magnitude`
-(1.51×) and `gmrg` (1.22×)**, both of which get worse at 512³ (2.00× and 2.93×).
+0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg` 0.47×, `otsu` 0.57×,
+`gradient_magnitude` 0.64×, `discrete_gaussian` 0.76×, `mean` 0.80×,
+`fft_convolution` 0.87×; and **loses on `smoothing_recursive_gaussian` (1.02×)**.
+At 512³ `gradient_magnitude` and `gmrg` are ties (1.02×, 1.01×) — ties, not wins.
+
+**Where the port loses now is small volumes**, not large ones: at 64³,
+`gradient_magnitude` is 2.91×, `otsu` 6.62× and `mean` 4.52× — fixed per-call cost
+that the reference size amortizes away.
 
 The interesting one is `mean`. It used to lose by **4.39×**, and the cause was not
 the kernel, the decomposition, bandwidth, or NUMA — each eliminated by measurement.
@@ -245,16 +250,31 @@ The threads were not stalled, they were *blocked*. Fixed structurally —
 function has no way to allocate** — and `mean` went from 4.39× slower than ITK to
 **0.80×**, faster, with all 16 `bit_parity` checksums unmoved.
 
+The second-most interesting is what the *fix* to `gmrg` then cost. Removing twelve
+full-volume allocations had replaced a **parallel** `f32→f64` widening with a
+**serial** `memcpy` — and because `vec![0.0; n]` is a lazily-zeroed mmap, the
+page-fault bill lands on whichever phase touches the buffer first. That phase was
+now serial: **517 ms** at 512³, against **79.7 ms** for the parallel widening of a
+buffer of exactly the same size. The fix won at 256³ and *lost* at 512³. The copy
+is now deleted rather than parallelized, and a related finding fell out of it — a
+`+=` into a fresh zeroed buffer costs **two page faults per page** (the read faults
+in the shared zero page, the write takes a second write-protect fault) where a
+plain store costs one.
+
 Read §0 of that document before quoting any number from it; it says how much of
 each one you can trust.
 
 ## Roadmap
 
-1. **The two ops that still lose.** `gradient_magnitude` (1.51× at medium, 2.00× at
-   large) and `gmrg` (1.22× / 2.93×). The buffer fix that answered `gmrg`'s medium
-   case did not touch its large case at all.
-2. **Small-volume overhead.** `otsu` is 6.62× and `mean` 4.52× at 64³ — a fixed
-   per-call cost the reference size amortizes away and the headline hides.
+1. **Small-volume overhead** — now the port's only real loss. `gradient_magnitude`
+   is 2.91× at 64³, `otsu` 6.62×, `mean` 4.52×: fixed per-call cost that the
+   reference size amortizes away and the headline hides. None of the three
+   `gradient.rs` fixes moved `gradient_magnitude`'s small case by more than its own
+   noise, because it is overhead-bound, not bandwidth-bound.
+2. **`smoothing_recursive_gaussian` at 512³ (1.75×)**, not investigated. And three
+   un-parallelized stencils next to the ones just fixed — `derivative`, `laplacian`,
+   `sobel_edge_detection` still run a serial `iter().map().collect()`. They are not
+   in the benchmarked twelve, so no number is claimed for them.
 3. **Device coverage.** The fixed-initial transform — the device resample's
    transform slot is empty, not hard, and the point map is bitwise reproducible for
    the nine matrix-offset transform variants (`Scale` is *not* one of them: it
