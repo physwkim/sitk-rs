@@ -2464,6 +2464,13 @@ impl ImageRegistrationMethod {
     /// So: a well-conditioned registration lands in the same place on both paths. An
     /// ill-conditioned one lands in *a* minimum on both paths, but not necessarily the
     /// same one, and that is worth knowing before you diff two result files.
+    ///
+    /// This is **upstream's behaviour, not this port's**: ITK initializes `m_Scales` to
+    /// all 1's when no scales and no estimator are set, and its estimators are opt-in,
+    /// so an ITK user registering a rotation without one runs the identical
+    /// ill-conditioned descent. Recorded as §2.157 of `doc/upstream-findings.md`, which
+    /// carries the measurements above and the reasoning for *not* gating this entry
+    /// point against a configuration `execute` accepts.
     #[cfg(feature = "cuda")]
     pub fn execute_on_device<T: ParametricTransform>(
         &self,
