@@ -25,17 +25,31 @@
 //!    this line, because a hidden per-op dispatch is exactly what made the bus cost
 //!    invisible in the first place.
 //!
-//! # `f32` only, and it says so
+//! # `f32` on the device — and the cast to it happens **on the device**
 //!
-//! The device type is `Float32`. [`upload`](DeviceImage::upload) of any other
-//! pixel type fails with [`CudaError::UnsupportedPixelType`], **naming the type** —
-//! it does not silently widen it, and it does not silently decline to the CPU. A
-//! caller with a `UInt16` CT casts on the host first (`sitk_filters::cast`), which
-//! is one visible pass, rather than having a conversion happen inside a function
-//! whose name does not mention it.
+//! The device type is `Float32`, but a CT arrives from disk as `UInt16`, and
+//! casting it on the host cost 40 ms at 256³ — the largest host term left in the
+//! resident chain, and it also doubled the H2D (67 MB of `f32` where the native
+//! volume is 33 MB).
+//!
+//! So [`upload`](DeviceImage::upload) takes the image in its **native scalar type**,
+//! pushes the native bytes, and converts on the device. A `UInt16` CT never
+//! materializes as an `f32` volume on the host at all.
+//!
+//! The conversion is the CPU filter's, exactly: `sitk_filters::cast` goes
+//! `native → f64 → f32` (`to_f64_vec`, then `Scalar::from_f64`), so the kernel goes
+//! `(float)(double)x` and not `(float)x`. For the ≤32-bit types those are the same
+//! number, but for `Int64`/`UInt64` above 2⁵³ they are not — a single rounding and a
+//! double rounding disagree — and the device must reproduce what the host filter
+//! produces, not what is more accurate. A test asserts bit-identity for every type.
+//!
+//! A pixel type with **no** device path — a vector, complex or label image — is
+//! still refused with [`CudaError::UnsupportedPixelType`] **naming the type**. The
+//! refusal is the point: the device never quietly converts something it was not
+//! asked to convert, and never quietly decides to be a CPU path.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
-use sitk_core::{Image, PixelId};
+use cudarc::driver::{DeviceRepr, LaunchConfig, PushKernelArg};
+use sitk_core::{Image, PixelId, Scalar};
 
 use crate::backend::{Backend, backend};
 use crate::buffer::DeviceBuffer;
@@ -52,6 +66,23 @@ extern "C" __global__ void widen_f32_f64(
 {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = (double)x[i];
+}
+"#;
+
+/// The device cast, with the source element type left open as `CTYPE`.
+///
+/// `(float)(double)x` — through `double`, deliberately. See the [module docs](self):
+/// the CPU filter casts through `f64`, and for the 64-bit integer types a single
+/// `native → f32` rounding gives a *different* result from the host's double
+/// rounding. Matching the host is the requirement.
+const CAST: &str = r#"
+extern "C" __global__ void cast_to_f32(
+    const CTYPE* __restrict__ x,
+    float* __restrict__ y,
+    const long long n)
+{
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = (float)(double)x[i];
 }
 "#;
 
@@ -119,21 +150,75 @@ impl DeviceImage {
     /// Copy a host image to the device (**the H2D**, and one of only two bus
     /// crossings in this crate).
     ///
-    /// `img` must be a `Float32` scalar image. Any other pixel type is refused
-    /// with [`CudaError::UnsupportedPixelType`] carrying the type that was
-    /// offered — the device path never widens a volume behind the caller's back,
-    /// and never quietly decides to be a CPU path.
+    /// `img` may be **any scalar pixel type**: a `Float32` image is pushed as it
+    /// is, and every other scalar type is pushed in its native width and cast to
+    /// `f32` **on the device**, bit-identically to `sitk_filters::cast(img,
+    /// Float32)` (see the [module docs](self)). A `UInt16` volume therefore crosses
+    /// the bus at 2 bytes per voxel, not 4, and is never widened on the host.
+    ///
+    /// A pixel type with no device path — vector, complex, label — is refused with
+    /// [`CudaError::UnsupportedPixelType`] carrying the type that was offered. The
+    /// device path never quietly converts what it was not asked to convert, and
+    /// never quietly decides to be a CPU path.
     pub fn upload(img: &Image) -> Result<Self, CudaError> {
-        if img.pixel_id() != PixelId::Float32 {
-            return Err(CudaError::UnsupportedPixelType(img.pixel_id()));
+        match img.pixel_id() {
+            // Already the device type: the bytes go up as they are.
+            PixelId::Float32 => {
+                let host = img.scalar_slice::<f32>()?;
+                if host.is_empty() {
+                    return Err(CudaError::DegenerateInput);
+                }
+                let backend = backend()?;
+                Ok(Self {
+                    buf: DeviceBuffer::from_host(backend, host)?,
+                    geom: Geometry::of(img),
+                    id: next_id(),
+                })
+            }
+            PixelId::UInt8 => Self::upload_cast::<u8>(img, "unsigned char"),
+            PixelId::Int8 => Self::upload_cast::<i8>(img, "signed char"),
+            PixelId::UInt16 => Self::upload_cast::<u16>(img, "unsigned short"),
+            PixelId::Int16 => Self::upload_cast::<i16>(img, "short"),
+            PixelId::UInt32 => Self::upload_cast::<u32>(img, "unsigned int"),
+            PixelId::Int32 => Self::upload_cast::<i32>(img, "int"),
+            PixelId::UInt64 => Self::upload_cast::<u64>(img, "unsigned long long"),
+            PixelId::Int64 => Self::upload_cast::<i64>(img, "long long"),
+            PixelId::Float64 => Self::upload_cast::<f64>(img, "double"),
+            other => Err(CudaError::UnsupportedPixelType(other)),
         }
-        let host = img.scalar_slice::<f32>()?;
+    }
+
+    /// Push `img`'s voxels in their native type `T` and cast them to `f32` on the
+    /// device. `ctype` is `T`'s C spelling, and the two must agree — that is the
+    /// invariant the `upload` match arms exist to hold.
+    fn upload_cast<T: Scalar + DeviceRepr>(img: &Image, ctype: &str) -> Result<Self, CudaError> {
+        let host = img.scalar_slice::<T>()?;
         if host.is_empty() {
             return Err(CudaError::DegenerateInput);
         }
-        let backend = backend()?;
+        let backend: &Backend = backend()?;
+        let n = host.len();
+
+        let src = DeviceBuffer::from_host(backend, host)?;
+        let mut buf = DeviceBuffer::<f32>::zeros(backend, n)?;
+
+        let f = backend.function(&CAST.replace("CTYPE", ctype), "cast_to_f32")?;
+        let n_i64 = n as i64;
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(BLOCK as usize) as u32, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = backend.stream().launch_builder(&f);
+        launch.arg(src.device()).arg(buf.device_mut()).arg(&n_i64);
+        // SAFETY: three parameters, three arguments, matching in order and type —
+        // `CTYPE` is `T`'s C spelling, fixed by the caller's match arm, and both
+        // buffers hold `n` elements. The kernel guards every access on `i < n`.
+        unsafe { launch.launch(cfg)? };
+        backend.synchronize()?;
+
         Ok(Self {
-            buf: DeviceBuffer::from_host(backend, host)?,
+            buf,
             geom: Geometry::of(img),
             id: next_id(),
         })

@@ -146,7 +146,7 @@ fn main() {
         let d_m = device_rescale(&d_moving, OUT_MIN, OUT_MAX).unwrap();
         let r_filters = ms(t);
         let t = Instant::now();
-        let mut r_metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+        let r_metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
         let r_setup = ms(t);
         let t = Instant::now();
         for _ in 0..ITERS {

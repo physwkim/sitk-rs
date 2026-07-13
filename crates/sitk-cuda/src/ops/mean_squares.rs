@@ -71,6 +71,8 @@
 //! parallel reduction can reproduce a left-to-right f64 accumulation. The
 //! divergence is reduction-rounding only (~√N·ε).
 
+use std::sync::OnceLock;
+
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use crate::backend::{Backend, backend};
@@ -90,7 +92,23 @@ const NSLOT: usize = 14;
 /// is written for `dim = 3` and a 2-D caller falls back to the CPU.
 pub const DIM: usize = 3;
 
-const KERNEL: &str = r#"
+/// The kernel body, with the two volumes' element types left open — `FSCALAR` for
+/// the fixed samples, `MSCALAR` for the moving image. Nothing else about the
+/// instantiations differs.
+///
+/// The volumes are the only scalars: every load widens to `double` on the spot
+/// (`(double)x` is exact for every `f32`) and every multiply, add and accumulator
+/// below is `double` in every instantiation. That is what makes a narrowed volume
+/// bit-identical to a wide one **when the voxels came from an `f32` image** —
+/// which is exactly when it is narrowed.
+///
+/// The two are separate because they are not symmetric. The fixed value is **one**
+/// load per sample; the moving image is **eight** (the trilinear corners). Each
+/// `f32` load costs an `f32 → f64` conversion, which issues on the FP64 pipe that
+/// Ada runs at 1:64 — so narrowing the moving image buys half the memory at eight
+/// ninths of the conversion cost, while narrowing the fixed samples buys the other
+/// half of the memory at one ninth of it. See [`Volumes`].
+const KERNEL_BODY: &str = r#"
 #define BLOCK 256
 #define NSLOT 14
 
@@ -104,14 +122,14 @@ __device__ __forceinline__ bool is_inside(const double* c, const long long* size
 }
 
 extern "C" __global__ void ms_moments(
-    const double* __restrict__ fvals,     // fixed sample values, n
+    const FSCALAR* __restrict__ fvals,    // fixed sample values, n
     const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); unused if !has_pts
     const int has_pts,
     const long long* __restrict__ fsize,  // 3, fixed grid size (used if !has_pts)
     const double* __restrict__ forigin,   // 3
     const double* __restrict__ fmat,      // 3x3 index_to_physical, row-major
     const long long n,
-    const double* __restrict__ mbuf,      // moving image buffer
+    const MSCALAR* __restrict__ mbuf,     // moving image buffer
     const long long* __restrict__ msize,  // 3
     const long long* __restrict__ mstride,// 3
     const double* __restrict__ morigin,   // 3
@@ -194,7 +212,7 @@ extern "C" __global__ void ms_moments(
                 if (idx > msize[d] - 1) idx = msize[d] - 1;
                 offset += idx * mstride[d];
             }
-            const double b = mbuf[offset];
+            const double b = (double)mbuf[offset];
             value += weight * b;
             for (int j = 0; j < 3; ++j) {
                 double w = 1.0;
@@ -214,7 +232,7 @@ extern "C" __global__ void ms_moments(
             g[d] = gi[0]*mmat[0*3+d] + gi[1]*mmat[1*3+d] + gi[2]*mmat[2*3+d];
         }
 
-        const double diff = value - fvals[s];
+        const double diff = value - (double)fvals[s];
         acc[0] += diff * diff;
         for (int d = 0; d < 3; ++d) {
             const double dg = diff * g[d];
@@ -240,6 +258,62 @@ extern "C" __global__ void ms_moments(
     }
 }
 "#;
+
+/// The kernel source for a volume element type, compiled once per process (the
+/// backend caches modules by source).
+fn kernel_src(fixed: &str, moving: &str) -> &'static str {
+    static WIDE: OnceLock<String> = OnceLock::new();
+    static SPLIT: OnceLock<String> = OnceLock::new();
+    static NARROW: OnceLock<String> = OnceLock::new();
+    let cell = match (fixed, moving) {
+        ("float", "float") => &NARROW,
+        ("float", _) => &SPLIT,
+        _ => &WIDE,
+    };
+    cell.get_or_init(|| format!("#define FSCALAR {fixed}\n#define MSCALAR {moving}\n{KERNEL_BODY}"))
+        .as_str()
+}
+
+/// The fixed samples and the moving volume, in the precision the kernel reads them.
+///
+/// Not a tuning knob for the caller: the *host-producer* path
+/// ([`ResidentMetric::new`]) accepts any pixel type, including `Float64` and
+/// `Int64`, so it stays [`F64`](Volumes::F64) — narrowing there would drop bits the
+/// caller handed us. The *device* path ([`ResidentMetric::from_device`]) reads `f32`
+/// images, so narrowing is lossless and the only question is which volume to narrow.
+///
+/// It narrows the **fixed** samples and leaves the moving image wide, because the
+/// two are not symmetric: one fixed load per sample against eight moving loads (the
+/// trilinear corners), while the memory splits evenly between them. See
+/// [`from_device`](ResidentMetric::from_device) for the measurement.
+enum Volumes {
+    F64 {
+        fvals: DeviceBuffer<f64>,
+        mbuf: DeviceBuffer<f64>,
+    },
+    /// Fixed narrow, moving wide.
+    Split {
+        fvals: DeviceBuffer<f32>,
+        mbuf: DeviceBuffer<f64>,
+    },
+}
+
+impl Volumes {
+    fn lens(&self) -> (usize, usize) {
+        match self {
+            Volumes::F64 { fvals, mbuf } => (fvals.len(), mbuf.len()),
+            Volumes::Split { fvals, mbuf } => (fvals.len(), mbuf.len()),
+        }
+    }
+
+    /// Device bytes held by the two volumes.
+    fn bytes(&self) -> usize {
+        match self {
+            Volumes::F64 { fvals, mbuf } => 8 * fvals.len() + 8 * mbuf.len(),
+            Volumes::Split { fvals, mbuf } => 4 * fvals.len() + 8 * mbuf.len(),
+        }
+    }
+}
 
 /// The 14 moments of one metric evaluation. Parameter-count- and
 /// transform-independent; the host contracts these into value + derivative.
@@ -302,13 +376,12 @@ pub enum FixedPoints<'a> {
 
 pub struct ResidentMetric {
     n: usize,
-    d_fvals: DeviceBuffer<f64>,
+    vols: Volumes,
     d_fpts: DeviceBuffer<f64>,
     has_pts: i32,
     d_fsize: DeviceBuffer<i64>,
     d_forigin: DeviceBuffer<f64>,
     d_fmat: DeviceBuffer<f64>,
-    d_mbuf: DeviceBuffer<f64>,
     d_msize: DeviceBuffer<i64>,
     d_mstride: DeviceBuffer<i64>,
     d_morigin: DeviceBuffer<f64>,
@@ -344,8 +417,10 @@ impl ResidentMetric {
         let backend = backend()?;
         Self::build(
             n,
-            DeviceBuffer::from_chunks(backend, n, fixed_values)?,
-            DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
+            Volumes::F64 {
+                fvals: DeviceBuffer::from_chunks(backend, n, fixed_values)?,
+                mbuf: DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
+            },
             fixed_points,
             moving,
         )
@@ -358,10 +433,32 @@ impl ResidentMetric {
     /// uploads the fixed samples and the moving volume, and when those volumes came
     /// out of a device filter chain seconds earlier, it is re-uploading voxels that
     /// were *already on the device*: 113.7 ms at 256³, the largest single item in
-    /// the chain. Here nothing crosses the bus. The `f64` copies the kernel reduces
-    /// in are made device-to-device ([`DeviceImage::widen_f64`], ~1 ms), and
-    /// `(double)x` is exact for every `f32`, so the metric sees exactly the numbers
-    /// the uploading path gave it.
+    /// the chain. Here nothing crosses the bus.
+    ///
+    /// # Which volume is narrowed, and why only one
+    ///
+    /// The images are `f32`, so keeping either volume `f32` is lossless
+    /// (`(double)x` is exact) — but each `f32` load costs a conversion on the FP64
+    /// pipe, and the two volumes are read at very different rates: **one** fixed
+    /// load per sample against **eight** moving loads (the trilinear corners), while
+    /// the memory splits evenly. Measured at 256³ on an RTX 5000 Ada:
+    ///
+    /// ```text
+    ///   256^3, mean of 3        per evaluation           volume bytes
+    ///   f64 fixed / f64 moving     5.755 ms                 268 MB
+    ///   f32 fixed / f32 moving     6.088 ms   (+5.8%)       134 MB
+    ///   f32 fixed / f64 moving     5.747 ms   (-0.1%)       201 MB   <- this
+    ///
+    ///   128^3                      0.816 / 0.873 (+7.0%) / 0.826 (+1.2%) ms
+    /// ```
+    ///
+    /// So the fixed samples are narrowed and the moving image is left wide: half the
+    /// memory saving for a conversion cost that does not show above the noise at 256³
+    /// and is ~1% at 128³. Narrowing *both* pays eight more conversions per sample for
+    /// the other half of the memory, and costs 6–7%.
+    ///
+    /// The buffers are private device-to-device copies, so the caller may drop or
+    /// reuse the images.
     ///
     /// `fixed_points` is normally [`FixedPoints::Grid`] — a device-resident image is
     /// a full grid with no sampling and no mask — and `moving` carries the moving
@@ -375,28 +472,34 @@ impl ResidentMetric {
         if moving.len() != moving_geometry.len {
             return Err(CudaError::DegenerateInput);
         }
+        let backend = backend()?;
         Self::build(
             fixed.len(),
-            fixed.widen_f64()?,
-            moving.widen_f64()?,
+            Volumes::Split {
+                // The fixed samples: narrow, one load per sample.
+                fvals: DeviceBuffer::copy_of(backend, fixed.buffer().device())?,
+                // The moving image: wide, eight loads per sample.
+                mbuf: moving.widen_f64()?,
+            },
             fixed_points,
             moving_geometry,
         )
     }
 
-    /// The construction both constructors share: everything except where the two
-    /// `f64` volumes came from, which is the only thing they disagree about.
+    /// The construction both constructors share: everything except where the
+    /// volumes came from and what precision they are in, which is the only thing
+    /// the two disagree about.
     fn build(
         n: usize,
-        d_fvals: DeviceBuffer<f64>,
-        d_mbuf: DeviceBuffer<f64>,
+        vols: Volumes,
         fixed_points: FixedPoints<'_>,
         moving: &MovingGeometry<'_>,
     ) -> Result<Self, CudaError> {
         let backend = backend()?;
+        let (fvals_len, mbuf_len) = vols.lens();
         if n == 0
-            || d_fvals.len() != n
-            || d_mbuf.len() != moving.len
+            || fvals_len != n
+            || mbuf_len != moving.len
             || moving.size.len() != DIM
             || moving.size.iter().product::<usize>() != moving.len
         {
@@ -445,13 +548,12 @@ impl ResidentMetric {
 
         Ok(Self {
             n,
-            d_fvals,
+            vols,
             d_fpts: DeviceBuffer::from_host(backend, pts)?,
             has_pts,
             d_fsize: DeviceBuffer::from_host(backend, &fsize)?,
             d_forigin: DeviceBuffer::from_host(backend, &forigin)?,
             d_fmat: DeviceBuffer::from_host(backend, &fmat)?,
-            d_mbuf,
             d_msize: DeviceBuffer::from_host(backend, &as_i64(moving.size))?,
             d_mstride: DeviceBuffer::from_host(backend, &as_i64(moving.strides))?,
             d_morigin: DeviceBuffer::from_host(backend, moving.origin)?,
@@ -469,6 +571,12 @@ impl ResidentMetric {
         self.n
     }
 
+    /// Device bytes held by the two volumes — what the precision choice above is
+    /// spending.
+    pub fn volume_bytes(&self) -> usize {
+        self.vols.bytes()
+    }
+
     /// Evaluate the moments for the point map `x ↦ A·x + b`.
     ///
     /// `a` is row-major `3 × 3`, `b` is length 3. Deterministic: the same inputs
@@ -476,53 +584,88 @@ impl ResidentMetric {
     pub fn evaluate(&mut self, a: &[f64; 9], b: &[f64; 3]) -> Result<Moments, CudaError> {
         let backend: &Backend = backend()?;
 
+        // Field-by-field, so the volumes can be matched on while the partials
+        // buffer is borrowed mutably for the same launch.
+        let Self {
+            n,
+            vols,
+            d_fpts,
+            has_pts,
+            d_fsize,
+            d_forigin,
+            d_fmat,
+            d_msize,
+            d_mstride,
+            d_morigin,
+            d_mmat,
+            d_mmask,
+            has_mask,
+            d_ab,
+            d_partials,
+            h_partials,
+        } = self;
+
         let mut ab = [0.0f64; 12];
         ab[..9].copy_from_slice(a);
         ab[9..].copy_from_slice(b);
-        self.d_ab.copy_from_host(backend, &ab)?;
+        d_ab.copy_from_host(backend, &ab)?;
 
-        let f = backend.function(KERNEL, "ms_moments")?;
-        let n_i64 = self.n as i64;
+        let n_i64 = *n as i64;
         let cfg = LaunchConfig {
             grid_dim: (GRID, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut launch = backend.stream().launch_builder(&f);
-        launch
-            .arg(self.d_fvals.device())
-            .arg(self.d_fpts.device())
-            .arg(&self.has_pts)
-            .arg(self.d_fsize.device())
-            .arg(self.d_forigin.device())
-            .arg(self.d_fmat.device())
-            .arg(&n_i64)
-            .arg(self.d_mbuf.device())
-            .arg(self.d_msize.device())
-            .arg(self.d_mstride.device())
-            .arg(self.d_morigin.device())
-            .arg(self.d_mmat.device())
-            .arg(self.d_mmask.device())
-            .arg(&self.has_mask)
-            .arg(self.d_ab.device())
-            .arg(self.d_partials.device_mut());
-        // SAFETY: the sixteen arguments match the kernel's sixteen parameters in
-        // order and type. `d_fvals` holds `n` f64, read only under `s < n`.
-        // `d_fpts` holds `n*3` and is read only when `has_pts != 0`; otherwise it
-        // is a one-element dummy and the kernel reads `d_fsize`/`d_forigin`/
-        // `d_fmat` (3, 3 and 9 elements) instead, whose product-of-size equals `n`
-        // so the derived index stays in the grid. The moving geometry buffers hold
-        // exactly 3, 3, 3 and 9 elements as the kernel indexes them; `d_mmask` is
-        // read only when
-        // `has_mask != 0`, in which case it has one byte per moving voxel and the
-        // kernel bounds-checks the index it builds; `d_ab` holds 12; `d_partials`
-        // holds `GRID * NSLOT`, and the kernel writes `blockIdx.x * NSLOT + k`
-        // for `blockIdx.x < GRID`, `k < NSLOT`. Shared memory is declared
-        // statically at `BLOCK` doubles, matching `block_dim`.
-        unsafe { launch.launch(cfg)? };
 
-        self.d_partials
-            .copy_to_host(backend, &mut self.h_partials)?;
+        // The two instantiations differ in the element type of `fvals`/`mbuf` and
+        // in nothing else — same sixteen arguments, same order, same grid.
+        macro_rules! launch_moments {
+            ($fscalar:expr, $mscalar:expr, $fvals:expr, $mbuf:expr) => {{
+                let f = backend.function(kernel_src($fscalar, $mscalar), "ms_moments")?;
+                let mut launch = backend.stream().launch_builder(&f);
+                launch
+                    .arg($fvals.device())
+                    .arg(d_fpts.device())
+                    .arg(&*has_pts)
+                    .arg(d_fsize.device())
+                    .arg(d_forigin.device())
+                    .arg(d_fmat.device())
+                    .arg(&n_i64)
+                    .arg($mbuf.device())
+                    .arg(d_msize.device())
+                    .arg(d_mstride.device())
+                    .arg(d_morigin.device())
+                    .arg(d_mmat.device())
+                    .arg(d_mmask.device())
+                    .arg(&*has_mask)
+                    .arg(d_ab.device())
+                    .arg(d_partials.device_mut());
+                // SAFETY: the sixteen arguments match the kernel's sixteen
+                // parameters in order and type — `fvals` is `FSCALAR` and `mbuf` is
+                // `MSCALAR`, which are the element types of the buffers this arm
+                // matched.
+                // `fvals` holds `n` elements, read only under `s < n`. `d_fpts`
+                // holds `n*3` and is read only when `has_pts != 0`; otherwise it is
+                // a one-element dummy and the kernel reads `d_fsize`/`d_forigin`/
+                // `d_fmat` (3, 3 and 9 elements) instead, whose product-of-size
+                // equals `n` so the derived index stays in the grid. The moving
+                // geometry buffers hold exactly 3, 3, 3 and 9 elements as the
+                // kernel indexes them; `d_mmask` is read only when `has_mask != 0`,
+                // in which case it has one byte per moving voxel and the kernel
+                // bounds-checks the index it builds; `d_ab` holds 12; `d_partials`
+                // holds `GRID * NSLOT`, and the kernel writes
+                // `blockIdx.x * NSLOT + k` for `blockIdx.x < GRID`, `k < NSLOT`.
+                // Shared memory is declared statically at `BLOCK` doubles, matching
+                // `block_dim`.
+                unsafe { launch.launch(cfg)? };
+            }};
+        }
+        match vols {
+            Volumes::F64 { fvals, mbuf } => launch_moments!("double", "double", fvals, mbuf),
+            Volumes::Split { fvals, mbuf } => launch_moments!("float", "double", fvals, mbuf),
+        }
+
+        d_partials.copy_to_host(backend, h_partials)?;
         backend.synchronize()?;
 
         // Fold the per-block partials in block-index order. Fixed order, on the
@@ -530,7 +673,7 @@ impl ResidentMetric {
         let mut m = Moments::default();
         let mut count = 0.0f64;
         for blk in 0..GRID as usize {
-            let p = &self.h_partials[blk * NSLOT..(blk + 1) * NSLOT];
+            let p = &h_partials[blk * NSLOT..(blk + 1) * NSLOT];
             m.sq += p[0];
             for d in 0..DIM {
                 m.s0[d] += p[1 + d];
