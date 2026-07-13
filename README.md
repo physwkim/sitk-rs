@@ -148,8 +148,8 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
 
 **The caveats, stated plainly:**
 
-- **Those numbers are 22% worse than the ones this file used to publish, and the
-  22% is a bug fix.** The kernel's continuous index was being formed with FMA
+- **Those numbers are 15–22% worse than the ones this file used to publish, and the
+  regression is a bug fix.** The kernel's continuous index was being formed with FMA
   contraction and with the transform offset seeded into the accumulator, where the
   host adds it last; a 1-ULP difference flips `floor()` for a sample sitting exactly
   on a voxel plane, and the trilinear gradient is discontinuous there, so the kernel
@@ -158,8 +158,9 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   source (`__dmul_rn`/`__dadd_rn`/`__dsub_rn` in the host's exact order, 3.2e-14
   after), and the per-iteration cost rose from 6.9 ms to 8.4 ms. The old 107–119×
   was the number for a derivative that was wrong.
-- `RegistrationResult` reports only the **last** pyramid level's iteration count and
-  stop reason; the coarse levels' are not observable through the public API.
+- A `Float64` registration still differs between host and device: the host keeps
+  `f64` levels and a `DeviceImage` holds `f32`. That is inherent to the device type,
+  not a defect, and `execute_on_device`'s doc comment says so.
 - The device metric is mean-squares, full grid, linear interpolation. No device
   Mattes/correlation/ANTS, no masks, no sampling strategies.
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.

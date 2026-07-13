@@ -101,26 +101,39 @@ The per-op table above understates the case, because in a real pipeline the bus 
 crossed *once*, not once per filter. Measured at 256³, `UInt16` input, 20 iterations
 (`load → cast → rescale → smooth → register`):
 
-| | host (CPU tN) | device-resident |
-|---|---|---|
-| cast | 80.6 | 42.0 → 22.9 (now on device) |
-| rescale | 24.1 | 6.1 |
-| smooth (both volumes) | **2250.7** | **9.7** |
-| registration setup | 22.4 | 6.8 |
-| 20 iterations | 15469.3 | 138.0 |
-| **total** | **17,880 ms** | **240.5 ms** — **74×** |
+Four runs of the identical command, because the first two disagreed by 40% on the
+host column and a total built on a coin flip is not a measurement. Utilization gate
+from `/proc/stat` (~3 busy cores of 96) — not `loadavg`, which reads 18–21 on this
+box with nothing running and **cannot be used as a gate**.
 
-> **The `registration setup` and `20 iterations` rows predate a metric-kernel fix**
-> and have not been re-taken. The kernel was forming the continuous index with FMA
-> contraction and with the transform offset seeded into the accumulator (the host
-> adds it last). A 1-ULP index difference flips `floor()` for a sample lying exactly
-> on a voxel plane, where the trilinear gradient is discontinuous — so the kernel
-> took the *opposite one-sided derivative*: `d/d(angle_y)` off by 34% while the
-> value agreed to 1e-15, which is why every value-only check passed it. Fixed at
-> source; 3.2e-14 after. The blast radius is that one kernel, `mean_squares.cu`:
-> `cast`, `rescale`, and `smooth` are untouched code, as is every row of §1 and §3.
-> **The fix costs 22% per iteration** (§2.1) — that is the price of a derivative
-> that is not 34% wrong.
+| row | host (CPU tN), 4 runs | device-resident, 4 runs |
+|---|---|---|
+| cast | 84.0 / 66.3 / 68.1 / 71.4 | on device (upload+cast 28.3–70.6) |
+| rescale | 25.9 / 28.6 / 20.7 / 29.4 | 3.0 / 1.9 / 4.7 / 1.9 |
+| smooth (both volumes) | **2325 / 1538 / 2103 / 1539** | **14.1 / 9.6 / 16.3 / 9.5** |
+| registration setup | 22.2 / 21.8 / 21.8 / 21.0 | 7.5 / 7.5 / 7.4 / 7.5 |
+| 20 iterations | 18545 / 13280 / 14755 / 13763 | 163.7 / 160.2 / 157.9 / 152.9 |
+| **total** | **21,037 / 14,953 / 16,989 / 15,443** | **258.9 / 240.0 / 247.4 / 200.1** |
+| **speedup** | | **81× / 62× / 69× / 77×** |
+
+The metric value is identical in all four runs — host `89.934407782061`, resident
+`89.934407781794`, relative error **2.94e-12**.
+
+**Quote this as ~70×, not as a point estimate.** The device column is stable; the
+*host* column is not — its `20 iterations` row varies by 40% and its `smooth` row
+flips bimodally between ~1,540 and ~2,300 ms. The 62–81× spread is host noise, and
+§0's warning about this document's own reproducibility is what produced it.
+
+**The metric-kernel fix cost 15% per iteration, not the 22% this document
+previously extrapolated** (138.0 → 152.9–163.7). The kernel had been forming the
+continuous index with FMA contraction and with the transform offset seeded into the
+accumulator (the host adds it last); a 1-ULP index difference flips `floor()` for a
+sample lying exactly on a voxel plane, where the trilinear gradient is
+discontinuous, so the kernel took the *opposite one-sided derivative* —
+`d/d(angle_y)` off by 34% while the value agreed to 1e-15, which is why every
+value-only check passed it. `registration setup` rose 6.8 → 7.5 (+10%, and the most
+reproducible number in the table). Both are the price of a derivative that is not
+34% wrong.
 
 ### 2.1 A real `execute()`, re-measured on the fixed kernel
 
@@ -143,8 +156,11 @@ Three things a reader should take from this table, two of which contradict what
 this document previously implied:
 
 - **The published 107–119× was measured on the broken kernel. It is 88–111×.** The
-  device now costs 8.4 ms per iteration against 6.9 ms before — **+22%**, paid for
-  the correct derivative.
+  device now costs 8.4 ms per iteration against 6.9 ms before — **+22%** by this
+  benchmark's arithmetic. §2's `20 iterations` row, where the count is *pinned* and
+  so the trajectory cannot move it, puts the same cost at **+15%**. The pinned-count
+  number is the cleaner measurement; the honest range is 15–22%, and it is what the
+  correct derivative costs.
 - **The pyramid is not what costs you the speedup — 87–97× with, 88–111× without.**
   The device pays 83 ms to build the extra levels (209 → 292); the host pays 5–7
   *seconds* and gets nothing back on this input, because a 3-voxel misalignment
