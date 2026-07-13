@@ -451,16 +451,18 @@ pub fn shrink(src: &DeviceImage, factors: &[usize]) -> Result<DeviceImage, CudaE
 /// `p` packs, in order: `out_origin[3]`, `out_index_to_phys[9]`, `in_origin[3]`,
 /// `in_phys_to_index[9]`, `default_value` — 25 doubles.
 const RESAMPLE: &str = r#"
-extern "C" __global__ void resample_linear3(
-    const float* __restrict__ in,
-    float* __restrict__ out,
+// The continuous index of output voxel `o` in the input's index space, and whether
+// it is inside the input buffer. Shared by both kernels below **on purpose**: the
+// nearest-neighbour resample must land on the same continuous index as the linear
+// one, and two transcriptions of this arithmetic would be two things to keep in
+// step. `resample_linear3`'s bit-identity test against the CPU filter is what
+// guards this function.
+__device__ __forceinline__ bool cindex_of(
+    const long long o,
     const double* __restrict__ p,
-    const long long* __restrict__ g,   // in_size[3], out_size[3], in_stride[3], out_stride[3]
-    const long long n_out)
+    const long long* __restrict__ g,
+    double* cindex)
 {
-    const long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (o >= n_out) return;
-
     double index_f[3];
     for (int d = 0; d < 3; ++d) {
         index_f[d] = (double)((o / g[9 + d]) % g[3 + d]);
@@ -477,17 +479,32 @@ extern "C" __global__ void resample_linear3(
     // cindex = M_in * (phys - in_origin)   [the transform is the identity]
     double diff[3];
     for (int d = 0; d < 3; ++d) diff[d] = phys[d] - p[12 + d];
-    double cindex[3];
     for (int r = 0; r < 3; ++r) {
         double acc = 0.0;
         for (int c = 0; c < 3; ++c) acc += p[15 + r * 3 + c] * diff[c];
         cindex[r] = acc;
     }
 
+    // is_inside: pixel-centred coverage [-0.5, size - 0.5) on every axis.
     bool inside = true;
     for (int d = 0; d < 3; ++d) {
         if (!(cindex[d] >= -0.5 && cindex[d] < (double)g[d] - 0.5)) inside = false;
     }
+    return inside;
+}
+
+extern "C" __global__ void resample_linear3(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    const double* __restrict__ p,
+    const long long* __restrict__ g,   // in_size[3], out_size[3], in_stride[3], out_stride[3]
+    const long long n_out)
+{
+    const long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+
+    double cindex[3];
+    const bool inside = cindex_of(o, p, g, cindex);
 
     double v = p[24];
     if (inside) {
@@ -513,6 +530,45 @@ extern "C" __global__ void resample_linear3(
             if (weight != 0.0) acc += weight * (double)in[offset];
         }
         v = acc;
+    }
+    out[o] = (float)v;
+}
+
+extern "C" __global__ void resample_nearest3(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    const double* __restrict__ p,
+    const long long* __restrict__ g,
+    const long long n_out)
+{
+    const long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+
+    double cindex[3];
+    const bool inside = cindex_of(o, p, g, cindex);
+
+    double v = p[24];
+    if (inside) {
+        // `nearest_at`: round HALF UP (ITK's RoundHalfIntegerUp), then clamp.
+        //
+        // It must be floor(c + 0.5) and not a library rounding call. `rint`/
+        // `nearbyint` are round-half-to-EVEN, which disagrees at *every* positive
+        // half-integer (rint(0.5) = 0, floor(0.5 + 0.5) = 1) -- and a tie is not
+        // exotic here: a grid offset by exactly half a voxel puts every sample on
+        // one. `round()` is half-away-from-zero, which agrees for c >= 0 and differs
+        // only at c = -0.5, where the clamp below hides it. So only floor(c + 0.5)
+        // reproduces the host on all three.
+        //
+        // The clamp is the CPU's, and with `inside` already true it can only bite at
+        // c in [-0.5, 0), which maps to index 0.
+        long long offset = 0;
+        for (int d = 0; d < 3; ++d) {
+            long long i = (long long)floor(cindex[d] + 0.5);
+            if (i < 0) i = 0;
+            if (i > g[d] - 1) i = g[d] - 1;
+            offset += i * g[6 + d];
+        }
+        v = (double)in[offset];
     }
     out[o] = (float)v;
 }
@@ -565,6 +621,48 @@ pub fn resample_linear(
     grid: &Geometry,
     default_value: f64,
 ) -> Result<DeviceImage, CudaError> {
+    resample(src, grid, default_value, "resample_linear3")
+}
+
+/// Resample a resident volume onto `grid` with **nearest-neighbour** interpolation
+/// through the identity transform — the device form of
+/// `ResampleImageFilter::execute(input, identity)` with
+/// `Interpolator::NearestNeighbor` and `grid` as the reference image.
+///
+/// This exists for **masks**. A mask is a binary predicate over physical space, and
+/// carrying it to a coarse level means re-sampling it without blurring and
+/// re-thresholding — which is why the host uses nearest-neighbour for exactly this
+/// and linear for the image (`prepare_level`). The values are 0/1, so an arithmetic
+/// error here is invisible in the *values*: the failure mode is entirely in the
+/// index arithmetic, where a half-voxel tie broken the wrong way flips a shell of
+/// boundary voxels, changes the metric's valid-sample count, and shows up as a
+/// count mismatch rather than as a wrong number. Hence
+/// `the_device_nearest_resample_is_bit_identical_to_the_host_filter`, which pins the
+/// op before anything is wired to it.
+///
+/// Rounding is **half-up** (`floor(c + 0.5)`, ITK's `RoundHalfIntegerUp`), not
+/// `round()` — the two disagree at exact half-integers below zero.
+///
+/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image or a singular
+/// direction matrix.
+pub fn resample_nearest(
+    src: &DeviceImage,
+    grid: &Geometry,
+    default_value: f64,
+) -> Result<DeviceImage, CudaError> {
+    resample(src, grid, default_value, "resample_nearest3")
+}
+
+/// The body both resamples share: the geometry checks, the 25-double parameter
+/// pack, the 12-`i64` size/stride pack, and the launch. Only the kernel name
+/// differs, so the two interpolators cannot drift apart in the arithmetic that
+/// decides *where* they sample — only in what they do once they are there.
+fn resample(
+    src: &DeviceImage,
+    grid: &Geometry,
+    default_value: f64,
+    kernel: &str,
+) -> Result<DeviceImage, CudaError> {
     let in_geom = src.geometry();
     require_3d(in_geom)?;
     require_3d(grid)?;
@@ -596,7 +694,7 @@ pub fn resample_linear(
 
     let mut dst = DeviceImage::with_geometry(grid.clone())?;
     let n_i64 = n_out as i64;
-    let f = backend.function_exact(RESAMPLE, "resample_linear3")?;
+    let f = backend.function_exact(RESAMPLE, kernel)?;
     let mut launch = backend.stream().launch_builder(&f);
     launch
         .arg(src.buffer().device())
