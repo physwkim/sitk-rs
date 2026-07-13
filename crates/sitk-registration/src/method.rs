@@ -2694,19 +2694,19 @@ impl ImageRegistrationMethod {
         if !matches!(self.sampling_strategy, SamplingStrategy::None) {
             return Err(DeviceRegistrationError::UnsupportedSampling);
         }
-        // Masks and virtual domains are no longer refused: the level carries a device
-        // fixed mask (`level_mask_on_device`), the metric takes a moving mask, and the
-        // level's grid can be the virtual one (`level_grid`).
+        // Masks, virtual domains and fixed-initial transforms are no longer refused as
+        // *configurations*: the level carries a device fixed mask
+        // (`level_mask_on_device`), the metric takes a moving mask, the level's grid can
+        // be the virtual one (`level_grid`), and the fixed image and its in-buffer
+        // predicate are resampled *through* the fixed-initial transform
+        // (`fixed_initial_map` + `resample_*_through`, pinned bit-identical to
+        // `ResampleImageFilter`).
         //
-        // A **fixed-initial transform** is still refused, and it is the last one. It
-        // would need the fixed image *and the in-buffer predicate* resampled through
-        // the transform, and neither device resample can resample through anything but
-        // the identity. See `UnsupportedFixedInitialTransform`: the blocker is not the
-        // kernel, it is that a predicate matched only to a tolerance would break the
-        // valid-point count this path pins as exactly equal to the host's.
-        if self.fixed_initial_transform.is_some() {
-            return Err(DeviceRegistrationError::UnsupportedFixedInitialTransform);
-        }
+        // What is still refused is a fixed-initial transform whose **arithmetic** the
+        // device cannot reproduce to the bit — and that refusal is not made here. It is
+        // made where the map is taken (`fixed_initial_map`), by name, per transform
+        // class, so a `ScaleTransform` is refused while an `Euler3DTransform` is not.
+        // Doing it here would mean re-deriving that classification at a second site.
 
         let geom = fixed.geometry();
         let schedule = self.level_schedule(geom.dimension())?;
@@ -2872,10 +2872,46 @@ impl ImageRegistrationMethod {
         };
 
         let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
-        let fixed_level =
-            sitk_cuda::resample_linear(sf, &grid, 0.0).map_err(DeviceRegistrationError::Pyramid)?;
+        let fixed_level = match self.fixed_initial_map()? {
+            Some(m) => sitk_cuda::resample_linear_through(sf, &grid, 0.0, &m.matrix, &m.offset),
+            None => sitk_cuda::resample_linear(sf, &grid, 0.0),
+        }
+        .map_err(DeviceRegistrationError::Pyramid)?;
 
         Ok((Some(fixed_level), moving_level))
+    }
+
+    /// The fixed-initial transform's point map, in the only form the device resample
+    /// may take: the matrix and offset the transform **itself** multiplies, bit for
+    /// bit ([`sitk_transform::Transform::matrix_offset_map`]).
+    ///
+    /// `None` when no fixed-initial transform is configured — the device then resamples
+    /// through the identity, which is what the host does too (`prepare_level`'s
+    /// `onto_virtual` passes `AffineTransform::identity(dim)`, not nothing).
+    ///
+    /// A transform with no such form is refused, by name, rather than approximated.
+    /// The metric's `affine_form` could hand one over for any affine transform — it
+    /// probes `T(0)` and `T(e_e) − T(0)` — but that reconstruction is ~1e-12 from the
+    /// transform's own arithmetic, and the level's *predicate* is a 0/1 field whose
+    /// border is decided by rounding a continuous index. One ulp there flips a shell of
+    /// voxels, moves the valid-point count, and breaks the one thing the device path
+    /// pins as *exactly* equal to the host's. So: the transform's own bits, or nothing.
+    #[cfg(feature = "cuda")]
+    fn fixed_initial_map(
+        &self,
+    ) -> std::result::Result<
+        Option<sitk_transform::matrix_offset::MatrixOffsetMap>,
+        DeviceRegistrationError,
+    > {
+        match &self.fixed_initial_transform {
+            None => Ok(None),
+            Some(t) => match t.matrix_offset_map() {
+                Some(m) => Ok(Some(m)),
+                None => Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(
+                    t.kind(),
+                )),
+            },
+        }
     }
 
     /// The grid this level's samples live on, as a geometry — `prepare_level`'s
@@ -2951,8 +2987,20 @@ impl ImageRegistrationMethod {
         use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
 
         let grid_ref = grid.unwrap_or(fixed.geometry());
+        // The same transform the level's fixed image goes through, and it must be the
+        // same one *to the bit*: the host resamples the ones volume and the user mask
+        // through `onto_virtual` — the identical closure it resamples the image with —
+        // so a device that mapped the predicate with even a 1-ulp-different point would
+        // disagree with the host on a shell of border voxels.
+        let map = self.fixed_initial_map()?;
         let onto_level = |img: &DeviceImage| -> std::result::Result<DeviceMask, CudaError> {
-            DeviceMask::from_device_image(&sitk_cuda::resample_nearest(img, grid_ref, 0.0)?)
+            let resampled = match &map {
+                Some(m) => {
+                    sitk_cuda::resample_nearest_through(img, grid_ref, 0.0, &m.matrix, &m.offset)?
+                }
+                None => sitk_cuda::resample_nearest(img, grid_ref, 0.0)?,
+            };
+            DeviceMask::from_device_image(&resampled)
         };
 
         let inside_fixed =
@@ -6765,7 +6813,7 @@ mod tests {
 mod device_level_tests {
     use super::*;
     use sitk_cuda::{DeviceImage, DeviceMask};
-    use sitk_transform::Euler3DTransform;
+    use sitk_transform::{Euler3DTransform, Transform};
 
     fn no_device() -> bool {
         matches!(sitk_cuda::backend(), Err(sitk_cuda::CudaError::NoDevice(_)))
@@ -7114,6 +7162,152 @@ mod device_level_tests {
                 d_err <= 1e-9,
                 "{what}: deriv rel err {d_err:e} exceeds 1e-9"
             );
+        }
+    }
+
+    /// D3: with a **fixed-initial transform**, the device level image is the host's bit
+    /// for bit and the device level mask is the host's **byte for byte** — the transform
+    /// carried through the image resample, the in-buffer predicate and the user mask
+    /// alike, exactly as `prepare_level`'s single `onto_virtual` closure carries it.
+    ///
+    /// The anti-vacuity here is not optional, and it is stronger than C3's. A transform
+    /// that moved nothing would leave the predicate all-ones and this test would pass on
+    /// a device that ignored the transform entirely. So it asserts, before comparing:
+    ///
+    /// - the host's predicate actually gates (it has zeros *and* ones), and
+    /// - the level mask **differs** from the mask the same configuration produces with
+    ///   the transform removed — i.e. the transform genuinely pushed part of the fixed
+    ///   image off the level's grid, which is the shell where a 1-ulp point map does its
+    ///   damage.
+    ///
+    /// (Checked by deleting the map from `level_mask_on_device`'s `onto_level`: the mask
+    /// comparison then fails on a shell of border voxels.)
+    #[test]
+    fn the_device_level_is_the_host_level_through_a_fixed_initial_transform() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        // A rotation about a corner plus a translation: it swings a slab of the fixed
+        // image off the level grid, so the in-buffer predicate has real work to do.
+        let initial = Transform::Euler3D(Euler3DTransform::new(
+            0.15,
+            -0.10,
+            0.35,
+            [4.0, -3.0, 2.0],
+            [0.0, 0.0, 0.0],
+        ));
+
+        for (name, with_mask, with_domain) in [
+            ("fixed-initial transform only", false, false),
+            ("with a user mask", true, false),
+            ("with a virtual domain", false, true),
+            ("with both", true, true),
+        ] {
+            let build = |transform: Option<&Transform>| {
+                let mut reg = ImageRegistrationMethod::new();
+                if with_mask {
+                    reg.set_metric_fixed_mask(&mask);
+                }
+                if with_domain {
+                    reg.set_virtual_domain(
+                        vec![24, 20, 28],
+                        vec![-8.0, -4.0, -6.0],
+                        vec![1.5, 2.0, 2.0],
+                        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    )
+                    .unwrap();
+                }
+                if let Some(t) = transform {
+                    reg.set_fixed_initial_transform(t.clone());
+                }
+                reg
+            };
+
+            let reg = build(Some(&initial));
+            // The same configuration with the transform removed — the mask this must
+            // *not* equal, or the transform is not reaching the predicate.
+            let no_transform = build(None);
+
+            for factors in [vec![2usize; 3], vec![1usize; 3]] {
+                let sigma = vec![0.0; 3];
+                let what = format!("{name}, factors {factors:?}");
+
+                let (host_fixed, host_moving, host_mask) = reg
+                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                    .unwrap();
+                let (dev_fixed, dev_moving) = reg
+                    .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                    .unwrap();
+                let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+                let dev_mask = reg
+                    .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
+                    .unwrap();
+
+                // The level image, through the transform, bit for bit.
+                assert_same_image(
+                    &host_fixed,
+                    &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                    &format!("{what}: fixed level"),
+                );
+                assert_same_image(
+                    &host_moving,
+                    &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                    &format!("{what}: moving level"),
+                );
+
+                // A fixed-initial transform always makes the host build a predicate.
+                let host_mask = host_mask.expect("a fixed-initial transform builds a predicate");
+                let dev_mask = dev_mask.expect("the device built no level mask");
+
+                let hb = host_mask_bytes(&host_mask);
+                let db = device_mask_bytes(&dev_mask);
+
+                // Anti-vacuity 1: the mask must gate something.
+                let zeros = hb.iter().filter(|&&b| b == 0).count();
+                let ones = hb.len() - zeros;
+                assert!(
+                    zeros > 0 && ones > 0,
+                    "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); the \
+                     comparison below would pass on a device that ignored the transform"
+                );
+
+                // Anti-vacuity 2: the transform must have *moved* the predicate.
+                let (_, _, plain_mask) = no_transform
+                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                    .unwrap();
+                let plain = plain_mask.map(|m| host_mask_bytes(&m));
+                match &plain {
+                    None => {} // no domain, no user mask: without the transform there is no mask at all
+                    Some(p) => assert!(
+                        p.len() != hb.len() || p != &hb,
+                        "{what}: the level mask is identical with and without the \
+                         fixed-initial transform; the transform is not reaching the \
+                         predicate and this test proves nothing"
+                    ),
+                }
+
+                assert_eq!(
+                    db.len(),
+                    hb.len(),
+                    "{what}: the device mask is not on the level's grid"
+                );
+                let differing = hb.iter().zip(db.iter()).filter(|&(&h, &d)| h != d).count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "{what}: {differing} of {} mask bytes differ (host zeros {zeros}, ones {ones})",
+                    hb.len()
+                );
+                println!("{what}: level mask byte-equal ({zeros} zeros, {ones} ones)");
+            }
         }
     }
 }

@@ -707,17 +707,61 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedSampling)
     ));
 
-    // A fixed-initial transform: the last refusal, and the only mask-shaped one left.
-    // The fixed image and the in-buffer predicate would have to be resampled *through*
-    // it, and both device resamples go through the identity only.
+    // A fixed-initial transform is refused **per transform class**, not as a
+    // configuration: what the device needs is a point map that is bitwise
+    // `mat_vec(matrix, p) + offset` on the transform's own stored fields, because the
+    // in-buffer predicate it carries is 0/1 and one ulp at the border moves the
+    // valid-point count. `ScaleTransform` evaluates `(p - c)*s + c`, which is that map
+    // in exact arithmetic and not in the last bits, so it is refused rather than folded.
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Scale(
+        sitk_transform::ScaleTransform::new(vec![1.1, 1.0, 0.9], vec![0.0, 0.0, 0.0]),
+    ));
+    match run(&reg) {
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
+            assert_eq!(kind, sitk_transform::TransformKind::Scale);
+        }
+        other => panic!(
+            "a ScaleTransform fixed-initial transform must be refused by name: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // Composite: linear when its stages are, and still refused — folding the stages into
+    // one matrix rounds once where the transform rounds per stage.
+    let mut composite = sitk_transform::CompositeTransform::new(3);
+    composite
+        .add_transform(sitk_transform::Transform::Translation(
+            sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
+        ))
+        .unwrap();
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Composite(composite));
+    match run(&reg) {
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
+            assert_eq!(kind, sitk_transform::TransformKind::Composite);
+        }
+        other => panic!(
+            "a CompositeTransform fixed-initial transform must be refused by name: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // ...and the classes the device *can* reproduce bit for bit are no longer refused.
+    // A translation is one of them (`mat_vec(I, p) + t`, pinned bitwise), so it must not
+    // come back as a boundary refusal. Where it lands is pinned end to end by
+    // `a_fixed_initial_transform_lands_where_execute_lands`.
     let mut reg = ImageRegistrationMethod::new();
     reg.set_fixed_initial_transform(sitk_transform::Transform::Translation(
         sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
     ));
-    assert!(matches!(
-        run(&reg),
-        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform)
-    ));
+    assert!(
+        !matches!(
+            run(&reg),
+            Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
+        ),
+        "a TranslationTransform has a bitwise point map and must not be refused"
+    );
 
     // ...and a fixed mask is *not* refused any more — it is carried onto every level.
     //
@@ -734,7 +778,7 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             Err(DeviceRegistrationError::UnsupportedMetric
                 | DeviceRegistrationError::UnsupportedInterpolator(_)
                 | DeviceRegistrationError::UnsupportedSampling
-                | DeviceRegistrationError::UnsupportedFixedInitialTransform)
+                | DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
         ),
         "a fixed mask was refused at the boundary"
     );
