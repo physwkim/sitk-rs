@@ -89,9 +89,10 @@ fn main() {
         reg.set_metric_as_mean_squares();
         reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, iters, 1e-8);
 
-        // Burn NVRTC (once per process, size-independent) on a tiny volume.
-        match DeviceImage::upload(&sitk_filters::cast(&volume(16, 0.0), PixelId::Float32).unwrap())
-        {
+        // Burn NVRTC (once per process, size-independent) on a tiny volume — and on
+        // the NATIVE type, so the device cast's kernel is compiled too and its
+        // one-time compile does not land inside the timed upload below.
+        match DeviceImage::upload(&volume(16, 0.0)) {
             Ok(d) => {
                 let r = device_rescale(&d, OUT_MIN, OUT_MAX).unwrap();
                 let s = device_smooth(&r, &SIGMA).unwrap();
@@ -132,12 +133,11 @@ fn main() {
 
         // ---- resident: cast (host) -> upload -> rescale -> smooth -> execute ---
         let mut dev_pre = [0.0f64; 4];
+        // No host cast: `upload` takes the UInt16 volume in its native type and
+        // casts on the device, so the f32 volume never exists on the host.
         let device_chain = |img: &Image, stage: &mut [f64; 4]| {
             let t = Instant::now();
-            let c = sitk_filters::cast(img, PixelId::Float32).unwrap();
-            stage[0] += ms(t);
-            let t = Instant::now();
-            let d = DeviceImage::upload(&c).unwrap();
+            let d = DeviceImage::upload(img).unwrap();
             stage[1] += ms(t);
             let t = Instant::now();
             let r = device_rescale(&d, OUT_MIN, OUT_MAX).unwrap();
@@ -161,7 +161,7 @@ fn main() {
             host_pre[0], host_pre[1], host_pre[2]
         );
         println!(
-            "resident  cast {:7.1}  upload  {:7.1}  rescale {:6.1}  smooth {:6.1}  \
+            "resident  cast {:7.1}  upload+cast {:7.1}  rescale {:6.1}  smooth {:6.1}  \
              execute_on_device {device_reg:7.1}   total {device_total:9.1} ms",
             dev_pre[0], dev_pre[1], dev_pre[2], dev_pre[3]
         );

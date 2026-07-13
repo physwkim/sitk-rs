@@ -11,7 +11,7 @@
 //! Only compiled with the `cuda` feature.
 #![cfg(feature = "cuda")]
 
-use sitk_core::{Image, PixelId};
+use sitk_core::Image;
 use sitk_cuda::{CudaError, DeviceImage};
 use sitk_registration::metric::{FixedSamples, MovingImage};
 use sitk_registration::{
@@ -58,21 +58,9 @@ fn no_device() -> bool {
     matches!(sitk_cuda::backend(), Err(CudaError::NoDevice(_)))
 }
 
-/// The crossing is refused for a pixel type the device does not have, and the
-/// error **names the type** — it does not widen it silently and it does not
-/// silently become a CPU path. Needs no GPU: the check precedes the driver.
-#[test]
-fn upload_names_the_pixel_type_it_cannot_take() {
-    let img = Image::from_vec(&[4, 4, 4], vec![7u16; 64]).unwrap();
-    match DeviceImage::upload(&img) {
-        Err(CudaError::UnsupportedPixelType(id)) => {
-            assert_eq!(id, PixelId::UInt16);
-            println!("refused, by name: {}", CudaError::UnsupportedPixelType(id));
-        }
-        Err(e) => panic!("wrong error: {e}"),
-        Ok(_) => panic!("a UInt16 image must not upload to an f32-only device type"),
-    }
-}
+// The crossing's pixel-type contract — every scalar type casts on the device,
+// bit-identically to `sitk_filters::cast`, and a type with no device path is
+// refused by name without touching the driver — lives in `tests/upload_cast.rs`.
 
 /// `upload` → `to_host` is the identity on voxels *and* on geometry: a volume that
 /// makes the round trip must come back as the image it was.

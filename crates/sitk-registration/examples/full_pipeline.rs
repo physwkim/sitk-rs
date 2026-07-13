@@ -82,9 +82,9 @@ fn main() {
     let tf = Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [0.0; 3]);
 
     sitk_core::parallel::with_threads(threads, || {
-        // Burn NVRTC (once per process, size-independent) for both kernels used below.
-        match DeviceImage::upload(&sitk_filters::cast(&volume(16, 0.0), PixelId::Float32).unwrap())
-        {
+        // Burn NVRTC (once per process, size-independent) for every kernel used below
+        // — including the device cast, which is why this warms up on the NATIVE type.
+        match DeviceImage::upload(&volume(16, 0.0)) {
             Ok(d) => {
                 let r = device_rescale(&d, OUT_MIN, OUT_MAX).unwrap();
                 let _ = device_smooth(&r, &SIGMA).unwrap();
@@ -132,12 +132,11 @@ fn main() {
 
         // ---- resident: cast (host) -> upload -> rescale -> smooth -> register --
         let mut dev_stage = [0.0f64; 4];
+        // No host cast: `upload` takes the UInt16 volume in its native type and
+        // casts on the device, so the f32 volume never exists on the host.
         let device_chain = |img: &Image, stage: &mut [f64; 4]| {
             let t = Instant::now();
-            let c = sitk_filters::cast(img, PixelId::Float32).unwrap();
-            stage[0] += ms(t);
-            let t = Instant::now();
-            let d = DeviceImage::upload(&c).unwrap();
+            let d = DeviceImage::upload(img).unwrap();
             stage[1] += ms(t);
             let t = Instant::now();
             let r = device_rescale(&d, OUT_MIN, OUT_MAX).unwrap();
@@ -166,7 +165,7 @@ fn main() {
             host_stage[0], host_stage[1], host_stage[2]
         );
         println!(
-            "resident  cast {:7.1}  upload  {:7.1}  rescale {:6.1}  smooth {:6.1}  \
+            "resident  cast {:7.1}  upload+cast {:7.1}  rescale {:6.1}  smooth {:6.1}  \
              setup {dev_setup:6.1}  iters {dev_iters:7.1}   total {dev_total:9.1} ms",
             dev_stage[0], dev_stage[1], dev_stage[2], dev_stage[3]
         );
