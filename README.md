@@ -204,25 +204,35 @@ harnesses received a byte-identical input before any timing is compared.
 The headline: the port wins on `binary_dilate` (0.20×), `connected_component`
 (0.22×), `rescale_intensity` (0.45×), `signed_maurer_distance_map` (0.39×), is
 level on `otsu`/`median`/`fft_convolution`, and **loses on the separable/stencil
-family** — `mean` 4.4×, `gradient_magnitude` 4.3×. That loss is a *scaling* gap,
-not a constant-factor one: the single-threaded numbers are competitive and the
-all-core ones are not. It is unresolved and it is written up rather than buried.
+family** — `mean` 4.4×, `gradient_magnitude` 4.3×. That loss was a *scaling* gap,
+not a constant-factor one, and its cause turned out to be **glibc's allocator**:
+`mean` was making **30,910,860 heap allocations per call** on the neighborhood
+boundary path, so at 48 threads the window walk ran 13.8 busy cores — blocked, not
+stalled. Fixed structurally (`push_values_checked` now takes a `&mut [i64]`, and a
+slice cannot grow, so the function *has no way* to allocate); `mean` at t48 went
+338.6 → 185.1 ms with all 16 `bit_parity` checksums unmoved. **The published table
+still shows the pre-fix numbers** — a clean sweep is owed, and the doc says so
+rather than quietly re-labelling.
 
 Read §0 of that document before quoting any number from it; it says how much of
 each one you can trust.
 
 ## Roadmap
 
-1. **Close the CPU scaling gap.** The port reaches 5–8× on 48 physical cores
-   where ITK reaches 12–21×. Bandwidth, false sharing, the allocator, NUMA
-   placement, and the cost of bit-exactness are all *ruled out by measurement*.
-   This is the largest unexplained number in the project.
-2. **Device coverage.** Device cast, shrink, and resample — which is what unlocks
-   the multi-resolution pyramid on the GPU. Then multi-GPU.
-3. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
+1. **Finish the CPU scaling work.** The allocator was the dominant cause and is
+   fixed, but two things remain: `mean` now scales perfectly to 16 threads and
+   then stops dead (196 ms at t16, 185 at t48, ~20 busy cores — cause unknown,
+   chunk granularity ruled out), and `gradient_magnitude_recursive_gaussian`'s
+   1.88× loss is a *different* defect (44,429 allocations, never touches the
+   boundary path; most likely its per-axis full-volume `to_f64_vec()` copies).
+2. **Re-measure.** The published tables predate both the allocator fix and the
+   device metric-kernel fix.
+3. **Device coverage.** Mattes/correlation/ANTS on the device; masks and sampling
+   strategies. Then multi-GPU.
+4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
-4. **Close §5.** The open parity-vs-correctness decisions in the ledger.
+5. **Close §5.** The open parity-vs-correctness decisions in the ledger.
 
 ## Build
 
