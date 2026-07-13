@@ -17,7 +17,7 @@
 //!
 //! [`gradient_magnitude_recursive_gaussian`], [`laplacian_recursive_gaussian`]
 //! and [`gradient_recursive_gaussian`] instead compose per-axis calls to
-//! `recursive_gaussian_f64_into`, exactly as
+//! `recursive_gaussian_f64_from_into`, exactly as
 //! ITK's `GradientMagnitudeRecursiveGaussianImageFilter`/
 //! `LaplacianRecursiveGaussianImageFilter`/`GradientRecursiveGaussianImageFilter`
 //! compose per-axis `RecursiveGaussianImageFilter`s (one
@@ -49,7 +49,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64_into};
+use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64_from_into};
 use sitk_core::{
     Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
     dispatch_scalar, matrix, parallel,
@@ -378,7 +378,7 @@ pub fn sobel_edge_detection(img: &Image, use_legacy_operator_coefficients: bool)
 /// `GradientMagnitudeRecursiveGaussianImageFilter`: the Euclidean norm of the
 /// gradient of `img` convolved with a Gaussian of physical-space `sigma`
 /// (isotropic — one value for every axis, matching ITK's single `Sigma`
-/// parameter). Composes per-axis [`recursive_gaussian_f64_into`] calls —
+/// parameter). Composes per-axis [`recursive_gaussian_f64_from_into`] calls —
 /// [`GaussianOrder::FirstOrder`] on one axis, [`GaussianOrder::ZeroOrder`] on
 /// the rest — dividing each axis's derivative by `spacing[d]` again to convert
 /// it from the recursion's index space to physical space.
@@ -416,10 +416,17 @@ pub fn gradient_magnitude_recursive_gaussian(
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::FirstOrder;
-        // The recursion is in-place and destroys its input, so each axis starts
-        // from a fresh copy of `src` — into the buffer that already exists.
-        work.copy_from_slice(&src);
-        recursive_gaussian_f64_into(
+        // The recursion destroys its input, so each axis needs its own copy of
+        // `src` — but it is the *recursion's first axis pass* that makes it, by
+        // reading `src` and writing `work`, instead of a `memcpy` ahead of a pass
+        // that then reads `work` back. The copy this replaces was `std`'s
+        // single-threaded one, and at 512³ it was also where `work`'s 1.07 GB of
+        // fresh pages got faulted in, on one core: 517 ms on the first axis, 684 ms
+        // over the three, 42% of the filter. Folding it into the first pass deletes
+        // that traffic rather than spreading it, and lets those pages be faulted by
+        // a parallel line pass.
+        recursive_gaussian_f64_from_into(
+            &src,
             &mut work,
             &size,
             &spacing,
@@ -445,7 +452,7 @@ pub fn gradient_magnitude_recursive_gaussian(
 
 /// `LaplacianRecursiveGaussianImageFilter`: the Laplacian-of-Gaussian of
 /// `img`, `sum_d d2/dx_d^2 [G_sigma * img]`. Composes per-axis
-/// [`recursive_gaussian_f64_into`] calls — [`GaussianOrder::SecondOrder`] on
+/// [`recursive_gaussian_f64_from_into`] calls — [`GaussianOrder::SecondOrder`] on
 /// one axis, [`GaussianOrder::ZeroOrder`] on the rest — dividing each axis's
 /// second derivative by `spacing[d]^2` again to convert it from
 /// the recursion's index space to physical space.
@@ -474,8 +481,12 @@ pub fn laplacian_recursive_gaussian(
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::SecondOrder;
-        work.copy_from_slice(&src);
-        recursive_gaussian_f64_into(
+        // The recursion's first axis pass makes the per-axis copy of `src` itself,
+        // by reading `src` and writing `work` — see
+        // `gradient_magnitude_recursive_gaussian`, which carried the same
+        // single-threaded `memcpy`.
+        recursive_gaussian_f64_from_into(
+            &src,
             &mut work,
             &size,
             &spacing,
@@ -586,7 +597,7 @@ pub fn gradient(img: &Image, use_image_spacing: bool, use_image_direction: bool)
 /// `GradientRecursiveGaussianImageFilter.yaml:9-11`, default `1.0`), assembled
 /// into a covariant-vector image.
 ///
-/// For each axis `d`, this composes per-axis [`recursive_gaussian_f64_into`] calls
+/// For each axis `d`, this composes per-axis [`recursive_gaussian_f64_from_into`] calls
 /// exactly like [`gradient_magnitude_recursive_gaussian`] does —
 /// [`GaussianOrder::FirstOrder`] on axis `d`, [`GaussianOrder::ZeroOrder`] on
 /// the rest — then divides that axis's derivative by `spacing[d]` again to
@@ -670,8 +681,11 @@ pub fn gradient_recursive_gaussian(
         for d in 0..dim {
             let mut orders = vec![GaussianOrder::ZeroOrder; dim];
             orders[d] = GaussianOrder::FirstOrder;
-            work.copy_from_slice(&src);
-            recursive_gaussian_f64_into(
+            // Same as the two filters above: the recursion's first axis pass reads
+            // `src` and writes `work`, so the per-axis copy is the pass, not a
+            // single-threaded `memcpy` in front of it.
+            recursive_gaussian_f64_from_into(
+                &src,
                 &mut work,
                 &size,
                 &spacing,

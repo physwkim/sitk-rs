@@ -203,6 +203,80 @@ pub(crate) fn recursive_gaussian_f64_into(
     Ok(())
 }
 
+/// [`recursive_gaussian_f64_into`] reading its input from `src` instead of from
+/// the buffer it writes — for the caller that runs the whole cascade **once per
+/// axis** off one unchanging input.
+///
+/// That caller (a gradient magnitude, a Laplacian, a per-axis derivative) cannot
+/// use the in-place form directly: the recursion destroys its input, so every
+/// axis needs its own copy of `src`. Copying it is what this replaces, and the
+/// copy was not free — `work.copy_from_slice(&src)` is `std`'s **single-threaded**
+/// `memcpy`, and at 512³ it is also where a freshly-allocated `dst` gets its 1.07 GB
+/// of pages faulted in, on one core. Measured, that copy cost 517 ms on the first
+/// axis and 684 ms across the three, **42% of the whole filter**, against 80 ms for
+/// the *parallel* widening that fills a buffer of exactly the same size.
+///
+/// So the copy is not made parallel here, it is **removed**: the first filtered
+/// axis reads `src` and writes `dst`, and every later axis runs in place on `dst`,
+/// exactly as before. `dst`'s pages are then first touched by a parallel line pass
+/// rather than by a serial `memcpy`.
+///
+/// This cannot move a bit. [`filter_line`] runs on a line that is fully gathered
+/// into a contiguous scratch buffer before it is called, and it writes the line
+/// back only after it returns, so each output element is computed from exactly the
+/// values it was computed from before, in the same order — the only thing that
+/// changed is *which buffer those values were read out of*.
+///
+/// `src` and `dst` must be the same length; `dst`'s prior contents are ignored.
+/// If no axis is filtered at all (every `sigma[d] <= 0`), the result is `src`
+/// unchanged, so `dst` is filled from `src` — that is the one case where a copy is
+/// still the correct answer, because there is no pass to fold it into.
+pub(crate) fn recursive_gaussian_f64_from_into(
+    src: &[f64],
+    dst: &mut [f64],
+    size: &[usize],
+    spacing: &[f64],
+    sigma: &[f64],
+    orders: &[GaussianOrder],
+    normalize_across_scale: bool,
+) -> Result<()> {
+    let dim = size.len();
+    check_sigma_and_orders(dim, sigma, orders)?;
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(dst.len(), size.iter().product::<usize>());
+
+    let strides = strides(size);
+    let mut wrote_dst = false;
+    for d in 0..dim {
+        if sigma[d] <= 0.0 {
+            continue;
+        }
+        if size[d] < 4 {
+            return Err(FilterError::AxisTooShortForRecursion {
+                axis: d,
+                len: size[d],
+            });
+        }
+        let coeff = Coefficients::new(
+            orders[d],
+            sigma[d] / spacing[d],
+            sigma[d],
+            normalize_across_scale,
+        );
+        if wrote_dst {
+            filter_axis(dst, size, &strides, d, &coeff);
+        } else {
+            filter_axis_from(src, dst, size, &strides, d, &coeff);
+            wrote_dst = true;
+        }
+    }
+
+    if !wrote_dst {
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+
 /// The `sigma`/`orders` shape checks both entry points above make, in the order
 /// they have always been made in.
 fn check_sigma_and_orders(dim: usize, sigma: &[f64], orders: &[GaussianOrder]) -> Result<()> {
@@ -341,6 +415,44 @@ fn filter_axis(buf: &mut [f64], size: &[usize], strides: &[usize], d: usize, coe
         |(line, outs, scratch), mut slot| {
             for (k, v) in line.iter_mut().enumerate() {
                 *v = slot.get(k);
+            }
+            filter_line(line, coeff, outs, scratch);
+            for (k, &v) in outs.iter().enumerate() {
+                slot.set(k, v);
+            }
+        },
+    );
+}
+
+/// [`filter_axis`] reading each line from `src` rather than from the buffer it
+/// writes. `src` and `dst` have the same shape, so a line's `k`-th element lives
+/// at `slot.start() + k * slot.stride()` in **either** buffer — which is what
+/// `Line`'s `start`/`stride` are exposed for.
+///
+/// The gather, the recursion, and the write-back are the same three steps as
+/// [`filter_axis`], in the same order; only the buffer the gather reads from
+/// differs. The line is fully materialized into a contiguous scratch buffer
+/// before [`filter_line`] sees it, so every output element is computed from the
+/// same values in the same order as before: bit-identical, by construction.
+fn filter_axis_from(
+    src: &[f64],
+    dst: &mut [f64],
+    size: &[usize],
+    strides: &[usize],
+    d: usize,
+    coeff: &Coefficients,
+) {
+    debug_assert_eq!(strides[d], size[..d].iter().product::<usize>());
+    let ln = size[d];
+    parallel::for_each_line_mut(
+        dst,
+        size,
+        d,
+        || (vec![0.0f64; ln], vec![0.0f64; ln], vec![0.0f64; ln]),
+        |(line, outs, scratch), mut slot| {
+            let (start, stride) = (slot.start(), slot.stride());
+            for (k, v) in line.iter_mut().enumerate() {
+                *v = src[start + k * stride];
             }
             filter_line(line, coeff, outs, scratch);
             for (k, &v) in outs.iter().enumerate() {
@@ -894,6 +1006,68 @@ mod tests {
         let img = Image::from_vec(&[9, 9], vec![5u8; 81]).unwrap();
         let out = smoothing_recursive_gaussian(&img, &[1.0, 1.0], false).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    /// The out-of-place first pass must be **bit-identical** to copying the input
+    /// and filtering in place — that equality is the entire licence for
+    /// `recursive_gaussian_f64_from_into` to exist, so it is pinned rather than
+    /// argued. `assert_eq!` on `f64` is exact here on purpose: a value that is
+    /// merely close is a failure.
+    ///
+    /// Anisotropic spacing, a non-cubic volume, and every `GaussianOrder`,
+    /// including the axis-skipping `sigma == 0` case (whose fallback is the one
+    /// path that still copies) and the all-zero case (where nothing is filtered
+    /// and the result must be the input).
+    #[test]
+    fn out_of_place_first_pass_is_bit_identical_to_copy_then_filter_in_place() {
+        let size = [9usize, 7, 5];
+        let spacing = [1.0f64, 0.75, 1.3];
+        let n: usize = size.iter().product();
+
+        // Deterministic, non-degenerate, and not symmetric about any axis.
+        let src: Vec<f64> = (0..n)
+            .map(|i| ((i * 37 % 101) as f64) * 0.5 - 11.0 + (i % 7) as f64)
+            .collect();
+
+        use GaussianOrder::{FirstOrder, SecondOrder, ZeroOrder};
+        let cases: &[([GaussianOrder; 3], [f64; 3])] = &[
+            ([FirstOrder, ZeroOrder, ZeroOrder], [1.5, 1.5, 1.5]),
+            ([ZeroOrder, FirstOrder, ZeroOrder], [1.5, 1.5, 1.5]),
+            ([ZeroOrder, ZeroOrder, SecondOrder], [2.0, 1.0, 0.8]),
+            ([SecondOrder, FirstOrder, ZeroOrder], [0.9, 1.7, 2.3]),
+            // sigma == 0 on the leading axis: the first *filtered* axis is axis 1,
+            // so the out-of-place pass must land there, not on axis 0.
+            ([ZeroOrder, FirstOrder, ZeroOrder], [0.0, 1.5, 1.5]),
+            // Nothing filtered at all: the result is the input, unchanged.
+            ([ZeroOrder, ZeroOrder, ZeroOrder], [0.0, 0.0, 0.0]),
+        ];
+
+        for (normalize, (orders, sigma)) in [false, true]
+            .into_iter()
+            .flat_map(|nz| cases.iter().map(move |c| (nz, c)))
+        {
+            // Reference: the in-place recursion, fed the copy it has always been fed.
+            let mut reference = src.clone();
+            recursive_gaussian_f64_into(&mut reference, &size, &spacing, sigma, orders, normalize)
+                .unwrap();
+
+            // Under test: the same cascade, with the first pass reading `src`.
+            // `dst` starts full of a poison value, so a pass that fails to write
+            // an element cannot pass by accidentally holding the right one.
+            let mut dst = vec![f64::NAN; n];
+            recursive_gaussian_f64_from_into(
+                &src, &mut dst, &size, &spacing, sigma, orders, normalize,
+            )
+            .unwrap();
+
+            assert_eq!(
+                dst, reference,
+                "out-of-place first pass diverged from copy-then-filter-in-place \
+                 (orders={orders:?}, sigma={sigma:?}, normalize={normalize})"
+            );
+            // And `src` itself is untouched — the caller reuses it on the next axis.
+            assert!(src.iter().all(|v| v.is_finite()));
+        }
     }
 
     #[test]
