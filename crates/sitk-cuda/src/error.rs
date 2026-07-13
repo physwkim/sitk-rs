@@ -43,6 +43,16 @@ pub enum CudaError {
     #[error("degenerate input; deferring to the CPU implementation")]
     DegenerateInput,
 
+    /// A fixed mask gates samples by their **grid** index, so it means nothing
+    /// against an explicit, host-selected point list — where the samples are already
+    /// a subset in an arbitrary order and the same index refers to a different voxel.
+    /// The two are refused together rather than silently gating the wrong samples.
+    #[error(
+        "a fixed mask is indexed by the fixed grid, so it cannot be combined with an \
+         explicit fixed-point list"
+    )]
+    MaskedExplicitPoints,
+
     /// The image is a vector/complex image, or its buffer does not match its
     /// declared pixel type — `sitk_core` already names this precisely, so
     /// carry its message rather than reclassifying it.

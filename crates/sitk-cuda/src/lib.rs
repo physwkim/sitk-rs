@@ -28,6 +28,7 @@ mod backend;
 mod buffer;
 mod error;
 mod image;
+mod mask;
 mod ops;
 mod pinned;
 
@@ -35,6 +36,7 @@ pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use image::{DeviceImage, Geometry};
+pub use mask::DeviceMask;
 pub use ops::device::rescale_intensity;
 pub use ops::gaussian::smooth_gaussian;
 pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};

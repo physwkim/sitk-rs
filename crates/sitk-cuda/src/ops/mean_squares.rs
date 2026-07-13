@@ -79,6 +79,7 @@ use crate::backend::{Backend, backend};
 use crate::buffer::DeviceBuffer;
 use crate::error::CudaError;
 use crate::image::DeviceImage;
+use crate::mask::DeviceMask;
 
 /// Threads per block. The kernel's shared-memory tree is exactly this wide.
 const BLOCK: u32 = 256;
@@ -159,6 +160,8 @@ extern "C" __global__ void ms_moments(
     const double* __restrict__ mmat,      // 3x3 phys_to_index, row-major
     const unsigned char* __restrict__ mmask,
     const int has_mask,
+    const unsigned char* __restrict__ fmask, // fixed-grid mask, n; unused if !has_fmask
+    const int has_fmask,
     const double* __restrict__ ab,        // A (9, row-major) then b (3)
     double* __restrict__ partials)        // GRID * NSLOT
 {
@@ -167,6 +170,20 @@ extern "C" __global__ void ms_moments(
 
     const long long stride = (long long)blockDim.x * gridDim.x;
     for (long long s = (long long)blockIdx.x * blockDim.x + threadIdx.x; s < n; s += stride) {
+        // The fixed mask drops the sample before any work is done on it. `s` IS the
+        // fixed grid's flat index -- which is why a fixed mask and explicit fixed
+        // points are refused together at construction: with an explicit point list
+        // the samples have already been selected host-side and `s` indexes that list,
+        // not the grid.
+        //
+        // This `continue` does not perturb the reduction. The tree is a function of
+        // (BLOCK, GRID, n) and nothing else, and within a thread the surviving terms
+        // keep their order -- skipping a term removes it, it does not reorder the
+        // rest. `is_inside` and the moving mask below already skip samples this way,
+        // so a data-dependent valid count is the status quo, not something the fixed
+        // mask introduces.
+        if (has_fmask && !fmask[s]) continue;
+
         // The sample's physical point. When the sample set is the whole fixed grid
         // in traversal order -- the common case -- it is a pure function of `s` and
         // the grid, so it is DERIVED here rather than uploaded: at 256^3 the points
@@ -420,6 +437,8 @@ pub struct ResidentMetric {
     d_mmat: DeviceBuffer<f64>,
     d_mmask: DeviceBuffer<u8>,
     has_mask: i32,
+    d_fmask: DeviceBuffer<u8>,
+    has_fmask: i32,
     /// Reused across iterations: the per-iteration H2D writes into this rather
     /// than allocating (`copy_from_host`, not `from_host`).
     d_ab: DeviceBuffer<f64>,
@@ -454,6 +473,7 @@ impl ResidentMetric {
                 mbuf: DeviceBuffer::from_chunks(backend, moving.len, moving_values)?,
             },
             fixed_points,
+            None,
             moving,
         )
     }
@@ -501,6 +521,29 @@ impl ResidentMetric {
         moving: &DeviceImage,
         moving_geometry: &MovingGeometry<'_>,
     ) -> Result<Self, CudaError> {
+        Self::from_device_masked(fixed, fixed_points, None, moving, moving_geometry)
+    }
+
+    /// [`from_device`](Self::from_device) with a **fixed mask**: a sample whose voxel
+    /// is zero in `fixed_mask` is not a sample at all, exactly as a zero voxel of the
+    /// host's fixed mask drops that sample from `FixedSamples`.
+    ///
+    /// The mask lives on the *fixed grid* and is indexed by the sample's grid index,
+    /// so it is only meaningful for [`FixedPoints::Grid`]. Combining it with
+    /// [`FixedPoints::Explicit`] is refused by name
+    /// ([`CudaError::MaskedExplicitPoints`]) rather than checked in the kernel: with
+    /// an explicit point list the host has already selected the samples, and a mask
+    /// indexed by position in that list is a different object with the same name.
+    ///
+    /// The mask must cover the fixed grid exactly — same voxel count — or
+    /// [`CudaError::DegenerateInput`].
+    pub fn from_device_masked(
+        fixed: &DeviceImage,
+        fixed_points: FixedPoints<'_>,
+        fixed_mask: Option<&DeviceMask>,
+        moving: &DeviceImage,
+        moving_geometry: &MovingGeometry<'_>,
+    ) -> Result<Self, CudaError> {
         if moving.len() != moving_geometry.len {
             return Err(CudaError::DegenerateInput);
         }
@@ -514,6 +557,7 @@ impl ResidentMetric {
                 mbuf: moving.widen_f64()?,
             },
             fixed_points,
+            fixed_mask,
             moving_geometry,
         )
     }
@@ -525,6 +569,7 @@ impl ResidentMetric {
         n: usize,
         vols: Volumes,
         fixed_points: FixedPoints<'_>,
+        fixed_mask: Option<&DeviceMask>,
         moving: &MovingGeometry<'_>,
     ) -> Result<Self, CudaError> {
         let backend = backend()?;
@@ -578,6 +623,26 @@ impl ResidentMetric {
             Some(m) => (m.iter().map(|&b| u8::from(b)).collect(), 1),
         };
 
+        // `has_fmask ⟹ !has_pts`, enforced here so the kernel never has to ask. The
+        // fixed mask is indexed by the *grid* sample index; an explicit point list is
+        // a host-selected subset in an arbitrary order, and a mask indexed into that
+        // list would silently gate the wrong samples. Refused by name, not clamped.
+        let (d_fmask, has_fmask) = match fixed_mask {
+            None => (DeviceBuffer::zeros(backend, 1)?, 0),
+            Some(m) => {
+                if has_pts == 1 {
+                    return Err(CudaError::MaskedExplicitPoints);
+                }
+                // The mask is indexed by the fixed grid's *flat* index, so it must be
+                // that grid — the same voxel count on a different shape indexes
+                // different voxels, and would gate silently wrong ones.
+                if as_i64(&m.geometry().size) != fsize {
+                    return Err(CudaError::DegenerateInput);
+                }
+                (DeviceBuffer::copy_of(backend, m.buffer().device())?, 1)
+            }
+        };
+
         Ok(Self {
             n,
             vols,
@@ -592,6 +657,8 @@ impl ResidentMetric {
             d_mmat: DeviceBuffer::from_host(backend, moving.phys_to_index)?,
             d_mmask: DeviceBuffer::from_host(backend, &mask_bytes)?,
             has_mask,
+            d_fmask,
+            has_fmask,
             d_ab: DeviceBuffer::zeros(backend, 12)?,
             d_partials: DeviceBuffer::zeros(backend, GRID as usize * NSLOT)?,
             h_partials: vec![0.0; GRID as usize * NSLOT],
@@ -632,6 +699,8 @@ impl ResidentMetric {
             d_mmat,
             d_mmask,
             has_mask,
+            d_fmask,
+            has_fmask,
             d_ab,
             d_partials,
             h_partials,
@@ -650,7 +719,7 @@ impl ResidentMetric {
         };
 
         // The two instantiations differ in the element type of `fvals`/`mbuf` and
-        // in nothing else — same sixteen arguments, same order, same grid.
+        // in nothing else — same eighteen arguments, same order, same grid.
         macro_rules! launch_moments {
             ($fscalar:expr, $mscalar:expr, $fvals:expr, $mbuf:expr) => {{
                 let f = backend.function(kernel_src($fscalar, $mscalar), "ms_moments")?;
@@ -670,9 +739,11 @@ impl ResidentMetric {
                     .arg(d_mmat.device())
                     .arg(d_mmask.device())
                     .arg(&*has_mask)
+                    .arg(d_fmask.device())
+                    .arg(&*has_fmask)
                     .arg(d_ab.device())
                     .arg(d_partials.device_mut());
-                // SAFETY: the sixteen arguments match the kernel's sixteen
+                // SAFETY: the eighteen arguments match the kernel's eighteen
                 // parameters in order and type — `fvals` is `FSCALAR` and `mbuf` is
                 // `MSCALAR`, which are the element types of the buffers this arm
                 // matched.
@@ -684,7 +755,10 @@ impl ResidentMetric {
                 // geometry buffers hold exactly 3, 3, 3 and 9 elements as the
                 // kernel indexes them; `d_mmask` is read only when `has_mask != 0`,
                 // in which case it has one byte per moving voxel and the kernel
-                // bounds-checks the index it builds; `d_ab` holds 12; `d_partials`
+                // bounds-checks the index it builds. `d_fmask` is read only when
+                // `has_fmask != 0`, in which case `build` has checked it holds
+                // exactly `n` bytes and the kernel indexes it with `s < n`; otherwise
+                // it is a one-element dummy. `d_ab` holds 12; `d_partials`
                 // holds `GRID * NSLOT`, and the kernel writes
                 // `blockIdx.x * NSLOT + k` for `blockIdx.x < GRID`, `k < NSLOT`.
                 // Shared memory is declared statically at `BLOCK` doubles, matching
