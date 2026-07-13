@@ -467,17 +467,20 @@ pub(crate) fn pad_input(
 ///
 /// `kernel_values` has already been through [`prepare_kernel`], so `Normalize`
 /// is folded in.
-pub(crate) fn kernel_spectrum(
+/// The kernel, wrapped into the padded extent with its origin at index 0 — the
+/// real array whose transform is the convolution's transfer function.
+///
+/// `shifted[j] = padded[(j + radius) mod paddedSize]`, a per-element gather.
+/// Outside the kernel's own extent the upper zero pad supplies a zero.
+fn kernel_padded(
     kernel_values: &[f64],
     kernel_size: &[usize],
     radius: &[usize],
     padded_size: &[usize],
-) -> Vec<Complex> {
+) -> Vec<f64> {
     let dim = padded_size.len();
     let total: usize = padded_size.iter().product();
-
-    // `shifted[j] = padded[(j + radius) mod paddedSize]` — a per-element gather.
-    let mut spectrum: Vec<Complex> = parallel::map_indexed_init(
+    parallel::map_indexed_init(
         total,
         || (vec![0usize; dim], vec![0usize; dim]),
         |(m, source), j| {
@@ -486,13 +489,36 @@ pub(crate) fn kernel_spectrum(
             {
                 *s = (mi + r) % p;
             }
-            // Outside the kernel's own extent the upper zero pad supplies a zero.
             if source.iter().zip(kernel_size).all(|(&s, &k)| s < k) {
-                Complex::new(kernel_values[ravel(source, kernel_size)], 0.0)
+                kernel_values[ravel(source, kernel_size)]
             } else {
-                Complex::default()
+                0.0
             }
         },
+    )
+}
+
+/// The transfer function as a **half-spectrum** — see [`fft::transform_r2c`].
+/// The kernel is real, so half of what [`kernel_spectrum`] computes is redundant.
+pub(crate) fn kernel_spectrum_half(
+    kernel_values: &[f64],
+    kernel_size: &[usize],
+    radius: &[usize],
+    padded_size: &[usize],
+) -> Vec<Complex> {
+    let padded = kernel_padded(kernel_values, kernel_size, radius, padded_size);
+    fft::transform_r2c(&padded, padded_size)
+}
+
+pub(crate) fn kernel_spectrum(
+    kernel_values: &[f64],
+    kernel_size: &[usize],
+    radius: &[usize],
+    padded_size: &[usize],
+) -> Vec<Complex> {
+    let mut spectrum: Vec<Complex> = parallel::map_slice(
+        &kernel_padded(kernel_values, kernel_size, radius, padded_size),
+        |&v| Complex::new(v, 0.0),
     );
     fft::transform_nd(&mut spectrum, padded_size, false);
     spectrum
@@ -541,15 +567,17 @@ fn convolve_fft(
     boundary_condition: ConvolutionBoundaryCondition,
 ) -> Result<Vec<f64>> {
     let padded = pad_input(img, radius, out_index, out_size, boundary_condition)?;
-    let transfer = kernel_spectrum(kernel_values, kernel_size, radius, &padded.size);
+    let transfer = kernel_spectrum_half(kernel_values, kernel_size, radius, &padded.size);
 
-    let mut spectrum: Vec<Complex> = parallel::map_slice(&padded.values, |&v| Complex::new(v, 0.0));
-    fft::transform_nd(&mut spectrum, &padded.size, false);
-    // Elementwise spectrum product: each bin's one complex multiply, in place.
+    // Both operands are REAL, so both spectra are conjugate-symmetric and only
+    // half of each carries information (`fft::transform_r2c`). The multiply is
+    // elementwise, so it does not care: the product of the two halves is the
+    // half of the product. Transforming, storing and multiplying the other half
+    // would be twice the flops and twice the memory traffic for a result already
+    // determined by the half in hand.
+    let mut spectrum = fft::transform_r2c(&padded.values, &padded.size);
     parallel::for_each_mut(&mut spectrum, |i, x| *x = *x * transfer[i]);
-    fft::transform_nd(&mut spectrum, &padded.size, true);
-
-    let real: Vec<f64> = parallel::map_slice(&spectrum, |x| x.re);
+    let real = fft::transform_c2r(&mut spectrum, &padded.size);
     Ok(crop_output(
         &real,
         &padded.size,
