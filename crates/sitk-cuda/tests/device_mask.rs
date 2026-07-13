@@ -12,7 +12,8 @@
 
 use sitk_core::Image;
 use sitk_cuda::{
-    CudaError, DeviceImage, DeviceMask, FixedPoints, MovingGeometry, ResidentMetric, backend,
+    CudaError, DeviceImage, DeviceMask, FixedPoints, Geometry, MovingGeometry, ResidentMetric,
+    backend,
 };
 
 fn no_device() -> bool {
@@ -220,4 +221,150 @@ fn any_nonzero_voxel_is_inside_whatever_the_pixel_type() {
     );
     assert_eq!(from_u8.count, from_f32.count);
     assert_eq!(from_u8.sq.to_bits(), from_f32.sq.to_bits());
+}
+
+// ---------------------------------------------------------------------------
+// The primitives a pyramid level needs to build its mask on the device:
+// `DeviceImage::filled` (the ones predicate, without a per-level upload),
+// `DeviceMask::from_device_image` (re-read a resampled mask as a predicate),
+// `DeviceMask::intersect` (the device form of the host's `intersect_masks`), and
+// `DeviceMask::to_host` (which exists so the level mask can be pinned byte-wise).
+// ---------------------------------------------------------------------------
+
+fn mask_bytes(m: &DeviceMask) -> Vec<u8> {
+    m.to_host().unwrap().scalar_slice::<u8>().unwrap().to_vec()
+}
+
+/// `filled` puts a constant on an arbitrary grid without a host volume: the voxels
+/// come back as the constant and the geometry is the one that was asked for.
+#[test]
+fn filled_builds_a_constant_volume_on_the_device() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let geom = Geometry {
+        size: vec![5, 7, 3],
+        spacing: vec![0.8, 0.9, 1.1],
+        origin: vec![-3.0, 2.0, 1.0],
+        direction: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    };
+    let img = DeviceImage::filled(geom.clone(), 1.0).unwrap();
+    assert_eq!(img.geometry(), &geom);
+
+    let host = img.to_host().unwrap();
+    assert_eq!(host.size(), geom.size.as_slice());
+    assert_eq!(host.spacing(), geom.spacing.as_slice());
+    assert_eq!(host.origin(), geom.origin.as_slice());
+    assert_eq!(host.direction(), geom.direction.as_slice());
+    assert!(
+        host.scalar_slice::<f32>()
+            .unwrap()
+            .iter()
+            .all(|&v| v == 1.0),
+        "a voxel of the ones volume is not one"
+    );
+}
+
+/// Thresholding on the device is the same predicate as thresholding on the host:
+/// `DeviceMask::from_device_image(upload(m))` and `DeviceMask::upload(m)` must agree
+/// **byte for byte**, and the mask must actually contain zeros — a threshold that
+/// mapped everything to 1 would agree with itself and gate nothing.
+#[test]
+fn thresholding_on_the_device_is_the_same_predicate_as_on_the_host() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 16;
+    // Negative, zero, tiny and large values, so `!= 0.0` is exercised on both sides
+    // of zero rather than on a 0/1 image where any rule agrees.
+    let v: Vec<f32> = (0..n * n * n)
+        .map(|i| match i % 5 {
+            0 => 0.0,
+            1 => -1.0,
+            2 => 1e-30,
+            3 => 255.0,
+            _ => -0.0,
+        })
+        .collect();
+    let img = Image::from_vec(&[n, n, n], v).unwrap();
+
+    let host_side = DeviceMask::upload(&img).unwrap();
+    let device_side = DeviceMask::from_device_image(&DeviceImage::upload(&img).unwrap()).unwrap();
+
+    let (a, b) = (mask_bytes(&host_side), mask_bytes(&device_side));
+    let zeros = a.iter().filter(|&&x| x == 0).count();
+    assert!(
+        zeros > 0 && zeros < a.len(),
+        "the mask gates nothing: {zeros} zeros of {}",
+        a.len()
+    );
+    assert_eq!(a, b, "the device threshold disagrees with the host's");
+    // `-0.0 != 0.0` is false: a signed zero is outside, on both paths.
+    assert!(
+        a.iter().enumerate().all(|(i, &x)| (i % 5 != 4) || x == 0),
+        "a -0.0 voxel was let in"
+    );
+}
+
+/// `intersect` is `intersect_masks`: `x != 0 && y != 0`, elementwise — and it refuses
+/// two masks on different grids rather than gating voxels that are not the same voxels.
+#[test]
+fn intersect_is_the_elementwise_and_and_refuses_a_grid_mismatch() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 16;
+    let a_img = Image::from_vec(
+        &[n, n, n],
+        (0..n * n * n)
+            .map(|i| f32::from(u8::from(i % 2 == 0)))
+            .collect::<Vec<f32>>(),
+    )
+    .unwrap();
+    let b_img = Image::from_vec(
+        &[n, n, n],
+        (0..n * n * n)
+            .map(|i| f32::from(u8::from(i % 3 == 0)))
+            .collect::<Vec<f32>>(),
+    )
+    .unwrap();
+    let a = DeviceMask::upload(&a_img).unwrap();
+    let b = DeviceMask::upload(&b_img).unwrap();
+
+    let got = mask_bytes(&a.intersect(&b).unwrap());
+    let want: Vec<u8> = (0..n * n * n)
+        .map(|i| u8::from(i % 2 == 0 && i % 3 == 0))
+        .collect();
+    assert_eq!(got, want);
+    assert!(got.contains(&1), "the intersection is empty");
+
+    // Disjoint masks: every voxel is dropped, and nothing is silently kept.
+    let odd = DeviceMask::upload(
+        &Image::from_vec(
+            &[n, n, n],
+            (0..n * n * n)
+                .map(|i| f32::from(u8::from(i % 2 == 1)))
+                .collect::<Vec<f32>>(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        mask_bytes(&a.intersect(&odd).unwrap())
+            .iter()
+            .all(|&x| x == 0)
+    );
+
+    // A different grid is refused, not intersected by flat index.
+    let other =
+        DeviceMask::upload(&Image::from_vec(&[8, 32, 16], vec![1.0f32; n * n * n]).unwrap())
+            .unwrap();
+    match a.intersect(&other) {
+        Err(CudaError::DegenerateInput) => {}
+        Err(e) => panic!("refused, but by the wrong name: {e}"),
+        Ok(_) => panic!("two masks on different grids were intersected"),
+    }
 }
