@@ -113,6 +113,18 @@ crossed *once*, not once per filter. Measured at 256³, `UInt16` input, 20 itera
 A real `ImageRegistrationMethod::execute()` at 256³ — not an evaluate loop —
 is **16.2–17.7 s on the host against 148.6–151.0 ms on the device, 107–119×**.
 
+> **Both of those numbers are single-level, and both predate a metric-kernel fix.**
+> The device kernel was forming the continuous index with FMA contraction and with
+> the transform offset seeded into the accumulator (the host adds it last). A 1-ULP
+> index difference flips `floor()` for a sample lying exactly on a voxel plane,
+> where the trilinear gradient is discontinuous — so the kernel took the *opposite
+> one-sided derivative*: `d/d(angle_y)` off by 34% while the value agreed to 1e-15.
+> Fixed at source; 3.2e-14 after. **The timings above have not been re-taken on the
+> fixed kernel**, and no pyramid run has been timed at all. `execute_on_device` now
+> accepts a pyramid (bit-identical level images, identical iteration counts), so
+> these rows describe code that no longer exists. They are left here, marked, until
+> the re-measurement lands rather than deleted or quietly re-labelled.
+
 The Gaussian is where the CPU bleeds: 2,250.7 ms on 96 threads against 9.7 ms on
 the device. The device Gaussian is **bit-identical** to the CPU filter, not close
 to it — `f64` weights and intermediates, and `__dmul_rn`/`__dadd_rn` to forbid FMA
@@ -197,10 +209,12 @@ headline ratio is not read as more than it is.
   Ruled out by measurement: bandwidth, false sharing, the allocator, NUMA
   placement, and the cost of bit-exactness. This is the largest unexplained number
   in the project.
-- **Device coverage is one filter.** `rescale_intensity` and `smooth_gaussian` are
-  the only device-resident ops. No device cast for every type, no resample, no
-  shrink — which is why `execute_on_device` still refuses a multi-resolution
-  pyramid at the boundary.
+- **The device timings are owed a re-measurement.** See the box in §2: the metric
+  kernel changed under them, and the pyramid path they said was refused now exists.
+- **Device coverage.** Cast (all 10 scalar types), `rescale_intensity`,
+  `smooth_gaussian`, `recursive_gaussian`, `shrink`, `resample_linear`, and a
+  mean-squares metric. Still missing: device Mattes/correlation/ANTS, masks, and
+  sampling strategies.
 - **Multi-GPU.** Device 0 only. Four are present.
 - **`connected_component` at large** is the port's own worst absolute number
   (9.5 s). It beats ITK only because ITK's threaded path is broken.

@@ -126,13 +126,30 @@ End to end, `load → cast → rescale → smooth → register` at 256³ is
 `__dmul_rn`/`__dadd_rn` to forbid FMA contraction — an FMA would be *more*
 accurate and therefore *different*).
 
-**What it does not do yet, stated plainly:**
+Device ops: cast (every one of the 10 scalar pixel types uploads; the 12
+complex/vector ones are refused **by name**, enforced by an exhaustive match, so
+a new `PixelId` is a compile error rather than a silent refusal),
+`rescale_intensity`, `smooth_gaussian`, `recursive_gaussian`, `shrink`,
+`resample_linear`, and a mean-squares metric. `execute_on_device` drives a full
+multi-resolution pyramid: every level image is **bit-identical** host vs. device,
+and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
+236,479 valid points on both paths, with a worst parameter disagreement of
+6.1e-13.
 
-- **Every device registration number above is single-level.** `execute_on_device`
-  refuses a multi-resolution pyramid at the boundary, by name, because there is
-  no device shrink/resample yet.
-- Device ops are `rescale_intensity` and `smooth_gaussian` only. No device cast,
-  shrink, or resample; the device metric is mean-squares, full grid, linear.
+**The caveats, stated plainly:**
+
+- **The 74× and 107–119× numbers above are single-level, and they predate a
+  metric-kernel fix.** The kernel's continuous index was being formed with FMA
+  contraction and with the transform offset seeded into the accumulator, where
+  the host adds it last; a 1-ULP difference flips `floor()` for a sample sitting
+  exactly on a voxel plane, and the trilinear gradient is discontinuous there, so
+  the kernel took the *opposite one-sided derivative* — `d/d(angle_y)` off by
+  **34%** while the *value* agreed to 1e-15, which is why every value-only check
+  passed it. Fixed at source (`__dmul_rn`/`__dadd_rn`/`__dsub_rn` in the host's
+  exact order, 3.2e-14 after). The timings have **not** been re-taken on the
+  fixed kernel; a pyramid run has not been timed at all.
+- The device metric is mean-squares, full grid, linear interpolation. No device
+  Mattes/correlation/ANTS, no masks, no sampling strategies.
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.
 - ITK itself has no CUDA path (its only GPU registration is an OpenCL Demons
   filter), so this is new acceleration, not a port.
