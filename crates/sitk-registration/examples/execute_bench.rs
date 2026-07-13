@@ -25,6 +25,22 @@
 //! ```text
 //! ... --example execute_bench -- 256 96 20 1e-4 - - - random:0.01
 //! ```
+//!
+//! # Reading the parameter disagreement
+//!
+//! At 256³/20 iterations the two runs land ~1.7e-4 apart (relative), sampled or not. That
+//! is **not** a metric difference and not a preprocessing difference — the cross-evaluation
+//! printed below settles it, and is there for exactly this reason. Evaluated at the *same*
+//! transform (both endpoints), the two metrics agree to ~5e-15 on the value and ~1e-12 on
+//! the derivative, with identical valid-point counts.
+//!
+//! What separates the runs is the optimizer: `RegularStepGradientDescentOptimizer` halves
+//! its step on overshoot, a *discontinuous* decision, so once a ~1e-12 derivative
+//! difference flips one overshoot test the two take different steps and converge to two
+//! different, both-valid poses. Same mechanism the registration tests pin around
+//! (`a_fixed_initial_transform_converges_where_execute_converges`). Read the
+//! cross-evaluation, not the parameter delta, to decide whether the device metric is
+//! sound.
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("this example needs the GPU: rebuild with --features cuda");
