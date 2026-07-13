@@ -57,6 +57,8 @@
 //! [`set_fixed_initial_transform`]: ImageRegistrationMethod::set_fixed_initial_transform
 //! [`metric_evaluate`]: ImageRegistrationMethod::metric_evaluate
 
+use std::borrow::Cow;
+
 use sitk_core::Image;
 use sitk_filters::{recursive_gaussian, shrink};
 use sitk_transform::{
@@ -2283,19 +2285,59 @@ impl ImageRegistrationMethod {
     /// gradient flows through (ledger §4.66).
     ///
     /// [`set_interpolator`]: Self::set_interpolator
-    fn prepare_level(
+    fn prepare_level<'a>(
         &self,
-        fixed: &Image,
-        moving: &Image,
+        fixed: &'a Image,
+        moving: &'a Image,
         sigma: &[f64],
         factors: &[usize],
         dim: usize,
-    ) -> Result<(Image, Image, Option<Image>)> {
-        let smoothed_fixed = recursive_gaussian(fixed, sigma)?;
-        let coarse_grid = match &self.virtual_domain {
-            Some(v) => shrink(&v.grid()?, factors)?,
-            None => shrink(&smoothed_fixed, factors)?,
+    ) -> Result<(Cow<'a, Image>, Cow<'a, Image>, Option<Image>)> {
+        // A zero-sigma level does not smooth, and `recursive_gaussian` returns its
+        // input unchanged there (verified bit-for-bit). Running it anyway is not
+        // free: it materializes a fresh copy of the volume, and at 256³ the two
+        // copies cost 246 ms of first-touch page faults — pure waste for a level
+        // that smooths nothing. Borrow instead.
+        let no_smoothing = sigma.iter().all(|&s| s == 0.0);
+        let smooth = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            Ok(if no_smoothing {
+                Cow::Borrowed(img)
+            } else {
+                Cow::Owned(recursive_gaussian(img, sigma)?)
+            })
         };
+        let smoothed_fixed = smooth(fixed)?;
+
+        // When no virtual domain and no fixed-initial transform are configured and
+        // the level does not shrink, the virtual grid *is* the smoothed fixed
+        // image's own grid: `shrink(x, [1,…])` is `x`, and resampling `x` onto its
+        // own grid through the identity samples every output voxel at its own
+        // physical point, so every interpolation weight is exactly 1. The whole
+        // pipeline below is then the identity by construction — and at 256³ that
+        // identity cost 6.4 s of resampling plus a 407 ms copy, which was the
+        // single largest term in a GPU registration run.
+        //
+        // This is *not* true for a shrinking level: `shrink` subsamples voxels
+        // while the resample interpolates at the shrunk grid's centers, and for an
+        // even factor those centers fall between input voxels — measured, every
+        // value differs. So a pyramid level still resamples, exactly as before.
+        //
+        // The gate is the same condition the `inside_fixed` predicate below already
+        // keys on, for the same reason: with no virtual domain and no fixed-initial
+        // transform, nothing moves relative to the fixed grid.
+        let native_grid = self.virtual_domain.is_none()
+            && self.fixed_initial_transform.is_none()
+            && factors.iter().all(|&f| f == 1);
+
+        let coarse_grid = if native_grid {
+            None
+        } else {
+            Some(match &self.virtual_domain {
+                Some(v) => shrink(&v.grid()?, factors)?,
+                None => shrink(&smoothed_fixed, factors)?,
+            })
+        };
+        let grid_ref = coarse_grid.as_ref().unwrap_or(&smoothed_fixed);
 
         // Output point x ↦ input point fixed_initial(x): `ResampleImageFilter`
         // maps each output voxel's physical point through the transform and
@@ -2303,7 +2345,7 @@ impl ImageRegistrationMethod {
         let onto_virtual = |input: &Image, interpolator: Interpolator| -> Result<Image> {
             let mut resampler = ResampleImageFilter::new();
             resampler
-                .set_reference_image(&coarse_grid)
+                .set_reference_image(grid_ref)
                 .set_interpolator(interpolator)
                 .set_default_pixel_value(0.0);
             Ok(match &self.fixed_initial_transform {
@@ -2312,8 +2354,12 @@ impl ImageRegistrationMethod {
             })
         };
 
-        let fixed_level = onto_virtual(&smoothed_fixed, Interpolator::Linear)?;
-        let moving_level = recursive_gaussian(moving, sigma)?;
+        let resampled_fixed = if native_grid {
+            None
+        } else {
+            Some(onto_virtual(&smoothed_fixed, Interpolator::Linear)?)
+        };
+        let moving_level = smooth(moving)?;
 
         let inside_fixed =
             if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
@@ -2327,6 +2373,13 @@ impl ImageRegistrationMethod {
             None => None,
         };
         let fixed_mask_level = intersect_masks(inside_fixed, user_mask)?;
+
+        // `grid_ref`'s last use is above, so the borrow of `smoothed_fixed` has
+        // ended and the native path can hand the buffer over rather than copy it.
+        let fixed_level = match resampled_fixed {
+            Some(img) => Cow::Owned(img),
+            None => smoothed_fixed,
+        };
 
         Ok((fixed_level, moving_level, fixed_mask_level))
     }
