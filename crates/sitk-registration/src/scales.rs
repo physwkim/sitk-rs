@@ -234,6 +234,14 @@ pub struct VirtualGrid {
 }
 
 impl VirtualGrid {
+    /// The grid as `(size, origin, index_to_physical)` — everything a device
+    /// backend needs to derive a sample's physical point from its index, instead
+    /// of being sent the whole precomputed points array.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn parts(&self) -> (&[usize], &[f64], &[f64]) {
+        (&self.size, &self.origin, &self.idx_to_phys)
+    }
+
     pub(crate) fn new(
         dim: usize,
         size: Vec<usize>,

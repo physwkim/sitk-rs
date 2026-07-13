@@ -104,7 +104,11 @@ __device__ __forceinline__ bool is_inside(const double* c, const long long* size
 
 extern "C" __global__ void ms_moments(
     const double* __restrict__ fvals,     // fixed sample values, n
-    const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major)
+    const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); unused if !has_pts
+    const int has_pts,
+    const long long* __restrict__ fsize,  // 3, fixed grid size (used if !has_pts)
+    const double* __restrict__ forigin,   // 3
+    const double* __restrict__ fmat,      // 3x3 index_to_physical, row-major
     const long long n,
     const double* __restrict__ mbuf,      // moving image buffer
     const long long* __restrict__ msize,  // 3
@@ -121,7 +125,26 @@ extern "C" __global__ void ms_moments(
 
     const long long stride = (long long)blockDim.x * gridDim.x;
     for (long long s = (long long)blockIdx.x * blockDim.x + threadIdx.x; s < n; s += stride) {
-        const double x[3] = { fpts[s*3+0], fpts[s*3+1], fpts[s*3+2] };
+        // The sample's physical point. When the sample set is the whole fixed grid
+        // in traversal order -- the common case -- it is a pure function of `s` and
+        // the grid, so it is DERIVED here rather than uploaded: at 256^3 the points
+        // array is 402 MB, which was 60% of the only large transfer in the run.
+        // Same arithmetic, same order, as the host's `write_point_at`.
+        double x[3];
+        if (has_pts) {
+            x[0] = fpts[s*3+0]; x[1] = fpts[s*3+1]; x[2] = fpts[s*3+2];
+        } else {
+            const double i = (double)(s % fsize[0]);
+            const double j = (double)((s / fsize[0]) % fsize[1]);
+            const double k = (double)(s / (fsize[0] * fsize[1]));
+            for (int r = 0; r < 3; ++r) {
+                double acc_r = forigin[r];
+                acc_r += fmat[r*3+0] * i;
+                acc_r += fmat[r*3+1] * j;
+                acc_r += fmat[r*3+2] * k;
+                x[r] = acc_r;
+            }
+        }
 
         // p = A*x + b  --- the transform's point map, whatever transform it is.
         double p[3];
@@ -250,10 +273,36 @@ pub struct MovingGeometry<'a> {
 /// and **`GRID · 14 · 8` = 57 KiB down** (the per-block partials). Nothing else
 /// crosses the bus, and nothing is reallocated per iteration — the partials
 /// buffer and its host destination are owned here and reused.
+/// Where the fixed samples' physical points come from.
+///
+/// The points are `origin + idx_to_phys · index`, so when the sample set is the
+/// whole fixed grid in traversal order they are a pure function of the sample
+/// index and need not exist as a buffer at all. [`Grid`](Self::Grid) says so, and
+/// the kernel derives each point from its own `s`. At 256³ that removes a 402 MB
+/// upload — 60% of the run's only large transfer.
+///
+/// [`Explicit`](Self::Explicit) is for a sampled or masked set, whose points are
+/// an arbitrary subset in an arbitrary order and must be uploaded.
+pub enum FixedPoints<'a> {
+    /// One point per sample, row-major `N × 3`.
+    Explicit(&'a [f64]),
+    /// Every voxel of `size`, in dim-0-fastest order. `idx_to_phys` is row-major
+    /// `3 × 3`; the sample count must equal the product of `size`.
+    Grid {
+        size: &'a [usize],
+        origin: &'a [f64],
+        idx_to_phys: &'a [f64],
+    },
+}
+
 pub struct ResidentMetric {
     n: usize,
     d_fvals: DeviceBuffer<f64>,
     d_fpts: DeviceBuffer<f64>,
+    has_pts: i32,
+    d_fsize: DeviceBuffer<i64>,
+    d_forigin: DeviceBuffer<f64>,
+    d_fmat: DeviceBuffer<f64>,
     d_mbuf: DeviceBuffer<f64>,
     d_msize: DeviceBuffer<i64>,
     d_mstride: DeviceBuffer<i64>,
@@ -276,16 +325,48 @@ impl ResidentMetric {
     /// transfer in a registration run.
     pub fn new(
         fixed_values: &[f64],
-        fixed_points: &[f64],
+        fixed_points: FixedPoints<'_>,
         moving: &MovingGeometry<'_>,
     ) -> Result<Self, CudaError> {
         let backend = backend()?;
         let n = fixed_values.len();
-        if n == 0 || moving.size.len() != DIM || fixed_points.len() != n * DIM {
+        if n == 0 || moving.size.len() != DIM {
             return Err(CudaError::DegenerateInput);
         }
 
         let as_i64 = |v: &[usize]| v.iter().map(|&x| x as i64).collect::<Vec<_>>();
+
+        // A zero-length allocation is not a valid kernel pointer, so the unused
+        // side of the choice below still allocates a single dummy element and the
+        // kernel gates on `has_pts`.
+        let (pts, has_pts, fsize, forigin, fmat) = match fixed_points {
+            FixedPoints::Explicit(p) => {
+                if p.len() != n * DIM {
+                    return Err(CudaError::DegenerateInput);
+                }
+                (p, 1, vec![1i64; DIM], vec![0.0; DIM], vec![0.0; DIM * DIM])
+            }
+            FixedPoints::Grid {
+                size,
+                origin,
+                idx_to_phys,
+            } => {
+                if size.len() != DIM
+                    || origin.len() != DIM
+                    || idx_to_phys.len() != DIM * DIM
+                    || size.iter().product::<usize>() != n
+                {
+                    return Err(CudaError::DegenerateInput);
+                }
+                (
+                    &[0.0f64][..],
+                    0,
+                    as_i64(size),
+                    origin.to_vec(),
+                    idx_to_phys.to_vec(),
+                )
+            }
+        };
         let (mask_bytes, has_mask) = match moving.mask {
             // A zero-length allocation is not a valid kernel pointer, so the
             // no-mask case still allocates one byte and gates on `has_mask`.
@@ -296,7 +377,11 @@ impl ResidentMetric {
         Ok(Self {
             n,
             d_fvals: DeviceBuffer::from_host(backend, fixed_values)?,
-            d_fpts: DeviceBuffer::from_host(backend, fixed_points)?,
+            d_fpts: DeviceBuffer::from_host(backend, pts)?,
+            has_pts,
+            d_fsize: DeviceBuffer::from_host(backend, &fsize)?,
+            d_forigin: DeviceBuffer::from_host(backend, &forigin)?,
+            d_fmat: DeviceBuffer::from_host(backend, &fmat)?,
             d_mbuf: DeviceBuffer::from_host(backend, moving.buf)?,
             d_msize: DeviceBuffer::from_host(backend, &as_i64(moving.size))?,
             d_mstride: DeviceBuffer::from_host(backend, &as_i64(moving.strides))?,
@@ -338,6 +423,10 @@ impl ResidentMetric {
         launch
             .arg(self.d_fvals.device())
             .arg(self.d_fpts.device())
+            .arg(&self.has_pts)
+            .arg(self.d_fsize.device())
+            .arg(self.d_forigin.device())
+            .arg(self.d_fmat.device())
             .arg(&n_i64)
             .arg(self.d_mbuf.device())
             .arg(self.d_msize.device())
@@ -348,10 +437,14 @@ impl ResidentMetric {
             .arg(&self.has_mask)
             .arg(self.d_ab.device())
             .arg(self.d_partials.device_mut());
-        // SAFETY: the twelve arguments match the kernel's twelve parameters in
-        // order and type. `d_fvals` holds `n` f64 and `d_fpts` holds `n*3`, both
-        // read only under `s < n`; the geometry buffers hold exactly 3, 3, 3 and
-        // 9 elements as the kernel indexes them; `d_mmask` is read only when
+        // SAFETY: the sixteen arguments match the kernel's sixteen parameters in
+        // order and type. `d_fvals` holds `n` f64, read only under `s < n`.
+        // `d_fpts` holds `n*3` and is read only when `has_pts != 0`; otherwise it
+        // is a one-element dummy and the kernel reads `d_fsize`/`d_forigin`/
+        // `d_fmat` (3, 3 and 9 elements) instead, whose product-of-size equals `n`
+        // so the derived index stays in the grid. The moving geometry buffers hold
+        // exactly 3, 3, 3 and 9 elements as the kernel indexes them; `d_mmask` is
+        // read only when
         // `has_mask != 0`, in which case it has one byte per moving voxel and the
         // kernel bounds-checks the index it builds; `d_ab` holds 12; `d_partials`
         // holds `GRID * NSLOT`, and the kernel writes `blockIdx.x * NSLOT + k`
