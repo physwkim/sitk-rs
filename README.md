@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,329 tests** on the CPU, **3,357** with the CUDA
+> implemented and tested — **3,342 tests** on the CPU, **3,398** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -140,7 +140,11 @@ Device ops: cast (every one of the 10 scalar pixel types uploads; the 12
 complex/vector ones are refused **by name**, enforced by an exhaustive match, so
 a new `PixelId` is a compile error rather than a silent refusal),
 `rescale_intensity`, `smooth_gaussian`, `recursive_gaussian`, `shrink`,
-`resample_linear`, and a mean-squares metric. `execute_on_device` drives a full
+`resample_linear`, `resample_nearest`, a constant fill (`DeviceImage::filled`,
+which is what keeps the all-ones in-buffer predicate off the bus — 67 MB per
+level not uploaded at 256³), two mask kernels behind `DeviceMask`
+(`threshold_nonzero`, `mask_and`), and a mean-squares metric.
+`execute_on_device` drives a full
 multi-resolution pyramid: every level image is **bit-identical** host vs. device,
 and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
 236,479 valid points on both paths, with a worst parameter disagreement of
@@ -161,15 +165,27 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
 - A `Float64` registration still differs between host and device: the host keeps
   `f64` levels and a `DeviceImage` holds `f32`. That is inherent to the device type,
   not a defect, and `execute_on_device`'s doc comment says so.
-- The device metric is mean-squares, full grid, linear interpolation. No device
-  Mattes/correlation/ANTS, no masks, no sampling strategies.
+- The device metric is mean-squares, full grid, linear interpolation, **with fixed
+  and moving masks** and with a virtual domain. The device level mask is built in
+  the host's own order (NN-resample the in-buffer predicate, NN-resample the user
+  mask, intersect) and is **byte-equal** to the host's, so the two paths walk
+  exactly the same valid points — fixed mask 59,647 on both, moving mask 59,617 on
+  both, virtual domain 31,124 on both, both together 12,489 on both, 25 iterations
+  either way. No device Mattes/correlation/ANTS, no sampling strategies.
+- **A fixed-initial transform is still refused by name** (`UnsupportedFixedInitialTransform`)
+  and that configuration falls back to the host, at the host's cost. The device
+  would have to resample the fixed image *and* its in-buffer predicate **through**
+  that transform, and its resample has no transform slot yet. The predicate is the
+  hard half: it is a 0/1 field whose boundary is decided by a rounding rule, so an
+  affine that differs by 1e-12 flips a shell of voxels and the exactly-equal
+  valid-point count above degrades to a tolerance band.
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.
 - ITK itself has no CUDA path (its only GPU registration is an OpenCL Demons
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,329), with it **on** (3,357), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,357) — a machine with no GPU is a supported configuration, not a crash.
+(3,342), with it **on** (3,398), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,398) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -239,9 +255,11 @@ each one you can trust.
    case did not touch its large case at all.
 2. **Small-volume overhead.** `otsu` is 6.62× and `mean` 4.52× at 64³ — a fixed
    per-call cost the reference size amortizes away and the headline hides.
-3. **Device coverage.** A nearest-neighbour resample, which is what a device mask
-   needs, and a device mask is what closes two of the boundary's refusals at once.
-   Then Mattes/correlation/ANTS, then multi-GPU.
+3. **Device coverage.** The fixed-initial transform — the device resample's
+   transform slot is empty, not hard, and the point map is bitwise reproducible for
+   the nine matrix-offset transform variants (`Scale` is *not* one of them: it
+   evaluates `(p−c)·s + c`, which is a different rounding from `M·p + b`, so it gets
+   refused rather than approximated). Then Mattes/correlation/ANTS, then multi-GPU.
 4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
@@ -251,8 +269,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,329 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,357, needs CUDA 13
+cargo nextest run --workspace                        # 3,342 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,398, needs CUDA 13
 ```
 
 License: Apache-2.0.

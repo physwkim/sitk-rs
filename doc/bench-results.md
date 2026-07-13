@@ -65,8 +65,8 @@ An earlier version of this document claimed the GPU cannot win a per-pixel op �
 that PCIe was a hard floor and offload was not worth it. **That was wrong, and the
 row that refutes it is a row I had already collected.**
 
-`rescale_intensity` — the only op with a device kernel — on the same tree and the
-same quiet box as every CPU row above:
+`rescale_intensity` — of the twelve benchmark ops, the only one with a device
+kernel — on the same tree and the same quiet box as every CPU row above:
 
 | size | CPU tN | GPU one-shot | **GPU resident** | ITK tN |
 |---|---|---|---|---|
@@ -95,7 +95,9 @@ functions that cross PCIe, and an op's signature (`&DeviceImage -> DeviceImage`)
 *cannot express* a round trip. The bus crossing is a thing the caller schedules,
 not a thing a filter does behind their back.
 
-Only `rescale_intensity` has a device kernel today. `discrete_gaussian` carries a
+Of the twelve benchmark ops, only `rescale_intensity` has a device kernel — the
+device op set is larger than that (§6), but none of the rest is a bench op.
+`discrete_gaussian` carries a
 `skipped` field rather than a number: `sitk-cuda` has no device port of it, and
 `smooth_gaussian` — which does exist on the device — is a **different filter**
 (physical-units σ, truncated at ⌈4σ⌉) and not a port of ITK's
@@ -347,11 +349,15 @@ than it is.
 - **The §2 pipeline table's `setup` / `20 iterations` rows** are re-measured; the
   `cast` / `rescale` / `smooth` rows still carry their original numbers.
 - **Device coverage.** Cast (all 10 scalar types), `rescale_intensity`,
-  `smooth_gaussian`, `recursive_gaussian`, `shrink`, `resample_linear`, and a
-  mean-squares metric. Still missing: device Mattes/correlation/ANTS, masks,
-  sampling strategies, and a nearest-neighbour resample — the last of which is what
-  a device mask needs, and a device mask is what closes two of the boundary's
-  refusals.
+  `smooth_gaussian`, `recursive_gaussian`, `shrink`, `resample_linear`,
+  `resample_nearest`, a constant fill, two mask kernels behind `DeviceMask`, and a
+  mean-squares metric with fixed and moving masks. Masks, the nearest-neighbour
+  resample and the virtual domain landed, and **both** of the boundary's
+  mask/virtual-domain refusals are closed — the device level mask is byte-equal to
+  the host's and the two paths walk exactly the same valid points. Still missing:
+  device Mattes/correlation/ANTS and sampling strategies. What the boundary still
+  refuses, by name, is a **fixed-initial transform**: it needs a device resample
+  *through* a transform, and the transform slot in `cindex_of` is empty.
 - **Multi-GPU.** Device 0 only. Four are present.
 - **`connected_component` at large** is the port's own worst absolute number
   (8.6 s). It beats ITK only because ITK's threaded path is broken.
