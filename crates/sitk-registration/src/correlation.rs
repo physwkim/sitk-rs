@@ -182,13 +182,13 @@ impl CorrelationMetric {
             None => return f64::MAX,
         };
 
-        let dim = self.fixed.dim;
         let mut fm = 0.0f64;
         let mut f2 = 0.0f64;
         let mut m2 = 0.0f64;
         let mut valid_points = 0usize;
+        let mut scratch = self.fixed.scratch();
         for s in 0..self.fixed.len() {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
                 Some(v) => v,
@@ -216,12 +216,12 @@ impl CorrelationMetric {
     /// moving sample means over the valid point set. `None` when no sample maps
     /// inside the moving image.
     fn means(&self, transform: &dyn ParametricTransform) -> Option<(f64, f64)> {
-        let dim = self.fixed.dim;
         let mut fix_sum = 0.0f64;
         let mut mov_sum = 0.0f64;
         let mut valid = 0usize;
+        let mut scratch = self.fixed.scratch();
         for s in 0..self.fixed.len() {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
                 Some(v) => v,
@@ -243,7 +243,6 @@ impl CorrelationMetric {
             "CorrelationMetric is global-transform-only; call check_transform first"
         );
 
-        let dim = self.fixed.dim;
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
 
@@ -267,8 +266,9 @@ impl CorrelationMetric {
         let mut mdm = vec![0.0f64; nparams];
         let mut valid_points = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let fv = self.fixed.values[s];
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {

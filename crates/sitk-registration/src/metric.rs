@@ -143,82 +143,52 @@ fn next_id() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The physical point at multi-index `index`, via `origin + idx_to_phys ·
-/// index`, written into `out` (length `dim`). Shared by every [`FixedSamples`]
-/// sampling strategy.
+/// Where a sample's physical point comes from.
 ///
-/// Writes rather than returns: at 256³ this runs 16.7 M times, and returning a
-/// `Vec` made it 16.7 M heap allocations — which is most of what made building
-/// the sample set the dominant cost of a GPU registration run.
-fn write_point_at(
-    out: &mut [f64],
-    idx_to_phys: &[f64],
-    origin: &[f64],
-    dim: usize,
-    index: &[usize],
-) {
-    for (r, pr) in out.iter_mut().enumerate() {
-        let mut acc = origin[r];
-        for (c, &idx) in index.iter().enumerate() {
-            acc += idx_to_phys[r * dim + c] * idx as f64;
-        }
-        *pr = acc;
-    }
+/// The unsampled, unmasked default — the SimpleITK default, and what a
+/// registration actually runs — samples *every voxel of the virtual grid, in
+/// grid order*. For that set the point of sample `s` is a closed-form function
+/// of `s` alone ([`VirtualGrid::write_point`]: `dim` divisions and nine flops),
+/// so the port used to spend 402 MB (at 256³) and a full page-fault pass
+/// memoizing a function it can evaluate in the loop that reads it. Now it does
+/// not exist.
+///
+/// Every other strategy — [`SamplingStrategy::Regular`], `Random`, or any mask —
+/// selects an arbitrary subset, for which there is no closed form from `s`, so
+/// those points are materialized. That is the *only* case that allocates, it is
+/// proportional to the sample count rather than the volume, and it is named here
+/// rather than being a flag on a buffer that always exists.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SamplePoints {
+    /// Sample `s` is voxel `s` of [`FixedSamples::grid`]; its point is derived.
+    Grid,
+    /// Physical points, row-major `N × dim`, for a sample set with no closed
+    /// form.
+    Explicit(Vec<f64>),
 }
 
-/// The physical point of every voxel of `size`, row-major `N × dim`, in the
-/// dim-0-fastest traversal order [`increment`] produces.
+/// Per-task scratch for [`FixedSamples::point`], so the derivation in the hot
+/// loop allocates nothing. One per thread, not one per sample.
+pub(crate) struct PointScratch {
+    index: Vec<usize>,
+    point: Vec<f64>,
+}
+
+/// The physical points of an arbitrary sample set, given as flat voxel indices
+/// into `grid` — the materialization the derived path exists to avoid, kept for
+/// the sampled/masked strategies that genuinely have no closed form.
 ///
-/// The buffer is 402 MB at 256³ and freshly allocated, so *the fill is also the
-/// first touch*: Linux faults and zeroes one page per 4 KB as it is written.
-/// [`sitk_core::parallel::map_indexed_init`] spreads that fault storm across the
-/// pool and, because it writes into uninitialized capacity, it writes each page
-/// exactly once — the `vec![0.0; n * dim]` this replaces faulted the whole buffer
-/// serially first and then overwrote it.
-///
-/// Every element is a pure function of its own index — the same `origin[r] + Σ_c
-/// idx_to_phys[r][c] · index[c]` accumulated in the same order as
-/// [`write_point_at`] — so this is bit-for-bit the serial loop's output at any
-/// thread count, and it now honors the caller's rayon pool rather than spawning a
-/// hardcoded 16 threads behind [`sitk_core::parallel::with_threads`]'s back.
-fn grid_points(
-    n: usize,
-    size: &[usize],
-    idx_to_phys: &[f64],
-    origin: &[f64],
-    dim: usize,
-) -> Vec<f64> {
+/// Bit-identical to the serial loop it replaces: every component is
+/// [`VirtualGrid::write_point`]'s, computed from its own sample index alone.
+fn explicit_points(grid: &VirtualGrid, flats: &[usize], dim: usize) -> Vec<f64> {
     parallel::map_indexed_init(
-        n * dim,
-        || vec![0usize; dim],
-        |index, i| {
-            write_multi_index(index, i / dim, size);
-            let r = i % dim;
-            let mut acc = origin[r];
-            for (c, &idx) in index.iter().enumerate() {
-                acc += idx_to_phys[r * dim + c] * idx as f64;
-            }
-            acc
+        flats.len() * dim,
+        || (vec![0usize; dim], vec![0.0f64; dim]),
+        |(index, point), i| {
+            grid.write_point(flats[i / dim], index, point);
+            point[i % dim]
         },
     )
-}
-
-/// The multi-index (dim-0-fastest) of flat voxel index `flat`, written into
-/// `out` (length `size.len()`) — the inverse of the traversal order
-/// [`increment`] produces.
-fn write_multi_index(out: &mut [usize], mut flat: usize, size: &[usize]) {
-    for (d, id) in out.iter_mut().enumerate() {
-        *id = flat % size[d];
-        flat /= size[d];
-    }
-}
-
-/// [`write_multi_index`] into a fresh `Vec`, for the sampling strategies that
-/// need one index at a time rather than all of them.
-fn linear_to_multi(flat: usize, size: &[usize]) -> Vec<usize> {
-    let mut index = vec![0usize; size.len()];
-    write_multi_index(&mut index, flat, size);
-    index
 }
 
 /// The fixed image reduced to its sample set (the registration *virtual
@@ -228,19 +198,12 @@ pub struct FixedSamples {
     /// Identity for a device-resident copy of these buffers — see [`next_id`].
     #[cfg(feature = "cuda")]
     pub(crate) id: u64,
-    /// Whether the sample set is *every* voxel of [`grid`](Self::grid), in that
-    /// grid's traversal order — true for the unsampled, unmasked default.
-    ///
-    /// When it holds, [`points`](Self::points) is a 402 MB memo (at 256³) of a
-    /// nine-flop function of the sample index, and a device backend can derive
-    /// each point rather than be sent it. The CPU path reads `points` regardless,
-    /// so the buffer still exists; what this flag removes is the *upload*.
-    #[cfg(feature = "cuda")]
-    pub(crate) full_grid: bool,
     /// One value per sample, length `N`.
     pub(crate) values: Vec<f64>,
-    /// Physical points, row-major `N × dim`.
-    pub(crate) points: Vec<f64>,
+    /// Where each sample's physical point comes from — derived from the grid for
+    /// the full-grid default, materialized only for a sampled or masked subset.
+    /// Read through [`point`](Self::point), never directly.
+    pub(crate) points: SamplePoints,
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
     /// The virtual domain as a grid. The metric never reads it — only the
@@ -252,8 +215,9 @@ pub struct FixedSamples {
     /// neither the metric's sampling percentage nor its fixed mask narrows the
     /// scale estimate.
     ///
-    /// `pub(crate)` rather than private because a device backend derives its
-    /// sample points from this geometry — see [`full_grid`](Self::full_grid).
+    /// `pub(crate)` rather than private because the CPU metric and the device
+    /// backend both derive their sample points from this geometry — see
+    /// [`SamplePoints`].
     pub(crate) grid: VirtualGrid,
 }
 
@@ -264,34 +228,7 @@ impl FixedSamples {
     /// Fails on a vector `fixed` image, like every scalar consumer of
     /// [`sitk_core::Image::to_f64_vec`].
     pub fn from_image(fixed: &Image) -> Result<Self> {
-        let dim = fixed.dimension();
-        let size = fixed.size().to_vec();
-        let values = fixed.to_f64_vec()?;
-        let n = values.len();
-
-        // point = origin + (D · diag(spacing)) · index
-        let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
-        let origin = fixed.origin();
-
-        let points = grid_points(n, &size, &idx_to_phys, origin, dim);
-
-        let min_spacing = fixed
-            .spacing()
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-
-        Ok(Self {
-            dim,
-            #[cfg(feature = "cuda")]
-            id: next_id(),
-            #[cfg(feature = "cuda")]
-            full_grid: true,
-            values,
-            points,
-            min_spacing,
-            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
-        })
+        Self::from_image_with(fixed, SamplingStrategy::None, 1.0, 0, None)
     }
 
     /// Reduce a fixed image to its sample set under an explicit sampling
@@ -315,6 +252,17 @@ impl FixedSamples {
     /// and `Random`'s count exactly reproducible without porting a
     /// normal-variate generator.
     ///
+    /// # The sample set is a list of voxels, and that is all it is
+    ///
+    /// Each strategy is a *selection*: which flat voxel indices, in which order,
+    /// with what multiplicity. Everything downstream — the values, the physical
+    /// points — is a function of that selection and the grid. Writing it that way
+    /// is what lets the default case (every voxel, in grid order) carry **no
+    /// index list and no points buffer at all**: its selection is the identity,
+    /// and [`VirtualGrid::write_point`] recovers any sample's point from its
+    /// index in nine flops. The buffer that used to hold those points was 402 MB
+    /// at 256³ and the largest single term in a GPU registration's setup.
+    ///
     /// Fails if `mask` does not share `fixed`'s size.
     pub fn from_image_with(
         fixed: &Image,
@@ -329,7 +277,7 @@ impl FixedSamples {
         let n = values_all.len();
 
         let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
-        let origin = fixed.origin();
+        let grid = VirtualGrid::new(dim, size, fixed.origin().to_vec(), idx_to_phys);
 
         let mask_buf = match mask {
             Some(m) => {
@@ -344,73 +292,40 @@ impl FixedSamples {
             }
             None => None,
         };
-        // The sample set is the grid itself exactly when nothing filters it.
-        #[cfg(feature = "cuda")]
-        let full_grid = matches!(strategy, SamplingStrategy::None) && mask_buf.is_none();
-
         let mask_allows = |flat: usize| match &mask_buf {
             None => true,
             Some(m) => m[flat] != 0.0,
         };
 
-        let mut values;
-        let mut points;
-        // One scratch point, reused: `write_point_at` writes into it and it is
-        // appended. The `Vec` it replaces was allocated once per sample.
-        let mut scratch = vec![0.0; dim];
-
-        match strategy {
-            // Every voxel, nothing masked out: the sample set *is* the grid, in
-            // grid order. There is nothing to filter, so nothing needs pushing —
-            // take the values buffer whole and fill the points in parallel.
-            SamplingStrategy::None if mask_buf.is_none() => {
-                points = grid_points(n, &size, &idx_to_phys, origin, dim);
-                values = values_all;
-            }
-            SamplingStrategy::None => {
-                values = Vec::with_capacity(n);
-                points = Vec::with_capacity(n * dim);
-                let mut index = vec![0usize; dim];
-                for (s, &fv) in values_all.iter().enumerate() {
-                    if mask_allows(s) {
-                        values.push(fv);
-                        write_point_at(&mut scratch, &idx_to_phys, origin, dim, &index);
-                        points.extend_from_slice(&scratch);
-                    }
-                    increment(&mut index, &size);
-                }
-            }
+        // The selected voxels, as flat indices in sample order. `None` is the
+        // identity selection — every voxel, in grid order — and is the one case
+        // that needs neither this list nor a points buffer.
+        let selected: Option<Vec<usize>> = match strategy {
+            SamplingStrategy::None if mask_buf.is_none() => None,
+            SamplingStrategy::None => Some((0..n).filter(|&s| mask_allows(s)).collect()),
             SamplingStrategy::Regular => {
                 let stride = ((1.0 / percentage).ceil() as usize).max(1);
-                let expect = n.div_ceil(stride);
-                values = Vec::with_capacity(expect);
-                points = Vec::with_capacity(expect * dim);
-                let mut index = vec![0usize; dim];
-                for (s, &fv) in values_all.iter().enumerate() {
-                    if s % stride == 0 && mask_allows(s) {
-                        values.push(fv);
-                        write_point_at(&mut scratch, &idx_to_phys, origin, dim, &index);
-                        points.extend_from_slice(&scratch);
-                    }
-                    increment(&mut index, &size);
-                }
+                Some((0..n).step_by(stride).filter(|&s| mask_allows(s)).collect())
             }
             SamplingStrategy::Random => {
                 let sample_count = (n as f64 * percentage) as usize;
-                values = Vec::with_capacity(sample_count);
-                points = Vec::with_capacity(sample_count * dim);
                 let mut rng = SplitMix64::new(seed);
-                for _ in 0..sample_count {
-                    let flat = rng.next_below(n);
-                    if mask_allows(flat) {
-                        let index = linear_to_multi(flat, &size);
-                        values.push(values_all[flat]);
-                        write_point_at(&mut scratch, &idx_to_phys, origin, dim, &index);
-                        points.extend_from_slice(&scratch);
-                    }
-                }
+                Some(
+                    (0..sample_count)
+                        .map(|_| rng.next_below(n))
+                        .filter(|&flat| mask_allows(flat))
+                        .collect(),
+                )
             }
-        }
+        };
+
+        let (values, points) = match &selected {
+            None => (values_all, SamplePoints::Grid),
+            Some(flats) => (
+                flats.iter().map(|&f| values_all[f]).collect(),
+                SamplePoints::Explicit(explicit_points(&grid, flats, dim)),
+            ),
+        };
 
         let min_spacing = fixed
             .spacing()
@@ -422,13 +337,37 @@ impl FixedSamples {
             dim,
             #[cfg(feature = "cuda")]
             id: next_id(),
-            #[cfg(feature = "cuda")]
-            full_grid,
             values,
             points,
             min_spacing,
-            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
+            grid,
         })
+    }
+
+    /// Scratch for [`point`](Self::point), one per thread.
+    pub(crate) fn scratch(&self) -> PointScratch {
+        PointScratch {
+            index: vec![0usize; self.dim],
+            point: vec![0.0f64; self.dim],
+        }
+    }
+
+    /// The physical point of sample `s`, length `dim`.
+    ///
+    /// Derived from the grid for the full-grid sample set (no buffer exists to
+    /// read), or read out of the materialized points for a sampled/masked one.
+    /// Which it is, is not the caller's business — this is the single accessor,
+    /// so the storage can be a closed form without 24 call sites knowing.
+    #[inline]
+    pub(crate) fn point<'a>(&'a self, s: usize, scratch: &'a mut PointScratch) -> &'a [f64] {
+        match &self.points {
+            SamplePoints::Explicit(p) => &p[s * self.dim..(s + 1) * self.dim],
+            SamplePoints::Grid => {
+                self.grid
+                    .write_point(s, &mut scratch.index, &mut scratch.point);
+                &scratch.point
+            }
+        }
     }
 
     /// Number of samples `N`.
@@ -870,7 +809,6 @@ impl MetricBackend for CpuBackend {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> MetricValue {
-        let dim = fixed.dim;
         let nparams = transform.number_of_parameters();
         let n = fixed.values.len();
 
@@ -883,9 +821,10 @@ impl MetricBackend for CpuBackend {
         // empty where the point contributes nothing (see
         // `ParametricTransform::sparse_jacobian_wrt_parameters`). So this reads
         // it once, on the first sample, and picks the loop.
+        let mut scratch = fixed.scratch();
         let sparse = n > 0
             && transform
-                .sparse_jacobian_wrt_parameters(&fixed.points[..dim])
+                .sparse_jacobian_wrt_parameters(fixed.point(0, &mut scratch))
                 .is_some();
 
         if sparse {
@@ -896,7 +835,7 @@ impl MetricBackend for CpuBackend {
             // exists for. Left serial deliberately — see the metric's parallel
             // note in the module docs.
             for s in 0..n {
-                let fp = &fixed.points[s * dim..(s + 1) * dim];
+                let fp = fixed.point(s, &mut scratch);
                 let mp = transform.transform_point(fp);
                 let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
                     Some(vg) => vg,
@@ -934,9 +873,9 @@ impl MetricBackend for CpuBackend {
             parallel::map_rows_fold_in_order(
                 n,
                 1 + nparams,
-                || (),
-                |(), s, row| {
-                    let fp = &fixed.points[s * dim..(s + 1) * dim];
+                || fixed.scratch(),
+                |scratch, s, row| {
+                    let fp = fixed.point(s, scratch);
                     let mp = transform.transform_point(fp);
                     let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
                         return false;
@@ -986,7 +925,6 @@ impl MetricBackend for CpuBackend {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> f64 {
-        let dim = fixed.dim;
         let n = fixed.values.len();
 
         let mut value_sum = 0.0;
@@ -999,9 +937,9 @@ impl MetricBackend for CpuBackend {
         parallel::map_rows_fold_in_order(
             n,
             1,
-            || (),
-            |(), s, row| {
-                let fp = &fixed.points[s * dim..(s + 1) * dim];
+            || fixed.scratch(),
+            |scratch, s, row| {
+                let fp = fixed.point(s, scratch);
                 let mp = transform.transform_point(fp);
                 // No gradient, no Jacobian: `value_at` decides validity by exactly
                 // the same predicate `value_and_physical_gradient` does, so this
@@ -1145,17 +1083,6 @@ pub(crate) fn local_support_block(
     Some((offset, block))
 }
 
-/// Increment a multi-index in place (first index fastest).
-fn increment(index: &mut [usize], size: &[usize]) {
-    for d in 0..index.len() {
-        index[d] += 1;
-        if index[d] < size[d] {
-            return;
-        }
-        index[d] = 0;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,12 +1132,13 @@ mod tests {
 
         // The serial loop, verbatim — the code the parallel path replaced.
         let (fixed, moving) = (&metric.fixed, &metric.moving);
-        let (dim, nparams) = (fixed.dim, t.number_of_parameters());
+        let nparams = t.number_of_parameters();
         let mut want_value = 0.0f64;
         let mut want_deriv = vec![0.0f64; nparams];
         let mut want_valid = 0usize;
+        let mut scratch = fixed.scratch();
         for s in 0..fixed.values.len() {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let fp = fixed.point(s, &mut scratch);
             let mp = t.transform_point(fp);
             let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
                 continue;
@@ -1241,8 +1169,9 @@ mod tests {
         let want_deriv: Vec<f64> = want_deriv.iter().map(|d| d * inv).collect();
         let mut want_only = 0.0f64;
         let mut only_valid = 0usize;
+        let mut scratch = fixed.scratch();
         for s in 0..fixed.values.len() {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let fp = fixed.point(s, &mut scratch);
             let Some(mv) = moving.value_at(&t.transform_point(fp)) else {
                 continue;
             };
@@ -1259,8 +1188,9 @@ mod tests {
         // catch a re-association, rather than passing because the sum happens to
         // be exact.
         let mut contributions = Vec::new();
+        let mut scratch = fixed.scratch();
         for s in 0..fixed.values.len() {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let fp = fixed.point(s, &mut scratch);
             if let Some(mv) = moving.value_at(&t.transform_point(fp)) {
                 let diff = mv - fixed.values[s];
                 contributions.push(diff * diff);
@@ -1459,7 +1389,6 @@ mod tests {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> MetricValue {
-        let dim = fixed.dim;
         let nparams = transform.number_of_parameters();
         let n = fixed.values.len();
 
@@ -1467,8 +1396,9 @@ mod tests {
         let mut deriv = vec![0.0; nparams];
         let mut valid = 0usize;
 
+        let mut scratch = fixed.scratch();
         for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
+            let fp = fixed.point(s, &mut scratch);
             let fv = fixed.values[s];
 
             let mp = transform.transform_point(fp);

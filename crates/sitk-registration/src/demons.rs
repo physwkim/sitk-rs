@@ -305,13 +305,13 @@ impl DemonsMetric {
             "DemonsMetric requires a transform with local support; call check_transform first"
         );
 
-        let dim = self.fixed.dim;
         let n = self.fixed.len();
         let mut value_sum = 0.0f64;
         let mut valid = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let mp = transform.transform_point(fp);
             let mv = match self.moving.value_at(&mp) {
                 Some(v) => v,
@@ -344,7 +344,6 @@ impl DemonsMetric {
             "DemonsMetric requires a transform with local support; call check_transform first"
         );
 
-        let dim = self.fixed.dim;
         let nparams = transform.number_of_parameters();
         let num_local = transform.number_of_local_parameters();
         let n = self.fixed.len();
@@ -353,8 +352,9 @@ impl DemonsMetric {
         let mut derivative = vec![0.0; nparams];
         let mut valid = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);

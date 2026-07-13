@@ -36,7 +36,9 @@ use std::sync::Mutex;
 use sitk_cuda::{FixedPoints, MovingGeometry, ResidentMetric};
 use sitk_transform::{Interpolator, ParametricTransform};
 
-use crate::metric::{CpuBackend, FixedSamples, MetricBackend, MetricValue, MovingImage};
+use crate::metric::{
+    CpuBackend, FixedSamples, MetricBackend, MetricValue, MovingImage, SamplePoints,
+};
 
 /// Relative tolerance for the probes that decide whether a transform's point map
 /// and Jacobian really are affine in the point.
@@ -142,17 +144,20 @@ impl CudaMetricBackend {
             };
             // When the sample set is the whole fixed grid in traversal order, the
             // points are a pure function of the sample index: send the grid (24
-            // numbers) instead of the points (402 MB at 256³). A sampled or masked
-            // set has no such closed form, so it uploads its points.
-            let points = if fixed.full_grid {
-                let (size, origin, idx_to_phys) = fixed.grid.parts();
-                FixedPoints::Grid {
-                    size,
-                    origin,
-                    idx_to_phys,
+            // numbers) instead of the points (402 MB at 256³). The host does not
+            // hold them either — `SamplePoints::Grid` derives them — so this is
+            // the same closed form on both sides of the bus. A sampled or masked
+            // set has no such form, so it uploads the points it materialized.
+            let points = match &fixed.points {
+                SamplePoints::Grid => {
+                    let (size, origin, idx_to_phys) = fixed.grid.parts();
+                    FixedPoints::Grid {
+                        size,
+                        origin,
+                        idx_to_phys,
+                    }
                 }
-            } else {
-                FixedPoints::Explicit(&fixed.points)
+                SamplePoints::Explicit(p) => FixedPoints::Explicit(p),
             };
             let metric = ResidentMetric::new(&fixed.values, points, &geom).ok()?;
             *guard = Some(Resident {

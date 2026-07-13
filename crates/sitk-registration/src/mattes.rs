@@ -305,7 +305,6 @@ impl MattesMutualInformationMetric {
     /// fuses the histogram and the `bins² × nparams` joint-PDF derivative into
     /// one walk, and splitting them would cost it a second pass.
     fn build_histogram(&self, transform: &dyn ParametricTransform) -> (Vec<f64>, Vec<f64>, usize) {
-        let dim = self.fixed.dim;
         let bins = self.num_bins;
         let n = self.fixed.len();
 
@@ -313,8 +312,9 @@ impl MattesMutualInformationMetric {
         let mut fixed_marginal = vec![0.0f64; bins];
         let mut valid = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);
@@ -397,11 +397,11 @@ impl MattesMutualInformationMetric {
     }
 
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        let dim = self.fixed.dim;
-        let sparse_capable = match self.fixed.points.get(..dim) {
-            Some(p0) => transform.sparse_jacobian_wrt_parameters(p0).is_some(),
-            None => false,
-        };
+        let mut scratch = self.fixed.scratch();
+        let sparse_capable = !self.fixed.is_empty()
+            && transform
+                .sparse_jacobian_wrt_parameters(self.fixed.point(0, &mut scratch))
+                .is_some();
         if sparse_capable {
             self.evaluate_sparse_support(transform)
         } else {
@@ -416,7 +416,6 @@ impl MattesMutualInformationMetric {
     /// per-bin joint-PDF parameter derivatives; the second walks the histogram
     /// to form `−MI` and folds each bin's `pRatio` into the derivative.
     fn evaluate_global_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        let dim = self.fixed.dim;
         let bins = self.num_bins;
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
@@ -429,8 +428,9 @@ impl MattesMutualInformationMetric {
         let mut joint_pdf_derivatives = vec![0.0f64; bins * bins * nparams];
         let mut valid = 0usize;
 
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);
@@ -608,7 +608,6 @@ impl MattesMutualInformationMetric {
     /// [`BSplineTransform::sparse_jacobian_wrt_parameters`]: sitk_transform::BSplineTransform
     /// [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
     fn evaluate_sparse_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        let dim = self.fixed.dim;
         let bins = self.num_bins;
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
@@ -674,8 +673,9 @@ impl MattesMutualInformationMetric {
         // Pass 2: re-walk the samples, scatter-adding each one's sparse
         // Jacobian contribution weighted by the now-finished per-bin pRatio.
         let mut derivative = vec![0.0f64; nparams];
+        let mut scratch = self.fixed.scratch();
         for s in 0..n {
-            let fp = &self.fixed.points[s * dim..(s + 1) * dim];
+            let fp = self.fixed.point(s, &mut scratch);
             let fv = self.fixed.values[s];
 
             let mp = transform.transform_point(fp);
