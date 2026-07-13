@@ -707,12 +707,41 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedSampling)
     ));
 
+    // A fixed-initial transform: the last refusal, and the only mask-shaped one left.
+    // The fixed image and the in-buffer predicate would have to be resampled *through*
+    // it, and both device resamples go through the identity only.
     let mut reg = ImageRegistrationMethod::new();
-    reg.set_metric_fixed_mask(&fixed);
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Translation(
+        sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
+    ));
     assert!(matches!(
         run(&reg),
-        Err(DeviceRegistrationError::UnsupportedMask)
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform)
     ));
+
+    // ...and a fixed mask is *not* refused any more — it is carried onto every level.
+    //
+    // This configuration (the fixed image used as its own mask, with the default
+    // optimizer) then diverges and ends in `NoValidSamples` — on **both** paths,
+    // identically, which is the agreement that matters. What is asserted here is only
+    // that the device no longer *declines* it. That it also lands where `execute` lands
+    // is pinned by `the_configurations_the_boundary_now_accepts_land_where_execute_lands`.
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_fixed_mask(&fixed);
+    assert!(
+        !matches!(
+            run(&reg),
+            Err(DeviceRegistrationError::UnsupportedMetric
+                | DeviceRegistrationError::UnsupportedInterpolator(_)
+                | DeviceRegistrationError::UnsupportedSampling
+                | DeviceRegistrationError::UnsupportedFixedInitialTransform)
+        ),
+        "a fixed mask was refused at the boundary"
+    );
+    assert!(
+        reg.execute(&fixed, &moving, euler()).is_err(),
+        "the host takes this configuration; then the device declining to run it would          be a real divergence rather than a shared outcome"
+    );
 
     // And a transform the moment identity does not cover: refused before the run,
     // carrying the metric's own named error rather than a generic failure.
@@ -738,7 +767,7 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             DeviceMetricError::NonAffineTransform
         ))
     ));
-    println!("five refusals, each by name, all before the first iteration");
+    println!("four refusals, each by name, all before the first iteration");
 }
 
 /// The boundary refuses a sampling **strategy**, not a sampling **percentage**.
@@ -1242,5 +1271,132 @@ fn a_moving_mask_of_the_wrong_size_is_refused() {
         Err(DeviceMetricError::Cuda(CudaError::DegenerateInput)) => {}
         Err(e) => panic!("refused, but by the wrong name: {e}"),
         Ok(_) => panic!("a moving mask shorter than the moving image built a metric"),
+    }
+}
+
+/// C5: the configurations the boundary now **accepts** run on the device and land
+/// where `execute` lands — a fixed mask, a moving mask, and a virtual domain.
+///
+/// Per-level `valid_points` is compared **exactly**. That is the assertion that would
+/// catch a level whose mask was built on the wrong grid, or dropped: the run would
+/// still converge and the parameters would still be close (the objective is smooth),
+/// but it would be sampling a different set of voxels than `execute` samples, and the
+/// count says so immediately. Parameters are compared at 1e-6 relative, the band the
+/// unmasked end-to-end test already uses — the two paths are the same optimizer over a
+/// metric that agrees to ~1e-14, not a bit-identical one.
+#[test]
+fn the_configurations_the_boundary_now_accepts_land_where_execute_lands() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let mask = ellipsoid_mask(n);
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    let configure = |reg: &mut ImageRegistrationMethod| {
+        reg.set_metric_as_mean_squares();
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+    };
+
+    // A virtual grid that overhangs the fixed image on every axis, so the in-buffer
+    // predicate actually drops points rather than being all ones.
+    let mut with_domain = ImageRegistrationMethod::new();
+    configure(&mut with_domain);
+    with_domain
+        .set_virtual_domain(
+            vec![40, 36, 44],
+            vec![-14.0, -8.0, -12.0],
+            vec![1.4, 1.5, 1.6],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+    let mut with_fixed_mask = ImageRegistrationMethod::new();
+    configure(&mut with_fixed_mask);
+    with_fixed_mask.set_metric_fixed_mask(&mask);
+
+    let mut with_moving_mask = ImageRegistrationMethod::new();
+    configure(&mut with_moving_mask);
+    with_moving_mask.set_metric_moving_mask(&mask);
+
+    let mut with_both = ImageRegistrationMethod::new();
+    configure(&mut with_both);
+    with_both.set_metric_fixed_mask(&mask);
+    with_both
+        .set_virtual_domain(
+            vec![40, 36, 44],
+            vec![-14.0, -8.0, -12.0],
+            vec![1.4, 1.5, 1.6],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+    let unmasked_points = {
+        let mut reg = ImageRegistrationMethod::new();
+        configure(&mut reg);
+        reg.execute(&fixed, &moving, initial())
+            .unwrap()
+            .valid_points
+    };
+
+    for (name, reg) in [
+        ("fixed mask", &with_fixed_mask),
+        ("moving mask", &with_moving_mask),
+        ("virtual domain", &with_domain),
+        ("fixed mask + virtual domain", &with_both),
+    ] {
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg
+            .execute_on_device(&d_f, &d_m, initial())
+            .unwrap_or_else(|e| panic!("{name}: the device path refused a run it now takes: {e}"));
+
+        // Anti-vacuity: whatever the configuration does, it must not be a no-op. A
+        // device that silently ignored the mask or the domain would agree with a host
+        // that did too, and this is what makes that impossible.
+        assert!(
+            host.valid_points < unmasked_points,
+            "{name}: the configuration drops no samples ({} vs {unmasked_points} plain); \
+             a path that ignored it would pass this test",
+            host.valid_points
+        );
+
+        println!(
+            "{name}: host {} iters / {} valid | device {} iters / {} valid",
+            host.iterations, host.valid_points, device.iterations, device.valid_points
+        );
+        assert_eq!(
+            device.levels.len(),
+            host.levels.len(),
+            "{name}: different level counts"
+        );
+        for (h, d) in host.levels.iter().zip(device.levels.iter()) {
+            assert_eq!(
+                d.valid_points, h.valid_points,
+                "{name}, level {}: the device walked a different sample set than the host",
+                h.level
+            );
+        }
+        assert_eq!(
+            device.valid_points, host.valid_points,
+            "{name}: final valid-point counts differ"
+        );
+        for (k, (&d, &h)) in device
+            .transform
+            .parameters()
+            .iter()
+            .zip(host.transform.parameters().iter())
+            .enumerate()
+        {
+            let rel = (d - h).abs() / (1.0 + h.abs());
+            assert!(
+                rel <= 1e-6,
+                "{name}, param {k}: device {d:e} vs host {h:e} (rel {rel:e})"
+            );
+        }
     }
 }

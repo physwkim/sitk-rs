@@ -2560,29 +2560,34 @@ impl ImageRegistrationMethod {
     /// - a **globally affine** transform (translation, rigid, Euler, versor,
     ///   similarity, affine) — the moment identity the kernel evaluates holds for
     ///   exactly those, and a B-spline or displacement field is refused by name;
-    /// - **linear** interpolation, no masks, and the default sampling *strategy*
+    /// - **linear** interpolation and the default sampling *strategy*
     ///   ([`SamplingStrategy::None`](crate::metric::SamplingStrategy::None), every
     ///   voxel of the fixed grid). A configured sampling *percentage* is accepted:
     ///   the `None` strategy ignores it on the host too, so refusing it would have
     ///   cost the caller this path for a value that changes nothing;
     /// - a **multi-resolution pyramid**: each level is built on the device by the
-    ///   same three ops in the same order [`prepare_level`](Self::prepare_level)
-    ///   uses — `recursive_gaussian`, `shrink` for the coarse grid, `resample_linear`
-    ///   onto it — and each of the three is bit-identical to the CPU filter it
-    ///   transcribes (`pyramid_parity.rs`);
-    /// - no virtual domain and no fixed-initial transform — not because the device
-    ///   cannot build the grid (`resample_linear` takes an arbitrary geometry; that
-    ///   is how the pyramid's coarse levels are made) but because either one makes
-    ///   `prepare_level` fold an *in-buffer predicate* into the level's fixed mask,
-    ///   and a device image carries no mask. A moving-initial transform *is*
-    ///   supported (it composes with the optimized transform and the composition is
-    ///   probed for affineness like any other).
+    ///   same ops in the same order [`prepare_level`](Self::prepare_level) uses —
+    ///   `recursive_gaussian`, the shrunk grid, `resample_linear` onto it — and each
+    ///   is bit-identical to the CPU filter it transcribes (`pyramid_parity.rs`);
+    /// - a **fixed mask** and a **moving mask**. The fixed mask is nearest-neighbour
+    ///   resampled onto each level's grid and folded with the in-buffer predicate
+    ///   exactly as `prepare_level` folds them; the level's mask is pinned *byte for
+    ///   byte* against the host's and the level's valid-point count *exactly*
+    ///   (`method::device_level_tests`);
+    /// - a **virtual domain**: the level's grid is the shrunk virtual grid, and the
+    ///   in-buffer predicate that a virtual grid requires — which virtual points map
+    ///   inside the fixed buffer at all — is a nearest-neighbour resample of an
+    ///   all-ones volume, built on the device and never uploaded;
+    /// - a **moving-initial** transform (it composes with the optimized transform and
+    ///   the composition is probed for affineness like any other).
     ///
-    /// **The one capability that would move this boundary is a device mask.** It
-    /// closes [`UnsupportedMask`](DeviceRegistrationError::UnsupportedMask) and
-    /// [`UnsupportedVirtualDomain`](DeviceRegistrationError::UnsupportedVirtualDomain)
-    /// together — they are two refusals for one missing thing — and nothing else on
-    /// this list is a single capability away.
+    /// The one thing left is a **fixed-initial transform**, refused by name as
+    /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform).
+    /// It needs the fixed image *and its in-buffer predicate* resampled **through** the
+    /// transform, and both device resamples go through the identity only. That refusal
+    /// documents why the missing piece is not merely a kernel: a transformed resample
+    /// whose point map is 1e-12 from the host's would move the predicate's boundary by
+    /// a voxel, and the predicate is what makes the valid-point count exactly equal.
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
@@ -2665,11 +2670,18 @@ impl ImageRegistrationMethod {
         if !matches!(self.sampling_strategy, SamplingStrategy::None) {
             return Err(DeviceRegistrationError::UnsupportedSampling);
         }
-        if self.fixed_mask.is_some() || self.moving_mask.is_some() {
-            return Err(DeviceRegistrationError::UnsupportedMask);
-        }
-        if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
-            return Err(DeviceRegistrationError::UnsupportedVirtualDomain);
+        // Masks and virtual domains are no longer refused: the level carries a device
+        // fixed mask (`level_mask_on_device`), the metric takes a moving mask, and the
+        // level's grid can be the virtual one (`level_grid`).
+        //
+        // A **fixed-initial transform** is still refused, and it is the last one. It
+        // would need the fixed image *and the in-buffer predicate* resampled through
+        // the transform, and neither device resample can resample through anything but
+        // the identity. See `UnsupportedFixedInitialTransform`: the blocker is not the
+        // kernel, it is that a predicate matched only to a tolerance would break the
+        // valid-point count this path pins as exactly equal to the host's.
+        if self.fixed_initial_transform.is_some() {
+            return Err(DeviceRegistrationError::UnsupportedFixedInitialTransform);
         }
 
         let geom = fixed.geometry();
