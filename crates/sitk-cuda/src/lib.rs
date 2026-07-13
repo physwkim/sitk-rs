@@ -35,7 +35,8 @@ pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
 pub use ops::rescale_intensity::{
-    rescale_intensity_gpu, rescale_intensity_gpu_into, try_rescale_intensity,
+    rescale_intensity_gpu, rescale_intensity_gpu_into, rescale_intensity_resident,
+    try_rescale_intensity,
 };
 pub use pinned::PinnedBuffer;
 
