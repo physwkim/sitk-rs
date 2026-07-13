@@ -59,8 +59,8 @@
 
 use std::borrow::Cow;
 
-use sitk_core::Image;
-use sitk_filters::{recursive_gaussian, shrink};
+use sitk_core::{Image, PixelId};
+use sitk_filters::{cast, recursive_gaussian, shrink};
 use sitk_transform::{
     AffineTransform, BSplineTransform, Interpolator, ParametricTransform, ResampleImageFilter,
     Transform, TransformBase, TranslationTransform,
@@ -2325,6 +2325,12 @@ impl ImageRegistrationMethod {
     /// requirement bites only on a pathologically small input (a level with
     /// `sigma == 0` is a no-op and imposes nothing).
     ///
+    /// **The level is built in floating point.** A non-floating input is cast to
+    /// [`PixelId::Float32`] before it is smoothed, so no level re-quantizes the
+    /// smoothed intensities back to the input's integer type; a `Float64` input
+    /// keeps its width. See the body for why this is upstream's behaviour and not
+    /// a divergence from it (ledger §5.12).
+    ///
     /// The moving image is only smoothed (it is resampled through the transform,
     /// so it is not shrunk). The fixed image is smoothed and then placed on the
     /// coarse **virtual-domain** grid: ITK shrinks the virtual domain with
@@ -2379,6 +2385,37 @@ impl ImageRegistrationMethod {
         factors: &[usize],
         dim: usize,
     ) -> Result<(Cow<'a, Image>, Cow<'a, Image>, Option<Image>)> {
+        // The level pipeline runs in floating point, whatever the caller handed in.
+        //
+        // `recursive_gaussian` narrows back to its *input's* pixel type, so on an
+        // integer volume every level used to round the smoothed intensities back to
+        // the integer type before resampling — and the resample onto a shrunk grid
+        // interpolates, so it rounded a second time. A CT registered as `UInt16` was
+        // being re-quantized once per level, which is a precision loss this
+        // function's parity claim does not have and no caller asked for.
+        //
+        // Promoting is not a divergence from upstream, it is the only way to *have*
+        // this case: SimpleITK's `ImageRegistrationMethod::Execute` registers only
+        // `RealPixelIDTypeList` (`sitkImageRegistrationMethod.cxx:749`), so it refuses
+        // an integer image outright and the user casts to float first. ITK's own
+        // pyramid smoother is `SmoothingRecursiveGaussianImageFilter<FixedImageType,
+        // FixedImageType>` (`itkImageRegistrationMethodv4.hxx:593`) — output type is
+        // the *image* type, not `float` — so for the types upstream accepts, "smooth
+        // in the image's own float type" is exactly what upstream does. A `Float64`
+        // volume therefore stays `Float64` here; narrowing it to `Float32` (which the
+        // standalone `smoothing_recursive_gaussian` filter would do, since its yaml
+        // rebinds unconditionally to `float`) would be a *new* precision loss on the
+        // one type ITK keeps at full width. Only a non-floating type is promoted, and
+        // it is promoted to `Float32` — what `DeviceImage::upload` already does, so
+        // the host and device pyramids build the same level images (ledger §5.12).
+        let level_type = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            Ok(if img.pixel_id().is_floating_point() {
+                Cow::Borrowed(img)
+            } else {
+                Cow::Owned(cast(img, PixelId::Float32)?)
+            })
+        };
+
         // A zero-sigma level does not smooth, and `recursive_gaussian` returns its
         // input unchanged there (verified bit-for-bit). Running it anyway is not
         // free: it materializes a fresh copy of the volume, and at 256³ the two
@@ -2386,10 +2423,11 @@ impl ImageRegistrationMethod {
         // that smooths nothing. Borrow instead.
         let no_smoothing = sigma.iter().all(|&s| s == 0.0);
         let smooth = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            let img = level_type(img)?;
             Ok(if no_smoothing {
-                Cow::Borrowed(img)
+                img
             } else {
-                Cow::Owned(recursive_gaussian(img, sigma)?)
+                Cow::Owned(recursive_gaussian(&img, sigma)?)
             })
         };
         let smoothed_fixed = smooth(fixed)?;
@@ -2504,13 +2542,16 @@ impl ImageRegistrationMethod {
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
-    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so the device pyramid
-    /// smooths in `f64` and stores `f32`. `sitk_filters::recursive_gaussian` narrows
-    /// back to its *input's* pixel type, so `execute` on a `UInt16` CT re-quantizes
-    /// every level to `UInt16` and this path does not. What this path reproduces,
-    /// bit for bit, is `execute` run on the **`Float32` casts** of the two volumes —
+    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so what this path
+    /// reproduces is `execute` run on the **`Float32` casts** of the two volumes —
     /// which is exactly what [`upload`](sitk_cuda::DeviceImage::upload) put on the
-    /// device.
+    /// device. For an integer input that is now the same thing as `execute` on the
+    /// original volumes: [`prepare_level`](Self::prepare_level) promotes a
+    /// non-floating input to `Float32` before smoothing, so the host pyramid no
+    /// longer re-quantizes a `UInt16` CT at every level while this one does not
+    /// (ledger §5.12; the gap was a worst-parameter 5.5e-4 and a 1.4% coarse-level
+    /// metric difference, pinned in `pyramid_precision.rs`). A `Float64` input still
+    /// differs: the host keeps `f64` levels and the device holds `f32`.
     ///
     /// If a device failure occurs *during* the run, the run is discarded and the
     /// error returned — see [`DeviceActive`].
