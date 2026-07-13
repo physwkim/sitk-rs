@@ -34,8 +34,10 @@ mod pinned;
 pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
-pub use ops::mean_squares::{DIM, Moments, MovingGeometry, ResidentMetric};
-pub use ops::rescale_intensity::{rescale_intensity_gpu, try_rescale_intensity};
+pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
+pub use ops::rescale_intensity::{
+    rescale_intensity_gpu, rescale_intensity_gpu_into, try_rescale_intensity,
+};
 pub use pinned::PinnedBuffer;
 
 /// Wall-clock split of one GPU op, in milliseconds.
