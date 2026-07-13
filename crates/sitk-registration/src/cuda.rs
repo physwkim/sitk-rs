@@ -158,7 +158,12 @@ impl CudaMetricBackend {
                         idx_to_phys,
                     }
                 }
-                SamplePoints::Explicit(p) => FixedPoints::Explicit(p),
+                // This backend uploads the *values it gathered per sample*, not the fixed
+                // grid, so its samples have no grid to index into and the points are what
+                // it can send. (The device-resident path holds the whole grid and does
+                // send indices — `FixedPoints::Indices` — which is why a fixed mask
+                // composes with a sampled set there and not here.)
+                SamplePoints::Explicit { points, .. } => FixedPoints::Explicit(points),
             };
             // Both volumes are held in their image's native type, so each is
             // widened straight into its upload, a chunk at a time — there is no

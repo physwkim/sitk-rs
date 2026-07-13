@@ -78,10 +78,6 @@ pub enum DeviceRegistrationError {
     #[error("the device metric interpolates linearly; interpolator {0:?} is host-only")]
     UnsupportedInterpolator(Interpolator),
 
-    /// The device metric samples every voxel of the fixed grid.
-    #[error("the device metric samples every voxel; sampling strategies are host-only")]
-    UnsupportedSampling,
-
     /// Building a resolution level on the device failed: no device, an NVRTC
     /// failure, out of memory, or a geometry the pyramid ops have no kernel for (a
     /// non-3-D image, a shrink factor of zero, an axis too short for the recursive
@@ -135,11 +131,17 @@ pub enum DeviceRegistrationError {
 /// Mean-squares metric over two [`DeviceImage`]s, evaluable against any number of
 /// transforms without moving a voxel.
 ///
-/// Samples the **whole fixed grid** in traversal order — a device image carries no
-/// sampling strategy and no mask, and the fixed points are a closed-form function
-/// of the sample index, so nothing but the geometry (24 numbers) is uploaded to
-/// describe them. The moving image is sampled with **linear** interpolation, which
-/// is what the kernel implements.
+/// Samples the **whole fixed grid** in traversal order by default: the fixed points are
+/// then a closed-form function of the sample index, so nothing but the geometry (24
+/// numbers) is uploaded to describe them.
+///
+/// A **sampling strategy** ([`from_device_sampled`](Self::from_device_sampled)) replaces
+/// that with the list of fixed-grid voxels the host drew — 8 bytes a sample, and the
+/// points and values are still derived from the grid, at those voxels. The device never
+/// draws the samples; it is told which ones.
+///
+/// The moving image is sampled with **linear** interpolation, which is what the kernel
+/// implements.
 pub struct DeviceMeanSquaresMetric {
     /// `Mutex` rather than `&mut self` on every call: the optimizer driver holds
     /// the metric by shared reference (it is the same driver the host path uses),
@@ -186,6 +188,36 @@ impl DeviceMeanSquaresMetric {
         fixed_mask: Option<&sitk_cuda::DeviceMask>,
         moving_mask: Option<&[bool]>,
     ) -> Result<Self, DeviceMetricError> {
+        Self::from_device_sampled(fixed, moving, fixed_mask, moving_mask, None)
+    }
+
+    /// [`from_device_masked`](Self::from_device_masked) over a **sampled** subset of the
+    /// fixed grid: `samples[s]` is the flat fixed-grid voxel of sample `s`.
+    ///
+    /// The device does **not** draw the samples. The list is
+    /// [`crate::metric::draw_samples`]'s — the same function, called with the same
+    /// percentage and the same seed, that the host path draws with — so the two paths do
+    /// not *agree* on a sample set, they *share* one. What the device is told is which
+    /// voxels; it derives each one's physical point from the same closed form the
+    /// full-grid path uses and reads its value from the resident image, so a sampled run
+    /// is the full run restricted to those voxels, bit for bit
+    /// (`sitk_cuda`'s `the_identity_index_list_is_the_grid_bit_for_bit`).
+    ///
+    /// The list is the draw **before** the fixed mask has filtered it: the mask is gated
+    /// in the kernel, by grid voxel, which an index list still knows. The host filters the
+    /// same draw by the same mask, so the two evaluate the same samples — a masked-out
+    /// draw contributes nothing on either side.
+    ///
+    /// `None` is the whole grid in grid order, which is [`from_device_masked`].
+    ///
+    /// [`from_device_masked`]: Self::from_device_masked
+    pub fn from_device_sampled(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceMask>,
+        moving_mask: Option<&[bool]>,
+        samples: Option<&[usize]>,
+    ) -> Result<Self, DeviceMetricError> {
         let f = fixed.geometry();
         let m = moving.geometry();
         if f.dimension() != sitk_cuda::DIM {
@@ -218,10 +250,21 @@ impl DeviceMeanSquaresMetric {
             // indices line up.
             mask: moving_mask,
         };
-        let points = FixedPoints::Grid {
-            size: &f.size,
-            origin: &f.origin,
-            idx_to_phys: &idx_to_phys,
+        // The sample set: the whole grid, or the voxels the host's draw named.
+        let idx: Option<Vec<i64>> =
+            samples.map(|s| s.iter().map(|&v| v as i64).collect::<Vec<_>>());
+        let points = match &idx {
+            None => FixedPoints::Grid {
+                size: &f.size,
+                origin: &f.origin,
+                idx_to_phys: &idx_to_phys,
+            },
+            Some(idx) => FixedPoints::Indices {
+                idx,
+                size: &f.size,
+                origin: &f.origin,
+                idx_to_phys: &idx_to_phys,
+            },
         };
 
         let resident =

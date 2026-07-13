@@ -16,7 +16,7 @@ use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
 use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
 use sitk_registration::{
     CpuBackend, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
-    ImageRegistrationMethod, MeanSquaresMetric,
+    ImageRegistrationMethod, MeanSquaresMetric, RegistrationError,
 };
 use sitk_transform::{BSplineTransform, Euler3DTransform, ParametricTransform};
 
@@ -699,13 +699,30 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedInterpolator(_))
     ));
 
+    // Sampling is **not** refused any more: the device is handed the host's draw
+    // (`draw_samples`) as a list of fixed-grid voxels.
+    //
+    // This configuration — like the fixed-mask one below — then diverges under the
+    // default optimizer and ends in `NoValidSamples`, on **both** paths identically. What
+    // is asserted here is only that the device no longer *declines* it as a configuration;
+    // that it samples the voxels the host samples is pinned by
+    // `the_device_samples_the_voxels_the_host_samples`, on a pose that converges.
     let mut reg = ImageRegistrationMethod::new();
     reg.set_metric_sampling_strategy(sitk_registration::metric::SamplingStrategy::Random);
     reg.set_metric_sampling_percentage(0.2, 7);
-    assert!(matches!(
-        run(&reg),
-        Err(DeviceRegistrationError::UnsupportedSampling)
-    ));
+    match run(&reg) {
+        Err(DeviceRegistrationError::Registration(RegistrationError::NoValidSamples)) => {
+            assert!(
+                matches!(
+                    reg.execute(&fixed, &moving, euler()),
+                    Err(RegistrationError::NoValidSamples)
+                ),
+                "the device gave up on a sampled run the host completes"
+            );
+        }
+        Err(e) => panic!("a sampling strategy was refused at the boundary: {e}"),
+        Ok(_) => {}
+    }
 
     // A fixed-initial transform is refused **per transform class**, not as a
     // configuration: what the device needs is a point map that is bitwise
@@ -777,7 +794,6 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             run(&reg),
             Err(DeviceRegistrationError::UnsupportedMetric
                 | DeviceRegistrationError::UnsupportedInterpolator(_)
-                | DeviceRegistrationError::UnsupportedSampling
                 | DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
         ),
         "a fixed mask was refused at the boundary"
@@ -1847,4 +1863,142 @@ fn what_the_f32_payload_costs_a_float64_registration() {
          the 6.3e-10 this limit was priced at"
     );
     println!("PRICED: the f32 payload costs {narrowing:e} of pose on a Float64 pair");
+}
+
+/// **S2: the device samples the voxels the host samples.**
+///
+/// Not "the two draws agree" — there is one draw. `metric::draw_samples` is the single
+/// owner of which voxels a strategy selects; the host filters that draw by its fixed mask
+/// and the device is handed the same draw with the mask gated in the kernel, by grid
+/// voxel. So the first assertion below is on the **lists themselves**: the device's list,
+/// filtered by the host's mask, must be bit-equal to the host's — element for element,
+/// including order and including a voxel drawn twice, because `Random` draws with
+/// replacement and the metric counts it twice.
+///
+/// Then the consequence, at a **common transform** (zero optimizer steps, so the two
+/// paths are evaluated at identical parameters and no optimizer trajectory can be blamed):
+/// per-level `valid_points` **exactly** equal, and the metric value inside
+/// reduction-rounding.
+///
+/// Anti-vacuity, twice over: the strategy must actually select a small subset (or a device
+/// that ignored it and walked the full grid would pass), and the sampled run's
+/// `valid_points` must differ from the full-grid run's.
+#[test]
+fn the_device_samples_the_voxels_the_host_samples() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    use sitk_registration::metric::draw_samples;
+
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    // Not the identity: a pose that swings part of the fixed grid off the moving image, so
+    // some drawn samples are *invalid* and `valid_points` is strictly less than the draw.
+    // Under an identity-ish pose every sample lands inside and the count degenerates to
+    // the list's length — which a device that drew its own list of the same length would
+    // also reproduce. Here it cannot.
+    let initial = || Euler3DTransform::new(0.10, -0.07, 0.05, [14.0, -11.0, 7.0], [c, c, c]);
+    let voxels = n * n * n;
+
+    for (strategy, pct, seed) in [
+        (SamplingStrategy::Regular, 0.05, 0),
+        (SamplingStrategy::Regular, 0.37, 0),
+        (SamplingStrategy::Random, 0.01, 0),
+        (SamplingStrategy::Random, 0.10, 7),
+        (SamplingStrategy::Random, 0.10, 12345),
+    ] {
+        let what = format!("{strategy:?} {pct} seed {seed}");
+
+        // The draw the device is handed, and the sample set the host walks. One function
+        // made both; the host's is this one filtered by its mask (there is no mask here,
+        // so they must be equal outright).
+        let drawn = draw_samples(voxels, strategy, pct, seed).expect("a strategy draws a list");
+        let host_samples =
+            FixedSamples::from_image_with(&fixed, strategy, pct, seed, None).unwrap();
+        let host_list = host_samples
+            .selected_indices()
+            .expect("a sampled set has a list");
+        assert_eq!(
+            drawn.as_slice(),
+            host_list,
+            "{what}: the list handed to the device is not the list the host walks"
+        );
+        assert!(
+            drawn.len() < voxels / 2,
+            "{what}: the strategy drew {} of {voxels} voxels — a device that ignored it \
+             would pass everything below",
+            drawn.len()
+        );
+
+        let build = |sampled: bool| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_metric_as_mean_squares();
+            // Zero steps: both paths are evaluated at `initial()`, so nothing here can be
+            // the optimizer's doing.
+            reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 0, 1e-8);
+            if sampled {
+                reg.set_metric_sampling_strategy(strategy);
+                reg.set_metric_sampling_percentage(pct, seed);
+            }
+            reg
+        };
+        let reg = build(true);
+        let full = build(false);
+
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg
+            .execute_on_device(&d_f, &d_m, initial())
+            .unwrap_or_else(|e| panic!("{what}: the device refused a sampled run: {e}"));
+        let full_grid = full.execute(&fixed, &moving, initial()).unwrap();
+
+        assert!(
+            host.valid_points < full_grid.valid_points,
+            "{what}: the sampled run walks as many points as the full grid ({} vs {})",
+            host.valid_points,
+            full_grid.valid_points
+        );
+        // The pose drops some of the draw, so the count below is a statement about *which*
+        // voxels were sampled and not merely how many were listed.
+        assert!(
+            host.valid_points < drawn.len(),
+            "{what}: every drawn sample landed inside the moving image ({} of {}), so the \
+             count equality below cannot distinguish the host's voxels from any other list \
+             of the same length",
+            host.valid_points,
+            drawn.len()
+        );
+
+        assert_eq!(
+            device.levels.len(),
+            host.levels.len(),
+            "{what}: different level counts"
+        );
+        for (h, d) in host.levels.iter().zip(device.levels.iter()) {
+            assert_eq!(
+                d.valid_points, h.valid_points,
+                "{what}, level {}: the device walked a different sample set than the host",
+                h.level
+            );
+            let rel = (d.metric_value - h.metric_value).abs() / h.metric_value.abs();
+            assert!(
+                rel <= 1e-11,
+                "{what}, level {}: metric {:e} (device) vs {:e} (host), rel {rel:e} — the \
+                 counts agree but the values do not, so the device sampled the right number \
+                 of voxels from the wrong places",
+                h.level,
+                d.metric_value,
+                h.metric_value
+            );
+        }
+        println!(
+            "{what}: {} drawn, {} valid on both ({} on the full grid)",
+            drawn.len(),
+            host.valid_points,
+            full_grid.valid_points
+        );
+    }
 }
