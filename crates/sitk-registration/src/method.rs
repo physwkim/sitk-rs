@@ -2517,6 +2517,30 @@ impl ImageRegistrationMethod {
         };
         let moving_level = smooth(moving)?;
 
+        // This *is* ITK's in-buffer predicate, not an approximation of it, and the
+        // nearest-neighbour resample is what makes it one — do not "simplify" it.
+        //
+        // ITK tests `m_FixedInterpolator->IsInsideBuffer(mappedFixedPoint)`
+        // (`itkImageToImageMetricv4.hxx:313`) → `ImageFunction::IsInsideBuffer(Point)`
+        // (`itkImageFunction.h:176-184`) → the continuous-index overload
+        // (`itkImageFunction.h:159-170`), whose bounds are
+        // `m_StartContinuousIndex = start - 0.5`, `m_EndContinuousIndex = end + 0.5`
+        // (`itkImageFunction.hxx:63-64`): inside ⟺ `c ∈ [-0.5, size - 0.5)` per axis.
+        //
+        // The resample below accepts a point exactly when `interpolator::is_inside`
+        // does, i.e. `c >= -0.5 && c < size - 0.5` — the same interval. The
+        // `floor(c + 0.5)` inside `nearest_at` runs *after* that gate and only picks
+        // which voxel to copy; it neither widens nor narrows the accepted set. (Nor
+        // would a rounded-index formulation: `floor(c + 0.5) ∈ [0, size-1]` ⟺
+        // `c ∈ [-0.5, size - 0.5)`, the identical set — which is also why the user
+        // mask, whose ITK test *is* rounded-index (`itkImageMaskSpatialObject.hxx:36-47`),
+        // is exact under the same resample.)
+        //
+        // Resolution matches too: ITK's per-level metric fixed image is
+        // `m_FixedSmoothImages[n]` — smoothed, **not** shrunk
+        // (`itkImageRegistrationMethodv4.hxx:609`, `:636`, set at `:654`; only the
+        // virtual domain is shrunk, `:447-451`) — so the buffer ITK's predicate tests
+        // is the full-resolution fixed buffer, which is the grid these ones are on.
         let inside_fixed =
             if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
                 let ones = with_geometry_of(fixed, vec![1.0f64; fixed.size().iter().product()])?;
