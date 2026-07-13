@@ -6,7 +6,7 @@ use sitk_core::Image;
 use sitk_filters::{
     ConvolutionBoundaryCondition, OutputRegionMode, Result, StructuringElement, binary_dilate,
     connected_component, discrete_gaussian, fft_convolution, gradient_magnitude,
-    gradient_magnitude_recursive_gaussian, mean, median, otsu_threshold, rescale_intensity,
+    gradient_magnitude_recursive_gaussian, mean, median, otsu_threshold, rescale_intensity_cpu,
     signed_maurer_distance_map, smoothing_recursive_gaussian,
 };
 
@@ -98,12 +98,19 @@ pub const OPS: &[OpSpec] = &[
     },
 ];
 
-/// `doc/bench-spec.md` op 1 parameters.
-const RESCALE_OUTPUT_MIN: f64 = 0.0;
-const RESCALE_OUTPUT_MAX: f64 = 255.0;
+/// `doc/bench-spec.md` op 1 parameters, named so `benches/bench_ops.rs`'s GPU
+/// row calls `sitk_cuda::rescale_intensity_gpu` with the exact same values
+/// instead of a second, possibly-drifting literal.
+pub const RESCALE_OUTPUT_MIN: f64 = 0.0;
+pub const RESCALE_OUTPUT_MAX: f64 = 255.0;
 
 fn run_rescale_intensity(img: &Image) -> Result<Image> {
-    rescale_intensity(img, RESCALE_OUTPUT_MIN, RESCALE_OUTPUT_MAX)
+    // Always the CPU path, regardless of the `cuda` feature: `t1`/`tN` and the
+    // correctness-gate reference must stay comparable across builds and must
+    // never silently run on GPU (`rescale_intensity`'s public dispatcher
+    // tries GPU first when the feature is on; `rescale_intensity_cpu` is the
+    // guaranteed-CPU entry point it falls back to).
+    rescale_intensity_cpu(img, RESCALE_OUTPUT_MIN, RESCALE_OUTPUT_MAX)
 }
 
 fn run_smoothing_recursive_gaussian(img: &Image) -> Result<Image> {

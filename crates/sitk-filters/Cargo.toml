@@ -7,13 +7,17 @@ license.workspace = true
 repository.workspace = true
 description = "Image filters for sitk-rs"
 
-# No `cuda` feature: the filter API is CPU-only by decision. The GPU
-# per-pixel op that used to live behind one was measured slower than the CPU at
-# every volume size (doc/bench-results.md) and removed, dispatch and all, so
-# this crate has no edge to `sitk-cuda` to gate.
+[features]
+# Default OFF. On, every op with a GPU kernel tries the GPU first and falls
+# back to the CPU implementation whenever the GPU declines (no driver, no
+# device, NVRTC failure, out of memory, unsupported pixel type). Off, this
+# crate is exactly what it was before `sitk-cuda` existed.
+default = []
+cuda = ["dep:sitk-cuda", "sitk-cuda/cuda"]
 
 [dependencies]
 sitk-core.workspace = true
+sitk-cuda = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]

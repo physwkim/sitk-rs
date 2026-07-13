@@ -1,38 +1,21 @@
 //! Optional CUDA backend for sitk-rs.
 //!
-//! # Scope: the registration metric, and nothing else
+//! # Two API layers, one meaning each
 //!
-//! This crate implements **one** thing — the per-sample reduction behind
-//! `sitk-registration`'s mean-squares metric ([`ResidentMetric`]). It is
-//! deliberately not a GPU version of the filter API, and the filter API does
-//! not dispatch to it.
+//! Every op here comes in two forms, and the split is deliberate — a single
+//! function returning "error" for both "this GPU run failed" and "there is no
+//! GPU" would make the caller guess which it got:
 //!
-//! That boundary was drawn by measurement, not taste. `rescale_intensity` was
-//! ported here first, precisely because a pure per-pixel op is the easiest kind
-//! of kernel to get right — and it lost. Even with the host output allocation
-//! driven to literally zero (a caller-owned destination, no page faults left to
-//! pay), it measured **1.4× slower than the CPU at 256³ and 2.2× slower at
-//! 512³**. A per-pixel op crosses PCIe twice to do one pass of arithmetic the
-//! CPU does at memory bandwidth without moving a byte, and the ratio gets
-//! *worse* with volume size, so there is no crossover to wait for. The kernel,
-//! its `_into` form and the filter's dispatch branch were all removed;
-//! `doc/bench-results.md` keeps the measurement that justifies their absence.
+//! - the **strict** form (`rescale_intensity_gpu`) returns
+//!   [`Result<_, CudaError>`]: it says exactly what the GPU did, and is what
+//!   tests and benchmarks call;
+//! - the **fallback** form (`try_rescale_intensity`) returns [`Option`]:
+//!   `None` means "the GPU produced no result, for *any* reason — no driver,
+//!   no device, NVRTC failure, out of memory, unsupported pixel type" and the
+//!   caller must run the CPU implementation. It never panics.
 //!
-//! The registration metric is the opposite shape, and that is why it stays: the
-//! fixed samples and the moving volume are uploaded **once** and then evaluated
-//! hundreds of times as the optimizer walks, so the transfer amortizes to
-//! nothing and what is left is arithmetic — where the device wins by 67–201×
-//! per iteration over 96 CPU cores.
-//!
-//! The rule this leaves behind: **a GPU op earns its place only if the data it
-//! moves is reused.** One-shot per-pixel work belongs on the CPU.
-//!
-//! # No hard dependency, ever
-//!
-//! [`backend`] returns [`CudaError::NoDevice`] rather than panicking when there
-//! is no driver, no device, or no NVRTC; `sitk-registration`'s CUDA backend
-//! turns any such failure into a silent fall back to its CPU path. A machine
-//! with no GPU runs the same code and gets the same answers.
+//! `sitk-filters` calls only the fallback form, so no GPU condition can turn a
+//! working CPU call into a failure.
 //!
 //! # Feature gate
 //!
@@ -45,8 +28,44 @@ mod backend;
 mod buffer;
 mod error;
 mod ops;
+mod pinned;
 
 pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
+pub use ops::rescale_intensity::{
+    rescale_intensity_gpu, rescale_intensity_gpu_into, try_rescale_intensity,
+};
+pub use pinned::PinnedBuffer;
+
+/// Wall-clock split of one GPU op, in milliseconds.
+///
+/// Measured with a stream synchronize between phases, so `kernel_ms` excludes
+/// transfer time rather than hiding behind it. For a per-pixel op the transfer
+/// terms dominate; reporting them separately is the point.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuTimings {
+    /// Host-to-device copy of the input buffer.
+    pub h2d_ms: f64,
+    /// Preparing the output allocation so the D2H does not fault under the DMA
+    /// (see [`sitk_core::alloc::resident_vec`]).
+    ///
+    /// This is a *host* cost, and it is broken out rather than folded into
+    /// `d2h_ms` because folding it there is precisely the mistake that made a
+    /// page-fault storm look like a slow PCIe link.
+    pub alloc_ms: f64,
+    /// All kernel launches (for `rescale_intensity`: the min/max reduction and
+    /// the map), synchronized.
+    pub kernel_ms: f64,
+    /// Device-to-host copy of the output buffer into an already-resident
+    /// destination — the DMA alone, at link speed.
+    pub d2h_ms: f64,
+}
+
+impl GpuTimings {
+    /// Sum of the four phases: the op's whole wall-clock cost.
+    pub fn total_ms(&self) -> f64 {
+        self.h2d_ms + self.alloc_ms + self.kernel_ms + self.d2h_ms
+    }
+}

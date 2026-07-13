@@ -1,5 +1,6 @@
 use cudarc::driver::DriverError;
 use cudarc::nvrtc::CompileError;
+use sitk_core::PixelId;
 use thiserror::Error;
 
 /// Every way a GPU op can decline to produce a result.
@@ -23,10 +24,21 @@ pub enum CudaError {
     #[error("CUDA driver error: {0}")]
     Driver(#[from] DriverError),
 
-    /// The op's input is degenerate on its own terms: an empty sample set, a
-    /// moving image that is not 3-D, or geometry the kernel cannot represent.
+    /// The op has no GPU kernel for this pixel type. The CPU path supports
+    /// every scalar type; the GPU path currently supports `Float32`.
+    #[error("no CUDA kernel for pixel type {0:?}")]
+    UnsupportedPixelType(PixelId),
+
+    /// The op's input is degenerate on its own terms (for
+    /// `rescale_intensity`: an empty image, or one whose min equals its max).
     /// The CPU path defines the error the user sees, so the GPU path declines
     /// and lets it.
     #[error("degenerate input; deferring to the CPU implementation")]
     DegenerateInput,
+
+    /// The image is a vector/complex image, or its buffer does not match its
+    /// declared pixel type — `sitk_core` already names this precisely, so
+    /// carry its message rather than reclassifying it.
+    #[error("image is not a scalar image of the expected type: {0}")]
+    NotScalar(#[from] sitk_core::Error),
 }
