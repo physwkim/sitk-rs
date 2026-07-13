@@ -28,6 +28,7 @@ mod backend;
 mod buffer;
 mod error;
 mod image;
+mod mask;
 mod ops;
 mod pinned;
 
@@ -35,10 +36,11 @@ pub use backend::{Backend, backend};
 pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use image::{DeviceImage, Geometry};
+pub use mask::DeviceMask;
 pub use ops::device::rescale_intensity;
 pub use ops::gaussian::smooth_gaussian;
 pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
-pub use ops::pyramid::{recursive_gaussian, resample_linear, shrink};
+pub use ops::pyramid::{recursive_gaussian, resample_linear, resample_nearest, shrink};
 pub use ops::rescale_intensity::{
     rescale_intensity_gpu, rescale_intensity_gpu_into, rescale_intensity_resident,
     try_rescale_intensity,

@@ -158,6 +158,163 @@ fn the_device_resample_is_bit_identical_to_the_host_filter() {
     }
 }
 
+/// The nearest-neighbour resample, pinned **before** it is wired to anything.
+///
+/// A mask's values are 0 and 1, so an arithmetic error in this op is invisible in
+/// the values it produces — the failure is entirely in the index arithmetic, and it
+/// surfaces only later, as a metric valid-sample count that differs by a shell of
+/// boundary voxels. So this pins the op directly, and against a **textured** volume
+/// as well as a binary one: on a smooth volume an off-by-one index changes the
+/// value and is caught, where on a 0/1 mask it usually would not be.
+///
+/// The third grid is the one that matters. It is offset by exactly **half a voxel**,
+/// so every continuous index is an exact half-integer — the tie. Round-half-to-even
+/// (`rint`) would answer differently from ITK's `RoundHalfIntegerUp` at every single
+/// sample of it, and no other grid in this file would notice.
+#[test]
+fn the_device_nearest_resample_is_bit_identical_to_the_host_filter() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let img = volume(48);
+
+    // A binary mask on the same grid — the payload this op exists for.
+    let mask = {
+        let n = img.size()[0];
+        let mut v = vec![0.0f32; n * n * n];
+        for (s, x) in v.iter_mut().enumerate() {
+            let (i, j, k) = (s % n, (s / n) % n, s / (n * n));
+            let c = n as f64 / 2.0;
+            let r =
+                ((i as f64 - c).powi(2) + (j as f64 - c).powi(2) + (k as f64 - c).powi(2)).sqrt();
+            *x = if r < 0.3 * n as f64 { 1.0 } else { 0.0 };
+        }
+        let mut m = Image::from_vec(&[n, n, n], v).unwrap();
+        m.set_spacing(img.spacing()).unwrap();
+        m.set_origin(img.origin()).unwrap();
+        m.set_direction(img.direction()).unwrap();
+        m
+    };
+
+    // The grid whose every sample lands on a half-integer continuous index.
+    let half_voxel = {
+        let mut g = img.clone();
+        let o: Vec<f64> = img
+            .origin()
+            .iter()
+            .zip(img.spacing().iter())
+            .map(|(&o, &sp)| o + 0.5 * sp)
+            .collect();
+        g.set_origin(&o).unwrap();
+        g
+    };
+
+    let grids = [
+        (
+            "shrink [1,1,1]",
+            sitk_filters::shrink(&img, &[1, 1, 1]).unwrap(),
+        ),
+        (
+            "shrink [2,2,2]",
+            sitk_filters::shrink(&img, &[2, 2, 2]).unwrap(),
+        ),
+        (
+            "shrink [3,5,7]",
+            sitk_filters::shrink(&img, &[3, 5, 7]).unwrap(),
+        ),
+        ("half-voxel offset (every index is a tie)", half_voxel),
+    ];
+
+    for (name, grid) in &grids {
+        for (payload, src) in [("textured", &img), ("binary mask", &mask)] {
+            let mut resampler = ResampleImageFilter::new();
+            resampler
+                .set_reference_image(grid)
+                .set_interpolator(Interpolator::NearestNeighbor)
+                .set_default_pixel_value(0.0);
+            let host = resampler
+                .execute(src, &AffineTransform::identity(3))
+                .expect("host nearest resample");
+
+            let device = sitk_cuda::resample_nearest(
+                &DeviceImage::upload(src).unwrap(),
+                &Geometry::of(grid),
+                0.0,
+            )
+            .expect("device nearest resample")
+            .to_host()
+            .unwrap();
+
+            assert_bit_identical(&host, &device, &format!("nearest {payload} onto {name}"));
+        }
+    }
+}
+
+/// Nearest and linear are different operations, and the device keeps them apart:
+/// they agree only where every sample lands exactly on an input voxel.
+#[test]
+fn the_device_nearest_and_linear_resamples_are_different_operations() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let img = volume(48);
+    let src = DeviceImage::upload(&img).unwrap();
+
+    // On the image's own grid every sample is a voxel center: the two agree.
+    let same = Geometry::of(&img);
+    let nn = sitk_cuda::resample_nearest(&src, &same, 0.0)
+        .unwrap()
+        .to_host()
+        .unwrap();
+    let lin = sitk_cuda::resample_linear(&src, &same, 0.0)
+        .unwrap()
+        .to_host()
+        .unwrap();
+    assert_bit_identical(&nn, &lin, "nearest vs linear on the identity grid");
+
+    // Half a voxel off, the linear resample interpolates and the nearest one picks:
+    // they must disagree almost everywhere.
+    let mut shifted = img.clone();
+    let o: Vec<f64> = img
+        .origin()
+        .iter()
+        .zip(img.spacing().iter())
+        .map(|(&o, &sp)| o + 0.5 * sp)
+        .collect();
+    shifted.set_origin(&o).unwrap();
+    let g = Geometry::of(&shifted);
+    let nn = sitk_cuda::resample_nearest(&src, &g, 0.0)
+        .unwrap()
+        .to_host()
+        .unwrap();
+    let lin = sitk_cuda::resample_linear(&src, &g, 0.0)
+        .unwrap()
+        .to_host()
+        .unwrap();
+    let (a, b) = (
+        nn.scalar_slice::<f32>().unwrap(),
+        lin.scalar_slice::<f32>().unwrap(),
+    );
+    let differ = a
+        .iter()
+        .zip(b.iter())
+        .filter(|&(&x, &y)| x.to_bits() != y.to_bits())
+        .count();
+    println!(
+        "half-voxel grid: nearest and linear differ at {differ}/{} voxels",
+        a.len()
+    );
+    assert!(
+        differ * 2 > a.len(),
+        "nearest and linear agreed at {}/{} voxels on a half-voxel grid; one of them \
+         is not doing what its name says",
+        a.len() - differ,
+        a.len()
+    );
+}
+
 /// The two ops are **not** interchangeable, and the device keeps them apart. They
 /// agree at factor 1 (every output voxel sits exactly on an input voxel) and
 /// disagree everywhere at factor 2 (the coarse voxel centers fall between input

@@ -12,8 +12,8 @@
 #![cfg(feature = "cuda")]
 
 use sitk_core::Image;
-use sitk_cuda::{CudaError, DeviceImage};
-use sitk_registration::metric::{FixedSamples, MovingImage};
+use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
+use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
 use sitk_registration::{
     CpuBackend, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
     ImageRegistrationMethod, MeanSquaresMetric,
@@ -185,6 +185,153 @@ fn a_metric_built_from_device_images_matches_the_cpu_metric() {
         cpu.derivative.iter().any(|d| d.abs() > 1e-6),
         "the CPU derivative is ~zero here, so the comparison proves nothing"
     );
+}
+
+/// A **half-volume mask**: an ellipsoid centred off-axis, so it drops samples both at
+/// the grid's border and in its interior and is not reproducible by any stride mistake.
+fn ellipsoid_mask(n: usize) -> Image {
+    let c = n as f64 / 2.0;
+    let v: Vec<f32> = (0..n * n * n)
+        .map(|s| {
+            let (i, j, k) = (s % n, (s / n) % n, s / (n * n));
+            let (x, y, z) = (
+                (i as f64 - c + 4.0) / (0.42 * n as f64),
+                (j as f64 - c - 3.0) / (0.34 * n as f64),
+                (k as f64 - c + 2.0) / (0.38 * n as f64),
+            );
+            f32::from(u8::from(x * x + y * y + z * z <= 1.0))
+        })
+        .collect();
+    let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+    img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+    img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+    img
+}
+
+/// A **masked** device metric against the **masked** host metric.
+///
+/// The host drops a masked-out voxel from `FixedSamples` — it never becomes a sample.
+/// The device keeps the full grid and skips the voxel inside the kernel's grid-stride
+/// loop. Those are the same set of terms, so the two must agree on the **valid-point
+/// count exactly** (this is what would catch an off-by-one in the flat index, or a mask
+/// read with the moving image's strides), and on value and derivative to the same
+/// **1e-9 relative** reduction-rounding band the unmasked path lives in — nothing here
+/// changes the arithmetic of a surviving term.
+///
+/// Bit-identity to the host is *not* claimed and never was: the host sums the surviving
+/// terms left to right and the device reduces them in a fixed tree.
+#[test]
+fn a_masked_device_metric_matches_the_masked_host_metric() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let mask = ellipsoid_mask(n);
+    let t = probe_transform(n);
+
+    let kept = mask
+        .scalar_slice::<f32>()
+        .unwrap()
+        .iter()
+        .filter(|&&v| v != 0.0)
+        .count();
+    assert!(
+        kept > 0 && kept < n * n * n,
+        "the mask must drop some voxels and keep some; kept {kept} of {}",
+        n * n * n
+    );
+
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image_with(&fixed, SamplingStrategy::None, 1.0, 0, Some(&mask)).unwrap(),
+        MovingImage::from_image(&moving).unwrap(),
+    )
+    .unwrap();
+    let cpu = host.evaluate(&t, &CpuBackend);
+
+    let d_fixed = DeviceImage::upload(&fixed).unwrap();
+    let d_moving = DeviceImage::upload(&moving).unwrap();
+    let d_mask = DeviceMask::upload(&mask).unwrap();
+    let device =
+        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask)).unwrap();
+    let gpu = device.evaluate(&t).unwrap();
+
+    // The mask drops samples inside the walk; it does not shrink the grid.
+    assert_eq!(device.sample_count(), n * n * n);
+    assert_eq!(
+        gpu.valid_points, cpu.valid_points,
+        "the masked device metric walked a different valid-sample set than the host"
+    );
+    assert!(
+        cpu.valid_points > 0 && cpu.valid_points <= kept,
+        "valid points {} against {kept} masked-in voxels",
+        cpu.valid_points
+    );
+
+    let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+    let v_err = rel(gpu.value, cpu.value);
+    let d_err = gpu
+        .derivative
+        .iter()
+        .zip(cpu.derivative.iter())
+        .map(|(&g, &c)| rel(g, c))
+        .fold(0.0f64, f64::max);
+    println!(
+        "masked: valid_points {} of {kept} masked-in | value rel err {v_err:e} | \
+         derivative rel err {d_err:e}",
+        cpu.valid_points
+    );
+    assert!(v_err <= 1e-9, "value rel err {v_err:e} exceeds 1e-9");
+    assert!(d_err <= 1e-9, "derivative rel err {d_err:e} exceeds 1e-9");
+    assert!(
+        cpu.derivative.iter().any(|d| d.abs() > 1e-6),
+        "the CPU derivative is ~zero here, so the comparison proves nothing"
+    );
+}
+
+/// The mask has to *do* something: the masked metric must differ from the unmasked one
+/// on the same volumes. Without this, a mask silently ignored by the kernel would pass
+/// every agreement test above by matching a host metric that was also ignoring it.
+#[test]
+fn a_mask_changes_the_answer() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let t = probe_transform(n);
+    let d_fixed = DeviceImage::upload(&fixed).unwrap();
+    let d_moving = DeviceImage::upload(&moving).unwrap();
+    let d_mask = DeviceMask::upload(&ellipsoid_mask(n)).unwrap();
+
+    let unmasked = DeviceMeanSquaresMetric::from_device(&d_fixed, &d_moving)
+        .unwrap()
+        .evaluate(&t)
+        .unwrap();
+    let masked =
+        DeviceMeanSquaresMetric::from_device_masked(&d_fixed, &d_moving, Some(&d_mask)).unwrap();
+    let first = masked.evaluate(&t).unwrap();
+
+    assert!(
+        first.valid_points < unmasked.valid_points,
+        "the mask dropped no samples: {} vs {}",
+        first.valid_points,
+        unmasked.valid_points
+    );
+    assert!(
+        (first.value - unmasked.value).abs() > 1e-6,
+        "the mask did not change the value"
+    );
+
+    // ...and it is still deterministic: the same metric, evaluated again, is bit-identical.
+    let again = masked.evaluate(&t).unwrap();
+    assert_eq!(again.value.to_bits(), first.value.to_bits());
+    assert_eq!(again.valid_points, first.valid_points);
+    for (a, b) in again.derivative.iter().zip(first.derivative.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "a masked derivative moved");
+    }
 }
 
 /// The whole chain, with the host absent from the middle: upload both volumes once,
@@ -590,6 +737,60 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         ))
     ));
     println!("five refusals, each by name, all before the first iteration");
+}
+
+/// The boundary refuses a sampling **strategy**, not a sampling **percentage**.
+///
+/// `SamplingStrategy::None` samples every voxel and ignores the percentage — the
+/// `None` arm of `FixedSamples::from_image_with` never reads it — so a percentage
+/// set under the default strategy changes nothing on the host. The boundary used to
+/// refuse it anyway, sending the caller to the CPU for a run this path computes
+/// voxel for voxel. Nothing caught that, so this does: the run must be *taken*, and
+/// it must land where the host lands.
+#[test]
+fn a_sampling_percentage_under_the_default_strategy_does_not_lose_the_device_path() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 32;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-5, 50, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+    // The strategy stays at its default (`None`); only the percentage is set.
+    reg.set_metric_sampling_percentage(0.25, 7);
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .expect("a percentage the host itself ignores must not cost the device path");
+
+    // Every voxel is a sample on both paths — the percentage changed nothing, which
+    // is the whole point.
+    assert_eq!(
+        host.valid_points, device.valid_points,
+        "the percentage was honored by one path and ignored by the other"
+    );
+    assert_eq!(host.iterations, device.iterations);
+
+    let worst = device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .map(|(&d, &h)| (d - h).abs() / (1.0 + h.abs()))
+        .fold(0.0f64, f64::max);
+    println!("worst parameter disagreement: {worst:e}");
+    assert!(worst <= 1e-9, "worst {worst:e}");
 }
 
 /// **The guarantee**, pinned: the device metric is the *same objective* as the host

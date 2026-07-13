@@ -94,10 +94,26 @@ pub enum DeviceRegistrationError {
     #[error("building a resolution level on the device failed: {0}")]
     Pyramid(#[source] CudaError),
 
-    /// The device metric samples the fixed image's own grid.
+    /// A virtual domain or a fixed-initial transform needs a **mask** the device
+    /// metric does not have — this is [`UnsupportedMask`](Self::UnsupportedMask)
+    /// under another name.
+    ///
+    /// Not a grid limitation: `sitk_cuda::resample_linear` takes an arbitrary
+    /// geometry and `DeviceImage::with_geometry` builds one, so a device metric can
+    /// be built on a virtual grid — that is how the device pyramid's coarse levels
+    /// are made. What blocks it is the *in-buffer predicate*: whenever a virtual
+    /// domain or a fixed-initial transform is configured, the host's `prepare_level`
+    /// resamples an all-ones image over the fixed grid to learn which virtual points
+    /// map inside the fixed buffer at all, and folds that predicate into the level's
+    /// fixed mask. A virtual point outside the buffer is *not a sample*, and a
+    /// [`DeviceImage`] carries no mask with which to drop it.
+    ///
+    /// So device mask support closes this refusal and
+    /// [`UnsupportedMask`](Self::UnsupportedMask) together — one capability, two
+    /// refusals, and the highest-leverage gap left in this boundary.
     #[error(
-        "the device metric samples the fixed image's grid; a virtual domain or a \
-             fixed-initial transform is host-only"
+        "a virtual domain or a fixed-initial transform needs a fixed mask (the \
+             in-buffer predicate), and the device metric has no mask support"
     )]
     UnsupportedVirtualDomain,
 
@@ -143,6 +159,29 @@ impl DeviceMeanSquaresMetric {
         fixed: &DeviceImage,
         moving: &DeviceImage,
     ) -> Result<Self, DeviceMetricError> {
+        Self::from_device_masked(fixed, moving, None)
+    }
+
+    /// [`from_device`](Self::from_device) with a **fixed mask** on the fixed image's
+    /// grid: a sample whose mask voxel is zero is not a sample, exactly as on the
+    /// host, where a zero voxel of the fixed mask drops that sample from
+    /// `FixedSamples`.
+    ///
+    /// The mask does not change how the reduction is performed. A masked-out sample
+    /// is skipped in the kernel's grid-stride loop, and the reduction tree is a
+    /// function of the block/grid shape and the *voxel count* — never of how many
+    /// samples survived. Skipping a term removes it; it does not reorder the terms
+    /// that remain, and `is_inside` has always skipped samples this way. So the
+    /// valid-point count stays exactly equal to the host's, and value and derivative
+    /// stay within the reduction-rounding band the unmasked path already lives in.
+    ///
+    /// The mask must be on the fixed image's grid (same voxel count), or
+    /// [`DeviceMetricError::Cuda`] carrying `CudaError::DegenerateInput`.
+    pub fn from_device_masked(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceMask>,
+    ) -> Result<Self, DeviceMetricError> {
         let f = fixed.geometry();
         let m = moving.geometry();
         if f.dimension() != sitk_cuda::DIM {
@@ -177,7 +216,8 @@ impl DeviceMeanSquaresMetric {
             idx_to_phys: &idx_to_phys,
         };
 
-        let resident = ResidentMetric::from_device(fixed, points, moving, &geom)?;
+        let resident =
+            ResidentMetric::from_device_masked(fixed, points, fixed_mask, moving, &geom)?;
         Ok(Self {
             resident: Mutex::new(resident),
             grid: VirtualGrid::new(dim, f.size.clone(), f.origin.clone(), idx_to_phys),
@@ -186,7 +226,6 @@ impl DeviceMeanSquaresMetric {
         })
     }
 
-    /// Number of fixed samples — every voxel of the fixed image.
     /// Device bytes held by the fixed and moving volumes.
     pub fn volume_bytes(&self) -> usize {
         self.resident
@@ -195,6 +234,9 @@ impl DeviceMeanSquaresMetric {
             .volume_bytes()
     }
 
+    /// Number of fixed samples the kernel walks — every voxel of the fixed grid,
+    /// masked or not. A mask drops samples *inside* the walk (they never become
+    /// valid points); it does not shrink the grid, so this count is unchanged by one.
     pub fn sample_count(&self) -> usize {
         self.lock().sample_count()
     }
