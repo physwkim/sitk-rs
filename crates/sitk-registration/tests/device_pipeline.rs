@@ -1683,3 +1683,168 @@ fn a_fixed_initial_transform_converges_where_execute_converges() {
         );
     }
 }
+
+/// The same volume in `Float64` — `volume`'s values before the `as f32`, so the two
+/// are the identical numbers and one is exactly the other's narrowing.
+fn volume_f64(n: usize, shift: [f64; 3]) -> Image {
+    let c = n as f64 / 2.0;
+    let mut v = Vec::with_capacity(n * n * n);
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let (x, y, z) = (
+                    i as f64 - c + shift[0],
+                    j as f64 - c + shift[1],
+                    k as f64 - c + shift[2],
+                );
+                let d2 = x * x + y * y + z * z;
+                v.push(
+                    120.0 * (-d2 / (2.0 * (n as f64 / 5.0).powi(2))).exp()
+                        + 10.0 * (x / 7.0).sin() * (y / 9.0).cos() * (z / 11.0).sin(),
+                );
+            }
+        }
+    }
+    let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+    img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+    img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+    img
+}
+
+/// **S0: what the device's `f32` payload costs a `Float64` registration.**
+///
+/// `DeviceImage` holds one `f32` per voxel (`image.rs`), so uploading a `Float64`
+/// image narrows it. That has been on the UNFIXED list every round, asserted and never
+/// priced. This prices it, and it attributes the price rather than just observing it:
+///
+/// - `h64` vs `d64` — the number a caller actually feels: host `Float64` registration
+///   against device `Float64` registration.
+/// - `h64` vs `h32` — the narrowing **alone**, host on both sides, no GPU in it.
+/// - `d64` vs `d32` — the device's cast against the host's. `volume` is `volume_f64`
+///   with `as f32` applied, so if `DeviceImage`'s on-device cast rounds the way Rust's
+///   does, these two runs are the *same run* and every parameter is bit-identical.
+///
+/// The yardstick is D4's band: host and device already part company by up to 2.4e-5
+/// relative on a converged run, because the device's reduction order meets
+/// `RegularStepGradientDescentOptimizer`'s halve-on-overshoot branch. A narrowing cost
+/// below that is invisible under a difference we already cannot remove.
+#[test]
+fn what_the_f32_payload_costs_a_float64_registration() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (f64_fixed, f64_moving) = (volume_f64(n, [0.0; 3]), volume_f64(n, [3.0, -2.0, 1.5]));
+    let (f32_fixed, f32_moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    assert_eq!(f64_fixed.pixel_id(), sitk_core::PixelId::Float64);
+    assert_eq!(f32_fixed.pixel_id(), sitk_core::PixelId::Float32);
+
+    let d64 = (
+        DeviceImage::upload(&f64_fixed).unwrap(),
+        DeviceImage::upload(&f64_moving).unwrap(),
+    );
+    let d32 = (
+        DeviceImage::upload(&f32_fixed).unwrap(),
+        DeviceImage::upload(&f32_moving).unwrap(),
+    );
+
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+    let build = |with_transform: bool| {
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares();
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+        if with_transform {
+            reg.set_fixed_initial_transform(sitk_transform::Transform::Euler3D(
+                Euler3DTransform::new(0.12, -0.08, 0.30, [5.0, -4.0, 3.0], [0.0, 0.0, 0.0]),
+            ));
+        }
+        reg
+    };
+
+    // Relative parameter distance, the same measure D4's band is quoted in.
+    let pose_delta = |a: &Euler3DTransform, b: &Euler3DTransform| -> f64 {
+        a.parameters()
+            .iter()
+            .zip(b.parameters().iter())
+            .map(|(&x, &y)| (x - y).abs() / (1.0 + y.abs()))
+            .fold(0.0f64, f64::max)
+    };
+
+    for with_transform in [false, true] {
+        let what = if with_transform {
+            "with a fixed-initial Euler3D"
+        } else {
+            "plain"
+        };
+        let reg = build(with_transform);
+
+        let h64 = reg.execute(&f64_fixed, &f64_moving, initial()).unwrap();
+        let h32 = reg.execute(&f32_fixed, &f32_moving, initial()).unwrap();
+        let r64 = reg.execute_on_device(&d64.0, &d64.1, initial()).unwrap();
+        let r32 = reg.execute_on_device(&d32.0, &d32.1, initial()).unwrap();
+
+        let host_vs_device = pose_delta(&r64.transform, &h64.transform);
+        let narrowing_only = pose_delta(&h32.transform, &h64.transform);
+        let cast_agrees = pose_delta(&r64.transform, &r32.transform);
+
+        println!(
+            "{what}:\n  host f64 vs device f64 : pose {host_vs_device:e}  metric {:e} vs {:e}\n  \
+             host f64 vs host f32   : pose {narrowing_only:e}  (the narrowing alone, no GPU)\n  \
+             device f64 vs device f32: pose {cast_agrees:e}  (the device's cast vs the host's)\n  \
+             D4's band               : 2.4e-5",
+            r64.metric_value, h64.metric_value
+        );
+
+        // The device's on-device `Float64 → f32` cast is the host's `as f32`: same
+        // rounding, so uploading the wide image and uploading the narrowed image give
+        // the *same* device run, parameter for parameter. This is what lets the two
+        // measurements above be *attributed* rather than merely observed.
+        for (k, (&a, &b)) in r64
+            .transform
+            .parameters()
+            .iter()
+            .zip(r32.transform.parameters().iter())
+            .enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{what}, param {k}: uploading the Float64 image ({a:e}) and uploading its \
+                 narrowed self ({b:e}) gave different device runs — the device's cast is not \
+                 the host's"
+            );
+        }
+    }
+
+    // The attribution, as an assertion rather than a printout. On the plain
+    // configuration the device and the host agree to 5e-14 on identical `Float32`
+    // inputs (measured in D4), so if the whole `Float64` delta is the narrowing and
+    // none of it is the GPU, then the device's `Float64` run must land on the *host's
+    // Float32* run to that same order — which is what this checks. It failed at 6e-10
+    // against the host's `Float64` run, and passes at 1e-11 against its `Float32` one.
+    let reg = build(false);
+    let h32 = reg.execute(&f32_fixed, &f32_moving, initial()).unwrap();
+    let r64 = reg.execute_on_device(&d64.0, &d64.1, initial()).unwrap();
+    let attributed = pose_delta(&r64.transform, &h32.transform);
+    assert!(
+        attributed <= 1e-11,
+        "the device's Float64 run is {attributed:e} from the host's Float32 run — the \
+         narrowing does not account for the whole difference and something else moved"
+    );
+
+    // The price, as a regression guard: narrowing a `Float64` pair costs this much pose,
+    // measured on the configuration where the optimizer is *not* amplifying (host and
+    // device agree to 5e-14 there on identical inputs). 6.3e-10 measured; the guard is
+    // an order and a half above it and four orders below D4's band.
+    let reg = build(false);
+    let h64 = reg.execute(&f64_fixed, &f64_moving, initial()).unwrap();
+    let narrowing = pose_delta(&h32.transform, &h64.transform);
+    assert!(
+        narrowing <= 1e-8,
+        "narrowing a Float64 registration to f32 now costs {narrowing:e} of pose, up from \
+         the 6.3e-10 this limit was priced at"
+    );
+    println!("PRICED: the f32 payload costs {narrowing:e} of pose on a Float64 pair");
+}
