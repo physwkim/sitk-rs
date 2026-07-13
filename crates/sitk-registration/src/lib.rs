@@ -157,7 +157,7 @@ pub use correlation::CorrelationMetric;
 pub use cuda::CudaMetricBackend;
 pub use demons::DemonsMetric;
 #[cfg(feature = "cuda")]
-pub use device::{DeviceMeanSquaresMetric, DeviceMetricError};
+pub use device::{DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError};
 pub use error::{RegistrationError, Result};
 pub use gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,

@@ -151,7 +151,7 @@ fn main() {
         let df = device_chain(&fixed, &mut dev_stage);
         let dm = device_chain(&moving, &mut dev_stage);
         let t = Instant::now();
-        let mut dev_metric = DeviceMeanSquaresMetric::from_device(&df, &dm).unwrap();
+        let dev_metric = DeviceMeanSquaresMetric::from_device(&df, &dm).unwrap();
         let dev_setup = ms(t);
         let t = Instant::now();
         for _ in 0..ITERS {

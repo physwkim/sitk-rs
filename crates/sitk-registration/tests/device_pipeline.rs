@@ -15,7 +15,8 @@ use sitk_core::{Image, PixelId};
 use sitk_cuda::{CudaError, DeviceImage};
 use sitk_registration::metric::{FixedSamples, MovingImage};
 use sitk_registration::{
-    CpuBackend, DeviceMeanSquaresMetric, DeviceMetricError, MeanSquaresMetric,
+    CpuBackend, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
+    ImageRegistrationMethod, MeanSquaresMetric,
 };
 use sitk_transform::{BSplineTransform, Euler3DTransform, ParametricTransform};
 
@@ -171,7 +172,7 @@ fn a_metric_built_from_device_images_matches_the_cpu_metric() {
 
     let d_fixed = DeviceImage::upload(&fixed).unwrap();
     let d_moving = DeviceImage::upload(&moving).unwrap();
-    let mut device = DeviceMeanSquaresMetric::from_device(&d_fixed, &d_moving).unwrap();
+    let device = DeviceMeanSquaresMetric::from_device(&d_fixed, &d_moving).unwrap();
     let gpu = device.evaluate(&t).unwrap();
 
     assert_eq!(device.sample_count(), n * n * n);
@@ -228,7 +229,7 @@ fn the_resident_chain_agrees_with_the_host_chain() {
     let d_m =
         sitk_cuda::rescale_intensity(&DeviceImage::upload(&moving).unwrap(), OUT_MIN, OUT_MAX)
             .unwrap();
-    let mut device = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+    let device = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
     let gpu = device.evaluate(&t).unwrap();
 
     let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
@@ -281,7 +282,7 @@ fn the_device_metric_is_bit_identical_run_to_run() {
     for run in 1..6 {
         let d_f = DeviceImage::upload(&fixed).unwrap();
         let d_m = DeviceImage::upload(&moving).unwrap();
-        let mut metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+        let metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
         assert_eq!(
             bits(&metric.evaluate(&t).unwrap()),
             first,
@@ -307,7 +308,7 @@ fn a_non_affine_transform_is_refused_by_name() {
     let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
     let d_f = DeviceImage::upload(&fixed).unwrap();
     let d_m = DeviceImage::upload(&moving).unwrap();
-    let mut metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+    let metric = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
 
     let mut t = BSplineTransform::new(
         3,
@@ -437,7 +438,7 @@ fn the_full_resident_pipeline_agrees_with_the_host_pipeline() {
     };
     let d_f = device_chain(&fixed);
     let d_m = device_chain(&moving);
-    let mut device = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+    let device = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
     let gpu = device.evaluate(&t).unwrap();
 
     let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
@@ -453,4 +454,152 @@ fn the_full_resident_pipeline_agrees_with_the_host_pipeline() {
     assert!(v_err <= 1e-9, "value rel err {v_err:e} exceeds 1e-9");
     assert!(d_err <= 1e-9, "derivative rel err {d_err:e} exceeds 1e-9");
     assert!(cpu.derivative.iter().any(|d| d.abs() > 1e-6));
+}
+
+/// The optimizer drives the device metric through the **public API**, and lands
+/// where the host `execute` lands.
+///
+/// This is the number that matters: `execute_on_device` runs the same optimizer,
+/// the same scales estimator and the same convergence test as `execute` — it is
+/// literally the same driver — so agreement here says the device metric steers the
+/// feedback loop the same way, not merely that one evaluation agrees.
+#[test]
+fn execute_on_device_lands_where_execute_lands() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .unwrap();
+
+    println!(
+        "host   : {} iters, metric {:.9}, params {:?}",
+        host.iterations,
+        host.metric_value,
+        host.transform.parameters()
+    );
+    println!(
+        "device : {} iters, metric {:.9}, params {:?}",
+        device.iterations,
+        device.metric_value,
+        device.transform.parameters()
+    );
+    assert_eq!(
+        device.iterations, host.iterations,
+        "the two runs took different paths through the optimizer"
+    );
+    assert_eq!(device.valid_points, host.valid_points);
+    for (k, (&d, &h)) in device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .enumerate()
+    {
+        let rel = (d - h).abs() / (1.0 + h.abs());
+        assert!(
+            rel <= 1e-6,
+            "param {k}: device {d:e} vs host {h:e} (rel {rel:e}) — the device metric steered \
+             the optimizer somewhere else"
+        );
+    }
+}
+
+/// Every condition the device path cannot take is refused **at the boundary, by
+/// name**, before the first iteration — so the caller can run the host method
+/// instead. This is the fallback, and it is the only one: nothing inside the
+/// optimizer loop asks where the metric lives.
+#[test]
+fn the_device_entry_point_refuses_at_the_boundary_by_name() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 32;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let euler = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    let run = |reg: &ImageRegistrationMethod| reg.execute_on_device(&d_f, &d_m, euler());
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mattes_mutual_information(32);
+    assert!(matches!(
+        run(&reg),
+        Err(DeviceRegistrationError::UnsupportedMetric)
+    ));
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_interpolator(sitk_transform::Interpolator::BSpline);
+    assert!(matches!(
+        run(&reg),
+        Err(DeviceRegistrationError::UnsupportedInterpolator(_))
+    ));
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_sampling_strategy(sitk_registration::metric::SamplingStrategy::Random);
+    reg.set_metric_sampling_percentage(0.2, 7);
+    assert!(matches!(
+        run(&reg),
+        Err(DeviceRegistrationError::UnsupportedSampling)
+    ));
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_fixed_mask(&fixed);
+    assert!(matches!(
+        run(&reg),
+        Err(DeviceRegistrationError::UnsupportedMask)
+    ));
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_shrink_factors_per_level(vec![2, 1]);
+    reg.set_smoothing_sigmas_per_level(vec![1.0, 0.0]);
+    assert!(matches!(
+        run(&reg),
+        Err(DeviceRegistrationError::UnsupportedPyramid)
+    ));
+
+    // And a transform the moment identity does not cover: refused before the run,
+    // carrying the metric's own named error rather than a generic failure.
+    let reg = ImageRegistrationMethod::new();
+    let mut bs = BSplineTransform::new(
+        3,
+        &[0.0, 0.0, 0.0],
+        &[n as f64, n as f64, n as f64],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        &[4, 4, 4],
+    )
+    .unwrap();
+    let np = bs.number_of_parameters();
+    bs.set_parameters(
+        &(0..np)
+            .map(|k| ((k as f64) * 0.7).sin())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(matches!(
+        reg.execute_on_device(&d_f, &d_m, bs),
+        Err(DeviceRegistrationError::Metric(
+            DeviceMetricError::NonAffineTransform
+        ))
+    ));
+    println!("six refusals, each by name, all before the first iteration");
 }
