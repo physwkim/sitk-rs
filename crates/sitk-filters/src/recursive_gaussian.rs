@@ -145,27 +145,61 @@ pub(crate) fn recursive_gaussian_f64(
     normalize_across_scale: bool,
 ) -> Result<Vec<f64>> {
     let dim = img.dimension();
-    if sigma.len() != dim {
-        return Err(FilterError::DimensionLength {
-            expected: dim,
-            got: sigma.len(),
-        });
-    }
-    if orders.len() != dim {
-        return Err(FilterError::DimensionLength {
-            expected: dim,
-            got: orders.len(),
-        });
-    }
-    if sigma.iter().any(|&s| s < 0.0) {
-        return Err(FilterError::InvalidSigma(sigma.to_vec()));
-    }
+    // Validated before `to_f64_vec`, so a bad `sigma`/`orders` length still
+    // reports itself ahead of a non-scalar pixel type, exactly as it did when
+    // this function held the axis loop itself.
+    check_sigma_and_orders(dim, sigma, orders)?;
 
     let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
-    let strides = strides(&size);
     let mut buf = img.to_f64_vec()?;
+    recursive_gaussian_f64_into(
+        &mut buf,
+        &size,
+        &spacing,
+        sigma,
+        orders,
+        normalize_across_scale,
+    )?;
+    Ok(buf)
+}
 
+/// [`recursive_gaussian_f64`] run on a buffer the **caller owns** — the axis
+/// loop, and the only place it lives.
+///
+/// [`recursive_gaussian_f64`] is this function plus `to_f64_vec`: one recursion,
+/// not two that can drift.
+///
+/// It exists because the recursion is separable and a caller composes it: a
+/// gradient magnitude runs the whole `dim`-axis cascade once *per axis*, so
+/// anything the recursion allocates internally, that caller allocates `dim`
+/// times. Every one of those is a full volume — 134 MB at 256³ — and a fresh
+/// volume is not merely a `malloc`: its pages are faulted in one at a time under
+/// a kernel lock, which is why [`sitk_core::parallel::map_indexed`]'s allocating
+/// form measures a parallel efficiency of 0.09 against 0.90 for the same map
+/// writing into a buffer that already exists. Handing the recursion a `&mut
+/// [f64]` is what makes those volumes unwritable rather than merely unwise: a
+/// caller holding a slice has no way to allocate one.
+///
+/// `buf` is `size.iter().product()` elements, dimension-0-fastest, and is
+/// filtered **in place**. `spacing` is the image's, in the same axis order; the
+/// recursion reparametrizes as `sigma[d] / spacing[d]`.
+///
+/// Errors if `sigma` or `orders` has the wrong length, any `sigma` value is
+/// negative, or a filtered axis (`sigma[d] > 0`) has fewer than four pixels.
+pub(crate) fn recursive_gaussian_f64_into(
+    buf: &mut [f64],
+    size: &[usize],
+    spacing: &[f64],
+    sigma: &[f64],
+    orders: &[GaussianOrder],
+    normalize_across_scale: bool,
+) -> Result<()> {
+    let dim = size.len();
+    check_sigma_and_orders(dim, sigma, orders)?;
+    debug_assert_eq!(buf.len(), size.iter().product::<usize>());
+
+    let strides = strides(size);
     for d in 0..dim {
         if sigma[d] <= 0.0 {
             continue;
@@ -182,10 +216,31 @@ pub(crate) fn recursive_gaussian_f64(
             sigma[d],
             normalize_across_scale,
         );
-        filter_axis(&mut buf, &size, &strides, d, &coeff);
+        filter_axis(buf, size, &strides, d, &coeff);
     }
 
-    Ok(buf)
+    Ok(())
+}
+
+/// The `sigma`/`orders` shape checks both entry points above make, in the order
+/// they have always been made in.
+fn check_sigma_and_orders(dim: usize, sigma: &[f64], orders: &[GaussianOrder]) -> Result<()> {
+    if sigma.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: sigma.len(),
+        });
+    }
+    if orders.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: orders.len(),
+        });
+    }
+    if sigma.iter().any(|&s| s < 0.0) {
+        return Err(FilterError::InvalidSigma(sigma.to_vec()));
+    }
+    Ok(())
 }
 
 /// `SmoothingRecursiveGaussianImageFilter`
