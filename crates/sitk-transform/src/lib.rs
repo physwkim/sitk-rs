@@ -11,6 +11,7 @@ pub mod displacement;
 pub mod erased;
 pub mod error;
 pub mod interpolator;
+pub mod matrix_offset;
 pub mod resample;
 pub mod transform;
 pub mod transform_geometry;

@@ -459,13 +459,15 @@ pub fn shrink(src: &DeviceImage, factors: &[usize]) -> Result<DeviceImage, CudaE
 // resample (linear, identity transform)
 // ---------------------------------------------------------------------------
 
-/// `ResampleImageFilter` with `Interpolator::Linear` and the identity transform,
-/// transcribed operation for operation: `mat_vec`'s left-to-right accumulation,
-/// `is_inside`'s half-open `[-0.5, size-0.5)` test, and `linear_at`'s corner order,
-/// cumulative weight product, clamped corner index and `weight != 0.0` guard.
+/// `ResampleImageFilter` with `Interpolator::Linear`, transcribed operation for
+/// operation: `mat_vec`'s left-to-right accumulation, the transform's own
+/// `mat_vec(matrix, p) + offset`, `is_inside`'s half-open `[-0.5, size-0.5)` test,
+/// and `linear_at`'s corner order, cumulative weight product, clamped corner index
+/// and `weight != 0.0` guard.
 ///
 /// `p` packs, in order: `out_origin[3]`, `out_index_to_phys[9]`, `in_origin[3]`,
-/// `in_phys_to_index[9]`, `default_value` — 25 doubles.
+/// `in_phys_to_index[9]`, `default_value`, `map_matrix[9]`, `map_offset[3]` — 37
+/// doubles.
 const RESAMPLE: &str = r#"
 // The continuous index of output voxel `o` in the input's index space, and whether
 // it is inside the input buffer. Shared by both kernels below **on purpose**: the
@@ -492,9 +494,30 @@ __device__ __forceinline__ bool cindex_of(
         phys[r] = p[r] + acc;
     }
 
-    // cindex = M_in * (phys - in_origin)   [the transform is the identity]
+    // mapped = transform(phys) = mat_vec(map_matrix, phys) + map_offset.
+    //
+    // This is the transform `ResampleImageFilter` applies between the two affines
+    // (`resample.rs:270`), and it is applied here **unconditionally** because the
+    // host applies it unconditionally too: with no fixed-initial transform,
+    // `prepare_level` resamples through `AffineTransform::identity(dim)`, not
+    // through nothing. So the identity case packs `M = I, b = 0` and runs the same
+    // multiply the host runs — one code path, not an identity fast path that would
+    // be a second transcription to keep in step.
+    //
+    // Same accumulation as `sitk_core::matrix::mat_vec` (left to right, `acc` seeded
+    // at 0.0, offset added last) and compiled `--fmad=false`, so the bits are the
+    // host's. Every accepted transform *is* this arithmetic on its own stored fields
+    // — see `Transform::matrix_offset_map`, which refuses the ones that are not.
+    double mapped[3];
+    for (int r = 0; r < 3; ++r) {
+        double acc = 0.0;
+        for (int c = 0; c < 3; ++c) acc += p[25 + r * 3 + c] * phys[c];
+        mapped[r] = acc + p[34 + r];
+    }
+
+    // cindex = M_in * (mapped - in_origin)
     double diff[3];
-    for (int d = 0; d < 3; ++d) diff[d] = phys[d] - p[12 + d];
+    for (int d = 0; d < 3; ++d) diff[d] = mapped[d] - p[12 + d];
     for (int r = 0; r < 3; ++r) {
         double acc = 0.0;
         for (int c = 0; c < 3; ++c) acc += p[15 + r * 3 + c] * diff[c];
@@ -623,12 +646,8 @@ fn affines(geom: &Geometry) -> Option<(Vec<f64>, Vec<f64>)> {
 /// point, which for a coarse grid falls *between* input voxels. See the
 /// [module docs](self).
 ///
-/// Only the identity transform is offered, because that is the mapping the fixed
-/// image takes onto the virtual grid when no fixed-initial transform is
-/// configured — the only configuration
-/// [`execute_on_device`](https://docs.rs/sitk-registration) accepts. A resample
-/// *through* a transform is the moving image's job, and the metric kernel already
-/// does it per sample without materializing a volume.
+/// For a resample *through* a transform — a fixed-initial transform relocating the
+/// fixed image's sample points — see [`resample_linear_through`].
 ///
 /// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image or a singular
 /// direction matrix.
@@ -637,7 +656,37 @@ pub fn resample_linear(
     grid: &Geometry,
     default_value: f64,
 ) -> Result<DeviceImage, CudaError> {
-    resample(src, grid, default_value, "resample_linear3")
+    resample(src, grid, default_value, "resample_linear3", None)
+}
+
+/// [`resample_linear`], but through the point map `x ↦ mat_vec(matrix, x) + offset`
+/// — the device form of `ResampleImageFilter::execute(input, transform)`.
+///
+/// `matrix` is row-major `3×3`, `offset` has length 3, and together they must be the
+/// transform's **own** arithmetic, bit for bit: pass what
+/// `sitk_transform::Transform::matrix_offset_map` returns, and nothing else. A
+/// reconstructed affine (probing `T(0)` and `T(e_e) − T(0)`) is ~1e-12 away, which is
+/// harmless for an image and fatal for the 0/1 in-buffer predicate that rides the same
+/// resample — one ulp at the buffer border flips a shell of voxels and moves the
+/// valid-point count. That is why `matrix_offset_map` refuses `ScaleTransform` rather
+/// than folding it, and why this function takes the map instead of a transform.
+///
+/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image, a singular
+/// direction matrix, or a map that is not `3×3` + 3.
+pub fn resample_linear_through(
+    src: &DeviceImage,
+    grid: &Geometry,
+    default_value: f64,
+    matrix: &[f64],
+    offset: &[f64],
+) -> Result<DeviceImage, CudaError> {
+    resample(
+        src,
+        grid,
+        default_value,
+        "resample_linear3",
+        Some((matrix, offset)),
+    )
 }
 
 /// Resample a resident volume onto `grid` with **nearest-neighbour** interpolation
@@ -666,22 +715,72 @@ pub fn resample_nearest(
     grid: &Geometry,
     default_value: f64,
 ) -> Result<DeviceImage, CudaError> {
-    resample(src, grid, default_value, "resample_nearest3")
+    resample(src, grid, default_value, "resample_nearest3", None)
 }
 
-/// The body both resamples share: the geometry checks, the 25-double parameter
+/// [`resample_nearest`], but through the point map `x ↦ mat_vec(matrix, x) + offset`
+/// — see [`resample_linear_through`] for what the map must be, and why it must be the
+/// transform's own arithmetic rather than a reconstruction.
+///
+/// This is the one that carries the **in-buffer predicate** and the user mask through
+/// a fixed-initial transform. Its values are 0/1, so an error in the map is invisible
+/// in what it produces and shows up only as a valid-point count that differs from the
+/// host's by a shell of border voxels.
+///
+/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image, a singular
+/// direction matrix, or a map that is not `3×3` + 3.
+pub fn resample_nearest_through(
+    src: &DeviceImage,
+    grid: &Geometry,
+    default_value: f64,
+    matrix: &[f64],
+    offset: &[f64],
+) -> Result<DeviceImage, CudaError> {
+    resample(
+        src,
+        grid,
+        default_value,
+        "resample_nearest3",
+        Some((matrix, offset)),
+    )
+}
+
+/// The body both resamples share: the geometry checks, the 37-double parameter
 /// pack, the 12-`i64` size/stride pack, and the launch. Only the kernel name
 /// differs, so the two interpolators cannot drift apart in the arithmetic that
 /// decides *where* they sample — only in what they do once they are there.
+///
+/// `map` is the transform's `(matrix, offset)`, or `None` for the identity — which
+/// packs `M = I, b = 0` rather than taking a second code path, because the host's
+/// no-transform resample also runs `AffineTransform::identity(dim)` through
+/// `transform_point` (`method.rs`'s `onto_virtual`) rather than skipping it.
 fn resample(
     src: &DeviceImage,
     grid: &Geometry,
     default_value: f64,
     kernel: &str,
+    map: Option<(&[f64], &[f64])>,
 ) -> Result<DeviceImage, CudaError> {
     let in_geom = src.geometry();
     require_3d(in_geom)?;
     require_3d(grid)?;
+
+    let (map_matrix, map_offset): (Vec<f64>, Vec<f64>) = match map {
+        Some((m, b)) => {
+            if m.len() != 9 || b.len() != 3 {
+                return Err(CudaError::UnsupportedGeometry(format!(
+                    "the point map must be a 3x3 matrix and a 3-vector; got {} and {}",
+                    m.len(),
+                    b.len()
+                )));
+            }
+            (m.to_vec(), b.to_vec())
+        }
+        None => (
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            vec![0.0; 3],
+        ),
+    };
 
     let (out_fwd, _) = affines(grid).ok_or_else(|| {
         CudaError::UnsupportedGeometry("output direction matrix is singular".into())
@@ -693,12 +792,14 @@ fn resample(
     let backend: &Backend = backend()?;
     let n_out = grid.len();
 
-    let mut p: Vec<f64> = Vec::with_capacity(25);
+    let mut p: Vec<f64> = Vec::with_capacity(37);
     p.extend(grid.origin.iter().copied());
     p.extend(out_fwd.iter().copied());
     p.extend(in_geom.origin.iter().copied());
     p.extend(in_back.iter().copied());
     p.push(default_value);
+    p.extend(map_matrix.iter().copied());
+    p.extend(map_offset.iter().copied());
     let pb = DeviceBuffer::from_host(backend, &p)?;
 
     let mut packed: Vec<i64> = Vec::with_capacity(12);
@@ -719,7 +820,7 @@ fn resample(
         .arg(g.device())
         .arg(&n_i64);
     // SAFETY: five parameters, five arguments, matching in order and type. `p`
-    // holds the 25 doubles and `g` the 12 `i64`s the kernel indexes; every input
+    // holds the 37 doubles and `g` the 12 `i64`s the kernel indexes; every input
     // read is at a corner index clamped to `[0, in_size[d] - 1]` per axis, and the
     // store is guarded by `o < n_out`.
     unsafe { launch.launch(cfg(n_out))? };

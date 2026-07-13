@@ -707,17 +707,61 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedSampling)
     ));
 
-    // A fixed-initial transform: the last refusal, and the only mask-shaped one left.
-    // The fixed image and the in-buffer predicate would have to be resampled *through*
-    // it, and both device resamples go through the identity only.
+    // A fixed-initial transform is refused **per transform class**, not as a
+    // configuration: what the device needs is a point map that is bitwise
+    // `mat_vec(matrix, p) + offset` on the transform's own stored fields, because the
+    // in-buffer predicate it carries is 0/1 and one ulp at the border moves the
+    // valid-point count. `ScaleTransform` evaluates `(p - c)*s + c`, which is that map
+    // in exact arithmetic and not in the last bits, so it is refused rather than folded.
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Scale(
+        sitk_transform::ScaleTransform::new(vec![1.1, 1.0, 0.9], vec![0.0, 0.0, 0.0]),
+    ));
+    match run(&reg) {
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
+            assert_eq!(kind, sitk_transform::TransformKind::Scale);
+        }
+        other => panic!(
+            "a ScaleTransform fixed-initial transform must be refused by name: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // Composite: linear when its stages are, and still refused — folding the stages into
+    // one matrix rounds once where the transform rounds per stage.
+    let mut composite = sitk_transform::CompositeTransform::new(3);
+    composite
+        .add_transform(sitk_transform::Transform::Translation(
+            sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
+        ))
+        .unwrap();
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Composite(composite));
+    match run(&reg) {
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
+            assert_eq!(kind, sitk_transform::TransformKind::Composite);
+        }
+        other => panic!(
+            "a CompositeTransform fixed-initial transform must be refused by name: {:?}",
+            other.map(|_| ())
+        ),
+    }
+
+    // ...and the classes the device *can* reproduce bit for bit are no longer refused.
+    // A translation is one of them (`mat_vec(I, p) + t`, pinned bitwise), so it must not
+    // come back as a boundary refusal. Where it lands is pinned end to end by
+    // `a_fixed_initial_transform_lands_where_execute_lands`.
     let mut reg = ImageRegistrationMethod::new();
     reg.set_fixed_initial_transform(sitk_transform::Transform::Translation(
         sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
     ));
-    assert!(matches!(
-        run(&reg),
-        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform)
-    ));
+    assert!(
+        !matches!(
+            run(&reg),
+            Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
+        ),
+        "a TranslationTransform has a bitwise point map and must not be refused"
+    );
 
     // ...and a fixed mask is *not* refused any more — it is carried onto every level.
     //
@@ -734,7 +778,7 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             Err(DeviceRegistrationError::UnsupportedMetric
                 | DeviceRegistrationError::UnsupportedInterpolator(_)
                 | DeviceRegistrationError::UnsupportedSampling
-                | DeviceRegistrationError::UnsupportedFixedInitialTransform)
+                | DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
         ),
         "a fixed mask was refused at the boundary"
     );
@@ -1398,5 +1442,244 @@ fn the_configurations_the_boundary_now_accepts_land_where_execute_lands() {
                 "{name}, param {k}: device {d:e} vs host {h:e} (rel {rel:e})"
             );
         }
+    }
+}
+
+/// The four fixed-initial configurations the boundary now accepts: two transform
+/// classes, each bitwise-eligible by a *different* route — `Euler3D` reads a stored
+/// matrix and offset, `Translation` has neither and gets a synthesized identity matrix
+/// (`sitk_transform::matrix_offset`) — each alone and each crossed with a virtual
+/// domain, since the two compose in `prepare_level` and a device that pushed the
+/// transform through the image but not through the in-buffer predicate would still pass
+/// a transform-only test.
+fn fixed_initial_configs() -> Vec<(&'static str, sitk_transform::Transform, bool)> {
+    // A rotation about a corner plus a shift, and a pure shift: both swing a slab of
+    // the fixed image off the sample grid, so the predicate has real work to do.
+    let euler = || {
+        sitk_transform::Transform::Euler3D(Euler3DTransform::new(
+            0.12,
+            -0.08,
+            0.30,
+            [5.0, -4.0, 3.0],
+            [0.0, 0.0, 0.0],
+        ))
+    };
+    let translation = || {
+        sitk_transform::Transform::Translation(sitk_transform::TranslationTransform::new(vec![
+            9.0, -7.0, 5.0,
+        ]))
+    };
+    vec![
+        ("Euler3D", euler(), false),
+        ("Translation", translation(), false),
+        ("Euler3D + virtual domain", euler(), true),
+        ("Translation + virtual domain", translation(), true),
+    ]
+}
+
+fn virtual_domain(reg: &mut ImageRegistrationMethod) {
+    reg.set_virtual_domain(
+        vec![40, 36, 44],
+        vec![-14.0, -8.0, -12.0],
+        vec![1.4, 1.5, 1.6],
+        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    .unwrap();
+}
+
+/// **D4, the exact half: at one transform, both paths walk the same samples.**
+///
+/// This is the property the fixed-initial transform actually controls, and it is an
+/// equality, not a band: the in-buffer predicate is 0/1, so a point map that is a
+/// single ulp off flips a shell of border voxels and changes the count. Both paths are
+/// evaluated at the **same** parameters (zero optimizer steps — the transform's bits are
+/// identical on the two sides), so a difference here cannot be blamed on the optimizer;
+/// it can only mean the device sampled a different set than the host.
+///
+/// The metric value is pinned alongside the count, because a device that sampled the
+/// right *number* of points from the wrong *places* would satisfy the count alone.
+/// It is a tight band rather than an equality only because the device's reduction sums
+/// the residuals in a different order than the host's; the sampled values themselves are
+/// bit-identical (`method.rs`'s `the_device_level_is_the_host_level_through_a_fixed_initial_transform`).
+///
+/// Anti-vacuity: the transform must drop samples relative to the same run without it,
+/// or a device that ignored the fixed-initial transform entirely would agree with a
+/// host that also ignored it, and every assertion below would be empty.
+#[test]
+fn a_fixed_initial_transform_samples_where_execute_samples() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    for (name, transform, with_domain) in fixed_initial_configs() {
+        let build = |t: Option<&sitk_transform::Transform>| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_metric_as_mean_squares();
+            // Zero steps: the metric is evaluated once, at `initial()`, on both paths.
+            reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 0, 1e-8)
+                .set_shrink_factors_per_level(vec![2, 1])
+                .set_smoothing_sigmas_per_level(vec![1.0, 0.0]);
+            if with_domain {
+                virtual_domain(&mut reg);
+            }
+            if let Some(t) = t {
+                reg.set_fixed_initial_transform(t.clone());
+            }
+            reg
+        };
+        let reg = build(Some(&transform));
+        let plain = build(None);
+
+        let base = plain.execute(&fixed, &moving, initial()).unwrap();
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg
+            .execute_on_device(&d_f, &d_m, initial())
+            .unwrap_or_else(|e| panic!("{name}: the device refused a run it now takes: {e}"));
+
+        assert_eq!(
+            device.levels.len(),
+            host.levels.len(),
+            "{name}: different level counts"
+        );
+        for ((h, d), b) in host
+            .levels
+            .iter()
+            .zip(device.levels.iter())
+            .zip(base.levels.iter())
+        {
+            assert!(
+                h.valid_points < b.valid_points,
+                "{name}, level {}: the fixed-initial transform drops no samples ({} vs {} \
+                 without it); a device that ignored it would pass this test",
+                h.level,
+                h.valid_points,
+                b.valid_points
+            );
+            assert_eq!(
+                d.valid_points, h.valid_points,
+                "{name}, level {}: the device walked a different sample set than the host \
+                 at the same transform",
+                h.level
+            );
+            let rel = (d.metric_value - h.metric_value).abs() / h.metric_value.abs();
+            assert!(
+                rel <= 1e-11,
+                "{name}, level {}: metric {:e} (device) vs {:e} (host), rel {rel:e} — the \
+                 counts agree but the values do not, so the device sampled the right number \
+                 of points from the wrong places",
+                h.level,
+                d.metric_value,
+                h.metric_value
+            );
+            println!(
+                "{name}, level {}: {} valid on both ({} without the transform), metric rel {rel:e}",
+                h.level, h.valid_points, b.valid_points
+            );
+        }
+    }
+}
+
+/// **D4, the end-to-end half: the optimizer run lands in the same place.**
+///
+/// The same four configurations, driven to convergence rather than evaluated once. The
+/// pin here is deliberately weaker than the one above, and the reason is measured, not
+/// assumed:
+///
+/// The device's metric reduces the per-sample residuals in a different order than the
+/// host's, which costs about 1e-13 relative on the metric value. With no fixed-initial
+/// transform that difference stays put — host and device parameters agree to 5e-14
+/// after 40 iterations, and `valid_points` is exactly equal. A fixed-initial transform
+/// resamples the fixed image onto the sample grid, which puts a hard zero shell at its
+/// border; the metric landscape gains samples that enter and leave across a step, and
+/// `RegularStepGradientDescentOptimizer` halves its step on overshoot — a *discontinuous*
+/// branch. Once a 1e-13 difference flips one overshoot test, the two runs take different
+/// steps: the parameter gap measured 3e-9 at 15 iterations and 3.4e-5 at 25, and at the
+/// two different final poses two of 152383 border samples fall on opposite sides of the
+/// moving buffer.
+///
+/// So the final iterates are not bit-comparable and asserting that they are would be a
+/// pin on the optimizer's luck. What *is* pinned: both paths take the same number of
+/// steps, stop for the same reason, and land at the same pose to a stated tolerance —
+/// and the sample-set equality that the fixed-initial transform is responsible for is
+/// pinned exactly, at a common transform, in the test above. The residual difference is
+/// chaotic amplification of a metric difference that exists with or without the
+/// transform, not a divergence of the transform path itself.
+#[test]
+fn a_fixed_initial_transform_converges_where_execute_converges() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    for (name, transform, with_domain) in fixed_initial_configs() {
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares();
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+        if with_domain {
+            virtual_domain(&mut reg);
+        }
+        reg.set_fixed_initial_transform(transform);
+
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg
+            .execute_on_device(&d_f, &d_m, initial())
+            .unwrap_or_else(|e| panic!("{name}: the device refused a run it now takes: {e}"));
+
+        assert_eq!(
+            device.iterations, host.iterations,
+            "{name}: different iteration counts"
+        );
+        assert_eq!(
+            device.stop_reason, host.stop_reason,
+            "{name}: different stop reasons"
+        );
+
+        // Same pose, to a tolerance the amplification above forces. The measured worst
+        // case over these four configurations is printed; the band is two orders above
+        // it, and far below any parameter change a registration would call a difference.
+        let mut worst = 0.0f64;
+        for (k, (&d, &h)) in device
+            .transform
+            .parameters()
+            .iter()
+            .zip(host.transform.parameters().iter())
+            .enumerate()
+        {
+            let rel = (d - h).abs() / (1.0 + h.abs());
+            worst = worst.max(rel);
+            assert!(
+                rel <= 1e-3,
+                "{name}, param {k}: device {d:e} vs host {h:e} (rel {rel:e})"
+            );
+        }
+        // The counts may differ by the border samples the two poses disagree on, but a
+        // device that sampled a *different set* would differ by the whole border shell,
+        // which is thousands of voxels — not a handful.
+        let (dv, hv) = (device.valid_points as f64, host.valid_points as f64);
+        let drift = (dv - hv).abs() / hv;
+        assert!(
+            drift <= 1e-4,
+            "{name}: {} valid points (device) vs {} (host) — a difference of {drift:e}, far \
+             more than the border samples two nearby poses can disagree on",
+            device.valid_points,
+            host.valid_points
+        );
+        println!(
+            "{name}: {} iters on both, params rel <= {worst:e}, valid {} (device) vs {} (host)",
+            host.iterations, device.valid_points, host.valid_points
+        );
     }
 }

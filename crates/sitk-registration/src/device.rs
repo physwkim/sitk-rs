@@ -90,31 +90,35 @@ pub enum DeviceRegistrationError {
     #[error("building a resolution level on the device failed: {0}")]
     Pyramid(#[source] CudaError),
 
-    /// A **fixed-initial transform** relocates the fixed image's sample points, so
-    /// the level's fixed image and its in-buffer predicate must be resampled *through*
-    /// that transform — and the device has no resample that can.
+    /// A **fixed-initial transform** whose point map the device cannot reproduce
+    /// **bit for bit**.
     ///
-    /// Both device resamples (`sitk_cuda::resample_linear`, `sitk_cuda::resample_nearest`)
-    /// map an output voxel's physical point straight to the input's continuous index.
-    /// There is no transform in that path, and adding one is not the hard part: the
-    /// hard part is the **pin**. Bit-identity with `ResampleImageFilter` needs the
-    /// device to reproduce `Transform::transform_point`'s arithmetic for each transform
-    /// class, and the closest thing it has is the metric's affine form, which is ~1e-12
-    /// away. That is harmless for the level *image* (it feeds a metric already gated at
-    /// 1e-9) and **not** harmless for the *predicate*, which is a 0/1 field whose value
-    /// at the buffer border is decided by rounding a continuous index: one ulp there
-    /// flips a shell of voxels, changes the valid-point count, and breaks the one
-    /// property the device path pins as *exactly* equal to the host's.
+    /// The transform relocates the fixed image's sample points, so the level's fixed
+    /// image *and* its in-buffer predicate are resampled *through* it. The device does
+    /// that now ([`sitk_cuda::resample_linear_through`] /
+    /// [`sitk_cuda::resample_nearest_through`]) — but only for a transform whose point
+    /// map is *literally* `mat_vec(matrix, p) + offset` on its own stored fields, which
+    /// is what [`Transform::matrix_offset_map`](sitk_transform::Transform::matrix_offset_map)
+    /// hands over and what its contract guarantees.
     ///
-    /// So this refuses rather than matching a predicate to a tolerance. A virtual
-    /// domain **without** a fixed-initial transform is taken: the level's grid can be
-    /// any geometry, and the in-buffer predicate is a nearest-neighbour resample of an
-    /// all-ones volume through the identity, which is pinned bit-identical.
+    /// What is refused, and why it is refused rather than approximated: the predicate is
+    /// a 0/1 field whose value at the buffer border is decided by comparing a continuous
+    /// index against `[-0.5, size - 0.5)`. One ulp in the mapped point flips a shell of
+    /// voxels there, moves the valid-point count, and breaks the one property the device
+    /// path pins as *exactly* equal to the host's. So an approximate map is not a
+    /// slightly worse map — it is a different sample set. `ScaleTransform` and
+    /// `ScaleLogarithmicTransform` evaluate `(p − c)·s + c`, which is `M·p + b` in exact
+    /// arithmetic and **not** in the last bits; `CompositeTransform` rounds once per
+    /// stage, so a composed matrix is not its arithmetic either; `BSplineTransform` and
+    /// `DisplacementFieldTransform` are not linear at all. Each is named here rather
+    /// than folded into a matrix that would be *almost* right.
     #[error(
-        "a fixed-initial transform needs the fixed image and its in-buffer predicate \
-         resampled *through* the transform, and the device has no transformed resample"
+        "a fixed-initial {0:?} transform has no point map the device can reproduce bit \
+         for bit ({0:?} is not `mat_vec(matrix, p) + offset` on its own stored fields); \
+         the in-buffer predicate is 0/1 and one ulp at the border moves the valid-point \
+         count, so this is refused rather than approximated"
     )]
-    UnsupportedFixedInitialTransform,
+    UnsupportedFixedInitialTransform(sitk_transform::TransformKind),
 
     /// The metric itself refused — a non-affine transform, a non-3-D problem, no
     /// device, or a CUDA failure.
