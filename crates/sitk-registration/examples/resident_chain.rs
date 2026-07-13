@@ -20,21 +20,33 @@
 //! ```text
 //! cargo run --release --features cuda -p sitk-registration --example resident_chain -- 256
 //! ```
-#![cfg(feature = "cuda")]
+#[cfg(not(feature = "cuda"))]
+fn main() {
+    eprintln!("this example needs the GPU: rebuild with --features cuda");
+}
 
+#[cfg(feature = "cuda")]
 use std::time::Instant;
 
+#[cfg(feature = "cuda")]
 use sitk_core::Image;
+#[cfg(feature = "cuda")]
 use sitk_cuda::{DeviceBuffer, backend, rescale_intensity_gpu, rescale_intensity_resident};
+#[cfg(feature = "cuda")]
 use sitk_registration::{CpuBackend, CudaMetricBackend, MeanSquaresMetric, MetricBackend};
+#[cfg(feature = "cuda")]
 use sitk_transform::Euler3DTransform;
 
+#[cfg(feature = "cuda")]
 const OUT_MIN: f64 = 0.0;
+#[cfg(feature = "cuda")]
 const OUT_MAX: f64 = 255.0;
+#[cfg(feature = "cuda")]
 const ITERS: usize = 20;
 
 /// `f32` volume, smooth and non-symmetric; `shift` displaces it in physical
 /// space so the moving image is the fixed image under a known translation.
+#[cfg(feature = "cuda")]
 fn volume(n: usize, shift: f64) -> Image {
     let c = n as f64 / 2.0;
     let mut v = vec![0.0f32; n * n * n];
@@ -51,10 +63,12 @@ fn volume(n: usize, shift: f64) -> Image {
     Image::from_vec(&[n, n, n], v).expect("volume")
 }
 
+#[cfg(feature = "cuda")]
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+#[cfg(feature = "cuda")]
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -62,6 +76,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 /// One value+derivative evaluation per iteration, as a regular-step gradient
 /// descent step would.
+#[cfg(feature = "cuda")]
 fn iterate(metric: &MeanSquaresMetric, be: &dyn MetricBackend) -> f64 {
     let c = 0.0;
     let tf = Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
@@ -72,6 +87,7 @@ fn iterate(metric: &MeanSquaresMetric, be: &dyn MetricBackend) -> f64 {
     ms(t)
 }
 
+#[cfg(feature = "cuda")]
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
