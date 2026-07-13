@@ -658,6 +658,20 @@ impl VirtualDomain {
         image.set_direction(&self.direction)?;
         Ok(image)
     }
+
+    /// The same grid as [`grid`](Self::grid), as a geometry and **without the
+    /// volume** — what the device path needs. `grid` allocates one `f64` per virtual
+    /// voxel (134 MB at 256³) purely to carry a few dozen numbers; on the device
+    /// those numbers are all that is ever read.
+    #[cfg(feature = "cuda")]
+    fn device_geometry(&self) -> sitk_cuda::Geometry {
+        sitk_cuda::Geometry {
+            size: self.size.clone(),
+            spacing: self.spacing.clone(),
+            origin: self.origin.clone(),
+            direction: self.direction.clone(),
+        }
+    }
 }
 
 /// What one resolution level of a run did.
@@ -2647,7 +2661,7 @@ impl ImageRegistrationMethod {
         let mut levels = Vec::with_capacity(schedule.len());
         for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
-            let (fl, ml) = Self::prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
+            let (fl, ml) = self.prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
             let fixed_level = fl.as_ref().unwrap_or(fixed);
             let moving_level = ml.as_ref().unwrap_or(moving);
 
@@ -2713,8 +2727,14 @@ impl ImageRegistrationMethod {
     ///   nothing — the same `native_grid` short-circuit `prepare_level` takes, and
     ///   for the same reason (at factor 1 the resample is provably the identity).
     ///
-    /// There is no mask branch and no virtual-domain branch because
-    /// [`execute_on_device`](Self::execute_on_device) refuses both at the boundary.
+    /// The level's grid is [`level_grid`](Self::level_grid): the shrunk **virtual**
+    /// grid when a virtual domain is configured, and the shrunk fixed grid otherwise
+    /// — the same choice `prepare_level` makes.
+    ///
+    /// There is no fixed-initial-transform branch because
+    /// [`execute_on_device`](Self::execute_on_device) refuses one at the boundary:
+    /// both device resamples map an output point straight to the input's continuous
+    /// index, and neither can resample *through* a transform.
     ///
     /// `None` means *the uploaded volume already is this level* — the level neither
     /// smooths nor shrinks — so the caller registers against the volume it was
@@ -2724,6 +2744,7 @@ impl ImageRegistrationMethod {
     /// mistake to make by accident), so it says it with an `Option` instead.
     #[cfg(feature = "cuda")]
     fn prepare_level_on_device(
+        &self,
         fixed: &sitk_cuda::DeviceImage,
         moving: &sitk_cuda::DeviceImage,
         sigma: &[f64],
@@ -2754,16 +2775,48 @@ impl ImageRegistrationMethod {
         let smoothed_fixed = smooth(fixed)?;
         let moving_level = smooth(moving)?;
 
-        if factors.iter().all(|&f| f == 1) {
+        let Some(grid) = self.level_grid(fixed.geometry(), factors)? else {
             return Ok((smoothed_fixed, moving_level));
-        }
+        };
 
         let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
-        let coarse = sitk_cuda::shrink(sf, factors).map_err(DeviceRegistrationError::Pyramid)?;
-        let fixed_level = sitk_cuda::resample_linear(sf, coarse.geometry(), 0.0)
-            .map_err(DeviceRegistrationError::Pyramid)?;
+        let fixed_level =
+            sitk_cuda::resample_linear(sf, &grid, 0.0).map_err(DeviceRegistrationError::Pyramid)?;
 
         Ok((Some(fixed_level), moving_level))
+    }
+
+    /// The grid this level's samples live on, as a geometry — `prepare_level`'s
+    /// `coarse_grid` (`shrink` of the virtual grid when one is configured, of the
+    /// fixed grid otherwise), and `None` for the `native_grid` short-circuit where
+    /// the fixed image's own grid *is* the level's.
+    ///
+    /// A geometry, not a volume: a virtual domain has no voxels to shrink (ITK
+    /// allocates `m_VirtualDomainImage` and never reads its pixels), and
+    /// materializing one on the device to read its geometry back would allocate a
+    /// volume nothing samples.
+    #[cfg(feature = "cuda")]
+    fn level_grid(
+        &self,
+        fixed: &sitk_cuda::Geometry,
+        factors: &[usize],
+    ) -> std::result::Result<Option<sitk_cuda::Geometry>, DeviceRegistrationError> {
+        // The same gate `prepare_level` uses, for the same reason: with no virtual
+        // domain, no fixed-initial transform and no shrink, nothing moves relative to
+        // the fixed grid and the whole pipeline is the identity.
+        if self.virtual_domain.is_none()
+            && self.fixed_initial_transform.is_none()
+            && factors.iter().all(|&f| f == 1)
+        {
+            return Ok(None);
+        }
+        let base = match &self.virtual_domain {
+            Some(v) => v.device_geometry(),
+            None => fixed.clone(),
+        };
+        Ok(Some(
+            sitk_cuda::shrunk_geometry(&base, factors).map_err(DeviceRegistrationError::Pyramid)?,
+        ))
     }
 
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair
@@ -6537,6 +6590,132 @@ mod tests {
                     .is_ok(),
                 "{name}: unweighted gradient-free run should succeed"
             );
+        }
+    }
+}
+
+/// The device pyramid level against the host pyramid level — the *actual* functions,
+/// not a transcription of them.
+///
+/// `tests/pyramid_parity.rs` compares the device ops against the CPU filters by
+/// re-implementing `prepare_level`'s steps in the test. That pins the **ops**, and it
+/// is what pinned them before anything was wired to them. It cannot pin the
+/// **wiring**: a `prepare_level_on_device` that chose the wrong grid, or dropped the
+/// mask, would still agree with a test that made the same choice. These tests call
+/// `prepare_level` and `prepare_level_on_device` themselves and compare what the two
+/// return, so a divergence between them fails here whatever the ops do.
+#[cfg(all(test, feature = "cuda"))]
+mod device_level_tests {
+    use super::*;
+    use sitk_cuda::DeviceImage;
+
+    fn no_device() -> bool {
+        matches!(sitk_cuda::backend(), Err(sitk_cuda::CudaError::NoDevice(_)))
+    }
+
+    /// A textured `f32` volume with a non-trivial spacing and origin, so a grid that
+    /// is *nearly* right is still wrong.
+    fn volume(n: usize, shift: f64) -> Image {
+        let c = n as f64 / 2.0;
+        let mut v = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (i as f64 - c + shift, j as f64 - c, k as f64 - c);
+                    let r = (x * x + y * y + z * z).sqrt();
+                    v.push(
+                        (300.0 * (-(r * r) / (0.2 * n as f64).powi(2)).exp()
+                            + 40.0 * (0.7 * x).sin() * (0.5 * y).cos()
+                            + 17.0 * (0.3 * z).sin()) as f32,
+                    );
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+        img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+        img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+        img
+    }
+
+    fn assert_same_image(host: &Image, device: &Image, what: &str) {
+        assert_eq!(host.size(), device.size(), "{what}: size");
+        assert_eq!(host.spacing(), device.spacing(), "{what}: spacing");
+        assert_eq!(host.origin(), device.origin(), "{what}: origin");
+        assert_eq!(host.direction(), device.direction(), "{what}: direction");
+        let (a, b) = (
+            host.scalar_slice::<f32>().unwrap(),
+            device.scalar_slice::<f32>().unwrap(),
+        );
+        let differing = a
+            .iter()
+            .zip(b.iter())
+            .filter(|&(&x, &y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "{what}: {differing} of {} voxels differ",
+            a.len()
+        );
+    }
+
+    /// C2: with a **virtual domain**, the device level image is the host level image
+    /// — bit for bit, on the grid the host chose.
+    ///
+    /// Failure mode this catches: the device silently builds the level on the *fixed*
+    /// grid instead of the shrunk virtual one. The run would still converge; it would
+    /// just be optimizing a different objective than `execute` optimizes. (Checked by
+    /// deleting the virtual-domain arm of `level_grid`: this test fails.)
+    #[test]
+    fn the_device_level_image_is_the_host_level_image_on_a_virtual_grid() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+
+        // A virtual grid that is neither image's: different size, spacing, origin.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_virtual_domain(
+            vec![24, 20, 28],
+            vec![-2.0, 1.0, 0.5],
+            vec![1.0, 1.2, 0.9],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        for (factors, level_sigma) in [(vec![2usize; 3], 1.0f64), (vec![1usize; 3], 0.0)] {
+            let sigma: Vec<f64> = fixed.spacing().iter().map(|&s| level_sigma * s).collect();
+            let (host_fixed, host_moving, host_mask) = reg
+                .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                .unwrap();
+            let (dev_fixed, dev_moving) = reg
+                .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                .unwrap();
+
+            let what = format!("virtual domain, factors {factors:?}, sigma {level_sigma}");
+            assert_same_image(
+                &host_fixed,
+                &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                &format!("{what}: fixed level"),
+            );
+            assert_same_image(
+                &host_moving,
+                &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                &format!("{what}: moving level"),
+            );
+            // The level is on the virtual grid, not the fixed one — otherwise the
+            // comparison above would be comparing two wrong images to each other.
+            assert_ne!(
+                host_fixed.size(),
+                fixed.size(),
+                "{what}: the level was built on the fixed grid; the test proves nothing"
+            );
+            // A virtual domain always makes the host build an in-buffer predicate.
+            assert!(host_mask.is_some(), "{what}: the host built no level mask");
         }
     }
 }

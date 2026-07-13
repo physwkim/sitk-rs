@@ -340,6 +340,22 @@ extern "C" __global__ void shrink3(
 }
 "#;
 
+/// The grid a [`shrink`] would produce, **without shrinking anything** — the
+/// geometry alone, from a geometry alone.
+///
+/// A registration level needs this grid before it has a volume to put on it: when a
+/// virtual domain is configured, the level's grid is the shrunk *virtual* grid, and
+/// a virtual domain is a geometry with no voxels (ITK allocates `m_VirtualDomainImage`
+/// and never reads its pixels). Materializing a volume just to ask for its geometry
+/// would allocate 134 MB at 256³ to read back a few dozen numbers.
+///
+/// Same rule as [`shrink`] — it is the same function — so a level built on this grid
+/// and a level built by shrinking a volume land on the same voxels.
+pub fn shrunk_geometry(geom: &Geometry, factors: &[usize]) -> Result<Geometry, CudaError> {
+    require_3d(geom)?;
+    Ok(shrink_geometry(geom, factors)?.0)
+}
+
 /// The output geometry and sampling offset of a shrink — `ShrinkImageFilter`'s
 /// `GenerateOutputInformation`, transcribed from `sitk_filters::shrink`.
 ///
