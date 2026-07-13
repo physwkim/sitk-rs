@@ -560,6 +560,13 @@ fn transform_1d_unscaled(buf: &mut [Complex], positive_exponent: bool) {
 /// and it is what `deconvolution::tests::output_keeps_the_input_pixel_type_and_
 /// geometry` pins.
 ///
+/// The truncation is not this port's choice to revisit: ITK narrows a float
+/// result into an integer pixel with a plain `static_cast` on exactly this path
+/// (`itkExtractImageFilter.hxx:270` → `itkImageAlgorithm.hxx:46`), and rounding
+/// is opt-in there (a separate `RoundImageFilter`). Ledger §2.155. So the last
+/// bits of a spectrum *are* load-bearing when the output is integral, and that
+/// is what confines the fast kernel to the real-input pair.
+///
 /// So: the complex-spectrum API that filters round-trip through keeps the exact
 /// kernel, and the real-input pair — the one that carries the volume-sized cost
 /// — takes the fast one. Speed where the bits do not reach the output, exactness

@@ -1253,6 +1253,24 @@ mod tests {
 
     // ---- pixel type and geometry -------------------------------------------
 
+    /// The last assertion here pins more than it looks like it does, and a
+    /// reader who trips it should know what they are looking at.
+    ///
+    /// A delta kernel is the identity, so the `u8` values must come back
+    /// unchanged — but they come back *through* an FFT round trip in `f64`, and
+    /// the narrowing to `u8` truncates toward zero (ITK does the same, with a
+    /// `static_cast`; ledger §2.155). So `20` survives only because the round
+    /// trip lands on `20.0` exactly, or above it. It is not robust to a hair of
+    /// round-off on the low side: `19.99999999999999289` truncates to `19`, and
+    /// that is a whole pixel level from an error of 1e-14.
+    ///
+    /// What makes it land exactly is pocketfft's hardcoded twiddle literals
+    /// (`cos(2π/3) == -0.5` exactly — see `fft::radix_twiddles`), which this port
+    /// transcribes. Swapping in a kernel that *computes* its roots of unity —
+    /// rustfft gets `-0.4999999999999998` — fails this test. That is the test
+    /// working, not the kernel being broken: see `fft::LineKernel` for why the
+    /// complex-spectrum path therefore keeps the exact kernel while the
+    /// real-input pair takes the fast one.
     #[test]
     fn output_keeps_the_input_pixel_type_and_geometry() {
         let mut image = Image::from_vec(&[3, 2], vec![10u8, 20, 30, 40, 50, 60]).unwrap();
