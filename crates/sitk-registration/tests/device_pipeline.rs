@@ -738,3 +738,80 @@ fn a_well_conditioned_run_lands_in_the_same_place_on_both_paths() {
         "a well-conditioned run must land in the same place; worst {worst:e}"
     );
 }
+
+/// A sample whose continuous index lands **exactly on a voxel plane** of the moving
+/// image, which is where the trilinear interpolant's gradient is discontinuous.
+///
+/// This is not an exotic input: it is what the identity transform does whenever the
+/// two grids are commensurate — a fixed image and a moving image on the same
+/// spacing, offset by a whole number of voxels, which is the *starting point* of a
+/// great many registrations. Here the moving image's origin is shifted by exactly
+/// three voxels along x (2.1 = 3 × 0.7) and by a fraction of one along y and z, so
+/// every sample sits on a knot in x and nowhere near one in y or z.
+///
+/// The value is continuous across the knot and always agreed. The **derivative** is
+/// not: whichever side of the plane `floor()` lands on decides which one-sided
+/// difference the gradient is. The device must therefore compute the continuous
+/// index with the host's exact roundings — the kernel does the multiplies and adds
+/// of the point chain with `__dmul_rn`/`__dadd_rn`, in the host's order, so NVRTC
+/// cannot fuse them. Before that fix this case was off by **34%** in `d/d(angle_y)`
+/// and **8%** in `d/d(translation_x)`, with the value still agreeing to 1e-15.
+#[test]
+fn the_device_metric_agrees_with_the_host_on_a_sample_that_lands_on_a_voxel_plane() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let spacing = [0.7, 1.1, 1.3];
+    let origin = [-12.0, 5.5, 3.25];
+
+    let mut fixed = volume(n, [0.0; 3]);
+    fixed.set_spacing(&spacing).unwrap();
+    fixed.set_origin(&origin).unwrap();
+
+    let mut moving = volume(n, [3.0, -2.0, 1.5]);
+    moving.set_spacing(&spacing).unwrap();
+    // + exactly 3 voxels in x; a fraction of a voxel in y and z.
+    moving
+        .set_origin(&[origin[0] + 2.1, origin[1] - 1.4, origin[2] + 0.8])
+        .unwrap();
+
+    let c = n as f64 / 2.0;
+    let identity = Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image(&fixed).unwrap(),
+        MovingImage::from_image(&moving).unwrap(),
+    )
+    .unwrap();
+    let h = host.evaluate(&identity, &CpuBackend);
+
+    let device = DeviceMeanSquaresMetric::from_device(
+        &DeviceImage::upload(&fixed).unwrap(),
+        &DeviceImage::upload(&moving).unwrap(),
+    )
+    .unwrap();
+    let d = device.evaluate(&identity).unwrap();
+
+    assert_eq!(d.valid_points, h.valid_points);
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let v = rel(d.value, h.value);
+    let g = d
+        .derivative
+        .iter()
+        .zip(h.derivative.iter())
+        .map(|(&x, &y)| rel(x, y))
+        .fold(0.0f64, f64::max);
+    println!("on a voxel plane: value rel {v:e}, derivative rel {g:e}");
+    assert!(v <= 1e-9, "value rel err {v:e} exceeds 1e-9");
+    assert!(
+        g <= 1e-9,
+        "derivative rel err {g:e} exceeds 1e-9 — the device took the other \
+         one-sided gradient at the knot"
+    );
+    assert!(
+        h.derivative.iter().any(|x| x.abs() > 1e-6),
+        "the derivative is ~zero here, so the comparison proves nothing"
+    );
+}

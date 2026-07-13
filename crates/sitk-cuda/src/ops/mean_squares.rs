@@ -121,6 +121,29 @@ __device__ __forceinline__ bool is_inside(const double* c, const long long* size
     return true;
 }
 
+// acc + a*b, with the multiply and the add rounded SEPARATELY.
+//
+// The chain that produces the continuous index -- fixed point x, mapped point p,
+// index c -- must be bit-identical to the host's, because `floor(c)` and
+// `is_inside(c)` are *branches*, and the trilinear interpolant's gradient is
+// discontinuous across them. A 1-ULP difference in c is harmless for the value
+// (which is continuous in c) but takes the OTHER one-sided gradient at a sample
+// whose index lands exactly on a voxel plane -- and a fixed grid that maps onto
+// the moving grid is not exotic, it is what the identity transform does on
+// commensurate geometry. Measured on such data before this was fixed: the value
+// agreed to 1e-15 and the derivative was off by 7%.
+//
+// Rust does not fuse a multiply and an add; NVRTC does, by default. `__dmul_rn` /
+// `__dadd_rn` are the IEEE round-to-nearest primitives, which the compiler may not
+// contract -- so the guarantee holds regardless of the flags this is compiled with,
+// and it is stated in the code rather than in a build option. Everything downstream
+// of `c` (weights, value, gradient, the reduction) is a continuous function of it
+// and stays contracted: that is where the arithmetic is, and a ULP there is the
+// reduction-rounding the metric is already gated at.
+__device__ __forceinline__ double fmadd_rn(double acc, double a, double b) {
+    return __dadd_rn(acc, __dmul_rn(a, b));
+}
+
 extern "C" __global__ void ms_moments(
     const FSCALAR* __restrict__ fvals,    // fixed sample values, n
     const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); unused if !has_pts
@@ -156,26 +179,35 @@ extern "C" __global__ void ms_moments(
             const double i = (double)(s % fsize[0]);
             const double j = (double)((s / fsize[0]) % fsize[1]);
             const double k = (double)(s / (fsize[0] * fsize[1]));
+            // VirtualGrid::point: the origin is the accumulator's seed, then one
+            // rounded multiply-add per axis.
             for (int r = 0; r < 3; ++r) {
                 double acc_r = forigin[r];
-                acc_r += fmat[r*3+0] * i;
-                acc_r += fmat[r*3+1] * j;
-                acc_r += fmat[r*3+2] * k;
+                acc_r = fmadd_rn(acc_r, fmat[r*3+0], i);
+                acc_r = fmadd_rn(acc_r, fmat[r*3+1], j);
+                acc_r = fmadd_rn(acc_r, fmat[r*3+2], k);
                 x[r] = acc_r;
             }
         }
 
-        // p = A*x + b  --- the transform's point map, whatever transform it is.
+        // p = A*x + b --- the transform's point map, whatever transform it is.
+        // `TransformBase::transform_point` is `mat_vec(matrix, x)` and THEN the
+        // offset, so the accumulator starts at zero and `b` lands last.
         double p[3];
         for (int d = 0; d < 3; ++d) {
-            p[d] = ab[9+d] + ab[d*3+0]*x[0] + ab[d*3+1]*x[1] + ab[d*3+2]*x[2];
+            double acc_d = 0.0;
+            acc_d = fmadd_rn(acc_d, ab[d*3+0], x[0]);
+            acc_d = fmadd_rn(acc_d, ab[d*3+1], x[1]);
+            acc_d = fmadd_rn(acc_d, ab[d*3+2], x[2]);
+            p[d] = __dadd_rn(acc_d, ab[9+d]);
         }
 
-        // c = M * (p - origin): continuous index in the moving image.
+        // c = M * (p - origin): continuous index in the moving image. The host
+        // subtracts the origin first, then runs `mat_vec` from zero.
         double c[3];
         for (int r = 0; r < 3; ++r) {
             double a = 0.0;
-            for (int j = 0; j < 3; ++j) a += mmat[r*3+j] * (p[j] - morigin[j]);
+            for (int j = 0; j < 3; ++j) a = fmadd_rn(a, mmat[r*3+j], __dsub_rn(p[j], morigin[j]));
             c[r] = a;
         }
 
