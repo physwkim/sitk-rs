@@ -120,10 +120,22 @@ is **16.2–17.7 s on the host against 148.6–151.0 ms on the device, 107–119
 > where the trilinear gradient is discontinuous — so the kernel took the *opposite
 > one-sided derivative*: `d/d(angle_y)` off by 34% while the value agreed to 1e-15.
 > Fixed at source; 3.2e-14 after. **The timings above have not been re-taken on the
-> fixed kernel**, and no pyramid run has been timed at all. `execute_on_device` now
-> accepts a pyramid (bit-identical level images, identical iteration counts), so
-> these rows describe code that no longer exists. They are left here, marked, until
-> the re-measurement lands rather than deleted or quietly re-labelled.
+> fixed kernel**, and no pyramid run has been timed at all.
+>
+> **The blast radius is one kernel, `mean_squares.cu`.** Of the six rows in the
+> table, only `registration setup` and `20 iterations` sit downstream of it; `cast`,
+> `rescale`, and `smooth` are untouched code and still describe what runs today, as
+> does every row of §1 and §3.
+>
+> **But the 107–119× row can move for a reason that is not kernel speed.** It is a
+> real `execute()`, so the optimizer picks its own iteration count; a corrected
+> derivative changes the descent trajectory, and the wall clock can move in either
+> direction with the per-iteration cost unchanged. The `20 iterations` row is immune
+> (its count is pinned); that one is not. `execute_on_device` also now accepts a
+> pyramid (bit-identical level images, identical iteration counts on both paths).
+>
+> These rows are left in place and marked, not deleted and not quietly re-labelled,
+> until the re-measurement lands.
 
 The Gaussian is where the CPU bleeds: 2,250.7 ms on 96 threads against 9.7 ms on
 the device. The device Gaussian is **bit-identical** to the CPU filter, not close
@@ -164,24 +176,63 @@ contraction, because an FMA would be *more* accurate and therefore *different*.
 | gradient_magnitude_recursive_gaussian | 2091 / 1940 | 784 / 814 | **2.67×** |
 | gradient_magnitude | 340 / 380 | 106 / 99.2 | **3.22×** |
 
-## 4. Where the port still loses to ITK
+## 4. Where the port loses to ITK — and what the cause turned out to be
 
-Four ops, and the same suspect in all four — they are the **separable / stencil**
-family, where ITK's per-thread scanline machinery is genuinely better than ours:
+Four ops, all in the **separable / stencil** family:
 
 - `mean` — 4.4× at medium, 2.4× at large
 - `gradient_magnitude` — 4.3× / 3.2×
 - `gradient_magnitude_recursive_gaussian` — 1.9× / 2.7×
 - `discrete_gaussian` — 1.25× / 1.85×
 
-Note the shape: the port's `t1` is competitive-to-better on several of these
-(`gradient_magnitude_recursive_gaussian` t1 2639 vs ITK 2440), and it is the `tN`
-column that falls behind. This is a **scaling** gap, not a constant-factor one.
-The port's CPU parallel metric shows the same ceiling — 11–15× on 48 physical
-cores against a ~38× clock-adjusted bound — and the cause is not bit-exactness
-(the serial in-order combine is 1.0% of `t1` work), not memory bandwidth (an
-L3-resident volume hits the same wall as one that does not fit), and not false
-sharing (the mean worker completes its slice at 92% of ideal). It is unresolved.
+The shape said what it was: the port's `t1` is competitive-to-better on several of
+these (`gradient_magnitude_recursive_gaussian` t1 2639 vs ITK 2440) and it is the
+`tN` column that falls behind. A **scaling** gap, not a constant-factor one.
+
+**Three of the four were the allocator.** Not the kernel, not the decomposition,
+not the barrier count, not NUMA, not bandwidth — each eliminated by measurement: a
+pure-compute region scales 43.1× on this box; a streaming map at 16 flops/element
+scales 33.4×; one socket with all memory local scales *identically* to two; 125
+loads from a single L1-hot address hit the same ceiling as the real 25-stream
+window. The threads were not stalled, they were **blocked** — at t48 the window
+walk ran 13.8 of 48 cores while the identical kernel through `map_indexed` ran
+43.0. Idle cores mean a lock, and the lock was glibc's.
+
+`mean` was making **30,910,860 heap allocations per call**.
+`smoothing_recursive_gaussian` — the op in the same family that *beats* ITK —
+makes 14,926, because it never constructs a `NeighborhoodIterator`. That single
+difference was the whole gap. Two sites, both on the neighborhood **boundary**
+path: `push_values_checked` built two ND buffers per boundary voxel, and every
+`BoundaryCondition::get_pixel` impl `collect()`ed a `Vec` per out-of-bounds
+neighbor.
+
+| allocations per call, 256³ | before | after |
+|---|---|---|
+| `mean` r=2 | 30,910,860 | **13,212** |
+| `median` r=2 | 30,913,804 | **16,191** |
+| `discrete_gaussian` | 9,854,298 | **35,994** |
+| `gradient_magnitude` | 4,318,099 | **12,049** |
+
+Fixed structurally rather than by pooling: `boundary::remapped` folds each
+condition's per-axis rule straight into a linear index, so no implementation ever
+has an ND index to materialize, and `push_values_checked` now takes `nd: &mut [i64]`
+— **a slice cannot grow, so the function has no way to allocate**. All 16
+`bit_parity` checksums are unmoved: same pixels, same fold order, same bits.
+
+`mean` at t48: **338.6 → 185.1 ms (1.83×)**; parallel efficiency at t16 0.66 → 0.98.
+
+**The table above still shows the pre-fix numbers.** It was measured before the fix
+landed, and a clean sweep on a quiet box is owed before it can be updated. Two
+things remain open even after it:
+
+- **A second limiter on `mean`.** It now scales near-perfectly to t16 (efficiency
+  0.98) and then stops dead — 196 ms at t16, 190 at t24, 185 at t48, with only ~20
+  busy cores. Chunk granularity is ruled out (sweeping `GRAIN` 4096/1024/256 moves
+  it under 7%). The allocator was the dominant cause, not the only one.
+- **`gradient_magnitude_recursive_gaussian` is a different defect.** It makes 44,429
+  allocations (0.00/voxel) and never touches the boundary path. Its 1.88× loss is
+  most likely the per-axis full-volume `to_f64_vec()` copies. Uninvestigated — and
+  not folded into the finding above just because it was on the same list.
 
 `fft_convolution` **is closed**: it was 6.5× slower than ITK at `t1` before
 rustfft/realfft landed and the real-input half-Hermitian path replaced three full
