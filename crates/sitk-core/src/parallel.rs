@@ -206,6 +206,105 @@ where
         });
 }
 
+/// Rows per staging chunk in [`map_rows_fold_in_order`]. Bounds the staging
+/// buffer, nothing else: `combine` sees `0..n` in order whatever this is, so it
+/// cannot change a single bit of the result.
+const FOLD_CHUNK_ROWS: usize = 1 << 16;
+
+/// **Parallel per-element compute, sequential in-order combine** — a float
+/// reduction that is bit-identical to the sequential loop it replaces.
+///
+/// # The problem this solves
+///
+/// A float sum cannot be parallelized by splitting it: `+` is not associative,
+/// so any re-bracketing changes the bits, and this module refuses to offer such
+/// a reduction ([see the module docs](self)). But an expensive per-element
+/// *computation* whose result is merely *added* to an accumulator is a different
+/// shape. Split it in two:
+///
+/// - `compute(scratch, i, row)` — the expensive part (a coordinate transform, an
+///   interpolation, a Jacobian). It sees only element `i`, touches no
+///   accumulator, and writes its contribution into `row`. **Runs in parallel.**
+/// - `combine(i, row)` — the cheap part: the additions. **Runs on one thread, for
+///   `i = 0, 1, 2, … n-1`, in order.**
+///
+/// So the accumulator sees exactly the sequence of values, in exactly the order,
+/// that the original serial loop fed it. It is not a fold over per-chunk
+/// partials — that *would* be a re-association. It is the *same fold*, over the
+/// same elements, in the same order, with only the work that feeds it moved off
+/// the critical path. The result is bit-identical to the sequential loop, at any
+/// thread count, and identical to it — not merely reproducible.
+///
+/// `compute` returns `false` to mark element `i` invalid; `combine` is then not
+/// called for it, exactly as a `continue` would have skipped it.
+///
+/// # Why a non-deterministic reduction stays unwritable
+///
+/// `combine` is `FnMut` and is never handed to rayon. A caller cannot get its
+/// accumulator into a worker thread, so it cannot re-associate anything even by
+/// accident. The parallel half (`compute`) is `Fn` and cannot own the
+/// accumulator. The determinism is in the *shape* of the API.
+///
+/// # Cost
+///
+/// Amdahl, not accuracy: the combine stays serial, so the speedup is bounded by
+/// how much of the per-element work sits in `compute`. That is the right trade
+/// exactly when the compute dwarfs the additions — which is the case this exists
+/// for.
+pub fn map_rows_fold_in_order<S, I, C, F>(
+    n: usize,
+    width: usize,
+    init: I,
+    compute: C,
+    mut combine: F,
+) where
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    C: Fn(&mut S, usize, &mut [f64]) -> bool + Sync + Send,
+    F: FnMut(usize, &[f64]),
+{
+    assert!(width > 0, "a staged row needs at least one column");
+    if n == 0 {
+        return;
+    }
+    if n < SERIAL_THRESHOLD {
+        let mut scratch = init();
+        let mut row = vec![0.0; width];
+        for i in 0..n {
+            if compute(&mut scratch, i, &mut row) {
+                combine(i, &row);
+            }
+        }
+        return;
+    }
+
+    let chunk_rows = FOLD_CHUNK_ROWS.min(n);
+    let mut rows = vec![0.0f64; chunk_rows * width];
+    let mut valid = vec![false; chunk_rows];
+
+    let mut start = 0usize;
+    while start < n {
+        let count = chunk_rows.min(n - start);
+
+        // Parallel: every row is written by exactly one task, from its own index.
+        rows[..count * width]
+            .par_chunks_mut(width)
+            .zip(valid[..count].par_iter_mut())
+            .enumerate()
+            .for_each_init(&init, |scratch, (r, (row, ok))| {
+                *ok = compute(scratch, start + r, row);
+            });
+
+        // Sequential, in index order — the original loop's fold, untouched.
+        for r in 0..count {
+            if valid[r] {
+                combine(start + r, &rows[r * width..(r + 1) * width]);
+            }
+        }
+        start += count;
+    }
+}
+
 /// The minimum and maximum of `vals` widened to `f64`, or `None` if empty.
 ///
 /// Equals the sequential `lo = lo.min(v); hi = hi.max(v)` scan bit-for-bit: see
@@ -640,5 +739,105 @@ mod tests {
         let got = bin_counts(&vals, bins, |v| (v < 4.0).then_some(v as usize));
         assert_eq!(got, vec![(n / 8) as u64; 4]);
         assert_eq!(got.iter().sum::<u64>(), (n / 2) as u64);
+    }
+
+    /// The reason the primitive exists: the accumulator must see the same
+    /// additions in the same order as the loop it replaces, at *any* thread
+    /// count. The values make re-association visible in the bits — the leading
+    /// `1.0` swallows every subsequent `1e-17` by rounding, so a sum that
+    /// brackets the tail separately (a chunked fold, a tree reduce) lands on a
+    /// different `f64`. The sequential sum here is 1.0 exactly; any parallel
+    /// re-association gets 1.0 + something.
+    #[test]
+    fn map_rows_fold_in_order_is_bit_identical_to_the_sequential_fold() {
+        let sample = |i: usize| if i == 0 { 1.0f64 } else { 1e-17 };
+        // 0 and 1 are the empty/degenerate paths, 999 takes the serial path,
+        // and the last straddles two staging chunks with a partial tail.
+        for n in [0usize, 1, 999, FOLD_CHUNK_ROWS * 2 + 137] {
+            let mut want = 0.0f64;
+            for i in 0..n {
+                want += sample(i);
+            }
+            if n > 1 {
+                assert_eq!(want, 1.0, "the tail must vanish into the leading 1.0");
+            }
+
+            for threads in [1usize, 2, 3, 7, 16, 64] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut got = 0.0f64;
+                let mut order = Vec::with_capacity(n);
+                pool.install(|| {
+                    map_rows_fold_in_order(
+                        n,
+                        1,
+                        || (),
+                        |(), i, row| {
+                            row[0] = sample(i);
+                            true
+                        },
+                        |i, row| {
+                            order.push(i);
+                            got += row[0];
+                        },
+                    );
+                });
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "n={n}, {threads} threads moved the bits"
+                );
+                assert_eq!(
+                    order,
+                    (0..n).collect::<Vec<_>>(),
+                    "combine ran out of order"
+                );
+            }
+        }
+    }
+
+    /// An invalid element must be skipped entirely, exactly as `continue` would
+    /// have skipped it — not combined as a zero row.
+    #[test]
+    fn map_rows_fold_in_order_skips_invalid_rows_and_carries_every_column() {
+        let n = SERIAL_THRESHOLD * 4 + 3;
+        let width = 3;
+        let ok = |i: usize| !i.is_multiple_of(3);
+
+        let mut got = vec![0.0f64; width];
+        let mut combined = 0usize;
+        map_rows_fold_in_order(
+            n,
+            width,
+            || (),
+            |(), i, row| {
+                if !ok(i) {
+                    return false;
+                }
+                for (c, slot) in row.iter_mut().enumerate() {
+                    *slot = (i * (c + 1)) as f64;
+                }
+                true
+            },
+            |_, row| {
+                combined += 1;
+                for (acc, &v) in got.iter_mut().zip(row) {
+                    *acc += v;
+                }
+            },
+        );
+
+        let mut want = vec![0.0f64; width];
+        let mut want_combined = 0usize;
+        for i in (0..n).filter(|&i| ok(i)) {
+            want_combined += 1;
+            for (c, acc) in want.iter_mut().enumerate() {
+                *acc += (i * (c + 1)) as f64;
+            }
+        }
+        assert_eq!(combined, want_combined);
+        assert_eq!(got, want);
     }
 }
