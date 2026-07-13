@@ -17,19 +17,25 @@
 //!
 //! [`gradient_magnitude_recursive_gaussian`], [`laplacian_recursive_gaussian`]
 //! and [`gradient_recursive_gaussian`] instead compose per-axis calls to
-//! [`recursive_gaussian_with_order`]/`recursive_gaussian_f64`, exactly as
+//! `recursive_gaussian_f64_into`, exactly as
 //! ITK's `GradientMagnitudeRecursiveGaussianImageFilter`/
 //! `LaplacianRecursiveGaussianImageFilter`/`GradientRecursiveGaussianImageFilter`
 //! compose per-axis `RecursiveGaussianImageFilter`s (one
 //! [`GaussianOrder::FirstOrder`] or [`GaussianOrder::SecondOrder`] axis,
 //! [`GaussianOrder::ZeroOrder`] elsewhere) — then divide each axis's
 //! contribution by `spacing[d]` (gradient) or `spacing[d]^2` (Laplacian)
-//! *again*: `recursive_gaussian_with_order`'s own `sigmad = sigma /
+//! *again*: the recursion's own `sigmad = sigma /
 //! spacing[d]` reparametrization makes its derivative output index-space, and
 //! these filters need it in physical space, matching ITK's `GenerateData`
 //! (`a + Math::sqr(b / spacing[dim])` and `a + b * (1.0 / spacing2)`
 //! respectively) and `itkGradientRecursiveGaussianImageFilter.hxx`'s
 //! `it.Get() / spacing`.
+//!
+//! They take the `_into` form, on one working buffer reused across the axis
+//! loop, because they are the callers that run the whole `dim`-axis cascade once
+//! *per axis*: anything the recursion allocates internally, they allocate `dim`
+//! times over, and each one is a full volume whose pages must be faulted in
+//! under a kernel lock — work that does not parallelize.
 //!
 //! Output pixel type follows SimpleITK's yaml: [`gradient_magnitude`],
 //! [`gradient_magnitude_recursive_gaussian`] and [`laplacian_recursive_gaussian`]
@@ -43,9 +49,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use crate::recursive_gaussian::{
-    GaussianOrder, recursive_gaussian_f64, recursive_gaussian_with_order,
-};
+use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64_into};
 use sitk_core::{
     Image, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
     dispatch_scalar, matrix, parallel,
@@ -374,10 +378,10 @@ pub fn sobel_edge_detection(img: &Image, use_legacy_operator_coefficients: bool)
 /// `GradientMagnitudeRecursiveGaussianImageFilter`: the Euclidean norm of the
 /// gradient of `img` convolved with a Gaussian of physical-space `sigma`
 /// (isotropic — one value for every axis, matching ITK's single `Sigma`
-/// parameter). Composes per-axis [`recursive_gaussian_with_order`] calls —
+/// parameter). Composes per-axis [`recursive_gaussian_f64_into`] calls —
 /// [`GaussianOrder::FirstOrder`] on one axis, [`GaussianOrder::ZeroOrder`] on
 /// the rest — dividing each axis's derivative by `spacing[d]` again to convert
-/// it from `recursive_gaussian_with_order`'s index space to physical space.
+/// it from the recursion's index space to physical space.
 /// `normalize_across_scale` is ITK's `NormalizeAcrossScale` (off by default).
 /// Output is always [`PixelId::Float32`].
 ///
@@ -389,36 +393,62 @@ pub fn gradient_magnitude_recursive_gaussian(
     normalize_across_scale: bool,
 ) -> Result<Image> {
     let dim = img.dimension();
+    let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
-    let scratch = scratch_f64(img)?;
     let sigma_array = vec![sigma; dim];
 
-    let mut acc = vec![0.0f64; img.number_of_pixels()];
+    // Three full volumes, allocated once each and reused across the axis loop:
+    // the `f64` input, the working buffer the recursion runs in, and the
+    // accumulator. This used to be fifteen — 2.0 GB of fresh pages per call at
+    // 256³, against 134 MB for `smoothing_recursive_gaussian`, which runs the
+    // same recursion and beats ITK. Twelve of them came from the axis loop: the
+    // recursion allocated its own volume per axis, handed it back through an
+    // `Image` (`recursive_gaussian_with_order` narrows `Float64` to `Float64` —
+    // the identity), which was immediately unwrapped again by `to_f64_vec`, and
+    // then `acc` was reallocated to hold the sum. A fresh volume must have its
+    // pages faulted in under a kernel lock, which is work that does not
+    // parallelize (efficiency 0.09), so those twelve were most of what the
+    // filter did at high thread counts.
+    let src = img.to_f64_vec()?;
+    let mut work = vec![0.0f64; src.len()];
+    let mut acc = vec![0.0f64; src.len()];
+
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::FirstOrder;
-        let deriv =
-            recursive_gaussian_with_order(&scratch, &sigma_array, &orders, normalize_across_scale)?;
+        // The recursion is in-place and destroys its input, so each axis starts
+        // from a fresh copy of `src` — into the buffer that already exists.
+        work.copy_from_slice(&src);
+        recursive_gaussian_f64_into(
+            &mut work,
+            &size,
+            &spacing,
+            &sigma_array,
+            &orders,
+            normalize_across_scale,
+        )?;
         // The axis loop stays sequential, so `acc[i]` still accumulates its
         // `dim` terms in axis order — only the elementwise step within one axis
         // is spread across threads, and each element's arithmetic is untouched.
-        let values = deriv.to_f64_vec()?;
-        acc = parallel::map_indexed(acc.len(), |i| {
-            let g = values[i] / spacing[d];
-            acc[i] + g * g
+        // The tap stays a *division* by `spacing[d]`: multiplying by a
+        // precomputed `1.0 / spacing[d]` is a different `f64` and would move the
+        // checksum.
+        parallel::for_each_mut(&mut acc, |i, a| {
+            let g = work[i] / spacing[d];
+            *a += g * g;
         });
     }
-    let out: Vec<f64> = parallel::map_slice(&acc, |v| v.sqrt());
+    parallel::for_each_mut(&mut acc, |_, a| *a = a.sqrt());
 
-    image_from_f64(PixelId::Float32, img.size(), img, &out)
+    image_from_f64(PixelId::Float32, img.size(), img, &acc)
 }
 
 /// `LaplacianRecursiveGaussianImageFilter`: the Laplacian-of-Gaussian of
 /// `img`, `sum_d d2/dx_d^2 [G_sigma * img]`. Composes per-axis
-/// [`recursive_gaussian_with_order`] calls — [`GaussianOrder::SecondOrder`] on
+/// [`recursive_gaussian_f64_into`] calls — [`GaussianOrder::SecondOrder`] on
 /// one axis, [`GaussianOrder::ZeroOrder`] on the rest — dividing each axis's
 /// second derivative by `spacing[d]^2` again to convert it from
-/// `recursive_gaussian_with_order`'s index space to physical space.
+/// the recursion's index space to physical space.
 /// `normalize_across_scale` is ITK's `NormalizeAcrossScale` (off by default).
 /// Output is always [`PixelId::Float32`].
 ///
@@ -430,20 +460,36 @@ pub fn laplacian_recursive_gaussian(
     normalize_across_scale: bool,
 ) -> Result<Image> {
     let dim = img.dimension();
+    let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
-    let scratch = scratch_f64(img)?;
     let sigma_array = vec![sigma; dim];
 
-    let mut acc = vec![0.0f64; img.number_of_pixels()];
+    // Same three-volume shape as `gradient_magnitude_recursive_gaussian`, and it
+    // was the same defect: a per-axis recursion that allocated its own volume,
+    // round-tripped it through an `Image` for nothing, and unwrapped it again.
+    let src = img.to_f64_vec()?;
+    let mut work = vec![0.0f64; src.len()];
+    let mut acc = vec![0.0f64; src.len()];
+
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::SecondOrder;
-        let deriv =
-            recursive_gaussian_with_order(&scratch, &sigma_array, &orders, normalize_across_scale)?;
+        work.copy_from_slice(&src);
+        recursive_gaussian_f64_into(
+            &mut work,
+            &size,
+            &spacing,
+            &sigma_array,
+            &orders,
+            normalize_across_scale,
+        )?;
+        // `inv_spacing_sq` is precomputed and multiplied, as it always was here —
+        // unlike the gradient magnitude above, which divides. Keeping each
+        // filter's own arithmetic is what keeps each checksum.
         let inv_spacing_sq = 1.0 / (spacing[d] * spacing[d]);
-        for (a, v) in acc.iter_mut().zip(deriv.to_f64_vec()?) {
-            *a += v * inv_spacing_sq;
-        }
+        parallel::for_each_mut(&mut acc, |i, a| {
+            *a += work[i] * inv_spacing_sq;
+        });
     }
 
     image_from_f64(PixelId::Float32, img.size(), img, &acc)
@@ -540,11 +586,11 @@ pub fn gradient(img: &Image, use_image_spacing: bool, use_image_direction: bool)
 /// `GradientRecursiveGaussianImageFilter.yaml:9-11`, default `1.0`), assembled
 /// into a covariant-vector image.
 ///
-/// For each axis `d`, this composes per-axis `recursive_gaussian_f64` calls
+/// For each axis `d`, this composes per-axis [`recursive_gaussian_f64_into`] calls
 /// exactly like [`gradient_magnitude_recursive_gaussian`] does —
 /// [`GaussianOrder::FirstOrder`] on axis `d`, [`GaussianOrder::ZeroOrder`] on
 /// the rest — then divides that axis's derivative by `spacing[d]` again to
-/// convert it from `recursive_gaussian_f64`'s index space to physical space,
+/// convert it from the recursion's index space to physical space,
 /// matching the hxx's explicit `it.Get() / spacing`
 /// (`itkGradientRecursiveGaussianImageFilter.hxx:245-251`). Axis `d`'s result
 /// becomes output component `d` (scalar input) or `nc * dim + d` for input
@@ -608,19 +654,33 @@ pub fn gradient_recursive_gaussian(
 
     let mut out = vec![0.0f64; img.number_of_pixels() * input_components * dim];
 
+    let size = img.size().to_vec();
+    // One working buffer for the whole `component x axis` loop, instead of a
+    // fresh volume inside the recursion on every one of its `input_components *
+    // dim` iterations. `src` is refilled per component, `work` per axis.
+    let mut work = vec![0.0f64; img.number_of_pixels()];
+
     for nc in 0..input_components {
         let component = if img.pixel_id().is_vector() {
             img.extract_component(nc)?
         } else {
             img.clone()
         };
+        let src = component.to_f64_vec()?;
         for d in 0..dim {
             let mut orders = vec![GaussianOrder::ZeroOrder; dim];
             orders[d] = GaussianOrder::FirstOrder;
-            let deriv =
-                recursive_gaussian_f64(&component, &sigma_array, &orders, normalize_across_scale)?;
+            work.copy_from_slice(&src);
+            recursive_gaussian_f64_into(
+                &mut work,
+                &size,
+                &spacing,
+                &sigma_array,
+                &orders,
+                normalize_across_scale,
+            )?;
             let inv_spacing = 1.0 / spacing[d];
-            for (p, &v) in deriv.iter().enumerate() {
+            for (p, &v) in work.iter().enumerate() {
                 out[p * input_components * dim + nc * dim + d] = v * inv_spacing;
             }
         }

@@ -4,14 +4,22 @@
 //!
 //! This crate is otherwise algorithm-free — it holds pixels and geometry and
 //! provides the [`dispatch_scalar!`] macro that lets the filter and transform
-//! crates recover static typing over a runtime pixel type. The one exception
-//! is [`ops`]'s `std::ops` operator overloads (`img1 + img2`, ...): Rust's
-//! orphan rule only lets the crate that defines [`Image`] implement a foreign
-//! trait like `std::ops::Add` for it, so that arithmetic has to live here
-//! rather than in `sitk-filters` — see the [`ops`] module docs.
+//! crates recover static typing over a runtime pixel type. Two modules are
+//! exceptions, each because it is the only place its code *can* live:
+//!
+//! - [`ops`]'s `std::ops` operator overloads (`img1 + img2`, ...): Rust's orphan
+//!   rule only lets the crate that defines [`Image`] implement a foreign trait
+//!   like `std::ops::Add` for it, so that arithmetic has to live here rather
+//!   than in `sitk-filters` — see the [`ops`] module docs.
+//! - [`deriche`]'s recursive-Gaussian coefficients: they have two consumers,
+//!   `sitk-filters`' host filter and `sitk-cuda`'s device kernel, and since
+//!   `sitk-filters` depends on `sitk-cuda` neither can see the other. This crate
+//!   is the only one both depend on, so it is the only home the math has that
+//!   does not mean writing it twice — see the [`deriche`] module docs.
 
 pub mod alloc;
 pub mod boundary;
+pub mod deriche;
 pub mod error;
 pub mod fused;
 pub mod image;

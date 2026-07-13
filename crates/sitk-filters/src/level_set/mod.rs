@@ -93,7 +93,7 @@ use crate::distance::danielsson_distance_map;
 use crate::error::{FilterError, Result};
 use crate::gradient::laplacian;
 use crate::image_from_f64;
-use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_with_order};
+use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64};
 use function::{CurvatureSpeed, DifferenceFunction, LevelSetFunction};
 use grid::Grid;
 use sitk_core::{Image, PixelId};
@@ -574,14 +574,12 @@ fn advection_field(feature_image: &Image) -> Result<Vec<Vec<f64>>> {
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::FirstOrder;
-        let derivative = recursive_gaussian_with_order(&scratch, &sigma, &orders, false)?;
-        fields.push(
-            derivative
-                .to_f64_vec()?
-                .into_iter()
-                .map(|v| -v / spacing[d])
-                .collect(),
-        );
+        // `scratch` is `Float64` (`scratch_f64`), so `recursive_gaussian_with_order`
+        // would narrow `Float64 -> Float64` — the identity — into an `Image` that
+        // `to_f64_vec` immediately unwraps again. Two full volumes per axis, for
+        // no change in value. Take the `f64` core directly.
+        let derivative = recursive_gaussian_f64(&scratch, &sigma, &orders, false)?;
+        fields.push(derivative.into_iter().map(|v| -v / spacing[d]).collect());
     }
     Ok(fields)
 }

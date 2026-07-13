@@ -130,7 +130,7 @@
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::linalg::{MAX_DIM, Mat, symmetric_eigen};
-use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_with_order};
+use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian, recursive_gaussian_f64};
 use sitk_core::{Image, PixelId};
 
 /// `HalfStencilSize` in 3-D, and so the width of the fixed-size stencil
@@ -469,17 +469,23 @@ fn structure_tensor(
     let base = scalar_image(size, spacing, data.to_vec())?;
 
     // Gradient of the sigma-smoothed image, in physical (world) coordinates.
-    // `recursive_gaussian_with_order` reparametrizes as sigma/spacing[d], so
+    // The recursion reparametrizes as sigma/spacing[d], so
     // its derivative is index-space; dividing by spacing[d] matches ITK's
     // `it.Get() / spacing`.
+    //
+    // `recursive_gaussian_f64` and not `recursive_gaussian_with_order`: `base` is
+    // already `Float64` (`scalar_image` builds it from a `Vec<f64>`), so the
+    // `Image` the latter returns is a `Float64 -> Float64` narrowing — the
+    // identity — that `to_f64_vec` then immediately undoes. The round-trip
+    // materialized two extra full volumes per axis and changed no value.
     let sigmas = vec![noise_scale; dim];
     let mut grads: Vec<Vec<f64>> = Vec::with_capacity(dim);
     for d in 0..dim {
         let mut orders = vec![GaussianOrder::ZeroOrder; dim];
         orders[d] = GaussianOrder::FirstOrder;
-        let g = recursive_gaussian_with_order(&base, &sigmas, &orders, false)?;
+        let g = recursive_gaussian_f64(&base, &sigmas, &orders, false)?;
         let sp = spacing[d];
-        grads.push(g.to_f64_vec()?.iter().map(|v| v / sp).collect());
+        grads.push(g.iter().map(|v| v / sp).collect());
     }
 
     // `TransformLocalVectorToPhysicalVector` (m_UseImageDirection is on by
