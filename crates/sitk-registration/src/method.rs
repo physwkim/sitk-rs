@@ -660,6 +660,35 @@ impl VirtualDomain {
     }
 }
 
+/// What one resolution level of a run did.
+///
+/// A multi-resolution run optimizes once per level, and until this existed only
+/// the *last* level's diagnostics survived: a caller could not see that a coarse
+/// level had burned its iteration cap, or had converged in two steps, or had run
+/// on a level whose valid-sample count was a fraction of the native grid's. Those
+/// are the facts you need to tell a pyramid that is doing work from one that is
+/// only costing you time.
+#[derive(Clone, Debug)]
+pub struct LevelResult {
+    /// This level's index in the schedule, coarsest (0) to finest.
+    pub level: usize,
+    /// The shrink factors this level's grid was built with, per axis.
+    pub shrink_factors: Vec<usize>,
+    /// The scalar smoothing sigma configured for this level (before the
+    /// physical-units conversion, i.e. the number the caller set).
+    pub smoothing_sigma: f64,
+    /// Metric value at this level's final iterate.
+    pub metric_value: f64,
+    /// Optimizer steps taken at this level.
+    pub iterations: usize,
+    /// Why this level's optimizer stopped.
+    pub stop_reason: StopReason,
+    /// Fixed samples that mapped inside the moving image at this level's final
+    /// iterate. Counted on *this level's* grid, so a coarse level's count is
+    /// smaller than the native level's by construction.
+    pub valid_points: usize,
+}
+
 /// The optimized transform plus diagnostics from a registration run.
 #[derive(Clone, Debug)]
 pub struct RegistrationResult<T> {
@@ -668,11 +697,52 @@ pub struct RegistrationResult<T> {
     /// Metric value at that transform (lower is better for mean squares).
     pub metric_value: f64,
     /// Optimizer steps taken.
+    ///
+    /// For a multi-resolution run this is the **last (finest) level's** count,
+    /// not the sum over levels — the meaning it has always had. Per-level counts
+    /// are in [`levels`](Self::levels).
     pub iterations: usize,
-    /// Why the optimizer stopped.
+    /// Why the optimizer stopped. Multi-resolution: the last level's reason.
     pub stop_reason: StopReason,
     /// Fixed samples that mapped inside the moving image at the final transform.
+    /// Multi-resolution: counted on the last level's grid.
     pub valid_points: usize,
+    /// One entry per resolution level, coarsest first. A single-level run has
+    /// exactly one entry, whose fields equal the four above.
+    pub levels: Vec<LevelResult>,
+}
+
+impl<T> RegistrationResult<T> {
+    /// Assemble the run's result from its per-level records — the **only** place
+    /// a `RegistrationResult` is built, so `execute` and `execute_on_device`
+    /// cannot drift on what the top-level fields mean.
+    ///
+    /// The top-level fields are the *last* level's, which is what they have
+    /// always been: a caller reading `iterations` today keeps reading the same
+    /// number.
+    fn from_levels(transform: T, levels: Vec<LevelResult>) -> Self {
+        let last = levels
+            .last()
+            .expect("a level schedule always has at least one level");
+        Self {
+            metric_value: last.metric_value,
+            iterations: last.iterations,
+            stop_reason: last.stop_reason,
+            valid_points: last.valid_points,
+            transform,
+            levels,
+        }
+    }
+}
+
+/// Which level of the schedule is being run — the metadata `drive` needs to
+/// stamp onto the [`LevelResult`] it produces, carried as one value so both
+/// entry points hand over the same thing.
+#[derive(Clone, Copy, Debug)]
+struct LevelSpec<'a> {
+    index: usize,
+    factors: &'a [usize],
+    sigma: f64,
 }
 
 /// The registration driver. Configure the optimizer (and optionally parameter
@@ -1986,32 +2056,29 @@ impl ImageRegistrationMethod {
         }
 
         let mut transform = initial;
-        let mut diagnostics = None;
+        let mut levels = Vec::with_capacity(schedule.len());
         for (level, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             adapt(level, level_factors, &mut transform)?;
             let sigma = self.physical_sigma(fixed.spacing(), *level_sigma);
             let (fixed_level, moving_level, fixed_mask_level) =
                 self.prepare_level(fixed, moving, &sigma, level_factors, dim)?;
-            let r = self.run_single_level(
+            let spec = LevelSpec {
+                index: level,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.run_single_level(
                 &fixed_level,
                 &moving_level,
                 fixed_mask_level.as_ref(),
-                level,
+                spec,
                 transform,
             )?;
-            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
-            transform = r.transform;
+            levels.push(record);
+            transform = t;
         }
-        let (metric_value, iterations, stop_reason, valid_points) =
-            diagnostics.expect("level schedule always has at least one level");
 
-        Ok(RegistrationResult {
-            transform,
-            metric_value,
-            iterations,
-            stop_reason,
-            valid_points,
-        })
+        Ok(RegistrationResult::from_levels(transform, levels))
     }
 
     /// Register `moving` onto `fixed` starting from the transform stored by
@@ -2519,8 +2586,8 @@ impl ImageRegistrationMethod {
         let schedule = self.level_schedule(geom.dimension())?;
 
         let mut transform = initial;
-        let mut diagnostics = None;
-        for (level_factors, level_sigma) in &schedule {
+        let mut levels = Vec::with_capacity(schedule.len());
+        for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
             let (fl, ml) = Self::prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
             let fixed_level = fl.as_ref().unwrap_or(fixed);
@@ -2544,7 +2611,12 @@ impl ImageRegistrationMethod {
                 }
             }
 
-            let r = self.drive(&metric, transform)?;
+            let spec = LevelSpec {
+                index,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.drive(&metric, spec, transform)?;
 
             // A device failure during the run invalidates the run, not just the
             // iteration it happened in.
@@ -2554,19 +2626,11 @@ impl ImageRegistrationMethod {
                 return Err(e.into());
             }
 
-            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
-            transform = r.transform;
+            levels.push(record);
+            transform = t;
         }
 
-        let (metric_value, iterations, stop_reason, valid_points) =
-            diagnostics.expect("level schedule always has at least one level");
-        Ok(RegistrationResult {
-            transform,
-            metric_value,
-            iterations,
-            stop_reason,
-            valid_points,
-        })
+        Ok(RegistrationResult::from_levels(transform, levels))
     }
 
     /// One resolution level's `(fixed, moving)` pair, built **on the device** — the
@@ -2651,17 +2715,17 @@ impl ImageRegistrationMethod {
         fixed: &Image,
         moving: &Image,
         fixed_mask: Option<&Image>,
-        level: usize,
+        spec: LevelSpec<'_>,
         initial: T,
-    ) -> Result<RegistrationResult<T>> {
+    ) -> Result<(T, LevelResult)> {
         let metric = self.build_metric(
             fixed,
             moving,
             fixed_mask,
             self.sampling_strategy,
-            self.sampling_percentage(level),
+            self.sampling_percentage(spec.index),
         )?;
-        self.drive(&metric, initial)
+        self.drive(&metric, spec, initial)
     }
 
     /// Drive the configured optimizer against an already-built metric.
@@ -2675,8 +2739,9 @@ impl ImageRegistrationMethod {
     fn drive<T: ParametricTransform>(
         &self,
         metric: &ActiveMetric,
+        spec: LevelSpec<'_>,
         initial: T,
-    ) -> Result<RegistrationResult<T>> {
+    ) -> Result<(T, LevelResult)> {
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
@@ -3048,13 +3113,18 @@ impl ImageRegistrationMethod {
             return Err(RegistrationError::NoValidSamples);
         }
 
-        Ok(RegistrationResult {
+        Ok((
             transform,
-            metric_value: final_metric.value,
-            iterations: result.iterations,
-            stop_reason: result.stop_reason,
-            valid_points: final_metric.valid_points,
-        })
+            LevelResult {
+                level: spec.index,
+                shrink_factors: spec.factors.to_vec(),
+                smoothing_sigma: spec.sigma,
+                metric_value: final_metric.value,
+                iterations: result.iterations,
+                stop_reason: result.stop_reason,
+                valid_points: final_metric.valid_points,
+            },
+        ))
     }
 }
 
@@ -3671,6 +3741,75 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// A pyramid reports what every level did, not only the last one — and the
+    /// top-level fields keep meaning the last level's, which is what callers
+    /// already read.
+    #[test]
+    fn every_level_of_a_pyramid_reports_its_own_diagnostics() {
+        let (w, h, sigma, amp) = (64usize, 64usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 32.0, 32.0, sigma, amp);
+        let moving = gaussian(w, h, 35.0, 30.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8)
+            .set_shrink_factors_per_level(vec![4, 2, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 3, "one record per scheduled level");
+        for (i, lv) in r.levels.iter().enumerate() {
+            assert_eq!(lv.level, i, "levels are reported coarsest first");
+        }
+        assert_eq!(r.levels[0].shrink_factors, vec![4, 4]);
+        assert_eq!(r.levels[2].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 2.0);
+        assert_eq!(r.levels[2].smoothing_sigma, 0.0);
+
+        // The coarse level samples a coarse grid: 16x16 against the native 64x64.
+        // This is the fact the old result could not express at all.
+        assert!(
+            r.levels[0].valid_points < r.levels[2].valid_points,
+            "coarse level sampled {} points, native {}",
+            r.levels[0].valid_points,
+            r.levels[2].valid_points
+        );
+        for lv in &r.levels {
+            assert!(lv.iterations > 0, "level {} took no step at all", lv.level);
+        }
+
+        // The four top-level fields are the last level's, unchanged in meaning.
+        let last = r.levels.last().unwrap();
+        assert_eq!(r.iterations, last.iterations);
+        assert_eq!(r.valid_points, last.valid_points);
+        assert_eq!(r.stop_reason, last.stop_reason);
+        assert_eq!(r.metric_value, last.metric_value);
+    }
+
+    /// A single-level run reports exactly one level, so a caller can read
+    /// `levels` unconditionally.
+    #[test]
+    fn a_single_level_run_reports_one_level() {
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 23.0, 18.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 1);
+        assert_eq!(r.levels[0].level, 0);
+        assert_eq!(r.levels[0].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 0.0);
+        assert_eq!(r.levels[0].iterations, r.iterations);
     }
 
     #[test]
