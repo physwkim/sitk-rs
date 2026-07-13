@@ -168,7 +168,7 @@ pub use landmark::LandmarkBasedTransformInitializer;
 pub use lbfgs2::{LBFGS2Optimizer, LineSearchMethod};
 pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
-pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
+pub use method::{EstimateLearningRate, ImageRegistrationMethod, LevelResult, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue, SamplingStrategy};
 pub use optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,

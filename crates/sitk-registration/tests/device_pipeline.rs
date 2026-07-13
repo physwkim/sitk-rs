@@ -794,6 +794,56 @@ fn a_pyramid_run_lands_where_the_host_pyramid_lands() {
         "the finest level took a different number of steps"
     );
 
+    // Per-level diagnostics: both entry points fill them from the same place
+    // (`drive`), so a pyramid that agreed only at the finest level — a coarse
+    // level that burned its cap on one path and converged on the other — is
+    // caught here rather than hidden by the last level's agreement.
+    assert_eq!(
+        device.levels.len(),
+        3,
+        "three scheduled levels, three records"
+    );
+    assert_eq!(host.levels.len(), device.levels.len());
+    for (h, d) in host.levels.iter().zip(device.levels.iter()) {
+        println!(
+            "level {}: shrink {:?} sigma {} | host {} iters, {} valid, metric {:.12} \
+             | device {} iters, {} valid, metric {:.12}",
+            h.level,
+            h.shrink_factors,
+            h.smoothing_sigma,
+            h.iterations,
+            h.valid_points,
+            h.metric_value,
+            d.iterations,
+            d.valid_points,
+            d.metric_value
+        );
+        assert_eq!(d.level, h.level);
+        assert_eq!(d.shrink_factors, h.shrink_factors);
+        assert_eq!(d.smoothing_sigma, h.smoothing_sigma);
+        assert_eq!(
+            d.iterations, h.iterations,
+            "level {} took a different number of steps",
+            h.level
+        );
+        assert_eq!(
+            d.valid_points, h.valid_points,
+            "level {} sampled a different number of points",
+            h.level
+        );
+        assert_eq!(
+            d.stop_reason, h.stop_reason,
+            "level {} stopped for a different reason",
+            h.level
+        );
+        let rel = (d.metric_value - h.metric_value).abs() / (1.0 + h.metric_value.abs());
+        assert!(
+            rel <= 1e-9,
+            "level {} converged to a different metric value: rel {rel:e}",
+            h.level
+        );
+    }
+
     let worst = device
         .transform
         .parameters()

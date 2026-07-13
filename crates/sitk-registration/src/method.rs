@@ -59,8 +59,8 @@
 
 use std::borrow::Cow;
 
-use sitk_core::Image;
-use sitk_filters::{recursive_gaussian, shrink};
+use sitk_core::{Image, PixelId};
+use sitk_filters::{cast, recursive_gaussian, shrink};
 use sitk_transform::{
     AffineTransform, BSplineTransform, Interpolator, ParametricTransform, ResampleImageFilter,
     Transform, TransformBase, TranslationTransform,
@@ -660,6 +660,35 @@ impl VirtualDomain {
     }
 }
 
+/// What one resolution level of a run did.
+///
+/// A multi-resolution run optimizes once per level, and until this existed only
+/// the *last* level's diagnostics survived: a caller could not see that a coarse
+/// level had burned its iteration cap, or had converged in two steps, or had run
+/// on a level whose valid-sample count was a fraction of the native grid's. Those
+/// are the facts you need to tell a pyramid that is doing work from one that is
+/// only costing you time.
+#[derive(Clone, Debug)]
+pub struct LevelResult {
+    /// This level's index in the schedule, coarsest (0) to finest.
+    pub level: usize,
+    /// The shrink factors this level's grid was built with, per axis.
+    pub shrink_factors: Vec<usize>,
+    /// The scalar smoothing sigma configured for this level (before the
+    /// physical-units conversion, i.e. the number the caller set).
+    pub smoothing_sigma: f64,
+    /// Metric value at this level's final iterate.
+    pub metric_value: f64,
+    /// Optimizer steps taken at this level.
+    pub iterations: usize,
+    /// Why this level's optimizer stopped.
+    pub stop_reason: StopReason,
+    /// Fixed samples that mapped inside the moving image at this level's final
+    /// iterate. Counted on *this level's* grid, so a coarse level's count is
+    /// smaller than the native level's by construction.
+    pub valid_points: usize,
+}
+
 /// The optimized transform plus diagnostics from a registration run.
 #[derive(Clone, Debug)]
 pub struct RegistrationResult<T> {
@@ -668,11 +697,52 @@ pub struct RegistrationResult<T> {
     /// Metric value at that transform (lower is better for mean squares).
     pub metric_value: f64,
     /// Optimizer steps taken.
+    ///
+    /// For a multi-resolution run this is the **last (finest) level's** count,
+    /// not the sum over levels — the meaning it has always had. Per-level counts
+    /// are in [`levels`](Self::levels).
     pub iterations: usize,
-    /// Why the optimizer stopped.
+    /// Why the optimizer stopped. Multi-resolution: the last level's reason.
     pub stop_reason: StopReason,
     /// Fixed samples that mapped inside the moving image at the final transform.
+    /// Multi-resolution: counted on the last level's grid.
     pub valid_points: usize,
+    /// One entry per resolution level, coarsest first. A single-level run has
+    /// exactly one entry, whose fields equal the four above.
+    pub levels: Vec<LevelResult>,
+}
+
+impl<T> RegistrationResult<T> {
+    /// Assemble the run's result from its per-level records — the **only** place
+    /// a `RegistrationResult` is built, so `execute` and `execute_on_device`
+    /// cannot drift on what the top-level fields mean.
+    ///
+    /// The top-level fields are the *last* level's, which is what they have
+    /// always been: a caller reading `iterations` today keeps reading the same
+    /// number.
+    fn from_levels(transform: T, levels: Vec<LevelResult>) -> Self {
+        let last = levels
+            .last()
+            .expect("a level schedule always has at least one level");
+        Self {
+            metric_value: last.metric_value,
+            iterations: last.iterations,
+            stop_reason: last.stop_reason,
+            valid_points: last.valid_points,
+            transform,
+            levels,
+        }
+    }
+}
+
+/// Which level of the schedule is being run — the metadata `drive` needs to
+/// stamp onto the [`LevelResult`] it produces, carried as one value so both
+/// entry points hand over the same thing.
+#[derive(Clone, Copy, Debug)]
+struct LevelSpec<'a> {
+    index: usize,
+    factors: &'a [usize],
+    sigma: f64,
 }
 
 /// The registration driver. Configure the optimizer (and optionally parameter
@@ -1986,32 +2056,29 @@ impl ImageRegistrationMethod {
         }
 
         let mut transform = initial;
-        let mut diagnostics = None;
+        let mut levels = Vec::with_capacity(schedule.len());
         for (level, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             adapt(level, level_factors, &mut transform)?;
             let sigma = self.physical_sigma(fixed.spacing(), *level_sigma);
             let (fixed_level, moving_level, fixed_mask_level) =
                 self.prepare_level(fixed, moving, &sigma, level_factors, dim)?;
-            let r = self.run_single_level(
+            let spec = LevelSpec {
+                index: level,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.run_single_level(
                 &fixed_level,
                 &moving_level,
                 fixed_mask_level.as_ref(),
-                level,
+                spec,
                 transform,
             )?;
-            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
-            transform = r.transform;
+            levels.push(record);
+            transform = t;
         }
-        let (metric_value, iterations, stop_reason, valid_points) =
-            diagnostics.expect("level schedule always has at least one level");
 
-        Ok(RegistrationResult {
-            transform,
-            metric_value,
-            iterations,
-            stop_reason,
-            valid_points,
-        })
+        Ok(RegistrationResult::from_levels(transform, levels))
     }
 
     /// Register `moving` onto `fixed` starting from the transform stored by
@@ -2258,6 +2325,12 @@ impl ImageRegistrationMethod {
     /// requirement bites only on a pathologically small input (a level with
     /// `sigma == 0` is a no-op and imposes nothing).
     ///
+    /// **The level is built in floating point.** A non-floating input is cast to
+    /// [`PixelId::Float32`] before it is smoothed, so no level re-quantizes the
+    /// smoothed intensities back to the input's integer type; a `Float64` input
+    /// keeps its width. See the body for why this is upstream's behaviour and not
+    /// a divergence from it (ledger §5.12).
+    ///
     /// The moving image is only smoothed (it is resampled through the transform,
     /// so it is not shrunk). The fixed image is smoothed and then placed on the
     /// coarse **virtual-domain** grid: ITK shrinks the virtual domain with
@@ -2312,6 +2385,37 @@ impl ImageRegistrationMethod {
         factors: &[usize],
         dim: usize,
     ) -> Result<(Cow<'a, Image>, Cow<'a, Image>, Option<Image>)> {
+        // The level pipeline runs in floating point, whatever the caller handed in.
+        //
+        // `recursive_gaussian` narrows back to its *input's* pixel type, so on an
+        // integer volume every level used to round the smoothed intensities back to
+        // the integer type before resampling — and the resample onto a shrunk grid
+        // interpolates, so it rounded a second time. A CT registered as `UInt16` was
+        // being re-quantized once per level, which is a precision loss this
+        // function's parity claim does not have and no caller asked for.
+        //
+        // Promoting is not a divergence from upstream, it is the only way to *have*
+        // this case: SimpleITK's `ImageRegistrationMethod::Execute` registers only
+        // `RealPixelIDTypeList` (`sitkImageRegistrationMethod.cxx:749`), so it refuses
+        // an integer image outright and the user casts to float first. ITK's own
+        // pyramid smoother is `SmoothingRecursiveGaussianImageFilter<FixedImageType,
+        // FixedImageType>` (`itkImageRegistrationMethodv4.hxx:593`) — output type is
+        // the *image* type, not `float` — so for the types upstream accepts, "smooth
+        // in the image's own float type" is exactly what upstream does. A `Float64`
+        // volume therefore stays `Float64` here; narrowing it to `Float32` (which the
+        // standalone `smoothing_recursive_gaussian` filter would do, since its yaml
+        // rebinds unconditionally to `float`) would be a *new* precision loss on the
+        // one type ITK keeps at full width. Only a non-floating type is promoted, and
+        // it is promoted to `Float32` — what `DeviceImage::upload` already does, so
+        // the host and device pyramids build the same level images (ledger §5.12).
+        let level_type = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            Ok(if img.pixel_id().is_floating_point() {
+                Cow::Borrowed(img)
+            } else {
+                Cow::Owned(cast(img, PixelId::Float32)?)
+            })
+        };
+
         // A zero-sigma level does not smooth, and `recursive_gaussian` returns its
         // input unchanged there (verified bit-for-bit). Running it anyway is not
         // free: it materializes a fresh copy of the volume, and at 256³ the two
@@ -2319,10 +2423,11 @@ impl ImageRegistrationMethod {
         // that smooths nothing. Borrow instead.
         let no_smoothing = sigma.iter().all(|&s| s == 0.0);
         let smooth = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            let img = level_type(img)?;
             Ok(if no_smoothing {
-                Cow::Borrowed(img)
+                img
             } else {
-                Cow::Owned(recursive_gaussian(img, sigma)?)
+                Cow::Owned(recursive_gaussian(&img, sigma)?)
             })
         };
         let smoothed_fixed = smooth(fixed)?;
@@ -2437,13 +2542,16 @@ impl ImageRegistrationMethod {
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
-    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so the device pyramid
-    /// smooths in `f64` and stores `f32`. `sitk_filters::recursive_gaussian` narrows
-    /// back to its *input's* pixel type, so `execute` on a `UInt16` CT re-quantizes
-    /// every level to `UInt16` and this path does not. What this path reproduces,
-    /// bit for bit, is `execute` run on the **`Float32` casts** of the two volumes —
+    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so what this path
+    /// reproduces is `execute` run on the **`Float32` casts** of the two volumes —
     /// which is exactly what [`upload`](sitk_cuda::DeviceImage::upload) put on the
-    /// device.
+    /// device. For an integer input that is now the same thing as `execute` on the
+    /// original volumes: [`prepare_level`](Self::prepare_level) promotes a
+    /// non-floating input to `Float32` before smoothing, so the host pyramid no
+    /// longer re-quantizes a `UInt16` CT at every level while this one does not
+    /// (ledger §5.12; the gap was a worst-parameter 5.5e-4 and a 1.4% coarse-level
+    /// metric difference, pinned in `pyramid_precision.rs`). A `Float64` input still
+    /// differs: the host keeps `f64` levels and the device holds `f32`.
     ///
     /// If a device failure occurs *during* the run, the run is discarded and the
     /// error returned — see [`DeviceActive`].
@@ -2519,8 +2627,8 @@ impl ImageRegistrationMethod {
         let schedule = self.level_schedule(geom.dimension())?;
 
         let mut transform = initial;
-        let mut diagnostics = None;
-        for (level_factors, level_sigma) in &schedule {
+        let mut levels = Vec::with_capacity(schedule.len());
+        for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
             let (fl, ml) = Self::prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
             let fixed_level = fl.as_ref().unwrap_or(fixed);
@@ -2544,7 +2652,12 @@ impl ImageRegistrationMethod {
                 }
             }
 
-            let r = self.drive(&metric, transform)?;
+            let spec = LevelSpec {
+                index,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.drive(&metric, spec, transform)?;
 
             // A device failure during the run invalidates the run, not just the
             // iteration it happened in.
@@ -2554,19 +2667,11 @@ impl ImageRegistrationMethod {
                 return Err(e.into());
             }
 
-            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
-            transform = r.transform;
+            levels.push(record);
+            transform = t;
         }
 
-        let (metric_value, iterations, stop_reason, valid_points) =
-            diagnostics.expect("level schedule always has at least one level");
-        Ok(RegistrationResult {
-            transform,
-            metric_value,
-            iterations,
-            stop_reason,
-            valid_points,
-        })
+        Ok(RegistrationResult::from_levels(transform, levels))
     }
 
     /// One resolution level's `(fixed, moving)` pair, built **on the device** — the
@@ -2651,17 +2756,17 @@ impl ImageRegistrationMethod {
         fixed: &Image,
         moving: &Image,
         fixed_mask: Option<&Image>,
-        level: usize,
+        spec: LevelSpec<'_>,
         initial: T,
-    ) -> Result<RegistrationResult<T>> {
+    ) -> Result<(T, LevelResult)> {
         let metric = self.build_metric(
             fixed,
             moving,
             fixed_mask,
             self.sampling_strategy,
-            self.sampling_percentage(level),
+            self.sampling_percentage(spec.index),
         )?;
-        self.drive(&metric, initial)
+        self.drive(&metric, spec, initial)
     }
 
     /// Drive the configured optimizer against an already-built metric.
@@ -2675,8 +2780,9 @@ impl ImageRegistrationMethod {
     fn drive<T: ParametricTransform>(
         &self,
         metric: &ActiveMetric,
+        spec: LevelSpec<'_>,
         initial: T,
-    ) -> Result<RegistrationResult<T>> {
+    ) -> Result<(T, LevelResult)> {
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
@@ -3048,13 +3154,18 @@ impl ImageRegistrationMethod {
             return Err(RegistrationError::NoValidSamples);
         }
 
-        Ok(RegistrationResult {
+        Ok((
             transform,
-            metric_value: final_metric.value,
-            iterations: result.iterations,
-            stop_reason: result.stop_reason,
-            valid_points: final_metric.valid_points,
-        })
+            LevelResult {
+                level: spec.index,
+                shrink_factors: spec.factors.to_vec(),
+                smoothing_sigma: spec.sigma,
+                metric_value: final_metric.value,
+                iterations: result.iterations,
+                stop_reason: result.stop_reason,
+                valid_points: final_metric.valid_points,
+            },
+        ))
     }
 }
 
@@ -3671,6 +3782,75 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// A pyramid reports what every level did, not only the last one — and the
+    /// top-level fields keep meaning the last level's, which is what callers
+    /// already read.
+    #[test]
+    fn every_level_of_a_pyramid_reports_its_own_diagnostics() {
+        let (w, h, sigma, amp) = (64usize, 64usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 32.0, 32.0, sigma, amp);
+        let moving = gaussian(w, h, 35.0, 30.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8)
+            .set_shrink_factors_per_level(vec![4, 2, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 3, "one record per scheduled level");
+        for (i, lv) in r.levels.iter().enumerate() {
+            assert_eq!(lv.level, i, "levels are reported coarsest first");
+        }
+        assert_eq!(r.levels[0].shrink_factors, vec![4, 4]);
+        assert_eq!(r.levels[2].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 2.0);
+        assert_eq!(r.levels[2].smoothing_sigma, 0.0);
+
+        // The coarse level samples a coarse grid: 16x16 against the native 64x64.
+        // This is the fact the old result could not express at all.
+        assert!(
+            r.levels[0].valid_points < r.levels[2].valid_points,
+            "coarse level sampled {} points, native {}",
+            r.levels[0].valid_points,
+            r.levels[2].valid_points
+        );
+        for lv in &r.levels {
+            assert!(lv.iterations > 0, "level {} took no step at all", lv.level);
+        }
+
+        // The four top-level fields are the last level's, unchanged in meaning.
+        let last = r.levels.last().unwrap();
+        assert_eq!(r.iterations, last.iterations);
+        assert_eq!(r.valid_points, last.valid_points);
+        assert_eq!(r.stop_reason, last.stop_reason);
+        assert_eq!(r.metric_value, last.metric_value);
+    }
+
+    /// A single-level run reports exactly one level, so a caller can read
+    /// `levels` unconditionally.
+    #[test]
+    fn a_single_level_run_reports_one_level() {
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 23.0, 18.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 1);
+        assert_eq!(r.levels[0].level, 0);
+        assert_eq!(r.levels[0].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 0.0);
+        assert_eq!(r.levels[0].iterations, r.iterations);
     }
 
     #[test]
