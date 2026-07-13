@@ -334,3 +334,123 @@ fn a_non_affine_transform_is_refused_by_name() {
     // The affine transform it *does* have a kernel for still works on the same metric.
     assert!(metric.evaluate(&probe_transform(n)).is_ok());
 }
+
+/// The device Gaussian is **bit-identical** to `sitk_filters::smooth_gaussian`.
+///
+/// Not a tolerance: the two paths perform the same operations in the same order —
+/// the same host-computed `f64` weights, `f64` intermediates between axes, the same
+/// clamped boundary, and no FMA contraction on the device (`__dmul_rn` /
+/// `__dadd_rn`). Anything that breaks that equality is a real divergence, not
+/// rounding, and this test is where it should be caught.
+#[test]
+fn the_device_gaussian_is_bit_identical_to_the_host_filter() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let img = volume(48, [0.0; 3]);
+    let sigma = [1.5, 2.0, 1.0];
+
+    let cpu = sitk_filters::smooth_gaussian(&img, &sigma).unwrap();
+    let gpu = sitk_cuda::smooth_gaussian(&DeviceImage::upload(&img).unwrap(), &sigma)
+        .unwrap()
+        .to_host()
+        .unwrap();
+
+    let (a, b) = (
+        cpu.scalar_slice::<f32>().unwrap(),
+        gpu.scalar_slice::<f32>().unwrap(),
+    );
+    let differing = a
+        .iter()
+        .zip(b.iter())
+        .filter(|&(&x, &y)| x.to_bits() != y.to_bits())
+        .count();
+    let max_abs = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x as f64 - y as f64).abs())
+        .fold(0.0f64, f64::max);
+    println!(
+        "device gaussian vs host filter: {differing}/{} voxels differ, max_abs {max_abs:e}",
+        a.len()
+    );
+    assert_eq!(
+        differing, 0,
+        "the device Gaussian diverged from the CPU filter"
+    );
+}
+
+/// A zero `sigma` axis is untouched on the device too, as on the CPU.
+#[test]
+fn the_device_gaussian_leaves_a_zero_sigma_axis_alone() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let img = volume(32, [0.0; 3]);
+    let cpu = sitk_filters::smooth_gaussian(&img, &[0.0, 0.0, 0.0]).unwrap();
+    let gpu = sitk_cuda::smooth_gaussian(&DeviceImage::upload(&img).unwrap(), &[0.0, 0.0, 0.0])
+        .unwrap()
+        .to_host()
+        .unwrap();
+    assert_eq!(
+        cpu.scalar_slice::<f32>().unwrap(),
+        gpu.scalar_slice::<f32>().unwrap()
+    );
+    assert_eq!(
+        gpu.scalar_slice::<f32>().unwrap(),
+        img.scalar_slice::<f32>().unwrap(),
+        "zero sigma must be the identity"
+    );
+}
+
+/// The pipeline the user actually described, with nothing crossing the bus in the
+/// middle: `upload → rescale → smooth → register`, against the same chain on the
+/// host. Same reduction-rounding band as every other GPU-vs-CPU metric comparison.
+#[test]
+fn the_full_resident_pipeline_agrees_with_the_host_pipeline() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let sigma = [1.0, 1.0, 1.0];
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let t = probe_transform(n);
+
+    let host_chain = |img: &Image| {
+        let r = sitk_filters::rescale_intensity(img, OUT_MIN, OUT_MAX).unwrap();
+        sitk_filters::smooth_gaussian(&r, &sigma).unwrap()
+    };
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image(&host_chain(&fixed)).unwrap(),
+        MovingImage::from_image(&host_chain(&moving)).unwrap(),
+    )
+    .unwrap();
+    let cpu = host.evaluate(&t, &CpuBackend);
+
+    let device_chain = |img: &Image| {
+        let d = DeviceImage::upload(img).unwrap();
+        let r = sitk_cuda::rescale_intensity(&d, OUT_MIN, OUT_MAX).unwrap();
+        sitk_cuda::smooth_gaussian(&r, &sigma).unwrap()
+    };
+    let d_f = device_chain(&fixed);
+    let d_m = device_chain(&moving);
+    let mut device = DeviceMeanSquaresMetric::from_device(&d_f, &d_m).unwrap();
+    let gpu = device.evaluate(&t).unwrap();
+
+    let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+    let v_err = rel(gpu.value, cpu.value);
+    let d_err = gpu
+        .derivative
+        .iter()
+        .zip(cpu.derivative.iter())
+        .map(|(&g, &c)| rel(g, c))
+        .fold(0.0f64, f64::max);
+    println!("full pipeline: value rel err {v_err:e} | derivative rel err {d_err:e}");
+    assert_eq!(gpu.valid_points, cpu.valid_points);
+    assert!(v_err <= 1e-9, "value rel err {v_err:e} exceeds 1e-9");
+    assert!(d_err <= 1e-9, "derivative rel err {d_err:e} exceeds 1e-9");
+    assert!(cpu.derivative.iter().any(|d| d.abs() > 1e-6));
+}

@@ -36,6 +36,7 @@ pub use buffer::DeviceBuffer;
 pub use error::CudaError;
 pub use image::{DeviceImage, Geometry};
 pub use ops::device::rescale_intensity;
+pub use ops::gaussian::smooth_gaussian;
 pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
 pub use ops::rescale_intensity::{
     rescale_intensity_gpu, rescale_intensity_gpu_into, rescale_intensity_resident,
