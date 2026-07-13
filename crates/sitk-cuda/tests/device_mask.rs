@@ -1,10 +1,18 @@
-//! [`DeviceMask`] and the invariant that governs it: **`has_fmask ⟹ !has_pts`**.
+//! [`DeviceMask`] and the invariant that governs it: **a fixed mask requires a sample
+//! set that knows its grid index.**
 //!
-//! A fixed mask gates a sample by its *grid* index. An explicit fixed-point list is a
-//! host-selected subset in an arbitrary order, where the same index refers to a
-//! different voxel — so a mask indexed into it would gate silently wrong samples. The
+//! A fixed mask gates a sample by its *grid* index, so the question is only ever whether
+//! the sample set still knows what that index is. An explicit fixed-point *list* does not
+//! — it is a host-selected subset in an arbitrary order that kept the points and threw
+//! the indices away, and a mask indexed into it would gate silently wrong samples. That
 //! combination is refused by name at construction ([`CudaError::MaskedExplicitPoints`]),
 //! not clamped and not checked in the kernel, and this file is the gate on that.
+//!
+//! An *index* list ([`FixedPoints::Indices`]) is the sample set that kept the index, so
+//! the mask means exactly what it means on the full grid — `fmask[idx[s]]` — and the two
+//! compose. The earlier form of this invariant (`has_fmask ⟹ !has_pts`) forbade that
+//! combination too, which was right when a selected sample set could only be a point
+//! list and is wrong now that it can be an index list.
 //!
 //! Also here: a mask whose grid is not the fixed grid is refused, and the mask's
 //! nonzero-is-inside convention (the host's) holds for whatever pixel type it arrived in.
@@ -367,4 +375,55 @@ fn intersect_is_the_elementwise_and_and_refuses_a_grid_mismatch() {
         Err(e) => panic!("refused, but by the wrong name: {e}"),
         Ok(_) => panic!("two masks on different grids were intersected"),
     }
+}
+
+/// The other half of the invariant: an **index** list keeps the grid index, so a fixed
+/// mask composes with it and gates exactly the voxels it gates on the full grid.
+///
+/// The list here names voxels the mask keeps *and* voxels it drops, so a device that
+/// ignored the mask, or that indexed it by position-in-the-list instead of by grid voxel,
+/// lands on a different count. Checked against the count computed on the host from the
+/// same two objects — not against the device's own answer in another configuration.
+#[test]
+fn a_fixed_mask_composes_with_an_index_list_and_gates_by_grid_index() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 16;
+    let (fixed, moving) = (volume(n), volume(n));
+    let keep = checker(n); // voxel v survives iff v % 3 == 0
+    let mask = DeviceMask::upload(&keep).unwrap();
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+
+    // Every 5th voxel: a list that straddles the mask, since 5 and 3 are coprime.
+    let voxels = n * n * n;
+    let idx: Vec<i64> = (0..voxels).step_by(5).map(|v| v as i64).collect();
+    let expected = idx.iter().filter(|&&v| v % 3 == 0).count();
+    assert!(
+        expected > 0 && expected < idx.len(),
+        "the mask must drop some of the list and keep some of it, or this proves nothing"
+    );
+
+    let points = FixedPoints::Indices {
+        idx: &idx,
+        size: &SIZE,
+        origin: &ORIGIN,
+        idx_to_phys: &EYE,
+    };
+    let m = ResidentMetric::from_device_masked(&d_f, points, Some(&mask), &d_m, &moving_geometry())
+        .expect("a fixed mask and an index list must compose")
+        .evaluate(&EYE, &[0.0, 0.0, 0.0])
+        .unwrap();
+
+    // The identity map keeps every sample inside the moving image, so the only thing
+    // that can reduce the count is the mask.
+    assert_eq!(
+        m.count,
+        expected,
+        "the mask gated {} of {} listed samples; by grid index it should gate {expected}",
+        m.count,
+        idx.len()
+    );
 }

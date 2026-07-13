@@ -47,11 +47,23 @@ pub enum CudaError {
     /// against an explicit, host-selected point list — where the samples are already
     /// a subset in an arbitrary order and the same index refers to a different voxel.
     /// The two are refused together rather than silently gating the wrong samples.
+    ///
+    /// The rule is not "no mask with a selected sample set" but *a fixed mask requires
+    /// a sample set that knows its grid index*: an index list
+    /// ([`FixedPoints::Indices`](crate::FixedPoints::Indices)) carries that index and
+    /// is masked correctly. A bare point list has thrown it away, and this is where it
+    /// says so.
     #[error(
         "a fixed mask is indexed by the fixed grid, so it cannot be combined with an \
          explicit fixed-point list"
     )]
     MaskedExplicitPoints,
+
+    /// A sample's index does not name a voxel of the fixed grid. Checked on the host
+    /// before launch: the kernel would read outside the volume, and a clamped read
+    /// would silently sample the wrong voxel.
+    #[error("fixed sample index {index} is outside the fixed grid ({voxels} voxels)")]
+    SampleIndexOutOfGrid { index: i64, voxels: usize },
 
     /// The image is a vector/complex image, or its buffer does not match its
     /// declared pixel type — `sitk_core` already names this precisely, so

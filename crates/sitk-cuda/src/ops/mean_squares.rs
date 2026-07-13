@@ -89,6 +89,11 @@ const BLOCK: u32 = 256;
 const GRID: u32 = 512;
 /// `sq` (1) + `S0[3]` (3) + `S1[3][3]` (9) + `count` (1).
 const NSLOT: usize = 14;
+/// The sample-set forms, mirroring the kernel's `MODE_*` defines. See [`FixedPoints`].
+const MODE_GRID: i32 = 0;
+const MODE_POINTS: i32 = 1;
+const MODE_INDICES: i32 = 2;
+
 /// This backend handles 3-D only. The moment algebra generalizes, but the kernel
 /// is written for `dim = 3` and a 2-D caller falls back to the CPU.
 pub const DIM: usize = 3;
@@ -145,11 +150,18 @@ __device__ __forceinline__ double fmadd_rn(double acc, double a, double b) {
     return __dadd_rn(acc, __dmul_rn(a, b));
 }
 
+// Where a sample comes from. The kernel reads exactly one of `fpts` / `fidx`, and
+// in MODE_GRID neither: the sample IS the grid voxel of the same index.
+#define MODE_GRID    0
+#define MODE_POINTS  1
+#define MODE_INDICES 2
+
 extern "C" __global__ void ms_moments(
-    const FSCALAR* __restrict__ fvals,    // fixed sample values, n
-    const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); unused if !has_pts
-    const int has_pts,
-    const long long* __restrict__ fsize,  // 3, fixed grid size (used if !has_pts)
+    const FSCALAR* __restrict__ fvals,    // fixed values: n in MODE_POINTS, the whole grid otherwise
+    const double* __restrict__ fpts,      // fixed sample points, n * 3 (row-major); MODE_POINTS only
+    const int mode,
+    const long long* __restrict__ fidx,   // sample -> fixed grid index, n; MODE_INDICES only
+    const long long* __restrict__ fsize,  // 3, fixed grid size (MODE_GRID and MODE_INDICES)
     const double* __restrict__ forigin,   // 3
     const double* __restrict__ fmat,      // 3x3 index_to_physical, row-major
     const long long n,
@@ -170,11 +182,18 @@ extern "C" __global__ void ms_moments(
 
     const long long stride = (long long)blockDim.x * gridDim.x;
     for (long long s = (long long)blockIdx.x * blockDim.x + threadIdx.x; s < n; s += stride) {
-        // The fixed mask drops the sample before any work is done on it. `s` IS the
-        // fixed grid's flat index -- which is why a fixed mask and explicit fixed
-        // points are refused together at construction: with an explicit point list
-        // the samples have already been selected host-side and `s` indexes that list,
-        // not the grid.
+        // The sample's voxel in the FIXED GRID. In MODE_GRID sample `s` *is* grid
+        // voxel `s`, so `gv == s` and every expression below is what it has always
+        // been, term for term. In MODE_INDICES the host chose the voxels and `gv` is
+        // the one it chose. MODE_POINTS has no grid index at all -- the host gathered
+        // the values and the points itself -- and `gv` degenerates to `s`, which is how
+        // that path indexes its own gathered arrays.
+        const long long gv = (mode == MODE_INDICES) ? fidx[s] : s;
+
+        // The fixed mask drops the sample before any work is done on it, gated by the
+        // sample's GRID voxel. That is what makes the mask meaningful in MODE_INDICES
+        // as well as MODE_GRID -- and what makes it meaningless in MODE_POINTS, where
+        // there is no grid index and the two are refused together at construction.
         //
         // This `continue` does not perturb the reduction. The tree is a function of
         // (BLOCK, GRID, n) and nothing else, and within a thread the surviving terms
@@ -182,20 +201,22 @@ extern "C" __global__ void ms_moments(
         // rest. `is_inside` and the moving mask below already skip samples this way,
         // so a data-dependent valid count is the status quo, not something the fixed
         // mask introduces.
-        if (has_fmask && !fmask[s]) continue;
+        if (has_fmask && !fmask[gv]) continue;
 
-        // The sample's physical point. When the sample set is the whole fixed grid
-        // in traversal order -- the common case -- it is a pure function of `s` and
-        // the grid, so it is DERIVED here rather than uploaded: at 256^3 the points
-        // array is 402 MB, which was 60% of the only large transfer in the run.
+        // The sample's physical point. Unless the host uploaded points, it is a pure
+        // function of the sample's grid voxel `gv` and the grid, so it is DERIVED here
+        // rather than uploaded: at 256^3 the points array is 402 MB, which was 60% of
+        // the only large transfer in the run. A sampled set derives it from the SAME
+        // expression -- so sample `s` of a sampled run reads the point that voxel
+        // `gv` reads in a full run, bit for bit, rather than a separately computed one.
         // Same arithmetic, same order, as the host's `write_point_at`.
         double x[3];
-        if (has_pts) {
+        if (mode == MODE_POINTS) {
             x[0] = fpts[s*3+0]; x[1] = fpts[s*3+1]; x[2] = fpts[s*3+2];
         } else {
-            const double i = (double)(s % fsize[0]);
-            const double j = (double)((s / fsize[0]) % fsize[1]);
-            const double k = (double)(s / (fsize[0] * fsize[1]));
+            const double i = (double)(gv % fsize[0]);
+            const double j = (double)((gv / fsize[0]) % fsize[1]);
+            const double k = (double)(gv / (fsize[0] * fsize[1]));
             // VirtualGrid::point: the origin is the accumulator's seed, then one
             // rounded multiply-add per axis.
             for (int r = 0; r < 3; ++r) {
@@ -281,7 +302,9 @@ extern "C" __global__ void ms_moments(
             g[d] = gi[0]*mmat[0*3+d] + gi[1]*mmat[1*3+d] + gi[2]*mmat[2*3+d];
         }
 
-        const double diff = value - (double)fvals[s];
+        // The fixed value at the sample's grid voxel. Same `gv` as the point and the
+        // mask: value, point and gate cannot disagree about which voxel this is.
+        const double diff = value - (double)fvals[gv];
         acc[0] += diff * diff;
         for (int d = 0; d < 3; ++d) {
             const double dg = diff * g[d];
@@ -409,14 +432,39 @@ pub struct MovingGeometry<'a> {
 /// the kernel derives each point from its own `s`. At 256³ that removes a 402 MB
 /// upload — 60% of the run's only large transfer.
 ///
-/// [`Explicit`](Self::Explicit) is for a sampled or masked set, whose points are
-/// an arbitrary subset in an arbitrary order and must be uploaded.
+/// [`Explicit`](Self::Explicit) is for a set whose points are *not* voxel centers of
+/// the fixed grid — it carries the points themselves and nothing else.
+///
+/// [`Indices`](Self::Indices) is for a **sampled** set, and it is the one a sampling
+/// strategy uses. A sampled set is not an arbitrary point cloud: our sampler does not
+/// jitter (`sitk_registration::metric::FixedSamples::from_image_with`, a documented
+/// deviation from ITK), so every sample is a voxel center and the sample is fully
+/// described by its flat grid index. Saying it that way costs 8 bytes per sample
+/// instead of 24, and buys two things the point list cannot:
+///
+/// - the point is *derived* from the same closed form [`Grid`](Self::Grid) uses, so a
+///   sampled run reads what a full run reads at that voxel, bit for bit, rather than a
+///   separately computed approximation of it;
+/// - the sample knows its grid index, so a **fixed mask** — which gates by grid index —
+///   still means something. That is the whole difference between this and
+///   [`Explicit`](Self::Explicit), and it is why the mask is refused with one and
+///   allowed with the other.
 pub enum FixedPoints<'a> {
-    /// One point per sample, row-major `N × 3`.
+    /// One point per sample, row-major `N × 3`. The values are the host's gathered
+    /// per-sample values, indexed by sample.
     Explicit(&'a [f64]),
     /// Every voxel of `size`, in dim-0-fastest order. `idx_to_phys` is row-major
     /// `3 × 3`; the sample count must equal the product of `size`.
     Grid {
+        size: &'a [usize],
+        origin: &'a [f64],
+        idx_to_phys: &'a [f64],
+    },
+    /// Sample `s` is the fixed grid's flat voxel `idx[s]`, in the grid described by
+    /// `size` / `origin` / `idx_to_phys`. Duplicates are allowed — `Random` draws with
+    /// replacement — and the values are the whole grid's, indexed by `idx[s]`.
+    Indices {
+        idx: &'a [i64],
         size: &'a [usize],
         origin: &'a [f64],
         idx_to_phys: &'a [f64],
@@ -427,7 +475,9 @@ pub struct ResidentMetric {
     n: usize,
     vols: Volumes,
     d_fpts: DeviceBuffer<f64>,
-    has_pts: i32,
+    /// Which of `d_fpts` / `d_fidx` the kernel reads, if either: one of `MODE_*`.
+    mode: i32,
+    d_fidx: DeviceBuffer<i64>,
     d_fsize: DeviceBuffer<i64>,
     d_forigin: DeviceBuffer<f64>,
     d_fmat: DeviceBuffer<f64>,
@@ -547,9 +597,16 @@ impl ResidentMetric {
         if moving.len() != moving_geometry.len {
             return Err(CudaError::DegenerateInput);
         }
+        // The sample count is the sample set's, not the volume's: a sampled run holds
+        // the whole fixed image on the device (the values are gathered *in the kernel*,
+        // by grid index) while evaluating only the voxels the host selected.
+        let n = match &fixed_points {
+            FixedPoints::Indices { idx, .. } => idx.len(),
+            _ => fixed.len(),
+        };
         let backend = backend()?;
         Self::build(
-            fixed.len(),
+            n,
             Volumes::Split {
                 // The fixed samples: narrow, one load per sample.
                 fvals: DeviceBuffer::copy_of(backend, fixed.buffer().device())?,
@@ -575,7 +632,6 @@ impl ResidentMetric {
         let backend = backend()?;
         let (fvals_len, mbuf_len) = vols.lens();
         if n == 0
-            || fvals_len != n
             || mbuf_len != moving.len
             || moving.size.len() != DIM
             || moving.size.iter().product::<usize>() != moving.len
@@ -584,32 +640,71 @@ impl ResidentMetric {
         }
 
         let as_i64 = |v: &[usize]| v.iter().map(|&x| x as i64).collect::<Vec<_>>();
+        let grid_ok = |size: &[usize], origin: &[f64], idx_to_phys: &[f64]| {
+            size.len() == DIM && origin.len() == DIM && idx_to_phys.len() == DIM * DIM
+        };
 
-        // A zero-length allocation is not a valid kernel pointer, so the unused
-        // side of the choice below still allocates a single dummy element and the
-        // kernel gates on `has_pts`.
-        let (pts, has_pts, fsize, forigin, fmat) = match fixed_points {
+        // A zero-length allocation is not a valid kernel pointer, so each unused arm
+        // below still allocates a single dummy element; the kernel reads `fpts` only in
+        // `MODE_POINTS` and `fidx` only in `MODE_INDICES`.
+        //
+        // `fvals` is indexed by the *sample's grid voxel*, so it holds the whole fixed
+        // grid — except in `MODE_POINTS`, where there is no grid and the host gathered
+        // one value per sample.
+        let (pts, idx, mode, fsize, forigin, fmat) = match fixed_points {
             FixedPoints::Explicit(p) => {
-                if p.len() != n * DIM {
+                if p.len() != n * DIM || fvals_len != n {
                     return Err(CudaError::DegenerateInput);
                 }
-                (p, 1, vec![1i64; DIM], vec![0.0; DIM], vec![0.0; DIM * DIM])
+                (
+                    p,
+                    &[0i64][..],
+                    MODE_POINTS,
+                    vec![1i64; DIM],
+                    vec![0.0; DIM],
+                    vec![0.0; DIM * DIM],
+                )
             }
             FixedPoints::Grid {
                 size,
                 origin,
                 idx_to_phys,
             } => {
-                if size.len() != DIM
-                    || origin.len() != DIM
-                    || idx_to_phys.len() != DIM * DIM
+                if !grid_ok(size, origin, idx_to_phys)
                     || size.iter().product::<usize>() != n
+                    || fvals_len != n
                 {
                     return Err(CudaError::DegenerateInput);
                 }
                 (
                     &[0.0f64][..],
-                    0,
+                    &[0i64][..],
+                    MODE_GRID,
+                    as_i64(size),
+                    origin.to_vec(),
+                    idx_to_phys.to_vec(),
+                )
+            }
+            FixedPoints::Indices {
+                idx,
+                size,
+                origin,
+                idx_to_phys,
+            } => {
+                let voxels = size.iter().product::<usize>();
+                if !grid_ok(size, origin, idx_to_phys) || idx.len() != n || fvals_len != voxels {
+                    return Err(CudaError::DegenerateInput);
+                }
+                // Every sample must name a voxel of the grid. Checked here, once, rather
+                // than in the kernel: an out-of-range index would read outside the volume,
+                // and clamping it would silently sample the wrong voxel.
+                if let Some(&bad) = idx.iter().find(|&&i| i < 0 || i as usize >= voxels) {
+                    return Err(CudaError::SampleIndexOutOfGrid { index: bad, voxels });
+                }
+                (
+                    &[0.0f64][..],
+                    idx,
+                    MODE_INDICES,
                     as_i64(size),
                     origin.to_vec(),
                     idx_to_phys.to_vec(),
@@ -631,14 +726,20 @@ impl ResidentMetric {
             }
         };
 
-        // `has_fmask ⟹ !has_pts`, enforced here so the kernel never has to ask. The
-        // fixed mask is indexed by the *grid* sample index; an explicit point list is
-        // a host-selected subset in an arbitrary order, and a mask indexed into that
-        // list would silently gate the wrong samples. Refused by name, not clamped.
+        // **A fixed mask requires a sample set that knows its grid index.** Enforced
+        // here, so the kernel never has to ask: it gates on `fmask[g]`, and `g` is a
+        // grid voxel in `MODE_GRID` and `MODE_INDICES` alike.
+        //
+        // `MODE_POINTS` is the one that cannot satisfy it. A bare point list is a
+        // host-selected subset in an arbitrary order that has *thrown the grid index
+        // away*; a mask indexed into that list is a different object with the same
+        // name, and would silently gate the wrong samples. Refused by name, not
+        // clamped — and it stays refused now that `MODE_INDICES` exists, because an
+        // index list is precisely the thing that kept the index.
         let (d_fmask, has_fmask) = match fixed_mask {
             None => (DeviceBuffer::zeros(backend, 1)?, 0),
             Some(m) => {
-                if has_pts == 1 {
+                if mode == MODE_POINTS {
                     return Err(CudaError::MaskedExplicitPoints);
                 }
                 // The mask is indexed by the fixed grid's *flat* index, so it must be
@@ -655,7 +756,8 @@ impl ResidentMetric {
             n,
             vols,
             d_fpts: DeviceBuffer::from_host(backend, pts)?,
-            has_pts,
+            mode,
+            d_fidx: DeviceBuffer::from_host(backend, idx)?,
             d_fsize: DeviceBuffer::from_host(backend, &fsize)?,
             d_forigin: DeviceBuffer::from_host(backend, &forigin)?,
             d_fmat: DeviceBuffer::from_host(backend, &fmat)?,
@@ -697,7 +799,8 @@ impl ResidentMetric {
             n,
             vols,
             d_fpts,
-            has_pts,
+            mode,
+            d_fidx,
             d_fsize,
             d_forigin,
             d_fmat,
@@ -735,7 +838,8 @@ impl ResidentMetric {
                 launch
                     .arg($fvals.device())
                     .arg(d_fpts.device())
-                    .arg(&*has_pts)
+                    .arg(&*mode)
+                    .arg(d_fidx.device())
                     .arg(d_fsize.device())
                     .arg(d_forigin.device())
                     .arg(d_fmat.device())
@@ -751,26 +855,33 @@ impl ResidentMetric {
                     .arg(&*has_fmask)
                     .arg(d_ab.device())
                     .arg(d_partials.device_mut());
-                // SAFETY: the eighteen arguments match the kernel's eighteen
+                // SAFETY: the nineteen arguments match the kernel's nineteen
                 // parameters in order and type — `fvals` is `FSCALAR` and `mbuf` is
                 // `MSCALAR`, which are the element types of the buffers this arm
                 // matched.
-                // `fvals` holds `n` elements, read only under `s < n`. `d_fpts`
-                // holds `n*3` and is read only when `has_pts != 0`; otherwise it is
-                // a one-element dummy and the kernel reads `d_fsize`/`d_forigin`/
-                // `d_fmat` (3, 3 and 9 elements) instead, whose product-of-size
-                // equals `n` so the derived index stays in the grid. The moving
-                // geometry buffers hold exactly 3, 3, 3 and 9 elements as the
-                // kernel indexes them; `d_mmask` is read only when `has_mask != 0`,
-                // in which case it has one byte per moving voxel and the kernel
-                // bounds-checks the index it builds. `d_fmask` is read only when
-                // `has_fmask != 0`, in which case `build` has checked it holds
-                // exactly `n` bytes and the kernel indexes it with `s < n`; otherwise
-                // it is a one-element dummy. `d_ab` holds 12; `d_partials`
-                // holds `GRID * NSLOT`, and the kernel writes
-                // `blockIdx.x * NSLOT + k` for `blockIdx.x < GRID`, `k < NSLOT`.
-                // Shared memory is declared statically at `BLOCK` doubles, matching
-                // `block_dim`.
+                //
+                // Every read the kernel makes of the fixed side is indexed by `gv`,
+                // and `gv` is a voxel of the fixed grid in every mode: it is `s < n`
+                // in `MODE_GRID` (where `build` checked the grid's product-of-size
+                // equals `n`) and `MODE_POINTS` (where `fvals` holds `n` gathered
+                // values), and it is `fidx[s]` in `MODE_INDICES`, where `build` has
+                // checked *every* index against the grid's voxel count and `fvals`
+                // holds that many. So `fvals[gv]` and `fmask[gv]` are in bounds in all
+                // three, and the point derived from `gv` stays in the grid.
+                //
+                // `d_fpts` holds `n*3` and is read only in `MODE_POINTS`; `d_fidx`
+                // holds `n` and is read only in `MODE_INDICES`; each is a one-element
+                // dummy otherwise, and neither is a valid allocation at length zero,
+                // which is why the dummy exists. `d_fsize`/`d_forigin`/`d_fmat` hold
+                // 3, 3 and 9. The moving geometry buffers hold exactly 3, 3, 3 and 9
+                // elements as the kernel indexes them; `d_mmask` is read only when
+                // `has_mask != 0`, in which case it has one byte per moving voxel and
+                // the kernel bounds-checks the index it builds. `d_fmask` is read only
+                // when `has_fmask != 0`, in which case `build` has checked it covers
+                // the fixed grid. `d_ab` holds 12; `d_partials` holds `GRID * NSLOT`,
+                // and the kernel writes `blockIdx.x * NSLOT + k` for
+                // `blockIdx.x < GRID`, `k < NSLOT`. Shared memory is declared
+                // statically at `BLOCK` doubles, matching `block_dim`.
                 unsafe { launch.launch(cfg)? };
             }};
         }
