@@ -121,4 +121,18 @@ impl<T: DeviceRepr + ValidAsZeroBits> DeviceBuffer<T> {
             slice: backend.stream().alloc_zeros::<T>(len)?,
         })
     }
+
+    /// A private copy of an allocation that is already on the device — never
+    /// touches the bus.
+    ///
+    /// The copy is what lets a consumer *own* voxels that a
+    /// [`DeviceImage`](crate::DeviceImage) it only borrowed is holding: the image
+    /// may be dropped, or handed to another op, without the consumer's buffer
+    /// changing under it.
+    pub fn copy_of(backend: &Backend, src: &CudaSlice<T>) -> Result<Self, CudaError> {
+        let mut out = Self::zeros(backend, src.len())?;
+        backend.stream().memcpy_dtod(src, out.device_mut())?;
+        backend.synchronize()?;
+        Ok(out)
+    }
 }

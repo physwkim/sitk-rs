@@ -69,6 +69,8 @@ use sitk_transform::{
 use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
 use crate::correlation::CorrelationMetric;
 use crate::demons::DemonsMetric;
+#[cfg(feature = "cuda")]
+use crate::device::{DeviceActive, DeviceMeanSquaresMetric, DeviceRegistrationError};
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
@@ -177,6 +179,12 @@ enum MetricKind {
 /// [`physical_shift_scales`]: Self::physical_shift_scales
 enum ActiveMetric {
     MeanSquares(MeanSquaresMetric),
+    /// Mean squares over two volumes that are already on the device
+    /// ([`ImageRegistrationMethod::execute_on_device`]). Selected at construction,
+    /// like every other variant here — the optimizer loop never asks per call where
+    /// a metric lives.
+    #[cfg(feature = "cuda")]
+    Device(Box<DeviceActive>),
     Mattes(MattesMutualInformationMetric),
     Correlation(CorrelationMetric),
     AntsNeighborhoodCorrelation(AntsNeighborhoodCorrelationMetric),
@@ -405,6 +413,8 @@ impl ActiveMetric {
     ) -> MetricValue {
         match self {
             ActiveMetric::MeanSquares(m) => m.evaluate(transform, backend),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.evaluate(transform),
             ActiveMetric::Mattes(m) => m.evaluate(transform),
             ActiveMetric::Correlation(m) => m.evaluate(transform),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.evaluate(transform),
@@ -421,6 +431,8 @@ impl ActiveMetric {
         match self {
             ActiveMetric::Correlation(m) => m.check_transform(transform),
             ActiveMetric::Demons(m) => m.check_transform(transform),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(_) => Ok(()),
             ActiveMetric::MeanSquares(_)
             | ActiveMetric::Mattes(_)
             | ActiveMetric::AntsNeighborhoodCorrelation(_)
@@ -439,6 +451,8 @@ impl ActiveMetric {
     fn value(&self, transform: &dyn ParametricTransform, backend: &dyn MetricBackend) -> f64 {
         match self {
             ActiveMetric::MeanSquares(m) => m.value(transform, backend),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.value(transform),
             ActiveMetric::Mattes(m) => m.value(transform),
             ActiveMetric::Correlation(m) => m.value(transform),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.value(transform),
@@ -455,6 +469,8 @@ impl ActiveMetric {
     ) -> ScalesEstimator {
         match self {
             ActiveMetric::MeanSquares(m) => m.scales_estimator(transform, kind),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.scales_estimator(transform, kind),
             ActiveMetric::Mattes(m) => m.scales_estimator(transform, kind),
             ActiveMetric::Correlation(m) => m.scales_estimator(transform, kind),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.scales_estimator(transform, kind),
@@ -2384,6 +2400,101 @@ impl ImageRegistrationMethod {
         Ok((fixed_level, moving_level, fixed_mask_level))
     }
 
+    /// Register two volumes that are **already on the device**, driving the
+    /// configured optimizer against a [`DeviceMeanSquaresMetric`] — the public
+    /// entry point for the resident pipeline.
+    ///
+    /// This is a separate entry point rather than an overload of
+    /// [`execute`](Self::execute) on purpose, and it is the same reason
+    /// `DeviceMeanSquaresMetric` is a separate type: `execute` must not grow a
+    /// per-iteration "is this on the device?" branch. **The fallback lives here, at
+    /// the boundary.** Every condition the device path cannot take is decided
+    /// *before* the first iteration and returned to the caller by name; the caller
+    /// then runs [`execute`](Self::execute) on the host images. Once optimization
+    /// starts, the metric's identity is fixed and the optimizer — the very same
+    /// driver the host path uses — never asks again.
+    ///
+    /// What the device path takes:
+    ///
+    /// - the **mean-squares** metric (the only one with a kernel);
+    /// - a **globally affine** transform (translation, rigid, Euler, versor,
+    ///   similarity, affine) — the moment identity the kernel evaluates holds for
+    ///   exactly those, and a B-spline or displacement field is refused by name;
+    /// - **linear** interpolation, no masks, no sampling strategy (every voxel of
+    ///   the fixed grid), and a **single resolution level** — a device pyramid needs
+    ///   a device shrink, which does not exist yet;
+    /// - no virtual domain and no fixed-initial transform: the fixed image's own
+    ///   grid is the sampling grid. A moving-initial transform *is* supported (it
+    ///   composes with the optimized transform and the composition is probed for
+    ///   affineness like any other).
+    ///
+    /// If a device failure occurs *during* the run, the run is discarded and the
+    /// error returned — see [`DeviceActive`].
+    #[cfg(feature = "cuda")]
+    pub fn execute_on_device<T: ParametricTransform>(
+        &self,
+        fixed: &sitk_cuda::DeviceImage,
+        moving: &sitk_cuda::DeviceImage,
+        initial: T,
+    ) -> std::result::Result<RegistrationResult<T>, DeviceRegistrationError> {
+        if !matches!(self.metric_kind, MetricKind::MeanSquares) {
+            return Err(DeviceRegistrationError::UnsupportedMetric);
+        }
+        if self.interpolator != Interpolator::Linear {
+            return Err(DeviceRegistrationError::UnsupportedInterpolator(
+                self.interpolator,
+            ));
+        }
+        if !matches!(self.sampling_strategy, SamplingStrategy::None)
+            || self.sampling_percentage_per_level.iter().any(|&p| p != 1.0)
+        {
+            return Err(DeviceRegistrationError::UnsupportedSampling);
+        }
+        if self.fixed_mask.is_some() || self.moving_mask.is_some() {
+            return Err(DeviceRegistrationError::UnsupportedMask);
+        }
+        if self.shrink_factors_per_level.iter().any(|&f| f != 1)
+            || self.smoothing_sigmas_per_level.iter().any(|&s| s != 0.0)
+            || self.shrink_factors_per_level.len() > 1
+            || self.smoothing_sigmas_per_level.len() > 1
+        {
+            return Err(DeviceRegistrationError::UnsupportedPyramid);
+        }
+        if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
+            return Err(DeviceRegistrationError::UnsupportedVirtualDomain);
+        }
+
+        let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
+            DeviceMeanSquaresMetric::from_device(fixed, moving)?,
+        )));
+
+        // The boundary probe: one evaluation at the initial transform, composed
+        // exactly as the optimizer will compose it. This is what turns "the device
+        // cannot take this transform" from a mid-run surprise into a named refusal
+        // the caller can act on.
+        let mut probe = initial;
+        {
+            let composed = Composed {
+                optimized: &mut probe,
+                moving_initial: self.moving_initial_transform.as_ref(),
+            };
+            if let ActiveMetric::Device(d) = &metric {
+                d.metric_evaluate_probe(&composed)?;
+            }
+        }
+
+        let result = self.drive(&metric, probe)?;
+
+        // A device failure during the run invalidates the run, not just the
+        // iteration it happened in.
+        if let ActiveMetric::Device(d) = &metric
+            && let Some(e) = d.take_failure()
+        {
+            return Err(e.into());
+        }
+        Ok(result)
+    }
+
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair
     /// — a single resolution level of [`execute`](Self::execute).
     fn run_single_level<T: ParametricTransform>(
@@ -2401,6 +2512,22 @@ impl ImageRegistrationMethod {
             self.sampling_strategy,
             self.sampling_percentage(level),
         )?;
+        self.drive(&metric, initial)
+    }
+
+    /// Drive the configured optimizer against an already-built metric.
+    ///
+    /// Split out of [`run_single_level`](Self::run_single_level) so that a metric
+    /// which is *not* built from host images — the device-resident one
+    /// ([`execute_on_device`](Self::execute_on_device)) — is optimized by exactly
+    /// this code, rather than by a parallel driver that would drift from it. The
+    /// metric's identity is fixed before the first iteration; nothing in here asks
+    /// per call where it lives.
+    fn drive<T: ParametricTransform>(
+        &self,
+        metric: &ActiveMetric,
+        initial: T,
+    ) -> Result<RegistrationResult<T>> {
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
