@@ -86,9 +86,13 @@ pub enum DeviceRegistrationError {
     #[error("the device metric has no mask support; masked registration is host-only")]
     UnsupportedMask,
 
-    /// A multi-resolution pyramid needs a device shrink, which does not exist yet.
-    #[error("the device path is single-level; a shrink/smooth pyramid is host-only")]
-    UnsupportedPyramid,
+    /// Building a resolution level on the device failed: no device, an NVRTC
+    /// failure, out of memory, or a geometry the pyramid ops have no kernel for (a
+    /// non-3-D image, a shrink factor of zero, an axis too short for the recursive
+    /// Gaussian's fourth-order recursion — the last of which the CPU filter refuses
+    /// as well).
+    #[error("building a resolution level on the device failed: {0}")]
+    Pyramid(#[source] CudaError),
 
     /// The device metric samples the fixed image's own grid.
     #[error(

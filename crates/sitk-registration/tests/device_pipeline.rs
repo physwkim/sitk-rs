@@ -565,14 +565,6 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedMask)
     ));
 
-    let mut reg = ImageRegistrationMethod::new();
-    reg.set_shrink_factors_per_level(vec![2, 1]);
-    reg.set_smoothing_sigmas_per_level(vec![1.0, 0.0]);
-    assert!(matches!(
-        run(&reg),
-        Err(DeviceRegistrationError::UnsupportedPyramid)
-    ));
-
     // And a transform the moment identity does not cover: refused before the run,
     // carrying the metric's own named error rather than a generic failure.
     let reg = ImageRegistrationMethod::new();
@@ -597,7 +589,7 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             DeviceMetricError::NonAffineTransform
         ))
     ));
-    println!("six refusals, each by name, all before the first iteration");
+    println!("five refusals, each by name, all before the first iteration");
 }
 
 /// **The guarantee**, pinned: the device metric is the *same objective* as the host
@@ -736,6 +728,92 @@ fn a_well_conditioned_run_lands_in_the_same_place_on_both_paths() {
     assert!(
         worst <= 1e-9,
         "a well-conditioned run must land in the same place; worst {worst:e}"
+    );
+}
+
+/// The pyramid, which the device path used to refuse outright: a three-level
+/// schedule, shrunk and smoothed, run on both paths from the same start.
+///
+/// Each level's fixed image is built on the device by the same three ops
+/// `prepare_level` uses, and each of the three is bit-identical to its CPU filter
+/// (`pyramid_parity.rs`). This test pins the *composition*: the levels are built in
+/// the same order, the transform is carried from level to level the same way, and
+/// the run therefore lands in the same place — to the same tolerance the metric is
+/// gated at.
+///
+/// Scales come from the physical-shift estimator for the reason `execute_on_device`
+/// documents (and §2.157 records): with unit scales the descent is chaotic on
+/// *both* paths and a 1e-12 metric difference is amplified into a different local
+/// minimum. That is a property of the parameter space, not of the device, and this
+/// test is about the pyramid.
+#[test]
+fn a_pyramid_run_lands_where_the_host_pyramid_lands() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_mean_squares();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-6, 300, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+    reg.set_shrink_factors_per_level(vec![4, 2, 1]);
+    reg.set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .expect("the device path must take a pyramid now");
+
+    println!(
+        "host   : {} iters, {} valid, metric {:.12}",
+        host.iterations, host.valid_points, host.metric_value
+    );
+    println!(
+        "device : {} iters, {} valid, metric {:.12}",
+        device.iterations, device.valid_points, device.metric_value
+    );
+
+    // The finest level is full resolution, so the valid-sample count is the whole
+    // grid on both paths — and if the coarse levels had landed anywhere different,
+    // the finest level would have started from a different transform.
+    assert_eq!(
+        device.valid_points, host.valid_points,
+        "the finest level sampled a different number of points"
+    );
+    assert_eq!(
+        device.iterations, host.iterations,
+        "the finest level took a different number of steps"
+    );
+
+    let worst = device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .map(|(&d, &h)| (d - h).abs() / (1.0 + h.abs()))
+        .fold(0.0f64, f64::max);
+    println!("worst parameter disagreement across the pyramid: {worst:e}");
+    assert!(
+        worst <= 1e-9,
+        "a three-level pyramid must land in the same place on both paths; worst {worst:e}"
+    );
+
+    // And it actually moved: a pyramid that silently did nothing would also agree.
+    let shifted = device.transform.parameters()[3..6]
+        .iter()
+        .any(|&t| t.abs() > 0.5);
+    assert!(
+        shifted,
+        "the registration did not move; the test proves nothing"
     );
 }
 
