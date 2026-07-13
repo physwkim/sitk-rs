@@ -183,6 +183,14 @@ impl DeviceMeanSquaresMetric {
     }
 
     /// Number of fixed samples — every voxel of the fixed image.
+    /// Device bytes held by the fixed and moving volumes.
+    pub fn volume_bytes(&self) -> usize {
+        self.resident
+            .lock()
+            .expect("resident metric poisoned")
+            .volume_bytes()
+    }
+
     pub fn sample_count(&self) -> usize {
         self.lock().sample_count()
     }
