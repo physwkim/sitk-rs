@@ -5,6 +5,7 @@
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::recursive_gaussian::recursive_gaussian;
+use sitk_core::compensated::{CompensatedSum, compensated_sum};
 use sitk_core::{Image, PixelId};
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry, used so a filter's
@@ -194,13 +195,14 @@ pub fn laplacian_sharpening(img: &Image, use_image_spacing: bool) -> Result<Imag
         return Err(FilterError::DegenerateRange);
     }
 
-    let (mut input_min, mut input_max, mut input_sum) = (f64::INFINITY, f64::NEG_INFINITY, 0.0);
+    let (mut input_min, mut input_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut input_sum = CompensatedSum::new();
     for &v in &original {
         input_min = input_min.min(v);
         input_max = input_max.max(v);
-        input_sum += v;
+        input_sum.add(v);
     }
-    let input_mean = input_sum / n as f64;
+    let input_mean = input_sum.sum() / n as f64;
     let input_shift = input_min;
     let input_scale = input_max - input_min;
 
@@ -228,7 +230,7 @@ pub fn laplacian_sharpening(img: &Image, use_image_spacing: bool) -> Result<Imag
         })
         .collect();
 
-    let enhanced_mean = combined.iter().sum::<f64>() / n as f64;
+    let enhanced_mean = compensated_sum(combined.iter().copied()) / n as f64;
 
     let out: Vec<f64> = combined
         .iter()
@@ -239,6 +241,130 @@ pub fn laplacian_sharpening(img: &Image, use_image_spacing: bool) -> Result<Imag
         .collect();
 
     image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
+
+#[cfg(test)]
+mod compensated_laplacian_sharpening {
+    //! `LaplacianSharpeningImageFilter` takes **both** its means from
+    //! `StatisticsImageFilter::GetMean()` (`itkLaplacianSharpeningImageFilter.hxx:54-61`
+    //! for the input, `:131-136` for the enhanced image), and that filter accumulates
+    //! through a `CompensatedSummation` — so upstream compensates these two reductions
+    //! *indirectly*, by delegating them. This port hand-rolled both with a naive `+=`.
+    //!
+    //! Ledger §2.172. It is the member of the §2.165 family that the sweep's anchor could
+    //! not see: the anchor was the token `CompensatedSummation` in an ITK source file, and
+    //! this filter's source does not contain it — it reaches compensation one filter away.
+    use super::*;
+    use sitk_core::compensated::compensated_sum;
+
+    const N: usize = 64;
+
+    /// 4096 intensities near `1e6` whose fractional parts do not sum exactly: the running
+    /// sum reaches ~4.1e9, where each term's low bits fall below an ulp, so the naive walk
+    /// sheds them one rounding at a time and the compensated walk carries them. The two
+    /// means come out **one ulp apart**.
+    ///
+    /// The narrow value range is deliberate and load-bearing. A fixture built the obvious
+    /// way — one enormous pixel among small ones — separates the means by ~1.0, but the
+    /// filter's final `clamp(.., input_min, input_max)` then saturates every pixel and the
+    /// two pipelines produce *identical* output: the pin would have passed against nothing.
+    /// The mean difference has to be small enough to survive the clamp and still move bits.
+    fn fixture() -> Image {
+        let v: Vec<f64> = (0..N * N)
+            .map(|i| 1.0e6 + (i % 7) as f64 * 0.1 + 1.0e-3 * i as f64)
+            .collect();
+        Image::from_vec(&[N, N], v).unwrap()
+    }
+
+    /// The filter's own pipeline, with the two means computed either naively or
+    /// compensated. Everything else is identical, so any difference in the output is the
+    /// means and nothing else.
+    fn replica(img: &Image, compensated: bool) -> Vec<f64> {
+        let original = img.to_f64_vec().unwrap();
+        let n = original.len();
+        let mean = |xs: &[f64]| {
+            if compensated {
+                compensated_sum(xs.iter().copied()) / n as f64
+            } else {
+                xs.iter().sum::<f64>() / n as f64
+            }
+        };
+
+        let (mut input_min, mut input_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in &original {
+            input_min = input_min.min(v);
+            input_max = input_max.max(v);
+        }
+        let input_mean = mean(&original);
+        let input_scale = input_max - input_min;
+
+        let scratch = scratch_f64(img).unwrap();
+        let filtered = crate::laplacian(&scratch, false)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let (mut filtered_min, mut filtered_max) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &v in &filtered {
+            filtered_min = filtered_min.min(v);
+            filtered_max = filtered_max.max(v);
+        }
+        let filtered_scale = filtered_max - filtered_min;
+
+        let combined: Vec<f64> = original
+            .iter()
+            .zip(filtered.iter())
+            .map(|(&orig, &f)| {
+                let adjustment = if filtered_scale == 0.0 {
+                    0.0
+                } else {
+                    (f - filtered_min) * (input_scale / filtered_scale)
+                };
+                orig - (adjustment + input_min)
+            })
+            .collect();
+        let enhanced_mean = mean(&combined);
+
+        combined
+            .iter()
+            .map(|&c| (c - enhanced_mean + input_mean).clamp(input_min, input_max))
+            .collect()
+    }
+
+    /// **The fixture is real.** If the naive and compensated pipelines agreed, the pin
+    /// below could not fail and would be proving nothing — the failure mode that caught
+    /// two of this sweep's other pins.
+    #[test]
+    fn a_naive_mean_and_a_compensated_mean_are_different_numbers_here() {
+        let img = fixture();
+        let data = img.to_f64_vec().unwrap();
+        let naive: f64 = data.iter().sum::<f64>() / data.len() as f64;
+        let compensated = compensated_sum(data.iter().copied()) / data.len() as f64;
+        assert_ne!(
+            naive.to_bits(),
+            compensated.to_bits(),
+            "the fixture must separate the two walks: {naive} vs {compensated}"
+        );
+        assert_ne!(
+            replica(&img, false),
+            replica(&img, true),
+            "the two means must reach the output, or the pin below is vacuous"
+        );
+    }
+
+    /// **The pin.** The filter's means must be the compensated ones. Revert either sum in
+    /// `laplacian_sharpening` to `+=` / `.sum::<f64>()` and this fails.
+    #[test]
+    fn the_sharpening_means_are_compensated_and_a_naive_walk_is_not_good_enough() {
+        let img = fixture();
+        let out = laplacian_sharpening(&img, false)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let compensated = replica(&img, true);
+        for (i, (&a, &b)) in out.iter().zip(compensated.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "pixel {i}: {a} vs {b}");
+        }
+    }
 }
 
 #[cfg(test)]
