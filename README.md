@@ -315,40 +315,58 @@ NDJSON frozen in [`bench/results/`](bench/results/) and the contract in
 [`doc/bench-spec.md`](doc/bench-spec.md). `bench/compare.py` proves both
 harnesses received a byte-identical input before any timing is compared.
 
-**A retraction first, because it is the most important thing this section says.**
-The benchmark harness was timing the box's warm-up: criterion warmed up for 500 ms
-against a ~2.1 s ramp, and the harness's own cell order ran a seconds-long
-*single-threaded* leg immediately before every all-cores leg — cooling 95 of 96
-cores and then timing the recovery. **Every 64³ number this README used to quote is
-withdrawn**, and so is the C++ side of it (the ITK harness warms up with a single
-call, so both halves of every 64³ ratio are contaminated). The measured noise floor
-is 1.13× at 64³, 1.08× at 256³, 1.15× at 512³, and a ratio inside the floor is not a
-tie — it is unresolved. The port now measures under `bench/run_protocol.py` (one op
-per process, a `/proc/stat` quiet gate, a median of ≥6 launches, and a refusal to
-certify any cell whose spread exceeds the floor).
+**A retraction first, because it is the most instructive thing in this section.**
+This README used to publish a set of small-volume *losses*. They were not losses —
+they were two broken harnesses measured against each other, failing in **opposite
+directions**. The Rust side was **penalised**: criterion warmed up for 500 ms against
+a ~2.1 s box ramp, and the harness ran a seconds-long *single-threaded* leg
+immediately before every all-cores leg, cooling 95 of 96 cores and then timing the
+recovery. The C++ side was **flattered by up to 2.4×**: it warmed up with a *single
+call*, and ITK's fresh-process transient runs **fast and climbs** to a plateau
+(`gradient_magnitude` published 1.01 ms; sustained, 2.43 ms). A ratio with a
+penalised numerator and a flattered denominator can be off by **~5×** — and no amount
+of care on our own column would ever have found it, because the ITK transient is
+per-process and survives any quiet gate.
 
-At 256³, all cores, `rust/itk` (below 1.00 means the port is faster): the port wins
-on `binary_dilate` **0.03×**, `connected_component` 0.25×, `signed_maurer_distance_map`
-0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg` 0.47×, `otsu` 0.57×,
-`gradient_magnitude` 0.64×, `discrete_gaussian` 0.76×, `mean` 0.80×,
-`fft_convolution` 0.87×. These sit far outside the floor, and at 256³ the paired
-old-harness/new-harness control found no resolvable inflation, which is why they
-stand. `smoothing_recursive_gaussian` at 256³ used to be quoted here as a 1.02×
-loss; **that is inside the floor and is withdrawn** — it is unresolved, not a tie.
-The port's two real losses are both at 512³: `smoothing_recursive_gaussian` **1.75×**
-and `otsu` **1.37×**.
+Both harnesses are fixed with the same constant from the same measured ramp, and both
+columns are now taken under `bench/run_protocol.py`: one op per process, a
+`/proc/stat` quiet gate, a median of ≥6 launches, and a **refusal to print** any cell
+whose spread exceeds the measured noise floor (1.13× at 64³, 1.08× at 256³, 1.15× at
+512³). A ratio inside the floor is not a tie — it is unresolved, and it does not get
+published as a result.
 
-**Small volumes are where the port has no number at all right now**, and that is a
-change from what this README used to claim. One real seam was found and fixed there:
-the chunk grain was a *constant*, so a 64³ volume could raise **four tasks on a
-96-worker pool** no matter what the kernel did, and a second defect concentrated all
-the expensive boundary voxels into one chunk. Both are closed, and the improvement
-is measured **port-against-port** (same harness on both legs, so the ramp defect
-cancels): the 64³ path is **2–3× faster** than before, and `bit_parity` is unmoved at
-1, 4, 48 and 96 threads. What that does *not* establish is any comparison with ITK.
-Retaking the 64³ table needs the rust column under the new protocol and an ITK column
-whose warm-up covers the ramp; neither is done, and until they are, **this port makes
-no claim about 64³ performance against ITK.**
+**64³, all cores, `rust/itk` — rebuilt, both columns** (below 1.00 means the port is
+faster): `connected_component` **0.08×**, `binary_dilate` 0.09×, `median` 0.14×,
+`gradient_magnitude` 0.21×, `otsu` 0.23×, `discrete_gaussian` 0.26×, `mean` 0.28×,
+`rescale_intensity` 0.40×, `smoothing_recursive_gaussian` 0.72×. **Every certified
+cell is a win.** Three ops (`gmrg`, `fft_convolution`, and ITK's half of
+`signed_maurer_distance_map`) are **refused** rather than printed: this box cannot
+resolve them, and a cell it cannot resolve is a result, not a gap to fill with
+whatever number came out. `mean` was published here as a **2.82× loss** and is a
+**0.28× win**.
+
+**256³**: the port wins on `binary_dilate` **0.03×**, `connected_component` 0.25×,
+`signed_maurer_distance_map` 0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg`
+0.47×, `otsu` 0.57×, `gradient_magnitude` 0.64×, `discrete_gaussian` 0.76×, `mean`
+0.80×, `fft_convolution` 0.87×. Read these as **upper bounds**: the ITK transient has
+been checked at this size for one op so far (`gradient_magnitude`, under-reported
+1.37×, so its true ratio is nearer 0.43×), so the remaining ratios can only move in
+the port's favour. `smoothing_recursive_gaussian` used to be quoted here as a 1.02×
+loss; that is inside the floor and is withdrawn as unresolved.
+
+**The port's two real losses are both at 512³**: `smoothing_recursive_gaussian`
+**1.75×** and `otsu` **1.37×**. Both win at 64³ and 256³ — the loss is specific to the
+size, which is what points at the block decomposition rather than the kernel.
+
+Small volumes did have a real defect, and it was found and fixed *before* the harness
+was: the chunk grain was a **constant**, so a 64³ volume could raise only **four tasks
+on a 96-worker pool** no matter what the kernel did, and a second defect concentrated
+every expensive boundary voxel into one chunk. Both are closed. The improvement is
+measured port-against-port (same harness on both legs, so the defect cancels): the
+64³ path is **2–3× faster**, `bit_parity` unmoved at 1, 4, 48 and 96 threads. Worth
+saying plainly, since the record should show it: **that fix was diagnosed from a
+number that did not exist, and was correct anyway.** A four-task ceiling on a
+96-worker pool is a defect whether or not a benchmark can see it.
 
 The interesting one is `mean` at 256³. It used to lose by **4.39×**, and the cause was not
 the kernel, the decomposition, bandwidth, or NUMA — each eliminated by measurement.
@@ -375,30 +393,38 @@ each one you can trust.
 
 ## Roadmap
 
-1. **Retake the 64³ table**, under `bench/run_protocol.py` on the rust side and a
-   fixed-warm-up C++ harness on the ITK side. This is first because until it is done
-   the port cannot say whether it wins or loses at small volumes, and every
-   optimization aimed there would be aimed at a number nobody can reproduce.
-2. **`mean`'s window locality.** Independent of any ITK comparison, and measured
-   port-against-port: the same 125-tap window costs **1.85× more** on 96 workers than
-   on 8. That is window locality, not task count. No rule has been written, because
-   the taps are non-monotonic (a 3-tap histogram *wins* on a narrow pool, a 6-tap
-   stencil *loses*, a 125-tap window *wins*) and `gradient_magnitude`'s optimal pool
-   width flips with the call shape — so no rule keyed on the op's own structure can
-   be right in both places.
+1. **Retake the 256³ and 512³ ITK columns.** The same mistake one size up: ITK's
+   fresh-process transient was quantified at 64³ for all twelve ops and at 256³ for
+   exactly one — where it under-reported ITK by 1.37×. Nine of twelve at 256³ and ten
+   of twelve at 512³ are untested, not cleared. The prediction, written before the
+   measurement: the transient is per-process and climbing, so a longer benchmark
+   amortizes it rather than escaping it, and the defect should *shrink* with volume.
+2. **The two-mode instability.** `gmrg` is bimodal solo on a quiet box, in *runs*
+   rather than as a coin flip — so something persists across legs inside a process and
+   then flips. Clock, NUMA placement, allocator threshold and heap layout are excluded
+   by measurement; the mechanism is unidentified, and three ops have no certifiable
+   64³ number because of it.
 3. **The line pass.** `for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor is under
    this box's 96 workers — the same arithmetic the grain seam closed, but it
    decomposes by whole blocks, so it needs a different rule. `smoothing_recursive_gaussian`
    (**1.75× at 512³**, the port's largest remaining loss) and `gmrg` spend their time
    there and moved **0%** under the grain seam.
-4. **Device coverage.** **Mattes** — the deterministic histogram it was refused for
+4. **`mean`'s window locality.** Independent of any ITK comparison, and measured
+   port-against-port: the same 125-tap window costs **1.85× more** on 96 workers than
+   on 8. That is window locality, not task count, and it is worth having even though
+   `mean` turns out to win at every size. No rule has been written, because the taps
+   are non-monotonic (a 3-tap histogram *wins* on a narrow pool, a 6-tap stencil
+   *loses*, a 125-tap window *wins*) and `gradient_magnitude`'s optimal pool width
+   flips with the call shape — so no rule keyed on the op's own structure can be right
+   in both places.
+5. **Device coverage.** **Mattes** — the deterministic histogram it was refused for
    now exists and is pinned bit-identical to the host's naive loop; the metric is not
    built on it yet. ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs
    are present and device 0 is the only one used.
-5. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
+6. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
-6. **Close §5.** The open parity-vs-correctness decisions in the ledger.
+7. **Close §5.** The open parity-vs-correctness decisions in the ledger.
 
 ## Build
 
