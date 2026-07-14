@@ -113,6 +113,23 @@ fn elementary_kernel(dim: usize, fully_connected: bool) -> StructuringElement {
     }
 }
 
+/// Image strides, dimension 0 fastest — the same order `Image::linear_index`
+/// uses.
+///
+/// The serial walks below took their linear voxel index from `iter.enumerate()`.
+/// A parallel window map has no counterpart for that, so the index is recovered
+/// from the ND window center instead. It is only ever used to read the mask at
+/// the *same* voxel; it enters no accumulation.
+fn linear_strides(size: &[usize]) -> Vec<usize> {
+    let mut strides = vec![0usize; size.len()];
+    let mut stride = 1usize;
+    for (s, &extent) in strides.iter_mut().zip(size) {
+        *s = stride;
+        stride *= extent;
+    }
+    strides
+}
+
 fn geodesic_dilate_iteration_typed<T: Scalar>(
     marker: &Image,
     mask: &Image,
@@ -123,17 +140,25 @@ fn geodesic_dilate_iteration_typed<T: Scalar>(
     let mask_vals = mask.scalar_slice::<T>()?;
     let iter =
         NeighborhoodIterator::new(marker, kernel.radius(), ZeroFluxNeumannBoundaryCondition)?;
-    let mut out = Vec::with_capacity(marker.number_of_pixels());
-    for (i, (_, nb)) in iter.enumerate() {
+    let strides = linear_strides(marker.size());
+
+    // Parallel over output voxels. `kernel.on()` is in the window's own
+    // dimension-0-fastest slot order, so it zips straight onto the borrowed
+    // window; the scan visits one voxel's own window in the same order, and the
+    // strict `val > v` keeps the first maximum on ties exactly as before. The
+    // pointwise `min` against the mask reads the *same* voxel, so nothing crosses
+    // voxels and no thread count can reach the result.
+    let out: Vec<T> = iter.par_map_window(|center, w| {
         let mut v = init;
-        for (&on, &val) in kernel.on().iter().zip(nb.values()) {
+        for (&on, val) in kernel.on().iter().zip(w.iter()) {
             if on && val > v {
                 v = val;
             }
         }
+        let i: usize = center.iter().zip(&strides).map(|(&c, &s)| c * s).sum();
         let mv = mask_vals[i];
-        out.push(if mv < v { mv } else { v });
-    }
+        if mv < v { mv } else { v }
+    });
     let mut result = Image::from_vec(marker.size(), out)?;
     result.copy_geometry_from(marker);
     Ok(result)
@@ -149,17 +174,21 @@ fn geodesic_erode_iteration_typed<T: Scalar>(
     let mask_vals = mask.scalar_slice::<T>()?;
     let iter =
         NeighborhoodIterator::new(marker, kernel.radius(), ZeroFluxNeumannBoundaryCondition)?;
-    let mut out = Vec::with_capacity(marker.number_of_pixels());
-    for (i, (_, nb)) in iter.enumerate() {
+    let strides = linear_strides(marker.size());
+
+    // Parallel over output voxels — see `geodesic_dilate_iteration_typed`; this is
+    // the same scan with the comparison and the mask clamp inverted.
+    let out: Vec<T> = iter.par_map_window(|center, w| {
         let mut v = init;
-        for (&on, &val) in kernel.on().iter().zip(nb.values()) {
+        for (&on, val) in kernel.on().iter().zip(w.iter()) {
             if on && val < v {
                 v = val;
             }
         }
+        let i: usize = center.iter().zip(&strides).map(|(&c, &s)| c * s).sum();
         let mv = mask_vals[i];
-        out.push(if mv > v { mv } else { v });
-    }
+        if mv > v { mv } else { v }
+    });
     let mut result = Image::from_vec(marker.size(), out)?;
     result.copy_geometry_from(marker);
     Ok(result)
@@ -409,5 +438,222 @@ mod tests {
         assert_eq!(geodesic.scalar_slice::<i32>().unwrap(), &[0; 9]);
         let reconstruction = reconstruction_by_dilation(&marker, &mask, true).unwrap();
         assert_eq!(reconstruction.scalar_slice::<i32>().unwrap()[4], 1);
+    }
+}
+
+/// Thread-count parity pins for the two geodesic iteration stencils.
+///
+/// A **comparison** stencil (max/min over the window, then a pointwise clamp
+/// against the mask), so the non-vacuity guard is slot-dependence, not fold
+/// order — see [`crate::morphology`]'s pin module for why a fold-order guard on a
+/// max would be a vacuous assertion.
+///
+/// These pins also cover the one thing that *was* newly derived here: the serial
+/// walk got the mask's linear index from `enumerate()`, and the parallel pass
+/// reconstructs it from the window's ND center against the image strides. The
+/// reference below still uses `enumerate()`, so if that reconstruction were off by
+/// even one voxel — a swapped axis, a wrong stride — the mask would be read at the
+/// wrong place and these pins would fail.
+///
+/// `-0.0` does not apply: no value is added or accumulated. Every output is one of
+/// the input values, selected by comparison, and a strict `>` / `<` keeps the first
+/// extremum on ties exactly as the serial scan did — so `-0.0` and `0.0`, which
+/// compare equal, resolve the same way they did before.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{PIXELS, THREADS, assert_bits_eq, volume};
+    use sitk_core::{PixelId, parallel};
+
+    /// A marker strictly below the mask, so the dilation has somewhere to grow and
+    /// the mask clamp actually bites.
+    fn marker_of(mask: &Image) -> Image {
+        let vals: Vec<f64> = mask.to_f64_vec().unwrap().iter().map(|v| v - 9.5).collect();
+        let mut m = match mask.pixel_id() {
+            PixelId::Float64 => Image::from_vec(mask.size(), vals).unwrap(),
+            PixelId::Float32 => {
+                let d: Vec<f32> = vals.iter().map(|&v| v as f32).collect();
+                Image::from_vec(mask.size(), d).unwrap()
+            }
+            other => panic!("pin does not cover {other:?}"),
+        };
+        m.copy_geometry_from(mask);
+        m
+    }
+
+    // ---- the serial references: the exact loops that were deleted -----------
+
+    fn dilate_iteration_serial<T: Scalar>(
+        marker: &Image,
+        mask: &Image,
+        kernel: &StructuringElement,
+    ) -> Vec<f64> {
+        let (_, nonpositive_min) = bounds_for(marker.pixel_id());
+        let init = T::from_f64(nonpositive_min);
+        let mask_vals = mask.scalar_slice::<T>().unwrap();
+        let iter = NeighborhoodIterator::<T, _>::new(
+            marker,
+            kernel.radius(),
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        iter.enumerate()
+            .map(|(i, (_, nb))| {
+                let mut v = init;
+                for (&on, &val) in kernel.on().iter().zip(nb.values()) {
+                    if on && val > v {
+                        v = val;
+                    }
+                }
+                let mv = mask_vals[i];
+                if mv < v { mv.as_f64() } else { v.as_f64() }
+            })
+            .collect()
+    }
+
+    fn erode_iteration_serial<T: Scalar>(
+        marker: &Image,
+        mask: &Image,
+        kernel: &StructuringElement,
+    ) -> Vec<f64> {
+        let (max_value, _) = bounds_for(marker.pixel_id());
+        let init = T::from_f64(max_value);
+        let mask_vals = mask.scalar_slice::<T>().unwrap();
+        let iter = NeighborhoodIterator::<T, _>::new(
+            marker,
+            kernel.radius(),
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        iter.enumerate()
+            .map(|(i, (_, nb))| {
+                let mut v = init;
+                for (&on, &val) in kernel.on().iter().zip(nb.values()) {
+                    if on && val < v {
+                        v = val;
+                    }
+                }
+                let mv = mask_vals[i];
+                if mv > v { mv.as_f64() } else { v.as_f64() }
+            })
+            .collect()
+    }
+
+    fn serial(marker: &Image, mask: &Image, fully_connected: bool, dilate: bool) -> Vec<f64> {
+        let kernel = elementary_kernel(marker.dimension(), fully_connected);
+        match (marker.pixel_id(), dilate) {
+            (PixelId::Float64, true) => dilate_iteration_serial::<f64>(marker, mask, &kernel),
+            (PixelId::Float64, false) => erode_iteration_serial::<f64>(marker, mask, &kernel),
+            (PixelId::Float32, true) => dilate_iteration_serial::<f32>(marker, mask, &kernel),
+            (PixelId::Float32, false) => erode_iteration_serial::<f32>(marker, mask, &kernel),
+            (other, _) => panic!("pin does not cover {other:?}"),
+        }
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    /// The pin means nothing unless the iteration actually moves voxels, and
+    /// unless the *mask* read — the part whose index is now reconstructed rather
+    /// than counted — actually decides some of them. Both are asserted: the
+    /// dilation must change a large share of the marker, and the mask clamp must
+    /// bind on a large share (otherwise a mask read at the wrong index would
+    /// still produce the right answer).
+    #[test]
+    fn the_iteration_moves_voxels_and_the_mask_clamp_binds() {
+        let mask = volume(PixelId::Float64);
+        let marker = marker_of(&mask);
+        let out = grayscale_geodesic_dilate(&marker, &mask, true, true).unwrap();
+
+        let (m0, mk, o) = (
+            marker.to_f64_vec().unwrap(),
+            mask.to_f64_vec().unwrap(),
+            out.to_f64_vec().unwrap(),
+        );
+        let moved = o.iter().zip(&m0).filter(|(a, b)| a != b).count();
+        assert!(
+            moved > o.len() / 2,
+            "the geodesic dilation moved only {moved}/{} voxels — too static to pin anything",
+            o.len()
+        );
+
+        let clamped = o.iter().zip(&mk).filter(|(a, b)| a == b).count();
+        assert!(
+            clamped > o.len() / 10,
+            "the mask clamp bound on only {clamped}/{} voxels — a mask read at the wrong \
+             index would mostly not show, so this pin could not catch a bad index \
+             reconstruction",
+            o.len()
+        );
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn geodesic_dilate_iteration_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let mask = volume(pixel);
+            let marker = marker_of(&mask);
+            for fully_connected in [false, true] {
+                let expected = serial(&marker, &mask, fully_connected, true);
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        grayscale_geodesic_dilate(&marker, &mask, true, fully_connected)
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "grayscale_geodesic_dilate({pixel:?}, \
+                             fully_connected={fully_connected}, {threads} threads)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geodesic_erode_iteration_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let mask = volume(pixel);
+            // For the erosion the marker must sit *above* the mask, so use the mask
+            // as the marker's floor rather than its ceiling.
+            let marker = {
+                let vals: Vec<f64> = mask.to_f64_vec().unwrap().iter().map(|v| v + 9.5).collect();
+                let mut m = match pixel {
+                    PixelId::Float64 => Image::from_vec(mask.size(), vals).unwrap(),
+                    PixelId::Float32 => Image::from_vec(
+                        mask.size(),
+                        vals.iter().map(|&v| v as f32).collect::<Vec<f32>>(),
+                    )
+                    .unwrap(),
+                    other => panic!("pin does not cover {other:?}"),
+                };
+                m.copy_geometry_from(&mask);
+                m
+            };
+            for fully_connected in [false, true] {
+                let expected = serial(&marker, &mask, fully_connected, false);
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        grayscale_geodesic_erode(&marker, &mask, true, fully_connected)
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "grayscale_geodesic_erode({pixel:?}, \
+                             fully_connected={fully_connected}, {threads} threads)"
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
