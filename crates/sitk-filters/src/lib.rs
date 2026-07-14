@@ -296,6 +296,7 @@ pub use scalar_connected_component::scalar_connected_component;
 pub use scalar_to_rgb_colormap::{Colormap, scalar_to_rgb_colormap};
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::{bin_shrink, shrink};
+use sitk_core::compensated::CompensatedSum;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar, parallel};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
@@ -831,6 +832,22 @@ pub struct Statistics {
 }
 
 /// `StatisticsImageFilter`: min / max / mean / variance / sigma / sum.
+///
+/// **Both accumulators are compensated, as upstream's are** — `itkStatisticsImageFilter`
+/// declares `CompensatedSummation<RealType> sum` and `sumOfSquares`
+/// (`itkStatisticsImageFilter.hxx:103-104`). This is the reduction most exposed to naive
+/// summation in the whole crate: it walks *every voxel* (a 256³ volume is 16.7M terms, so
+/// a naive `f64` walk carries up to `n·ε ≈ 3.7e-9` relative), and `sum_of_squares` makes
+/// it worse by squaring the dynamic range before adding. `sigma` is what most callers
+/// actually read, and it is a difference of two large nearly-equal numbers — the
+/// cancellation that turns a small absolute error in `sum_sq` into a large relative one in
+/// the variance.
+///
+/// **Accuracy, not parity.** Upstream partitions the volume across threads and folds
+/// per-thread compensated partials, so its summation order is its thread decomposition;
+/// this port walks the buffer in raster order on one thread. The orders differ by
+/// construction, so no compensation makes this bit-identical to ITK — what it buys is a
+/// smaller error against the true sum of the same terms.
 pub fn statistics(img: &Image) -> Result<Statistics> {
     let vals = img.to_f64_vec()?;
     let n = vals.len();
@@ -839,14 +856,16 @@ pub fn statistics(img: &Image) -> Result<Statistics> {
     }
     let mut minimum = f64::INFINITY;
     let mut maximum = f64::NEG_INFINITY;
-    let mut sum = 0.0;
-    let mut sum_sq = 0.0;
+    let mut sum_acc = CompensatedSum::new();
+    let mut sum_sq_acc = CompensatedSum::new();
     for &v in &vals {
         minimum = minimum.min(v);
         maximum = maximum.max(v);
-        sum += v;
-        sum_sq += v * v;
+        sum_acc += v;
+        sum_sq_acc += v * v;
     }
+    let sum = sum_acc.sum();
+    let sum_sq = sum_sq_acc.sum();
     let mean = sum / n as f64;
     let variance = if n > 1 {
         (sum_sq - (n as f64) * mean * mean) / ((n - 1) as f64)
@@ -1151,6 +1170,45 @@ mod tests {
 /// or vector, dispatching on [`sitk_core::PixelId::is_vector`] and, for a
 /// vector image, decomposing into components with [`Image::extract_component`]
 /// before ever reaching the scalar seam.
+#[cfg(test)]
+mod compensated_statistics {
+    use super::*;
+
+    /// **`statistics` compensates its accumulators, and a naive walk is not good enough.**
+    ///
+    /// One large voxel and many small ones — the shape of a real intensity volume with a
+    /// bright structure on a low background, in miniature and pushed to where the failure
+    /// is visible in one assertion instead of in the ninth decimal of a 16M-voxel sum.
+    ///
+    /// Three assertions, and the middle is the one that catches a regression: the fixture
+    /// *does* defeat a naive walk (else this proves nothing), the shipped `sum` is **not**
+    /// the naive sum's bits, and the shipped `sum` is exact here. Reverting either
+    /// accumulator in [`statistics`] to a plain `f64` fails the middle one.
+    #[test]
+    fn the_statistics_sums_are_compensated_and_a_naive_walk_is_not_good_enough() {
+        const SMALL: usize = 1000;
+        let mut vals = vec![1.0e17];
+        vals.extend(std::iter::repeat_n(1.0, SMALL));
+        let img = Image::from_vec(&[vals.len()], vals.clone()).unwrap();
+
+        let naive: f64 = vals.iter().sum();
+        let exact = 1.0e17 + SMALL as f64;
+        assert_ne!(
+            naive.to_bits(),
+            exact.to_bits(),
+            "the fixture must defeat naive summation, or the pin below is vacuous"
+        );
+
+        let s = statistics(&img).unwrap();
+        assert_ne!(
+            s.sum.to_bits(),
+            naive.to_bits(),
+            "the statistics sum is the naive sum's bits: the compensation is gone"
+        );
+        assert_eq!(s.sum.to_bits(), exact.to_bits());
+    }
+}
+
 #[cfg(test)]
 mod vector_guard {
     use super::*;
