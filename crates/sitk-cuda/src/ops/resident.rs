@@ -109,10 +109,24 @@ __device__ __forceinline__ bool is_inside(const double* c, const long long* size
 // Rust does not fuse a multiply and an add; NVRTC does, by default. `__dmul_rn` /
 // `__dadd_rn` are the IEEE round-to-nearest primitives, which the compiler may not
 // contract -- so the guarantee holds regardless of the flags this is compiled with,
-// and it is stated in the code rather than in a build option. Everything downstream
-// of `c` (weights, value, gradient, the reduction) is a continuous function of it
-// and stays contracted: that is where the arithmetic is, and a ULP there is the
-// reduction-rounding the metric is already gated at.
+// and it is stated in the code rather than in a build option.
+//
+// The pin covers the interpolant's weights, value and gradient too, and THAT IS NOT
+// DECORATION -- it is the second discrete consumer, found when Mattes arrived. The
+// comment that used to sit here said the arithmetic downstream of `c` could stay
+// contracted because "a ULP there is the reduction-rounding the metric is already
+// gated at". That was true of every metric that existed at the time and is FALSE of
+// Mattes: mean squares and correlation feed the interpolated value into `diff` and a
+// sum -- continuous, no branch -- whereas Mattes feeds it into
+//
+//     index = (long long)(mv / bin_size - normalized_min)
+//
+// a TRUNCATION, i.e. a branch, exactly like `floor(c)` one step earlier. A 1-ULP `mv`
+// at a sample whose term lands on a bin boundary picks the other Parzen bin, moves
+// half a unit of mass into a neighbouring histogram cell, and no longer agrees with
+// the host on the bits. So the interpolated value is now a bit-identity surface, and
+// it is pinned here, in the ONE sampler, rather than in a Mattes-only copy of the
+// chain -- a second copy is what this module exists to forbid.
 __device__ __forceinline__ double fmadd_rn(double acc, double a, double b) {
     return __dadd_rn(acc, __dmul_rn(a, b));
 }
@@ -256,12 +270,15 @@ __device__ __forceinline__ bool take_sample(
     if (!is_inside(c, msize)) return false;
 
     // Trilinear value + exact gradient of the interpolant, in the same corner
-    // order and with the same clamping as linear_value_and_gradient.
+    // order, with the same clamping, and -- since Mattes -- with the same ROUNDING as
+    // `linear_value_and_gradient`: every product and every sum below is rounded
+    // separately, because the host's is (Rust does not fuse) and because the value
+    // this produces is truncated into a Parzen bin. See `fmadd_rn`.
     double base[3], frac[3];
     for (int d = 0; d < 3; ++d) {
         const double f = floor(c[d]);
         base[d] = f;
-        frac[d] = c[d] - f;
+        frac[d] = __dsub_rn(c[d], f);
     }
     double value = 0.0;
     double gi[3] = { 0.0, 0.0, 0.0 };
@@ -270,32 +287,41 @@ __device__ __forceinline__ bool take_sample(
         double weight = 1.0;
         for (int d = 0; d < 3; ++d) {
             const int bit = (corner >> d) & 1;
-            weight *= bit ? frac[d] : (1.0 - frac[d]);
+            weight = __dmul_rn(weight, bit ? frac[d] : __dsub_rn(1.0, frac[d]));
             long long idx = (long long)base[d] + bit;
             if (idx < 0) idx = 0;
             if (idx > msize[d] - 1) idx = msize[d] - 1;
             offset += idx * mstride[d];
         }
         const double b = (double)mbuf[offset];
-        value += weight * b;
+        value = fmadd_rn(value, weight, b);
         if (WANT_GRAD) {
             for (int j = 0; j < 3; ++j) {
                 double w = 1.0;
                 for (int d = 0; d < 3; ++d) {
                     if (d == j) continue;
                     const int bit = (corner >> d) & 1;
-                    w *= bit ? frac[d] : (1.0 - frac[d]);
+                    w = __dmul_rn(w, bit ? frac[d] : __dsub_rn(1.0, frac[d]));
                 }
                 const double sign = ((corner >> j) & 1) ? 1.0 : -1.0;
-                gi[j] += sign * w * b;
+                // The host writes `sign * w_without_j * b`, left to right: `sign` is
+                // +/-1 so `sign*w` is exact, and the product with `b` is the rounding
+                // that matters.
+                gi[j] = fmadd_rn(gi[j], __dmul_rn(sign, w), b);
             }
         }
     }
 
     if (WANT_GRAD) {
-        // Index-space gradient -> physical-space: g[d] = sum_j gi[j] * M[j][d].
+        // Index-space gradient -> physical-space: g[d] = sum_j gi[j] * M[j][d]. The
+        // host's `.map(..).sum()` seeds the accumulator at 0.0 and adds three
+        // separately-rounded products, in j order.
         for (int d = 0; d < 3; ++d) {
-            out->g[d] = gi[0]*mmat[0*3+d] + gi[1]*mmat[1*3+d] + gi[2]*mmat[2*3+d];
+            double acc_g = 0.0;
+            acc_g = fmadd_rn(acc_g, gi[0], mmat[0*3+d]);
+            acc_g = fmadd_rn(acc_g, gi[1], mmat[1*3+d]);
+            acc_g = fmadd_rn(acc_g, gi[2], mmat[2*3+d]);
+            out->g[d] = acc_g;
         }
     }
     out->x[0] = x[0]; out->x[1] = x[1]; out->x[2] = x[2];
