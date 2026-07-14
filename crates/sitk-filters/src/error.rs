@@ -144,6 +144,22 @@ pub enum FilterError {
     #[error("number of histogram bins must be >= 1, got {0}")]
     InvalidHistogramBins(u32),
 
+    /// A `HistogramThresholdImageFilter`-family mask admitted **no** voxels, so
+    /// the histogram it scopes is empty and no threshold is defined.
+    ///
+    /// **Refused by name rather than reproduced, because upstream does not agree
+    /// with itself here.** Eleven of ITK's thirteen threshold calculators guard
+    /// this and throw `"Histogram is empty"` (e.g. `itkHuangThresholdCalculator.hxx:35-38`);
+    /// `OtsuThresholdCalculator` and `OtsuMultipleThresholdsCalculator` do **not** —
+    /// `itkOtsuMultipleThresholdsCalculator.hxx:147-154` computes
+    /// `globalMean /= globalFrequency` with a zero frequency, so every class mean and
+    /// variance is `NaN`, every `varBetween > maxVarBetween` comparison is therefore
+    /// false, and the search returns its *initializer*: bin `0`. The caller gets bin
+    /// zero's upper edge as a threshold — a real number, produced by no voxel, with no
+    /// error raised. Ledger §1.76. This port refuses uniformly, by name.
+    #[error("the threshold mask admits no voxels (no mask pixel equals mask_value {mask_value})")]
+    MaskAdmitsNoVoxels { mask_value: u8 },
+
     /// Otsu's multi-threshold search needs strictly more histogram bins than
     /// requested thresholds (`itkOtsuMultipleThresholdsCalculator.hxx`'s
     /// `IncrementThresholds` indexes off `numberOfHistogramBins - 2 - ...`,

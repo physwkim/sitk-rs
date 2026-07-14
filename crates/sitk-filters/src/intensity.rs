@@ -31,7 +31,9 @@
 use crate::error::{FilterError, Result};
 use crate::functor;
 use crate::functor::UnaryFunctor;
-use crate::histogram::Histogram;
+use crate::histogram::{
+    Histogram, ThresholdMask, apply_threshold_mask_output, threshold_histogram,
+};
 use sitk_core::{Image, PixelId, parallel};
 
 // ---- Sigmoid ----------------------------------------------------------
@@ -569,10 +571,11 @@ pub fn otsu_threshold(
     return_bin_midpoint: bool,
     inside_value: u8,
     outside_value: u8,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     require_bins_over_thresholds(number_of_histogram_bins, 1)?;
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let idx = otsu_multiple_threshold_indices(&hist, 1, false)[0];
     let threshold = threshold_value(&hist, idx, return_bin_midpoint);
 
@@ -580,13 +583,14 @@ pub fn otsu_threshold(
     // it folds `f64` class variances over the bins, and re-associating that fold
     // would change its bits — but it is O(bins), not O(voxels), so there is
     // nothing to win by touching it.
-    let out: Vec<u8> = parallel::map_slice(&vals, |&v| {
+    let mut out: Vec<u8> = parallel::map_slice(&vals, |&v| {
         if v <= threshold {
             inside_value
         } else {
             outside_value
         }
     });
+    apply_threshold_mask_output(&mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))
@@ -736,22 +740,24 @@ pub fn triangle_threshold(
     number_of_histogram_bins: u32,
     inside_value: u8,
     outside_value: u8,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = triangle_threshold_value(&hist);
 
     // Parallel per-pixel binarize. The threshold *search* above stays sequential:
     // it folds `f64` class variances over the bins, and re-associating that fold
     // would change its bits — but it is O(bins), not O(voxels), so there is
     // nothing to win by touching it.
-    let out: Vec<u8> = parallel::map_indexed(vals.len(), |i| {
+    let mut out: Vec<u8> = parallel::map_indexed(vals.len(), |i| {
         if vals[i] <= threshold {
             inside_value
         } else {
             outside_value
         }
     });
+    apply_threshold_mask_output(&mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))
@@ -1017,7 +1023,7 @@ mod tests {
     #[test]
     fn otsu_threshold_constant_image_returns_the_constant_value() {
         let a = img_f64(&[4, 1], vec![7.0; 4]);
-        let (out, threshold) = otsu_threshold(&a, 8, false, 1, 0).unwrap();
+        let (out, threshold) = otsu_threshold(&a, 8, false, 1, 0, None).unwrap();
         assert_eq!(threshold, 7.0);
         assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 1, 1, 1]);
     }
@@ -1025,7 +1031,7 @@ mod tests {
     #[test]
     fn otsu_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (out, threshold) = otsu_threshold(&a, 10, false, 1, 0).unwrap();
+        let (out, threshold) = otsu_threshold(&a, 10, false, 1, 0, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1039,7 +1045,7 @@ mod tests {
     fn otsu_threshold_needs_more_than_one_bin() {
         let a = bimodal_image(0.0, 100.0, 5);
         assert!(matches!(
-            otsu_threshold(&a, 1, false, 1, 0),
+            otsu_threshold(&a, 1, false, 1, 0, None),
             Err(FilterError::InvalidThresholdCount { .. })
         ));
     }
@@ -1082,7 +1088,7 @@ mod tests {
     #[test]
     fn triangle_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (out, threshold) = triangle_threshold(&a, 10, 1, 0).unwrap();
+        let (out, threshold) = triangle_threshold(&a, 10, 1, 0, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1095,14 +1101,14 @@ mod tests {
     #[test]
     fn triangle_threshold_single_bin_does_not_panic() {
         let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
-        let (_, threshold) = triangle_threshold(&a, 1, 1, 0).unwrap();
+        let (_, threshold) = triangle_threshold(&a, 1, 1, 0, None).unwrap();
         assert!(threshold.is_finite());
     }
 
     #[test]
     fn triangle_threshold_constant_image() {
         let a = img_f64(&[3, 1], vec![9.0, 9.0, 9.0]);
-        let (out, threshold) = triangle_threshold(&a, 5, 1, 0).unwrap();
+        let (out, threshold) = triangle_threshold(&a, 5, 1, 0, None).unwrap();
         assert_eq!(threshold, 9.0);
         assert_eq!(out.scalar_slice::<u8>().unwrap(), &[1, 1, 1]);
     }

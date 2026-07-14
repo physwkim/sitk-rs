@@ -151,7 +151,7 @@ fn run_connected_component(img: &Image) -> Result<Image> {
 }
 
 fn run_otsu_threshold(img: &Image) -> Result<Image> {
-    otsu_threshold(img, 128, false, 1, 0).map(|(image, _threshold)| image)
+    otsu_threshold(img, 128, false, 1, 0, None).map(|(image, _threshold)| image)
 }
 
 fn run_fft_convolution(img: &Image) -> Result<Image> {
