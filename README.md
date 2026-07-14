@@ -347,16 +347,19 @@ whatever number came out. `mean` was published here as a **2.82× loss** and is 
 
 **256³**: the port wins on `binary_dilate` **0.03×**, `connected_component` 0.25×,
 `signed_maurer_distance_map` 0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg`
-0.47×, `otsu` 0.57×, `gradient_magnitude` 0.64×, `discrete_gaussian` 0.76×, `mean`
-0.80×, `fft_convolution` 0.87×. Read these as **upper bounds**: the ITK transient has
-been checked at this size for one op so far (`gradient_magnitude`, under-reported
-1.37×, so its true ratio is nearer 0.43×), so the remaining ratios can only move in
-the port's favour. `smoothing_recursive_gaussian` used to be quoted here as a 1.02×
-loss; that is inside the floor and is withdrawn as unresolved.
+0.47×, `otsu` 0.57×, `gradient_magnitude` **~0.43×**, `discrete_gaussian` 0.76×,
+`mean` 0.80×, `fft_convolution` 0.87×. The ITK transient has now been checked at this
+size for every op that can differ: `gradient_magnitude` was the only one it moved
+(flattered 1.30×, so 0.64× → ~0.43×), and every other row stands as printed.
+`smoothing_recursive_gaussian` used to be quoted here as a 1.02× loss; that is inside
+the floor and is withdrawn as unresolved.
 
 **The port's two real losses are both at 512³**: `smoothing_recursive_gaussian`
 **1.75×** and `otsu` **1.37×**. Both win at 64³ and 256³ — the loss is specific to the
-size, which is what points at the block decomposition rather than the kernel.
+size, which is what points at the block decomposition rather than the kernel. At 512³
+the transient runs the *other* way for one op: `rescale_intensity`'s ITK column is
+under-reported, so its 0.41× is really nearer **0.35×** — a second, opposite-sign
+transient that is named from one signal, not modelled.
 
 Small volumes did have a real defect, and it was found and fixed *before* the harness
 was: the chunk grain was a **constant**, so a 64³ volume could raise only **four tasks
@@ -393,17 +396,14 @@ each one you can trust.
 
 ## Roadmap
 
-1. **Retake the 256³ and 512³ ITK columns.** The same mistake one size up: ITK's
-   fresh-process transient was quantified at 64³ for all twelve ops and at 256³ for
-   exactly one — where it under-reported ITK by 1.37×. Nine of twelve at 256³ and ten
-   of twelve at 512³ are untested, not cleared. The prediction, written before the
-   measurement: the transient is per-process and climbing, so a longer benchmark
-   amortizes it rather than escaping it, and the defect should *shrink* with volume.
-2. **The two-mode instability.** `gmrg` is bimodal solo on a quiet box, in *runs*
-   rather than as a coin flip — so something persists across legs inside a process and
-   then flips. Clock, NUMA placement, allocator threshold and heap layout are excluded
-   by measurement; the mechanism is unidentified, and three ops have no certifiable
-   64³ number because of it.
+1. **The two-mode instability** — the one measurement problem still open, now that the
+   ITK columns are priced. `gmrg` is bimodal solo on a quiet box, in *runs* rather than
+   as a coin flip — so something persists across *separate processes* and then flips.
+   Localized: NUMA is excluded (zero far-node faults, and forcing pages remote leaves
+   the 2× standing), as are clock, allocator threshold and heap layout. What survives
+   is a box-wide page-backing state — the fast mode is the freshly-idle box, the slow
+   mode takes measurably more minor faults. Three ops have no certifiable 64³ number
+   because of it.
 3. **The line pass.** `for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor is under
    this box's 96 workers — the same arithmetic the grain seam closed, but it
    decomposes by whole blocks, so it needs a different rule. `smoothing_recursive_gaussian`

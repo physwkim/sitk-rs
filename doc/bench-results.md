@@ -65,12 +65,18 @@ Read this before quoting any number.
 > protocol.** Every certified cell is a win; `mean`, published here as a **2.82× loss**,
 > is a **0.28× win**.
 >
-> A fourth defect, still open: **the op-set inside a process flips short cells between
-> two modes 2× apart.** One op per process was believed to avoid it and **does not** —
-> `gmrg` is bimodal *solo on a quiet box*, in runs rather than as a coin flip. Clock,
-> NUMA, allocator threshold and heap layout are excluded by measurement; the mechanism
-> is unidentified. Three ops therefore have **no certifiable 64³ number** and are
-> printed as *refused*.
+> A fourth defect, still open: **short cells flip between two modes 2× apart.** One op
+> per process was believed to avoid it and **does not** — `gmrg` is bimodal *solo on a
+> quiet box*, in runs rather than as a coin flip. It is now localized: **NUMA is
+> excluded** (`numa_miss = numa_foreign = 0` on every plain leg, and forcing 43% of
+> pages remote with `numactl --interleave=all` leaves the 2× standing), and so are
+> clock, allocator threshold and heap layout. What survives is a **box-wide
+> page-backing state** — the fast mode is the freshly-idle box and persists across
+> *separate processes* for minutes (which is why legs come in runs), and the slow mode
+> does measurably more work (2367–2975 minor faults/iter vs 1328–2278) while `MemFree`
+> and `Cached` stay flat. Same family as the memory tax the user told me not to chase,
+> now with a fault-count signature. Three ops therefore have **no certifiable 64³
+> number** and are printed as *refused*.
 >
 > **Noise floor under the protocol: 1.13× at 64³, 1.08× at 256³, 1.15× at 512³. A
 > ratio inside the floor is not a tie — it is unresolved.** That strikes
@@ -88,15 +94,19 @@ Read this before quoting any number.
 > verdicts: `bench/results/harness-audit-of-bench-results.md`. The rebuild and the
 > ITK quantification: `bench/results/small-64-rebuilt.md`.
 >
-> **What is still owed, and it is the same mistake one size up.** The ITK transient was
-> quantified at 64³ for all twelve ops. At 256³ it has been checked for **one** op —
-> `gradient_magnitude`, where ITK is under-reported by **1.37× with disjoint bands**,
-> which moves its published 0.64× to roughly **0.43×**. Nine of twelve at 256³ and ten
-> of twelve at 512³ are **untested, not cleared.** The medium and large ITK columns
-> below are therefore soft in the *same direction* — flattering ITK, understating the
-> port. They are being re-measured.
+> **The 256³ and 512³ ITK columns have now been priced to complete coverage**, and
+> the result is two moved rows, both in the port's favour. The transient was checked
+> at both sizes for every op that *can* differ — the ≥3 s/call ops run a single
+> warm-up call in both binaries and are excluded by construction, not left untested.
+> Findings: `gradient_magnitude` 256³ is flattered 1.30× (→ ~0.43×); `rescale_intensity`
+> 512³ carries a *second* transient of the **opposite sign** (the un-warmed ITK column
+> read ITK *slower*), so its 0.41× understates the win (→ ~0.35×). **Every other tested
+> row at both sizes is within the old/new = 1.0 floor and stands.** The prediction that
+> the transient would be nil at 512³ was falsified: it shrinks with volume but does not
+> vanish, and there is a second mechanism, opposite in sign, that "climbing, amortized
+> by duration" does not describe. Named, not modelled, from one signal.
 >
-> **Also still soft:** every `t1` figure in this document (the `t1` leg *is* the cooling
+> **Still soft:** every `t1` figure in this document (the `t1` leg *is* the cooling
 > mechanism, and none has been retaken, on either harness, at any size); and the host
 > *denominators* of the GPU speedups in §1 and §2, which inherit the rust-side defect
 > one level down and inflate those speedups.
@@ -281,14 +291,14 @@ contraction, because an FMA would be *more* accurate and therefore *different*.
 **Read the ᵘ and ˢ marks before quoting any cell — and the whole `t1` pair of
 columns is soft** (see below).
 
-**The ITK column here is soft, in the direction that flatters ITK.** The
-fresh-process transient that flattered ITK by up to 2.4× at 64³ has been checked at
-256³ for exactly **one** op: `gradient_magnitude`, where ITK is under-reported by
-**1.37×**, with disjoint bands — so its `0.64×` below should be roughly **`0.43×`**,
-a *bigger* win. The other eleven are untested, not cleared. Every ratio in this table
-is therefore an **upper bound on the port's ratio** — the true numbers can only move
-in the port's favour, never against it. Re-measurement is in flight; until it lands,
-quote these as "at worst".
+**The ITK column here is now priced to complete coverage, and one row moves.** The
+fresh-process transient that flattered ITK at 64³ was checked at 256³ for all eleven
+ops that *can* differ (the ≥3 s/call ops run one warm-up call in both binaries and
+cannot differ — a structural exclusion, not an untested gap). Result: **`gradient_magnitude`
+is the only affected row.** ITK is under-reported there by **1.30×** with disjoint
+bands (four campaigns agree 0.73–0.84), so its `0.64×` below should read **`~0.43×`**,
+a *bigger* win. **Every other 256³ row is within the old/new = 1.0 noise floor and
+stands as printed** — they are not upper bounds, they are the numbers.
 
 | op | rust tN | itk tN | **rust/itk (tN)** | rust t1 ˢ | itk t1 ˢ |
 |---|---|---|---|---|---|
@@ -303,7 +313,12 @@ quote these as "at worst".
 | fft_convolution | 471 / 501 | 587 / 574 | 0.87× | 2148 | 1228 |
 | ~~smoothing_recursive_gaussian~~ ᵘ | 64.6 / 67.2 | 52.3 / 66.0 | ~~1.02×~~ | 1005 | 818 |
 | **gmrg** | **116.9** ᶠ | 207 / 247 | **0.47×** | 2319 ᵗ | 2426 |
-| **gradient_magnitude** | **22.5** ᶠ | 36.2 / 35.1 | **0.64×** | 511 | 314 |
+| **gradient_magnitude** | **22.5** ᶠ | 36.2 / 35.1 | **0.64× → ~0.43×** ᵛ | 511 | 314 |
+
+ᵛ — the ITK denominator here is flattered 1.30× by the fresh-process transient
+(§0). The **true ratio is ~0.43×**; the `0.64×` is what the un-warmed ITK column
+printed. This is the one 256³ row the transient moves — the other eleven are within
+the floor and stand.
 
 ᵘ — **struck: unresolved, not a tie.** The measured noise floor at 256³ is **1.08×**
 and this ratio is 1.02×, i.e. inside it. Worse, the two ITK legs alone span 52.3 and
@@ -338,7 +353,7 @@ this table is still rounds 1/2, which is why they still carry two columns.
 | binary_dilate | 286 / 279 | 14812 / 15071 | **0.02×** |
 | connected_component | 8418 / 8623 | 30180 / 31409 | **0.27×** |
 | median | 1283 / 1298 | 3486 / 3328 | **0.39×** |
-| rescale_intensity | 105 / 108 | 261 / 266 | **0.41×** |
+| rescale_intensity | 105 / 108 | 261 / 266 | **0.41× → ~0.35×** ᵛ |
 | signed_maurer_distance_map | 613 / 581 | 1310 / 1257 | **0.46×** |
 | mean | 354 / 354 | 488 / 484 | 0.73× |
 | fft_convolution | 2700 / 2711 | 3327 / 3201 | 0.85× |
@@ -356,14 +371,23 @@ rows *did* establish stands: both were **2.00×** and **2.93×** before the
 `gradient.rs` fixes of §4.1, and those are outside the floor by a wide margin, so
 the fixes closed a real gap. Where they landed is not known.
 
-**A caveat that applies to this whole table, not just the struck rows.** The `large`
-cells get a ~2 s criterion window and the box's ramp is ~2.1 s of work, so the
-ramp-in-window defect (§0 retraction) could be *larger* here than at 64³, not
-smaller. The paired old-harness/new-harness test was run at 64³ (up to 2.02×
-inflation) and at 256³ (0.89–0.99×, no resolvable defect); **it was never run at
-512³.** No 512³ row is asserted to be free of the defect — that is an untested
-claim, and it is not being made. The ratios below the floor (0.02×–0.46×) are large
-enough that no plausible ramp inflation reverses them; the ones near 1.0× are not.
+ᵛ — **the ITK transient at 512³ runs the *opposite* way, and this is the one row it
+touches.** `rescale_intensity` — the cheapest op at the largest size — is the case
+where the un-warmed ITK column reported ITK *slower* than the warmed one (disjoint
+bands at 1.15×, inverted). So the printed `0.41×` *understates* the port's win; the
+true ratio is **~0.35×**. This is a second transient, opposite in sign to the 64³/256³
+one, and it is named — not modelled — from a single paired signal (§0). No mechanism
+is claimed for the inversion.
+
+**The 512³ ITK column has now been priced, and the caveat that stood here is
+resolved.** It previously read "never run at 512³". The paired old/new-harness test
+was subsequently run at 512³ on the eight ops that *can* differ (the four ≥3 s/call
+ops — `connected_component`, `binary_dilate`, `median`, `fft_convolution` — run one
+warm-up call in both binaries and are excluded by construction, not left untested).
+Result: **`rescale_intensity` is the only affected row** (above), and it moves in the
+port's favour. Every other 512³ row is within the old/new = 1.0 floor and stands. The
+two struck rows are struck for the noise-floor reason, which is independent of the
+warm-up question and unchanged.
 
 ### small (64³) — REBUILT 2026-07-15, both columns under the protocol
 
