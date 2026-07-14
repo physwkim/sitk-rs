@@ -308,16 +308,22 @@ fn window_offsets(radius: &[usize]) -> Vec<Vec<i64>> {
 fn grayscale_erode_typed<T: Bounds>(img: &Image, kernel: &StructuringElement) -> Result<Image> {
     let boundary = ConstantBoundaryCondition::new(T::MAX_VALUE);
     let iter = NeighborhoodIterator::new(img, kernel.radius(), boundary)?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
+    // Parallel over output voxels. `kernel.on()` is in the window's own
+    // dimension-0-fastest slot order (it is built from the same enumeration
+    // `NeighborhoodIterator::new` builds), so it zips straight onto the borrowed
+    // window. The scan still visits one voxel's own window in that order, and the
+    // strict `v < min` keeps the *first* minimum on ties exactly as before —
+    // which is what makes this identical for `-0.0`/`0.0` and for NaN, neither of
+    // which ever replaces the incumbent.
+    let out: Vec<T> = iter.par_map_window(|_, w| {
         let mut min = T::MAX_VALUE;
-        for (&on, &v) in kernel.on().iter().zip(nb.values()) {
+        for (&on, v) in kernel.on().iter().zip(w.iter()) {
             if on && v < min {
                 min = v;
             }
         }
-        out.push(min);
-    }
+        min
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -326,16 +332,17 @@ fn grayscale_erode_typed<T: Bounds>(img: &Image, kernel: &StructuringElement) ->
 fn grayscale_dilate_typed<T: Bounds>(img: &Image, kernel: &StructuringElement) -> Result<Image> {
     let boundary = ConstantBoundaryCondition::new(T::NONPOSITIVE_MIN);
     let iter = NeighborhoodIterator::new(img, kernel.radius(), boundary)?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
+    // Parallel over output voxels — see `grayscale_erode_typed` for why the
+    // window scan is unchanged, ties included.
+    let out: Vec<T> = iter.par_map_window(|_, w| {
         let mut max = T::NONPOSITIVE_MIN;
-        for (&on, &v) in kernel.on().iter().zip(nb.values()) {
+        for (&on, v) in kernel.on().iter().zip(w.iter()) {
             if on && v > max {
                 max = v;
             }
         }
-        out.push(max);
-    }
+        max
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -1044,5 +1051,167 @@ mod tests {
         let f = img_u8(&[4, 3], vec![7; 12]);
         let gradient = morphological_gradient(&f, &se).unwrap();
         assert_eq!(gradient.scalar_slice::<u8>().unwrap(), &[0u8; 12]);
+    }
+}
+
+/// Thread-count parity pins for the grayscale erode/dilate stencils.
+///
+/// These two are **comparison** stencils: each output voxel is a min or a max
+/// over its own window. That makes them order-*insensitive* — reversing the scan
+/// cannot change a minimum — so the non-vacuity guard here is not a fold-order
+/// one (asserting that a min changes when reordered would be asserting a
+/// falsehood). What *can* break in them is a **wrong window slot**: `kernel.on()`
+/// is zipped straight onto the borrowed window, which is only correct because both
+/// are in the same dimension-0-fastest order. The guard below shows the output
+/// really does depend on which slots are on, so a mis-zipped kernel could not
+/// have gone unnoticed.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{PIXELS, THREADS, assert_bits_eq, volume};
+    use sitk_core::parallel;
+
+    // ---- the serial references: the exact loops that were deleted -----------
+
+    fn erode_serial<T: Bounds>(img: &Image, kernel: &StructuringElement) -> Vec<f64> {
+        let boundary = ConstantBoundaryCondition::new(T::MAX_VALUE);
+        let iter = NeighborhoodIterator::<T, _>::new(img, kernel.radius(), boundary).unwrap();
+        iter.map(|(_, nb)| {
+            let mut min = T::MAX_VALUE;
+            for (&on, &v) in kernel.on().iter().zip(nb.values()) {
+                if on && v < min {
+                    min = v;
+                }
+            }
+            min.as_f64()
+        })
+        .collect()
+    }
+
+    fn dilate_serial<T: Bounds>(img: &Image, kernel: &StructuringElement) -> Vec<f64> {
+        let boundary = ConstantBoundaryCondition::new(T::NONPOSITIVE_MIN);
+        let iter = NeighborhoodIterator::<T, _>::new(img, kernel.radius(), boundary).unwrap();
+        iter.map(|(_, nb)| {
+            let mut max = T::NONPOSITIVE_MIN;
+            for (&on, &v) in kernel.on().iter().zip(nb.values()) {
+                if on && v > max {
+                    max = v;
+                }
+            }
+            max.as_f64()
+        })
+        .collect()
+    }
+
+    fn serial(img: &Image, kernel: &StructuringElement, erode: bool) -> Vec<f64> {
+        match img.pixel_id() {
+            PixelId::Float64 if erode => erode_serial::<f64>(img, kernel),
+            PixelId::Float64 => dilate_serial::<f64>(img, kernel),
+            PixelId::Float32 if erode => erode_serial::<f32>(img, kernel),
+            PixelId::Float32 => dilate_serial::<f32>(img, kernel),
+            other => panic!("pin does not cover {other:?}"),
+        }
+    }
+
+    fn kernels() -> Vec<(&'static str, StructuringElement)> {
+        vec![
+            ("ball[1,1,1]", StructuringElement::ball(&[1, 1, 1])),
+            ("cross[2,2,2]", StructuringElement::cross(&[2, 2, 2])),
+            ("box[1,2,1]", StructuringElement::box_(&[1, 2, 1])),
+        ]
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    /// The pins would assert nothing if the filter's output did not actually
+    /// depend on *which* window slots the kernel turns on — a stencil that read
+    /// the wrong slot, or ignored `kernel.on()` entirely, would still match a
+    /// reference that made the same mistake.
+    ///
+    /// Two things are shown here, and both are needed:
+    ///
+    /// * the erosion moves pixels at all (it is not the identity on this volume), and
+    /// * it gives a *different* answer for a cross kernel than for a box kernel of
+    ///   the same radius — the two differ only in which slots are on, so this is
+    ///   exactly the sensitivity that would catch a mis-zipped `kernel.on()`.
+    ///
+    /// This is deliberately not a fold-order guard. A min is associative and
+    /// commutative; the sum-order guard the summing stencils use would be
+    /// meaningless here, and pretending otherwise would be dressing up a vacuous
+    /// assertion as a rigorous one.
+    #[test]
+    fn the_output_depends_on_which_window_slots_are_on() {
+        let img = volume(PixelId::Float64);
+        let input = img.to_f64_vec().unwrap();
+
+        let cross = grayscale_erode(&img, &StructuringElement::cross(&[2, 2, 2]))
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let boxed = grayscale_erode(&img, &StructuringElement::box_(&[2, 2, 2]))
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+
+        let moved = cross.iter().zip(&input).filter(|(a, b)| a != b).count();
+        assert!(
+            moved > input.len() / 2,
+            "erosion changed only {moved}/{} voxels — the volume is too flat to pin anything",
+            input.len()
+        );
+
+        let differ = cross.iter().zip(&boxed).filter(|(a, b)| a != b).count();
+        assert!(
+            differ > input.len() / 4,
+            "a cross kernel and a box kernel of the same radius produced the same erosion on \
+             {}/{} voxels — the output barely depends on which slots are on, so these pins \
+             could not catch a mis-zipped kernel",
+            input.len() - differ,
+            input.len()
+        );
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn grayscale_erode_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (name, kernel) in kernels() {
+                let expected = serial(&img, &kernel, true);
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || grayscale_erode(&img, &kernel))
+                        .unwrap()
+                        .to_f64_vec()
+                        .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!("grayscale_erode({pixel:?}, {name}, {threads} threads)"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grayscale_dilate_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (name, kernel) in kernels() {
+                let expected = serial(&img, &kernel, false);
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || grayscale_dilate(&img, &kernel))
+                        .unwrap()
+                        .to_f64_vec()
+                        .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!("grayscale_dilate({pixel:?}, {name}, {threads} threads)"),
+                    );
+                }
+            }
+        }
     }
 }
