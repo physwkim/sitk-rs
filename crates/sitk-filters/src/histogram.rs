@@ -31,7 +31,7 @@
 //! `f64` uniformly for every caller, matching that rule exactly.
 
 use crate::error::{FilterError, Result};
-use sitk_core::{Image, parallel};
+use sitk_core::{Image, PixelId, parallel};
 
 /// The mask of the `HistogramThresholdImageFilter` family — **one owner for all
 /// twelve** of this crate's histogram-driven thresholds, because twelve local mask
@@ -140,18 +140,71 @@ impl<'a> ThresholdMask<'a> {
     }
 }
 
+/// `HistogramThresholdImageFilter`'s constructor turns `AutoMinimumMaximum` **off**
+/// for the three 8-bit pixel types and leaves it on for every other
+/// (`itkHistogramThresholdImageFilter.hxx:44-53`):
+///
+/// ```text
+/// if (typeid(ValueType) == typeid(signed char) || typeid(ValueType) == typeid(unsigned char) ||
+///     typeid(ValueType) == typeid(char))
+///   { m_AutoMinimumMaximum = false; }
+/// else
+///   { m_AutoMinimumMaximum = true; }
+/// ```
+///
+/// With it off, and with no explicit `HistogramBinMinimum`/`Maximum` (the filter never
+/// sets one), `ImageToHistogramFilter::InitializeOutputHistogram` bins over
+/// `[NonpositiveMin() - 0.5, max() + 0.5]` — the **pixel type's** range, half-integer
+/// offsets and all, with no marginal scale (`itkImageToHistogramFilter.hxx:155-175`).
+/// So an 8-bit image's threshold is computed against `[-0.5, 255.5]` no matter how
+/// narrow its data is, and 128 bins are 2 grey levels wide by construction.
+///
+/// Returns `None` for every other pixel type, which then bins over the data range.
+///
+/// **This is the family's rule, not the crate's.** `OtsuMultipleThresholdsImageFilter`
+/// is a different ITK class: it builds its histogram through
+/// `ScalarImageToHistogramGenerator` → `SampleToHistogramFilter`, whose constructor sets
+/// `AutoMinimumMaximum = true` unconditionally, with no pixel-type branch
+/// (`itkSampleToHistogramFilter.hxx:35`), and the filter never turns it off. It therefore
+/// bins over the *data* range for 8-bit input too — so ITK's two Otsu implementations
+/// disagree with each other on an 8-bit image (ledger §2.174). `otsu_multiple_thresholds`
+/// calls `Histogram::from_values` directly and must keep doing so; only the twelve that
+/// route through [`threshold_histogram`] take this rule.
+fn fixed_bin_range(pixel_id: PixelId) -> Option<(f64, f64)> {
+    match pixel_id {
+        PixelId::UInt8 => Some((-0.5, 255.5)),
+        PixelId::Int8 => Some((-128.5, 127.5)),
+        _ => None,
+    }
+}
+
 /// The histogram every one of this crate's twelve histogram thresholds is built from:
-/// all voxels, or — when a mask is given — exactly the voxels it admits, whose min/max
-/// then set the bin range too. The single place the masked/unmasked choice is made.
+/// all voxels, or — when a mask is given — exactly the voxels it admits. The single place
+/// both the masked/unmasked choice and the bin-range choice are made.
+///
+/// The two interact, and not in the direction the flag's name suggests: the mask scopes
+/// the bin range **only** on the auto path. `MaskedImageToHistogramFilter` overrides
+/// `ThreadedComputeMinimumAndMaximum`, but that scan is called from inside
+/// `InitializeOutputHistogram`'s `AutoMinimumMaximum` branch alone
+/// (`itkImageToHistogramFilter.hxx:140-152`) — so on an 8-bit image the mask selects
+/// which voxels are *counted* and has no say in the range at all.
 pub(crate) fn threshold_histogram(
     img: &Image,
     vals: &[f64],
     bins: u32,
     mask: Option<&ThresholdMask>,
 ) -> Result<Histogram> {
-    match mask {
-        None => Histogram::from_values(vals, bins),
-        Some(m) => Histogram::from_values(&m.selected(img, vals)?, bins),
+    let selected;
+    let counted = match mask {
+        None => vals,
+        Some(m) => {
+            selected = m.selected(img, vals)?;
+            &selected
+        }
+    };
+    match fixed_bin_range(img.pixel_id()) {
+        Some((lower, upper)) => Histogram::from_fixed_range(counted, bins, lower, upper),
+        None => Histogram::from_values(counted, bins),
     }
 }
 
@@ -184,7 +237,6 @@ impl Histogram {
         if vals.is_empty() {
             return Err(FilterError::DegenerateRange);
         }
-        let bins = bins as usize;
 
         // `min`/`max` select an element of the input set: exactly associative, so
         // the chunked scan returns the same bits as the sequential one.
@@ -193,10 +245,40 @@ impl Histogram {
         // `itkImageToHistogramFilter.hxx`'s `ApplyMarginalScale` /
         // `itkSampleToHistogramFilter.hxx`'s equivalent: margin added only to
         // the upper bound, `marginalScale` defaults to 100 in both.
-        let margin = (hi - lo) / bins as f64 / 100.0;
-        let lower = lo;
-        let upper = hi + margin;
-        // `itkHistogram.hxx`'s `Initialize(size, lowerBound, upperBound)`.
+        let margin = (hi - lo) / f64::from(bins) / 100.0;
+        Self::over_range(vals, bins, lo, hi + margin)
+    }
+
+    /// The **non-`AutoMinimumMaximum`** path of `itkImageToHistogramFilter`
+    /// (`.hxx:155-175`): the bin range is fixed, no marginal scale is applied
+    /// ("No marginal scaling is applied in this case"), and the values are
+    /// counted into it with `ClipBinsAtEnds` still `true`.
+    ///
+    /// The range is the *pixel type's*, not the data's — see [`fixed_bin_range`],
+    /// which is where the choice between this and [`from_values`](Self::from_values)
+    /// is made.
+    pub(crate) fn from_fixed_range(
+        vals: &[f64],
+        bins: u32,
+        lower: f64,
+        upper: f64,
+    ) -> Result<Self> {
+        if bins == 0 {
+            return Err(FilterError::InvalidHistogramBins(0));
+        }
+        if vals.is_empty() {
+            return Err(FilterError::DegenerateRange);
+        }
+        Self::over_range(vals, bins, lower, upper)
+    }
+
+    /// `itkHistogram.hxx`'s `Initialize(size, lowerBound, upperBound)` with
+    /// `ClipBinsAtEnds(true)`: equal-width bins spanning `[lower, upper]`, and
+    /// every value counted (clipped into the first/last bin if it falls outside),
+    /// so `total` is `vals.len()`. The two range rules above differ only in how
+    /// they arrive at `lower`/`upper`; the binning itself is one function.
+    fn over_range(vals: &[f64], bins: u32, lower: f64, upper: f64) -> Result<Self> {
+        let bins = bins as usize;
         let interval = (upper - lower) / bins as f64;
 
         let mut bin_min = Vec::with_capacity(bins);
