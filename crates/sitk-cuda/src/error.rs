@@ -65,6 +65,20 @@ pub enum CudaError {
     #[error("fixed sample index {index} is outside the fixed grid ({voxels} voxels)")]
     SampleIndexOutOfGrid { index: i64, voxels: usize },
 
+    /// The two passes of the correlation metric disagreed about how many samples are
+    /// valid.
+    ///
+    /// They cannot, by construction: both run the same sampler over the same sample
+    /// set under the same point map, so the same samples survive. If they ever do
+    /// differ, the sample means were divided by one population while the moments were
+    /// accumulated over another — a metric that is silently wrong rather than loudly
+    /// broken. Raised instead of trusting the invariant.
+    #[error(
+        "the correlation passes disagree on the valid-sample count: {sums} in the sums \
+         pass, {moments} in the moments pass"
+    )]
+    PassCountMismatch { sums: usize, moments: usize },
+
     /// The image is a vector/complex image, or its buffer does not match its
     /// declared pixel type — `sitk_core` already names this precisely, so
     /// carry its message rather than reclassifying it.

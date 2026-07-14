@@ -330,6 +330,85 @@ pub(crate) fn contract(moments: &sitk_cuda::Moments, form: &AffineForm) -> Metri
     }
 }
 
+/// Contract the correlation moments with the transform's own Jacobian into value +
+/// derivative — the host half of the NCC metric, and the **only** place its formula
+/// exists on this path.
+///
+/// ```text
+/// value      = −sfm² / (sff·smm)
+/// fdmₖ       = Σ_d J(0)[d][k]·F0[d] + Σ_d Σ_e C_e[d][k]·F1[d][e]      (mdmₖ likewise)
+/// ∂value/∂pₖ = −2·sfm/(sff·smm) · ( fdmₖ − (sfm/smm)·mdmₖ )
+/// ```
+///
+/// The globals `sfm`/`sff`/`smm` never reached the device: they multiply the finished
+/// sums and do not depend on the sample, so they factor out of the reduction and are
+/// applied here, in `f64`, exactly as `CorrelationMetric::evaluate` applies them.
+///
+/// # The degenerate branch is the host's, deliberately
+///
+/// `CorrelationMetric::evaluate` returns `f64::MAX` when no sample is valid, and again
+/// when `smm·sff <= f64::EPSILON` (a constant image has no variance to correlate).
+/// Both tests are re-stated here **in the same order, on the same product, against the
+/// same constant** — not because the device could not test them, but because a
+/// threshold on a *reduced* quantity is a discontinuous branch, and two paths whose
+/// sums differ by √N·ε can land on opposite sides of it. Keeping the branch in one
+/// implementation means the only way the two paths can disagree is if the reduced
+/// values straddle the threshold — which is a measurable property of the data, not a
+/// second copy of a rule that might drift.
+pub(crate) fn contract_correlation(
+    moments: &sitk_cuda::CorrelationMoments,
+    form: &AffineForm,
+) -> MetricValue {
+    let dim = sitk_cuda::DIM;
+    let nparams = form.nparams;
+
+    // `means()` returned `None`: no sample maps inside the moving image.
+    if moments.count == 0 {
+        return MetricValue {
+            value: f64::MAX,
+            derivative: vec![0.0; nparams],
+            valid_points: 0,
+        };
+    }
+
+    let (sff, smm, sfm) = (moments.sff, moments.smm, moments.sfm);
+    // The host's own product and the host's own test, in the host's order.
+    let m2f2 = smm * sff;
+    if m2f2 <= f64::EPSILON {
+        return MetricValue {
+            value: f64::MAX,
+            derivative: vec![0.0; nparams],
+            valid_points: moments.count,
+        };
+    }
+
+    // The Jacobian contraction, identical in shape to mean squares' — once with the
+    // fixed-side moments and once with the moving-side ones.
+    let contract_moment = |m0: &[f64; 3], m1: &[[f64; 3]; 3], k: usize| {
+        let mut g = 0.0;
+        for d in 0..dim {
+            g += form.j0[d * nparams + k] * m0[d];
+            for (e, &m1de) in m1[d].iter().enumerate().take(dim) {
+                g += form.c[e][d * nparams + k] * m1de;
+            }
+        }
+        g
+    };
+
+    let mut derivative = vec![0.0; nparams];
+    for (k, dk) in derivative.iter_mut().enumerate() {
+        let fdm = contract_moment(&moments.f0, &moments.f1, k);
+        let mdm = contract_moment(&moments.m0, &moments.m1, k);
+        *dk = -2.0 * sfm / (sff * smm) * (fdm - sfm / smm * mdm);
+    }
+
+    MetricValue {
+        value: -sfm * sfm / m2f2,
+        derivative,
+        valid_points: moments.count,
+    }
+}
+
 impl MetricBackend for CudaMetricBackend {
     fn mean_squares(
         &self,

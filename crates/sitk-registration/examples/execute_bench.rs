@@ -11,9 +11,9 @@
 //! cargo run --release --features cuda -p sitk-registration --example execute_bench -- 256 96
 //! ```
 //!
-//! Arguments: `size threads iterations min_step [scales] [shrink] [sigmas]`. The last
-//! two turn the run into a **multi-resolution pyramid**, which is how a registration is
-//! really driven; without them the run is single-level:
+//! Arguments: `size threads iterations min_step [scales] [shrink] [sigmas] [sampling]
+//! [metric]`. `shrink` and `sigmas` turn the run into a **multi-resolution pyramid**, which
+//! is how a registration is really driven; without them the run is single-level:
 //!
 //! ```text
 //! ... --example execute_bench -- 256 96 200 1e-4 scales 4,2,1 2,1,0
@@ -41,6 +41,30 @@
 //! (`a_fixed_initial_transform_converges_where_execute_converges`). Read the
 //! cross-evaluation, not the parameter delta, to decide whether the device metric is
 //! sound.
+//!
+//! # The correlation speed-up printed here is NOT a device number
+//!
+//! A 9th argument selects the metric (`meansquares`, the default, or `correlation`). Both
+//! have a device kernel. But the *host* sides are not comparable to each other:
+//! `CpuBackend::mean_squares` folds its samples in parallel across the thread pool, and
+//! `CorrelationMetric::evaluate` is a plain serial loop with no rayon in it at all. So the
+//! host correlation run is slow for a reason that has nothing to do with the GPU, and the
+//! host/device ratio it produces credits the device with the host's missing threading.
+//!
+//! Measured, 128³, 20 iterations, 96 threads, physical-shift scales:
+//!
+//! ```text
+//!                  host execute   device execute   ratio
+//!   mean squares       3367.8 ms         24.7 ms    136x
+//!   correlation       30091.1 ms         44.6 ms    674x
+//! ```
+//!
+//! The host correlation run is 8.9× the host mean-squares run; the *device* correlation
+//! evaluation is 1.88× the device mean-squares one (1.891 ms vs 1.005 ms per iteration,
+//! printed at the end of every run). 1.88× is the number that belongs to this design — the
+//! second pass NCC needs for its sample means, plus the wider partials buffer. The rest of
+//! the 674× is the host metric's serial loop, and quoting it as a GPU speed-up would be
+//! reporting a missing `par_iter` as a kernel.
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("this example needs the GPU: rebuild with --features cuda");
@@ -59,7 +83,8 @@ use sitk_cuda::{
 use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
 #[cfg(feature = "cuda")]
 use sitk_registration::{
-    CpuBackend, DeviceMeanSquaresMetric, ImageRegistrationMethod, MeanSquaresMetric,
+    CorrelationMetric, CpuBackend, DeviceCorrelationMetric, DeviceMeanSquaresMetric,
+    ImageRegistrationMethod, MeanSquaresMetric, MetricValue,
 };
 #[cfg(feature = "cuda")]
 use sitk_transform::{Euler3DTransform, ParametricTransform};
@@ -110,6 +135,14 @@ fn main() {
     let min_step: f64 = std::env::args()
         .nth(4)
         .map_or(1e-4, |s| s.parse().expect("min step"));
+    // Optional 9th arg: which metric. Both have a device kernel; correlation costs a
+    // second device pass per evaluation (its moments need the sample means first), and
+    // what that costs is measured at the end of this run rather than asserted.
+    let correlation = match std::env::args().nth(9).as_deref() {
+        None | Some("-") | Some("") | Some("meansquares") => false,
+        Some("correlation") => true,
+        Some(other) => panic!("metric is `meansquares` or `correlation`, not `{other}`"),
+    };
 
     // A pyramid is only run if BOTH lists are given, and they must be the same length:
     // the schedule is one (shrink, sigma) pair per level.
@@ -133,7 +166,11 @@ fn main() {
         // The method is not `Send` (it owns a `Box<dyn MetricBackend>`), so it is
         // built inside the pool's scope rather than moved into it.
         let mut reg = ImageRegistrationMethod::new();
-        reg.set_metric_as_mean_squares();
+        if correlation {
+            reg.set_metric_as_correlation();
+        } else {
+            reg.set_metric_as_mean_squares();
+        }
         reg.set_optimizer_as_regular_step_gradient_descent(1.0, min_step, iters, 1e-8);
         // Optional 5th arg: condition the optimizer's step in physical units, which
         // is what a caller registering a rotation *should* do. Without it a
@@ -202,7 +239,12 @@ fn main() {
         };
         println!(
             "== {n}^3 UInt16 in, {threads} CPU threads, sigma {SIGMA:?}, real execute(), \
-             {schedule}, max {iters} iterations per level, min step {min_step:e}\n"
+             {schedule}, metric {}, max {iters} iterations per level, min step {min_step:e}\n",
+            if correlation {
+                "correlation"
+            } else {
+                "mean squares"
+            }
         );
 
         // ---- host: cast -> rescale -> smooth -> execute -----------------------
@@ -266,6 +308,14 @@ fn main() {
             host_reg / device_reg,
             host_total / device_total
         );
+        if correlation {
+            println!(
+                "  ^ NOT a device number: CpuBackend::mean_squares folds its samples in \
+                 parallel, CorrelationMetric::evaluate is a serial loop with no rayon in it. \
+                 The host side of this ratio is single-threaded. What the second device pass \
+                 costs is measured below, against the mean-squares kernel on the same volumes."
+            );
+        }
         println!(
             "\n  host   : {} iters, {} valid, metric {:.9}, stop {:?}, params {:?}",
             host.iterations,
@@ -296,19 +346,41 @@ fn main() {
         // at BOTH endpoints: agreement here means the metric is sound and the
         // optimizer amplified rounding, not that the device computed a different
         // objective.
-        let hmetric = MeanSquaresMetric::from_samples(
+        let host_ms = MeanSquaresMetric::from_samples(
             FixedSamples::from_image(&hf).unwrap(),
             MovingImage::from_image(&hm).unwrap(),
         )
         .unwrap();
-        let dmetric = DeviceMeanSquaresMetric::from_device(&df, &dm).unwrap();
+        let host_ncc = CorrelationMetric::from_samples(
+            FixedSamples::from_image(&hf).unwrap(),
+            MovingImage::from_image(&hm).unwrap(),
+        )
+        .unwrap();
+        let dev_ms = DeviceMeanSquaresMetric::from_device(&df, &dm).unwrap();
+        let dev_ncc = DeviceCorrelationMetric::from_device(&df, &dm).unwrap();
+
+        let on_host = |t: &dyn ParametricTransform| -> MetricValue {
+            if correlation {
+                host_ncc.evaluate(t)
+            } else {
+                host_ms.evaluate(t, &CpuBackend)
+            }
+        };
+        let on_device = |t: &dyn ParametricTransform| -> MetricValue {
+            if correlation {
+                dev_ncc.evaluate(t).unwrap()
+            } else {
+                dev_ms.evaluate(t).unwrap()
+            }
+        };
+
         for (name, t) in [
-            ("initial", &initial()),
+            ("initial", &initial() as &dyn ParametricTransform),
             ("host-final", &host.transform),
             ("dev-final", &device.transform),
         ] {
-            let h = hmetric.evaluate(t, &CpuBackend);
-            let d = dmetric.evaluate(t).unwrap();
+            let h = on_host(t);
+            let d = on_device(t);
             let dv = (h.value - d.value).abs() / (1.0 + h.value.abs());
             let dd = h
                 .derivative
@@ -322,5 +394,34 @@ fn main() {
                 h.value, h.valid_points, d.valid_points
             );
         }
+
+        // What the second pass costs, measured rather than claimed. Correlation needs the
+        // sample means before any mean-subtracted moment can be formed, so it launches the
+        // sampling kernel twice per evaluation: once for (sum f, sum m, count), once for the
+        // 28 moments. Mean squares launches once, for 14. Both walk the same samples with
+        // the same sampler, so the ratio below is the price of the extra pass and of the
+        // wider partials buffer --- and nothing else.
+        let probe = initial();
+        let bench = |f: &mut dyn FnMut()| -> f64 {
+            for _ in 0..3 {
+                f();
+            }
+            let t = Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            ms(t) / 20.0
+        };
+        let ms_iter = bench(&mut || {
+            std::hint::black_box(dev_ms.evaluate(&probe).unwrap());
+        });
+        let ncc_iter = bench(&mut || {
+            std::hint::black_box(dev_ncc.evaluate(&probe).unwrap());
+        });
+        println!(
+            "\n  device metric cost/iteration: mean squares {ms_iter:.3} ms (1 pass, 14 slots) | \
+             correlation {ncc_iter:.3} ms (2 passes, 3 + 28 slots) | ratio {:.2}x",
+            ncc_iter / ms_iter
+        );
     });
 }
