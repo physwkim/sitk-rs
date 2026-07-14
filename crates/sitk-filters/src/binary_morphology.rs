@@ -257,19 +257,22 @@ fn voting_binary_typed<T: Scalar>(
     let foreground = T::from_f64(foreground);
     let background = T::from_f64(background);
     let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
-        let inpixel = nb.center_value();
-        let count = nb.values().iter().filter(|&&v| v == foreground).count() as u32;
-        let value = if inpixel == background && count >= birth_threshold {
+    let center_slot = iter.len() / 2;
+    // Parallel over output voxels. Every output pixel is a function of its own
+    // window alone — the neighbor count is an *equality* count over the borrowed
+    // window in its own order, and the birth/survival test is unchanged — so no
+    // value crosses voxels and no thread count can reach the result.
+    let out: Vec<T> = iter.par_map_window(|_, w| {
+        let inpixel = w.get(center_slot);
+        let count = w.iter().filter(|&v| v == foreground).count() as u32;
+        if inpixel == background && count >= birth_threshold {
             foreground
         } else if inpixel == foreground && count < survival_threshold {
             background
         } else {
             inpixel
-        };
-        out.push(value);
-    }
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -314,17 +317,26 @@ fn voting_binary_hole_filling_pass_typed<T: Scalar>(
     let foreground = T::from_f64(foreground);
     let background = T::from_f64(background);
     let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    let mut changed = 0u32;
-    for (_, nb) in iter {
-        let inpixel = nb.center_value();
-        let value = if inpixel == background {
-            let count = nb.values().iter().filter(|&&v| v == foreground).count() as u32;
+    let center_slot = iter.len() / 2;
+
+    // Parallel over output voxels, each carrying its own `changed` flag rather
+    // than incrementing a shared counter.
+    //
+    // `m_NumberOfPixelsChanged` is the one quantity here that crosses voxels, and
+    // it is deliberately NOT accumulated inside the parallel pass. It is recovered
+    // afterwards by counting the flags, in voxel order, on one thread. That keeps
+    // the count a pure function of the output — it is a `usize` tally of a
+    // predicate, so it is exact and could not have been re-associated into a
+    // different answer anyway, but tallying it here rather than in the workers
+    // means there is no shared accumulator to reason about at all.
+    let flagged: Vec<(T, bool)> = iter.par_map_window(|_, w| {
+        let inpixel = w.get(center_slot);
+        if inpixel == background {
+            let count = w.iter().filter(|&v| v == foreground).count() as u32;
             if count >= birth_threshold {
-                changed += 1;
-                foreground
+                (foreground, true)
             } else {
-                background
+                (background, false)
             }
         } else {
             // itkVotingBinaryHoleFillingImageFilter.hxx's unconditional
@@ -332,10 +344,13 @@ fn voting_binary_hole_filling_pass_typed<T: Scalar>(
             // is stamped to foreground_value, not just an exact-foreground
             // one, and this branch never contributes to the changed count.
             // Tracked in the upstream-findings ledger, §2.70.
-            foreground
-        };
-        out.push(value);
-    }
+            (foreground, false)
+        }
+    });
+
+    let changed = flagged.iter().filter(|(_, c)| *c).count() as u32;
+    let out: Vec<T> = flagged.into_iter().map(|(v, _)| v).collect();
+
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, changed))
@@ -455,15 +470,16 @@ fn binary_median_typed<T: Scalar>(
     let background = T::from_f64(background);
     let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
     let median_position = iter.len() / 2;
-    let mut out = Vec::with_capacity(img.number_of_pixels());
-    for (_, nb) in iter {
-        let count = nb.values().iter().filter(|&&v| v == foreground).count();
-        out.push(if count > median_position {
+    // Parallel over output voxels: the majority vote is a count over one voxel's
+    // own window, so nothing crosses voxels.
+    let out: Vec<T> = iter.par_map_window(|_, w| {
+        let count = w.iter().filter(|&v| v == foreground).count();
+        if count > median_position {
             foreground
         } else {
             background
-        });
-    }
+        }
+    });
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok(result)
@@ -1063,5 +1079,228 @@ mod tests {
             binary_thinning(&image).unwrap_err(),
             FilterError::UnsupportedThinningDimension(3)
         );
+    }
+}
+
+/// Thread-count parity pins for the three window passes in this module.
+///
+/// All three are **counting** stencils — an equality count over one voxel's own
+/// window — so, like the grayscale morphology pins, their non-vacuity guard is
+/// slot-dependence, not fold order: a `usize` count is exact and order-insensitive,
+/// and asserting that reordering it moves the answer would be asserting a
+/// falsehood.
+///
+/// The one quantity here that genuinely crossed voxels is
+/// [`voting_binary_hole_filling`]'s `changed` counter, which the serial pass
+/// incremented inside the loop. It is pinned too: the parallel pass returns a
+/// per-voxel flag and the count is tallied afterwards on one thread, so the pin
+/// below asserts both the image *and* the count.
+///
+/// `-0.0` does not arise anywhere in this module: every value written is one of
+/// the two caller-supplied labels, and the pixel type is required to be integer
+/// ([`crate::logic::require_integer_pixel_type`]), so there is no signed zero to
+/// preserve.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{THREADS, binary_volume};
+    use sitk_core::parallel;
+
+    const FG: f64 = 1.0;
+    const BG: f64 = 0.0;
+
+    // ---- the serial references: the exact loops that were deleted -----------
+
+    fn voting_binary_serial(img: &Image, radius: &[usize], birth: u32, survival: u32) -> Vec<u8> {
+        let foreground = u8::from_f64(FG);
+        let background = u8::from_f64(BG);
+        let iter =
+            NeighborhoodIterator::<u8, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        iter.map(|(_, nb)| {
+            let inpixel = nb.center_value();
+            let count = nb.values().iter().filter(|&&v| v == foreground).count() as u32;
+            if inpixel == background && count >= birth {
+                foreground
+            } else if inpixel == foreground && count < survival {
+                background
+            } else {
+                inpixel
+            }
+        })
+        .collect()
+    }
+
+    /// The hole-filling pass *and* its `changed` counter, as the serial loop
+    /// produced them: one shared `changed += 1` inside the walk.
+    fn hole_filling_serial(img: &Image, radius: &[usize], birth: u32) -> (Vec<u8>, u32) {
+        let foreground = u8::from_f64(FG);
+        let background = u8::from_f64(BG);
+        let iter =
+            NeighborhoodIterator::<u8, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        let mut out = Vec::with_capacity(img.number_of_pixels());
+        let mut changed = 0u32;
+        for (_, nb) in iter {
+            let inpixel = nb.center_value();
+            let value = if inpixel == background {
+                let count = nb.values().iter().filter(|&&v| v == foreground).count() as u32;
+                if count >= birth {
+                    changed += 1;
+                    foreground
+                } else {
+                    background
+                }
+            } else {
+                foreground
+            };
+            out.push(value);
+        }
+        (out, changed)
+    }
+
+    fn binary_median_serial(img: &Image, radius: &[usize]) -> Vec<u8> {
+        let foreground = u8::from_f64(FG);
+        let background = u8::from_f64(BG);
+        let iter =
+            NeighborhoodIterator::<u8, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        let median_position = iter.len() / 2;
+        iter.map(|(_, nb)| {
+            let count = nb.values().iter().filter(|&&v| v == foreground).count();
+            if count > median_position {
+                foreground
+            } else {
+                background
+            }
+        })
+        .collect()
+    }
+
+    fn pixels(img: &Image) -> Vec<u8> {
+        img.scalar_slice::<u8>().unwrap().to_vec()
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    /// These pins are worth nothing unless each output voxel actually depends on
+    /// *which* window slots it counts. Shown two ways: the median moves a large
+    /// share of the voxels (so the volume is not trivially all-foreground or
+    /// all-background), and a `[1,1,1]` window gives a different answer than a
+    /// `[1,0,0]` one — the two differ only in which slots are in the count, so a
+    /// mis-addressed window would be caught.
+    #[test]
+    fn the_output_depends_on_which_window_slots_are_counted() {
+        let img = binary_volume();
+        let input = pixels(&img);
+
+        let full = binary_median(&img, &[1, 1, 1], FG, BG).unwrap();
+        let thin = binary_median(&img, &[1, 0, 0], FG, BG).unwrap();
+
+        let moved = pixels(&full)
+            .iter()
+            .zip(&input)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            moved > input.len() / 100,
+            "the binary median moved only {moved}/{} voxels — the volume is too uniform to \
+             pin anything",
+            input.len()
+        );
+
+        let differ = pixels(&full)
+            .iter()
+            .zip(pixels(&thin))
+            .filter(|(a, b)| **a != *b)
+            .count();
+        assert!(
+            differ > input.len() / 100,
+            "a [1,1,1] window and a [1,0,0] window produced the same median on all but \
+             {differ} voxels — the output barely depends on which slots are counted, so \
+             these pins could not catch a mis-addressed window"
+        );
+    }
+
+    /// The hole-filling counter is only pinned meaningfully if the pass actually
+    /// flips pixels — a count of zero would match a broken parallel tally by
+    /// accident.
+    #[test]
+    fn the_hole_filling_pass_actually_changes_pixels() {
+        let img = binary_volume();
+        let (_, changed) = hole_filling_serial(&img, &[2, 2, 2], 14);
+        assert!(
+            changed > 100,
+            "the serial hole-filling pass flipped only {changed} pixels — too few for the \
+             counter pin to mean anything"
+        );
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn voting_binary_is_bit_identical_at_every_thread_count() {
+        let img = binary_volume();
+        for (radius, birth, survival) in [(vec![1usize, 1, 1], 12u32, 10u32), (vec![2, 1, 1], 8, 6)]
+        {
+            let expected = voting_binary_serial(&img, &radius, birth, survival);
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    voting_binary(&img, &radius, birth, survival, FG, BG)
+                })
+                .unwrap();
+                assert_eq!(
+                    pixels(&got),
+                    expected,
+                    "voting_binary({radius:?}, birth={birth}, survival={survival}) moved with \
+                     {threads} threads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn voting_binary_hole_filling_image_and_count_are_identical_at_every_thread_count() {
+        let img = binary_volume();
+        for (radius, majority) in [(vec![2usize, 2, 2], 1u32), (vec![1, 1, 1], 2)] {
+            let neighborhood: usize = radius.iter().map(|&r| 2 * r + 1).product();
+            let birth = ((neighborhood - 1) / 2) as u32 + majority;
+            let (expected_image, expected_changed) = hole_filling_serial(&img, &radius, birth);
+
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    voting_binary_hole_filling(&img, &radius, majority, FG, BG)
+                })
+                .unwrap();
+                assert_eq!(
+                    pixels(&got.image),
+                    expected_image,
+                    "voting_binary_hole_filling({radius:?}) image moved with {threads} threads"
+                );
+                assert_eq!(
+                    got.number_of_pixels_changed, expected_changed,
+                    "voting_binary_hole_filling({radius:?}) changed-count moved with {threads} \
+                     threads: {} vs serial {expected_changed}",
+                    got.number_of_pixels_changed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_median_is_bit_identical_at_every_thread_count() {
+        let img = binary_volume();
+        for radius in [vec![1usize, 1, 1], vec![2, 1, 3]] {
+            let expected = binary_median_serial(&img, &radius);
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || binary_median(&img, &radius, FG, BG))
+                    .unwrap();
+                assert_eq!(
+                    pixels(&got),
+                    expected,
+                    "binary_median({radius:?}) moved with {threads} threads"
+                );
+            }
+        }
     }
 }

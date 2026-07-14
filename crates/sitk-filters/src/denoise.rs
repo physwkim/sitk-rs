@@ -909,25 +909,28 @@ pub fn discrete_gaussian_derivative(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        let out: Vec<f64> = iter
-            .map(|(_, nb)| {
-                let mut off = vec![0i64; dim];
-                let acc: f64 = kernel
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &c)| {
-                        off[d] = k as i64 - half as i64;
-                        c * nb.get(&off)
-                    })
-                    .sum();
-                // Real-valued intermediate: the separable passes accumulate in
-                // f64 and quantize to `pixel_id` exactly once, at the end (via
-                // `image_from_f64`). ITK's `RealOutputImageType` alias is
-                // misdeclared `Image<OutputPixelType>`, truncating every partial
-                // derivative on integer images; this port carries the real type.
-                acc
-            })
-            .collect();
+        // The window is 1-D along axis `d` (radius is zero on every other axis),
+        // so its slot stride along `d` is 1 and tap `k` sits at slot `k`. That is
+        // the whole of the ND-offset arithmetic `Neighborhood::get` was
+        // re-deriving per tap, per voxel.
+        //
+        // Parallel over output voxels: the taps are summed over `k` in kernel
+        // order, exactly as the serial `map(..).sum()` summed them, and nothing
+        // accumulates across voxels. The axis loop itself stays sequential — each
+        // pass reads the previous pass's whole output — so the separable cascade
+        // is unchanged.
+        let out: Vec<f64> = iter.par_map_window(|_, w| {
+            // Real-valued intermediate: the separable passes accumulate in
+            // f64 and quantize to `pixel_id` exactly once, at the end (via
+            // `image_from_f64`). ITK's `RealOutputImageType` alias is
+            // misdeclared `Image<OutputPixelType>`, truncating every partial
+            // derivative on integer images; this port carries the real type.
+            kernel
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| c * w.get_f64(k))
+                .sum()
+        });
 
         current = Image::from_vec(&size, out)?;
         current.copy_geometry_from(img);
@@ -1086,31 +1089,76 @@ pub fn bilateral(
         .collect();
     let distance_to_table_index = samples as f64 / dynamic_range_used;
 
-    let scratch = scratch_f64(img)?;
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
-
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
-            let center = nb.center_value();
-            let mut val = 0.0f64;
-            let mut norm_factor = 0.0f64;
-            for (off, &dk) in offsets.iter().zip(&domain_kernel) {
-                let pixel = nb.get(off);
-                let range_distance = (pixel - center).abs();
-                if range_distance < dynamic_range_used {
-                    let table_arg = range_distance * distance_to_table_index;
-                    let idx = (table_arg.floor() as usize).min(samples - 1);
-                    let product = dk * table[idx];
-                    norm_factor += product;
-                    val += pixel * product;
-                }
-            }
-            val / norm_factor
-        })
-        .collect();
-
+    let weights = BilateralWeights {
+        domain_kernel: &domain_kernel,
+        table: &table,
+        dynamic_range_used,
+        distance_to_table_index,
+    };
+    let out = dispatch_scalar!(img.pixel_id(), bilateral_pass, img, &radius, &weights)?;
     image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
+
+/// Everything [`bilateral`] precomputes once and its stencil then reads per
+/// neighbor: the normalized domain (spatial) kernel in window-slot order, the
+/// sampled range (intensity) Gaussian table, and the two scalars that turn an
+/// intensity distance into an index into it.
+struct BilateralWeights<'a> {
+    /// The domain weight of window slot `j` — see [`bilateral_pass`] for why the
+    /// kernel's index *is* the slot.
+    domain_kernel: &'a [f64],
+    table: &'a [f64],
+    dynamic_range_used: f64,
+    distance_to_table_index: f64,
+}
+
+/// [`bilateral`]'s stencil, as a parallel map over output voxels.
+///
+/// Reads `T` and widens per access instead of materializing an `f64` copy of the
+/// whole volume first — the same `Scalar::as_f64` that copy's `to_f64_vec`
+/// applied, so every value the arithmetic sees is the one it held. The copy's
+/// scalar-pixel rejection survives its deletion: `NeighborhoodIterator::new`
+/// takes a `scalar_view::<T>()`, which returns the same
+/// [`sitk_core::Error::RequiresScalarPixelType`].
+///
+/// The ND offset table is gone with it. [`window_offsets`] enumerates the window
+/// in the *same* dimension-0-fastest order that
+/// [`sitk_core::Neighborhood::values`] holds — it is the same enumeration
+/// `NeighborhoodIterator::new` builds internally — so the domain-kernel weight at
+/// index `j` belongs to window slot `j`, and the per-neighbor ND-offset lookup
+/// `Neighborhood::get` was re-deriving is just an index. `domain_kernel` is built
+/// from `offsets` and therefore already carries that order.
+///
+/// `val` and `norm_factor` accumulate over one voxel's own window, in that order,
+/// under the identical `range_distance < dynamic_range_used` test and the
+/// identical table index. Nothing accumulates across voxels, so the result is
+/// bit-identical to the serial walk at any thread count.
+fn bilateral_pass<T: Scalar>(
+    img: &Image,
+    radius: &[usize],
+    weights: &BilateralWeights<'_>,
+) -> Result<Vec<f64>> {
+    let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
+    let center_slot = iter.len() / 2;
+    let samples = weights.table.len();
+
+    Ok(iter.par_map_window(|_, w| {
+        let center = w.get_f64(center_slot);
+        let mut val = 0.0f64;
+        let mut norm_factor = 0.0f64;
+        for (slot, &dk) in weights.domain_kernel.iter().enumerate() {
+            let pixel = w.get_f64(slot);
+            let range_distance = (pixel - center).abs();
+            if range_distance < weights.dynamic_range_used {
+                let table_arg = range_distance * weights.distance_to_table_index;
+                let idx = (table_arg.floor() as usize).min(samples - 1);
+                let product = dk * weights.table[idx];
+                norm_factor += product;
+                val += pixel * product;
+            }
+        }
+        val / norm_factor
+    }))
 }
 
 // ---- curvature_flow ----------------------------------------------------
@@ -2197,5 +2245,440 @@ mod tests {
         let img = Image::from_vec(&[5, 5], vec![1.0f32; 25]).unwrap();
         let out = curvature_flow(&img, 1, 0.05, true).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float64);
+    }
+}
+
+/// Thread-count parity for [`bilateral`], which was a serial
+/// `iter().map().collect()` over a `Neighborhood<f64>` copied out per voxel, fed
+/// by a full `f64` copy of the input volume. Both are gone; the pass is now a
+/// [`NeighborhoodIterator::par_map_window`] over a borrowed
+/// [`sitk_core::WindowView`] of the input's own pixels.
+///
+/// **No `-0.0` exposure.** That trap is specific to converting a first
+/// accumulate into a store, where `0.0 + x` and `x` differ only at `x == -0.0`.
+/// Nothing here is converted: `val` and `norm_factor` still start at `0.0` and
+/// still accumulate, and which neighbors contribute is still decided by the same
+/// `range_distance < dynamic_range_used` test. There is no store to substitute.
+#[cfg(test)]
+mod bilateral_thread_parity {
+    use super::*;
+    use sitk_core::parallel;
+
+    /// The `f64` volume copy and the serial neighborhood walk [`bilateral`] used
+    /// to run, kept verbatim as the reference the parallel pass is pinned against.
+    fn bilateral_serial(
+        img: &Image,
+        domain_sigma: f64,
+        range_sigma: f64,
+        number_of_range_gaussian_samples: u32,
+    ) -> Vec<f64> {
+        const DOMAIN_MU: f64 = 2.5;
+        const RANGE_MU: f64 = 4.0;
+
+        let dim = img.dimension();
+        let spacing = img.spacing().to_vec();
+
+        let radius: Vec<usize> = (0..dim)
+            .map(|d| (DOMAIN_MU * domain_sigma / spacing[d]).ceil().max(0.0) as usize)
+            .collect();
+
+        let offsets = window_offsets(&radius);
+        let mut domain_kernel: Vec<f64> = offsets
+            .iter()
+            .map(|off| {
+                let exponent: f64 = off
+                    .iter()
+                    .zip(&spacing)
+                    .map(|(&o, &s)| {
+                        let physical = o as f64 * s;
+                        physical * physical
+                    })
+                    .sum();
+                (-0.5 * exponent / (domain_sigma * domain_sigma)).exp()
+            })
+            .collect();
+        let domain_norm: f64 = domain_kernel.iter().sum();
+        for w in &mut domain_kernel {
+            *w /= domain_norm;
+        }
+
+        let samples = number_of_range_gaussian_samples.max(1) as usize;
+        let dynamic_range_used = RANGE_MU * range_sigma;
+        let range_variance = range_sigma * range_sigma;
+        let range_gaussian_denom = range_sigma * (2.0 * std::f64::consts::PI).sqrt();
+        let table_delta = dynamic_range_used / samples as f64;
+        let table: Vec<f64> = (0..samples)
+            .map(|i| {
+                let v = i as f64 * table_delta;
+                (-0.5 * v * v / range_variance).exp() / range_gaussian_denom
+            })
+            .collect();
+        let distance_to_table_index = samples as f64 / dynamic_range_used;
+
+        let scratch = scratch_f64(img).unwrap();
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        iter.map(|(_, nb)| {
+            let center = nb.center_value();
+            let mut val = 0.0f64;
+            let mut norm_factor = 0.0f64;
+            for (off, &dk) in offsets.iter().zip(&domain_kernel) {
+                let pixel = nb.get(off);
+                let range_distance = (pixel - center).abs();
+                if range_distance < dynamic_range_used {
+                    let table_arg = range_distance * distance_to_table_index;
+                    let idx = (table_arg.floor() as usize).min(samples - 1);
+                    let product = dk * table[idx];
+                    norm_factor += product;
+                    val += pixel * product;
+                }
+            }
+            val / norm_factor
+        })
+        .collect()
+    }
+
+    /// A 32³ volume — 32 768 voxels, over `parallel`'s 16 384 serial threshold, so
+    /// the window pass really runs on rayon.
+    ///
+    /// `Float64` is the volume with teeth: full 53-bit mantissas, so the window's
+    /// weighted sums genuinely round and the term order is observable. `Float32`
+    /// exercises the widening-per-access path that replaced the deleted copy.
+    fn volume(pixel: PixelId) -> Image {
+        let n = 32usize;
+        let mut data = vec![0.0f64; n * n * n];
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (i as f64, j as f64, k as f64);
+                    data[(k * n + j) * n + i] = (0.7 * x).sin() * 40.0
+                        + (0.3 * y).cos() * 25.0
+                        + (x * y * 0.01 + z * 0.9).sin() * 13.0
+                        + ((i * 37 + j * 11 + k * 7) % 29) as f64;
+                }
+            }
+        }
+        let mut img = match pixel {
+            PixelId::Float64 => Image::from_vec(&[n, n, n], data).unwrap(),
+            PixelId::Float32 => {
+                let d: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+                Image::from_vec(&[n, n, n], d).unwrap()
+            }
+            other => panic!("volume() does not build {other:?}"),
+        };
+        img.set_spacing(&[1.0, 0.75, 1.3]).unwrap();
+        img
+    }
+
+    const PIXELS: [PixelId; 2] = [PixelId::Float64, PixelId::Float32];
+
+    /// [`bilateral`] keeps the input's pixel type, so on an `f32` input its output
+    /// is `f32`-rounded; the reference must go through the same exit or the pin
+    /// would fail on the rounding rather than on the parallelization.
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    /// The pin below asserts nothing unless this filter's window accumulation can
+    /// actually round — a sum that is exact is unchanged by any re-association, so
+    /// "the bits match" would hold however the code summed it.
+    ///
+    /// On the `Float64` volume, reversing a voxel's weighted neighbor sum must move
+    /// its bits somewhere. Unlike Sobel's, bilateral's weights are *not* powers of
+    /// two — they are `exp()` outputs — so the products round and the order tells.
+    /// That is the teeth, and this measures it rather than assuming it.
+    #[test]
+    fn the_within_window_weighted_sum_order_is_observable_on_float64() {
+        let img = volume(PixelId::Float64);
+        let radius = [1usize, 1, 1];
+        let scratch = scratch_f64(&img).unwrap();
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        // A domain kernel of the same shape the filter builds: exp() weights,
+        // normalized, so the products are not exactly representable.
+        let offsets = window_offsets(&radius);
+        let mut kernel: Vec<f64> = offsets
+            .iter()
+            .map(|off| {
+                let e: f64 = off.iter().map(|&o| (o * o) as f64).sum();
+                (-0.5 * e / (0.9 * 0.9)).exp()
+            })
+            .collect();
+        let norm: f64 = kernel.iter().sum();
+        for w in &mut kernel {
+            *w /= norm;
+        }
+
+        let mut moved = 0usize;
+        for (_, nb) in iter {
+            let terms: Vec<f64> = kernel
+                .iter()
+                .zip(nb.values())
+                .map(|(&k, &v)| k * v)
+                .collect();
+            let forward = terms.iter().fold(0.0f64, |a, &t| a + t);
+            let backward = terms.iter().rev().fold(0.0f64, |a, &t| a + t);
+            if forward.to_bits() != backward.to_bits() {
+                moved += 1;
+            }
+        }
+        assert!(
+            moved > 0,
+            "no voxel's weighted window sum changed bits when its terms were \
+             reversed, so this volume cannot observe a re-association and the pin \
+             below would pass even if the accumulation were reordered"
+        );
+    }
+
+    /// The other axis of vacuity: the filter must actually smooth. If the range
+    /// term rejected every neighbor, `val / norm_factor` would collapse to the
+    /// center pixel and the pin would compare a copy against a copy.
+    #[test]
+    fn the_reference_output_is_not_a_copy_of_the_input() {
+        let img = volume(PixelId::Float64);
+        let out = bilateral_serial(&img, 1.0, 20.0, 100);
+        let src = img.to_f64_vec().unwrap();
+        let changed = out
+            .iter()
+            .zip(&src)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert!(
+            changed > src.len() / 2,
+            "bilateral changed only {changed}/{} voxels — the range sigma is \
+             rejecting almost every neighbor, so this pin is comparing the input \
+             against itself",
+            src.len()
+        );
+    }
+
+    /// `bilateral` is bit-identical to the deleted serial loop at every thread
+    /// count, on both pixel types, across range sigmas that admit few and many
+    /// neighbors (the range test is data-dependent, so a wrong slot would show up
+    /// as a *different set* of contributing neighbors, not just different bits).
+    #[test]
+    fn bilateral_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            assert!(
+                img.number_of_pixels() > 1 << 14,
+                "volume must exceed the serial threshold, or the parallel path never runs"
+            );
+
+            // The range sigma is what varies which neighbors contribute — the
+            // data-dependent half, and the half a wrong window slot would break.
+            // The domain sigma only sets the window's size, so it stays small: at
+            // `2.0` with this spacing the serial reference walks a 1485-voxel
+            // window per output voxel, and the pin took 80 s to say the same thing
+            // it says here in a few.
+            for (domain_sigma, range_sigma, samples) in
+                [(1.0f64, 20.0f64, 100u32), (1.0, 5.0, 64), (1.0, 50.0, 128)]
+            {
+                let expected = narrowed_like(
+                    &img,
+                    &bilateral_serial(&img, domain_sigma, range_sigma, samples),
+                );
+                for threads in [1usize, 4, 48, 96] {
+                    let got = parallel::with_threads(threads, || {
+                        bilateral(&img, domain_sigma, range_sigma, samples).unwrap()
+                    });
+                    let got = got.to_f64_vec().unwrap();
+                    assert_eq!(got.len(), expected.len());
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "bilateral({pixel:?}, domain={domain_sigma}, \
+                             range={range_sigma}, samples={samples}) moved at voxel {i} \
+                             with {threads} threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Thread-count parity pin for `discrete_gaussian_derivative`'s separable pass.
+///
+/// This is a **summing** stencil: each output voxel is `Σ_k kernel[k] · w[k]` in
+/// `f64`, and `f64` addition is not associative — so the non-vacuity guard here
+/// *is* the fold-order one
+/// ([`crate::stencil_test_support::window_sum_order_is_observable`]), and it is
+/// asserted on the volume the pin actually uses.
+///
+/// `-0.0` does not apply. The conversion did not turn an accumulate into a store
+/// or a skip into an add: the sum still starts at `0.0` and runs over the same
+/// taps in the same `k` order. The only thing that changed is *where* tap `k` is
+/// read from — slot `k` of a borrowed 1-D window, instead of an ND offset vector
+/// re-derived per tap — and reading the same value from a different expression
+/// cannot move a bit.
+#[cfg(test)]
+mod gaussian_derivative_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{
+        PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
+    };
+    use sitk_core::parallel;
+
+    const MAX_ERROR: f64 = 0.01;
+    const MAX_WIDTH: u32 = 32;
+
+    /// The exact serial cascade that was deleted: same kernels, same axis order,
+    /// same `Neighborhood::get` ND-offset tap read.
+    fn serial(
+        img: &Image,
+        variance: &[f64],
+        order: &[u32],
+        use_image_spacing: bool,
+        normalize_across_scale: bool,
+    ) -> Vec<f64> {
+        let dim = img.dimension();
+        let maximum_error = clamp_maximum_error(MAX_ERROR);
+        let spacing = img.spacing().to_vec();
+        let size = img.size().to_vec();
+        let mut current = scratch_f64(img).unwrap();
+
+        for d in (0..dim).rev() {
+            let pixel_variance = if use_image_spacing {
+                variance[d] / (spacing[d] * spacing[d])
+            } else {
+                variance[d]
+            };
+            let mut kernel = gaussian_derivative_operator_coefficients(
+                pixel_variance,
+                maximum_error,
+                MAX_WIDTH,
+                order[d],
+                normalize_across_scale,
+            );
+            kernel.reverse();
+            let half = kernel.len() / 2;
+            let mut radius = vec![0usize; dim];
+            radius[d] = half;
+
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &current,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+            let out: Vec<f64> = iter
+                .map(|(_, nb)| {
+                    let mut off = vec![0i64; dim];
+                    kernel
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &c)| {
+                            off[d] = k as i64 - half as i64;
+                            c * nb.get(&off)
+                        })
+                        .sum()
+                })
+                .collect();
+
+            current = Image::from_vec(&size, out).unwrap();
+            current.copy_geometry_from(img);
+        }
+        current.to_f64_vec().unwrap()
+    }
+
+    /// Narrow a serial reference through the same exit the filter takes.
+    /// `discrete_gaussian_derivative` keeps the input's pixel type, so on an `f32`
+    /// input its output is `f32`-rounded; comparing against an un-rounded `f64`
+    /// reference would fail on the rounding rather than on the parallelization.
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    /// Non-vacuity. The taps are summed in `f64`; if that sum could not round on
+    /// this volume, re-associating it would be invisible and the pin would pass on
+    /// a filter that summed its window in any order at all. This asserts the order
+    /// *is* observable — reversing a window's terms moves the bits on at least one
+    /// voxel — on the same `f64` volume the pin runs on.
+    ///
+    /// The `f32` volume is pinned as well, but for a different reason: it exercises
+    /// the widening-per-access path, not the fold order. It is not asserted to be
+    /// order-sensitive, and it must not be read as proving anything about it.
+    #[test]
+    fn the_window_sum_order_is_observable_on_the_float64_volume() {
+        let img = volume(PixelId::Float64);
+        assert!(
+            window_sum_order_is_observable(&img, &[4, 0, 0]),
+            "no voxel changed bits when its window sum was reversed, so this volume cannot \
+             observe a re-association and the pin below would pass even on a filter that \
+             summed its taps in a different order"
+        );
+    }
+
+    #[test]
+    fn the_reference_output_is_not_degenerate() {
+        let img = volume(PixelId::Float64);
+        let values = serial(&img, &[2.0, 2.0, 2.0], &[1, 0, 0], true, false);
+        let nonzero = values.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero > values.len() / 2,
+            "only {nonzero}/{} voxels are non-zero — the volume is too flat to pin anything",
+            values.len()
+        );
+    }
+
+    #[test]
+    fn discrete_gaussian_derivative_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (order, use_image_spacing, normalize) in [
+                (vec![1u32, 0, 0], true, false),
+                (vec![0, 2, 0], true, false),
+                (vec![1, 1, 0], false, true),
+            ] {
+                let variance = vec![2.0f64, 1.5, 3.0];
+                let expected = narrowed_like(
+                    &img,
+                    &serial(&img, &variance, &order, use_image_spacing, normalize),
+                );
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        discrete_gaussian_derivative(
+                            &img,
+                            &variance,
+                            &order,
+                            MAX_ERROR,
+                            MAX_WIDTH,
+                            use_image_spacing,
+                            normalize,
+                        )
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "discrete_gaussian_derivative({pixel:?}, order={order:?}, \
+                             spacing={use_image_spacing}, normalize={normalize}, \
+                             {threads} threads)"
+                        ),
+                    );
+                }
+            }
+        }
     }
 }

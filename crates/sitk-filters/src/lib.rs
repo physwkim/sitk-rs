@@ -38,6 +38,9 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+#[cfg(test)]
+pub(crate) mod stencil_test_support;
+
 pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
 pub mod attribute_morphology;

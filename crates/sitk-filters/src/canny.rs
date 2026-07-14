@@ -91,21 +91,28 @@ fn second_directional_derivative_field(smoothed: &Image) -> Result<Vec<f64>> {
     let d2 = derivative_operator_coefficients(2);
     let taps = [-1i64, 0, 1];
 
-    let out = iter
-        .map(|(_, nb)| {
-            let mut dx = vec![0.0f64; dim];
-            let mut dxx = vec![0.0f64; dim];
-            let mut off = vec![0i64; dim];
+    // Every axis of this window has extent 3, so the window slot of a one-pixel
+    // step along axis `a` is `3^a` — exactly the enumeration `Neighborhood::get`
+    // re-derived from an ND offset vector on every single tap.
+    let center_slot = iter.len() / 2;
+    let window_stride = window_strides(dim);
+
+    // Parallel over output voxels. `dx` and `dxx` are per-task scratch, fully
+    // overwritten for each voxel (every `a` in `0..dim` is assigned), never
+    // carried between them. Each voxel's sums run over its own window in the same
+    // order as before, and nothing accumulates across voxels, so no thread count
+    // can reach the arithmetic.
+    let out = iter.par_map_window_init(
+        || (vec![0.0f64; dim], vec![0.0f64; dim]),
+        |(dx, dxx), _, w| {
             for a in 0..dim {
                 let mut sx = 0.0;
                 let mut sxx = 0.0;
                 for (k, &delta) in taps.iter().enumerate() {
-                    off[a] = delta;
-                    let v = nb.get(&off);
+                    let v = w.get_f64((center_slot as i64 + delta * window_stride[a]) as usize);
                     sx += d1[k] * v;
                     sxx += d2[k] * v;
                 }
-                off[a] = 0;
                 dx[a] = sx;
                 dxx[a] = sxx;
             }
@@ -113,17 +120,13 @@ fn second_directional_derivative_field(smoothed: &Image) -> Result<Vec<f64>> {
             let mut deriv = 0.0;
             for i in 0..dim {
                 for j in (i + 1)..dim {
-                    off[i] = -1;
-                    off[j] = -1;
-                    let m_m = nb.get(&off);
-                    off[j] = 1;
-                    let m_p = nb.get(&off);
-                    off[i] = 1;
-                    let p_p = nb.get(&off);
-                    off[j] = -1;
-                    let p_m = nb.get(&off);
-                    off[i] = 0;
-                    off[j] = 0;
+                    let (si, sj) = (window_stride[i], window_stride[j]);
+                    let at =
+                        |a: i64, b: i64| w.get_f64((center_slot as i64 + a * si + b * sj) as usize);
+                    let m_m = at(-1, -1);
+                    let m_p = at(-1, 1);
+                    let p_p = at(1, 1);
+                    let p_m = at(1, -1);
                     let dxy = 0.25 * m_m - 0.25 * m_p - 0.25 * p_m + 0.25 * p_p;
                     deriv += 2.0 * dx[i] * dx[j] * dxy;
                 }
@@ -135,8 +138,8 @@ fn second_directional_derivative_field(smoothed: &Image) -> Result<Vec<f64>> {
                 grad_mag += dx[a] * dx[a];
             }
             deriv / grad_mag
-        })
-        .collect();
+        },
+    );
     Ok(out)
 }
 
@@ -159,19 +162,41 @@ fn positional_gate_field(smoothed: &Image, deriv_field: &Image) -> Result<Vec<f6
     let d1 = derivative_operator_coefficients(1);
     let taps = [-1i64, 0, 1];
 
-    let out = iter_s
-        .zip(iter_d)
-        .map(|((_, nb_s), (_, nb_d))| {
+    let center_slot = iter_s.len() / 2;
+    let window_stride = window_strides(dim);
+
+    // This is the one stencil in the module that reads **two** aligned images at
+    // the same voxel, which `par_map_window` alone does not cover: it hands out
+    // one image's window. The second image's window is refilled into per-task
+    // scratch instead (`window_buffer` once per task, `refill` per voxel), so
+    // `deriv_field`'s window is still materialized exactly as the serial
+    // `iter_s.zip(iter_d)` materialized it — same values, same order — while
+    // `smoothed`'s is borrowed and neither is allocated per voxel.
+    //
+    // `dx`, `dx1` and the refilled window are scratch that each voxel fully
+    // overwrites; nothing is carried between voxels, and nothing accumulates
+    // across them.
+    let out = iter_s.par_map_window_init(
+        || {
+            (
+                iter_d.window_buffer(),
+                vec![0i64; dim],
+                vec![0.0f64; dim],
+                vec![0.0f64; dim],
+            )
+        },
+        |(nb_d, nd, dx, dx1), center, w_s| {
+            iter_d.refill(center, nd, nb_d);
+
             let mut off = vec![0i64; dim];
-            let mut dx = vec![0.0f64; dim];
-            let mut dx1 = vec![0.0f64; dim];
             let mut grad_mag_sq = 0.0001;
             for a in 0..dim {
                 let mut sx = 0.0;
                 let mut sx1 = 0.0;
                 for (k, &delta) in taps.iter().enumerate() {
+                    let slot = (center_slot as i64 + delta * window_stride[a]) as usize;
                     off[a] = delta;
-                    sx += d1[k] * nb_s.get(&off);
+                    sx += d1[k] * w_s.get_f64(slot);
                     sx1 += d1[k] * nb_d.get(&off);
                 }
                 off[a] = 0;
@@ -182,8 +207,8 @@ fn positional_gate_field(smoothed: &Image, deriv_field: &Image) -> Result<Vec<f6
             let grad_mag = grad_mag_sq.sqrt();
             let deriv_pos: f64 = (0..dim).map(|a| dx1[a] * (dx[a] / grad_mag)).sum();
             if deriv_pos <= 0.0 { grad_mag } else { 0.0 }
-        })
-        .collect();
+        },
+    );
     Ok(out)
 }
 
@@ -209,36 +234,61 @@ pub(crate) fn zero_crossing_values(
     let radius = vec![1usize; dim];
     let iter = NeighborhoodIterator::<f64, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
 
-    let out = iter
-        .map(|(_, nb)| {
-            let this_one = nb.center_value();
-            let mut off = vec![0i64; dim];
-            let mut result = background;
-            'search: for (pass, delta) in [(0, -1i64), (1, 1i64)] {
-                for d in 0..dim {
-                    off[d] = delta;
-                    let that = nb.get(&off);
-                    off[d] = 0;
+    let center_slot = iter.len() / 2;
+    let window_stride = window_strides(dim);
 
-                    let sign_change = (this_one < 0.0 && that > 0.0)
-                        || (this_one > 0.0 && that < 0.0)
-                        || (this_one == 0.0 && that != 0.0)
-                        || (this_one != 0.0 && that == 0.0);
-                    if !sign_change {
-                        continue;
-                    }
-                    let a = this_one.abs();
-                    let b = that.abs();
-                    if a < b || (a == b && pass == 1) {
-                        result = foreground;
-                        break 'search;
-                    }
+    // Parallel over output voxels: the label is decided entirely by the center and
+    // its `2 * dim` city-block neighbors, walked in ITK's own order (all negative
+    // directions, then all positive), with the same short-circuit on the first
+    // qualifying sign change. Nothing crosses voxels.
+    let out = iter.par_map_window(|_, w| {
+        let this_one = w.get_f64(center_slot);
+        let mut result = background;
+        'search: for (pass, delta) in [(0, -1i64), (1, 1i64)] {
+            // Axis order is ITK's own (`d = 0 .. dim`), and it is load-bearing:
+            // the first qualifying sign change wins, so visiting the axes in a
+            // different order could label a different pixel.
+            for &stride in &window_stride {
+                let that = w.get_f64((center_slot as i64 + delta * stride) as usize);
+
+                let sign_change = (this_one < 0.0 && that > 0.0)
+                    || (this_one > 0.0 && that < 0.0)
+                    || (this_one == 0.0 && that != 0.0)
+                    || (this_one != 0.0 && that == 0.0);
+                if !sign_change {
+                    continue;
+                }
+                let a = this_one.abs();
+                let b = that.abs();
+                if a < b || (a == b && pass == 1) {
+                    result = foreground;
+                    break 'search;
                 }
             }
-            result
-        })
-        .collect();
+        }
+        result
+    });
     Ok(out)
+}
+
+/// Slot strides of a radius-1 window: the step, inside the window, of a
+/// one-pixel move along image axis `d`.
+///
+/// Every axis of a radius-1 window has extent 3 and the window is laid out
+/// dimension-0-fastest, so the stride along axis `d` is `3^d`. Every stencil in
+/// this module has radius 1, and each one used to re-derive this per neighbor
+/// access, from an ND offset vector it allocated per voxel — that is what
+/// `Neighborhood::get` did in a loop. Computing it once per filter turns a
+/// neighbor access into one addition, and is what lets these stencils read a
+/// borrowed [`sitk_core::WindowView`] instead of a per-voxel `Neighborhood` copy.
+fn window_strides(dim: usize) -> Vec<i64> {
+    let mut strides = vec![0i64; dim];
+    let mut stride = 1i64;
+    for s in strides.iter_mut() {
+        *s = stride;
+        stride *= 3;
+    }
+    strides
 }
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry, used as the working
@@ -683,5 +733,322 @@ mod tests {
         let img = Image::from_vec(&[9, 9], vec![1.0f32; 81]).unwrap();
         let out = canny_edge_detection(&img, &[1.0, 1.0], &[0.01, 0.01], 1.0, 0.5).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+}
+
+/// Thread-count parity pins for the three window passes in this module.
+///
+/// All three are **summing** stencils in `f64` (the zero-crossing labeller sums
+/// nothing itself, but the field it labels is one), so the non-vacuity guard is
+/// the fold-order one, asserted on the volume the pins actually run on.
+///
+/// These pins are pass-level on purpose. Each pass is pinned against a hand-kept
+/// copy of the exact serial loop that was deleted, on the same input, rather than
+/// only end-to-end through [`canny_edge_detection`] — an end-to-end pin would let
+/// a re-associated sum inside one pass hide behind the hysteresis threshold that
+/// follows it. The public filter is pinned too, on top.
+///
+/// The three passes are `f64`-only by construction (they iterate an `f64`
+/// scratch), so unlike the other stencil pins there is no `Float32` half here:
+/// the widening path they would exercise does not exist in them. The public
+/// filter is run on both pixel types.
+///
+/// `-0.0` exposure, per pass:
+///
+/// * `second_directional_derivative_field` — does not apply. `sx`/`sxx`/`deriv`
+///   still start at `0.0` and take the same terms in the same order; no accumulate
+///   became a store. (It *is* a second derivative, so it can emit `-0.0` — which is
+///   exactly why the first term was left as an accumulation rather than folded into
+///   an initializer, as it was in `laplacian_recursive_gaussian`.)
+/// * `positional_gate_field` — does not apply, same reason. `grad_mag_sq` still
+///   starts at its `0.0001` floor and `deriv_pos` still sums over the same axes in
+///   the same order.
+/// * `zero_crossing_values` — does not apply. It writes one of two caller-supplied
+///   labels and never adds; its comparisons (`this_one == 0.0`) treat `-0.0` and
+///   `0.0` alike, as they did before.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{
+        PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
+    };
+    use sitk_core::{PixelId, parallel};
+
+    // ---- the serial references: the exact loops that were deleted -----------
+
+    fn second_directional_derivative_serial(smoothed: &Image) -> Vec<f64> {
+        let dim = smoothed.dimension();
+        let radius = vec![1usize; dim];
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            smoothed,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        let d1 = derivative_operator_coefficients(1);
+        let d2 = derivative_operator_coefficients(2);
+        let taps = [-1i64, 0, 1];
+
+        iter.map(|(_, nb)| {
+            let mut dx = vec![0.0f64; dim];
+            let mut dxx = vec![0.0f64; dim];
+            let mut off = vec![0i64; dim];
+            for a in 0..dim {
+                let mut sx = 0.0;
+                let mut sxx = 0.0;
+                for (k, &delta) in taps.iter().enumerate() {
+                    off[a] = delta;
+                    let v = nb.get(&off);
+                    sx += d1[k] * v;
+                    sxx += d2[k] * v;
+                }
+                off[a] = 0;
+                dx[a] = sx;
+                dxx[a] = sxx;
+            }
+
+            let mut deriv = 0.0;
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    off[i] = -1;
+                    off[j] = -1;
+                    let m_m = nb.get(&off);
+                    off[j] = 1;
+                    let m_p = nb.get(&off);
+                    off[i] = 1;
+                    let p_p = nb.get(&off);
+                    off[j] = -1;
+                    let p_m = nb.get(&off);
+                    off[i] = 0;
+                    off[j] = 0;
+                    let dxy = 0.25 * m_m - 0.25 * m_p - 0.25 * p_m + 0.25 * p_p;
+                    deriv += 2.0 * dx[i] * dx[j] * dxy;
+                }
+            }
+            let mut grad_mag = 0.0001;
+            for a in 0..dim {
+                deriv += dx[a] * dx[a] * dxx[a];
+                grad_mag += dx[a] * dx[a];
+            }
+            deriv / grad_mag
+        })
+        .collect()
+    }
+
+    fn positional_gate_serial(smoothed: &Image, deriv_field: &Image) -> Vec<f64> {
+        let dim = smoothed.dimension();
+        let radius = vec![1usize; dim];
+        let iter_s = NeighborhoodIterator::<f64, _>::new(
+            smoothed,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        let iter_d = NeighborhoodIterator::<f64, _>::new(
+            deriv_field,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        let d1 = derivative_operator_coefficients(1);
+        let taps = [-1i64, 0, 1];
+
+        iter_s
+            .zip(iter_d)
+            .map(|((_, nb_s), (_, nb_d))| {
+                let mut off = vec![0i64; dim];
+                let mut dx = vec![0.0f64; dim];
+                let mut dx1 = vec![0.0f64; dim];
+                let mut grad_mag_sq = 0.0001;
+                for a in 0..dim {
+                    let mut sx = 0.0;
+                    let mut sx1 = 0.0;
+                    for (k, &delta) in taps.iter().enumerate() {
+                        off[a] = delta;
+                        sx += d1[k] * nb_s.get(&off);
+                        sx1 += d1[k] * nb_d.get(&off);
+                    }
+                    off[a] = 0;
+                    dx[a] = sx;
+                    dx1[a] = sx1;
+                    grad_mag_sq += sx * sx;
+                }
+                let grad_mag = grad_mag_sq.sqrt();
+                let deriv_pos: f64 = (0..dim).map(|a| dx1[a] * (dx[a] / grad_mag)).sum();
+                if deriv_pos <= 0.0 { grad_mag } else { 0.0 }
+            })
+            .collect()
+    }
+
+    fn zero_crossing_serial(img: &Image, foreground: f64, background: f64) -> Vec<f64> {
+        let dim = img.dimension();
+        let radius = vec![1usize; dim];
+        let iter =
+            NeighborhoodIterator::<f64, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        iter.map(|(_, nb)| {
+            let this_one = nb.center_value();
+            let mut off = vec![0i64; dim];
+            let mut result = background;
+            'search: for (pass, delta) in [(0, -1i64), (1, 1i64)] {
+                for d in 0..dim {
+                    off[d] = delta;
+                    let that = nb.get(&off);
+                    off[d] = 0;
+
+                    let sign_change = (this_one < 0.0 && that > 0.0)
+                        || (this_one > 0.0 && that < 0.0)
+                        || (this_one == 0.0 && that != 0.0)
+                        || (this_one != 0.0 && that == 0.0);
+                    if !sign_change {
+                        continue;
+                    }
+                    let a = this_one.abs();
+                    let b = that.abs();
+                    if a < b || (a == b && pass == 1) {
+                        result = foreground;
+                        break 'search;
+                    }
+                }
+            }
+            result
+        })
+        .collect()
+    }
+
+    /// The `f64` working images the three passes consume: `smoothed` is the test
+    /// volume itself, and `deriv` is the (serially computed) second-derivative
+    /// field, which is what the other two passes are actually fed inside the
+    /// filter.
+    fn fields() -> (Image, Image) {
+        let smoothed = volume(PixelId::Float64);
+        let deriv_values = second_directional_derivative_serial(&smoothed);
+        let mut deriv = Image::from_vec(smoothed.size(), deriv_values).unwrap();
+        deriv.copy_geometry_from(&smoothed);
+        (smoothed, deriv)
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    /// Every pass here sums `f64` terms over a radius-1 window. If those sums
+    /// could not round on this volume, a re-association would be invisible and the
+    /// pins would pass on a filter that summed in any order. This asserts the
+    /// order is observable on the volume the pins run on.
+    #[test]
+    fn the_window_sum_order_is_observable() {
+        let img = volume(PixelId::Float64);
+        assert!(
+            window_sum_order_is_observable(&img, &[1, 1, 1]),
+            "no voxel changed bits when its window sum was reversed — this volume cannot \
+             observe a re-association, so the pins below would pass even on a pass that \
+             summed its taps in a different order"
+        );
+    }
+
+    /// The zero-crossing labeller sums nothing, so the fold-order guard above does
+    /// not speak for it. What it needs instead is that its output is not constant:
+    /// an all-background (or all-foreground) label field would match a parallel
+    /// pass that read entirely the wrong neighbors, and the pin would pass anyway.
+    ///
+    /// Both classes must therefore be well represented. On this volume the
+    /// derivative field oscillates per voxel, so most voxels do sit next to a sign
+    /// change and the marked class is the larger one — that is fine; what would not
+    /// be fine is either class being empty or negligible.
+    #[test]
+    fn the_zero_crossing_output_is_not_constant() {
+        let (_, deriv) = fields();
+        let labels = zero_crossing_serial(&deriv, 1.0, 0.0);
+        let n = labels.len();
+        let marked = labels.iter().filter(|&&v| v == 1.0).count();
+        let unmarked = n - marked;
+        assert!(
+            marked > n / 20 && unmarked > n / 20,
+            "the zero-crossing pass labelled {marked} foreground and {unmarked} background \
+             out of {n} — one class is negligible, so the label field is effectively \
+             constant and the pin could not catch a wrong neighbor"
+        );
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn second_directional_derivative_is_bit_identical_at_every_thread_count() {
+        let (smoothed, _) = fields();
+        let expected = second_directional_derivative_serial(&smoothed);
+        for threads in THREADS {
+            let got =
+                parallel::with_threads(threads, || second_directional_derivative_field(&smoothed))
+                    .unwrap();
+            assert_bits_eq(
+                &got,
+                &expected,
+                &format!("second_directional_derivative_field ({threads} threads)"),
+            );
+        }
+    }
+
+    #[test]
+    fn positional_gate_is_bit_identical_at_every_thread_count() {
+        let (smoothed, deriv) = fields();
+        let expected = positional_gate_serial(&smoothed, &deriv);
+        for threads in THREADS {
+            let got = parallel::with_threads(threads, || positional_gate_field(&smoothed, &deriv))
+                .unwrap();
+            assert_bits_eq(
+                &got,
+                &expected,
+                &format!("positional_gate_field ({threads} threads)"),
+            );
+        }
+    }
+
+    #[test]
+    fn zero_crossing_values_is_bit_identical_at_every_thread_count() {
+        let (_, deriv) = fields();
+        let expected = zero_crossing_serial(&deriv, 1.0, 0.0);
+        for threads in THREADS {
+            let got =
+                parallel::with_threads(threads, || zero_crossing_values(&deriv, 1.0, 0.0)).unwrap();
+            assert_bits_eq(
+                &got,
+                &expected,
+                &format!("zero_crossing_values ({threads} threads)"),
+            );
+        }
+    }
+
+    /// And the whole filter on top of the three passes, on both pixel types: the
+    /// composed output must not move with the thread count either.
+    #[test]
+    fn canny_edge_detection_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            let variance = vec![2.0f64, 2.0, 2.0];
+            let error = vec![0.01f64, 0.01, 0.01];
+            let expected = parallel::with_threads(1, || {
+                canny_edge_detection(&img, &variance, &error, 12.0, 3.0)
+            })
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+            let marked = expected.iter().filter(|&&v| v != 0.0).count();
+            assert!(
+                marked > 100,
+                "canny marked only {marked} voxels on {pixel:?} — too few to pin anything"
+            );
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    canny_edge_detection(&img, &variance, &error, 12.0, 3.0)
+                })
+                .unwrap()
+                .to_f64_vec()
+                .unwrap();
+                assert_bits_eq(
+                    &got,
+                    &expected,
+                    &format!("canny_edge_detection({pixel:?}, {threads} threads)"),
+                );
+            }
+        }
     }
 }
