@@ -134,39 +134,11 @@
 //! §3.26.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::same_physical_space;
 use crate::image_from_f64;
 use sitk_core::{
     Image, NeighborhoodIterator, Scalar, ZeroFluxNeumannBoundaryCondition, dispatch_scalar,
 };
-
-/// `ImageToImageFilter`'s default `GlobalDefaultCoordinateTolerance` and
-/// `GlobalDefaultDirectionTolerance` (`itkImageToImageFilter.h`), neither of
-/// which this filter chain overrides.
-const COORDINATE_TOLERANCE: f64 = 1e-6;
-const DIRECTION_TOLERANCE: f64 = 1e-6;
-
-/// `ImageBase::IsCongruentImageGeometry` (`itkImageBase.hxx:391-406`): origin
-/// and spacing compared with a tolerance scaled by `primary`'s first-axis
-/// spacing, direction compared with a flat tolerance.
-fn same_physical_space(primary: &Image, other: &Image) -> bool {
-    let coord_tol = (COORDINATE_TOLERANCE * primary.spacing()[0]).abs();
-    let origin_ok = primary
-        .origin()
-        .iter()
-        .zip(other.origin())
-        .all(|(a, b)| (a - b).abs() <= coord_tol);
-    let spacing_ok = primary
-        .spacing()
-        .iter()
-        .zip(other.spacing())
-        .all(|(a, b)| (a - b).abs() <= coord_tol);
-    let direction_ok = primary
-        .direction()
-        .iter()
-        .zip(other.direction())
-        .all(|(a, b)| (a - b).abs() <= DIRECTION_TOLERANCE);
-    origin_ok && spacing_ok && direction_ok
-}
 
 /// Decompose linear offset `i` into a multi-index of `size`, first index
 /// fastest (matching [`Image`]'s layout).
