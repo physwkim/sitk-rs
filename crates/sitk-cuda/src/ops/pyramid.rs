@@ -56,6 +56,7 @@ use crate::backend::{Backend, backend};
 use crate::buffer::DeviceBuffer;
 use crate::error::CudaError;
 use crate::image::{DeviceImage, Geometry};
+use crate::ops::resident::{MAX_STAGES, PointStage};
 
 /// Threads per block for every kernel here.
 const BLOCK: u32 = 256;
@@ -466,8 +467,8 @@ pub fn shrink(src: &DeviceImage, factors: &[usize]) -> Result<DeviceImage, CudaE
 /// and `weight != 0.0` guard.
 ///
 /// `p` packs, in order: `out_origin[3]`, `out_index_to_phys[9]`, `in_origin[3]`,
-/// `in_phys_to_index[9]`, `default_value`, `map_matrix[9]`, `map_offset[3]` — 37
-/// doubles.
+/// `in_phys_to_index[9]`, `default_value` — 25 doubles — followed by the point map's
+/// stages, 12 doubles each (`matrix[9]`, `offset[3]`), `nstage` of them.
 const RESAMPLE: &str = r#"
 // The continuous index of output voxel `o` in the input's index space, and whether
 // it is inside the input buffer. Shared by both kernels below **on purpose**: the
@@ -479,6 +480,7 @@ __device__ __forceinline__ bool cindex_of(
     const long long o,
     const double* __restrict__ p,
     const long long* __restrict__ g,
+    const int nstage,
     double* cindex)
 {
     double index_f[3];
@@ -494,25 +496,41 @@ __device__ __forceinline__ bool cindex_of(
         phys[r] = p[r] + acc;
     }
 
-    // mapped = transform(phys) = mat_vec(map_matrix, phys) + map_offset.
+    // mapped = transform(phys): the transform's OWN stages, replayed in the host's
+    // application order, each one `mat_vec(matrix, q) + offset` and each rounding on
+    // its own.
     //
     // This is the transform `ResampleImageFilter` applies between the two affines
     // (`resample.rs:270`), and it is applied here **unconditionally** because the
     // host applies it unconditionally too: with no fixed-initial transform,
     // `prepare_level` resamples through `AffineTransform::identity(dim)`, not
-    // through nothing. So the identity case packs `M = I, b = 0` and runs the same
-    // multiply the host runs — one code path, not an identity fast path that would
-    // be a second transcription to keep in step.
+    // through nothing. So the identity case packs one `M = I, b = 0` stage and runs
+    // the same multiply the host runs — one code path, not an identity fast path
+    // that would be a second transcription to keep in step.
+    //
+    // The loop is a REPLAY, not a fold. Multiplying a composite's stage matrices
+    // together is the same map algebraically and rounds once where the host rounds
+    // per stage; the difference lands in the last bits of `cindex`, and
+    // `resample_nearest3` turns those bits into a whole voxel via `floor(c + 0.5)`.
+    // So the stages arrive as stages (`sitk_transform::TransformBase::point_map_stages`)
+    // and are replayed here in the same order — see `PointStage`.
     //
     // Same accumulation as `sitk_core::matrix::mat_vec` (left to right, `acc` seeded
     // at 0.0, offset added last) and compiled `--fmad=false`, so the bits are the
-    // host's. Every accepted transform *is* this arithmetic on its own stored fields
-    // — see `Transform::matrix_offset_map`, which refuses the ones that are not.
+    // host's. Every accepted transform *is* this arithmetic on its own stored fields;
+    // `point_map_stages` returns `None` for the ones that are not, and the caller
+    // refuses them by name rather than approximating them.
     double mapped[3];
-    for (int r = 0; r < 3; ++r) {
-        double acc = 0.0;
-        for (int c = 0; c < 3; ++c) acc += p[25 + r * 3 + c] * phys[c];
-        mapped[r] = acc + p[34 + r];
+    for (int d = 0; d < 3; ++d) mapped[d] = phys[d];
+    for (int st = 0; st < nstage; ++st) {
+        const double* ab = p + 25 + st * 12;
+        double q[3];
+        for (int r = 0; r < 3; ++r) {
+            double acc = 0.0;
+            for (int c = 0; c < 3; ++c) acc += ab[r * 3 + c] * mapped[c];
+            q[r] = acc + ab[9 + r];
+        }
+        for (int d = 0; d < 3; ++d) mapped[d] = q[d];
     }
 
     // cindex = M_in * (mapped - in_origin)
@@ -537,13 +555,14 @@ extern "C" __global__ void resample_linear3(
     float* __restrict__ out,
     const double* __restrict__ p,
     const long long* __restrict__ g,   // in_size[3], out_size[3], in_stride[3], out_stride[3]
+    const int nstage,
     const long long n_out)
 {
     const long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= n_out) return;
 
     double cindex[3];
-    const bool inside = cindex_of(o, p, g, cindex);
+    const bool inside = cindex_of(o, p, g, nstage, cindex);
 
     double v = p[24];
     if (inside) {
@@ -578,13 +597,14 @@ extern "C" __global__ void resample_nearest3(
     float* __restrict__ out,
     const double* __restrict__ p,
     const long long* __restrict__ g,
+    const int nstage,
     const long long n_out)
 {
     const long long o = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (o >= n_out) return;
 
     double cindex[3];
-    const bool inside = cindex_of(o, p, g, cindex);
+    const bool inside = cindex_of(o, p, g, nstage, cindex);
 
     double v = p[24];
     if (inside) {
@@ -659,34 +679,37 @@ pub fn resample_linear(
     resample(src, grid, default_value, "resample_linear3", None)
 }
 
-/// [`resample_linear`], but through the point map `x ↦ mat_vec(matrix, x) + offset`
-/// — the device form of `ResampleImageFilter::execute(input, transform)`.
+/// [`resample_linear`], but through the point map `stages` — the device form of
+/// `ResampleImageFilter::execute(input, transform)`.
 ///
-/// `matrix` is row-major `3×3`, `offset` has length 3, and together they must be the
-/// transform's **own** arithmetic, bit for bit: pass what
-/// `sitk_transform::Transform::matrix_offset_map` returns, and nothing else. A
-/// reconstructed affine (probing `T(0)` and `T(e_e) − T(0)`) is ~1e-12 away, which is
-/// harmless for an image and fatal for the 0/1 in-buffer predicate that rides the same
-/// resample — one ulp at the buffer border flips a shell of voxels and moves the
-/// valid-point count. That is why `matrix_offset_map` refuses `ScaleTransform` rather
-/// than folding it, and why this function takes the map instead of a transform.
+/// `stages` must be the transform's **own** arithmetic, bit for bit and stage for
+/// stage: pass what `sitk_transform::TransformBase::point_map_stages` returns, in the
+/// order it returns them, and nothing else.
 ///
-/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image, a singular
-/// direction matrix, or a map that is not `3×3` + 3.
+/// Two things are refused rather than approximated, and both refusals are the same
+/// argument:
+///
+/// - a **reconstructed** affine (probing `T(0)` and `T(e_e) − T(0)`) is ~1e-12 from the
+///   transform's own multiply — which is why `point_map_stages` returns `None` for the
+///   centred scale family instead of handing over a probe;
+/// - a **folded** composite (`M₂·M₁`) rounds once where the transform rounds twice —
+///   which is why this takes a stage *list* and replays it.
+///
+/// Either error is harmless for an image and fatal for what rides the same resample: the
+/// 0/1 in-buffer predicate, whose border is decided by rounding a continuous index, and
+/// [`resample_nearest_through`], whose `floor(c + 0.5)` turns one ulp into a whole voxel
+/// of intensity.
+///
+/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image or a singular
+/// direction matrix, and with [`CudaError::PointMapStageCount`] on an empty stage list
+/// or one longer than [`MAX_STAGES`].
 pub fn resample_linear_through(
     src: &DeviceImage,
     grid: &Geometry,
     default_value: f64,
-    matrix: &[f64],
-    offset: &[f64],
+    stages: &[PointStage],
 ) -> Result<DeviceImage, CudaError> {
-    resample(
-        src,
-        grid,
-        default_value,
-        "resample_linear3",
-        Some((matrix, offset)),
-    )
+    resample(src, grid, default_value, "resample_linear3", Some(stages))
 }
 
 /// Resample a resident volume onto `grid` with **nearest-neighbour** interpolation
@@ -718,31 +741,28 @@ pub fn resample_nearest(
     resample(src, grid, default_value, "resample_nearest3", None)
 }
 
-/// [`resample_nearest`], but through the point map `x ↦ mat_vec(matrix, x) + offset`
-/// — see [`resample_linear_through`] for what the map must be, and why it must be the
-/// transform's own arithmetic rather than a reconstruction.
+/// [`resample_nearest`], but through the point map `stages` — see
+/// [`resample_linear_through`] for what the stages must be, and why they must be the
+/// transform's own arithmetic replayed in its own order rather than a reconstruction or
+/// a fold.
 ///
 /// This is the one that carries the **in-buffer predicate** and the user mask through
-/// a fixed-initial transform. Its values are 0/1, so an error in the map is invisible
-/// in what it produces and shows up only as a valid-point count that differs from the
+/// a fixed-initial transform, and it is where a 1-ulp point map is *least* benign. Its
+/// values are 0/1 and its rounding is `floor(c + 0.5)`: an error in the map is invisible
+/// in the values it produces, picks a different voxel outright rather than a slightly
+/// different blend, and shows up only as a valid-point count that differs from the
 /// host's by a shell of border voxels.
 ///
-/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image, a singular
-/// direction matrix, or a map that is not `3×3` + 3.
+/// Errors with [`CudaError::UnsupportedGeometry`] on a non-3-D image or a singular
+/// direction matrix, and with [`CudaError::PointMapStageCount`] on an empty stage list
+/// or one longer than [`MAX_STAGES`].
 pub fn resample_nearest_through(
     src: &DeviceImage,
     grid: &Geometry,
     default_value: f64,
-    matrix: &[f64],
-    offset: &[f64],
+    stages: &[PointStage],
 ) -> Result<DeviceImage, CudaError> {
-    resample(
-        src,
-        grid,
-        default_value,
-        "resample_nearest3",
-        Some((matrix, offset)),
-    )
+    resample(src, grid, default_value, "resample_nearest3", Some(stages))
 }
 
 /// The body both resamples share: the geometry checks, the 37-double parameter
@@ -750,37 +770,36 @@ pub fn resample_nearest_through(
 /// differs, so the two interpolators cannot drift apart in the arithmetic that
 /// decides *where* they sample — only in what they do once they are there.
 ///
-/// `map` is the transform's `(matrix, offset)`, or `None` for the identity — which
-/// packs `M = I, b = 0` rather than taking a second code path, because the host's
-/// no-transform resample also runs `AffineTransform::identity(dim)` through
+/// `stages` is the transform's own point map, or `None` for the identity — which packs
+/// a single `M = I, b = 0` stage rather than taking a second code path, because the
+/// host's no-transform resample also runs `AffineTransform::identity(dim)` through
 /// `transform_point` (`method.rs`'s `onto_virtual`) rather than skipping it.
+///
+/// An **empty** stage list is refused, not treated as the identity: a zero-stage replay
+/// silently *is* the identity, which is a plausible wrong answer rather than an obvious
+/// one. The identity is spelled `None` here, and it means it.
 fn resample(
     src: &DeviceImage,
     grid: &Geometry,
     default_value: f64,
     kernel: &str,
-    map: Option<(&[f64], &[f64])>,
+    stages: Option<&[PointStage]>,
 ) -> Result<DeviceImage, CudaError> {
     let in_geom = src.geometry();
     require_3d(in_geom)?;
     require_3d(grid)?;
 
-    let (map_matrix, map_offset): (Vec<f64>, Vec<f64>) = match map {
-        Some((m, b)) => {
-            if m.len() != 9 || b.len() != 3 {
-                return Err(CudaError::UnsupportedGeometry(format!(
-                    "the point map must be a 3x3 matrix and a 3-vector; got {} and {}",
-                    m.len(),
-                    b.len()
-                )));
-            }
-            (m.to_vec(), b.to_vec())
-        }
-        None => (
-            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            vec![0.0; 3],
-        ),
-    };
+    const IDENTITY: [PointStage; 1] = [PointStage {
+        matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        offset: [0.0; 3],
+    }];
+    let stages: &[PointStage] = stages.unwrap_or(&IDENTITY);
+    if stages.is_empty() || stages.len() > MAX_STAGES {
+        return Err(CudaError::PointMapStageCount {
+            stages: stages.len(),
+            max: MAX_STAGES,
+        });
+    }
 
     let (out_fwd, _) = affines(grid).ok_or_else(|| {
         CudaError::UnsupportedGeometry("output direction matrix is singular".into())
@@ -792,15 +811,18 @@ fn resample(
     let backend: &Backend = backend()?;
     let n_out = grid.len();
 
-    let mut p: Vec<f64> = Vec::with_capacity(37);
+    let mut p: Vec<f64> = Vec::with_capacity(25 + stages.len() * 12);
     p.extend(grid.origin.iter().copied());
     p.extend(out_fwd.iter().copied());
     p.extend(in_geom.origin.iter().copied());
     p.extend(in_back.iter().copied());
     p.push(default_value);
-    p.extend(map_matrix.iter().copied());
-    p.extend(map_offset.iter().copied());
+    for s in stages {
+        p.extend(s.matrix.iter().copied());
+        p.extend(s.offset.iter().copied());
+    }
     let pb = DeviceBuffer::from_host(backend, &p)?;
+    let nstage = stages.len() as i32;
 
     let mut packed: Vec<i64> = Vec::with_capacity(12);
     packed.extend(in_geom.size.iter().map(|&s| s as i64));
@@ -818,11 +840,13 @@ fn resample(
         .arg(dst.buffer_mut().device_mut())
         .arg(pb.device())
         .arg(g.device())
+        .arg(&nstage)
         .arg(&n_i64);
-    // SAFETY: five parameters, five arguments, matching in order and type. `p`
-    // holds the 37 doubles and `g` the 12 `i64`s the kernel indexes; every input
-    // read is at a corner index clamped to `[0, in_size[d] - 1]` per axis, and the
-    // store is guarded by `o < n_out`.
+    // SAFETY: six parameters, six arguments, matching in order and type. `p` holds the
+    // 25 fixed doubles plus `nstage * 12` stage doubles — exactly the range the kernel
+    // indexes, since `nstage` is the length of the list `p` was built from — and `g`
+    // the 12 `i64`s. Every input read is at a corner index clamped to
+    // `[0, in_size[d] - 1]` per axis, and the store is guarded by `o < n_out`.
     unsafe { launch.launch(cfg(n_out))? };
     backend.synchronize()?;
     Ok(dst)
