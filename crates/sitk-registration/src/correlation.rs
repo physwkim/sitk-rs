@@ -43,6 +43,31 @@
 //! accumulates `sff`/`smm`/`sfm`/`fdm`/`mdm` and combines them into `value`
 //! and the derivative above.
 //!
+//! ## Parallelism, and why the numbers do not move
+//!
+//! All three sample loops — [`means`](CorrelationMetric::means) (pass 1),
+//! [`evaluate`](CorrelationMetric::evaluate) (pass 2) and
+//! [`value`](CorrelationMetric::value) — run on every core and return **the same
+//! bits they returned when they were serial**, at any thread count. They get that
+//! by construction, from [`sitk_core::parallel::map_rows_fold_in_order`], the
+//! same primitive [`crate::metric`]'s mean-squares backend uses: the expensive
+//! per-sample work (transform, interpolation and gradient, Jacobian) never
+//! touches an accumulator, so it runs in parallel; the accumulators are then fed
+//! the per-sample contributions on a single thread, in sample order, executing
+//! the identical sequence of additions the serial loop did.
+//!
+//! Nothing is re-associated. That is not a nicety here — float `+` is not
+//! associative, so per-thread partials would re-round every sum, and the CPU
+//! path's numbers are what the device pins in `tests/cuda_correlation.rs` are
+//! compared against. A re-association would move those bands, and it would also
+//! walk the optimizer to a different registration result, because the optimizer
+//! is a feedback loop and one ulp of drift compounds.
+//! `correlation_is_bit_identical_at_every_thread_count` pins it.
+//!
+//! There is no sparse branch to leave serial, unlike mean squares:
+//! [`check_transform`](CorrelationMetric::check_transform) already refuses
+//! local-support transforms, so a dense staged row is never the wrong shape.
+//!
 //! ## Derivative-sign convention vs ITK
 //!
 //! ITK's header (`itkCorrelationImageToImageMetricv4.h`) documents that its
@@ -78,6 +103,7 @@
 //! is true.
 
 use sitk_core::Image;
+use sitk_core::parallel;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
@@ -186,21 +212,37 @@ impl CorrelationMetric {
         let mut f2 = 0.0f64;
         let mut m2 = 0.0f64;
         let mut valid_points = 0usize;
-        let mut scratch = self.fixed.scratch();
-        for s in 0..self.fixed.len() {
-            let fp = self.fixed.point(s, &mut scratch);
-            let mp = transform.transform_point(fp);
-            let mv = match self.moving.value_at(&mp) {
-                Some(v) => v,
-                None => continue,
-            };
-            let f1 = self.fixed.value(s) - avg_fix;
-            let m1 = mv - avg_mov;
-            f2 += f1 * f1;
-            m2 += m1 * m1;
-            fm += f1 * m1;
-            valid_points += 1;
-        }
+
+        // Parallel, and bit-identical to the serial loop it replaces: each
+        // sample's `f1²`/`m1²`/`f1·m1` is formed in parallel from that sample
+        // alone, and the three accumulators are then fed those rows on one
+        // thread in sample order — the identical sequence of `+=`. See the
+        // module docs' parallelism section.
+        let (fixed, moving) = (&self.fixed, &self.moving);
+        parallel::map_rows_fold_in_order(
+            fixed.len(),
+            3,
+            || fixed.scratch(),
+            |scratch, s, row| {
+                let fp = fixed.point(s, scratch);
+                let mp = transform.transform_point(fp);
+                let Some(mv) = moving.value_at(&mp) else {
+                    return false;
+                };
+                let f1 = fixed.value(s) - avg_fix;
+                let m1 = mv - avg_mov;
+                row[0] = f1 * f1;
+                row[1] = m1 * m1;
+                row[2] = f1 * m1;
+                true
+            },
+            |_, row| {
+                f2 += row[0];
+                m2 += row[1];
+                fm += row[2];
+                valid_points += 1;
+            },
+        );
 
         if valid_points == 0 {
             return f64::MAX;
@@ -219,18 +261,33 @@ impl CorrelationMetric {
         let mut fix_sum = 0.0f64;
         let mut mov_sum = 0.0f64;
         let mut valid = 0usize;
-        let mut scratch = self.fixed.scratch();
-        for s in 0..self.fixed.len() {
-            let fp = self.fixed.point(s, &mut scratch);
-            let mp = transform.transform_point(fp);
-            let mv = match self.moving.value_at(&mp) {
-                Some(v) => v,
-                None => continue, // maps outside the moving buffer
-            };
-            fix_sum += self.fixed.value(s);
-            mov_sum += mv;
-            valid += 1;
-        }
+
+        // Parallel, bit-identical to the serial loop (see the module docs): the
+        // transform and interpolation run per sample with no accumulator in
+        // reach, and `fix_sum`/`mov_sum` are then fed sample by sample, in
+        // order, on one thread.
+        let (fixed, moving) = (&self.fixed, &self.moving);
+        parallel::map_rows_fold_in_order(
+            fixed.len(),
+            2,
+            || fixed.scratch(),
+            |scratch, s, row| {
+                let fp = fixed.point(s, scratch);
+                let mp = transform.transform_point(fp);
+                let Some(mv) = moving.value_at(&mp) else {
+                    return false; // maps outside the moving buffer
+                };
+                row[0] = fixed.value(s);
+                row[1] = mv;
+                true
+            },
+            |_, row| {
+                fix_sum += row[0];
+                mov_sum += row[1];
+                valid += 1;
+            },
+        );
+
         if valid == 0 {
             return None;
         }
@@ -266,35 +323,62 @@ impl CorrelationMetric {
         let mut mdm = vec![0.0f64; nparams];
         let mut valid_points = 0usize;
 
-        let mut scratch = self.fixed.scratch();
-        for s in 0..n {
-            let fp = self.fixed.point(s, &mut scratch);
-            let fv = self.fixed.value(s);
-            let mp = transform.transform_point(fp);
-            let (mv, grad_phys) = match self.moving.value_and_physical_gradient(&mp) {
-                Some(vg) => vg,
-                None => continue, // maps outside the moving buffer
-            };
+        // Parallel, and bit-identical to the serial loop it replaces. Every
+        // sample's expensive half — the transform, the interpolation and its
+        // gradient, the Jacobian, and each parameter's `f1·inner` / `m1·inner`
+        // product — is computed from sample `s` alone into that sample's own
+        // row, touching no accumulator. The accumulators are then fed those rows
+        // on one thread, for s = 0, 1, … n−1, executing the identical sequence
+        // of `+=`. Nothing is re-associated, so the value and every derivative
+        // component keep their exact bits at any thread count — which is what
+        // the device pins in `tests/cuda_correlation.rs` compare against.
+        //
+        // Row layout, width `3 + 2·nparams`:
+        //   [ f1·m1, f1², m1², fdm₀ … fdm_{k−1}, mdm₀ … mdm_{k−1} ]
+        let (fixed, moving) = (&self.fixed, &self.moving);
+        parallel::map_rows_fold_in_order(
+            n,
+            3 + 2 * nparams,
+            || fixed.scratch(),
+            |scratch, s, row| {
+                let fp = fixed.point(s, scratch);
+                let fv = fixed.value(s);
+                let mp = transform.transform_point(fp);
+                let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                    return false; // maps outside the moving buffer
+                };
 
-            let f1 = fv - avg_fix;
-            let m1 = mv - avg_mov;
-            f2 += f1 * f1;
-            m2 += m1 * m1;
-            fm += f1 * m1;
+                let f1 = fv - avg_fix;
+                let m1 = mv - avg_mov;
+                row[0] = f1 * m1;
+                row[1] = f1 * f1;
+                row[2] = m1 * m1;
 
-            let jac = transform.jacobian_wrt_parameters(fp);
-            for (k, (fdmk, mdmk)) in fdm.iter_mut().zip(mdm.iter_mut()).enumerate() {
-                // inner = ∇M · (column k of the transform Jacobian).
-                let mut inner = 0.0;
-                for (d, &g) in grad_phys.iter().enumerate() {
-                    inner += g * jac[d * nparams + k];
+                let jac = transform.jacobian_wrt_parameters(fp);
+                let (_, deriv_row) = row.split_at_mut(3);
+                let (fdm_row, mdm_row) = deriv_row.split_at_mut(nparams);
+                for (k, (fdmk, mdmk)) in fdm_row.iter_mut().zip(mdm_row.iter_mut()).enumerate() {
+                    // inner = ∇M · (column k of the transform Jacobian).
+                    let mut inner = 0.0;
+                    for (d, &g) in grad_phys.iter().enumerate() {
+                        inner += g * jac[d * nparams + k];
+                    }
+                    *fdmk = f1 * inner;
+                    *mdmk = m1 * inner;
                 }
-                *fdmk += f1 * inner;
-                *mdmk += m1 * inner;
-            }
-
-            valid_points += 1;
-        }
+                true
+            },
+            |_, row| {
+                fm += row[0];
+                f2 += row[1];
+                m2 += row[2];
+                for (k, (fdmk, mdmk)) in fdm.iter_mut().zip(mdm.iter_mut()).enumerate() {
+                    *fdmk += row[3 + k];
+                    *mdmk += row[3 + nparams + k];
+                }
+                valid_points += 1;
+            },
+        );
 
         if valid_points == 0 {
             return MetricValue {
@@ -334,7 +418,7 @@ impl CorrelationMetric {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::TranslationTransform;
+    use sitk_transform::{TransformBase, TranslationTransform};
 
     /// A 2-D Gaussian blob of amplitude `amp` and width `sigma`, centred at
     /// `(cx, cy)` in physical (== index, unit spacing) coordinates, on a small
@@ -350,6 +434,241 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// The serial reference: the exact loops this module ran before
+    /// [`sitk_core::parallel::map_rows_fold_in_order`] replaced them — two passes,
+    /// one accumulator sequence, no parallelism anywhere. Lives here so the
+    /// bit-identity claim is checked against the *original* sequence of `+=` and
+    /// not against another copy of the parallel code.
+    fn evaluate_serial(
+        metric: &CorrelationMetric,
+        transform: &dyn ParametricTransform,
+    ) -> MetricValue {
+        let nparams = transform.number_of_parameters();
+        let (fixed, moving) = (&metric.fixed, &metric.moving);
+
+        let mut fix_sum = 0.0f64;
+        let mut mov_sum = 0.0f64;
+        let mut valid = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let mp = transform.transform_point(fp);
+            let Some(mv) = moving.value_at(&mp) else {
+                continue;
+            };
+            fix_sum += fixed.value(s);
+            mov_sum += mv;
+            valid += 1;
+        }
+        if valid == 0 {
+            return MetricValue {
+                value: f64::MAX,
+                derivative: vec![0.0; nparams],
+                valid_points: 0,
+            };
+        }
+        let (avg_fix, avg_mov) = (fix_sum / valid as f64, mov_sum / valid as f64);
+
+        let mut fm = 0.0f64;
+        let mut f2 = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut fdm = vec![0.0f64; nparams];
+        let mut mdm = vec![0.0f64; nparams];
+        let mut valid_points = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let fv = fixed.value(s);
+            let mp = transform.transform_point(fp);
+            let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                continue;
+            };
+            let f1 = fv - avg_fix;
+            let m1 = mv - avg_mov;
+            f2 += f1 * f1;
+            m2 += m1 * m1;
+            fm += f1 * m1;
+
+            let jac = transform.jacobian_wrt_parameters(fp);
+            for (k, (fdmk, mdmk)) in fdm.iter_mut().zip(mdm.iter_mut()).enumerate() {
+                let mut inner = 0.0;
+                for (d, &g) in grad_phys.iter().enumerate() {
+                    inner += g * jac[d * nparams + k];
+                }
+                *fdmk += f1 * inner;
+                *mdmk += m1 * inner;
+            }
+            valid_points += 1;
+        }
+
+        let m2f2 = m2 * f2;
+        if valid_points == 0 || m2f2 <= f64::EPSILON {
+            return MetricValue {
+                value: f64::MAX,
+                derivative: vec![0.0; nparams],
+                valid_points,
+            };
+        }
+        let mut derivative = vec![0.0f64; nparams];
+        for (k, dk) in derivative.iter_mut().enumerate() {
+            *dk = -2.0 * fm / (f2 * m2) * (fdm[k] - fm / m2 * mdm[k]);
+        }
+        MetricValue {
+            value: -fm * fm / m2f2,
+            derivative,
+            valid_points,
+        }
+    }
+
+    /// The serial reference for the **value-only** pass. It needs its own, because
+    /// [`CorrelationMetric::value`] reads the moving image through `value_at`
+    /// while [`CorrelationMetric::evaluate`] reads it through
+    /// `value_and_physical_gradient` — two different interpolator entry points,
+    /// which the existing `value_agrees_with_evaluate` only pins to 1e-12, not to
+    /// the bit. Pinning `value()` against `evaluate()`'s reference would therefore
+    /// be testing the interpolator, not the fold.
+    fn value_serial(metric: &CorrelationMetric, transform: &dyn ParametricTransform) -> f64 {
+        let (fixed, moving) = (&metric.fixed, &metric.moving);
+
+        let mut fix_sum = 0.0f64;
+        let mut mov_sum = 0.0f64;
+        let mut valid = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let mp = transform.transform_point(fp);
+            let Some(mv) = moving.value_at(&mp) else {
+                continue;
+            };
+            fix_sum += fixed.value(s);
+            mov_sum += mv;
+            valid += 1;
+        }
+        if valid == 0 {
+            return f64::MAX;
+        }
+        let (avg_fix, avg_mov) = (fix_sum / valid as f64, mov_sum / valid as f64);
+
+        let mut fm = 0.0f64;
+        let mut f2 = 0.0f64;
+        let mut m2 = 0.0f64;
+        let mut valid_points = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let mp = transform.transform_point(fp);
+            let Some(mv) = moving.value_at(&mp) else {
+                continue;
+            };
+            let f1 = fixed.value(s) - avg_fix;
+            let m1 = mv - avg_mov;
+            f2 += f1 * f1;
+            m2 += m1 * m1;
+            fm += f1 * m1;
+            valid_points += 1;
+        }
+        let m2f2 = m2 * f2;
+        if valid_points == 0 || m2f2 <= f64::EPSILON {
+            return f64::MAX;
+        }
+        -fm * fm / m2f2
+    }
+
+    /// **The pin.** Every number this metric produces must be bit-identical to the
+    /// serial fold above, at every thread count — not close, identical. The device
+    /// tests (`tests/cuda_correlation.rs`) band their GPU results against these
+    /// exact CPU numbers, and the optimizer is a feedback loop in which one ulp
+    /// compounds, so a re-associated sum is a broken metric, not a rounding
+    /// detail.
+    ///
+    /// Non-vacuous by size: `map_rows_fold_in_order` runs the serial fast path
+    /// below its own element threshold, so a small image would pin nothing. The
+    /// 160×160 grid below is 25 600 samples, above that threshold — asserted, so
+    /// the test fails loudly rather than silently degrading if the threshold moves.
+    #[test]
+    fn correlation_is_bit_identical_at_every_thread_count() {
+        let (w, h) = (160usize, 160usize);
+        let fixed = gaussian(w, h, 78.0, 82.0, 20.0, 1.0);
+        let moving = gaussian(w, h, 83.0, 77.0, 20.0, 1.3);
+        let metric = CorrelationMetric::new(&fixed, &moving).unwrap();
+        assert!(
+            metric.sample_count() > 1 << 14,
+            "{} samples: at or below `parallel`'s serial threshold, so this test \
+             would pin the serial path against itself",
+            metric.sample_count()
+        );
+
+        // A generic transform: off-lattice, so interpolation is exercised, and
+        // asymmetric, so a re-association of any one accumulator shows up.
+        let t = TranslationTransform::new(vec![2.3, -1.7]);
+        let want = evaluate_serial(&metric, &t);
+        let want_value_only = value_serial(&metric, &t);
+
+        // The pin has teeth only if the fold order is *observable* on this input:
+        // if summing the same per-sample contributions in the reverse order gave
+        // the same bits, then every assertion below would pass even against a
+        // re-associating implementation, and this test would be decoration. Sum
+        // one accumulator (`sff`) forwards and backwards and require that they
+        // disagree — proving f64 addition is genuinely non-associative *here*, on
+        // this data, and so that the equalities below are load-bearing.
+        let (avg_fix, _) = metric.means(&t).unwrap();
+        let mut scratch = metric.fixed.scratch();
+        let mut contributions = Vec::with_capacity(metric.sample_count());
+        for s in 0..metric.fixed.len() {
+            let fp = metric.fixed.point(s, &mut scratch);
+            let mp = t.transform_point(fp);
+            if metric.moving.value_at(&mp).is_none() {
+                continue;
+            }
+            let f1 = metric.fixed.value(s) - avg_fix;
+            contributions.push(f1 * f1);
+        }
+        let forward = contributions.iter().fold(0.0f64, |a, &c| a + c);
+        let backward = contributions.iter().rev().fold(0.0f64, |a, &c| a + c);
+        assert_ne!(
+            forward.to_bits(),
+            backward.to_bits(),
+            "summing {} contributions forwards and backwards gave identical bits, so this input \
+             cannot detect a re-association and the assertions below prove nothing — pick data \
+             with a wider exponent spread",
+            contributions.len()
+        );
+
+        for threads in [1usize, 4, 48, 96] {
+            let got = sitk_core::parallel::with_threads(threads, || metric.evaluate(&t));
+            assert_eq!(
+                got.value.to_bits(),
+                want.value.to_bits(),
+                "value moved at {threads} threads: {} ({:#018x}) vs serial {} ({:#018x})",
+                got.value,
+                got.value.to_bits(),
+                want.value,
+                want.value.to_bits()
+            );
+            assert_eq!(
+                got.valid_points, want.valid_points,
+                "valid_points moved at {threads} threads"
+            );
+            for (k, (g, w)) in got.derivative.iter().zip(&want.derivative).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "derivative[{k}] moved at {threads} threads: {g} ({:#018x}) vs serial {w} \
+                     ({:#018x})",
+                    g.to_bits(),
+                    w.to_bits()
+                );
+            }
+
+            let got_value_only = sitk_core::parallel::with_threads(threads, || metric.value(&t));
+            assert_eq!(
+                got_value_only.to_bits(),
+                want_value_only.to_bits(),
+                "value() moved at {threads} threads: {got_value_only} vs serial {want_value_only}"
+            );
+        }
     }
 
     #[test]
