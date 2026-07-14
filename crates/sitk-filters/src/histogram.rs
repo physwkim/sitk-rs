@@ -93,7 +93,11 @@ impl<'a> ThresholdMask<'a> {
     ///
     /// Errors with [`FilterError::MaskAdmitsNoVoxels`] when the selection is empty —
     /// see that variant for why the port refuses instead of reproducing (upstream
-    /// throws in eleven calculators and returns a `NaN` threshold in two).
+    /// throws in eleven calculators and, in the two Otsu ones, returns **bin zero's
+    /// upper edge** — a finite, plausible-looking threshold no voxel voted for, because
+    /// every `varBetween > maxVarBetween` comparison against a `NaN` is false and the
+    /// search returns its own initializer; see §1.76 and
+    /// [`FilterError::MaskAdmitsNoVoxels`]).
     fn selected(&self, img: &Image, vals: &[f64]) -> Result<Vec<f64>> {
         // The mask's three preconditions — `UInt8` (SimpleITK's yaml gives these filters
         // `MaskImageType = OutputImageType = itk::Image<uint8_t, Dim>`, reached through the
