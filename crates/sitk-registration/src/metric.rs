@@ -811,10 +811,61 @@ impl MovingImage {
         })
     }
 
-    /// The `(min, max)` of the moving-image buffer. `(0, 0)` when empty. The
-    /// Mattes MI metric uses this to size the joint-histogram moving axis.
+    /// The `(min, max)` of the moving image **over the voxels the moving mask
+    /// admits** — every voxel when there is no mask. `(0, 0)` when the admitted
+    /// set is empty.
+    ///
+    /// The mask is not decoration here: this range *sizes* the moving axis of a
+    /// joint histogram. Both callers — [`crate::mattes`] and
+    /// [`crate::joint_histogram`] — turn it into a bin size, a normalized
+    /// minimum, and an out-of-range **reject** that drops the sample entirely, so
+    /// a masked-out voxel that is brighter than everything the mask admits does
+    /// not merely fail to contribute: it stretches every bin and moves every
+    /// sample's bin index. ITK masks both metrics' moving range for exactly this
+    /// reason (`itkMattesMutualInformationImageToImageMetricv4.hxx:199-214`,
+    /// `itkJointHistogramMutualInformationImageToImageMetricv4.hxx:122`), and
+    /// this port did not until 2026-07-14 — see §2.162.
+    ///
+    /// The fixed side needs no equivalent: a fixed mask filters the sample set
+    /// before it is ever reduced ([`FixedSamples::from_image_with`]), so
+    /// [`FixedSamples::value_range`] already sees only admitted voxels.
+    ///
+    /// min/max are **selections**, not sums: exact and order-independent, so this
+    /// is the same answer at any grain and on any backend.
     pub(crate) fn value_range(&self) -> (f64, f64) {
-        self.buf.min_max().unwrap_or((0.0, 0.0))
+        let range = match &self.mask {
+            None => self.buf.min_max(),
+            Some(mask) => self.buf.with(MaskedRange { mask }),
+        };
+        range.unwrap_or((0.0, 0.0))
+    }
+}
+
+/// [`MovingImage::value_range`] under a moving mask, monomorphized over the
+/// buffer's type. The mask is in the buffer's own traversal order, so this is a
+/// straight zip — no continuous index, no rounding, no interpolation.
+///
+/// Seeded and folded exactly as [`sitk_core::parallel::min_max`]'s serial scan is
+/// (`±∞`, then `f64::min`/`f64::max`, which skip NaN), and `None` on an empty
+/// admitted set, so masking narrows *which voxels* are reduced and changes nothing
+/// about *how*.
+struct MaskedRange<'a> {
+    mask: &'a [bool],
+}
+
+impl WithBuf for MaskedRange<'_> {
+    type Out = Option<(f64, f64)>;
+
+    fn call<T: Scalar>(self, buf: &[T]) -> Self::Out {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut any = false;
+        for (v, _) in buf.iter().zip(self.mask).filter(|&(_, &m)| m) {
+            let v = v.as_f64();
+            lo = lo.min(v);
+            hi = hi.max(v);
+            any = true;
+        }
+        any.then_some((lo, hi))
     }
 }
 

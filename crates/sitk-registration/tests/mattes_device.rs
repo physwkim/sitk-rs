@@ -509,3 +509,96 @@ fn execute_on_device_registers_a_contrast_inverted_pair_with_mattes() {
         "the two paths took different numbers of steps: device {dp:?}, host {hp:?}"
     );
 }
+
+/// **A moving mask must narrow the moving axis on the device exactly as it does on the
+/// host** — and this pin is the one that could not have caught its own bug.
+///
+/// Until 2026-07-14 the host reduced the moving range over the whole volume and so did
+/// this kernel. They agreed, bit for bit, and they were both wrong: ITK sizes the axis
+/// from the voxels the moving mask admits
+/// (`itkMattesMutualInformationImageToImageMetricv4.hxx:199-214`). A host-vs-device
+/// bit-identity pin is blind to a defect the two share — it pins the defect. So this test
+/// asserts the seam *and* the fixture asserts the defect is reachable: the masked-out
+/// voxels carry an intensity that visibly moves the axis when counted.
+///
+/// The excluded shell is two voxels deep and the outliers sit only in the outermost
+/// layer, so no admitted sample's trilinear stencil can read one — see
+/// `tests/mattes_mask.rs`, which pins the same property on the host alone.
+#[test]
+fn a_moving_mask_narrows_the_moving_axis_on_the_device_too() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    const N: usize = 24;
+    const OUTLIER: f32 = 5000.0;
+
+    // The moving volume, with a wild intensity written into its outermost layer.
+    let mut moving = volume(N, [2.0, -1.0, 1.5]);
+    let mut mask = vec![false; N * N * N];
+    {
+        let buf: &mut Vec<f32> = match moving.buffer_mut() {
+            sitk_core::PixelBuffer::Float32(b) => b,
+            _ => panic!("`volume` builds a Float32 image"),
+        };
+        for k in 0..N {
+            for j in 0..N {
+                for i in 0..N {
+                    let flat = (k * N + j) * N + i;
+                    let edge = i == 0 || j == 0 || k == 0 || i == N - 1 || j == N - 1 || k == N - 1;
+                    if edge {
+                        buf[flat] = OUTLIER;
+                    }
+                    // Admit the interior only: a shell two voxels deep is excluded, so an
+                    // admitted sample's eight interpolation corners never reach layer 0.
+                    mask[flat] = (2..N - 2).contains(&i)
+                        && (2..N - 2).contains(&j)
+                        && (2..N - 2).contains(&k);
+                }
+            }
+        }
+    }
+    let fixed = volume(N, [0.0; 3]);
+
+    // The fixture is real: counting the outliers changes the answer. Without this, the
+    // agreement below would prove nothing.
+    let unmasked = MattesMutualInformationMetric::new(&fixed, &moving, BINS).unwrap();
+    let masked = {
+        let f = sitk_registration::metric::FixedSamples::from_image(&fixed).unwrap();
+        let m = sitk_registration::metric::MovingImage::from_image(&moving)
+            .unwrap()
+            .with_moving_mask(
+                &Image::from_vec(
+                    &[N, N, N],
+                    mask.iter()
+                        .map(|&b| if b { 1.0f64 } else { 0.0 })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        MattesMutualInformationMetric::from_samples(f, m, BINS).unwrap()
+    };
+
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let device =
+        DeviceMattesMetric::from_device_sampled(&d_f, &d_m, None, Some(&mask), None, BINS).unwrap();
+
+    for t in [[0.0, 0.0, 0.0], [1.3, -0.7, 0.4]] {
+        let transform = TranslationTransform::new(t.to_vec());
+        let (h, d) = (masked.value(&transform), device.value(&transform).unwrap());
+        assert_ne!(
+            unmasked.value(&transform).to_bits(),
+            h.to_bits(),
+            "at {t:?}: the masked-out outliers do not change the value, so this test \
+             cannot fail when the mask is ignored"
+        );
+        assert_eq!(
+            d.to_bits(),
+            h.to_bits(),
+            "at {t:?}: masked device {d} vs masked host {h} — the two do not size the \
+             moving axis from the same voxels"
+        );
+    }
+}
