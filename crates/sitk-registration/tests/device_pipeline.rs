@@ -16,7 +16,7 @@ use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
 use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
 use sitk_registration::{
     CpuBackend, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
-    ImageRegistrationMethod, MeanSquaresMetric,
+    ImageRegistrationMethod, MeanSquaresMetric, RegistrationError,
 };
 use sitk_transform::{BSplineTransform, Euler3DTransform, ParametricTransform};
 
@@ -699,13 +699,30 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         Err(DeviceRegistrationError::UnsupportedInterpolator(_))
     ));
 
+    // Sampling is **not** refused any more: the device is handed the host's draw
+    // (`draw_samples`) as a list of fixed-grid voxels.
+    //
+    // This configuration — like the fixed-mask one below — then diverges under the
+    // default optimizer and ends in `NoValidSamples`, on **both** paths identically. What
+    // is asserted here is only that the device no longer *declines* it as a configuration;
+    // that it samples the voxels the host samples is pinned by
+    // `the_device_samples_the_voxels_the_host_samples`, on a pose that converges.
     let mut reg = ImageRegistrationMethod::new();
     reg.set_metric_sampling_strategy(sitk_registration::metric::SamplingStrategy::Random);
     reg.set_metric_sampling_percentage(0.2, 7);
-    assert!(matches!(
-        run(&reg),
-        Err(DeviceRegistrationError::UnsupportedSampling)
-    ));
+    match run(&reg) {
+        Err(DeviceRegistrationError::Registration(RegistrationError::NoValidSamples)) => {
+            assert!(
+                matches!(
+                    reg.execute(&fixed, &moving, euler()),
+                    Err(RegistrationError::NoValidSamples)
+                ),
+                "the device gave up on a sampled run the host completes"
+            );
+        }
+        Err(e) => panic!("a sampling strategy was refused at the boundary: {e}"),
+        Ok(_) => {}
+    }
 
     // A fixed-initial transform is refused **per transform class**, not as a
     // configuration: what the device needs is a point map that is bitwise
@@ -777,7 +794,6 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             run(&reg),
             Err(DeviceRegistrationError::UnsupportedMetric
                 | DeviceRegistrationError::UnsupportedInterpolator(_)
-                | DeviceRegistrationError::UnsupportedSampling
                 | DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
         ),
         "a fixed mask was refused at the boundary"
@@ -1679,6 +1695,555 @@ fn a_fixed_initial_transform_converges_where_execute_converges() {
         );
         println!(
             "{name}: {} iters on both, params rel <= {worst:e}, valid {} (device) vs {} (host)",
+            host.iterations, device.valid_points, host.valid_points
+        );
+    }
+}
+
+/// The same volume in `Float64` — `volume`'s values before the `as f32`, so the two
+/// are the identical numbers and one is exactly the other's narrowing.
+fn volume_f64(n: usize, shift: [f64; 3]) -> Image {
+    let c = n as f64 / 2.0;
+    let mut v = Vec::with_capacity(n * n * n);
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let (x, y, z) = (
+                    i as f64 - c + shift[0],
+                    j as f64 - c + shift[1],
+                    k as f64 - c + shift[2],
+                );
+                let d2 = x * x + y * y + z * z;
+                v.push(
+                    120.0 * (-d2 / (2.0 * (n as f64 / 5.0).powi(2))).exp()
+                        + 10.0 * (x / 7.0).sin() * (y / 9.0).cos() * (z / 11.0).sin(),
+                );
+            }
+        }
+    }
+    let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+    img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+    img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+    img
+}
+
+/// **S0: what the device's `f32` payload costs a `Float64` registration.**
+///
+/// `DeviceImage` holds one `f32` per voxel (`image.rs`), so uploading a `Float64`
+/// image narrows it. That has been on the UNFIXED list every round, asserted and never
+/// priced. This prices it, and it attributes the price rather than just observing it:
+///
+/// - `h64` vs `d64` — the number a caller actually feels: host `Float64` registration
+///   against device `Float64` registration.
+/// - `h64` vs `h32` — the narrowing **alone**, host on both sides, no GPU in it.
+/// - `d64` vs `d32` — the device's cast against the host's. `volume` is `volume_f64`
+///   with `as f32` applied, so if `DeviceImage`'s on-device cast rounds the way Rust's
+///   does, these two runs are the *same run* and every parameter is bit-identical.
+///
+/// The yardstick is D4's band: host and device already part company by up to 2.4e-5
+/// relative on a converged run, because the device's reduction order meets
+/// `RegularStepGradientDescentOptimizer`'s halve-on-overshoot branch. A narrowing cost
+/// below that is invisible under a difference we already cannot remove.
+#[test]
+fn what_the_f32_payload_costs_a_float64_registration() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (f64_fixed, f64_moving) = (volume_f64(n, [0.0; 3]), volume_f64(n, [3.0, -2.0, 1.5]));
+    let (f32_fixed, f32_moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    assert_eq!(f64_fixed.pixel_id(), sitk_core::PixelId::Float64);
+    assert_eq!(f32_fixed.pixel_id(), sitk_core::PixelId::Float32);
+
+    let d64 = (
+        DeviceImage::upload(&f64_fixed).unwrap(),
+        DeviceImage::upload(&f64_moving).unwrap(),
+    );
+    let d32 = (
+        DeviceImage::upload(&f32_fixed).unwrap(),
+        DeviceImage::upload(&f32_moving).unwrap(),
+    );
+
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+    let build = |with_transform: bool| {
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares();
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+        if with_transform {
+            reg.set_fixed_initial_transform(sitk_transform::Transform::Euler3D(
+                Euler3DTransform::new(0.12, -0.08, 0.30, [5.0, -4.0, 3.0], [0.0, 0.0, 0.0]),
+            ));
+        }
+        reg
+    };
+
+    // Relative parameter distance, the same measure D4's band is quoted in.
+    let pose_delta = |a: &Euler3DTransform, b: &Euler3DTransform| -> f64 {
+        a.parameters()
+            .iter()
+            .zip(b.parameters().iter())
+            .map(|(&x, &y)| (x - y).abs() / (1.0 + y.abs()))
+            .fold(0.0f64, f64::max)
+    };
+
+    for with_transform in [false, true] {
+        let what = if with_transform {
+            "with a fixed-initial Euler3D"
+        } else {
+            "plain"
+        };
+        let reg = build(with_transform);
+
+        let h64 = reg.execute(&f64_fixed, &f64_moving, initial()).unwrap();
+        let h32 = reg.execute(&f32_fixed, &f32_moving, initial()).unwrap();
+        let r64 = reg.execute_on_device(&d64.0, &d64.1, initial()).unwrap();
+        let r32 = reg.execute_on_device(&d32.0, &d32.1, initial()).unwrap();
+
+        let host_vs_device = pose_delta(&r64.transform, &h64.transform);
+        let narrowing_only = pose_delta(&h32.transform, &h64.transform);
+        let cast_agrees = pose_delta(&r64.transform, &r32.transform);
+
+        println!(
+            "{what}:\n  host f64 vs device f64 : pose {host_vs_device:e}  metric {:e} vs {:e}\n  \
+             host f64 vs host f32   : pose {narrowing_only:e}  (the narrowing alone, no GPU)\n  \
+             device f64 vs device f32: pose {cast_agrees:e}  (the device's cast vs the host's)\n  \
+             D4's band               : 2.4e-5",
+            r64.metric_value, h64.metric_value
+        );
+
+        // The device's on-device `Float64 → f32` cast is the host's `as f32`: same
+        // rounding, so uploading the wide image and uploading the narrowed image give
+        // the *same* device run, parameter for parameter. This is what lets the two
+        // measurements above be *attributed* rather than merely observed.
+        for (k, (&a, &b)) in r64
+            .transform
+            .parameters()
+            .iter()
+            .zip(r32.transform.parameters().iter())
+            .enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{what}, param {k}: uploading the Float64 image ({a:e}) and uploading its \
+                 narrowed self ({b:e}) gave different device runs — the device's cast is not \
+                 the host's"
+            );
+        }
+    }
+
+    // The attribution, as an assertion rather than a printout. On the plain
+    // configuration the device and the host agree to 5e-14 on identical `Float32`
+    // inputs (measured in D4), so if the whole `Float64` delta is the narrowing and
+    // none of it is the GPU, then the device's `Float64` run must land on the *host's
+    // Float32* run to that same order — which is what this checks. It failed at 6e-10
+    // against the host's `Float64` run, and passes at 1e-11 against its `Float32` one.
+    let reg = build(false);
+    let h32 = reg.execute(&f32_fixed, &f32_moving, initial()).unwrap();
+    let r64 = reg.execute_on_device(&d64.0, &d64.1, initial()).unwrap();
+    let attributed = pose_delta(&r64.transform, &h32.transform);
+    assert!(
+        attributed <= 1e-11,
+        "the device's Float64 run is {attributed:e} from the host's Float32 run — the \
+         narrowing does not account for the whole difference and something else moved"
+    );
+
+    // The price, as a regression guard: narrowing a `Float64` pair costs this much pose,
+    // measured on the configuration where the optimizer is *not* amplifying (host and
+    // device agree to 5e-14 there on identical inputs). 6.3e-10 measured; the guard is
+    // an order and a half above it and four orders below D4's band.
+    let reg = build(false);
+    let h64 = reg.execute(&f64_fixed, &f64_moving, initial()).unwrap();
+    let narrowing = pose_delta(&h32.transform, &h64.transform);
+    assert!(
+        narrowing <= 1e-8,
+        "narrowing a Float64 registration to f32 now costs {narrowing:e} of pose, up from \
+         the 6.3e-10 this limit was priced at"
+    );
+    println!("PRICED: the f32 payload costs {narrowing:e} of pose on a Float64 pair");
+}
+
+/// **S2: the device samples the voxels the host samples.**
+///
+/// Not "the two draws agree" — there is one draw. `metric::draw_samples` is the single
+/// owner of which voxels a strategy selects; the host filters that draw by its fixed mask
+/// and the device is handed the same draw with the mask gated in the kernel, by grid
+/// voxel. So the first assertion below is on the **lists themselves**: the device's list,
+/// filtered by the host's mask, must be bit-equal to the host's — element for element,
+/// including order and including a voxel drawn twice, because `Random` draws with
+/// replacement and the metric counts it twice.
+///
+/// Then the consequence, at a **common transform** (zero optimizer steps, so the two
+/// paths are evaluated at identical parameters and no optimizer trajectory can be blamed):
+/// per-level `valid_points` **exactly** equal, and the metric value inside
+/// reduction-rounding.
+///
+/// Anti-vacuity, twice over: the strategy must actually select a small subset (or a device
+/// that ignored it and walked the full grid would pass), and the sampled run's
+/// `valid_points` must differ from the full-grid run's.
+#[test]
+fn the_device_samples_the_voxels_the_host_samples() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    use sitk_registration::metric::draw_samples;
+
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    // Not the identity: a pose that swings part of the fixed grid off the moving image, so
+    // some drawn samples are *invalid* and `valid_points` is strictly less than the draw.
+    // Under an identity-ish pose every sample lands inside and the count degenerates to
+    // the list's length — which a device that drew its own list of the same length would
+    // also reproduce. Here it cannot.
+    let initial = || Euler3DTransform::new(0.10, -0.07, 0.05, [14.0, -11.0, 7.0], [c, c, c]);
+    let voxels = n * n * n;
+
+    for (strategy, pct, seed) in [
+        (SamplingStrategy::Regular, 0.05, 0),
+        (SamplingStrategy::Regular, 0.37, 0),
+        (SamplingStrategy::Random, 0.01, 0),
+        (SamplingStrategy::Random, 0.10, 7),
+        (SamplingStrategy::Random, 0.10, 12345),
+    ] {
+        let what = format!("{strategy:?} {pct} seed {seed}");
+
+        // The draw the device is handed, and the sample set the host walks. One function
+        // made both; the host's is this one filtered by its mask (there is no mask here,
+        // so they must be equal outright).
+        let drawn = draw_samples(voxels, strategy, pct, seed).expect("a strategy draws a list");
+        let host_samples =
+            FixedSamples::from_image_with(&fixed, strategy, pct, seed, None).unwrap();
+        let host_list = host_samples
+            .selected_indices()
+            .expect("a sampled set has a list");
+        assert_eq!(
+            drawn.as_slice(),
+            host_list,
+            "{what}: the list handed to the device is not the list the host walks"
+        );
+        assert!(
+            drawn.len() < voxels / 2,
+            "{what}: the strategy drew {} of {voxels} voxels — a device that ignored it \
+             would pass everything below",
+            drawn.len()
+        );
+
+        let build = |sampled: bool| {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_metric_as_mean_squares();
+            // Zero steps: both paths are evaluated at `initial()`, so nothing here can be
+            // the optimizer's doing.
+            reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 0, 1e-8);
+            if sampled {
+                reg.set_metric_sampling_strategy(strategy);
+                reg.set_metric_sampling_percentage(pct, seed);
+            }
+            reg
+        };
+        let reg = build(true);
+        let full = build(false);
+
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg
+            .execute_on_device(&d_f, &d_m, initial())
+            .unwrap_or_else(|e| panic!("{what}: the device refused a sampled run: {e}"));
+        let full_grid = full.execute(&fixed, &moving, initial()).unwrap();
+
+        assert!(
+            host.valid_points < full_grid.valid_points,
+            "{what}: the sampled run walks as many points as the full grid ({} vs {})",
+            host.valid_points,
+            full_grid.valid_points
+        );
+        // The pose drops some of the draw, so the count below is a statement about *which*
+        // voxels were sampled and not merely how many were listed.
+        assert!(
+            host.valid_points < drawn.len(),
+            "{what}: every drawn sample landed inside the moving image ({} of {}), so the \
+             count equality below cannot distinguish the host's voxels from any other list \
+             of the same length",
+            host.valid_points,
+            drawn.len()
+        );
+
+        assert_eq!(
+            device.levels.len(),
+            host.levels.len(),
+            "{what}: different level counts"
+        );
+        for (h, d) in host.levels.iter().zip(device.levels.iter()) {
+            assert_eq!(
+                d.valid_points, h.valid_points,
+                "{what}, level {}: the device walked a different sample set than the host",
+                h.level
+            );
+            let rel = (d.metric_value - h.metric_value).abs() / h.metric_value.abs();
+            assert!(
+                rel <= 1e-11,
+                "{what}, level {}: metric {:e} (device) vs {:e} (host), rel {rel:e} — the \
+                 counts agree but the values do not, so the device sampled the right number \
+                 of voxels from the wrong places",
+                h.level,
+                d.metric_value,
+                h.metric_value
+            );
+        }
+        println!(
+            "{what}: {} drawn, {} valid on both ({} on the full grid)",
+            drawn.len(),
+            host.valid_points,
+            full_grid.valid_points
+        );
+    }
+}
+
+/// **S3: sampling composed with everything the D-wave added.**
+///
+/// The sample set is now drawn from a level grid that a fixed mask, a fixed-initial
+/// transform and a virtual domain all had a hand in producing, so the four are pinned
+/// together rather than one at a time. Sixteen configurations: {Regular, Random} ×
+/// {fixed mask, none} × {fixed-initial Euler3D, none} × {virtual domain, none}.
+///
+/// The pin is the exact one, and it can be exact because both paths are evaluated at the
+/// **same parameters** (zero optimizer steps): per-level `valid_points` equal, not
+/// banded. Three things have to line up for that to hold — the level's fixed image and
+/// its in-buffer predicate (D2/D3), the mask gated by grid voxel in the kernel while the
+/// host filters the same draw by the same mask (S1's invariant), and the draw itself
+/// (S2) — and a mistake in any one of them moves the count.
+///
+/// The converged half is deliberately *not* here; it is the test below, banded, for the
+/// reason D4 measured.
+#[test]
+fn sampling_composes_with_the_mask_the_transform_and_the_domain() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let mask = ellipsoid_mask(n);
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.10, -0.07, 0.05, [14.0, -11.0, 7.0], [c, c, c]);
+
+    let mut checked = 0;
+    for strategy in [SamplingStrategy::Regular, SamplingStrategy::Random] {
+        for with_mask in [false, true] {
+            for with_transform in [false, true] {
+                for with_domain in [false, true] {
+                    let what = format!(
+                        "{strategy:?}{}{}{}",
+                        if with_mask { " + mask" } else { "" },
+                        if with_transform { " + transform" } else { "" },
+                        if with_domain { " + domain" } else { "" }
+                    );
+                    let build = |sampled: bool| {
+                        let mut reg = ImageRegistrationMethod::new();
+                        reg.set_metric_as_mean_squares();
+                        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 0, 1e-8)
+                            .set_shrink_factors_per_level(vec![2, 1])
+                            .set_smoothing_sigmas_per_level(vec![1.0, 0.0]);
+                        if sampled {
+                            reg.set_metric_sampling_strategy(strategy);
+                            reg.set_metric_sampling_percentage(0.08, 4242);
+                        }
+                        if with_mask {
+                            reg.set_metric_fixed_mask(&mask);
+                        }
+                        if with_domain {
+                            virtual_domain(&mut reg);
+                        }
+                        if with_transform {
+                            reg.set_fixed_initial_transform(sitk_transform::Transform::Euler3D(
+                                Euler3DTransform::new(
+                                    0.12,
+                                    -0.08,
+                                    0.30,
+                                    [5.0, -4.0, 3.0],
+                                    [0.0, 0.0, 0.0],
+                                ),
+                            ));
+                        }
+                        reg
+                    };
+                    let reg = build(true);
+                    let full = build(false);
+
+                    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+                    let device = reg
+                        .execute_on_device(&d_f, &d_m, initial())
+                        .unwrap_or_else(|e| {
+                            panic!("{what}: the device refused a run it now takes: {e}")
+                        });
+                    let full_grid = full.execute(&fixed, &moving, initial()).unwrap();
+
+                    assert_eq!(
+                        device.levels.len(),
+                        host.levels.len(),
+                        "{what}: different level counts"
+                    );
+                    for ((h, d), f) in host
+                        .levels
+                        .iter()
+                        .zip(device.levels.iter())
+                        .zip(full_grid.levels.iter())
+                    {
+                        // Anti-vacuity: sampling must actually thin this level, or the
+                        // equality below is the full-grid equality already pinned
+                        // elsewhere and this configuration proves nothing new.
+                        assert!(
+                            h.valid_points < f.valid_points / 4,
+                            "{what}, level {}: the sampled run walks {} points against the \
+                             full grid's {} — sampling is not thinning this level",
+                            h.level,
+                            h.valid_points,
+                            f.valid_points
+                        );
+                        assert_eq!(
+                            d.valid_points, h.valid_points,
+                            "{what}, level {}: the device walked a different sample set than \
+                             the host at the same transform",
+                            h.level
+                        );
+                        let rel = (d.metric_value - h.metric_value).abs() / h.metric_value.abs();
+                        assert!(
+                            rel <= 1e-11,
+                            "{what}, level {}: metric {:e} (device) vs {:e} (host), rel \
+                             {rel:e} — same count, different voxels",
+                            h.level,
+                            d.metric_value,
+                            h.metric_value
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 16, "not every configuration ran");
+    println!("{checked} configurations: per-level valid_points exactly equal");
+}
+
+/// **S3, the converged half — and the risk I named did not materialize.**
+///
+/// D4 found the device's reduction order (~1e-13 on the metric) meeting
+/// `RegularStepGradientDescentOptimizer`'s halve-on-overshoot branch — a *discontinuous*
+/// decision — so that once a difference that size flips one overshoot test, the two runs
+/// take different steps and land at two different, both-valid poses (2.4e-5 apart on the
+/// full grid). I predicted, before writing this, that a sampled metric would be a noisier
+/// landscape and would amplify *more*. Measured, it does not:
+///
+/// ```text
+///   sampled, no fixed-initial transform    params 1.1e-14 .. 2.7e-13, valid_points equal
+///   sampled + fixed-initial Euler3D        params 2.1e-7  .. 6.9e-7,  valid_points equal
+///   full grid + fixed-initial Euler3D (D4) params            2.4e-5
+/// ```
+///
+/// The amplifier is the **fixed-initial transform**, not the sampling: the transform
+/// resamples the fixed image onto the sample grid and leaves a hard zero shell at its
+/// border, which is what gives the optimizer a step to flip on. Sampling *without* it
+/// tracks the host to reduction-rounding, and sampling *with* it amplifies two orders less
+/// than the full grid does — fewer samples land on the shell.
+///
+/// So the pins are set to what was measured, not to what was feared. Where there is no
+/// amplifier the equality is real and is asserted as an equality; where there is one, the
+/// band is stated and the pose tolerance is four orders above the worst case seen, not ten.
+/// A pin ten orders looser than its measurement cannot fail when the code is wrong.
+#[test]
+fn a_sampled_run_converges_where_the_host_converges() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    for (strategy, pct, seed, with_transform) in [
+        (SamplingStrategy::Regular, 0.10, 0, false),
+        (SamplingStrategy::Random, 0.10, 7, false),
+        (SamplingStrategy::Random, 0.25, 99, false),
+        (SamplingStrategy::Regular, 0.10, 0, true),
+        (SamplingStrategy::Random, 0.10, 7, true),
+    ] {
+        let what = format!(
+            "{strategy:?} {pct} seed {seed}{}",
+            if with_transform { " + transform" } else { "" }
+        );
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_as_mean_squares();
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+        reg.set_metric_sampling_strategy(strategy);
+        reg.set_metric_sampling_percentage(pct, seed);
+        if with_transform {
+            reg.set_fixed_initial_transform(sitk_transform::Transform::Euler3D(
+                Euler3DTransform::new(0.12, -0.08, 0.30, [5.0, -4.0, 3.0], [0.0, 0.0, 0.0]),
+            ));
+        }
+
+        let host = reg.execute(&fixed, &moving, initial()).unwrap();
+        let device = reg.execute_on_device(&d_f, &d_m, initial()).unwrap();
+
+        assert_eq!(
+            device.iterations, host.iterations,
+            "{what}: different iteration counts"
+        );
+        assert_eq!(
+            device.stop_reason, host.stop_reason,
+            "{what}: different stop reasons"
+        );
+        // The pose tolerance, per configuration and from the measurement: without the
+        // transform there is nothing to amplify the reduction difference, so the two runs
+        // stay within reduction-rounding of each other; with it, D4's mechanism applies.
+        let band = if with_transform { 1e-5 } else { 1e-11 };
+        let mut worst = 0.0f64;
+        for (k, (&d, &h)) in device
+            .transform
+            .parameters()
+            .iter()
+            .zip(host.transform.parameters().iter())
+            .enumerate()
+        {
+            let rel = (d - h).abs() / (1.0 + h.abs());
+            worst = worst.max(rel);
+            assert!(
+                rel <= band,
+                "{what}, param {k}: device {d:e} vs host {h:e} (rel {rel:e}, band {band:e})"
+            );
+        }
+        if with_transform {
+            // The two land at *different* poses, so a border sample can fall on opposite
+            // sides of the moving buffer. They were in fact equal every time this was run;
+            // what is refused is a difference of the size a wrong sample set would produce.
+            let (dv, hv) = (device.valid_points as f64, host.valid_points as f64);
+            let drift = (dv - hv).abs() / hv;
+            assert!(
+                drift <= 1e-3,
+                "{what}: {} valid points (device) vs {} (host), {drift:e} apart — far more \
+                 than two nearby poses can disagree on at the border",
+                device.valid_points,
+                host.valid_points
+            );
+        } else {
+            // No amplifier: the two walk the same poses, so this is an equality.
+            assert_eq!(
+                device.valid_points, host.valid_points,
+                "{what}: the device and the host converged on different sample counts with \
+                 nothing in the configuration that could amplify the reduction difference"
+            );
+        }
+        println!(
+            "{what}: {} iters on both, params rel <= {worst:e}, valid {} (device) vs {} (host)",
             host.iterations, device.valid_points, host.valid_points
         );
     }

@@ -274,9 +274,17 @@ fn gather_values<T: IntoSampleValues>(
 pub(crate) enum SamplePoints {
     /// Sample `s` is voxel `s` of [`FixedSamples::grid`]; its point is derived.
     Grid,
-    /// Physical points, row-major `N × dim`, for a sample set with no closed
-    /// form.
-    Explicit(Vec<f64>),
+    /// A selected subset. `flats[s]` is the sample's voxel in the grid and `points`
+    /// holds its physical point, row-major `N × dim`.
+    ///
+    /// The points are what the host reads in its hot loop, and the `flats` are what
+    /// the *selection* actually was — the two are the same object seen twice, since
+    /// `points[s]` is the grid's point at `flats[s]`. Keeping the flats is what lets a
+    /// device backend be handed the selection itself rather than a bag of points it
+    /// would have to trust: an index still knows which voxel it is, so the device can
+    /// derive the point and read the value the same way a full-grid run does, and a
+    /// fixed mask still means something against it.
+    Explicit { flats: Vec<usize>, points: Vec<f64> },
 }
 
 /// Per-task scratch for [`FixedSamples::point`], so the derivation in the hot
@@ -334,7 +342,56 @@ pub struct FixedSamples {
     pub(crate) grid: VirtualGrid,
 }
 
+/// **Which voxels a sampling strategy draws.** The single owner of that question.
+///
+/// Returns the drawn voxels as flat grid indices *in sample order*, or `None` for the
+/// identity selection ([`SamplingStrategy::None`]: every voxel, in grid order — the one
+/// selection that needs no list). `Random` draws with replacement, so the list may repeat
+/// a voxel, and must: the metric counts it twice.
+///
+/// A fixed mask is **not** applied here. The host filters this draw by its mask
+/// ([`FixedSamples::from_image_with`]); a device backend gates the same mask inside its
+/// kernel, by grid index, and so takes the draw unfiltered. Both see the same samples — a
+/// masked-out draw contributes nothing on either side — and, what matters, both see the
+/// same *draw*, because there is one draw and this function is it.
+///
+/// That is the whole design of device sampling: **the device does not draw.** It is handed
+/// the list. So "do the two paths sample the same voxels" is not a property two
+/// implementations have to agree on, and that a test has to catch them failing — there is
+/// one implementation, and this is it.
+pub fn draw_samples(
+    voxels: usize,
+    strategy: SamplingStrategy,
+    percentage: f64,
+    seed: u64,
+) -> Option<Vec<usize>> {
+    match strategy {
+        SamplingStrategy::None => None,
+        SamplingStrategy::Regular => {
+            let stride = ((1.0 / percentage).ceil() as usize).max(1);
+            Some((0..voxels).step_by(stride).collect())
+        }
+        SamplingStrategy::Random => {
+            let sample_count = (voxels as f64 * percentage) as usize;
+            let mut rng = SplitMix64::new(seed);
+            Some((0..sample_count).map(|_| rng.next_below(voxels)).collect())
+        }
+    }
+}
+
 impl FixedSamples {
+    /// The voxels this sample set walks, as flat grid indices in sample order, or `None`
+    /// if it is the whole grid in grid order.
+    ///
+    /// This is the selection **after** a fixed mask has filtered it — what the host
+    /// actually evaluates.
+    pub fn selected_indices(&self) -> Option<&[usize]> {
+        match &self.points {
+            SamplePoints::Grid => None,
+            SamplePoints::Explicit { flats, .. } => Some(flats),
+        }
+    }
+
     /// Reduce a fixed image to its full sample set (sampling strategy = None:
     /// every pixel, matching SimpleITK's default).
     ///
@@ -412,23 +469,20 @@ impl FixedSamples {
         // The selected voxels, as flat indices in sample order. `None` is the
         // identity selection — every voxel, in grid order — and is the one case
         // that needs neither this list nor a points buffer.
-        let selected: Option<Vec<usize>> = match strategy {
-            SamplingStrategy::None if mask_buf.is_none() => None,
-            SamplingStrategy::None => Some((0..n).filter(|&s| mask_allows(s)).collect()),
-            SamplingStrategy::Regular => {
-                let stride = ((1.0 / percentage).ceil() as usize).max(1);
-                Some((0..n).step_by(stride).filter(|&s| mask_allows(s)).collect())
-            }
-            SamplingStrategy::Random => {
-                let sample_count = (n as f64 * percentage) as usize;
-                let mut rng = SplitMix64::new(seed);
-                Some(
-                    (0..sample_count)
-                        .map(|_| rng.next_below(n))
-                        .filter(|&flat| mask_allows(flat))
-                        .collect(),
-                )
-            }
+        //
+        // The *draw* is [`draw_samples`]; the mask filter is here. They are separate
+        // because a device backend gates the mask in its kernel, by grid index, and so
+        // wants the draw before the filter — while still needing it to be the same
+        // draw. See [`draw_samples`].
+        let selected: Option<Vec<usize>> = match draw_samples(n, strategy, percentage, seed) {
+            None if mask_buf.is_none() => None,
+            None => Some((0..n).filter(|&s| mask_allows(s)).collect()),
+            Some(draws) => Some(
+                draws
+                    .into_iter()
+                    .filter(|&flat| mask_allows(flat))
+                    .collect(),
+            ),
         };
 
         // The values never become an `f64` volume: the native buffer is taken (or
@@ -437,7 +491,10 @@ impl FixedSamples {
             dispatch_scalar!(fixed.pixel_id(), gather_values, fixed, selected.as_deref())?;
         let points = match &selected {
             None => SamplePoints::Grid,
-            Some(flats) => SamplePoints::Explicit(explicit_points(&grid, flats, dim)),
+            Some(flats) => SamplePoints::Explicit {
+                points: explicit_points(&grid, flats, dim),
+                flats: flats.clone(),
+            },
         };
 
         let min_spacing = fixed
@@ -474,7 +531,7 @@ impl FixedSamples {
     #[inline]
     pub(crate) fn point<'a>(&'a self, s: usize, scratch: &'a mut PointScratch) -> &'a [f64] {
         match &self.points {
-            SamplePoints::Explicit(p) => &p[s * self.dim..(s + 1) * self.dim],
+            SamplePoints::Explicit { points, .. } => &points[s * self.dim..(s + 1) * self.dim],
             SamplePoints::Grid => {
                 self.grid
                     .write_point(s, &mut scratch.index, &mut scratch.point);

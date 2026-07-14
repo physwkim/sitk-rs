@@ -18,6 +18,29 @@
 //! ```text
 //! ... --example execute_bench -- 256 96 200 1e-4 scales 4,2,1 2,1,0
 //! ```
+//!
+//! An 8th argument adds a **sampling strategy** (`random:0.01`, `regular:0.1`), applied to
+//! both paths: the host draws the samples, the device is handed that draw.
+//!
+//! ```text
+//! ... --example execute_bench -- 256 96 20 1e-4 - - - random:0.01
+//! ```
+//!
+//! # Reading the parameter disagreement
+//!
+//! At 256³/20 iterations the two runs land ~1.7e-4 apart (relative), sampled or not. That
+//! is **not** a metric difference and not a preprocessing difference — the cross-evaluation
+//! printed below settles it, and is there for exactly this reason. Evaluated at the *same*
+//! transform (both endpoints), the two metrics agree to ~5e-15 on the value and ~1e-12 on
+//! the derivative, with identical valid-point counts.
+//!
+//! What separates the runs is the optimizer: `RegularStepGradientDescentOptimizer` halves
+//! its step on overshoot, a *discontinuous* decision, so once a ~1e-12 derivative
+//! difference flips one overshoot test the two take different steps and converge to two
+//! different, both-valid poses. Same mechanism the registration tests pin around
+//! (`a_fixed_initial_transform_converges_where_execute_converges`). Read the
+//! cross-evaluation, not the parameter delta, to decide whether the device metric is
+//! sound.
 #[cfg(not(feature = "cuda"))]
 fn main() {
     eprintln!("this example needs the GPU: rebuild with --features cuda");
@@ -33,7 +56,7 @@ use sitk_cuda::{
     DeviceImage, rescale_intensity as device_rescale, smooth_gaussian as device_smooth,
 };
 #[cfg(feature = "cuda")]
-use sitk_registration::metric::{FixedSamples, MovingImage};
+use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
 #[cfg(feature = "cuda")]
 use sitk_registration::{
     CpuBackend, DeviceMeanSquaresMetric, ImageRegistrationMethod, MeanSquaresMetric,
@@ -90,9 +113,11 @@ fn main() {
 
     // A pyramid is only run if BOTH lists are given, and they must be the same length:
     // the schedule is one (shrink, sigma) pair per level.
+    // `-` is "not given", so a later argument can be reached without a schedule.
     let list = |i: usize| -> Vec<String> {
         std::env::args()
             .nth(i)
+            .filter(|s| s != "-" && !s.is_empty())
             .map(|s| s.split(',').map(str::to_owned).collect())
             .unwrap_or_default()
     };
@@ -125,6 +150,33 @@ fn main() {
             );
             reg.set_shrink_factors_per_level(shrink.clone());
             reg.set_smoothing_sigmas_per_level(sigmas.clone());
+        }
+
+        // Optional 8th arg: a **sampling strategy**, `random:0.01` or `regular:0.1`.
+        // Both paths get it — the host draws the samples and the device is handed that
+        // draw (`metric::draw_samples`), so this changes how many voxels each iteration
+        // walks and nothing else about what is compared.
+        if let Some(spec) = std::env::args()
+            .nth(8)
+            .filter(|s| s != "-" && !s.is_empty())
+        {
+            let (kind, pct) = spec.split_once(':').expect("sampling is kind:percentage");
+            let strategy = match kind {
+                "random" => SamplingStrategy::Random,
+                "regular" => SamplingStrategy::Regular,
+                other => panic!("sampling kind is `random` or `regular`, not `{other}`"),
+            };
+            let pct: f64 = pct.parse().expect("sampling percentage");
+            reg.set_metric_sampling_strategy(strategy);
+            reg.set_metric_sampling_percentage(pct, 7);
+            println!(
+                "  (sampling: {strategy:?} {:.1}% of the fixed grid — {} of {} voxels, and the \
+                 index list the device is handed is {} KiB)",
+                pct * 100.0,
+                (n * n * n) as f64 * pct,
+                n * n * n,
+                (n * n * n) as f64 * pct * 8.0 / 1024.0,
+            );
         }
 
         // Burn NVRTC (once per process, size-independent) on a tiny volume — and on

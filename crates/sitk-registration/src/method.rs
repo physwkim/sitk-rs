@@ -2684,15 +2684,16 @@ impl ImageRegistrationMethod {
                 self.interpolator,
             ));
         }
-        // The strategy alone, not the percentage. `SamplingStrategy::None` samples
-        // every voxel and **ignores** the percentage entirely — the `None` arm of
-        // `FixedSamples::from_image_with` never reads it (`metric.rs`, and its doc
-        // says so) — so a configured percentage under the default strategy changes
-        // nothing on the host either. Refusing it sent a caller to the CPU for a run
-        // this path computes identically, voxel for voxel: the gate was broader than
-        // the limit it names.
-        if !matches!(self.sampling_strategy, SamplingStrategy::None) {
-            return Err(DeviceRegistrationError::UnsupportedSampling);
+        // Sampling is no longer refused. Every strategy is a *selection* of fixed-grid
+        // voxels, `crate::metric::draw_samples` is the one function that makes it, and
+        // the device is handed the list it made (`level_samples` below). The device does
+        // not draw: there is nothing here for the two paths to disagree about.
+        //
+        // Matched exhaustively rather than with a wildcard, so a new strategy is a
+        // compile error at this boundary and not a silent accept — the same discipline
+        // the fixed-initial transform's classification is under.
+        match self.sampling_strategy {
+            SamplingStrategy::None | SamplingStrategy::Regular | SamplingStrategy::Random => {}
         }
         // Masks, virtual domains and fixed-initial transforms are no longer refused as
         // *configurations*: the level carries a device fixed mask
@@ -2752,12 +2753,28 @@ impl ImageRegistrationMethod {
             let level_mask =
                 self.level_mask_on_device(fixed, fixed_mask.as_ref(), grid.as_ref())?;
 
+            // Which voxels this level samples. Drawn by `draw_samples` — the same
+            // function, the same percentage, the same seed the host path draws with — so
+            // the device is handed the host's sample set rather than reproducing it.
+            //
+            // The draw is *unfiltered* by the fixed mask: the kernel gates the mask by
+            // grid voxel, which an index list still knows, and the host filters the same
+            // draw by the same mask. A masked-out draw contributes nothing on either
+            // side, so the two evaluate the same samples.
+            let samples = crate::metric::draw_samples(
+                fixed_level.len(),
+                self.sampling_strategy,
+                self.sampling_percentage(index),
+                self.sampling_seed,
+            );
+
             let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
-                DeviceMeanSquaresMetric::from_device_masked(
+                DeviceMeanSquaresMetric::from_device_sampled(
                     fixed_level,
                     moving_level,
                     level_mask.as_ref(),
                     moving_mask.as_deref(),
+                    samples.as_deref(),
                 )?,
             )));
 
