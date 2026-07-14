@@ -50,6 +50,26 @@ const SIZES: &[(&str, usize)] = &[("small", 64), ("medium", 256), ("large", 512)
 /// exactly the schema's own `"samples": 10` example.
 const SAMPLE_SIZE: usize = 10;
 
+/// Long enough that the box's ramp is inside the warm-up instead of inside the
+/// measurement.
+///
+/// Measured, not chosen: after the box idles, the first second of a 96-thread
+/// pass runs slow and decays. `signed_maurer_distance_map` at 64³/`tN`, first
+/// leg after a 90 s idle, criterion's own per-sample per-iteration times:
+///
+/// ```text
+///   4.970  4.328  3.479  3.049  3.318  3.913  3.557  3.021  2.935  2.898  (ms)
+/// ```
+///
+/// and the four legs after it are flat at 2.81–2.99. The samples reach within
+/// 5% of that steady value at a cumulative 1.63 s of measured work — so the ramp
+/// costs ~2.1 s of work counting the 500 ms warm-up that preceded it. A 500 ms
+/// warm-up therefore leaves the whole ramp inside the measured window, which is
+/// what made the same binary on the same op read 6.03 ms in one campaign and
+/// 2.89 ms in another: the number recorded whether the box was warm, not what
+/// the op costs. 3 s covers the measured 2.1 s ramp with margin.
+const WARM_UP_MS: u64 = 3_000;
+
 /// `doc/bench-spec.md` §"Thread configurations": `t1` pins a rayon pool to 1
 /// thread; `tN` is rayon's default pool, i.e. every logical core this
 /// machine actually reports — queried at runtime, never hardcoded, so the
@@ -182,7 +202,7 @@ fn main() {
     let mut criterion = Criterion::default()
         .output_directory(&criterion_dir)
         .sample_size(SAMPLE_SIZE)
-        .warm_up_time(Duration::from_millis(500))
+        .warm_up_time(Duration::from_millis(WARM_UP_MS))
         .measurement_time(Duration::from_secs(2));
 
     // `doc/bench-spec.md` §"Thread configurations": `tN` is "rayon default
