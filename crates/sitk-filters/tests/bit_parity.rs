@@ -222,7 +222,7 @@ fn op09_signed_maurer_distance_map() {
 fn op10_connected_component() {
     let img = binary_volume();
     assert_bit_parity("connected_component", 0x6fcb_a1e1_3b24_854f, || {
-        f::connected_component(&img, false).unwrap()
+        f::connected_component(&img, None, false).unwrap()
     });
 }
 

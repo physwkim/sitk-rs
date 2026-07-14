@@ -590,7 +590,7 @@ pub fn otsu_threshold(
             outside_value
         }
     });
-    apply_threshold_mask_output(&mut out, mask)?;
+    apply_threshold_mask_output(img, &mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))
@@ -757,7 +757,7 @@ pub fn triangle_threshold(
             outside_value
         }
     });
-    apply_threshold_mask_output(&mut out, mask)?;
+    apply_threshold_mask_output(img, &mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))

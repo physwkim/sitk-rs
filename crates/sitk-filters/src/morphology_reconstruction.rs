@@ -346,7 +346,7 @@ fn label_and_mark_kept(
 ) -> Result<(Vec<u32>, Vec<bool>)> {
     let bytes: Vec<u8> = indicator.iter().map(|&b| u8::from(b)).collect();
     let indicator_image = Image::from_vec(size, bytes)?;
-    let labels = connected_component(&indicator_image, fully_connected)?;
+    let labels = connected_component(&indicator_image, None, fully_connected)?;
     let label_vals = labels.scalar_slice::<u32>()?.to_vec();
 
     let max_label = label_vals.iter().copied().max().unwrap_or(0) as usize;

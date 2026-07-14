@@ -346,9 +346,41 @@ pub(crate) fn create_consecutive(
 /// (8-connected in 2-D, 26-connected in 3-D). Output pixel type is `UInt32`;
 /// background stays 0 and object labels are consecutive starting at 1,
 /// assigned in raster-scan order of first appearance.
-pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> {
+///
+/// # The optional mask
+///
+/// SimpleITK exposes an optional `MaskImage` input (`UInt8`), and ITK implements
+/// it by running the *input* through `MaskImageFilter` before labeling anything
+/// (`itkConnectedComponentImageFilter.hxx:79-92`). `MaskImageFilter` replaces a
+/// voxel with its outside value (`0`) where the mask **equals** the masking value
+/// — which is `TMask{}`, i.e. **`0`** (`itkMaskImageFilter.h:55`, `:107`) — so a
+/// masked-out voxel arrives at the labeler as a zero, i.e. as background.
+///
+/// Hence: **a voxel is foreground iff it is nonzero *and* its mask voxel is
+/// nonzero.** Note the polarity — every mask value except `0` keeps the voxel, so
+/// a mask of all `1`s is a no-op here. That is the opposite of the threshold
+/// family's mask ([`crate::histogram::ThresholdMask`]), which admits a voxel only
+/// where the mask **equals** `mask_value` (default **255**), and a mask of all
+/// `1`s admits nothing. Two upstream classes, two conventions; see
+/// [`crate::mask_input`] and ledger §2.175.
+///
+/// The mask must be `UInt8`, the image's size, and on the image's grid — ITK's
+/// three preconditions for a mask *input*, enforced by
+/// [`crate::mask_input::uint8_mask_voxels`].
+pub fn connected_component(
+    img: &Image,
+    mask: Option<&Image>,
+    fully_connected: bool,
+) -> Result<Image> {
     let size = img.size();
     let total: usize = size.iter().product();
+
+    // Before the empty-image shortcut: ITK validates a mask input in
+    // `VerifyInputInformation`, i.e. before `GenerateData` looks at a single voxel.
+    let mask_voxels = match mask {
+        None => None,
+        Some(m) => Some(crate::mask_input::uint8_mask_voxels(img, m)?),
+    };
 
     if total == 0 {
         let mut result = Image::from_vec(size, Vec::<u32>::new())?;
@@ -358,7 +390,14 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
 
     let xsize = size[0];
     let vals = img.to_f64_vec()?;
-    let is_fg: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
+    let is_fg: Vec<bool> = match mask_voxels {
+        None => vals.iter().map(|&v| v != 0.0).collect(),
+        Some(m) => vals
+            .iter()
+            .zip(m)
+            .map(|(&v, &m)| v != 0.0 && m != 0)
+            .collect(),
+    };
 
     let mut components = scanline_components(&is_fg, size, fully_connected);
     // `CreateConsecutive(0)` skips 0 on its first assignment, so the object
@@ -585,13 +624,13 @@ mod tests {
             0, 1,
             1, 0,
         ]);
-        let face = connected_component(&img, false).unwrap();
+        let face = connected_component(&img, None, false).unwrap();
         assert_eq!(face.pixel_id(), PixelId::UInt32);
         let face_labels = face.scalar_slice::<u32>().unwrap();
         assert_ne!(face_labels[1], face_labels[2]); // the two 1s, separate components
         assert_eq!(face_labels.iter().filter(|&&v| v != 0).count(), 2);
 
-        let full = connected_component(&img, true).unwrap();
+        let full = connected_component(&img, None, true).unwrap();
         let full_labels = full.scalar_slice::<u32>().unwrap();
         assert_eq!(full_labels[1], full_labels[2]); // joined diagonally
     }
@@ -604,7 +643,7 @@ mod tests {
         data[7] = 1; // (1,1,1)
         let img = img_u8(&[2, 2, 2], data);
 
-        let face = connected_component(&img, false).unwrap();
+        let face = connected_component(&img, None, false).unwrap();
         let face_labels = face.scalar_slice::<u32>().unwrap();
         assert_ne!(face_labels[0], face_labels[7]);
         assert_eq!(
@@ -615,7 +654,7 @@ mod tests {
             3 // background(0) + 2 distinct object labels
         );
 
-        let full = connected_component(&img, true).unwrap();
+        let full = connected_component(&img, None, true).unwrap();
         let full_labels = full.scalar_slice::<u32>().unwrap();
         assert_eq!(full_labels[0], full_labels[7]);
         assert_ne!(full_labels[0], 0);
@@ -645,7 +684,7 @@ mod tests {
             }
         }
         let img = img_u8(&[w, h], xfastest);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         let labels = out.scalar_slice::<u32>().unwrap();
         let distinct: std::collections::HashSet<u32> =
             labels.iter().copied().filter(|&v| v != 0).collect();
@@ -661,7 +700,7 @@ mod tests {
     #[test]
     fn background_only_image_has_no_objects() {
         let img = img_u8(&[3, 3], vec![0; 9]);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         assert!(out.scalar_slice::<u32>().unwrap().iter().all(|&v| v == 0));
     }
 
@@ -674,7 +713,7 @@ mod tests {
             0, 0, 1,
             1, 0, 0,
         ]);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         let labels = out.scalar_slice::<u32>().unwrap();
         // flat index 2 = (x=2,y=0) comes before flat index 3 = (x=0,y=1)
         assert_eq!(labels[2], 1);

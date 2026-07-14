@@ -149,18 +149,11 @@ pub fn stochastic_fractal_dimension(
     }
     let radius = &neighborhood_radius[..dim];
 
-    if let Some(mask) = mask_image {
-        if mask.pixel_id() != PixelId::UInt8 {
-            return Err(FilterError::RequiresUInt8MaskPixelType(mask.pixel_id()));
-        }
-        if mask.size() != image.size() {
-            return Err(FilterError::SizeMismatch {
-                a: image.size().to_vec(),
-                b: mask.size().to_vec(),
-            });
-        }
-    }
-    let mask_vals = mask_image.map(|m| m.scalar_slice::<u8>()).transpose()?;
+    // The mask is a pipeline input (`SetNthInput(1, ...)`), so its pixel type, size
+    // *and physical space* are all fixed by upstream — one owner enforces the three.
+    let mask_vals = mask_image
+        .map(|m| crate::mask_input::uint8_mask_voxels(image, m))
+        .transpose()?;
 
     let size = image.size();
     let n = image.number_of_pixels();
@@ -404,6 +397,24 @@ mod tests {
         assert_eq!(
             stochastic_fractal_dimension(&image, Some(&mask), &[1]),
             Err(FilterError::RequiresUInt8MaskPixelType(PixelId::UInt16))
+        );
+    }
+
+    /// The mask is a pipeline input, so `ImageToImageFilter::VerifyInputInformation`
+    /// compares its physical space with the image's and throws on a mismatch. The
+    /// aligned mask is accepted first, or the refusal below would prove nothing.
+    #[test]
+    fn rejects_a_mask_on_a_different_grid() {
+        let image = img(&[4], vec![0.0f64; 4]);
+        let aligned = img(&[4], vec![1u8; 4]);
+        stochastic_fractal_dimension(&image, Some(&aligned), &[1])
+            .expect("an aligned mask must be accepted, or the refusal below proves nothing");
+
+        let mut shifted = img(&[4], vec![1u8; 4]);
+        shifted.set_origin(&[5.0]).unwrap();
+        assert_eq!(
+            stochastic_fractal_dimension(&image, Some(&shifted), &[1]),
+            Err(FilterError::PhysicalSpaceMismatch { index: 1 })
         );
     }
 

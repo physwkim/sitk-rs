@@ -108,10 +108,10 @@ fn image_with_outliers(outlier: f64) -> Image {
 /// Admits everything except the outlier rows. `255` is ITK's and SimpleITK's default
 /// `MaskValue`, and the mask must be compared with `==`, not `!= 0`.
 fn mask_excluding_outliers() -> Image {
-    let mut m = vec![255.0f64; N * N];
+    let mut m = vec![255u8; N * N];
     for j in 0..2 {
         for i in 0..N {
-            m[j * N + i] = 0.0;
+            m[j * N + i] = 0;
         }
     }
     Image::from_vec(&[N, N], m).unwrap()
@@ -247,10 +247,10 @@ fn mask_output_zeroes_the_excluded_voxels_and_can_be_turned_off() {
 fn a_mask_value_that_is_neither_zero_nor_the_mask_value() {
     let img = image_with_outliers(-1000.0);
     // The outlier rows carry mask value 7: not admitted (7 != 255), not zeroed (7 != 0).
-    let mut m = vec![255.0f64; N * N];
+    let mut m = vec![255u8; N * N];
     for j in 0..2 {
         for i in 0..N {
-            m[j * N + i] = 7.0;
+            m[j * N + i] = 7;
         }
     }
     let mask_img = Image::from_vec(&[N, N], m).unwrap();
@@ -321,7 +321,7 @@ fn every_one_of_the_twelve_routes_through_the_owner() {
 #[test]
 fn a_mask_that_admits_no_voxels_is_refused_by_name() {
     let img = image_with_outliers(-1000.0);
-    let empty = Image::from_vec(&[N, N], vec![0.0f64; N * N]).unwrap();
+    let empty = Image::from_vec(&[N, N], vec![0u8; N * N]).unwrap();
     let mask = ThresholdMask::new(&empty);
 
     let err = otsu_threshold(&img, 128, false, 1, 0, Some(&mask)).unwrap_err();
@@ -344,7 +344,7 @@ fn a_mask_that_admits_no_voxels_is_refused_by_name() {
 #[test]
 fn a_mask_of_a_different_size_is_an_error() {
     let img = image_with_outliers(-1000.0);
-    let small = Image::from_vec(&[N / 2, N / 2], vec![255.0f64; N * N / 4]).unwrap();
+    let small = Image::from_vec(&[N / 2, N / 2], vec![255u8; N * N / 4]).unwrap();
     let mask = ThresholdMask::new(&small);
     assert!(matches!(
         otsu_threshold(&img, 128, false, 1, 0, Some(&mask)),
@@ -381,4 +381,39 @@ fn a_mask_on_a_different_grid_is_refused() {
         otsu_threshold(&img, 128, false, 1, 0, Some(&ThresholdMask::new(&rescaled))),
         Err(sitk_filters::FilterError::PhysicalSpaceMismatch { index: 1 })
     ));
+}
+
+/// **The mask's pixel type is `UInt8`, or it is refused.** SimpleITK instantiates all twelve
+/// with `MaskImageType = OutputImageType = itk::Image<uint8_t, Dim>` (`OtsuThresholdImageFilter.yaml`'s
+/// `output_image_type` plus its `filter_type`'s third template argument), and feeds the mask
+/// through `CastImageToITK` — a `dynamic_cast`, so a mask of any other type throws upstream
+/// rather than being converted. This port accepted a `Float64` mask and compared it as a
+/// float; the fixtures in this very file were built that way (ledger §2.176).
+#[test]
+fn a_mask_that_is_not_uint8_is_refused_by_name() {
+    let img = image_with_outliers(-1000.0);
+    let as_f64: Vec<f64> = mask_excluding_outliers().to_f64_vec().unwrap();
+    let float_mask = Image::from_vec(&[N, N], as_f64).unwrap();
+    let err = otsu_threshold(
+        &img,
+        128,
+        false,
+        1,
+        0,
+        Some(&ThresholdMask::new(&float_mask)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            sitk_filters::FilterError::RequiresUInt8MaskPixelType(sitk_core::PixelId::Float64)
+        ),
+        "a Float64 mask must be refused by name, got {err:?}"
+    );
+
+    // The same voxels as UInt8 are accepted — otherwise this test would pass against a
+    // filter that refuses every mask.
+    let u8_mask = mask_excluding_outliers();
+    otsu_threshold(&img, 128, false, 1, 0, Some(&ThresholdMask::new(&u8_mask)))
+        .expect("the UInt8 mask carrying the same voxels must still be accepted");
 }

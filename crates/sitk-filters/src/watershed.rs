@@ -395,7 +395,7 @@ pub fn morphological_watershed(
     let mut mask_image = Image::from_vec(size, mask)?;
     mask_image.copy_geometry_from(image);
 
-    let markers = connected_component(&mask_image, fully_connected)?;
+    let markers = connected_component(&mask_image, None, fully_connected)?;
     morphological_watershed_from_markers(image, &markers, mark_watershed_line, fully_connected)
 }
 

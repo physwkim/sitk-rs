@@ -147,7 +147,7 @@ fn run_signed_maurer_distance_map(img: &Image) -> Result<Image> {
 }
 
 fn run_connected_component(img: &Image) -> Result<Image> {
-    connected_component(img, false)
+    connected_component(img, None, false)
 }
 
 fn run_otsu_threshold(img: &Image) -> Result<Image> {

@@ -88,7 +88,7 @@ fn binarize_and_finish(
     // `MaskImageFilter` on the thresholded output, as `HistogramThresholdImageFilter`
     // does when `MaskOutput` is set (`.hxx:113-125`). Note it zeroes where the mask is
     // `0`, not where it differs from `mask_value` — see `ThresholdMask`'s docs.
-    apply_threshold_mask_output(&mut out, mask)?;
+    apply_threshold_mask_output(img, &mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))

@@ -234,7 +234,7 @@ fn count_components(
     minimum_object_size: u64,
 ) -> Result<u64> {
     let binarized = binary_threshold(img, lower, upper, inside_value, outside_value)?;
-    let cc = connected_component(&binarized, false)?;
+    let cc = connected_component(&binarized, None, false)?;
     let relabeled = relabel_component(&cc, minimum_object_size)?;
     let count = relabeled
         .to_f64_vec()?
