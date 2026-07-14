@@ -35,6 +35,7 @@ import os
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,27 @@ def foreign():
     ps = subprocess.run(["ps", "-eo", "comm"], capture_output=True, text=True).stdout
     return sorted({c.strip() for c in ps.splitlines()[1:]
                    if any(c.strip().startswith(f) for f in FOREIGN)})
+
+
+class LegWatch(threading.Thread):
+    """Watches for foreign load *during* a leg, not just before and after it.
+
+    Gating only at the leg's edges is not a gate: a sibling `cargo`/`nextest` that
+    starts and finishes inside the leg is invisible to it, and the leg is published.
+    That is not hypothetical -- it happened while this file was being written, and
+    it reported five 64^3 cells as unstable (spread up to 1.96x) that are tight to
+    1.02-1.11x when re-taken with this watch armed. A leg that shared the box with a
+    foreign process at ANY 2 s sample is dropped.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.stop = threading.Event()
+        self.seen = set()
+
+    def run(self):
+        while not self.stop.wait(2.0):
+            self.seen.update(foreign())
 
 
 def wait_quiet(deadline, need=2):
@@ -105,11 +127,15 @@ def main():
                 env["SITK_BENCH_SIZES"] = size
                 env["SITK_BENCH_CONFIGS"] = args.configs
                 before = foreign()
+                watch = LegWatch()
+                watch.start()
                 p = subprocess.run([binary], env=env, cwd=ROOT, capture_output=True, text=True)
+                watch.stop.set()
+                watch.join(timeout=3)
                 if p.returncode != 0:
                     print(p.stderr[-2000:], file=sys.stderr)
                     sys.exit(1)
-                dirty = sorted(set(before) | set(foreign()))
+                dirty = sorted(set(before) | watch.seen | set(foreign()))
                 if dirty:
                     dropped.append((op, size, k, dirty))
                     print(f"  drop {op} {size} leg {k}: foreign={dirty}", flush=True)
