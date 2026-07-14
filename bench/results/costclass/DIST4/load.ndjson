@@ -1,0 +1,107 @@
+{"t": 1784053281.720041, "busy": 1.38, "foreign": []}
+{"t": 1784053283.771133, "busy": 1.94, "foreign": []}
+{"t": 1784053285.821685, "busy": 2.13, "foreign": ["cargo-fmt"]}
+{"t": 1784053287.8712432, "busy": 2.49, "foreign": ["cargo-fmt"]}
+{"t": 1784053289.9191132, "busy": 2.66, "foreign": ["cargo", "rustc"]}
+{"t": 1784053291.971617, "busy": 2.66, "foreign": ["cargo", "rustc"]}
+{"t": 1784053294.0228167, "busy": 3.54, "foreign": []}
+{"t": 1784053296.0744553, "busy": 1.7, "foreign": []}
+{"t": 1784053298.123281, "busy": 1.63, "foreign": []}
+{"t": 1784053300.173964, "busy": 1.57, "foreign": []}
+{"t": 1784053302.2227664, "busy": 3.18, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053304.2756894, "busy": 4.0, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053306.3153753, "busy": 9.94, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053308.3555408, "busy": 2.57, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053310.3940818, "busy": 2.79, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053312.4339778, "busy": 5.61, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053314.4747412, "busy": 4.95, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053316.52128, "busy": 4.48, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053318.5727644, "busy": 5.13, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053320.6229432, "busy": 4.35, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053322.6746454, "busy": 6.78, "foreign": ["cargo-nextest"]}
+{"t": 1784053324.724726, "busy": 2.47, "foreign": []}
+{"t": 1784053326.7740495, "busy": 2.01, "foreign": []}
+{"t": 1784053328.8228545, "busy": 1.79, "foreign": []}
+{"t": 1784053330.8733015, "busy": 1.94, "foreign": []}
+{"t": 1784053332.9200385, "busy": 1.52, "foreign": []}
+{"t": 1784053334.9675815, "busy": 1.66, "foreign": []}
+{"t": 1784053337.0190208, "busy": 2.04, "foreign": []}
+{"t": 1784053339.0681472, "busy": 1.84, "foreign": []}
+{"t": 1784053341.1333451, "busy": 32.1, "foreign": []}
+{"t": 1784053343.1929765, "busy": 80.26, "foreign": []}
+{"t": 1784053345.252109, "busy": 76.66, "foreign": []}
+{"t": 1784053347.315341, "busy": 75.16, "foreign": []}
+{"t": 1784053349.3632798, "busy": 75.55, "foreign": []}
+{"t": 1784053351.4131305, "busy": 79.05, "foreign": []}
+{"t": 1784053353.4636636, "busy": 18.32, "foreign": []}
+{"t": 1784053355.5134807, "busy": 1.89, "foreign": []}
+{"t": 1784053357.5611954, "busy": 1.8, "foreign": []}
+{"t": 1784053359.6125002, "busy": 1.86, "foreign": []}
+{"t": 1784053361.6584878, "busy": 1.66, "foreign": []}
+{"t": 1784053363.7073584, "busy": 1.87, "foreign": []}
+{"t": 1784053365.7579267, "busy": 1.9, "foreign": []}
+{"t": 1784053367.7988248, "busy": 27.69, "foreign": []}
+{"t": 1784053369.8460882, "busy": 79.13, "foreign": []}
+{"t": 1784053371.8942044, "busy": 75.17, "foreign": []}
+{"t": 1784053373.9357233, "busy": 75.02, "foreign": []}
+{"t": 1784053375.978604, "busy": 78.42, "foreign": []}
+{"t": 1784053378.0270498, "busy": 75.04, "foreign": []}
+{"t": 1784053380.0773087, "busy": 40.77, "foreign": []}
+{"t": 1784053382.1228707, "busy": 1.63, "foreign": []}
+{"t": 1784053384.16156, "busy": 1.62, "foreign": []}
+{"t": 1784053386.2058802, "busy": 2.27, "foreign": []}
+{"t": 1784053388.2508018, "busy": 1.61, "foreign": []}
+{"t": 1784053390.2957745, "busy": 1.37, "foreign": []}
+{"t": 1784053392.3354745, "busy": 1.47, "foreign": []}
+{"t": 1784053394.3764117, "busy": 4.08, "foreign": []}
+{"t": 1784053396.418626, "busy": 79.38, "foreign": []}
+{"t": 1784053398.466454, "busy": 73.84, "foreign": []}
+{"t": 1784053400.506221, "busy": 74.34, "foreign": []}
+{"t": 1784053402.553331, "busy": 78.56, "foreign": []}
+{"t": 1784053404.596556, "busy": 74.16, "foreign": []}
+{"t": 1784053406.6351345, "busy": 54.6, "foreign": ["cargo-fmt"]}
+{"t": 1784053408.6775424, "busy": 2.41, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053410.716042, "busy": 2.79, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053412.7655373, "busy": 1.66, "foreign": []}
+{"t": 1784053414.816559, "busy": 1.89, "foreign": []}
+{"t": 1784053416.8569086, "busy": 2.74, "foreign": ["cargo", "cargo-clippy"]}
+{"t": 1784053418.8982768, "busy": 3.69, "foreign": ["cargo", "cargo-clippy"]}
+{"t": 1784053420.9386392, "busy": 2.73, "foreign": ["cargo", "cargo-clippy"]}
+{"t": 1784053422.9780066, "busy": 2.46, "foreign": ["cargo", "cargo-nextest"]}
+{"t": 1784053425.0165453, "busy": 3.66, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053427.0573092, "busy": 18.18, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053429.1097322, "busy": 6.33, "foreign": ["cargo", "cargo-nextest", "rustc"]}
+{"t": 1784053431.239058, "busy": 71.0, "foreign": ["cargo-nextest", "mattes_mask-7d5"]}
+{"t": 1784053433.2832828, "busy": 83.97, "foreign": ["cargo-nextest"]}
+{"t": 1784053435.3401625, "busy": 66.57, "foreign": ["cargo-nextest"]}
+{"t": 1784053437.3811538, "busy": 50.41, "foreign": ["cargo-nextest"]}
+{"t": 1784053439.4287932, "busy": 44.82, "foreign": ["cargo-nextest"]}
+{"t": 1784053441.465835, "busy": 35.12, "foreign": ["cargo-nextest"]}
+{"t": 1784053443.5061321, "busy": 10.49, "foreign": ["cargo-nextest"]}
+{"t": 1784053445.5454602, "busy": 11.27, "foreign": ["cargo-nextest"]}
+{"t": 1784053447.5864122, "busy": 10.19, "foreign": ["cargo-nextest"]}
+{"t": 1784053449.6238055, "busy": 6.31, "foreign": ["cargo-nextest"]}
+{"t": 1784053451.6596758, "busy": 10.43, "foreign": ["cargo-nextest"]}
+{"t": 1784053453.7011416, "busy": 4.63, "foreign": ["cargo-nextest"]}
+{"t": 1784053455.752133, "busy": 6.46, "foreign": ["cargo-nextest"]}
+{"t": 1784053457.792261, "busy": 2.92, "foreign": ["cargo-nextest"]}
+{"t": 1784053459.8327065, "busy": 2.47, "foreign": ["cargo-nextest"]}
+{"t": 1784053461.8724926, "busy": 2.46, "foreign": ["cargo-nextest"]}
+{"t": 1784053463.9133701, "busy": 2.95, "foreign": ["cargo-nextest"]}
+{"t": 1784053465.9547994, "busy": 2.9, "foreign": ["cargo-nextest"]}
+{"t": 1784053467.99582, "busy": 2.56, "foreign": ["cargo-nextest"]}
+{"t": 1784053470.0355208, "busy": 2.45, "foreign": ["cargo-nextest"]}
+{"t": 1784053472.0778732, "busy": 2.52, "foreign": ["cargo-nextest"]}
+{"t": 1784053474.1218107, "busy": 2.95, "foreign": []}
+{"t": 1784053476.1717434, "busy": 1.86, "foreign": []}
+{"t": 1784053478.223691, "busy": 1.72, "foreign": []}
+{"t": 1784053480.2753584, "busy": 2.5, "foreign": []}
+{"t": 1784053482.3246124, "busy": 1.63, "foreign": []}
+{"t": 1784053484.3733652, "busy": 1.79, "foreign": []}
+{"t": 1784053486.422096, "busy": 1.82, "foreign": []}
+{"t": 1784053488.469838, "busy": 62.35, "foreign": []}
+{"t": 1784053490.517763, "busy": 74.74, "foreign": []}
+{"t": 1784053492.5656362, "busy": 79.13, "foreign": []}
+{"t": 1784053494.6146646, "busy": 75.13, "foreign": []}
+{"t": 1784053496.6629894, "busy": 75.29, "foreign": ["cargo-fmt"]}
+{"t": 1784053498.7064412, "busy": 80.61, "foreign": ["cargo-fmt"]}

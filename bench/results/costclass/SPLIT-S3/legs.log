@@ -1,0 +1,14 @@
+02:52:14 r1 flat2048 wall=  42.0s busy_max= 93.4 clean
+02:52:53 r1 split wall=  39.0s busy_max= 91.2 clean
+02:53:36 r1 flat1024 wall=  43.3s busy_max= 86.3 clean
+  round r1 KEPT — 4/4 legs clean
+02:54:31 r2 split wall=  39.1s busy_max= 94.2 clean
+02:55:14 r2 flat2048 wall=  43.8s busy_max= 91.6 clean
+02:55:57 r2 flat1024 wall=  42.2s busy_max= 94.5 clean
+  round r2 KEPT — 4/4 legs clean
+02:56:50 r3 split wall=  38.5s busy_max= 94.3 clean
+02:57:33 r3 flat1024 wall=  42.9s busy_max= 94.3 clean
+02:58:17 r3 flat2048 wall=  43.4s busy_max= 89.8 clean
+  round r3 KEPT — 4/4 legs clean
+02:59:15 r4 flat1024 wall=  43.4s busy_max= 93.5 clean
+02:59:55 r4 split wall=  39.3s busy_max= 85.7 clean

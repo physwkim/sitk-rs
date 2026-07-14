@@ -1,0 +1,28 @@
+# Round 7 — the cost-class split. Legs, load traces, and what was voided.
+# Every kept round: atomic (one contaminated leg voids the round), foreign=none,
+# gated on /proc/stat busy cores (loadavg is not trustworthy on this box).
+
+## Binaries (all built from THIS worktree; md5-distinct)
+flat2048  = merged main with MIN_GRAIN_INDEXED forced to 2048 (the pre-Round-3 baseline)
+flat1024  = merged main as it stands (MIN_GRAIN_INDEXED = 1024, flat chunker)
+split     = the cost-class split, MIN_GRAIN_INDEXED deleted
+split1024 = the split WITH the 1024 floor re-added to the flat fill (the P29 control)
+flat1024b = a byte copy of flat1024 (the self-control: a binary raced against itself)
+
+## Campaigns kept
+SPLIT-S   64^3, 6 rounds — the first split (VOID as a claim: rule changed twice after)
+SPLIT-M3  256^3, 3 rounds — after the ceiling AND the leaf cap were restored
+SPLIT-S3  64^3 t1+tN, 4 rounds
+FINAL     64^3, 3 rounds — on the fully gated source, after the clippy fix
+P29       64^3 multi-op — its otsu/fft/distance cells are ARTIFACT, see below
+DIST4     signed_maurer_distance_map alone, all 4 binaries: 2.87/2.89/2.88/2.90 ms
+F4-*      otsu / fft alone, all 4 binaries
+SELF      the self-control: flat1024 vs a copy of itself (0.98-1.04)
+occS_r*   the occupancy re-probe (r1 VOIDED: load trace showed foreign=['git'])
+
+## Discarded, not reported
+- SPLIT-M  (256^3): measured a version with no GRAIN ceiling. binary_dilate 1.41x SLOWER.
+- SPLIT-M2 (256^3): measured a version with no with_max_len(1). dilate 3.5x, mean 2.2x SLOWER.
+  Both are real regressions of intermediate code, kept here as the record of what P31 caught.
+- The P29 multi-op otsu/fft/distance cells (1.85-1.95x): refuted by DIST4 and F4-*.
+- The first occupancy probe of Round 6, which ran in the DEV profile.
