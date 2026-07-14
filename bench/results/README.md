@@ -95,3 +95,24 @@ sampler, not load: when the process vanishes, its `/proc/<pid>/stat` disappears,
 the cumulative-CPU delta for `bench` goes negative, and `total - bench` blows up.
 A value above 96 on a 96-core box is impossible, which is how it is recognisable.
 Every other sample in that leg is under 4 cores, p50 0.8.
+
+## `rust-r4-grain.ndjson` — 2026-07-14, merged main (post grain seam)
+
+The full twelve-op × three-size sweep on merged `main`, run on a box whose foreign
+load had gone (load average 32 → under 3; traced beside the sweep, and the only
+peaks are the sweep's own 96-thread ops). **It supersedes `rust-r3-postfix.ndjson`
+and rounds 1–2 for every row**, and it is the file behind §3's rewritten 64³ table.
+
+What it changed: the 64³ cells, and only those — `otsu_threshold` 6.62× ITK → 0.68×,
+`gradient_magnitude` 2.91× → 1.05×, `mean` 4.52× → 2.82×.
+
+What it did **not** change, despite appearances: three cells (`gradient_magnitude`
+medium and large, `discrete_gaussian` large) read as regressions against r3 and are
+**noise** — see `twin-r4/` for the four-leg ABBA campaign that settled it, and §3's
+"noise floor at large" for what that costs this document's claims.
+
+## `twin-r4/` — the ABBA campaign that exonerated the `Stencil` refactor
+
+Five raw legs (four full published-path sweeps plus a 12-round subset), kept in a
+subdirectory **on purpose**: a `bench/results/*.ndjson` glob must not be able to feed
+a twin leg into a published comparison. See its `PROVENANCE.md`.

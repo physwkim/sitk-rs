@@ -233,13 +233,84 @@ this table is still rounds 1/2, which is why they still carry two columns.
 `gradient_magnitude` and `gmrg` are **ties at large, not wins** — 1.02× and 1.01×
 are parity and are not being claimed as anything else. They were 2.00× and 2.93×.
 
-### small (64³) — where per-call overhead shows, and the medium table hides it
+### small (64³) — rewritten 2026-07-14; the grain seam moved this table, not the others
 
-Two rows are far worse here than at any other size, and neither is visible in the
-headline: **`otsu_threshold` 6.62×** (15.4 ms against ITK's 2.3) and **`mean`
-4.52×** (23.2 against 5.1). `mean` *beats* ITK at medium and large and loses by
-4.5× at small — a fixed per-call cost that larger volumes amortize away. If your
-volumes are small, read this row, not the headline.
+The row that used to read *"`otsu_threshold` 6.62×, `mean` 4.52×, and
+`gradient_magnitude` 2.91× is the worst cell in the whole table"* is obsolete. One
+change — the grain seam of §5.2, which cuts the chunk grain from the input length
+instead of a fixed constant — moved every 64³ cell and **no other size**. Measured
+on merged main (`bench/results/rust-r4-grain.ndjson`, `rust tN` against `itk tN`):
+
+| op, 64³ | rust tN | itk tN | **rust/itk** | was |
+|---|---|---|---|---|
+| connected_component | 10.9 | 125.6 | **0.09×** | — |
+| signed_maurer_distance_map | 5.3 | 28.8 | **0.18×** | — |
+| median | 13.3 | 32.4 | **0.41×** | — |
+| discrete_gaussian | 2.8 | 6.3 | **0.44×** | — |
+| **otsu_threshold** | **1.6** | 2.3 | **0.68×** | **6.62×** |
+| rescale_intensity | 0.4 | 0.6 | 0.70× | — |
+| binary_dilate | 29.7 | 37.0 | 0.80× | — |
+| **gradient_magnitude** | **2.6** | 2.5 | **1.05×** | **2.91×** |
+| gmrg | 15.8 | 13.3 | 1.19× | 1.09× |
+| smoothing_recursive_gaussian | 2.3 | 1.7 | 1.34× | — |
+| fft_convolution | 22.9 | 16.2 | 1.41× | — |
+| **mean** | **14.4** | 5.1 | **2.82×** | **4.52×** |
+
+`otsu_threshold` crossed from the second-worst cell in the table to a **win**.
+`gradient_magnitude` — the cell whose four candidate causes were all refuted, and
+which was left with an *empty board* — is now a **tie**. Neither was fixed by
+anything aimed at them: both were bound by a grain that could not raise more than
+four tasks on a 96-worker pool.
+
+**`mean` still loses at 64³, by 2.82×.** It is the one 64³ cell the grain seam did
+not close, and the cause is the one named in §5.1 and still unaddressed: window
+locality, not task count.
+
+### The noise floor at `large`, measured — and what this table may therefore claim
+
+Publishing `rust-r4-grain.ndjson` surfaced three cells that appeared to have
+*regressed* against the r3 table: `gradient_magnitude` medium (22.5 → 28.8 ms),
+`gradient_magnitude` large (100.8 → 109.8), `discrete_gaussian` large (0.91× →
+1.05×). A four-leg **ABBA twin** (full published path, ~15 min per leg, r3's tree
+against merged main, ordered post/pre/pre/post so a monotonic drift cancels rather
+than loading onto one tree) settled it:
+
+| cell (tN) | pre legs | post legs | median post/pre |
+|---|---|---|---|
+| `gradient_magnitude` medium | 22.77, 25.74 | 24.42, 19.61 | **0.91×** |
+| `gradient_magnitude` large | 98.15, 104.79 | 97.99, 100.04 | **0.98×** |
+| `discrete_gaussian` large | 580.1, 638.4 | 655.7, 587.5 | **1.02×** |
+| `gradient_magnitude` small *(control)* | 7.30, 7.22 | **2.44, 2.53** | **0.34×** |
+| `discrete_gaussian` small *(control)* | 6.84, 6.40 | **3.04, 2.78** | **0.44×** |
+
+Every suspect cell's range **overlaps**; the r4 tree measures `gradient_magnitude`
+large at 98.0/100.0 ms — *below* r3's published 100.8 and nowhere near the 109.8
+attributed to it. **A regression the regressing code cannot reproduce is not a
+regression.** The control cells' ranges do *not* overlap, so the 64³ wins above are
+real and reproduce. The refactor suspected of causing it was also innocent by
+inspection: `gradient_magnitude_pass` was **already** on the borrowed-window path
+at `fd2b372`, and `gaussian_axis_pass` is byte-identical between the two trees —
+the hypothesis (a materialized copy amortized at 512³) described a copy the *older*
+tree had already deleted.
+
+What that costs this document is a claim, and it is the honest price:
+
+- **Process shape moves a cell by ~60%.** The identical binary measures
+  `gradient_magnitude` large at **155 ms** in a two-op process and **98 ms** in the
+  twelve-op sweep. A number is comparable only *within the same sweep shape*.
+- **Within-leg sample stddev at large is 9–25 ms** (`gradient_magnitude`) and
+  **46–94 ms** (`discrete_gaussian`) — the latter is larger than the entire gap it
+  was invoked to explain.
+- **Within-tree drift across one campaign:** `gradient_magnitude` large on one tree
+  alone walked 163.9 → 144.0 ms in a single session.
+
+So: **a `large` ratio in this document is worth about ±15%, and a difference
+smaller than that is not a result.** The 1.02× and 1.01× "ties" at large were
+already written as ties rather than wins, which survives; but no `large` row here
+should be read as a two-significant-figure fact, and a future change claiming a
+sub-15% win at `large` on this box is claiming something this harness cannot
+currently see. Quantifying `discrete_gaussian`'s 8–15% per-sample variance is
+**open and not chased**.
 
 ## 4. Where the port lost to ITK, and what the cause turned out to be
 
@@ -366,14 +437,23 @@ Both beat ITK at medium; both are **ties at large**, and a tie is not a win.
 
 ### What still loses, stated plainly
 
-- **`gradient_magnitude`: 2.91× at small** (7.2 ms against ITK's 2.5) — now the
-  **worst cell in the whole table**, and the three fixes above did not move it at
-  all (7.0 → 7.2 ms, stddev 0.31 — flat, not a regression). At 64³ it is bound by
-  fixed per-call overhead, not by bandwidth, and none of the fixes targets that.
-- **`smoothing_recursive_gaussian`: 1.75× at large** (1.02× at medium).
-- **`otsu_threshold`: 1.37× at large, 6.62× at small.**
-- **`mean`: 4.52× at small**, which its medium crossover hides completely.
-- **`gmrg` at small: 1.09×**, improved from 1.45× but still a loss.
+*(This list was written before §5.2. The three 64³ entries it opened with —
+`gradient_magnitude` 2.91×, `otsu_threshold` 6.62×, `mean` 4.52× — were all bound by
+the same constant grain, and the first two are now a tie and a win respectively. The
+list is corrected below rather than deleted, because what it got wrong is
+instructive: it attributed `gradient_magnitude`'s 64³ loss to "fixed per-call
+overhead" on the strength of the fixes that failed to move it, and that attribution
+was wrong.)*
+
+- **`mean`: 2.82× at small** (was 4.52×) — the last 64³ loss, and the only one the
+  grain seam did not close. Window locality, not task count (§6).
+- **`smoothing_recursive_gaussian`: 1.82× at large** (1.04× at medium). Its time is
+  in the line pass, whose own task floor is still under-raised (§6).
+- **`otsu_threshold`: 1.38× at large.** At small it now **wins** (0.68×).
+- **`gradient_magnitude` at small is a tie** (1.05×), not the worst cell. It was
+  never per-call overhead: it was the grain.
+- **`gmrg` at small: 1.19×** — a loss, and the line pass is why.
+- **`fft_convolution` at small: 1.41×**, not investigated.
 - Not benchmarked and not measured, but sitting next to the code just fixed:
   `derivative`, `laplacian` and `sobel_edge_detection` still run a **serial**
   `iter().map().collect()` over the old copying neighborhood path, plus a full
@@ -445,13 +525,67 @@ What survives is the measurement, not the code:
   setup, and a `t1`/`tN` crossover. Its 2.81× against ITK is unexplained, and the
   next investigation starts from an empty board rather than from these.
 
+## 5.2 The empty board had one square left on it, and it was the grain
+
+The refutation above ended with `gradient_magnitude` at 64³ *unexplained* — a 2.81×
+loss with four dead candidates. The cause was none of them, and it was not specific
+to that op: **the chunk grain was a constant.** `map_grain`/`reduce_grain` handed
+rayon a fixed grain (`GRAIN = 4096`, and 65536 for the reduce), so a 64³ volume —
+262,144 elements — could raise **four tasks** on a 96-worker pool no matter what the
+kernel did. Every op with heavy per-element work was serialized into a quarter of
+the machine, and the reason `otsu_threshold` was the worst hit is that its
+`bin_index` (`histogram.rs:162`) is a **binary search with `partial_cmp().unwrap()`
+per probe** — about 188 ns per element, which put **12.3 ms of otsu's 13.7 ms** in
+`bin_counts`. Heavy per-element work through a four-task ceiling is the worst case
+this defect has.
+
+The seam is one function, `usize` in and `usize` out, so it *cannot* observe the
+thread count — it bounds the pool by shape rather than querying it:
+
+```rust
+grain(len, ceiling) = clamp(len.div_ceil(TARGET_TASKS), MIN_GRAIN, ceiling)
+```
+
+with `TARGET_TASKS = 256` (dominating any plausible pool width) and `MIN_GRAIN =
+2048` **derived** — the largest power of two under 262,144/96 = 2,730, which raises
+128 tasks where 4,096 would raise only 64. Applied at all five chunked sites
+(`min_max`, `bin_counts`, `fill_indexed`, `fill_zip`, `for_each_mut`).
+
+**Why this one was mergeable where §5.1's was not:** it was proved a no-op at and
+above 256³ rather than asserted to be. The emitted chunk boundaries are compared
+**as integers** against the old fixed grain in a unit test, and a binding probe over
+all twelve ops at all three sizes shows the rule binds at 64³ for all twelve and for
+**no** op at 256³ or 512³. Medium and large therefore run a byte-identical
+decomposition — which is also why the three cells that looked like large-size
+regressions in the r4 sweep could not have been caused by it, and were not (§3, the
+noise floor).
+
+The result, on the published path: `otsu_threshold` 64³ **6.62× ITK → 0.68×**, and
+`gradient_magnitude` 64³ **2.91× → 1.05×**. Two of the three worst cells in the
+table, closed by one seam neither was diagnosed to need. Every checksum unmoved;
+`bit_parity` 18/18 at 1, 4, 48 and 96 threads.
+
+The ceiling is load-bearing in the direction assumed but not previously measured: at
+256³ a flat 2,048 grain *regresses* `otsu_threshold` to 47.0 ms against 38.0 at
+65,536, because the sequential combine is O(chunks). The `clamp`'s upper bound is
+not tidiness.
+
 ## 6. What is still open
 
-- **Small volumes (64³) are where the port loses now.** `gradient_magnitude` 2.81×,
-  `otsu_threshold` 6.20×, `mean` 4.16× — the reference size amortizes this away and
-  the headline hides it. `gradient_magnitude` at small is the worst cell in the
-  table; none of the §4/§4.1 fixes touched it, and §5.1's pool-width rule is now
-  refuted for it specifically.
+- **`mean` at 64³ (2.82× ITK) is the last 64³ loss**, and it is the one cell the
+  grain seam did not close (§5.2 moved it 4.52× → 2.82×, no further). Its cause is
+  the one named in §5.1 and still unaddressed: **window locality**, not task count —
+  a 125-tap window on a 96-worker pool, where the measured 1.85× came from running
+  it on *eight* workers instead. A rule keyed on work-per-element rather than
+  element count is what it needs, and no such rule has been written, because the
+  taps are non-monotonic (otsu's ~3 taps *win* on a narrow pool, gm's 6 taps *lose*,
+  mean's 125 *win*) and `gradient_magnitude`'s optimal pool width **flips with the
+  entry shape** — 8 workers on the direct path, 96 on the harness path. No rule
+  keyed on the op's own structure can be right in both.
+- **`for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor** sits below this box's 96
+  workers — the same arithmetic as §5.2's defect, but it decomposes by whole blocks
+  rather than element count, so it needs a different rule. `smoothing_recursive_gaussian`
+  and `gmrg` spend their time there and moved **0%** under the grain seam. Not fixed.
 - **`smoothing_recursive_gaussian` at large (1.75×)**, not investigated.
 - **The §2 pipeline table's `setup` / `20 iterations` rows** are re-measured; the
   `cast` / `rescale` / `smooth` rows still carry their original numbers.
