@@ -5,6 +5,8 @@
 //! tests and the CPU suite is untouched.
 #![cfg(feature = "cuda")]
 
+mod support;
+
 use sitk_core::Image;
 use sitk_registration::metric::{FixedSamples, MovingImage};
 use sitk_registration::{
@@ -12,6 +14,7 @@ use sitk_registration::{
     MetricValue,
 };
 use sitk_transform::{BSplineTransform, Euler3DTransform, ParametricTransform};
+use support::cell_boundary_straddles;
 
 /// A smooth, textured volume: three Gaussian blobs plus a low-frequency sine
 /// texture. Smooth so the metric has a real minimum; textured so the gradient is
@@ -95,6 +98,21 @@ fn metric(n: usize) -> MeanSquaresMetric {
 /// in practice. 1e-9 sits between "rounding" and "a real modelling difference", so
 /// a dropped term or a wrong Jacobian contraction fails this test loudly rather
 /// than hiding under a loose band. The measured error is printed.
+///
+/// # The precondition, named
+///
+/// That band means *reduction rounding* only where no sample of this pose lands on a
+/// moving-grid cell wall. Where one does, the two paths take **different one-sided limits
+/// of a discontinuous ∂M/∂x**, and one such sample — out of 262144 — moves this metric's
+/// derivative by **5.7e-6 relative**: 5,700× the band below, and nothing to do with the
+/// reduction (ledger §2.158, and
+/// [`a_sample_on_a_cell_boundary_costs_one_derivative_component`] below, which is that
+/// pose on purpose, with the number measured).
+///
+/// So the absence of a straddle is *asserted*, not assumed. Without the assertion this
+/// pin's 1e-9 is a claim about the reduction that happens to hold because of the
+/// geometry — and an edit to `probe_transform` that put one sample on an integer index
+/// would blow it by four decades while looking like a kernel regression.
 #[test]
 fn gpu_value_and_derivative_match_the_cpu() {
     if no_device() {
@@ -104,6 +122,15 @@ fn gpu_value_and_derivative_match_the_cpu() {
     let n = 64;
     let m = metric(n);
     let t = probe_transform(n);
+
+    let (fixed, moving) = pair(n);
+    let straddles = cell_boundary_straddles(&fixed, &moving, &t);
+    assert!(
+        straddles.is_empty(),
+        "{} sample(s) of this pose land on a moving-grid cell wall ({straddles:?}) --- the \
+         1e-9 band below would then be measuring a gradient discontinuity, not the reduction",
+        straddles.len()
+    );
 
     let cpu: MetricValue = m.evaluate(&t, &CpuBackend);
     let gpu: MetricValue = m.evaluate(&t, &CudaMetricBackend::new());
@@ -145,6 +172,150 @@ fn gpu_value_and_derivative_match_the_cpu() {
     assert!(
         cpu.derivative.iter().any(|d| d.abs() > 1e-6),
         "the CPU derivative is ~zero here, so the comparison proves nothing"
+    );
+}
+
+/// **One sample on a moving-grid cell wall costs mean squares one derivative component
+/// — and leaves its value untouched.** The exposure §2.158 records for Correlation,
+/// pinned where it also exists: in the metric that was written first and never showed it.
+///
+/// The mechanism is not the metric's. It is the device's point map (`p = A·x + b`, with
+/// `A` *probed* as `T(e_e) − T(0)`) differing from the host's (`R·(x − c) + c + t`,
+/// evaluated) in the last ulp, at a sample where that ulp decides which **cell** of the
+/// moving grid the sample sits in. The trilinear interpolant is continuous across a cell
+/// wall; its gradient is not. So any metric whose derivative consumes `∇M` sees it, and
+/// mean squares' derivative does: `∂/∂p = (2/N)·Σ (m − f)·∇M·J`.
+///
+/// The pose puts it there on purpose: a Euler transform whose centre is the volume's
+/// centre *voxel* and whose translation is a whole number of voxels. The centre voxel is
+/// fixed by the rotation, so it maps to `centre + t` — exactly integral, exactly on a
+/// cell wall — and it is the only such sample. Measured, at 64³:
+///
+/// * straddling samples: **1** — the centre voxel (32, 32, 32); `|Δ∂M/∂x|` there is
+///   **0.7156**, an O(1) jump, as a second difference of the image should be
+/// * `|Δvalue|`: **3.5e-15 relative** — the interpolant is continuous, so the value does
+///   not see it
+/// * `|Δderivative|`: **2.996e-4** on the x-translation column (**5.7e-6 relative**),
+///   **≤1.1e-11** on the other five
+///
+/// The size of that one number is the whole reason this pin exists. It is exactly one
+/// sample's worth of the `(2/N)·Σ (m − f)·∇M·J` sum: `2/262144 · 55 · 0.7156 ≈ 3e-4`,
+/// with 55 the residual at that voxel — an ordinary one for intensities of O(100). It is
+/// **1000× what the same straddle costs Correlation** (2.9e-7), because NCC divides by
+/// `sff·smm` and mean squares divides by nothing. A metric with no normalization has no
+/// protection from this, which is why the loudest version of the exposure lives here.
+///
+/// # What is asserted, and why each assertion is the interesting one
+///
+/// * **The value does not move.** This is the assertion that proves the pin is about
+///   `∇M` and not about the sampler in general: mean squares' *value* is built from the
+///   interpolated intensity alone, which is continuous across the wall, so it must stay
+///   inside the ordinary reduction band. If the value ever moves, the cause is not this.
+/// * **Five of the six derivative components do not move.** The straddling sample *is*
+///   the rotation centre, so the rotation columns of its Jacobian vanish, and the
+///   gradient jump is along x alone — leaving only the x-translation column exposed.
+///   The mechanism predicts the signature exactly, and the signature is asserted.
+/// * **The x-translation column is bounded BELOW as well as above.** Below, because a
+///   collapse to rounding would mean the device's point map had become bit-identical to
+///   the host's and this whole pin's story had changed; above, because a wrong
+///   contraction is orders of magnitude larger than one sample's worth of gradient jump.
+#[test]
+fn a_sample_on_a_cell_boundary_costs_one_derivative_component() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = pair(n);
+    let m = metric(n);
+    let c = n as f64 / 2.0;
+    let t = Euler3DTransform::new(0.15, 0.1, -0.12, [12.0, -9.0, 7.0], [c, c, c]);
+
+    let straddles = cell_boundary_straddles(&fixed, &moving, &t);
+    println!("straddling samples: {straddles:?}");
+    assert_eq!(
+        straddles.len(),
+        1,
+        "the pose is constructed so exactly one sample lands on a cell wall"
+    );
+    let ([i, j, k], axis, jump) = straddles[0];
+    assert_eq!(
+        [i, j, k],
+        [32, 32, 32],
+        "and it is the rotation-centre voxel"
+    );
+    assert_eq!(axis, 0, "the gradient jump is along x");
+    assert!(
+        jump > 1e-2,
+        "|Δ∂M/∂x| = {jump:e} --- the jump across a cell wall is O(1), not O(ε)"
+    );
+
+    let cpu: MetricValue = m.evaluate(&t, &CpuBackend);
+    let gpu: MetricValue = m.evaluate(&t, &CudaMetricBackend::new());
+    assert_eq!(
+        gpu.valid_points, cpu.valid_points,
+        "a cell-wall straddle must not move the valid set: the sample is inside on both \
+         paths, it is only interpolated differently"
+    );
+
+    // The same `rel` the ordinary pin bands at 1e-9, so the two numbers are comparable and
+    // the claim "this straddle would fail that pin" is checkable rather than asserted.
+    let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+    let v_err = rel(gpu.value, cpu.value);
+    let d_abs: Vec<f64> = gpu
+        .derivative
+        .iter()
+        .zip(cpu.derivative.iter())
+        .map(|(&g, &c)| (g - c).abs())
+        .collect();
+    let d_rel: Vec<f64> = gpu
+        .derivative
+        .iter()
+        .zip(cpu.derivative.iter())
+        .map(|(&g, &c)| rel(g, c))
+        .collect();
+    println!("value rel err  = {v_err:.3e}");
+    println!("cpu derivative = {:?}", cpu.derivative);
+    println!("|Δderivative|  = {d_abs:?}");
+    println!(
+        "x-translation column: |Δ| = {:.4e}, rel = {:.4e}",
+        d_abs[3], d_rel[3]
+    );
+
+    assert!(
+        v_err <= 1e-12,
+        "the straddle moved the value by {v_err:e} relative --- it must not: mean squares' \
+         value never touches ∇M, and the interpolant is continuous across the wall the \
+         straddle is about. If the value moves, the cause is not this"
+    );
+    for p in [0usize, 1, 2, 4, 5] {
+        assert!(
+            d_rel[p] <= 1e-9,
+            "param {p} moved by {:e} relative --- the other five columns must stay inside the \
+             ordinary reduction band: only the x-translation column can see this straddle, \
+             because the straddling sample IS the rotation centre and its rotation Jacobian \
+             is zero",
+            d_rel[p]
+        );
+    }
+    // The punchline, and the reason `gpu_value_and_derivative_match_the_cpu` now asserts
+    // the absence of a straddle instead of assuming it: this pose fails that pin's band by
+    // ~3.5 decades, on one sample out of 262144.
+    assert!(
+        d_rel[3] > 1e-9,
+        "the x-translation column moved by only {:e} relative --- one straddling sample is \
+         supposed to BLOW the 1e-9 band the ordinary pin bands at, and that is the whole \
+         reason that pin has to assert there is no straddle",
+        d_rel[3]
+    );
+    assert!(
+        (1e-6..1e-2).contains(&d_abs[3]),
+        "the x-translation column moved by {:e} absolute, outside the measured cost of one \
+         straddling sample ((2/N)·|m − f|·|Δ∂M/∂x| ≈ 3e-4). Bounded above because a wrong \
+         contraction is orders of magnitude larger; bounded BELOW because a collapse to \
+         rounding means the device's point map has become the host's, and then this pin must \
+         be rewritten rather than passed",
+        d_abs[3]
     );
 }
 
