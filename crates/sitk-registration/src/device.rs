@@ -82,8 +82,8 @@ pub enum DeviceMetricError {
 /// the host images instead.
 #[derive(Debug, Error)]
 pub enum DeviceRegistrationError {
-    /// Mean squares is the only metric with a device kernel.
-    #[error("the device path has a kernel only for the mean-squares metric")]
+    /// Mean squares and correlation are the metrics with a device kernel.
+    #[error("the device path has kernels only for the mean-squares and correlation metrics")]
     UnsupportedMetric,
 
     /// The device metric interpolates the moving image linearly.
@@ -524,13 +524,50 @@ impl DeviceCorrelationMetric {
     }
 }
 
-/// A [`DeviceMeanSquaresMetric`] wrapped for the optimizer driver, which cannot
-/// fail by signature ([`crate::optimizer::Objective`] returns values, not
-/// `Result`s).
+/// The metrics that have a device kernel — one variant per kernel, matched
+/// exhaustively everywhere, so adding a third is a compile error at every site that
+/// has to know about it rather than a silent fallthrough to one of the first two.
+pub(crate) enum DeviceMetric {
+    MeanSquares(DeviceMeanSquaresMetric),
+    Correlation(DeviceCorrelationMetric),
+}
+
+impl DeviceMetric {
+    fn evaluate(
+        &self,
+        transform: &dyn ParametricTransform,
+    ) -> Result<MetricValue, DeviceMetricError> {
+        match self {
+            Self::MeanSquares(m) => m.evaluate(transform),
+            Self::Correlation(m) => m.evaluate(transform),
+        }
+    }
+
+    fn value(&self, transform: &dyn ParametricTransform) -> Result<f64, DeviceMetricError> {
+        match self {
+            Self::MeanSquares(m) => m.value(transform),
+            Self::Correlation(m) => m.value(transform),
+        }
+    }
+
+    fn scales_estimator(
+        &self,
+        transform: &dyn ParametricTransform,
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        match self {
+            Self::MeanSquares(m) => m.scales_estimator(transform, kind),
+            Self::Correlation(m) => m.scales_estimator(transform, kind),
+        }
+    }
+}
+
+/// A [`DeviceMetric`] wrapped for the optimizer driver, which cannot fail by
+/// signature ([`crate::optimizer::Objective`] returns values, not `Result`s).
 ///
-/// The refusals that *matter* — a metric the device has no kernel for, a mask, a
-/// sampling strategy, a pyramid, a non-affine transform — are all decided at the
-/// pipeline boundary in
+/// The refusals that *matter* — a metric the device has no kernel for, a sampling
+/// strategy, a pyramid, a non-affine transform — are all decided at the pipeline
+/// boundary in
 /// [`ImageRegistrationMethod::execute_on_device`](crate::ImageRegistrationMethod::execute_on_device),
 /// before the first iteration runs. What is left is a *device* failure mid-run
 /// (the driver falling over, an allocation failing): rare, and impossible to
@@ -540,12 +577,12 @@ impl DeviceCorrelationMetric {
 /// run and returns the error**. The caller never receives a result computed after
 /// a device failure.
 pub(crate) struct DeviceActive {
-    metric: DeviceMeanSquaresMetric,
+    metric: DeviceMetric,
     failure: Mutex<Option<DeviceMetricError>>,
 }
 
 impl DeviceActive {
-    pub(crate) fn new(metric: DeviceMeanSquaresMetric) -> Self {
+    pub(crate) fn new(metric: DeviceMetric) -> Self {
         Self {
             metric,
             failure: Mutex::new(None),

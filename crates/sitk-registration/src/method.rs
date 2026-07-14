@@ -70,7 +70,10 @@ use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
 use crate::correlation::CorrelationMetric;
 use crate::demons::DemonsMetric;
 #[cfg(feature = "cuda")]
-use crate::device::{DeviceActive, DeviceMeanSquaresMetric, DeviceRegistrationError};
+use crate::device::{
+    DeviceActive, DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetric,
+    DeviceRegistrationError,
+};
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
@@ -2676,9 +2679,21 @@ impl ImageRegistrationMethod {
         moving: &sitk_cuda::DeviceImage,
         initial: T,
     ) -> std::result::Result<RegistrationResult<T>, DeviceRegistrationError> {
-        if !matches!(self.metric_kind, MetricKind::MeanSquares) {
-            return Err(DeviceRegistrationError::UnsupportedMetric);
+        // Which device kernel this run wants — decided once, here, and matched
+        // exhaustively so that a metric added to `MetricKind` is a compile error at this
+        // boundary rather than a silent `UnsupportedMetric`.
+        enum Kernel {
+            MeanSquares,
+            Correlation,
         }
+        let kernel = match self.metric_kind {
+            MetricKind::MeanSquares => Kernel::MeanSquares,
+            MetricKind::Correlation => Kernel::Correlation,
+            MetricKind::MattesMutualInformation { .. }
+            | MetricKind::AntsNeighborhoodCorrelation { .. }
+            | MetricKind::JointHistogramMutualInformation { .. }
+            | MetricKind::Demons { .. } => return Err(DeviceRegistrationError::UnsupportedMetric),
+        };
         if self.interpolator != Interpolator::Linear {
             return Err(DeviceRegistrationError::UnsupportedInterpolator(
                 self.interpolator,
@@ -2768,15 +2783,27 @@ impl ImageRegistrationMethod {
                 self.sampling_seed,
             );
 
-            let metric = ActiveMetric::Device(Box::new(DeviceActive::new(
-                DeviceMeanSquaresMetric::from_device_sampled(
-                    fixed_level,
-                    moving_level,
-                    level_mask.as_ref(),
-                    moving_mask.as_deref(),
-                    samples.as_deref(),
-                )?,
-            )));
+            let device_metric = match kernel {
+                Kernel::MeanSquares => {
+                    DeviceMetric::MeanSquares(DeviceMeanSquaresMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                    )?)
+                }
+                Kernel::Correlation => {
+                    DeviceMetric::Correlation(DeviceCorrelationMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                    )?)
+                }
+            };
+            let metric = ActiveMetric::Device(Box::new(DeviceActive::new(device_metric)));
 
             // The boundary probe: one evaluation at this level's starting transform,
             // composed exactly as the optimizer will compose it. This is what turns

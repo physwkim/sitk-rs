@@ -2248,3 +2248,160 @@ fn a_sampled_run_converges_where_the_host_converges() {
         );
     }
 }
+
+/// N3: a **correlation** run on the device lands where the host's correlation run
+/// lands — the same driver, the same scales estimator, the same convergence test, and
+/// now the NCC kernel underneath instead of the mean-squares one.
+///
+/// Scales come from the physical-shift estimator for the reason `execute_on_device`
+/// documents and §2.157 records: with unit scales the descent is chaotic on *both*
+/// paths, and a 1e-12 difference in the derivative flips a step-halving decision and
+/// sends the two runs to two different, both-valid minima. That is the conditioning of
+/// the parameter space, not a property of the device — pinning it away here would be
+/// pinning the wrong thing. What *is* pinned metric-side, exactly and without an
+/// optimizer in the loop, is `cuda_correlation.rs`: value 4.7e-14 absolute, derivative
+/// 6.7e-15 relative, valid points exact.
+#[test]
+fn a_correlation_run_on_the_device_lands_where_the_host_correlation_run_lands() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 64;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let c = n as f64 / 2.0;
+    let initial = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_correlation();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-6, 100, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+
+    let host = reg.execute(&fixed, &moving, initial()).unwrap();
+    let device = reg
+        .execute_on_device(
+            &DeviceImage::upload(&fixed).unwrap(),
+            &DeviceImage::upload(&moving).unwrap(),
+            initial(),
+        )
+        .unwrap();
+
+    println!(
+        "host   : {} iters, {} valid, metric {:.12}, params {:?}",
+        host.iterations,
+        host.valid_points,
+        host.metric_value,
+        host.transform.parameters()
+    );
+    println!(
+        "device : {} iters, {} valid, metric {:.12}, params {:?}",
+        device.iterations,
+        device.valid_points,
+        device.metric_value,
+        device.transform.parameters()
+    );
+
+    assert_eq!(device.iterations, host.iterations, "different walk lengths");
+    assert_eq!(device.valid_points, host.valid_points);
+    let worst = device
+        .transform
+        .parameters()
+        .iter()
+        .zip(host.transform.parameters().iter())
+        .map(|(&d, &h)| (d - h).abs() / (1.0 + h.abs()))
+        .fold(0.0f64, f64::max);
+    let dv = (device.metric_value - host.metric_value).abs();
+    println!("worst parameter disagreement: {worst:e}, |Δmetric| {dv:e}");
+    assert!(
+        worst <= 1e-9,
+        "a well-conditioned correlation run must land in the same place; worst {worst:e}"
+    );
+    assert!(dv <= 1e-12, "|Δmetric| {dv:e} at the endpoint");
+}
+
+/// N3: what the boundary says about the metric it now has a kernel for, and about the
+/// ones it does not.
+///
+/// Correlation is accepted; the four metrics with no kernel are refused by name before
+/// the first iteration; and a **local-support** transform under correlation is refused
+/// as `RequiresGlobalTransform` — the metric's own rule, which
+/// `CorrelationMetric::check_transform` enforces on the host — rather than as the
+/// generic `NonAffineTransform` the mean-squares path reports for the same transform.
+#[test]
+fn the_boundary_takes_correlation_and_still_names_what_it_refuses() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let n = 32;
+    let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
+    let d_f = DeviceImage::upload(&fixed).unwrap();
+    let d_m = DeviceImage::upload(&moving).unwrap();
+    let c = n as f64 / 2.0;
+    let euler = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
+
+    // Accepted: correlation has a kernel now, and the boundary must not decline it.
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_correlation();
+    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 5, 1e-8);
+    reg.set_optimizer_scales_from_physical_shift();
+    assert!(
+        !matches!(
+            reg.execute_on_device(&d_f, &d_m, euler()),
+            Err(DeviceRegistrationError::UnsupportedMetric)
+        ),
+        "correlation has a device kernel and must not be refused as unsupported"
+    );
+
+    // Still refused, each by name: the four metrics with no kernel.
+    type Configure = fn(&mut ImageRegistrationMethod);
+    let refusals: [(&str, Configure); 4] = [
+        ("mattes", |r| {
+            r.set_metric_as_mattes_mutual_information(32);
+        }),
+        ("ants neighborhood correlation", |r| {
+            r.set_metric_as_ants_neighborhood_correlation(2);
+        }),
+        ("joint histogram mutual information", |r| {
+            r.set_metric_as_joint_histogram_mutual_information(20, 1.5);
+        }),
+        ("demons", |r| {
+            r.set_metric_as_demons(0.001);
+        }),
+    ];
+    for (name, set) in refusals {
+        let mut reg = ImageRegistrationMethod::new();
+        set(&mut reg);
+        assert!(
+            matches!(
+                reg.execute_on_device(&d_f, &d_m, euler()),
+                Err(DeviceRegistrationError::UnsupportedMetric)
+            ),
+            "{name} has no device kernel and must be refused at the boundary"
+        );
+    }
+
+    // A local-support transform under correlation: the metric's rule, named as the
+    // metric's rule.
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_metric_as_correlation();
+    let df = sitk_transform::DisplacementFieldTransform::new(
+        3,
+        &[n, n, n],
+        &[0.0, 0.0, 0.0],
+        &[1.0, 1.0, 1.0],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    .unwrap();
+    assert!(df.has_local_support());
+    assert!(
+        matches!(
+            reg.execute_on_device(&d_f, &d_m, df),
+            Err(DeviceRegistrationError::Metric(
+                DeviceMetricError::RequiresGlobalTransform
+            ))
+        ),
+        "correlation refuses a local-support transform as a *metric* rule, on either backend"
+    );
+    println!("correlation accepted; four metrics and one local-support transform refused by name");
+}
