@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,408 tests** on the CPU, **3,509** with the CUDA
+> implemented and tested — **3,410 tests** on the CPU, **3,517** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -204,15 +204,24 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   form the full-grid path uses). Sameness is not a property two implementations
   agree on and a test hopes to catch — there is one implementation, so it is the
   same list, and the pin asserts exactly that, element for element.
-- **No device Mattes, and that is a refusal, not a gap.** Mattes needs a joint
-  histogram; the natural GPU form is `atomicAdd`, whose summation order is undefined
-  — not merely different from the host's, but *different on each run of the same
-  binary*. Fed to the optimizer branch described below, the same binary would send
-  **itself** to two different poses. A pin that cannot fail when the code is wrong
-  is not a pin. It becomes buildable behind a deterministic histogram (bin-keyed
-  radix sort, then a fixed-order segmented sum) — a reduction project, not a metric
-  project. **Correlation** is the next metric worth doing (its moments are the shape
-  we already reduce deterministically); **ANTS** is last.
+- **No device Mattes yet — it was a refusal, and the reason for it has now been
+  removed.** Mattes needs a joint histogram, and the natural GPU form is `atomicAdd`,
+  whose summation order is undefined — not merely different from the host's, but
+  *different on each run of the same binary*. That is measured on this box, not
+  quoted: **7 of 7 re-runs** of the atomic form over 2²¹ entries into 2,500 bins
+  returned different bits, the worst differing in **2,148 of 2,500 bins** at 1.15e-12
+  relative — exactly the magnitude that flips the optimizer's overshoot test, so the
+  same binary would send **itself** to two different poses. A pin that cannot fail
+  when the code is wrong is not a pin, so the metric was refused rather than shipped.
+  The reduction it was waiting for now exists (`sitk_cuda::histogram`): a **bin-keyed
+  counting sort** — a sub-tile entry's rank is *counted*, not claimed from an atomic
+  counter, which is the whole difference — then a **left-to-right segment sum**. That
+  order *is* the host's naive loop, so it is pinned **bit-identical** to
+  `for i in 0..n { h[k[i]] += v[i] }` rather than banded, and it is invariant to the
+  launch configuration (block sizes 32…1024, identical bits) and to the run (8 runs,
+  identical bits). Its counter-pin asserts that the atomic form *does* disagree with
+  itself, so the module can never quietly become pointless. **The metric is not built
+  on it yet, and the caveat stands until it is.** **ANTS** is last.
 - A **fixed-initial transform** works for the nine matrix-offset transform classes
   (`Affine`, `Euler3D`, the versor/similarity family, `Translation`) **and for a
   `Composite` of them**: the device resample replays the transform's own point-map
@@ -240,13 +249,20 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   are evaluated at the *same parameters*, which is where equality is a real property
   rather than the optimizer's luck; the converged run is pinned to the same iteration
   count, the same stop reason, and the same pose to 1e-3 (worst measured 2.4e-5).
+  The attribution is **measured, not argued**, and the point map is not part of it:
+  swept against iteration count, *without* the transform the reduction difference
+  stays at 1e-13 through 25 iterations and the counts **never** move, while *with* it
+  the parameter gap jumps 6.09e-10 → 1.89e-5 between iterations 5 and 10 — that is
+  one flipped overshoot test — and the counts diverge from there. The zero shell is
+  the enabler, the reduction order is the input, and the optimizer's branch is the
+  amplifier.
 - Device 0 only. Four GPUs are present; multi-GPU is untouched.
 - ITK itself has no CUDA path (its only GPU registration is an OpenCL Demons
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,408), with it **on** (3,509), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,509) — a machine with no GPU is a supported configuration, not a crash.
+(3,410), with it **on** (3,517), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,517) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -350,8 +366,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,408 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,509, needs CUDA 13
+cargo nextest run --workspace                        # 3,410 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,517, needs CUDA 13
 ```
 
 License: Apache-2.0.
