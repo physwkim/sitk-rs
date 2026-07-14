@@ -84,7 +84,7 @@ use sitk_core::compensated::compensated_sum;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{FixedSamples, MetricValue, MovingImage};
+use crate::metric::{FixedRangeScope, FixedSamples, MetricValue, MovingImage};
 use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Bins of padding at each histogram-axis end, reserved so the cubic B-spline
@@ -354,7 +354,7 @@ impl MattesMutualInformationMetric {
         let fixed_samples = FixedSamples::from_image(fixed)?;
         let moving_image = MovingImage::from_image(moving)?;
         let geom = MattesGeometry::new(
-            fixed_samples.value_range(),
+            fixed_samples.fixed_value_range(FixedRangeScope::SampledPoints),
             moving_image.value_range(),
             number_of_histogram_bins,
         )?;
@@ -385,7 +385,7 @@ impl MattesMutualInformationMetric {
             });
         }
         let geom = MattesGeometry::new(
-            fixed.value_range(),
+            fixed.fixed_value_range(FixedRangeScope::SampledPoints),
             moving.value_range(),
             number_of_histogram_bins,
         )?;
