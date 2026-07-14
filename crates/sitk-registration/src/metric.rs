@@ -255,6 +255,27 @@ fn gather_values<T: IntoSampleValues>(
     }))
 }
 
+/// The `(min, max)` of every voxel a mask admits — the [`FixedRangeScope::WholeFixedImage`]
+/// scan. `None` when the mask admits no voxel.
+///
+/// Streaming, not gathering: the unmasked case hands the native buffer straight to
+/// `parallel::min_max`, and the masked case folds without materializing the admitted subset.
+fn masked_min_max<T: Scalar>(img: &Image, mask: Option<&[f64]>) -> Result<Option<(f64, f64)>> {
+    let src = img.scalar_slice::<T>()?;
+    Ok(match mask {
+        None => parallel::min_max(src),
+        Some(m) => src
+            .iter()
+            .zip(m)
+            .filter(|&(_, &mv)| mv != 0.0)
+            .map(|(&v, _)| v.as_f64())
+            .fold(None, |acc, v| match acc {
+                None => Some((v, v)),
+                Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+            }),
+    })
+}
+
 /// Where a sample's physical point comes from.
 ///
 /// The unsampled, unmasked default — the SimpleITK default, and what a
@@ -313,6 +334,36 @@ fn explicit_points(grid: &VirtualGrid, flats: &[usize], dim: usize) -> Vec<f64> 
 
 /// The fixed image reduced to its sample set (the registration *virtual
 /// domain*): every pixel's value and its physical point, precomputed once.
+/// **Which voxel set a metric's fixed-axis intensity range is scoped to.** ITK's two
+/// joint-histogram metrics disagree, and the disagreement is deliberate on their side:
+///
+/// * `MattesMutualInformationImageToImageMetricv4::Initialize` branches on
+///   `m_UseSampledPointSet` and, when sampling is on, takes the fixed min/max **from the
+///   sampled points alone** — its own comment says so:
+///   *"If m_UseSampledPointSet is true, then \*ONLY\* the sparse sampled points are used for
+///   analysis of the metric, and the fixed space intensity range values will be fixed to
+///   those values identified in the sparse sampled points"*
+///   (`itkMattesMutualInformationImageToImageMetricv4.hxx:102-155`).
+/// * `JointHistogramMutualInformationImageToImageMetricv4::Initialize` has **no such
+///   branch**: it walks the fixed image's whole requested region with an
+///   `ImageRegionConstIteratorWithIndex`, gated only by the fixed *mask*, and the sampled
+///   point set never touches that scan
+///   (`itkJointHistogramMutualInformationImageToImageMetricv4.hxx:86-111`).
+///
+/// So with `Regular`/`Random` sampling the two metrics size their fixed axis from
+/// different voxels, and a range owner shared between them cannot have a default: whichever
+/// one it picks, the other metric silently inherits the wrong scope, which is exactly what
+/// this port did (ledger §2.177). Naming the scope is therefore a *parameter of the ask*,
+/// not a setting — a caller cannot forget what it never had a default for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FixedRangeScope {
+    /// The drawn (and fixed-mask-admitted) samples only — `MattesMutualInformation`.
+    SampledPoints,
+    /// Every fixed-image voxel the fixed mask admits, whatever the sampling strategy —
+    /// `JointHistogramMutualInformation`.
+    WholeFixedImage,
+}
+
 pub struct FixedSamples {
     pub(crate) dim: usize,
     /// Identity for a device-resident copy of these buffers — see [`next_id`].
@@ -325,6 +376,12 @@ pub struct FixedSamples {
     /// the full-grid default, materialized only for a sampled or masked subset.
     /// Read through [`point`](Self::point), never directly.
     pub(crate) points: SamplePoints,
+    /// The fixed image's `(min, max)` over **every mask-admitted voxel**, whatever the
+    /// sampling strategy — [`FixedRangeScope::WholeFixedImage`]. Computed once at
+    /// construction because the samples cannot reconstruct it: a `Regular`/`Random` draw
+    /// that misses the extremes has a strictly narrower range, and that is the whole point
+    /// of the distinction.
+    whole_image_range: (f64, f64),
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
     /// The virtual domain as a grid. The metric never reads it — only the
@@ -497,6 +554,13 @@ impl FixedSamples {
             },
         };
 
+        // The other scope, and it is not derivable from `values`: the whole fixed image,
+        // gated by the fixed mask and by nothing else. Streamed rather than gathered — a
+        // 256³ index list would cost more than the scan it feeds.
+        let whole_image_range: (f64, f64) =
+            dispatch_scalar!(fixed.pixel_id(), masked_min_max, fixed, mask_buf.as_deref())?
+                .unwrap_or((0.0, 0.0));
+
         let min_spacing = fixed
             .spacing()
             .iter()
@@ -509,6 +573,7 @@ impl FixedSamples {
             id: next_id(),
             values,
             points,
+            whole_image_range,
             min_spacing,
             grid,
         })
@@ -556,12 +621,20 @@ impl FixedSamples {
         self.values.get(s)
     }
 
-    /// The `(min, max)` of the sampled fixed-image values. `(0, 0)` when empty.
-    /// This is the fixed-image intensity range over the analysis region (full
-    /// sampling ⇒ the whole image), which the Mattes MI metric uses to size the
-    /// joint-histogram fixed axis.
-    pub(crate) fn value_range(&self) -> (f64, f64) {
-        self.values.min_max().unwrap_or((0.0, 0.0))
+    /// The fixed-image intensity range that sizes a joint histogram's **fixed
+    /// axis** — over the voxel set the caller's upstream class scopes it to.
+    ///
+    /// `scope` is not a convenience: ITK's two joint-histogram metrics scope this
+    /// range to *different* voxel sets, and taking the wrong one changes every bin
+    /// index (see [`FixedRangeScope`]). It has no default, because a default is how
+    /// the second metric inherited the first one's scope.
+    ///
+    /// `(0, 0)` when the scope admits no voxel.
+    pub(crate) fn fixed_value_range(&self, scope: FixedRangeScope) -> (f64, f64) {
+        match scope {
+            FixedRangeScope::SampledPoints => self.values.min_max().unwrap_or((0.0, 0.0)),
+            FixedRangeScope::WholeFixedImage => self.whole_image_range,
+        }
     }
 
     /// Build a scale/learning-rate estimator of `kind` for `transform` over

@@ -173,7 +173,7 @@ use sitk_core::compensated::neumaier_sum;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
-use crate::metric::{FixedSamples, MetricValue, MovingImage};
+use crate::metric::{FixedRangeScope, FixedSamples, MetricValue, MovingImage};
 use crate::scales::{ScalesEstimator, ScalesEstimatorKind};
 
 /// Bins of padding at each histogram-axis end. ITK's `m_Padding(2)` ctor
@@ -479,7 +479,7 @@ impl JointHistogramMutualInformationMetric {
             });
         }
 
-        let (fixed_min, fixed_max) = fixed.value_range();
+        let (fixed_min, fixed_max) = fixed.fixed_value_range(FixedRangeScope::WholeFixedImage);
         let (moving_min, moving_max) = moving.value_range();
         if fixed_max - fixed_min <= f64::EPSILON {
             return Err(RegistrationError::ConstantIntensity { which: "fixed" });
@@ -833,6 +833,7 @@ impl JointHistogramMutualInformationMetric {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metric::SamplingStrategy;
     use sitk_transform::{TransformBase, TranslationTransform};
 
     /// A joint PDF built to defeat naive summation: one bin holds nearly all the mass and
@@ -1425,6 +1426,98 @@ mod tests {
             result.parameters[1].abs() < 0.05,
             "recovered dy {} (expected ~0.0)",
             result.parameters[1]
+        );
+    }
+
+    /// **The fixed axis is scoped to the whole fixed image, not to the samples** — and the
+    /// two are different metrics' rules, not two spellings of one.
+    ///
+    /// `JointHistogramMutualInformationImageToImageMetricv4::Initialize` walks the fixed
+    /// image's whole requested region (`itkJointHistogram…MetricV4.hxx:86-111`) with no
+    /// sampled-point branch at all, while Mattes explicitly takes its range from the sampled
+    /// points alone (`itkMattes…MetricV4.hxx:102-155`). This port shared one range owner
+    /// between them and JHMI silently inherited Mattes' scope (ledger §2.177).
+    ///
+    /// The fixture puts a spike at flat index 1, which `Regular` sampling at 25 % (stride 4:
+    /// 0, 4, 8, …) **never draws**. So the spike is invisible to the samples and visible to
+    /// the whole-image scan — and the two anti-vacuity assertions below establish exactly
+    /// that before the pin is allowed to mean anything:
+    ///
+    /// * the *sampled* range is unchanged by the spike (it really is unsampled), and
+    /// * the *whole-image* range is changed by it (the two scopes really do differ here).
+    ///
+    /// Then: the spike must move the **JHMI** value (it re-scales the fixed axis) and must
+    /// **not** move the Mattes value (whose axis is sample-scoped). Take the sampled range
+    /// in JHMI and the first of those two fails.
+    #[test]
+    fn the_jhmi_fixed_axis_is_scoped_to_the_whole_image_even_under_sampling() {
+        const W: usize = 8;
+        const SPIKE_AT: usize = 1; // stride 4 draws 0, 4, 8, … — never 1.
+
+        let plain: Vec<f64> = (0..W * W).map(|k| 50.0 + (k % 7) as f64).collect();
+        let mut spiked = plain.clone();
+        spiked[SPIKE_AT] = 1000.0;
+
+        let moving_img = gaussian(W, W, 4.0, 4.0, 2.0, 100.0);
+        let plain_img = Image::from_vec(&[W, W], plain).unwrap();
+        let spiked_img = Image::from_vec(&[W, W], spiked).unwrap();
+
+        let samples = |img: &Image| {
+            FixedSamples::from_image_with(img, SamplingStrategy::Regular, 0.25, 0, None).unwrap()
+        };
+        let plain_s = samples(&plain_img);
+        let spiked_s = samples(&spiked_img);
+
+        // Anti-vacuity 1: the spike is genuinely not sampled.
+        assert_eq!(
+            plain_s.fixed_value_range(FixedRangeScope::SampledPoints),
+            spiked_s.fixed_value_range(FixedRangeScope::SampledPoints),
+            "the spike must be invisible to the draw, or this fixture tests nothing"
+        );
+        // Anti-vacuity 2: the two scopes disagree on this fixture.
+        assert_ne!(
+            spiked_s.fixed_value_range(FixedRangeScope::SampledPoints),
+            spiked_s.fixed_value_range(FixedRangeScope::WholeFixedImage),
+            "the sampled and whole-image ranges must differ, or the pin below is vacuous"
+        );
+
+        let transform = TranslationTransform::new(vec![0.0, 0.0]);
+        let jhmi = |fs: FixedSamples| {
+            JointHistogramMutualInformationMetric::from_samples(
+                fs,
+                MovingImage::from_image(&moving_img).unwrap(),
+                20,
+                JointHistogramMutualInformationMetric::DEFAULT_VARIANCE_FOR_JOINT_PDF_SMOOTHING,
+            )
+            .unwrap()
+            .value(&transform)
+        };
+        let mattes = |fs: FixedSamples| {
+            crate::mattes::MattesMutualInformationMetric::from_samples(
+                fs,
+                MovingImage::from_image(&moving_img).unwrap(),
+                20,
+            )
+            .unwrap()
+            .value(&transform)
+        };
+
+        // The pin: an unsampled voxel re-scales JHMI's fixed axis...
+        let (j_plain, j_spiked) = (jhmi(samples(&plain_img)), jhmi(samples(&spiked_img)));
+        assert_ne!(
+            j_plain.to_bits(),
+            j_spiked.to_bits(),
+            "JHMI's fixed axis spans the whole fixed image: an unsampled spike must move it \
+             ({j_plain} vs {j_spiked})"
+        );
+
+        // ...and does not touch Mattes', whose axis is the sampled points'.
+        let (m_plain, m_spiked) = (mattes(samples(&plain_img)), mattes(samples(&spiked_img)));
+        assert_eq!(
+            m_plain.to_bits(),
+            m_spiked.to_bits(),
+            "Mattes' fixed axis is sample-scoped: an unsampled spike must not move it \
+             ({m_plain} vs {m_spiked})"
         );
     }
 
