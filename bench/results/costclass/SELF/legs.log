@@ -1,0 +1,11 @@
+03:17:59 r1 flat1024b wall=   8.9s busy_max= 86.3 clean
+03:18:08 r1 flat1024 wall=   8.9s busy_max= 92.0 clean
+  round r1 KEPT — 4/4 legs clean
+03:18:42 r2 flat1024 wall=   8.9s busy_max= 83.8 foreign=['cargo', 'cargo-fmt', 'cargo-nextest', 'rustc']
+  round r2 VOIDED (whole round discarded): ['cargo', 'cargo-fmt', 'cargo-nextest', 'rustc']
+03:19:12 r3 flat1024b wall=   8.9s busy_max= 85.9 clean
+03:19:20 r3 flat1024 wall=   8.5s busy_max= 82.0 clean
+  round r3 KEPT — 4/4 legs clean
+03:19:44 r4 flat1024 wall=   9.2s busy_max= 87.1 clean
+03:19:54 r4 flat1024b wall=   9.1s busy_max= 93.9 clean
+  round r4 KEPT — 4/4 legs clean

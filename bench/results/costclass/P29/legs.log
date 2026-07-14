@@ -1,0 +1,9 @@
+03:08:35 r1 split wall=  20.2s busy_max= 93.0 foreign=['cargo', 'cargo-fmt', 'rustc']
+  round r1 VOIDED (whole round discarded): ['cargo', 'cargo-fmt', 'rustc']
+03:09:22 r2 flat1024 wall=  22.2s busy_max= 93.9 clean
+03:09:44 r2 split wall=  21.6s busy_max= 93.8 foreign=['cargo-fmt']
+  round r2 VOIDED (whole round discarded): ['cargo-fmt']
+03:10:38 r3 flat1024 wall=  23.6s busy_max= 87.5 clean
+03:10:59 r3 split1024 wall=  21.4s busy_max= 93.9 clean
+03:11:21 r3 split wall=  21.4s busy_max= 92.0 clean
+  round r3 KEPT — 4/4 legs clean
