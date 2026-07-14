@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,348 tests** on the CPU, **3,412** with the CUDA
+> implemented and tested — **3,348 tests** on the CPU, **3,422** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -162,16 +162,34 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   source (`__dmul_rn`/`__dadd_rn`/`__dsub_rn` in the host's exact order, 3.2e-14
   after), and the per-iteration cost rose from 6.9 ms to 8.4 ms. The old 107–119×
   was the number for a derivative that was wrong.
-- A `Float64` registration still differs between host and device: the host keeps
-  `f64` levels and a `DeviceImage` holds `f32`. That is inherent to the device type,
-  not a defect, and `execute_on_device`'s doc comment says so.
-- The device metric is mean-squares, full grid, linear interpolation, **with fixed
-  and moving masks** and with a virtual domain. The device level mask is built in
-  the host's own order (NN-resample the in-buffer predicate, NN-resample the user
-  mask, intersect) and is **byte-equal** to the host's, so the two paths walk
-  exactly the same valid points — fixed mask 59,647 on both, moving mask 59,617 on
-  both, virtual domain 31,124 on both, both together 12,489 on both, 25 iterations
-  either way. No device Mattes/correlation/ANTS, no sampling strategies.
+- A `Float64` registration narrows to the device's `f32` payload — and that is a
+  **measured** limit, not an asserted one. Narrowing costs **6.3e-10 of the pose**:
+  four orders of magnitude below the band the optimizer itself imposes (below), and
+  the device contributes none of it — the device's cast is bitwise the host's
+  `as f32`. An `f64` payload would close nothing a caller can observe, so it is not
+  built.
+- The device metric is mean-squares, linear interpolation, **with fixed and moving
+  masks, a virtual domain, and random/regular sampling**. The device level mask is
+  built in the host's own order (NN-resample the in-buffer predicate, NN-resample
+  the user mask, intersect) and is **byte-equal** to the host's, so the two paths
+  walk exactly the same valid points — fixed mask 59,647 on both, moving mask
+  59,617 on both, virtual domain 31,124 on both, both together 12,489 on both, 25
+  iterations either way.
+- **On a sampled run the device does not draw.** `FixedSamples::from_image_with`
+  stays the single owner of *which voxels*, and the device is handed its flat-index
+  list (8 bytes per sample, and the kernel derives the point from the same closed
+  form the full-grid path uses). Sameness is not a property two implementations
+  agree on and a test hopes to catch — there is one implementation, so it is the
+  same list, and the pin asserts exactly that, element for element.
+- **No device Mattes, and that is a refusal, not a gap.** Mattes needs a joint
+  histogram; the natural GPU form is `atomicAdd`, whose summation order is undefined
+  — not merely different from the host's, but *different on each run of the same
+  binary*. Fed to the optimizer branch described below, the same binary would send
+  **itself** to two different poses. A pin that cannot fail when the code is wrong
+  is not a pin. It becomes buildable behind a deterministic histogram (bin-keyed
+  radix sort, then a fixed-order segmented sum) — a reduction project, not a metric
+  project. **Correlation** is the next metric worth doing (its moments are the shape
+  we already reduce deterministically); **ANTS** is last.
 - A **fixed-initial transform** works for the nine matrix-offset transform classes
   (`Affine`, `Euler3D`, the versor/similarity family, `Translation`): the device
   resample carries a point map and is bit-identical to `ResampleImageFilter` through
@@ -197,8 +215,8 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,348), with it **on** (3,412), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,412) — a machine with no GPU is a supported configuration, not a crash.
+(3,348), with it **on** (3,422), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,422) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -288,9 +306,11 @@ each one you can trust.
    un-parallelized stencils next to the ones just fixed — `derivative`, `laplacian`,
    `sobel_edge_detection` still run a serial `iter().map().collect()`. They are not
    in the benchmarked twelve, so no number is claimed for them.
-3. **Device coverage.** Mattes/correlation/ANTS metrics — mean-squares is the only
-   device metric. Then sampling strategies, then multi-GPU (four GPUs are present;
-   device 0 is the only one used).
+3. **Device coverage.** A **Correlation** metric — its moments are the same shape
+   the mean-squares kernel already reduces deterministically, so it inherits the
+   exactness story unchanged. Mattes needs a deterministic histogram built first
+   (above); ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs are
+   present and device 0 is the only one used.
 4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
@@ -301,7 +321,7 @@ each one you can trust.
 ```sh
 cargo build --workspace
 cargo nextest run --workspace                        # 3,348 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,412, needs CUDA 13
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,422, needs CUDA 13
 ```
 
 License: Apache-2.0.
