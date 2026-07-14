@@ -97,6 +97,7 @@ pub mod label_to_rgb;
 pub mod level_set;
 mod linalg;
 pub mod logic;
+mod mask_input;
 pub mod math;
 pub mod min_max_curvature_flow;
 pub mod morphology;
