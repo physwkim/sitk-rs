@@ -147,8 +147,46 @@ const fn reduce_grain(len: usize) -> usize {
     grain(len, REDUCE_CHUNK)
 }
 
-/// A line pass parallelizes over blocks only if it can raise at least this many
-/// of them; otherwise it splits the block's lines column-wise instead.
+/// [`grain`] for the **line pass** ([`for_each_line_mut`]), expressed in whole
+/// blocks — the atom that path decomposes by.
+///
+/// A line lies *inside* one block, so a task takes a run of whole blocks and can
+/// never split one. This converts the same per-task element target every other
+/// pass here uses into that run length. Two consequences, both pinned as
+/// integers below:
+///
+/// - **It is a no-op at and above `medium`.** `grain(len, GRAIN) == GRAIN` for
+///   any `len >= TARGET_TASKS * GRAIN` (1 048 576 elements), so the runs it emits
+///   are the same integers the former fixed `GRAIN` emitted. Both bench volumes
+///   at or above `medium` are far past that bound —
+///   `the_line_grain_emits_the_same_block_runs_as_the_fixed_grain_at_and_above_medium`.
+/// - **It cannot lift the block-count cap.** When `block >= grain` the run length
+///   is 1 whatever the grain, and the task count is exactly `outer`. At 64³ along
+///   axis 1 that is 64 tasks on a box with 96 workers, and *no* grain rule closes
+///   it — only a decomposition that splits a block. See
+///   `the_line_pass_task_count_is_capped_by_the_block_count_not_by_the_grain`.
+const fn line_blocks_per_task(len: usize, block: usize) -> usize {
+    let g = grain(len, GRAIN);
+    // `usize::max` is not `const`; this is the same expression.
+    let runs = g.div_ceil(block);
+    if runs < 1 { 1 } else { runs }
+}
+
+/// The line pass takes the whole-block path only if it can raise at least this
+/// many tasks; otherwise it splits a block's lines column-wise instead.
+///
+/// **This is a path selector, not a floor on the task count**, and the difference
+/// is load-bearing: raising it does not create one task. It only diverts more
+/// shapes to the column path — and for an `inner == 1` shape (the axis-0 pass,
+/// whose lines *are* the blocks) there is no column path to divert to, so the
+/// pass falls into the **serial** branch instead. Raising this to the width of
+/// this box's pool (96) would therefore send the entire 64³ axis-0 line pass down
+/// one thread, which is the opposite of the intent.
+/// `min_block_tasks_never_sends_a_bench_volume_line_pass_serial` fails if a future
+/// edit tries it.
+///
+/// The pool is fed by [`line_blocks_per_task`], which is where the task count
+/// actually comes from.
 const MIN_BLOCK_TASKS: usize = 32;
 
 /// Upper bound on the column-chunk tasks per block on the column-split path,
@@ -757,7 +795,7 @@ where
     let block = n * inner;
     let outer = buf.len() / block;
 
-    let blocks_per_task = GRAIN.div_ceil(block).max(1);
+    let blocks_per_task = line_blocks_per_task(buf.len(), block);
     let block_tasks = outer.div_ceil(blocks_per_task);
 
     if buf.len() < SERIAL_THRESHOLD || (block_tasks < MIN_BLOCK_TASKS && inner == 1) {
@@ -999,6 +1037,141 @@ mod tests {
         assert_eq!(SMALL.div_ceil(reduce_grain(SMALL)), 128); // was 4, at a 65536 grain
         assert_eq!(map_grain(SMALL), 2048);
         assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128); // was 64, at a 4096 grain
+    }
+
+    /// The three bench volumes, cubic, as `for_each_line_mut` sees them.
+    fn cube(n: usize) -> Vec<usize> {
+        vec![n, n, n]
+    }
+
+    /// The line pass's block geometry for one `(size, axis)`: `(block, outer)`.
+    /// `index = o * block + k * inner + i`, exactly as `for_each_line_mut` derives
+    /// it — a line lies inside one block, and a block holds `inner` of them.
+    fn block_geometry(size: &[usize], axis: usize) -> (usize, usize) {
+        let len: usize = size.iter().product();
+        let inner: usize = size[..axis].iter().product();
+        let block = size[axis] * inner;
+        (block, len / block)
+    }
+
+    /// The **former** rule: a fixed `GRAIN` per task, whatever the input length.
+    /// Frozen here as the baseline the new rule must reproduce above `medium`.
+    fn fixed_grain_blocks_per_task(block: usize) -> usize {
+        GRAIN.div_ceil(block).max(1)
+    }
+
+    /// **The line-pass rule is a no-op at and above `medium`** — the same integer
+    /// proof that made the elementwise seam mergeable, applied to the pass that
+    /// decomposes by whole blocks. `par_chunks_mut(block * blocks_per_task)` is
+    /// what cuts the buffer, so its emitted chunk starts are the decomposition;
+    /// they are compared **as integers**, on every axis, against the fixed-grain
+    /// rule they replace.
+    #[test]
+    fn the_line_grain_emits_the_same_block_runs_as_the_fixed_grain_at_and_above_medium() {
+        for n in [256usize, 512] {
+            let size = cube(n);
+            let len: usize = size.iter().product();
+            for axis in 0..3 {
+                let (block, _) = block_geometry(&size, axis);
+                let new = line_blocks_per_task(len, block);
+                let old = fixed_grain_blocks_per_task(block);
+                assert_eq!(new, old, "{n}³ axis {axis}: the block run moved");
+                assert_eq!(
+                    boundaries(len, block * new),
+                    boundaries(len, block * old),
+                    "{n}³ axis {axis}: the emitted chunk starts moved"
+                );
+            }
+        }
+
+        // Non-vacuity. If the two rules agreed *everywhere*, the assertions above
+        // would be comparing a rule with itself and would prove nothing about the
+        // no-op. They must diverge at 64³ along axis 0 — the one shape this change
+        // exists to move — or this test is asserting a tautology.
+        let size = cube(64);
+        let (block, _) = block_geometry(&size, 0);
+        assert_ne!(
+            line_blocks_per_task(SMALL, block),
+            fixed_grain_blocks_per_task(block),
+            "the new rule matches the old one even at 64³ axis 0 — nothing changed, \
+             so the no-op proved above is vacuous"
+        );
+        assert_ne!(
+            boundaries(SMALL, block * line_blocks_per_task(SMALL, block)),
+            boundaries(SMALL, block * fixed_grain_blocks_per_task(block)),
+        );
+    }
+
+    /// What the new grain is worth on the line pass, stated as the task counts it
+    /// raises — and what it **cannot** reach.
+    ///
+    /// Axis 0 is the shape the grain governs: its blocks are smaller than the
+    /// grain, so a task takes a run of them, and cutting the run from the length
+    /// doubles the tasks (64 → 128).
+    #[test]
+    fn the_line_pass_raises_more_tasks_at_the_small_volume() {
+        let size = cube(64);
+        let (block, outer) = block_geometry(&size, 0);
+        let was = outer.div_ceil(fixed_grain_blocks_per_task(block));
+        let now = outer.div_ceil(line_blocks_per_task(SMALL, block));
+        assert_eq!(was, 64);
+        assert_eq!(now, 128);
+    }
+
+    /// **The residual this rule does not close, pinned so it is not forgotten.**
+    ///
+    /// A line lies inside one block, so a task takes *whole blocks* — which caps
+    /// the block path at `outer` tasks no matter how fine the grain gets. At 64³
+    /// along axis 1 a block is 4096 elements, already larger than any grain the
+    /// rule can emit, so the run length is 1 and the pass raises exactly `outer` =
+    /// 64 tasks — fewer than this box's 96 workers, before and after this change.
+    ///
+    /// Closing it needs a decomposition that splits a block by column, not a
+    /// constant. This asserts the cap exists rather than papering over it.
+    #[test]
+    fn the_line_pass_task_count_is_capped_by_the_block_count_not_by_the_grain() {
+        let size = cube(64);
+        let (block, outer) = block_geometry(&size, 1);
+        assert_eq!((block, outer), (4096, 64));
+
+        // Every grain the rule can emit, and the finest it could ever emit: the
+        // run length stays 1, so the task count stays `outer`.
+        for g in [MIN_GRAIN, GRAIN, 1usize] {
+            assert_eq!(g.div_ceil(block).max(1), 1, "grain {g} split a block");
+        }
+        assert_eq!(outer.div_ceil(line_blocks_per_task(SMALL, block)), 64);
+        assert!(
+            outer < 96,
+            "the cap this test pins is gone — a 64³ axis-1 line pass now raises \
+             {outer} tasks; re-derive the residual"
+        );
+    }
+
+    /// `MIN_BLOCK_TASKS` selects a *path*; it is not a floor on the task count,
+    /// and raising it to the pool's width does not feed the pool — it starves it.
+    ///
+    /// For an `inner == 1` shape (the axis-0 pass) there is no column path to fall
+    /// back to, so `block_tasks < MIN_BLOCK_TASKS` means **serial**. The 64³ axis-0
+    /// pass raises 128 tasks; a `MIN_BLOCK_TASKS` above that sends all 128 down one
+    /// thread. This test is what fails if someone "raises the floor to match the 96
+    /// workers", which is the natural-looking move and is a 96× regression.
+    #[test]
+    fn min_block_tasks_never_sends_a_bench_volume_line_pass_serial() {
+        for n in [64usize, 256, 512] {
+            let size = cube(n);
+            let len: usize = size.iter().product();
+            let (block, outer) = block_geometry(&size, 0);
+            let inner: usize = size[..0].iter().product();
+            assert_eq!(inner, 1, "axis 0's lines are its blocks");
+            let block_tasks = outer.div_ceil(line_blocks_per_task(len, block));
+            assert!(
+                block_tasks >= MIN_BLOCK_TASKS,
+                "{n}³ axis 0 raises {block_tasks} tasks but MIN_BLOCK_TASKS is \
+                 {MIN_BLOCK_TASKS}: this shape has no column path, so it would run \
+                 SERIAL. MIN_BLOCK_TASKS is a path selector, not a task floor — feed \
+                 the pool through `line_blocks_per_task` instead."
+            );
+        }
     }
 
     /// **The rule is a no-op at and above `TARGET_TASKS * ceiling` elements** — not
