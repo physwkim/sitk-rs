@@ -21,9 +21,12 @@
 //!   re-associate, because no entry point accepts one. Adding a new reduction
 //!   means adding a function *here*, next to this comment, with a proof that its
 //!   operator is exactly associative.
-//! - Chunk boundaries are private constants applied to the input length. No
-//!   entry point takes a chunk count, a grain size, or a thread count, so no
-//!   decomposition in the port can depend on `rayon::current_num_threads()`.
+//! - Chunk boundaries come from one private function, [`grain`], whose signature
+//!   is `usize` in and `usize` out: it *cannot* observe the thread count, because
+//!   there is no argument through which it could. No entry point takes a chunk
+//!   count, a grain size, or a thread count either, so no decomposition in the
+//!   port can depend on `rayon::current_num_threads()` — by construction, not by
+//!   convention.
 //!
 //! ## Why each shape is bit-stable
 //!
@@ -55,18 +58,94 @@ use rayon::prelude::*;
 
 use crate::pixel::Scalar;
 
-/// Target elements per worker task. Only a scheduling knob: every primitive
-/// here is exact, so changing it cannot change a result.
+/// The coarsest grain a map pass is cut to — its per-task element count once the
+/// input is big enough that [`grain`] stops subdividing. Also the target
+/// per-task element count of the line pass ([`for_each_line_mut`], which decomposes
+/// by whole blocks and has its own task-count guard). Only a scheduling knob:
+/// every primitive here is exact, so changing it cannot change a result.
 const GRAIN: usize = 4096;
 
 /// Below this many elements, run serially — thread hand-off costs more than the
 /// work. Bit-identical to the parallel path by the exactness argument above.
 const SERIAL_THRESHOLD: usize = 1 << 14;
 
-/// Elements per reduction chunk. Fixed, so the chunk count is
-/// `input.len().div_ceil(REDUCE_CHUNK)` — a pure function of the input length,
-/// never of the thread count.
+/// The coarsest grain a reduction is cut to. See [`grain`] for the finer grains
+/// a short input gets, and why the chunk count stays a function of the length.
 const REDUCE_CHUNK: usize = 1 << 16;
+
+/// The widest pool [`grain`] will try to raise enough tasks for.
+///
+/// An **upper bound on** the worker count of any box this runs on — never a
+/// *reading* of the running pool. That distinction is the determinism contract:
+/// a grain that depended on the thread count would make the chunk decomposition,
+/// and so every fold over it, a function of the schedule. This is a constant in
+/// the source, so it is not.
+///
+/// A box wider than this is fed by whatever tasks the input length can raise
+/// (bounded by `len / MIN_GRAIN`, below) — no rule keyed on `len` alone can do
+/// better, because a short input simply does not contain more parallelism.
+const TARGET_TASKS: usize = 256;
+
+/// The finest grain any pass is cut to — the floor on per-task work.
+///
+/// Derived, not tuned. The smallest volume in `doc/bench-spec.md` is 64³ =
+/// 262 144 elements; feeding a 96-worker pool from it needs a grain of at most
+/// 262144/96 = 2730, and 2048 is the largest power of two under that. It raises
+/// 128 tasks. A 4096 floor would raise 64 — fewer tasks than this box has
+/// workers, which is the defect this floor exists to close.
+///
+/// Measured against the floor's other side, on `otsu_threshold` at 64³ (whose
+/// `bin_counts` is the heaviest per-element reduction here, a binary search per
+/// value): 65 536 → 14.06 ms, 16 384 → 4.22, 8192 → 1.58, 4096 → 1.52, **2048 →
+/// 1.57**, 1024 → 1.38. The basin from 8192 down is flat, so 2048 is not a
+/// knife-edge; it is the derived value sitting inside the measured flat.
+const MIN_GRAIN: usize = 2048;
+
+/// Elements per chunk for a pass over `len` elements, at most `ceiling`.
+///
+/// **A pure function of `len`.** It reads nothing else: no thread count, no pool
+/// handle, no ambient state — the signature is `usize` in, `usize` out, and that
+/// is the whole determinism argument. `par_chunks(grain(len, c))` therefore cuts
+/// at the same multiples of the same integer on every box, at every thread count,
+/// under every steal order. The in-order fold over those chunks is then a fold
+/// over a fixed decomposition, which is what makes it bit-stable — see the module
+/// docs.
+///
+/// Between the two clamps it targets [`TARGET_TASKS`] chunks, so a short input is
+/// cut finely enough to fill a wide pool instead of handing it four chunks. Both
+/// ends are load-bearing:
+///
+/// - Without the [`MIN_GRAIN`] floor a tiny input would raise thousands of
+///   near-empty tasks and pay more in scheduling than it saves.
+/// - Without the `ceiling` a large input would too. `otsu_threshold` at 256³
+///   measures 38.0 ms at a 65 536 grain and 47.0 ms at 2048 — a 24% regression —
+///   because a reduction's sequential combine is `O(chunks)`. The ceiling is why
+///   this rule is a **no-op at and above `TARGET_TASKS * ceiling` elements**: for
+///   any such `len`, `len.div_ceil(TARGET_TASKS) >= ceiling`, the clamp pins the
+///   grain at `ceiling`, and the emitted chunk boundaries are the same integers
+///   they were before this rule existed.
+const fn grain(len: usize, ceiling: usize) -> usize {
+    // `clamp` is not `const`; this is the same expression.
+    let g = len.div_ceil(TARGET_TASKS);
+    if g < MIN_GRAIN {
+        MIN_GRAIN
+    } else if g > ceiling {
+        ceiling
+    } else {
+        g
+    }
+}
+
+/// [`grain`] for the elementwise maps — [`map_indexed`], [`map_slice`],
+/// [`for_each_mut`] and the `_into`/`_init` forms behind them.
+const fn map_grain(len: usize) -> usize {
+    grain(len, GRAIN)
+}
+
+/// [`grain`] for the chunked reductions — [`min_max`] and [`bin_counts`].
+const fn reduce_grain(len: usize) -> usize {
+    grain(len, REDUCE_CHUNK)
+}
 
 /// A line pass parallelizes over blocks only if it can raise at least this many
 /// of them; otherwise it splits the block's lines column-wise instead.
@@ -253,8 +332,8 @@ where
 ///
 /// # Why the leaf is capped at one chunk
 ///
-/// [`with_max_len(1)`] forces the job tree to split down to a single `GRAIN`
-/// chunk per task. Without it rayon splits *adaptively* — a job divides only
+/// [`with_max_len(1)`] forces the job tree to split down to a single
+/// [`map_grain`] chunk per task. Without it rayon splits *adaptively* — a job divides only
 /// when another worker tries to steal it — so once every worker is busy, no
 /// further splitting happens and whoever holds the largest un-split leaf runs it
 /// to the end alone. Measured on `mean` (a 5³ window, 256³ voxels, 48 threads):
@@ -265,7 +344,7 @@ where
 ///
 /// This is a scheduling knob and nothing more: it changes how the index range is
 /// cut, never which `i` an element is computed from, so it cannot move a bit —
-/// the same argument that lets [`GRAIN`] be tuned freely.
+/// the same argument that lets [`grain`] be tuned freely.
 ///
 /// It is deliberately **not** applied to [`fill_zip`] or [`for_each_mut`]. Those
 /// carry the *cheap* elementwise maps (a vectorized transform of a contiguous
@@ -291,12 +370,13 @@ where
         }
         return;
     }
+    let g = map_grain(slots.len());
     slots
-        .par_chunks_mut(GRAIN)
+        .par_chunks_mut(g)
         .enumerate()
         .with_max_len(1)
         .for_each_init(init, |scratch, (c, chunk)| {
-            let base = c * GRAIN;
+            let base = c * g;
             for (j, slot) in chunk.iter_mut().enumerate() {
                 slot.write(f(scratch, base + j));
             }
@@ -319,9 +399,10 @@ where
         }
         return;
     }
+    let g = map_grain(src.len());
     slots
-        .par_chunks_mut(GRAIN)
-        .zip(src.par_chunks(GRAIN))
+        .par_chunks_mut(g)
+        .zip(src.par_chunks(g))
         .for_each(|(dst_chunk, src_chunk)| {
             for (slot, x) in dst_chunk.iter_mut().zip(src_chunk) {
                 slot.write(f(x));
@@ -380,14 +461,13 @@ where
         out.iter_mut().enumerate().for_each(|(i, x)| f(i, x));
         return;
     }
-    out.par_chunks_mut(GRAIN)
-        .enumerate()
-        .for_each(|(c, chunk)| {
-            let base = c * GRAIN;
-            for (j, x) in chunk.iter_mut().enumerate() {
-                f(base + j, x);
-            }
-        });
+    let g = map_grain(out.len());
+    out.par_chunks_mut(g).enumerate().for_each(|(c, chunk)| {
+        let base = c * g;
+        for (j, x) in chunk.iter_mut().enumerate() {
+            f(base + j, x);
+        }
+    });
 }
 
 /// Rows per staging chunk in [`map_rows_fold_in_order`]. Bounds the staging
@@ -506,11 +586,11 @@ pub fn min_max<T: Scalar>(vals: &[T]) -> Option<(f64, f64)> {
     if vals.len() < SERIAL_THRESHOLD {
         return Some(fold_min_max(vals));
     }
-    // Chunk boundaries depend on `vals.len()` alone. Partials are collected in
-    // chunk order and combined left-to-right — the same bracketing on every run
-    // and every thread count.
+    // Chunk boundaries depend on `vals.len()` alone (see `grain`). Partials are
+    // collected in chunk order and combined left-to-right — the same bracketing on
+    // every run and every thread count.
     let partials: Vec<(f64, f64)> = vals
-        .par_chunks(REDUCE_CHUNK)
+        .par_chunks(reduce_grain(vals.len()))
         .map(fold_min_max)
         .collect::<Vec<_>>();
     Some(
@@ -558,7 +638,11 @@ where
     if vals.len() < SERIAL_THRESHOLD {
         return fold(vals);
     }
-    let partials: Vec<Vec<u64>> = vals.par_chunks(REDUCE_CHUNK).map(fold).collect();
+    // Chunk boundaries depend on `vals.len()` alone (see `grain`).
+    let partials: Vec<Vec<u64>> = vals
+        .par_chunks(reduce_grain(vals.len()))
+        .map(fold)
+        .collect();
     partials
         .into_iter()
         .fold(vec![0u64; bins], |mut acc, part| {
@@ -871,6 +955,143 @@ mod tests {
         let got = map_indexed(n, |i| (i as f64).sqrt());
         let want: Vec<f64> = (0..n).map(|i| (i as f64).sqrt()).collect();
         assert_eq!(got, want);
+    }
+
+    /// The bench-spec volumes, in elements.
+    const SMALL: usize = 64 * 64 * 64; // 262_144
+    const MEDIUM: usize = 256 * 256 * 256; // 16_777_216
+    const LARGE: usize = 512 * 512 * 512; // 134_217_728
+
+    /// The chunk starts `par_chunks(g)` emits for `len` elements.
+    fn boundaries(len: usize, g: usize) -> Vec<usize> {
+        (0..len.div_ceil(g)).map(|c| c * g).collect()
+    }
+
+    /// The whole determinism argument, as a test: the grain is a function of `len`
+    /// and of nothing else. It cannot observe the thread count — there is no
+    /// argument through which it could — so this pins the *values*, which is the
+    /// part a future edit could get wrong.
+    #[test]
+    fn the_grain_is_a_pure_function_of_the_length() {
+        for &len in &[0, 1, SERIAL_THRESHOLD, SMALL, MEDIUM, LARGE, LARGE * 3 + 7] {
+            let (m, r) = (map_grain(len), reduce_grain(len));
+            for _ in 0..4 {
+                assert_eq!(map_grain(len), m, "map_grain({len}) is not deterministic");
+                assert_eq!(
+                    reduce_grain(len),
+                    r,
+                    "reduce_grain({len}) is not deterministic"
+                );
+            }
+            assert!((MIN_GRAIN..=GRAIN).contains(&m), "map_grain({len}) = {m}");
+            assert!(
+                (MIN_GRAIN..=REDUCE_CHUNK).contains(&r),
+                "reduce_grain({len}) = {r}"
+            );
+        }
+    }
+
+    /// The defect this rule closes: a 64³ volume handed a 96-worker pool four
+    /// chunks. Both passes must now raise more tasks than the box has workers.
+    #[test]
+    fn a_small_volume_raises_more_tasks_than_a_wide_box_has_workers() {
+        assert_eq!(reduce_grain(SMALL), 2048);
+        assert_eq!(SMALL.div_ceil(reduce_grain(SMALL)), 128); // was 4, at a 65536 grain
+        assert_eq!(map_grain(SMALL), 2048);
+        assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128); // was 64, at a 4096 grain
+    }
+
+    /// **The rule is a no-op at and above `TARGET_TASKS * ceiling` elements** — not
+    /// "a small change", none: the emitted chunk boundaries are the same integers
+    /// the fixed grain emitted. Both bench volumes at or above `medium` are in that
+    /// range for both passes, so their decomposition, and every checksum folded
+    /// over it, is untouched by construction.
+    #[test]
+    fn the_rule_emits_the_same_boundaries_as_the_fixed_grain_at_and_above_medium() {
+        for &len in &[MEDIUM, LARGE] {
+            assert_eq!(
+                reduce_grain(len),
+                REDUCE_CHUNK,
+                "reduce grain moved at {len}"
+            );
+            assert_eq!(map_grain(len), GRAIN, "map grain moved at {len}");
+            assert_eq!(
+                boundaries(len, reduce_grain(len)),
+                boundaries(len, REDUCE_CHUNK)
+            );
+            assert_eq!(boundaries(len, map_grain(len)), boundaries(len, GRAIN));
+        }
+        // The exact crossover, both sides, for each ceiling. `div_ceil` rounds up,
+        // so the grain is already pinned at the ceiling for every length above
+        // `TARGET_TASKS * (ceiling - 1)` — that product, not `TARGET_TASKS *
+        // ceiling - 1`, is the last length the rule still subdivides.
+        assert_eq!(reduce_grain(TARGET_TASKS * REDUCE_CHUNK), REDUCE_CHUNK);
+        assert_eq!(
+            reduce_grain(TARGET_TASKS * (REDUCE_CHUNK - 1)),
+            REDUCE_CHUNK - 1
+        );
+        assert_eq!(map_grain(TARGET_TASKS * GRAIN), GRAIN);
+        assert_eq!(map_grain(TARGET_TASKS * (GRAIN - 1)), GRAIN - 1);
+    }
+
+    /// A finer grain re-brackets the fold, so this is the test that says the
+    /// re-bracketing is invisible: the two reductions return the same bits at every
+    /// grain the rule can emit, because `min`/`max` select an input element and
+    /// `u64` addition is exact.
+    #[test]
+    fn both_reductions_are_bit_identical_at_every_grain_the_rule_can_emit() {
+        let n = SMALL;
+        let vals: Vec<f64> = (0..n)
+            .map(|i| ((i * 2654435761usize) % 100_003) as f64 * 0.5 - 1000.0)
+            .collect();
+        let bins = 128usize;
+        let bin_of = |v: f64| Some((((v + 1000.0) / 25.0) as usize).min(bins - 1));
+
+        let want_mm = fold_min_max(&vals);
+        let mut want_bc = vec![0u64; bins];
+        for &v in &vals {
+            want_bc[bin_of(v).unwrap()] += 1;
+        }
+
+        for g in [1024usize, 2048, 4096, 8192, 65536, n, n * 2] {
+            let mm = vals
+                .par_chunks(g)
+                .map(fold_min_max)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (l, h)| {
+                    (lo.min(l), hi.max(h))
+                });
+            assert_eq!(
+                mm.0.to_bits(),
+                want_mm.0.to_bits(),
+                "min moved at grain {g}"
+            );
+            assert_eq!(
+                mm.1.to_bits(),
+                want_mm.1.to_bits(),
+                "max moved at grain {g}"
+            );
+
+            let bc = vals
+                .par_chunks(g)
+                .map(|chunk| {
+                    let mut c = vec![0u64; bins];
+                    for &v in chunk {
+                        c[bin_of(v).unwrap()] += 1;
+                    }
+                    c
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .fold(vec![0u64; bins], |mut acc, part| {
+                    for (a, p) in acc.iter_mut().zip(part) {
+                        *a += p;
+                    }
+                    acc
+                });
+            assert_eq!(bc, want_bc, "the histogram moved at grain {g}");
+        }
     }
 
     #[test]
