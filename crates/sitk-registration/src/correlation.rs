@@ -519,3 +519,479 @@ mod tests {
         }
     }
 }
+
+/// What the one-pass moment form would cost — the design the device does **not**
+/// take, measured rather than asserted.
+///
+/// # The road not taken
+///
+/// A device NCC could be a **single** reduction. Every mean-subtracted
+/// accumulator is affine in the means, so the mean-subtraction can be deferred
+/// to the host:
+///
+/// ```text
+/// sff       = Σ fᵢ²        − N·f̄²
+/// sfm       = Σ fᵢ·mᵢ      − N·f̄·m̄
+/// fdm[d]    = Σ fᵢ·∇Mᵢ[d]  − f̄·Σ ∇Mᵢ[d]
+/// ```
+///
+/// One resample pass, 42 raw moments, no dependence on a global quantity inside
+/// the kernel. It is **algebraically identical** to the two-pass form this module
+/// computes — and numerically it is not, because each line above is a difference
+/// of two comparable magnitudes. The relative error of `sff` computed that way is
+/// `ε · Σfᵢ²/sff = ε · (1 + f̄²/var(f))`, and that amplification factor is a
+/// property of **the caller's data**, not of the algorithm: a CT volume sitting at
+/// mean 1000 with σ = 50 carries a factor of ~400.
+///
+/// The device therefore runs the host's **two** passes — pass 1 reduces the sums
+/// that give the means, pass 2 reduces the mean-subtracted moments with the means
+/// as kernel scalars — and pays ~2× the memory traffic for it. That is a
+/// deliberate purchase, and these tests are its receipt:
+///
+/// * [`the_two_forms_are_the_same_algebra`] — on a centred volume the two agree to
+///   the last bits, so the divergence below is *not* a coding error in either form.
+/// * [`the_one_pass_form_loses_digits_to_the_dc_offset`] — on a CT-like volume the
+///   one-pass form is orders worse, with the measured factor in the failure
+///   message.
+/// * [`what_the_one_pass_form_loses_is_a_property_of_the_data`] — the loss grows
+///   with the pedestal, tracking `1 + f̄²/var(f)`. This is why no fixed tolerance
+///   can be written for the cheap form.
+///
+/// If a later change collapses the two device passes into one, the second and
+/// third tests fail. That is their entire purpose.
+#[cfg(test)]
+mod one_pass_moment_form {
+    use super::*;
+    use sitk_transform::{TransformBase, TranslationTransform};
+
+    /// Neumaier compensated summation — the **reference** both forms are measured
+    /// against. `sff`/`smm` have all-non-negative terms, so their condition number
+    /// is 1 and this is accurate to `ε`.
+    fn csum(terms: &[f64]) -> f64 {
+        let mut sum = 0.0f64;
+        let mut c = 0.0f64;
+        for &t in terms {
+            let s = sum + t;
+            c += if sum.abs() >= t.abs() {
+                (sum - s) + t
+            } else {
+                (t - s) + sum
+            };
+            sum = s;
+        }
+        sum + c
+    }
+
+    /// Plain left-to-right `f64` summation — what a real reduction (the host's
+    /// serial loop, or the device's block tree) actually does. Measuring both forms
+    /// through *this* is what says how the cheap form would behave in the kernel;
+    /// measuring them through [`csum`] isolates the *form* from the summation order
+    /// by giving the cheap form a perfect one.
+    fn psum(terms: &[f64]) -> f64 {
+        terms.iter().fold(0.0f64, |a, &t| a + t)
+    }
+
+    /// The per-sample terms of one NCC evaluation: the fixed and moving values at
+    /// the valid samples, and the moving gradient there. Both moment forms are
+    /// built from exactly these, so nothing but the *arithmetic* differs.
+    struct Terms {
+        f: Vec<f64>,
+        m: Vec<f64>,
+        /// `g[k]` is the k-th component of ∇M, one entry per valid sample. Under a
+        /// `TranslationTransform` the Jacobian is the identity, so `fdm[k] = Σ f1·g[k]`
+        /// directly — the derivative accumulator without the Jacobian machinery.
+        g: [Vec<f64>; 3],
+    }
+
+    fn terms(fixed: &Image, moving: &Image, shift: &[f64]) -> Terms {
+        let samples = FixedSamples::from_image(fixed).unwrap();
+        let mov = MovingImage::from_image(moving).unwrap();
+        let t = TranslationTransform::new(shift.to_vec());
+
+        let mut out = Terms {
+            f: Vec::new(),
+            m: Vec::new(),
+            g: [Vec::new(), Vec::new(), Vec::new()],
+        };
+        let mut scratch = samples.scratch();
+        for s in 0..samples.len() {
+            let fp = samples.point(s, &mut scratch);
+            let mp = t.transform_point(fp);
+            let Some((mv, grad)) = mov.value_and_physical_gradient(&mp) else {
+                continue;
+            };
+            out.f.push(samples.value(s));
+            out.m.push(mv);
+            for (gk, &g) in out.g.iter_mut().zip(&grad) {
+                gk.push(g);
+            }
+        }
+        assert!(out.f.len() > 1000, "too few valid samples to measure with");
+        out
+    }
+
+    /// The quantities a device NCC reduction produces, whichever form produced
+    /// them. `fdm` is the derivative accumulator `Σ f1ᵢ·∇Mᵢ[k]` (the Jacobian is
+    /// the identity under a `TranslationTransform`, so this *is* the derivative's
+    /// fixed half).
+    struct Form {
+        sff: f64,
+        sfm: f64,
+        value: f64,
+        fdm: [f64; 3],
+    }
+
+    /// How a form's sums are accumulated. Both forms are run through **both**, so
+    /// the summation order and the algebraic form are separated rather than
+    /// confounded.
+    type Sum = fn(&[f64]) -> f64;
+
+    /// The **two-pass** form, the one the device takes: means first, then the
+    /// mean-subtracted moments. Every term is formed exactly as
+    /// [`CorrelationMetric::evaluate`] forms it.
+    fn two_pass(t: &Terms, sum: Sum) -> Form {
+        let n = t.f.len() as f64;
+        let fbar = sum(&t.f) / n;
+        let mbar = sum(&t.m) / n;
+
+        let f1: Vec<f64> = t.f.iter().map(|f| f - fbar).collect();
+        let m1: Vec<f64> = t.m.iter().map(|m| m - mbar).collect();
+
+        let sff = sum(&f1.iter().map(|a| a * a).collect::<Vec<_>>());
+        let smm = sum(&m1.iter().map(|a| a * a).collect::<Vec<_>>());
+        let sfm = sum(&f1.iter().zip(&m1).map(|(a, b)| a * b).collect::<Vec<_>>());
+
+        let mut fdm = [0.0f64; 3];
+        for (k, fdmk) in fdm.iter_mut().enumerate() {
+            *fdmk = sum(&f1
+                .iter()
+                .zip(&t.g[k])
+                .map(|(a, g)| a * g)
+                .collect::<Vec<_>>());
+        }
+
+        Form {
+            sff,
+            sfm,
+            value: -sfm * sfm / (sff * smm),
+            fdm,
+        }
+    }
+
+    /// The **one-pass** form, the one the device refuses: raw moments, mean
+    /// subtracted afterwards. Algebraically identical to [`two_pass`]; every line
+    /// below is a difference of two comparable magnitudes, and that is the whole
+    /// difference.
+    fn one_pass(t: &Terms, sum: Sum) -> Form {
+        let n = t.f.len() as f64;
+        let fbar = sum(&t.f) / n;
+        let mbar = sum(&t.m) / n;
+
+        let sum_ff = sum(&t.f.iter().map(|a| a * a).collect::<Vec<_>>());
+        let sum_mm = sum(&t.m.iter().map(|a| a * a).collect::<Vec<_>>());
+        let sum_fm = sum(&t.f.iter().zip(&t.m).map(|(a, b)| a * b).collect::<Vec<_>>());
+
+        let sff = sum_ff - n * fbar * fbar;
+        let smm = sum_mm - n * mbar * mbar;
+        let sfm = sum_fm - n * fbar * mbar;
+
+        let mut fdm = [0.0f64; 3];
+        for (k, fdmk) in fdm.iter_mut().enumerate() {
+            let sum_fg = sum(&t
+                .f
+                .iter()
+                .zip(&t.g[k])
+                .map(|(a, g)| a * g)
+                .collect::<Vec<_>>());
+            let sum_g = sum(&t.g[k]);
+            *fdmk = sum_fg - fbar * sum_g;
+        }
+
+        Form {
+            sff,
+            sfm,
+            value: -sfm * sfm / (sff * smm),
+            fdm,
+        }
+    }
+
+    fn rel(a: f64, b: f64) -> f64 {
+        if b == 0.0 {
+            a.abs()
+        } else {
+            (a - b).abs() / b.abs()
+        }
+    }
+
+    /// The amplification the algebra predicts for `sff`: `Σf²/sff = 1 + f̄²/var(f)`.
+    /// This is the factor the one-pass form multiplies its summation error by.
+    fn dc_amplification(t: &Terms) -> f64 {
+        let n = t.f.len() as f64;
+        let fbar = csum(&t.f) / n;
+        let sum_ff = csum(&t.f.iter().map(|a| a * a).collect::<Vec<_>>());
+        let sff = csum(
+            &t.f.iter()
+                .map(|f| (f - fbar) * (f - fbar))
+                .collect::<Vec<_>>(),
+        );
+        sum_ff / sff
+    }
+
+    /// The same factor for the derivative accumulator: `|f̄·Σ∇M[k]| / |fdm[k]|`,
+    /// worst `k`.
+    ///
+    /// I predicted, when I designed this, that `fdm`'s cancellation would be the
+    /// *worst* of the three because its subtrahend `Σ∇M[k]` is a signed sum that can
+    /// approach zero. That was wrong, and wrong in the direction that matters: a
+    /// subtrahend near zero has nothing to cancel *against*, so the loss is small,
+    /// not large. `fdm` loses only when `|f̄·Σ∇M|` is **large** next to `fdm` itself
+    /// — and over a whole volume the gradients largely cancel, so it is not. The DC
+    /// offset lands on `sff`/`smm`/`sfm`, and therefore on the value.
+    /// [`the_dc_loss_lands_on_the_value_not_the_derivative`] pins that as measured.
+    fn fdm_cancellation(t: &Terms) -> f64 {
+        let n = t.f.len() as f64;
+        let fbar = csum(&t.f) / n;
+        let exact = two_pass(t, csum);
+        (0..3)
+            .map(|k| {
+                let sum_g = csum(&t.g[k]);
+                (fbar * sum_g).abs() / exact.fdm[k].abs()
+            })
+            .fold(0.0f64, f64::max)
+    }
+
+    /// A textured volume with mean ≈ `pedestal` and a spread of ≈ 50 intensity
+    /// units — a CT-like signal-to-DC ratio when `pedestal` is 1000. Deterministic
+    /// (SplitMix64), so the measured numbers below are reproducible.
+    fn volume(n: usize, pedestal: f64, shift: f64) -> Image {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let c = n as f64 / 2.0;
+        let mut v = vec![0.0f64; n * n * n];
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (i as f64 - c + shift, j as f64 - c, k as f64 - c);
+                    // A smooth blob plus texture; σ over the volume lands near 50.
+                    let blob = 90.0 * (-(x * x + y * y + z * z) / (2.0 * 90.0)).exp();
+                    let ripple = 30.0 * (0.4 * x).sin() * (0.3 * y).cos();
+                    let noise = 12.0 * (next() - 0.5);
+                    v[(k * n + j) * n + i] = pedestal + blob + ripple + noise;
+                }
+            }
+        }
+        Image::from_vec(&[n, n, n], v).unwrap()
+    }
+
+    /// The two forms are the same algebra: on a **centred** volume (`f̄ ≈ 0`, so the
+    /// cancellation has nothing to cancel) they agree to the last bits. Without
+    /// this, the divergence measured by the next two tests could just be a bug in
+    /// one of them.
+    #[test]
+    fn the_two_forms_are_the_same_algebra() {
+        let t = terms(
+            &volume(40, 0.0, 0.0),
+            &volume(40, 0.0, 1.5),
+            &[1.3, -0.7, 0.9],
+        );
+        let reference = two_pass(&t, csum);
+        let cheap = one_pass(&t, csum);
+
+        let amp = dc_amplification(&t);
+        assert!(amp < 2.0, "volume is not centred: DC amplification {amp}");
+
+        for (name, a, b) in [
+            ("sff", cheap.sff, reference.sff),
+            ("sfm", cheap.sfm, reference.sfm),
+            ("value", cheap.value, reference.value),
+            ("fdm[0]", cheap.fdm[0], reference.fdm[0]),
+            ("fdm[1]", cheap.fdm[1], reference.fdm[1]),
+            ("fdm[2]", cheap.fdm[2], reference.fdm[2]),
+        ] {
+            assert!(
+                rel(a, b) <= 1e-13,
+                "{name}: the two forms disagree at {:.3e} on a centred volume — \
+                 that is a bug in one of them, not the cancellation this module measures",
+                rel(a, b)
+            );
+        }
+    }
+
+    /// The one-pass form loses digits to the DC offset, and the loss is what the
+    /// device would actually eat.
+    ///
+    /// Both forms are measured against the compensated two-pass reference, twice:
+    ///
+    /// * **through [`csum`]** — the cheap form's *best case*, a perfect summation
+    ///   order. What survives is the cancellation in the final subtraction alone.
+    /// * **through [`psum`]** — a real reduction. Here the DC amplification
+    ///   multiplies the summation error too, which is the regime a kernel is in.
+    ///
+    /// The floors asserted below sit an order under the measured values, and the
+    /// message prints what was measured, so no reader has to trust the constants.
+    #[test]
+    fn the_one_pass_form_loses_digits_to_the_dc_offset() {
+        let t = terms(
+            &volume(40, 1000.0, 0.0),
+            &volume(40, 1000.0, 1.5),
+            &[1.3, -0.7, 0.9],
+        );
+        let amp = dc_amplification(&t);
+        assert!(
+            amp > 100.0,
+            "the CT-like volume did not reach the DC regime: amplification {amp}"
+        );
+
+        let reference = two_pass(&t, csum);
+
+        // Best case: both forms perfectly summed. Only the algebra differs.
+        let best = one_pass(&t, csum);
+        let best_sff = rel(best.sff, reference.sff);
+        let best_value = rel(best.value, reference.value);
+
+        // Real case: both forms through a plain reduction, as a kernel sums.
+        let real_two = two_pass(&t, psum);
+        let real_one = one_pass(&t, psum);
+        let kept_sff = rel(real_two.sff, reference.sff);
+        let kept_value = rel(real_two.value, reference.value);
+        let lost_sff = rel(real_one.sff, reference.sff);
+        let lost_value = rel(real_one.value, reference.value);
+
+        eprintln!(
+            "N0 @ mean 1000 (DC amplification {amp:.1}, {} samples):\n\
+             \x20   one-pass, perfectly summed : sff {best_sff:.3e}  value {best_value:.3e}\n\
+             \x20   TWO-pass, plainly summed   : sff {kept_sff:.3e}  value {kept_value:.3e}   <- the form the device runs\n\
+             \x20   one-pass, plainly summed   : sff {lost_sff:.3e}  value {lost_value:.3e}   <- the form the device refuses\n\
+             \x20   cost of the cheap form     : sff {:.0}x  value {:.0}x",
+            t.f.len(),
+            lost_sff / kept_sff,
+            lost_value / kept_value,
+        );
+
+        // Even perfectly summed, the cheap form cannot reach the reference: the
+        // cancellation is in the subtraction, not the sum.
+        assert!(
+            best_sff > 1e-15 && best_value > 1e-14,
+            "at DC amplification {amp:.1} the one-pass form did not diverge even in \
+             its best case (sff {best_sff:.3e}, value {best_value:.3e}) — it is not \
+             being exercised, so this pin is guarding nothing"
+        );
+
+        // And through a real reduction it is orders worse than the form we run.
+        assert!(
+            lost_sff > 30.0 * kept_sff,
+            "the one-pass form cost only {:.1}x on sff (one-pass {lost_sff:.3e} vs \
+             two-pass {kept_sff:.3e}) at DC amplification {amp:.1}; the pin was \
+             written from a measured ~1e3x. Either the volume no longer has a DC \
+             offset, or the form under test is no longer the one-pass form",
+            lost_sff / kept_sff
+        );
+        assert!(
+            lost_value > 30.0 * kept_value,
+            "the one-pass form cost only {:.1}x on the value (one-pass {lost_value:.3e} \
+             vs two-pass {kept_value:.3e}) at DC amplification {amp:.1}",
+            lost_value / kept_value
+        );
+    }
+
+    /// Where the DC loss lands — and where I predicted it would land, wrongly.
+    ///
+    /// Designing this wave I claimed `fdm`'s cancellation would be the worst of the
+    /// three, because its subtrahend `f̄·Σ∇M[k]` is a signed sum that can approach
+    /// zero. The measurement says otherwise, and the reasoning was backwards: a
+    /// subtrahend near zero has nothing to cancel against. Over a whole volume the
+    /// moving gradients largely cancel, so `|f̄·Σ∇M|` is *small* next to `fdm`, and
+    /// `fdm` barely moves. The DC offset lands on `sff`/`smm`/`sfm` — and so on the
+    /// value, which is exactly the quantity the optimizer reads.
+    ///
+    /// Pinned, so the refusal rests on where the loss *is* rather than on where I
+    /// guessed it would be.
+    #[test]
+    fn the_dc_loss_lands_on_the_value_not_the_derivative() {
+        let t = terms(
+            &volume(40, 1000.0, 0.0),
+            &volume(40, 1000.0, 1.5),
+            &[1.3, -0.7, 0.9],
+        );
+        let reference = two_pass(&t, csum);
+        let cheap = one_pass(&t, csum);
+
+        let e_sff = rel(cheap.sff, reference.sff);
+        let e_fdm = (0..3)
+            .map(|k| rel(cheap.fdm[k], reference.fdm[k]))
+            .fold(0.0f64, f64::max);
+        let fdm_cancel = fdm_cancellation(&t);
+        let sff_cancel = dc_amplification(&t);
+
+        eprintln!(
+            "N0 where the loss lands: sff cancellation {sff_cancel:.1} -> error {e_sff:.3e} | \
+             fdm cancellation {fdm_cancel:.2} -> error {e_fdm:.3e}"
+        );
+
+        // The measured relation, not a threshold I invented: the error each
+        // quantity loses tracks *its own* cancellation factor. `sff` cancels at
+        // ~1.9e3 and loses ~2.4e-14; `fdm` cancels at ~1.1e1 and loses ~1.3e-15.
+        // Two orders apart in cancellation, and the errors follow.
+        assert!(
+            fdm_cancel * 20.0 < sff_cancel,
+            "fdm's cancellation ({fdm_cancel:.2}) is no longer far below sff's \
+             ({sff_cancel:.1}) — the gradients stopped cancelling over the volume, \
+             so 'the DC loss misses the derivative' is not true of this data and \
+             the module doc above needs rewriting, not this constant"
+        );
+        assert!(
+            e_fdm < e_sff,
+            "fdm ({e_fdm:.3e}) lost more than sff ({e_sff:.3e}) — my original \
+             prediction after all; if this fires, the module doc above is wrong \
+             and the derivative needs the same scrutiny as the value"
+        );
+    }
+
+    /// The loss is a property of the **data**, not of the algorithm: it grows with
+    /// the pedestal, tracking `1 + f̄²/var(f)`. This is the whole argument for
+    /// paying the second pass — no fixed tolerance can be written for a form whose
+    /// error the caller's intensity range decides.
+    #[test]
+    fn what_the_one_pass_form_loses_is_a_property_of_the_data() {
+        let mut previous: Option<(f64, f64)> = None;
+        for pedestal in [0.0, 1_000.0, 10_000.0] {
+            let t = terms(
+                &volume(40, pedestal, 0.0),
+                &volume(40, pedestal, 1.5),
+                &[1.3, -0.7, 0.9],
+            );
+            let reference = two_pass(&t, csum);
+            let cheap = one_pass(&t, psum);
+            let kept = two_pass(&t, psum);
+
+            let amp = dc_amplification(&t);
+            let err = rel(cheap.sff, reference.sff);
+            eprintln!(
+                "N0 pedestal {pedestal:>8.0}: amplification {amp:>10.1}  \
+                 one-pass sff error {err:.3e}  (two-pass {:.3e})",
+                rel(kept.sff, reference.sff)
+            );
+
+            if let Some((prev_amp, prev_err)) = previous {
+                assert!(
+                    amp > prev_amp * 10.0,
+                    "amplification did not grow with the pedestal: {prev_amp} -> {amp}"
+                );
+                assert!(
+                    err > prev_err,
+                    "the one-pass error did not grow with the DC offset \
+                     ({prev_err:.3e} at amplification {prev_amp:.1} -> \
+                     {err:.3e} at {amp:.1}); the cancellation this pin measures is gone, \
+                     which means the form under test is no longer the one-pass form"
+                );
+            }
+            previous = Some((amp, err));
+        }
+    }
+}
