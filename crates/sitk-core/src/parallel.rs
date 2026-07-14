@@ -92,8 +92,7 @@ const TARGET_TASKS: usize = 256;
 /// A floor exists to keep the work in one task well above the cost of dispatching
 /// one (order 1 µs for a rayon job). That is a floor on **work**; it is spelled in
 /// **elements**, and the conversion between them is the pass's cost per element. So
-/// the floor is a property of the *cost class*, not of the module — which is why
-/// there are two of them, this one and [`MIN_GRAIN_INDEXED`].
+/// the floor is a property of the *cost class*, not of the module.
 ///
 /// This class does one or two ops per element, well under a nanosecond each. At
 /// 2048 elements a task carries ~2 µs, already the same order as its own dispatch;
@@ -109,41 +108,6 @@ const TARGET_TASKS: usize = 256;
 /// within-round and replicated, and this port's noise floor — ~60% on process shape
 /// — is larger than the gap that sweep claimed to see.)
 const MIN_GRAIN: usize = 2048;
-
-/// The floor on per-task work for the **indexed/stencil** pass ([`fill_indexed`]),
-/// whose cost per element is ~100× this module's elementwise class.
-///
-/// Derived from what a floor is for, evaluated with *this* class's cost per element.
-/// A 3³–5³ window is 27–125 fused multiply-adds per element (~50–100 ns), so a
-/// 1024-element task is 50–100 µs of work against a ~1 µs dispatch: scheduling
-/// overhead is under 2%, and the floor is simply not what protects this class. What
-/// binds here is [`TARGET_TASKS`], so the floor's only remaining job is to **not
-/// fight the target at the smallest volume the port supports**:
-///
-/// ```text
-/// MIN_GRAIN_INDEXED = SMALL / TARGET_TASKS = 262144 / 256 = 1024
-/// ```
-///
-/// At 64³ that is the difference between 128 tasks and the 256 the rule asked for.
-/// Measured, paired within-round over 10 clean rounds in two independent windows
-/// (64³/`tN`, against the 2048 floor): `mean` **0.30×**, `binary_dilate`
-/// **0.33–0.52×**, `median` **0.45–0.48×**, `gradient_magnitude` **0.62–0.64×**.
-///
-/// This is the same split the module already makes for the leaf cap — see
-/// [`fill_indexed`], which applies `with_max_len(1)` to this class and withholds it
-/// from the cheap one, "and the split policy follows from which one you are in, not
-/// from a tuned number." The grain floor now follows the class for the same reason.
-/// A single floor was wrong for both: too low to protect the elementwise class, too
-/// high to feed the stencil one.
-///
-/// Where the two classes can differ at all, as integers: `grain` reaches a floor
-/// only while `len / TARGET_TASKS` is under it, so the *elementwise* floor is the
-/// last one to let go, at `TARGET_TASKS * MIN_GRAIN = 524 288` elements. At and
-/// above that length both classes emit the same chunk boundaries, and this constant
-/// is a **no-op** — which puts every volume from `medium` (16.7 M) up on the same
-/// integers as before. Pinned in
-/// `the_two_grain_floors_emit_the_same_chunks_once_neither_can_bind`.
-const MIN_GRAIN_INDEXED: usize = 1024;
 
 /// Elements per chunk for a pass over `len` elements, at most `ceiling`.
 ///
@@ -191,13 +155,6 @@ const fn grain_floored(len: usize, ceiling: usize, floor: usize) -> usize {
 /// a few nanoseconds per element. Cheap class: [`MIN_GRAIN`].
 const fn map_grain(len: usize) -> usize {
     grain(len, GRAIN)
-}
-
-/// [`grain`] for the **indexed/stencil** fill behind [`map_indexed`],
-/// [`map_indexed_init`] and `Neighborhood::par_map_window*` — tens to hundreds of
-/// ops per element. Expensive class: [`MIN_GRAIN_INDEXED`].
-const fn indexed_grain(len: usize) -> usize {
-    grain_floored(len, GRAIN, MIN_GRAIN_INDEXED)
 }
 
 /// [`grain`] for the chunked reductions — [`min_max`] and [`bin_counts`].
@@ -414,6 +371,85 @@ where
     fill_indexed(as_uninit_mut(dst), init, f);
 }
 
+/// A run of consecutive indices whose cost per element is the same.
+///
+/// The unit of [`map_indexed_init_by_cost`]'s partition. `class` is an opaque tag:
+/// this module never asks what it *means*, only which runs share it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CostRun {
+    /// How many consecutive indices this run covers.
+    pub len: usize,
+    /// Which cost class they belong to. Only equality is used.
+    pub class: u8,
+}
+
+/// [`map_indexed_init`] over an index space the caller has partitioned into **cost
+/// classes** — the fill for a pass whose cost per index is not uniform.
+///
+/// # The defect this closes
+///
+/// [`fill_indexed`] cuts `0..len` into equal-**count** chunks, which are equal-**cost**
+/// chunks only when every index costs the same. A stencil pass is where that fails: a
+/// pixel whose window overhangs the image takes the checked path, which materializes
+/// the window through the boundary condition and measures ~**8×** the interior path
+/// per pixel (~1.0 µs against ~130 ns, 5³ window). Those pixels are not scattered —
+/// the layout concentrates them into whole rows and planes — so an equal-count chunker
+/// hands *one task* the entire `z = 0` plane, and that task becomes the wall. Measured
+/// at 64³/`t96` before this function existed: the longest chunk was **0.93–1.00 of the
+/// whole pass**, and for `mean` the last chunk to finish was chunk 0, which started at
+/// t≈0 and ran alone while the other 127 completed around it.
+///
+/// # The rule, and why it carries no cost constant
+///
+/// **Each class is split into its own [`TARGET_TASKS`] chunks**, so
+///
+/// ```text
+/// c_max = max over classes of (W_class / TARGET_TASKS)  <=  W / TARGET_TASKS
+/// ```
+///
+/// The ratio *between* the classes never enters: the classes are counted, not weighted,
+/// so there is no cost model here to get wrong and none to fit to a benchmark. A caller
+/// that mislabels a run makes the balance worse, never the answer. The [`GRAIN`] ceiling
+/// still applies per class — dropping it measured **1.41× slower** on `binary_dilate` at
+/// 256³ — while the *floor* does not, because a floor in elements cannot serve two costs
+/// per element and [`TARGET_TASKS`] is what bounds the task count.
+///
+/// # Bit-for-bit
+///
+/// This changes **which task** computes an element, never **how**: chunks are still
+/// contiguous index ranges, element `i` is still `f(&mut scratch, i)`, and it still lands
+/// in slot `i`. It is the same argument that lets [`grain`] be tuned freely — no
+/// element's value depends on the decomposition, so no decomposition can move a bit.
+///
+/// # Panics
+///
+/// If the runs do not sum to `len` — a partition that does not cover the index space
+/// exactly once would leave slots uninitialized, which is a caller bug.
+pub fn map_indexed_init_by_cost<R, S, I, F>(len: usize, runs: &[CostRun], init: I, f: F) -> Vec<R>
+where
+    R: Send,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    collect_filled(len, |slots| fill_by_cost(slots, runs, init, f))
+}
+
+/// [`map_indexed_init_by_cost`] writing into a destination the **caller owns**.
+///
+/// # Panics
+///
+/// If the runs do not sum to `dst.len()`.
+pub fn map_indexed_init_into_by_cost<R, S, I, F>(dst: &mut [R], runs: &[CostRun], init: I, f: F)
+where
+    R: Send + Copy,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    fill_by_cost(as_uninit_mut(dst), runs, init, f);
+}
+
 // ---------------------------------------------------------------------------
 // The two fill loops every map above is built from, and the allocation that
 // turns a fill into a `Vec`. Each `_into` form and its allocating twin call the
@@ -451,11 +487,22 @@ where
 /// elementwise work that is nearly free per element — and the split policy
 /// follows from which one you are in, not from a tuned number.
 ///
-/// **The grain floor follows the same split, for the same reason** — this fill is
-/// cut at [`indexed_grain`] and the cheap ones at [`map_grain`]. A floor is a bound
-/// on per-task *work* written in *elements*, so it converts through the class's cost
-/// per element; one number could not serve both, and the one that did was too low to
-/// protect the cheap class and too high to feed this one. See [`MIN_GRAIN_INDEXED`].
+/// # This fill is for indexed passes whose cost per index is *uniform*
+///
+/// It cuts equal-**count** chunks, which are equal-**cost** chunks only when every
+/// index costs the same — a convolution's kernel, a metric's per-sample term, a
+/// distance transform's per-voxel update. A **stencil** pass is the case where the
+/// assumption fails: its cost per pixel splits ~8× between the interior and the
+/// checked path, the layout concentrates the expensive pixels into whole rows and
+/// planes, and an equal-count chunker then hands one task the entire `z = 0` plane.
+/// Measured at 64³/`t96`: the longest chunk was **0.93–1.00 of the whole pass**. That
+/// pass goes through [`map_indexed_init_by_cost`] now, which is handed the partition
+/// by the only layer that knows it — see `NeighborhoodIterator::cost_runs`.
+///
+/// This fill once carried a second grain floor (`MIN_GRAIN_INDEXED = 1024`) whose only
+/// service was to halve that straggler. It was a workaround for the wrong
+/// decomposition and it is gone; the passes still on this fill are the uniform-cost
+/// ones, which the floor was never derived for.
 ///
 /// [`with_max_len(1)`]: rayon::iter::IndexedParallelIterator::with_max_len
 fn fill_indexed<R, S, I, F>(slots: &mut [MaybeUninit<R>], init: I, f: F)
@@ -472,7 +519,7 @@ where
         }
         return;
     }
-    let g = indexed_grain(slots.len());
+    let g = map_grain(slots.len());
     slots
         .par_chunks_mut(g)
         .enumerate()
@@ -481,6 +528,105 @@ where
             let base = c * g;
             for (j, slot) in chunk.iter_mut().enumerate() {
                 slot.write(f(scratch, base + j));
+            }
+        });
+}
+
+/// The chunk boundaries [`fill_by_cost`] cuts at, as **lengths in index order**.
+///
+/// A pure function of the partition — no thread count, no pool, no ambient state, the
+/// same integers on every box at every thread count, exactly as [`grain`] is. It is
+/// separated from the fill so it can be pinned as integers rather than inferred from a
+/// wall clock.
+///
+/// Two properties, both pinned below:
+///
+/// - **No chunk spans two classes.** Cuts are taken *within* a run, never across one,
+///   so every chunk is cost-homogeneous.
+/// - **No chunk holds more than `W_class / TARGET_TASKS` of its class**, and none
+///   exceeds the [`GRAIN`] ceiling. That is what bounds `c_max` without ever comparing
+///   the classes to each other.
+fn cost_chunks(runs: &[CostRun]) -> Vec<usize> {
+    let mut total = [0usize; 256];
+    for r in runs {
+        total[r.class as usize] += r.len;
+    }
+    // The module's own grain rule, applied to each class's own total. The *ceiling* is
+    // the same [`GRAIN`] every indexed pass has always had, and it is load-bearing in
+    // the other direction: without it a class with a large total emits chunks far bigger
+    // than the flat rule ever did — measured at 256³, `binary_dilate` **1.41× slower**,
+    // because a 62 500-element chunk is 15× what the ceiling allows. The *floor* is
+    // dropped (1), and only here.
+    let grain_of = |class: u8| grain_floored(total[class as usize], GRAIN, 1);
+
+    let mut chunks = Vec::new();
+    for r in runs {
+        let g = grain_of(r.class);
+        let mut left = r.len;
+        while left > 0 {
+            let take = left.min(g);
+            chunks.push(take);
+            left -= take;
+        }
+    }
+    chunks
+}
+
+/// `slots[i] = f(&mut scratch, i)` for every slot, cut at [`cost_chunks`] — the
+/// cost-class fill behind [`map_indexed_init_by_cost`].
+///
+/// Every slot is written exactly once: the chunk lengths sum to `slots.len()` and the
+/// slice is handed out by successive `split_at_mut`, so the chunks are disjoint by
+/// construction and the borrow checker is the proof.
+///
+/// # Panics
+///
+/// If the runs do not sum to `slots.len()`.
+fn fill_by_cost<R, S, I, F>(slots: &mut [MaybeUninit<R>], runs: &[CostRun], init: I, f: F)
+where
+    R: Send,
+    S: Send,
+    I: Fn() -> S + Sync + Send,
+    F: Fn(&mut S, usize) -> R + Sync + Send,
+{
+    let covered: usize = runs.iter().map(|r| r.len).sum();
+    assert_eq!(
+        covered,
+        slots.len(),
+        "fill_by_cost: the cost-class runs must cover the index space exactly once"
+    );
+    if slots.len() < SERIAL_THRESHOLD {
+        let mut scratch = init();
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.write(f(&mut scratch, i));
+        }
+        return;
+    }
+
+    let mut rest = slots;
+    let mut tasks = Vec::new();
+    let mut base = 0usize;
+    for len in cost_chunks(runs) {
+        let (chunk, tail) = rest.split_at_mut(len);
+        tasks.push((base, chunk));
+        base += len;
+        rest = tail;
+    }
+    debug_assert!(rest.is_empty());
+
+    // `with_max_len(1)` for the same reason [`fill_indexed`] needs it — and the reason is
+    // *not* that the chunks are unequal. A rayon job may hold a whole **run** of these
+    // tasks and execute it sequentially: building the leaves here does not prevent that,
+    // because rayon splits the task list adaptively, stops splitting once every worker is
+    // busy, and whoever holds the longest run runs it alone. Measured at 256³ without the
+    // cap: `binary_dilate` **3.5×** and `mean` **2.2×** *slower* than the flat chunker —
+    // the straggler this function exists to remove, reintroduced one level up.
+    tasks
+        .into_par_iter()
+        .with_max_len(1)
+        .for_each_init(init, |scratch, (b, chunk)| {
+            for (j, slot) in chunk.iter_mut().enumerate() {
+                slot.write(f(scratch, b + j));
             }
         });
 }
@@ -1076,7 +1222,7 @@ mod tests {
     #[test]
     fn the_grain_is_a_pure_function_of_the_length() {
         for &len in &[0, 1, SERIAL_THRESHOLD, SMALL, MEDIUM, LARGE, LARGE * 3 + 7] {
-            let (m, r, x) = (map_grain(len), reduce_grain(len), indexed_grain(len));
+            let (m, r) = (map_grain(len), reduce_grain(len));
             for _ in 0..4 {
                 assert_eq!(map_grain(len), m, "map_grain({len}) is not deterministic");
                 assert_eq!(
@@ -1084,16 +1230,7 @@ mod tests {
                     r,
                     "reduce_grain({len}) is not deterministic"
                 );
-                assert_eq!(
-                    indexed_grain(len),
-                    x,
-                    "indexed_grain({len}) is not deterministic"
-                );
             }
-            assert!(
-                (MIN_GRAIN_INDEXED..=GRAIN).contains(&x),
-                "indexed_grain({len}) = {x}"
-            );
             assert!((MIN_GRAIN..=GRAIN).contains(&m), "map_grain({len}) = {m}");
             assert!(
                 (MIN_GRAIN..=REDUCE_CHUNK).contains(&r),
@@ -1112,56 +1249,156 @@ mod tests {
         assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128); // was 64, at a 4096 grain
     }
 
-    /// Adding a second floor is safe at scale because the two floors stop being
-    /// distinguishable as soon as neither can bind. A floor is reached only while
-    /// `len / TARGET_TASKS` is below it, so the *elementwise* floor — the higher of
-    /// the two — is the last to let go, at `TARGET_TASKS * MIN_GRAIN` elements. From
-    /// there up, both classes cut at `len/TARGET_TASKS` (or the ceiling) and emit
-    /// **the same chunk boundaries**, so no volume at or above that length can move.
-    ///
-    /// `medium` (16.7 M) and `large` (134 M) are 32× and 256× past it. This is the
-    /// integer statement behind P10, and Campaigns M and L then measured those
-    /// volumes not moving — but the proof is here, in the integers, not there.
-    #[test]
-    fn the_two_grain_floors_emit_the_same_chunks_once_neither_can_bind() {
-        let converged = TARGET_TASKS * MIN_GRAIN; // 524_288
-        for &len in &[converged, converged + 1, MEDIUM, LARGE, LARGE * 3 + 7] {
-            assert_eq!(
-                boundaries(len, indexed_grain(len)),
-                boundaries(len, map_grain(len)),
-                "the two floors emit different chunks at len = {len}, which is at \
-                 or above {converged} and must be a no-op"
-            );
+    /// The cost-class runs a cubic stencil pass emits, built the way
+    /// `NeighborhoodIterator::cost_runs` builds them: a row is checked whenever a
+    /// coordinate above dimension 0 is within `radius` of an edge.
+    fn stencil_runs(side: usize, radius: usize) -> Vec<CostRun> {
+        let mut runs: Vec<CostRun> = Vec::new();
+        for row in 0..side * side {
+            let (y, z) = (row % side, row / side);
+            let checked = [y, z].iter().any(|&c| c < radius || c + radius >= side);
+            let class = u8::from(checked);
+            match runs.last_mut() {
+                Some(run) if run.class == class => run.len += side,
+                _ => runs.push(CostRun { len: side, class }),
+            }
         }
+        runs
+    }
 
-        // Non-vacuity: the two rules DO diverge below that length, or the equality
-        // above is a tautology and this test pins nothing. 64³ is the case the
-        // second floor exists for — the elementwise class holds at 2048 while the
-        // stencil class falls to 1024, which is twice the chunks and exactly the
-        // measured win.
-        assert!(SMALL < converged);
-        assert_eq!(map_grain(SMALL), MIN_GRAIN);
-        assert_eq!(indexed_grain(SMALL), MIN_GRAIN_INDEXED);
-        assert_ne!(
-            boundaries(SMALL, indexed_grain(SMALL)),
-            boundaries(SMALL, map_grain(SMALL)),
-            "the floors must differ at 64³, or the no-op above is vacuous"
+    /// Which run of the partition index `at` falls in.
+    fn run_at(runs: &[CostRun], at: usize) -> (CostRun, usize) {
+        let mut seen = 0usize;
+        for r in runs {
+            seen += r.len;
+            if at < seen {
+                return (*r, seen);
+            }
+        }
+        panic!("index {at} is outside the partition");
+    }
+
+    /// **The straggler, as integers.** The equal-count chunker gives one task the whole
+    /// `z = 0` plane; the cost-class chunker cannot, because it never cuts across a class
+    /// and it splits each class by that class's own total.
+    ///
+    /// This is the defect `occupancy-result.md` measured — `c_max/wall` = 0.93–1.00, the
+    /// makespan *being* one boundary chunk — restated as the property that caused it, so
+    /// an edit that reintroduces it fails here rather than in a benchmark months later.
+    #[test]
+    fn no_chunk_holds_more_checked_pixels_than_the_checked_class_grain() {
+        let (side, radius) = (64usize, 2usize);
+        let runs = stencil_runs(side, radius);
+        let checked: usize = runs.iter().filter(|r| r.class == 1).map(|r| r.len).sum();
+        let class_grain = grain_floored(checked, GRAIN, 1);
+
+        let chunks = cost_chunks(&runs);
+        assert_eq!(chunks.iter().sum::<usize>(), side * side * side);
+
+        let mut at = 0usize;
+        let mut worst_checked = 0usize;
+        for len in &chunks {
+            let (run, run_end) = run_at(&runs, at);
+            assert!(
+                at + len <= run_end,
+                "a chunk straddles two cost classes at index {at}"
+            );
+            if run.class == 1 {
+                worst_checked = worst_checked.max(*len);
+            }
+            at += len;
+        }
+        assert!(
+            worst_checked <= class_grain,
+            "a chunk holds {worst_checked} checked pixels, above the class grain {class_grain}"
+        );
+
+        // NON-VACUITY: the old equal-count rule really does hand one task a chunk that is
+        // *entirely* checked, or this pin guards against nothing. At 64³ the first 4096
+        // indices are the z = 0 plane, and a 2048 grain puts 2048 of them — all checked —
+        // in chunk 0, which is 16x the checked pixels the class rule allows in one chunk.
+        let flat = map_grain(side * side * side);
+        assert_eq!(flat, MIN_GRAIN);
+        assert!(
+            flat <= side * side,
+            "chunk 0 of the flat rule must be all-checked, or this pin is vacuous"
+        );
+        assert!(
+            flat > class_grain,
+            "the flat rule must give a bigger checked chunk ({flat}) than the class rule \
+             ({class_grain}), or the split changes nothing"
         );
     }
 
-    /// What the indexed floor buys at the volume it was derived for: 64³ is cut
-    /// into exactly `TARGET_TASKS` chunks — the count the rule asks for, which the
-    /// 2048 floor overrode down to 128.
+    /// Each class is split by its *own* total, which is what bounds `c_max` without ever
+    /// comparing the two costs — the property that keeps a cost constant out of this
+    /// module. The task count is bounded by the target plus one remainder per run.
     #[test]
-    fn the_indexed_pass_meets_the_task_target_at_the_smallest_bench_volume() {
-        assert_eq!(indexed_grain(SMALL), MIN_GRAIN_INDEXED);
-        assert_eq!(SMALL.div_ceil(indexed_grain(SMALL)), TARGET_TASKS);
+    fn each_cost_class_is_split_into_at_most_the_task_target() {
+        let runs = stencil_runs(64, 2);
+        let chunks = cost_chunks(&runs);
 
-        // And the elementwise/reduce class is untouched — same 128 tasks it had.
+        for class in [0u8, 1] {
+            let runs_of_class = runs.iter().filter(|r| r.class == class).count();
+            let mut at = 0usize;
+            let mut count = 0usize;
+            for len in &chunks {
+                if run_at(&runs, at).0.class == class {
+                    count += 1;
+                }
+                at += len;
+            }
+            assert!(
+                count <= TARGET_TASKS + runs_of_class,
+                "class {class}: {count} chunks, above the target {TARGET_TASKS} plus one \
+                 remainder per run ({runs_of_class})"
+            );
+        }
+    }
+
+    /// A one-class partition is the module's own grain rule, ceiling and all — the
+    /// cost-class chunker must not change a pass whose cost per index really is uniform,
+    /// and it must not emit chunks the flat rule would have refused.
+    ///
+    /// The ceiling is the half of the rule this test exists for. Dropping it measured
+    /// **1.41× slower** on `binary_dilate` at 256³: a 16.7 M class total asks for a
+    /// 65 536-element chunk, 16× what [`GRAIN`] allows, and cost-homogeneous chunks that
+    /// large are worse than heterogeneous small ones. Only the *floor* is dropped.
+    #[test]
+    fn a_single_class_partition_is_the_flat_grain_rule_without_the_floor() {
+        for &len in &[SMALL, MEDIUM, LARGE] {
+            let chunks = cost_chunks(&[CostRun { len, class: 0 }]);
+            let g = grain_floored(len, GRAIN, 1);
+            assert_eq!(chunks.iter().sum::<usize>(), len);
+            assert_eq!(chunks.len(), len.div_ceil(g));
+            assert!(
+                chunks.iter().all(|&c| c <= GRAIN),
+                "a chunk exceeds the ceiling"
+            );
+        }
+
+        // At and above the length where the elementwise floor stops binding, the one-class
+        // partition emits exactly the flat rule's chunks — so this change cannot move a
+        // uniform-cost pass at medium or large.
+        for &len in &[TARGET_TASKS * MIN_GRAIN, MEDIUM, LARGE] {
+            assert_eq!(
+                cost_chunks(&[CostRun { len, class: 0 }]).len(),
+                len.div_ceil(map_grain(len)),
+                "the one-class partition differs from the flat rule at len = {len}"
+            );
+        }
+
+        // Non-vacuity: at 64³ the floor DOES bind the flat rule (2048) while the partition
+        // asks for 1024, so the equality above is not a tautology.
         assert_eq!(map_grain(SMALL), MIN_GRAIN);
-        assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128);
-        assert_eq!(reduce_grain(SMALL), MIN_GRAIN);
-        assert_eq!(SMALL.div_ceil(reduce_grain(SMALL)), 128);
+        assert_ne!(
+            cost_chunks(&[CostRun {
+                len: SMALL,
+                class: 0
+            }])
+            .len(),
+            SMALL.div_ceil(map_grain(SMALL))
+        );
     }
 
     /// The three bench volumes, cubic, as `for_each_line_mut` sees them.

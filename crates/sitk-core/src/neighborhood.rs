@@ -758,8 +758,9 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         I: Fn() -> S + Sync + Send,
         F: Fn(&mut S, &[usize], WindowView<'_, T>) -> R + Sync + Send,
     {
-        parallel::map_indexed_init(
+        parallel::map_indexed_init_by_cost(
             self.view.image().number_of_pixels(),
+            &self.cost_runs(),
             || self.window_state(init()),
             |state, i| self.window_at(state, i, &f),
         )
@@ -809,11 +810,69 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
             self.view.image().number_of_pixels(),
             "par_map_window_into: the destination must hold one element per pixel"
         );
-        parallel::map_indexed_init_into(
+        parallel::map_indexed_init_into_by_cost(
             dst,
+            &self.cost_runs(),
             || self.window_state(init()),
             |state, i| self.window_at(state, i, &f),
         );
+    }
+
+    /// The **cost-class partition** of this walk's index space — the thing the
+    /// chunker in [`crate::parallel`] cannot derive for itself.
+    ///
+    /// A window pass has two costs per pixel, not one. [`Self::window_view`]
+    /// borrows the image when the window is interior and *materializes* it
+    /// through the boundary condition when it overhangs, and the second path
+    /// measures ~8× the first (~1.0 µs against ~130 ns, 5³ window). Those pixels
+    /// are not scattered: with dimension 0 fastest, a **row** is entirely on the
+    /// checked path whenever any coordinate above dimension 0 is within `radius`
+    /// of an edge, and every other row is interior except `radius[0]` pixels at
+    /// each end — the *same* count for every such row. So the index space is two
+    /// classes, uniform within each, and this function names them:
+    ///
+    /// - class 1 — a **checked row**: every pixel materializes.
+    /// - class 0 — a **mixed row**: `size[0] - 2*radius[0]` interior pixels and a
+    ///   fixed `2*radius[0]` checked ones, the same in every row of the class.
+    ///
+    /// Consecutive rows of a class merge into one run, so this returns ~3 runs
+    /// per slowest-dimension plane, not one per row.
+    ///
+    /// Handing this to [`parallel::map_indexed_init_by_cost`] is what stops one
+    /// task from being handed the entire `z = 0` plane — which, measured, *was*
+    /// the wall: the longest chunk of a 64³ pass was 0.93–1.00 of the whole pass.
+    /// See that function for the bound this buys and why it needs no cost
+    /// constant.
+    fn cost_runs(&self) -> Vec<parallel::CostRun> {
+        let size = self.view.image().size();
+        let n = self.view.image().number_of_pixels();
+        let row_len = size.first().copied().unwrap_or(0);
+        if n == 0 || row_len == 0 {
+            return Vec::new();
+        }
+        // A row has interior pixels at all only if the window fits along
+        // dimension 0; if it does not, every pixel in every row is checked.
+        let row_has_interior = row_len > 2 * self.radius[0];
+
+        let mut runs: Vec<parallel::CostRun> = Vec::new();
+        for row in 0..n / row_len {
+            let mut rest = row;
+            let mut checked = !row_has_interior;
+            for (&s, &r) in size.iter().zip(self.radius.iter()).skip(1) {
+                let c = rest % s;
+                rest /= s;
+                checked |= c < r || c + r >= s;
+            }
+            let class = u8::from(checked);
+            match runs.last_mut() {
+                Some(run) if run.class == class => run.len += row_len,
+                _ => runs.push(parallel::CostRun {
+                    len: row_len,
+                    class,
+                }),
+            }
+        }
+        runs
     }
 
     /// The per-task scratch both window passes hand to the fill loop.
@@ -890,8 +949,12 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     {
         let size = self.view.image().size();
         let dim = size.len();
-        parallel::map_indexed_init(
+        parallel::map_indexed_init_by_cost(
             self.view.image().number_of_pixels(),
+            // The same two cost classes the zero-copy pass has: `refill` picks
+            // the fast or the checked path per pixel exactly as `window_view`
+            // does. See `cost_runs`.
+            &self.cost_runs(),
             // `nd` joins the center and the window buffer as per-task storage:
             // `refill` consults the boundary condition per pixel, and a buffer
             // allocated in there would be allocated once per pixel. See
