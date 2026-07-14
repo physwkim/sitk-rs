@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,348 tests** on the CPU, **3,422** with the CUDA
+> implemented and tested — **3,369 tests** on the CPU, **3,469** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -175,23 +175,29 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   walk exactly the same valid points — fixed mask 59,647 on both, moving mask
   59,617 on both, virtual domain 31,124 on both, both together 12,489 on both, 25
   iterations either way.
-- **That equality has one measured exception, and it is stated rather than
-  claimed away.** The device recovers the transform's affine by *probing* it
-  (`b = T(0)`, `A[:,e] = T(e_e) − b`), which lands ~1e-14 from the host's own
-  arithmetic — fine for the metric's continuous quantities, and **not** fine for
-  its three discrete ones (`floor` picks the cell, `is_inside` decides validity,
-  `round` picks the mask voxel). Constructed deliberately and measured: with a
-  face of samples placed on the buffer boundary under a **z-rotation**, 3 of 17
-  ulp-swept poses disagree about `valid_points` by 16 samples; with a moving-mask
-  wall on a half-integer, 4 of 17 disagree by 16, *in the opposite direction*.
-  Under a pure **translation** the probe recovers the identity exactly and both
-  paths agree bit for bit. So the honest contract today is "`valid_points` is
-  exact except at poses where a sample lands within ~1e-14 of the buffer boundary
-  or of a mask rounding tie" (`cuda_boundary.rs`). This is a **port-side** gap,
-  not the interpolant property of §2.158, and it is closable: taking `A`/`b` from
-  the transform's stored matrix and offset instead of probing them makes the
-  device's continuous index bit-identical to the host's, which removes all three
-  exposures by construction. That work is in flight.
+- **That equality holds because the device computes the host's continuous index,
+  bit for bit — not because it computes one close to it.** The device replays the
+  transform's own point-map **stages** (each stage's stored matrix and offset,
+  applied in the host's application order, rounding once per stage — folding two
+  stages into `G·F` is algebraically identical and is pinned to *disagree on the
+  bits*, so the stage list is not ceremony). Pinned by `to_bits()` equality at
+  every sample of 240 random poses across six transform families, a three-stage
+  composite among them. This matters because the metric has three **discrete**
+  consumers of that index — `floor` picks the cell, `is_inside` decides validity,
+  `round` picks the mask voxel — and a discrete output has no tolerance to spend.
+  An earlier design *probed* the affine instead (`b = T(0)`, `A[:,e] = T(e_e) − b`),
+  landing ~1e-14 away, and it was measurably wrong: with a face of samples on the
+  buffer boundary under a z-rotation, **3 of 17** ulp-swept poses disagreed about
+  `valid_points` by 16 samples, and with a moving-mask wall on a half-integer,
+  **4 of 17** disagreed by 16 in the *opposite* direction. Both sweeps now
+  disagree at **0 of 17** while still crossing the boundary (`cuda_boundary.rs`).
+  The cost is named rather than hidden: **`ScaleTransform` and
+  `ScaleLogarithmicTransform` evaluate `(p − c)·s + c`, have no bitwise
+  matrix/offset form, and are now refused from the device metric by name**
+  (`NoBitwisePointMap`) instead of being approximated — the refusal test proves
+  both halves, that the probed form did reproduce `transform_point` to 1e-9 (so
+  the old code accepted it) and did not reproduce it on the bits (so accepting it
+  was wrong).
 - **On a sampled run the device does not draw.** `FixedSamples::from_image_with`
   stays the single owner of *which voxels*, and the device is handed its flat-index
   list (8 bytes per sample, and the kernel derives the point from the same closed
@@ -232,8 +238,8 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,348), with it **on** (3,422), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,422) — a machine with no GPU is a supported configuration, not a crash.
+(3,369), with it **on** (3,469), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,469) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -337,8 +343,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,348 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,422, needs CUDA 13
+cargo nextest run --workspace                        # 3,369 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,469, needs CUDA 13
 ```
 
 License: Apache-2.0.
