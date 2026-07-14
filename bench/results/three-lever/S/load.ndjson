@@ -1,0 +1,1037 @@
+{"t": 1784029725.2955651, "busy": 90.16, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029727.3413866, "busy": 90.1, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029729.4070385, "busy": 90.0, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029731.464702, "busy": 88.13, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029733.5156908, "busy": 86.95, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029735.5525599, "busy": 59.4, "foreign": ["cargo", "cargo-nextest"]}
+{"t": 1784029737.5974936, "busy": 4.14, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029739.645875, "busy": 5.5, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029741.6953604, "busy": 9.84, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029743.759885, "busy": 61.97, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029745.8131642, "busy": 92.83, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029747.8680966, "busy": 92.19, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029749.9178374, "busy": 92.06, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029752.0067005, "busy": 91.62, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029754.0534506, "busy": 91.56, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029756.1077955, "busy": 92.01, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029758.18734, "busy": 91.34, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029760.2912858, "busy": 91.31, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029762.3697813, "busy": 91.03, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029764.447528, "busy": 90.81, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029766.4931228, "busy": 90.2, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029768.5511754, "busy": 90.86, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029770.6143515, "busy": 90.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029772.6725514, "busy": 90.99, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029774.7329955, "busy": 90.26, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029776.7807832, "busy": 90.61, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029778.8459396, "busy": 90.27, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029780.8891487, "busy": 90.37, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029782.9595444, "busy": 90.22, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029785.0388117, "busy": 90.93, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029787.1002743, "busy": 89.88, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029789.1504755, "busy": 89.64, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029791.1970737, "busy": 90.38, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029793.244222, "busy": 90.11, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029795.2866437, "busy": 89.94, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029797.3317742, "busy": 90.05, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029799.3804529, "busy": 89.71, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029801.4286666, "busy": 90.23, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029803.478001, "busy": 88.16, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029805.5279799, "busy": 87.25, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029807.5704005, "busy": 35.93, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029809.6121182, "busy": 3.69, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029811.66084, "busy": 8.58, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029813.757715, "busy": 26.0, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029815.898894, "busy": 91.11, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029817.9470859, "busy": 92.85, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029819.9959116, "busy": 92.18, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029822.0558088, "busy": 92.48, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029824.111781, "busy": 91.74, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029826.1784623, "busy": 91.17, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029828.2297194, "busy": 91.79, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029830.2932963, "busy": 90.87, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029832.35535, "busy": 90.74, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029834.4098144, "busy": 90.59, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029836.4535775, "busy": 90.24, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029838.507338, "busy": 90.8, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029840.5656796, "busy": 90.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029842.62245, "busy": 90.61, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029844.670993, "busy": 90.43, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029846.7362638, "busy": 90.95, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029848.791501, "busy": 90.41, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029850.8466387, "busy": 90.14, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029852.9083622, "busy": 90.01, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029854.9703746, "busy": 90.45, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029857.0217702, "busy": 90.14, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029859.0782597, "busy": 89.54, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029861.1345234, "busy": 89.33, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029863.1814134, "busy": 90.37, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029865.2449198, "busy": 89.63, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029867.2949128, "busy": 89.99, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029869.3536336, "busy": 90.04, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029871.3998039, "busy": 89.61, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029873.4429219, "busy": 87.43, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029875.490534, "busy": 87.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029877.5294003, "busy": 54.9, "foreign": ["cargo-nextest"]}
+{"t": 1784029879.5782745, "busy": 3.91, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029881.6232152, "busy": 5.96, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029883.6705215, "busy": 10.23, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029885.7639728, "busy": 61.47, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029887.8284285, "busy": 91.79, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029889.8939924, "busy": 92.65, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029891.9493835, "busy": 92.45, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029893.9945488, "busy": 91.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029896.0459054, "busy": 91.77, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029898.1665998, "busy": 91.31, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029900.233851, "busy": 90.69, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029902.285914, "busy": 91.29, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029904.368253, "busy": 90.78, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029906.4298644, "busy": 90.24, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029908.5139964, "busy": 90.33, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029910.572777, "busy": 90.67, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029912.6192226, "busy": 90.54, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029914.6685922, "busy": 90.34, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029916.7221289, "busy": 90.39, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029918.7694662, "busy": 90.35, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029920.819038, "busy": 90.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029922.8776758, "busy": 90.82, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029924.9403703, "busy": 90.39, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029926.9914865, "busy": 90.59, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029929.0355341, "busy": 90.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029931.083662, "busy": 89.17, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029933.1388996, "busy": 90.03, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029935.2075086, "busy": 89.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029937.2596965, "busy": 89.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029939.309709, "busy": 89.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029941.3563468, "busy": 89.95, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029943.4135416, "busy": 89.78, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029945.4645836, "busy": 86.9, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029947.505603, "busy": 86.4, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029949.5454438, "busy": 42.24, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029951.5952044, "busy": 4.6, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029953.6468098, "busy": 7.52, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029955.7087197, "busy": 16.41, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029957.75518, "busy": 91.75, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029959.802534, "busy": 92.57, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029961.8565304, "busy": 92.18, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784029963.9185266, "busy": 91.89, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029965.9727979, "busy": 91.66, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029968.026125, "busy": 91.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029970.1338015, "busy": 91.49, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029972.1918044, "busy": 90.79, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029974.251424, "busy": 91.2, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029976.3137395, "busy": 91.26, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029978.4141922, "busy": 90.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029980.4881043, "busy": 91.06, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029982.5363245, "busy": 90.02, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029984.6118882, "busy": 90.76, "foreign": ["cargo", "cargo-clippy", "cargo-nextest", "device_pipeline"]}
+{"t": 1784029986.6572757, "busy": 90.38, "foreign": ["cargo", "cargo-clippy", "cargo-nextest", "device_pipeline"]}
+{"t": 1784029988.7169771, "busy": 90.15, "foreign": ["cargo", "cargo-clippy", "cargo-nextest", "device_pipeline"]}
+{"t": 1784029990.766202, "busy": 90.17, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784029992.8234382, "busy": 90.16, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784029994.8693426, "busy": 89.55, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784029996.9471164, "busy": 90.65, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784029999.0073404, "busy": 89.81, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030001.0610697, "busy": 90.2, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030003.1214082, "busy": 90.11, "foreign": ["cargo", "cargo-nextest", "device_pipeline"]}
+{"t": 1784030005.1727638, "busy": 90.06, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030007.2345436, "busy": 90.14, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030009.2801006, "busy": 89.68, "foreign": ["cargo", "cargo-nextest", "device_pipeline"]}
+{"t": 1784030011.3398397, "busy": 89.92, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030013.3932555, "busy": 89.76, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030015.4486752, "busy": 86.87, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030017.4988663, "busy": 87.02, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "rustc"]}
+{"t": 1784030019.5363936, "busy": 85.38, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030021.575357, "busy": 36.92, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030023.617604, "busy": 4.49, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030025.6536167, "busy": 8.58, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030027.6983314, "busy": 16.48, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030029.7394884, "busy": 90.5, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030031.800047, "busy": 92.33, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030033.8458047, "busy": 91.61, "foreign": ["cargo", "cargo-nextest", "device_pipeline", "mattes_device-c", "rustc"]}
+{"t": 1784030035.8973033, "busy": 91.58, "foreign": ["cargo", "cargo-nextest", "device_pipeline"]}
+{"t": 1784030037.958351, "busy": 92.11, "foreign": ["cargo", "cargo-nextest", "device_pipeline"]}
+{"t": 1784030040.0098672, "busy": 90.71, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030042.0900986, "busy": 91.22, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030044.1315446, "busy": 91.31, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030046.1773167, "busy": 90.0, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030048.2314672, "busy": 90.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030050.292644, "busy": 90.68, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030052.3765264, "busy": 90.04, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030054.4205337, "busy": 90.76, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030056.5043728, "busy": 90.55, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030058.5629938, "busy": 89.98, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030060.622506, "busy": 90.71, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030062.7023282, "busy": 90.13, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030064.7506907, "busy": 90.19, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030066.8411555, "busy": 90.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030068.8960648, "busy": 89.82, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030070.9601471, "busy": 90.58, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030073.0057156, "busy": 90.17, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030075.0697901, "busy": 89.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030077.126312, "busy": 89.56, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030079.1734192, "busy": 89.65, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030081.228508, "busy": 89.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030083.2746537, "busy": 89.78, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030085.321839, "busy": 89.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030087.375035, "busy": 89.72, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030089.418464, "busy": 87.79, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030091.4612513, "busy": 83.57, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030093.5096762, "busy": 34.39, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030095.552155, "busy": 3.95, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030097.6009965, "busy": 7.78, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030099.6519842, "busy": 27.01, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030101.7036018, "busy": 90.99, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030103.7605991, "busy": 92.61, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030105.812425, "busy": 91.93, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030107.859204, "busy": 91.6, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030109.9133275, "busy": 90.7, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030111.963118, "busy": 90.87, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030114.0185623, "busy": 91.02, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030116.0840216, "busy": 91.04, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030118.1352587, "busy": 90.52, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030120.2100813, "busy": 90.56, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030122.256093, "busy": 90.22, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030124.3075442, "busy": 90.81, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030126.4701436, "busy": 90.53, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030128.5112712, "busy": 90.67, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030130.565143, "busy": 90.14, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030132.6156406, "busy": 90.21, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030134.6721017, "busy": 90.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030136.7275474, "busy": 90.12, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030138.7778232, "busy": 90.0, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030140.8424506, "busy": 90.23, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030142.8897576, "busy": 90.02, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030144.9347365, "busy": 90.16, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030146.9788954, "busy": 89.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030149.0354202, "busy": 90.09, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030151.0933185, "busy": 89.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030153.1496036, "busy": 89.35, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030155.1997194, "busy": 89.81, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030157.264381, "busy": 89.97, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030159.3181396, "busy": 87.16, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030161.358465, "busy": 84.91, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030163.4118576, "busy": 51.32, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030165.4516852, "busy": 3.94, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030167.498138, "busy": 6.12, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030169.5491424, "busy": 10.87, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030171.5948603, "busy": 75.76, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030173.6571956, "busy": 92.06, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030175.7275429, "busy": 92.07, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030177.885739, "busy": 92.57, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030179.9492514, "busy": 91.67, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030182.0408144, "busy": 91.69, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030184.1542346, "busy": 91.49, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030186.212704, "busy": 91.45, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030188.3311799, "busy": 91.56, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030190.4040709, "busy": 90.9, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030192.4687726, "busy": 91.25, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030194.5157425, "busy": 90.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030196.563052, "busy": 90.61, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030198.6180463, "busy": 90.73, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030200.678107, "busy": 90.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030202.7241077, "busy": 90.64, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030204.7822762, "busy": 90.41, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030206.8321989, "busy": 90.32, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030208.892653, "busy": 90.52, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030210.949006, "busy": 90.47, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030213.0025399, "busy": 90.31, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030215.0481796, "busy": 89.85, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030217.0939858, "busy": 90.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030219.1575332, "busy": 89.91, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030221.2107513, "busy": 89.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030223.2633746, "busy": 90.33, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030225.3076258, "busy": 90.1, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030227.3547914, "busy": 89.82, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030229.398949, "busy": 88.95, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030231.444362, "busy": 87.27, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030233.4879959, "busy": 80.1, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030235.5379004, "busy": 25.9, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030237.585828, "busy": 3.77, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030239.6330516, "busy": 8.4, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030241.7178981, "busy": 20.64, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030243.8039243, "busy": 91.1, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030270.0489206, "busy": 90.29, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030272.093349, "busy": 90.22, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030274.1588047, "busy": 90.74, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030276.2008097, "busy": 90.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030278.2416606, "busy": 90.33, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030280.2916343, "busy": 89.68, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030282.3408809, "busy": 90.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030284.3849194, "busy": 90.4, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030286.442389, "busy": 90.32, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030288.487698, "busy": 89.14, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030290.5394242, "busy": 90.32, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030292.5919898, "busy": 90.01, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030294.6337557, "busy": 89.83, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030296.6924677, "busy": 89.8, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030298.7639146, "busy": 89.53, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030300.8090644, "busy": 89.53, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030302.8542924, "busy": 87.37, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030304.8946652, "busy": 86.5, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030306.9366076, "busy": 28.78, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030308.9763007, "busy": 3.78, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030311.0265505, "busy": 8.58, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030313.0746922, "busy": 20.03, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030315.13266, "busy": 91.5, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030317.1910179, "busy": 92.69, "foreign": ["cargo-nextest", "device_pipeline", "mattes_device-c"]}
+{"t": 1784030319.2424192, "busy": 92.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030321.292728, "busy": 92.28, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030323.3955598, "busy": 91.34, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030325.439379, "busy": 91.84, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030327.498386, "busy": 91.55, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030329.6280816, "busy": 91.19, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030331.6714044, "busy": 91.07, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030333.8040287, "busy": 90.99, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030335.8621922, "busy": 90.85, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030337.9197073, "busy": 91.09, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030340.0020018, "busy": 90.89, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030342.0639012, "busy": 90.65, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030344.1206954, "busy": 91.39, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030346.1683793, "busy": 90.98, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030348.2202291, "busy": 90.46, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030350.2685409, "busy": 90.44, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030352.327413, "busy": 91.12, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030354.3697772, "busy": 90.92, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030356.423151, "busy": 90.56, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030358.4766285, "busy": 90.4, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030360.5220761, "busy": 89.61, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030362.567601, "busy": 89.47, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030364.619364, "busy": 89.91, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030366.6802733, "busy": 89.72, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030368.723777, "busy": 90.13, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030370.7739768, "busy": 90.68, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030372.8291361, "busy": 87.98, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030374.8811827, "busy": 87.38, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030376.9194353, "busy": 75.83, "foreign": ["cargo-nextest", "device_pipeline"]}
+{"t": 1784030378.9606247, "busy": 12.73, "foreign": []}
+{"t": 1784030381.0002615, "busy": 2.47, "foreign": []}
+{"t": 1784030383.0440285, "busy": 2.2, "foreign": []}
+{"t": 1784030385.0834553, "busy": 2.09, "foreign": []}
+{"t": 1784030387.1264236, "busy": 2.21, "foreign": []}
+{"t": 1784030389.164029, "busy": 2.4, "foreign": []}
+{"t": 1784030391.203479, "busy": 2.12, "foreign": []}
+{"t": 1784030393.2485654, "busy": 2.17, "foreign": []}
+{"t": 1784030395.2953634, "busy": 43.13, "foreign": []}
+{"t": 1784030397.340401, "busy": 91.85, "foreign": []}
+{"t": 1784030399.3882263, "busy": 80.69, "foreign": []}
+{"t": 1784030401.4379194, "busy": 78.14, "foreign": []}
+{"t": 1784030403.476967, "busy": 68.61, "foreign": []}
+{"t": 1784030405.5214806, "busy": 56.76, "foreign": []}
+{"t": 1784030407.577615, "busy": 52.78, "foreign": []}
+{"t": 1784030409.6292508, "busy": 45.77, "foreign": []}
+{"t": 1784030411.6935508, "busy": 54.26, "foreign": []}
+{"t": 1784030413.7539215, "busy": 64.19, "foreign": []}
+{"t": 1784030415.814633, "busy": 69.46, "foreign": []}
+{"t": 1784030417.8689177, "busy": 67.15, "foreign": []}
+{"t": 1784030419.9247699, "busy": 39.33, "foreign": []}
+{"t": 1784030421.9721575, "busy": 43.57, "foreign": []}
+{"t": 1784030424.0379815, "busy": 81.98, "foreign": []}
+{"t": 1784030426.0883954, "busy": 45.18, "foreign": []}
+{"t": 1784030428.139889, "busy": 17.85, "foreign": []}
+{"t": 1784030430.2154357, "busy": 78.27, "foreign": []}
+{"t": 1784030432.276043, "busy": 77.03, "foreign": []}
+{"t": 1784030434.336761, "busy": 69.31, "foreign": []}
+{"t": 1784030436.3834643, "busy": 15.93, "foreign": []}
+{"t": 1784030438.4310894, "busy": 1.78, "foreign": []}
+{"t": 1784030440.475235, "busy": 1.92, "foreign": []}
+{"t": 1784030442.5218334, "busy": 2.07, "foreign": []}
+{"t": 1784030444.5692525, "busy": 2.02, "foreign": []}
+{"t": 1784030446.6148229, "busy": 1.8, "foreign": []}
+{"t": 1784030448.6612756, "busy": 1.85, "foreign": []}
+{"t": 1784030450.7370305, "busy": 35.34, "foreign": []}
+{"t": 1784030452.8106902, "busy": 91.47, "foreign": []}
+{"t": 1784030454.8752363, "busy": 81.5, "foreign": []}
+{"t": 1784030456.94314, "busy": 77.7, "foreign": []}
+{"t": 1784030458.9919832, "busy": 76.05, "foreign": []}
+{"t": 1784030461.0484407, "busy": 51.66, "foreign": []}
+{"t": 1784030463.1022522, "busy": 54.21, "foreign": []}
+{"t": 1784030465.1601336, "busy": 44.64, "foreign": []}
+{"t": 1784030467.2195816, "busy": 49.56, "foreign": []}
+{"t": 1784030469.280292, "busy": 61.56, "foreign": []}
+{"t": 1784030471.3416748, "busy": 68.33, "foreign": []}
+{"t": 1784030473.4041228, "busy": 73.15, "foreign": []}
+{"t": 1784030475.4574428, "busy": 47.47, "foreign": []}
+{"t": 1784030477.505801, "busy": 38.51, "foreign": []}
+{"t": 1784030479.570885, "busy": 65.92, "foreign": []}
+{"t": 1784030481.6254292, "busy": 75.77, "foreign": []}
+{"t": 1784030483.676638, "busy": 16.94, "foreign": []}
+{"t": 1784030485.7504003, "busy": 44.19, "foreign": []}
+{"t": 1784030487.8102562, "busy": 85.98, "foreign": []}
+{"t": 1784030489.8706853, "busy": 70.71, "foreign": []}
+{"t": 1784030491.9200366, "busy": 40.5, "foreign": []}
+{"t": 1784030493.9690828, "busy": 1.72, "foreign": []}
+{"t": 1784030496.0173793, "busy": 1.86, "foreign": []}
+{"t": 1784030498.0647755, "busy": 2.09, "foreign": []}
+{"t": 1784030500.1087759, "busy": 1.95, "foreign": []}
+{"t": 1784030502.1553473, "busy": 1.83, "foreign": []}
+{"t": 1784030504.2024732, "busy": 1.82, "foreign": []}
+{"t": 1784030506.267779, "busy": 3.06, "foreign": []}
+{"t": 1784030508.3451214, "busy": 91.61, "foreign": []}
+{"t": 1784030510.409227, "busy": 82.92, "foreign": []}
+{"t": 1784030512.4789844, "busy": 81.99, "foreign": []}
+{"t": 1784030514.536223, "busy": 89.01, "foreign": []}
+{"t": 1784030516.5960104, "busy": 64.34, "foreign": []}
+{"t": 1784030518.6497254, "busy": 66.98, "foreign": []}
+{"t": 1784030520.7103596, "busy": 64.59, "foreign": []}
+{"t": 1784030522.7747438, "busy": 81.18, "foreign": []}
+{"t": 1784030524.8325377, "busy": 77.98, "foreign": []}
+{"t": 1784030526.8940802, "busy": 69.15, "foreign": []}
+{"t": 1784030528.950786, "busy": 59.23, "foreign": []}
+{"t": 1784030531.0055916, "busy": 55.89, "foreign": []}
+{"t": 1784030533.0707276, "busy": 76.5, "foreign": []}
+{"t": 1784030535.1228101, "busy": 59.06, "foreign": []}
+{"t": 1784030537.1730094, "busy": 18.08, "foreign": []}
+{"t": 1784030539.2515366, "busy": 63.59, "foreign": []}
+{"t": 1784030541.3122663, "busy": 83.44, "foreign": []}
+{"t": 1784030543.372998, "busy": 72.54, "foreign": []}
+{"t": 1784030545.4197543, "busy": 26.17, "foreign": []}
+{"t": 1784030547.4678817, "busy": 1.74, "foreign": []}
+{"t": 1784030549.5147686, "busy": 1.59, "foreign": []}
+{"t": 1784030551.5640862, "busy": 1.8, "foreign": []}
+{"t": 1784030553.613151, "busy": 1.78, "foreign": []}
+{"t": 1784030555.6627417, "busy": 2.0, "foreign": []}
+{"t": 1784030557.7103128, "busy": 1.58, "foreign": []}
+{"t": 1784030559.779168, "busy": 21.44, "foreign": []}
+{"t": 1784030561.8557434, "busy": 91.68, "foreign": []}
+{"t": 1784030563.9182312, "busy": 80.01, "foreign": []}
+{"t": 1784030565.985068, "busy": 79.03, "foreign": []}
+{"t": 1784030568.039955, "busy": 69.73, "foreign": []}
+{"t": 1784030570.0945728, "busy": 57.2, "foreign": []}
+{"t": 1784030572.1468933, "busy": 53.22, "foreign": []}
+{"t": 1784030574.2024605, "busy": 44.71, "foreign": []}
+{"t": 1784030576.260121, "busy": 56.37, "foreign": []}
+{"t": 1784030578.318866, "busy": 60.19, "foreign": []}
+{"t": 1784030580.3803134, "busy": 72.22, "foreign": []}
+{"t": 1784030582.4341748, "busy": 67.33, "foreign": []}
+{"t": 1784030584.489777, "busy": 36.89, "foreign": []}
+{"t": 1784030586.5539904, "busy": 48.12, "foreign": []}
+{"t": 1784030588.618635, "busy": 82.13, "foreign": []}
+{"t": 1784030590.6704504, "busy": 23.73, "foreign": []}
+{"t": 1784030592.7209947, "busy": 14.07, "foreign": []}
+{"t": 1784030594.7960398, "busy": 77.8, "foreign": []}
+{"t": 1784030596.85628, "busy": 83.14, "foreign": []}
+{"t": 1784030598.915405, "busy": 68.58, "foreign": []}
+{"t": 1784030600.9628158, "busy": 34.02, "foreign": []}
+{"t": 1784030603.0094428, "busy": 1.97, "foreign": []}
+{"t": 1784030605.0557253, "busy": 2.0, "foreign": []}
+{"t": 1784030607.1053398, "busy": 2.26, "foreign": []}
+{"t": 1784030609.1522563, "busy": 1.87, "foreign": []}
+{"t": 1784030611.201855, "busy": 1.78, "foreign": []}
+{"t": 1784030613.2498167, "busy": 2.14, "foreign": []}
+{"t": 1784030615.326889, "busy": 10.48, "foreign": []}
+{"t": 1784030617.396043, "busy": 91.31, "foreign": []}
+{"t": 1784030619.4596033, "busy": 81.47, "foreign": []}
+{"t": 1784030621.5250614, "busy": 78.2, "foreign": []}
+{"t": 1784030623.5714629, "busy": 78.03, "foreign": []}
+{"t": 1784030625.6272774, "busy": 49.61, "foreign": []}
+{"t": 1784030627.681536, "busy": 54.8, "foreign": []}
+{"t": 1784030629.7361372, "busy": 45.67, "foreign": []}
+{"t": 1784030631.797646, "busy": 48.94, "foreign": []}
+{"t": 1784030633.8538094, "busy": 57.09, "foreign": []}
+{"t": 1784030635.8974452, "busy": 55.62, "foreign": []}
+{"t": 1784030637.9598267, "busy": 69.66, "foreign": []}
+{"t": 1784030640.0138474, "busy": 57.78, "foreign": []}
+{"t": 1784030642.06767, "busy": 37.84, "foreign": []}
+{"t": 1784030644.133331, "busy": 52.43, "foreign": []}
+{"t": 1784030646.198482, "busy": 81.8, "foreign": []}
+{"t": 1784030648.2501204, "busy": 24.21, "foreign": []}
+{"t": 1784030650.3212306, "busy": 26.35, "foreign": []}
+{"t": 1784030652.3968728, "busy": 93.84, "foreign": []}
+{"t": 1784030654.4572067, "busy": 67.42, "foreign": []}
+{"t": 1784030656.5066898, "busy": 60.85, "foreign": []}
+{"t": 1784030658.5576336, "busy": 1.6, "foreign": []}
+{"t": 1784030660.605054, "busy": 1.8, "foreign": []}
+{"t": 1784030662.6539526, "busy": 1.66, "foreign": []}
+{"t": 1784030664.7028499, "busy": 1.54, "foreign": []}
+{"t": 1784030666.7478216, "busy": 1.68, "foreign": []}
+{"t": 1784030668.7946465, "busy": 1.84, "foreign": []}
+{"t": 1784030670.8400807, "busy": 1.82, "foreign": []}
+{"t": 1784030672.9178543, "busy": 63.45, "foreign": []}
+{"t": 1784030674.9814637, "busy": 86.23, "foreign": []}
+{"t": 1784030677.04458, "busy": 79.1, "foreign": []}
+{"t": 1784030679.1144366, "busy": 81.93, "foreign": []}
+{"t": 1784030681.1677525, "busy": 54.93, "foreign": []}
+{"t": 1784030683.222054, "busy": 56.66, "foreign": []}
+{"t": 1784030685.275519, "busy": 45.48, "foreign": []}
+{"t": 1784030687.33887, "busy": 49.76, "foreign": []}
+{"t": 1784030689.3949432, "busy": 58.83, "foreign": []}
+{"t": 1784030691.4558947, "busy": 62.58, "foreign": []}
+{"t": 1784030693.5161371, "busy": 73.15, "foreign": []}
+{"t": 1784030695.570089, "busy": 46.5, "foreign": []}
+{"t": 1784030697.6207044, "busy": 40.03, "foreign": []}
+{"t": 1784030699.6866798, "busy": 68.92, "foreign": []}
+{"t": 1784030701.736353, "busy": 64.75, "foreign": []}
+{"t": 1784030703.7871127, "busy": 16.96, "foreign": []}
+{"t": 1784030705.8610706, "busy": 58.23, "foreign": []}
+{"t": 1784030707.9225166, "busy": 89.24, "foreign": []}
+{"t": 1784030709.980715, "busy": 72.99, "foreign": []}
+{"t": 1784030712.0299592, "busy": 40.82, "foreign": []}
+{"t": 1784030714.0728307, "busy": 1.9, "foreign": []}
+{"t": 1784030716.1251698, "busy": 1.86, "foreign": []}
+{"t": 1784030718.1747632, "busy": 1.93, "foreign": []}
+{"t": 1784030720.2239618, "busy": 2.93, "foreign": []}
+{"t": 1784030722.2739084, "busy": 2.17, "foreign": []}
+{"t": 1784030724.325221, "busy": 2.31, "foreign": []}
+{"t": 1784030726.3889227, "busy": 4.3, "foreign": []}
+{"t": 1784030728.4687886, "busy": 91.57, "foreign": []}
+{"t": 1784030730.5324473, "busy": 82.79, "foreign": []}
+{"t": 1784030732.6038175, "busy": 81.09, "foreign": []}
+{"t": 1784030734.6666105, "busy": 89.77, "foreign": []}
+{"t": 1784030736.7278237, "busy": 62.35, "foreign": []}
+{"t": 1784030738.7886503, "busy": 67.14, "foreign": []}
+{"t": 1784030740.8455236, "busy": 67.53, "foreign": []}
+{"t": 1784030742.913286, "busy": 82.57, "foreign": []}
+{"t": 1784030744.975561, "busy": 80.33, "foreign": []}
+{"t": 1784030747.039055, "busy": 75.46, "foreign": []}
+{"t": 1784030749.098013, "busy": 63.39, "foreign": []}
+{"t": 1784030751.1517746, "busy": 57.84, "foreign": []}
+{"t": 1784030753.2148879, "busy": 74.93, "foreign": []}
+{"t": 1784030755.2661316, "busy": 68.29, "foreign": []}
+{"t": 1784030757.3203034, "busy": 20.72, "foreign": []}
+{"t": 1784030759.3962882, "busy": 53.03, "foreign": []}
+{"t": 1784030761.4568446, "busy": 86.73, "foreign": []}
+{"t": 1784030763.5171149, "busy": 69.26, "foreign": []}
+{"t": 1784030765.5671175, "busy": 50.58, "foreign": []}
+{"t": 1784030767.6167073, "busy": 2.94, "foreign": []}
+{"t": 1784030769.668029, "busy": 2.89, "foreign": []}
+{"t": 1784030771.719153, "busy": 2.83, "foreign": []}
+{"t": 1784030773.7692661, "busy": 2.62, "foreign": []}
+{"t": 1784030775.815719, "busy": 2.93, "foreign": []}
+{"t": 1784030777.8643925, "busy": 2.51, "foreign": []}
+{"t": 1784030779.9144194, "busy": 2.7, "foreign": []}
+{"t": 1784030781.9905658, "busy": 79.33, "foreign": []}
+{"t": 1784030784.052159, "busy": 84.43, "foreign": []}
+{"t": 1784030786.116218, "busy": 78.46, "foreign": []}
+{"t": 1784030788.1830115, "busy": 79.62, "foreign": []}
+{"t": 1784030790.239154, "busy": 54.18, "foreign": []}
+{"t": 1784030792.28745, "busy": 57.9, "foreign": []}
+{"t": 1784030794.3443928, "busy": 42.79, "foreign": []}
+{"t": 1784030796.400751, "busy": 45.87, "foreign": []}
+{"t": 1784030798.4617367, "busy": 59.56, "foreign": []}
+{"t": 1784030800.5236337, "busy": 61.81, "foreign": []}
+{"t": 1784030802.5885751, "busy": 73.23, "foreign": []}
+{"t": 1784030804.6429155, "busy": 48.91, "foreign": []}
+{"t": 1784030806.6948822, "busy": 39.68, "foreign": []}
+{"t": 1784030808.7584481, "busy": 65.99, "foreign": []}
+{"t": 1784030810.8105447, "busy": 68.93, "foreign": []}
+{"t": 1784030812.8627453, "busy": 17.62, "foreign": []}
+{"t": 1784030814.9421153, "busy": 52.6, "foreign": []}
+{"t": 1784030817.0013595, "busy": 84.19, "foreign": []}
+{"t": 1784030819.0621378, "busy": 69.05, "foreign": []}
+{"t": 1784030829.3804932, "busy": 1.98, "foreign": []}
+{"t": 1784030831.4275146, "busy": 2.22, "foreign": []}
+{"t": 1784030833.4743662, "busy": 2.52, "foreign": []}
+{"t": 1784030835.5226755, "busy": 2.11, "foreign": []}
+{"t": 1784030837.5671566, "busy": 2.02, "foreign": []}
+{"t": 1784030839.6168227, "busy": 2.3, "foreign": []}
+{"t": 1784030841.6654317, "busy": 2.55, "foreign": []}
+{"t": 1784030843.7348046, "busy": 53.16, "foreign": []}
+{"t": 1784030845.794982, "busy": 87.16, "foreign": []}
+{"t": 1784030847.8471243, "busy": 80.91, "foreign": []}
+{"t": 1784030849.8988206, "busy": 89.9, "foreign": []}
+{"t": 1784030851.939229, "busy": 68.44, "foreign": []}
+{"t": 1784030853.9857419, "busy": 68.76, "foreign": []}
+{"t": 1784030856.029446, "busy": 57.27, "foreign": []}
+{"t": 1784030858.0950372, "busy": 78.09, "foreign": []}
+{"t": 1784030860.1548376, "busy": 80.67, "foreign": []}
+{"t": 1784030862.207559, "busy": 74.04, "foreign": []}
+{"t": 1784030864.2691782, "busy": 61.71, "foreign": []}
+{"t": 1784030866.3202562, "busy": 61.05, "foreign": []}
+{"t": 1784030868.3866322, "busy": 81.22, "foreign": []}
+{"t": 1784030870.4392216, "busy": 48.45, "foreign": []}
+{"t": 1784030872.491103, "busy": 18.17, "foreign": []}
+{"t": 1784030874.5652363, "busy": 79.09, "foreign": []}
+{"t": 1784030876.6278296, "busy": 76.59, "foreign": []}
+{"t": 1784030878.6906095, "busy": 69.28, "foreign": []}
+{"t": 1784030880.7411685, "busy": 20.19, "foreign": []}
+{"t": 1784030882.789315, "busy": 2.5, "foreign": []}
+{"t": 1784030884.8347144, "busy": 2.07, "foreign": []}
+{"t": 1784030886.882826, "busy": 2.16, "foreign": []}
+{"t": 1784030888.9287705, "busy": 2.5, "foreign": []}
+{"t": 1784030890.974369, "busy": 2.14, "foreign": []}
+{"t": 1784030893.0204906, "busy": 2.41, "foreign": []}
+{"t": 1784030895.0955665, "busy": 31.07, "foreign": []}
+{"t": 1784030897.152548, "busy": 90.04, "foreign": []}
+{"t": 1784030899.2157545, "busy": 80.61, "foreign": []}
+{"t": 1784030901.2842288, "busy": 79.12, "foreign": []}
+{"t": 1784030903.3327389, "busy": 65.96, "foreign": []}
+{"t": 1784030905.3869169, "busy": 56.89, "foreign": []}
+{"t": 1784030907.443191, "busy": 48.68, "foreign": []}
+{"t": 1784030909.4947448, "busy": 45.23, "foreign": []}
+{"t": 1784030911.5546224, "busy": 59.46, "foreign": []}
+{"t": 1784030913.6161902, "busy": 62.67, "foreign": []}
+{"t": 1784030915.676319, "busy": 73.32, "foreign": []}
+{"t": 1784030917.7287803, "busy": 56.9, "foreign": []}
+{"t": 1784030919.782051, "busy": 39.55, "foreign": []}
+{"t": 1784030921.8481815, "busy": 53.94, "foreign": []}
+{"t": 1784030923.9121203, "busy": 81.2, "foreign": []}
+{"t": 1784030925.9629247, "busy": 20.9, "foreign": []}
+{"t": 1784030928.0355833, "busy": 35.69, "foreign": []}
+{"t": 1784030930.0861547, "busy": 90.42, "foreign": []}
+{"t": 1784030932.1463468, "busy": 68.03, "foreign": []}
+{"t": 1784030934.1959846, "busy": 53.33, "foreign": []}
+{"t": 1784030936.243337, "busy": 1.9, "foreign": []}
+{"t": 1784030938.2923343, "busy": 2.17, "foreign": []}
+{"t": 1784030940.3417468, "busy": 1.97, "foreign": []}
+{"t": 1784030942.390712, "busy": 1.75, "foreign": []}
+{"t": 1784030944.4372644, "busy": 2.0, "foreign": []}
+{"t": 1784030946.4830759, "busy": 1.75, "foreign": []}
+{"t": 1784030948.5307531, "busy": 1.72, "foreign": []}
+{"t": 1784030950.6107504, "busy": 73.74, "foreign": []}
+{"t": 1784030952.676533, "busy": 85.54, "foreign": []}
+{"t": 1784030954.7423239, "busy": 77.81, "foreign": []}
+{"t": 1784030956.8093348, "busy": 80.46, "foreign": []}
+{"t": 1784030958.867629, "busy": 55.71, "foreign": []}
+{"t": 1784030960.9234762, "busy": 57.3, "foreign": []}
+{"t": 1784030962.9794574, "busy": 46.8, "foreign": []}
+{"t": 1784030965.0355372, "busy": 44.79, "foreign": []}
+{"t": 1784030967.0970142, "busy": 61.65, "foreign": []}
+{"t": 1784030969.1585166, "busy": 63.77, "foreign": []}
+{"t": 1784030971.221734, "busy": 74.67, "foreign": []}
+{"t": 1784030973.2758787, "busy": 51.81, "foreign": []}
+{"t": 1784030975.3281758, "busy": 40.07, "foreign": []}
+{"t": 1784030977.3925605, "busy": 64.35, "foreign": []}
+{"t": 1784030979.447781, "busy": 74.54, "foreign": []}
+{"t": 1784030981.4991078, "busy": 17.58, "foreign": []}
+{"t": 1784030983.5739892, "busy": 48.37, "foreign": []}
+{"t": 1784030985.6357126, "busy": 85.62, "foreign": []}
+{"t": 1784030987.6956847, "busy": 69.17, "foreign": []}
+{"t": 1784030989.7470806, "busy": 41.46, "foreign": []}
+{"t": 1784030991.8013453, "busy": 2.21, "foreign": []}
+{"t": 1784030993.8503892, "busy": 2.31, "foreign": []}
+{"t": 1784030995.8981001, "busy": 1.89, "foreign": []}
+{"t": 1784030997.9472518, "busy": 2.08, "foreign": []}
+{"t": 1784030999.9946084, "busy": 1.85, "foreign": []}
+{"t": 1784031002.041981, "busy": 2.29, "foreign": []}
+{"t": 1784031004.0967739, "busy": 2.33, "foreign": []}
+{"t": 1784031006.1708536, "busy": 91.01, "foreign": []}
+{"t": 1784031008.2344685, "busy": 83.08, "foreign": []}
+{"t": 1784031010.3001666, "busy": 79.14, "foreign": []}
+{"t": 1784031012.354604, "busy": 80.68, "foreign": []}
+{"t": 1784031014.411292, "busy": 50.02, "foreign": []}
+{"t": 1784031016.4686024, "busy": 52.84, "foreign": []}
+{"t": 1784031018.5244672, "busy": 45.5, "foreign": []}
+{"t": 1784031020.582479, "busy": 58.99, "foreign": []}
+{"t": 1784031022.642676, "busy": 64.2, "foreign": []}
+{"t": 1784031024.7046626, "busy": 73.04, "foreign": []}
+{"t": 1784031026.7565706, "busy": 54.65, "foreign": []}
+{"t": 1784031028.8110483, "busy": 39.57, "foreign": []}
+{"t": 1784031030.8760653, "busy": 58.03, "foreign": []}
+{"t": 1784031032.9356878, "busy": 81.04, "foreign": []}
+{"t": 1784031034.9875886, "busy": 18.2, "foreign": []}
+{"t": 1784031037.0626886, "busy": 39.23, "foreign": []}
+{"t": 1784031039.1266248, "busy": 88.7, "foreign": []}
+{"t": 1784031041.1858919, "busy": 73.18, "foreign": []}
+{"t": 1784031043.2337284, "busy": 43.11, "foreign": []}
+{"t": 1784031045.285299, "busy": 1.97, "foreign": []}
+{"t": 1784031047.3336983, "busy": 2.33, "foreign": []}
+{"t": 1784031049.3821087, "busy": 2.15, "foreign": []}
+{"t": 1784031051.4317422, "busy": 2.02, "foreign": []}
+{"t": 1784031053.481221, "busy": 2.04, "foreign": []}
+{"t": 1784031055.5321155, "busy": 2.13, "foreign": []}
+{"t": 1784031057.601468, "busy": 1.97, "foreign": []}
+{"t": 1784031059.6773639, "busy": 90.93, "foreign": []}
+{"t": 1784031061.7414262, "busy": 83.3, "foreign": []}
+{"t": 1784031063.7927914, "busy": 81.17, "foreign": []}
+{"t": 1784031065.845398, "busy": 91.05, "foreign": []}
+{"t": 1784031067.8834517, "busy": 67.94, "foreign": []}
+{"t": 1784031069.9355302, "busy": 66.17, "foreign": []}
+{"t": 1784031071.9797788, "busy": 58.07, "foreign": []}
+{"t": 1784031074.0456347, "busy": 70.8, "foreign": []}
+{"t": 1784031076.1098585, "busy": 85.36, "foreign": []}
+{"t": 1784031078.1708405, "busy": 70.95, "foreign": []}
+{"t": 1784031080.2313006, "busy": 64.52, "foreign": []}
+{"t": 1784031082.2877207, "busy": 57.64, "foreign": []}
+{"t": 1784031084.3527317, "busy": 74.31, "foreign": []}
+{"t": 1784031086.40213, "busy": 66.38, "foreign": []}
+{"t": 1784031088.4510553, "busy": 19.0, "foreign": []}
+{"t": 1784031090.5273955, "busy": 55.09, "foreign": []}
+{"t": 1784031092.5886428, "busy": 85.45, "foreign": []}
+{"t": 1784031094.652033, "busy": 70.69, "foreign": []}
+{"t": 1784031096.698917, "busy": 37.63, "foreign": []}
+{"t": 1784031098.7461548, "busy": 2.05, "foreign": []}
+{"t": 1784031100.7966979, "busy": 2.17, "foreign": []}
+{"t": 1784031102.8457649, "busy": 1.88, "foreign": []}
+{"t": 1784031104.8931751, "busy": 2.2, "foreign": []}
+{"t": 1784031106.941129, "busy": 2.11, "foreign": []}
+{"t": 1784031108.9885554, "busy": 1.97, "foreign": []}
+{"t": 1784031111.063006, "busy": 8.43, "foreign": []}
+{"t": 1784031113.1403627, "busy": 91.31, "foreign": []}
+{"t": 1784031115.202124, "busy": 81.97, "foreign": []}
+{"t": 1784031117.26685, "busy": 78.16, "foreign": []}
+{"t": 1784031119.3146021, "busy": 69.91, "foreign": []}
+{"t": 1784031121.3715036, "busy": 55.44, "foreign": []}
+{"t": 1784031123.4252884, "busy": 51.43, "foreign": []}
+{"t": 1784031125.4813757, "busy": 44.31, "foreign": []}
+{"t": 1784031127.5391283, "busy": 55.74, "foreign": []}
+{"t": 1784031129.599083, "busy": 55.31, "foreign": []}
+{"t": 1784031131.6616461, "busy": 66.69, "foreign": []}
+{"t": 1784031133.7239678, "busy": 69.51, "foreign": []}
+{"t": 1784031135.7790844, "busy": 37.4, "foreign": []}
+{"t": 1784031137.8392143, "busy": 39.85, "foreign": []}
+{"t": 1784031139.9036665, "busy": 78.51, "foreign": []}
+{"t": 1784031141.955508, "busy": 47.97, "foreign": []}
+{"t": 1784031144.0073984, "busy": 17.0, "foreign": []}
+{"t": 1784031146.0839136, "busy": 74.32, "foreign": []}
+{"t": 1784031148.145255, "busy": 79.77, "foreign": []}
+{"t": 1784031150.2043426, "busy": 72.98, "foreign": []}
+{"t": 1784031152.2557285, "busy": 12.84, "foreign": []}
+{"t": 1784031154.2989652, "busy": 2.23, "foreign": []}
+{"t": 1784031156.3493242, "busy": 1.86, "foreign": []}
+{"t": 1784031158.396454, "busy": 2.25, "foreign": []}
+{"t": 1784031160.4458635, "busy": 1.98, "foreign": []}
+{"t": 1784031162.4950209, "busy": 2.27, "foreign": []}
+{"t": 1784031164.543187, "busy": 1.76, "foreign": []}
+{"t": 1784031166.6179814, "busy": 40.3, "foreign": []}
+{"t": 1784031168.6793058, "busy": 87.76, "foreign": []}
+{"t": 1784031170.7422707, "busy": 82.79, "foreign": []}
+{"t": 1784031172.813038, "busy": 80.56, "foreign": []}
+{"t": 1784031174.8660047, "busy": 64.0, "foreign": []}
+{"t": 1784031176.9246154, "busy": 57.4, "foreign": []}
+{"t": 1784031178.983458, "busy": 46.2, "foreign": []}
+{"t": 1784031181.03872, "busy": 44.74, "foreign": []}
+{"t": 1784031183.098706, "busy": 64.89, "foreign": []}
+{"t": 1784031185.1605754, "busy": 65.07, "foreign": []}
+{"t": 1784031187.2230911, "busy": 70.86, "foreign": []}
+{"t": 1784031189.2757964, "busy": 50.64, "foreign": []}
+{"t": 1784031191.3287187, "busy": 40.21, "foreign": []}
+{"t": 1784031193.3948886, "busy": 62.76, "foreign": []}
+{"t": 1784031195.4484475, "busy": 73.41, "foreign": []}
+{"t": 1784031197.500327, "busy": 17.37, "foreign": []}
+{"t": 1784031199.5782185, "busy": 47.89, "foreign": []}
+{"t": 1784031201.638054, "busy": 87.31, "foreign": []}
+{"t": 1784031203.6996105, "busy": 68.51, "foreign": []}
+{"t": 1784031205.748773, "busy": 45.64, "foreign": []}
+{"t": 1784031207.796676, "busy": 2.12, "foreign": []}
+{"t": 1784031209.8442662, "busy": 1.91, "foreign": []}
+{"t": 1784031211.89263, "busy": 2.12, "foreign": []}
+{"t": 1784031213.9439528, "busy": 1.82, "foreign": []}
+{"t": 1784031215.9929166, "busy": 1.91, "foreign": []}
+{"t": 1784031218.0425918, "busy": 1.86, "foreign": []}
+{"t": 1784031220.0904896, "busy": 2.17, "foreign": []}
+{"t": 1784031222.1664658, "busy": 83.47, "foreign": []}
+{"t": 1784031224.2289176, "busy": 83.59, "foreign": []}
+{"t": 1784031226.2970388, "busy": 78.83, "foreign": []}
+{"t": 1784031228.3594992, "busy": 82.15, "foreign": []}
+{"t": 1784031230.4114635, "busy": 50.78, "foreign": []}
+{"t": 1784031232.466624, "busy": 56.11, "foreign": []}
+{"t": 1784031234.5217333, "busy": 43.98, "foreign": []}
+{"t": 1784031236.5753803, "busy": 53.41, "foreign": []}
+{"t": 1784031238.6343744, "busy": 57.42, "foreign": []}
+{"t": 1784031240.6938548, "busy": 63.59, "foreign": []}
+{"t": 1784031242.757633, "busy": 67.02, "foreign": []}
+{"t": 1784031244.8104343, "busy": 42.83, "foreign": []}
+{"t": 1784031246.8633916, "busy": 39.83, "foreign": []}
+{"t": 1784031248.9297795, "busy": 72.15, "foreign": []}
+{"t": 1784031250.980347, "busy": 63.29, "foreign": []}
+{"t": 1784031253.0311987, "busy": 17.21, "foreign": []}
+{"t": 1784031255.1051164, "busy": 56.61, "foreign": []}
+{"t": 1784031257.1643023, "busy": 84.25, "foreign": []}
+{"t": 1784031259.2250717, "busy": 70.12, "foreign": []}
+{"t": 1784031261.2753456, "busy": 35.42, "foreign": []}
+{"t": 1784031263.3246925, "busy": 2.53, "foreign": []}
+{"t": 1784031265.36255, "busy": 2.23, "foreign": []}
+{"t": 1784031267.4085765, "busy": 2.53, "foreign": []}
+{"t": 1784031269.4565928, "busy": 2.19, "foreign": []}
+{"t": 1784031271.5061035, "busy": 2.11, "foreign": []}
+{"t": 1784031273.5572412, "busy": 2.24, "foreign": []}
+{"t": 1784031275.6278088, "busy": 8.98, "foreign": []}
+{"t": 1784031277.7038722, "busy": 91.02, "foreign": []}
+{"t": 1784031279.7658277, "busy": 81.27, "foreign": []}
+{"t": 1784031281.8330379, "busy": 79.36, "foreign": []}
+{"t": 1784031283.8888319, "busy": 69.75, "foreign": []}
+{"t": 1784031285.9427605, "busy": 57.57, "foreign": []}
+{"t": 1784031287.9968016, "busy": 51.81, "foreign": []}
+{"t": 1784031290.053944, "busy": 45.49, "foreign": []}
+{"t": 1784031292.1165643, "busy": 55.16, "foreign": []}
+{"t": 1784031294.1749904, "busy": 62.71, "foreign": []}
+{"t": 1784031296.2341948, "busy": 69.3, "foreign": []}
+{"t": 1784031298.2878342, "busy": 63.04, "foreign": []}
+{"t": 1784031300.3403413, "busy": 40.22, "foreign": []}
+{"t": 1784031302.406634, "busy": 44.79, "foreign": []}
+{"t": 1784031304.4719691, "busy": 83.9, "foreign": []}
+{"t": 1784031306.5232563, "busy": 36.1, "foreign": []}
+{"t": 1784031308.5828986, "busy": 20.49, "foreign": []}
+{"t": 1784031310.6673782, "busy": 89.05, "foreign": []}
+{"t": 1784031312.727411, "busy": 79.74, "foreign": []}
+{"t": 1784031314.7874923, "busy": 69.32, "foreign": []}
+{"t": 1784031316.8368134, "busy": 24.95, "foreign": []}
+{"t": 1784031318.886715, "busy": 2.12, "foreign": []}
+{"t": 1784031320.935792, "busy": 2.16, "foreign": []}
+{"t": 1784031322.9857361, "busy": 2.18, "foreign": []}
+{"t": 1784031325.033802, "busy": 2.29, "foreign": []}
+{"t": 1784031327.08418, "busy": 2.14, "foreign": []}
+{"t": 1784031329.134544, "busy": 2.31, "foreign": []}
+{"t": 1784031331.2016401, "busy": 25.47, "foreign": []}
+{"t": 1784031333.2608678, "busy": 91.22, "foreign": []}
+{"t": 1784031335.3252752, "busy": 79.64, "foreign": []}
+{"t": 1784031337.3892975, "busy": 77.86, "foreign": []}
+{"t": 1784031339.448573, "busy": 66.05, "foreign": []}
+{"t": 1784031341.5081866, "busy": 56.05, "foreign": []}
+{"t": 1784031343.5641115, "busy": 49.44, "foreign": []}
+{"t": 1784031345.620173, "busy": 45.02, "foreign": []}
+{"t": 1784031347.6776896, "busy": 57.62, "foreign": []}
+{"t": 1784031349.7383962, "busy": 62.64, "foreign": []}
+{"t": 1784031351.8042166, "busy": 73.07, "foreign": []}
+{"t": 1784031353.8565164, "busy": 57.38, "foreign": []}
+{"t": 1784031355.9115365, "busy": 38.64, "foreign": []}
+{"t": 1784031357.9779282, "busy": 55.7, "foreign": []}
+{"t": 1784031360.0356908, "busy": 81.81, "foreign": []}
+{"t": 1784031362.0858936, "busy": 21.6, "foreign": []}
+{"t": 1784031364.1568236, "busy": 31.02, "foreign": []}
+{"t": 1784031366.2267947, "busy": 93.33, "foreign": []}
+{"t": 1784031368.2902179, "busy": 69.86, "foreign": []}
+{"t": 1784031375.507045, "busy": 2.31, "foreign": []}
+{"t": 1784031377.5572698, "busy": 2.53, "foreign": []}
+{"t": 1784031379.6079092, "busy": 2.49, "foreign": []}
+{"t": 1784031381.6576877, "busy": 2.29, "foreign": []}
+{"t": 1784031383.7014773, "busy": 2.12, "foreign": []}
+{"t": 1784031385.750222, "busy": 2.22, "foreign": []}
+{"t": 1784031387.7981973, "busy": 2.25, "foreign": []}
+{"t": 1784031389.868732, "busy": 53.19, "foreign": []}
+{"t": 1784031391.9320886, "busy": 87.7, "foreign": []}
+{"t": 1784031393.9934, "busy": 81.49, "foreign": []}
+{"t": 1784031396.065339, "busy": 86.54, "foreign": []}
+{"t": 1784031398.1111758, "busy": 72.11, "foreign": []}
+{"t": 1784031400.1567333, "busy": 73.83, "foreign": []}
+{"t": 1784031402.202606, "busy": 56.77, "foreign": []}
+{"t": 1784031404.2709234, "busy": 77.13, "foreign": []}
+{"t": 1784031406.3334868, "busy": 82.1, "foreign": []}
+{"t": 1784031408.3954737, "busy": 71.9, "foreign": []}
+{"t": 1784031410.4552445, "busy": 65.14, "foreign": []}
+{"t": 1784031412.5138936, "busy": 59.16, "foreign": []}
+{"t": 1784031414.5756588, "busy": 71.74, "foreign": []}
+{"t": 1784031416.6295898, "busy": 77.07, "foreign": []}
+{"t": 1784031418.6796007, "busy": 18.18, "foreign": []}
+{"t": 1784031420.7574763, "busy": 43.16, "foreign": []}
+{"t": 1784031422.8185499, "busy": 88.48, "foreign": []}
+{"t": 1784031424.8800547, "busy": 70.01, "foreign": []}
+{"t": 1784031426.9242587, "busy": 54.29, "foreign": []}
+{"t": 1784031428.972881, "busy": 1.89, "foreign": []}
+{"t": 1784031431.021129, "busy": 1.71, "foreign": []}
+{"t": 1784031433.0702748, "busy": 2.1, "foreign": []}
+{"t": 1784031435.1211996, "busy": 2.23, "foreign": []}
+{"t": 1784031437.1723013, "busy": 3.56, "foreign": []}
+{"t": 1784031439.2220929, "busy": 2.72, "foreign": []}
+{"t": 1784031441.2708938, "busy": 2.72, "foreign": []}
+{"t": 1784031443.3456402, "busy": 73.95, "foreign": []}
+{"t": 1784031445.4093964, "busy": 85.75, "foreign": []}
+{"t": 1784031447.4752562, "busy": 79.36, "foreign": []}
+{"t": 1784031449.5422165, "busy": 82.82, "foreign": []}
+{"t": 1784031451.5986285, "busy": 53.43, "foreign": []}
+{"t": 1784031453.650851, "busy": 55.35, "foreign": []}
+{"t": 1784031455.707797, "busy": 44.41, "foreign": []}
+{"t": 1784031457.7681727, "busy": 52.01, "foreign": []}
+{"t": 1784031459.8280597, "busy": 61.46, "foreign": []}
+{"t": 1784031461.890483, "busy": 68.91, "foreign": []}
+{"t": 1784031463.9481828, "busy": 64.86, "foreign": []}
+{"t": 1784031466.002004, "busy": 38.61, "foreign": []}
+{"t": 1784031468.0677638, "busy": 55.36, "foreign": []}
+{"t": 1784031470.1304338, "busy": 81.84, "foreign": []}
+{"t": 1784031472.1804771, "busy": 23.88, "foreign": []}
+{"t": 1784031474.2583737, "busy": 32.0, "foreign": []}
+{"t": 1784031476.3345842, "busy": 93.6, "foreign": []}
+{"t": 1784031478.3945568, "busy": 73.89, "foreign": []}
+{"t": 1784031480.4547362, "busy": 69.1, "foreign": []}
+{"t": 1784031482.5032666, "busy": 8.28, "foreign": []}
+{"t": 1784031484.5516932, "busy": 2.4, "foreign": []}
+{"t": 1784031486.600786, "busy": 2.43, "foreign": []}
+{"t": 1784031488.650366, "busy": 2.49, "foreign": []}
+{"t": 1784031490.7044094, "busy": 2.82, "foreign": []}
+{"t": 1784031492.7534034, "busy": 2.32, "foreign": []}
+{"t": 1784031494.804449, "busy": 2.05, "foreign": []}
+{"t": 1784031496.869047, "busy": 48.3, "foreign": []}
+{"t": 1784031498.934198, "busy": 86.69, "foreign": []}
+{"t": 1784031500.9979706, "busy": 81.43, "foreign": []}
+{"t": 1784031503.0682056, "busy": 79.09, "foreign": []}
+{"t": 1784031505.1250787, "busy": 67.26, "foreign": []}
+{"t": 1784031507.1807528, "busy": 56.48, "foreign": []}
+{"t": 1784031509.2441766, "busy": 52.24, "foreign": []}
+{"t": 1784031511.3010635, "busy": 46.58, "foreign": []}
+{"t": 1784031513.3628356, "busy": 56.95, "foreign": []}
+{"t": 1784031515.424747, "busy": 64.73, "foreign": []}
+{"t": 1784031517.4902477, "busy": 73.06, "foreign": []}
+{"t": 1784031519.543689, "busy": 63.58, "foreign": []}
+{"t": 1784031521.6045349, "busy": 39.43, "foreign": []}
+{"t": 1784031523.6668317, "busy": 47.56, "foreign": []}
+{"t": 1784031525.7296154, "busy": 83.65, "foreign": []}
+{"t": 1784031527.7864625, "busy": 41.64, "foreign": []}
+{"t": 1784031529.8376749, "busy": 19.23, "foreign": []}
+{"t": 1784031531.912197, "busy": 83.21, "foreign": []}
+{"t": 1784031533.9740925, "busy": 76.17, "foreign": []}
+{"t": 1784031536.0326717, "busy": 70.88, "foreign": []}
+{"t": 1784031538.077834, "busy": 8.81, "foreign": []}
+{"t": 1784031540.1276777, "busy": 3.04, "foreign": []}
+{"t": 1784031542.1785562, "busy": 2.86, "foreign": []}
+{"t": 1784031544.2297328, "busy": 2.56, "foreign": []}
+{"t": 1784031546.2736971, "busy": 3.1, "foreign": []}
+{"t": 1784031548.323802, "busy": 4.89, "foreign": []}
+{"t": 1784031550.3743212, "busy": 2.72, "foreign": []}
+{"t": 1784031552.4260495, "busy": 3.05, "foreign": []}
+{"t": 1784031554.4761727, "busy": 3.95, "foreign": []}
+{"t": 1784031556.5312755, "busy": 3.66, "foreign": []}
+{"t": 1784031558.5861554, "busy": 3.79, "foreign": []}
+{"t": 1784031560.6446972, "busy": 3.85, "foreign": []}
+{"t": 1784031562.703791, "busy": 4.06, "foreign": []}
+{"t": 1784031564.7609637, "busy": 4.03, "foreign": []}
+{"t": 1784031566.8176103, "busy": 4.1, "foreign": []}
+{"t": 1784031568.8761563, "busy": 4.03, "foreign": []}
+{"t": 1784031570.935124, "busy": 5.27, "foreign": []}
+{"t": 1784031572.9922972, "busy": 4.45, "foreign": []}
+{"t": 1784031575.0494094, "busy": 4.3, "foreign": []}
+{"t": 1784031577.1057189, "busy": 3.88, "foreign": []}
+{"t": 1784031579.1634073, "busy": 3.67, "foreign": []}
+{"t": 1784031581.2190971, "busy": 5.32, "foreign": []}
+{"t": 1784031583.2756698, "busy": 3.91, "foreign": []}
+{"t": 1784031585.335336, "busy": 4.68, "foreign": []}
+{"t": 1784031587.3922305, "busy": 4.68, "foreign": []}
+{"t": 1784031589.449769, "busy": 3.85, "foreign": []}
+{"t": 1784031591.5090437, "busy": 5.89, "foreign": []}
+{"t": 1784031593.56786, "busy": 4.55, "foreign": []}
+{"t": 1784031595.628246, "busy": 4.94, "foreign": []}
+{"t": 1784031597.6855993, "busy": 4.98, "foreign": []}
+{"t": 1784031599.7467823, "busy": 4.21, "foreign": []}
+{"t": 1784031601.805469, "busy": 4.58, "foreign": []}
+{"t": 1784031603.8641899, "busy": 5.78, "foreign": []}
+{"t": 1784031605.9242642, "busy": 4.73, "foreign": []}
+{"t": 1784031607.9858444, "busy": 5.17, "foreign": []}
+{"t": 1784031610.0438027, "busy": 6.52, "foreign": []}
+{"t": 1784031612.1002126, "busy": 4.67, "foreign": []}
+{"t": 1784031614.157394, "busy": 5.6, "foreign": []}
+{"t": 1784031616.2126102, "busy": 5.19, "foreign": []}
+{"t": 1784031618.2706513, "busy": 4.85, "foreign": []}
+{"t": 1784031620.3295622, "busy": 4.84, "foreign": []}
+{"t": 1784031622.3911722, "busy": 5.46, "foreign": []}
+{"t": 1784031624.4470277, "busy": 6.75, "foreign": []}
+{"t": 1784031626.503534, "busy": 5.77, "foreign": []}
+{"t": 1784031628.5606341, "busy": 5.74, "foreign": []}
+{"t": 1784031630.6216493, "busy": 4.25, "foreign": []}
+{"t": 1784031632.6815493, "busy": 5.14, "foreign": []}
+{"t": 1784031634.7408326, "busy": 4.94, "foreign": []}
+{"t": 1784031636.7986639, "busy": 4.47, "foreign": []}
+{"t": 1784031638.860111, "busy": 4.71, "foreign": []}
+{"t": 1784031640.9361122, "busy": 4.67, "foreign": []}
+{"t": 1784031642.9930665, "busy": 4.65, "foreign": []}
+{"t": 1784031645.051263, "busy": 4.61, "foreign": []}
+{"t": 1784031647.108127, "busy": 4.72, "foreign": []}
+{"t": 1784031649.1628077, "busy": 4.73, "foreign": []}
+{"t": 1784031651.2247024, "busy": 4.84, "foreign": []}
+{"t": 1784031653.2836306, "busy": 4.53, "foreign": []}
+{"t": 1784031655.3435304, "busy": 4.24, "foreign": []}
+{"t": 1784031657.4021873, "busy": 4.87, "foreign": []}
+{"t": 1784031659.4618227, "busy": 4.44, "foreign": []}
+{"t": 1784031661.5177572, "busy": 4.24, "foreign": []}
+{"t": 1784031663.5764947, "busy": 4.48, "foreign": []}
+{"t": 1784031665.635106, "busy": 4.33, "foreign": []}
+{"t": 1784031667.6862767, "busy": 3.88, "foreign": []}
+{"t": 1784031669.7426038, "busy": 3.61, "foreign": []}
+{"t": 1784031671.7988968, "busy": 3.94, "foreign": []}
+{"t": 1784031673.8550808, "busy": 3.93, "foreign": []}
+{"t": 1784031675.9154418, "busy": 4.09, "foreign": []}
+{"t": 1784031677.973555, "busy": 4.28, "foreign": []}
+{"t": 1784031680.0314167, "busy": 3.66, "foreign": []}
+{"t": 1784031682.0907426, "busy": 3.85, "foreign": []}
+{"t": 1784031684.1486886, "busy": 4.31, "foreign": []}
+{"t": 1784031686.2057955, "busy": 3.94, "foreign": []}
+{"t": 1784031688.2654824, "busy": 3.97, "foreign": []}
+{"t": 1784031690.323592, "busy": 3.54, "foreign": []}
+{"t": 1784031692.3857844, "busy": 3.59, "foreign": []}
+{"t": 1784031694.4426122, "busy": 3.63, "foreign": []}
+{"t": 1784031696.5023642, "busy": 3.92, "foreign": []}
+{"t": 1784031698.5636506, "busy": 3.93, "foreign": []}
+{"t": 1784031700.6200042, "busy": 3.93, "foreign": []}
+{"t": 1784031702.6786122, "busy": 3.69, "foreign": []}
+{"t": 1784031704.737314, "busy": 4.1, "foreign": []}
+{"t": 1784031706.7972727, "busy": 4.74, "foreign": []}
+{"t": 1784031708.8579564, "busy": 4.03, "foreign": []}
+{"t": 1784031710.91247, "busy": 4.07, "foreign": []}
+{"t": 1784031712.9709132, "busy": 4.43, "foreign": []}
+{"t": 1784031715.0285645, "busy": 5.14, "foreign": []}
+{"t": 1784031717.0863473, "busy": 3.99, "foreign": []}
+{"t": 1784031719.143759, "busy": 3.83, "foreign": []}
+{"t": 1784031721.2020884, "busy": 4.07, "foreign": []}
+{"t": 1784031723.2622252, "busy": 3.92, "foreign": []}
+{"t": 1784031725.3196073, "busy": 4.21, "foreign": []}
+{"t": 1784031727.377707, "busy": 3.89, "foreign": []}
+{"t": 1784031729.4368105, "busy": 4.24, "foreign": []}
+{"t": 1784031731.4948971, "busy": 3.95, "foreign": []}
+{"t": 1784031733.5509832, "busy": 4.52, "foreign": []}
+{"t": 1784031735.611837, "busy": 3.85, "foreign": []}
+{"t": 1784031737.6673524, "busy": 3.97, "foreign": []}
+{"t": 1784031739.7255945, "busy": 3.92, "foreign": []}
+{"t": 1784031741.7828941, "busy": 4.07, "foreign": []}
+{"t": 1784031743.8423622, "busy": 4.01, "foreign": []}
+{"t": 1784031745.8994725, "busy": 3.65, "foreign": []}
+{"t": 1784031747.9584877, "busy": 3.62, "foreign": []}
+{"t": 1784031750.0179703, "busy": 4.2, "foreign": []}
+{"t": 1784031752.0766952, "busy": 4.05, "foreign": []}
+{"t": 1784031754.1257546, "busy": 4.43, "foreign": []}
+{"t": 1784031756.1831045, "busy": 4.89, "foreign": []}
+{"t": 1784031758.2421043, "busy": 4.38, "foreign": []}
+{"t": 1784031760.2975926, "busy": 4.23, "foreign": []}
+{"t": 1784031762.358639, "busy": 4.01, "foreign": []}
+{"t": 1784031764.4193804, "busy": 4.66, "foreign": []}
+{"t": 1784031766.4775553, "busy": 4.85, "foreign": []}
+{"t": 1784031768.5364056, "busy": 4.15, "foreign": []}
+{"t": 1784031770.5962963, "busy": 3.94, "foreign": []}
+{"t": 1784031772.6562383, "busy": 3.97, "foreign": []}
+{"t": 1784031774.7133803, "busy": 3.61, "foreign": []}
+{"t": 1784031776.7690737, "busy": 4.66, "foreign": []}
+{"t": 1784031778.8272276, "busy": 3.65, "foreign": []}
+{"t": 1784031780.8846006, "busy": 4.21, "foreign": []}
+{"t": 1784031782.9436607, "busy": 3.85, "foreign": []}
+{"t": 1784031785.0022883, "busy": 3.59, "foreign": []}
+{"t": 1784031787.0615482, "busy": 4.26, "foreign": []}
+{"t": 1784031789.1141317, "busy": 3.59, "foreign": []}
+{"t": 1784031791.1710713, "busy": 4.01, "foreign": []}
+{"t": 1784031793.228624, "busy": 4.03, "foreign": []}
+{"t": 1784031795.2868142, "busy": 4.03, "foreign": []}
+{"t": 1784031797.3525724, "busy": 3.92, "foreign": []}
+{"t": 1784031799.411281, "busy": 3.67, "foreign": []}
+{"t": 1784031801.467314, "busy": 3.77, "foreign": []}
+{"t": 1784031803.5241513, "busy": 4.19, "foreign": []}
+{"t": 1784031805.581461, "busy": 4.45, "foreign": []}
+{"t": 1784031807.63991, "busy": 3.45, "foreign": []}
+{"t": 1784031809.6970112, "busy": 3.68, "foreign": []}
+{"t": 1784031811.754904, "busy": 4.17, "foreign": []}
+{"t": 1784031813.8114588, "busy": 4.64, "foreign": []}
+{"t": 1784031815.86976, "busy": 4.17, "foreign": []}
+{"t": 1784031817.9274468, "busy": 4.26, "foreign": []}
+{"t": 1784031819.98419, "busy": 4.29, "foreign": []}
+{"t": 1784031822.0438874, "busy": 3.91, "foreign": []}
+{"t": 1784031824.1019106, "busy": 4.72, "foreign": []}
+{"t": 1784031826.1632016, "busy": 4.28, "foreign": []}
+{"t": 1784031828.2238605, "busy": 4.83, "foreign": []}
+{"t": 1784031830.2842796, "busy": 4.75, "foreign": []}
+{"t": 1784031832.3419037, "busy": 4.78, "foreign": []}
+{"t": 1784031834.3972669, "busy": 5.24, "foreign": []}
+{"t": 1784031836.4563546, "busy": 5.37, "foreign": []}
+{"t": 1784031838.5177293, "busy": 5.15, "foreign": []}
+{"t": 1784031840.578124, "busy": 4.79, "foreign": []}
+{"t": 1784031842.6388867, "busy": 4.77, "foreign": []}
+{"t": 1784031844.69137, "busy": 5.09, "foreign": []}
+{"t": 1784031846.7509613, "busy": 5.08, "foreign": []}
+{"t": 1784031848.8102405, "busy": 4.81, "foreign": []}
+{"t": 1784031850.8708324, "busy": 5.54, "foreign": []}
+{"t": 1784031852.9306436, "busy": 4.67, "foreign": []}
+{"t": 1784031854.9898415, "busy": 4.81, "foreign": []}
+{"t": 1784031857.0460007, "busy": 5.08, "foreign": []}
+{"t": 1784031859.10408, "busy": 4.86, "foreign": []}
+{"t": 1784031861.165898, "busy": 4.81, "foreign": []}
+{"t": 1784031863.2238646, "busy": 5.02, "foreign": []}
+{"t": 1784031865.2783918, "busy": 4.87, "foreign": []}
+{"t": 1784031867.33465, "busy": 4.51, "foreign": []}
+{"t": 1784031869.3920307, "busy": 4.37, "foreign": []}
+{"t": 1784031871.4560237, "busy": 11.23, "foreign": ["cc1plus"]}
+{"t": 1784031873.521691, "busy": 27.63, "foreign": ["cc1plus"]}
+{"t": 1784031875.5874178, "busy": 28.14, "foreign": ["cc1plus"]}
+{"t": 1784031877.6573615, "busy": 28.11, "foreign": ["cc1plus"]}
+{"t": 1784031879.700675, "busy": 27.4, "foreign": ["cc1plus"]}
+{"t": 1784031881.7665088, "busy": 28.04, "foreign": ["cc1plus"]}
+{"t": 1784031883.8271496, "busy": 27.88, "foreign": ["cc1plus"]}
+{"t": 1784031885.8819706, "busy": 27.53, "foreign": ["cc1plus"]}
+{"t": 1784031887.943881, "busy": 17.2, "foreign": ["cc1plus"]}
+{"t": 1784031890.0054777, "busy": 27.78, "foreign": ["cc1plus"]}
+{"t": 1784031892.0687814, "busy": 27.79, "foreign": ["cc1plus"]}
+{"t": 1784031894.1247036, "busy": 27.03, "foreign": ["cc1plus"]}
