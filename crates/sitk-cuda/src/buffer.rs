@@ -122,6 +122,17 @@ impl<T: DeviceRepr + ValidAsZeroBits> DeviceBuffer<T> {
         })
     }
 
+    /// Zero every element in place, on the device.
+    ///
+    /// A reused scratch buffer that a kernel *accumulates* into (the histogram's
+    /// per-tile counts) must start each run at zero. Re-uploading a zero vector would
+    /// put a 20 MB H2D in the optimizer's inner loop for a buffer that never leaves
+    /// the device; this is the same clear without the bus.
+    pub fn zero(&mut self, backend: &Backend) -> Result<(), CudaError> {
+        backend.stream().memset_zeros(&mut self.slice)?;
+        Ok(())
+    }
+
     /// A private copy of an allocation that is already on the device — never
     /// touches the bus.
     ///

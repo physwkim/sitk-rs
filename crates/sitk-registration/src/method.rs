@@ -71,8 +71,8 @@ use crate::correlation::CorrelationMetric;
 use crate::demons::DemonsMetric;
 #[cfg(feature = "cuda")]
 use crate::device::{
-    DeviceActive, DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetric,
-    DeviceRegistrationError,
+    DeviceActive, DeviceCorrelationMetric, DeviceMattesMetric, DeviceMeanSquaresMetric,
+    DeviceMetric, DeviceRegistrationError,
 };
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
@@ -2727,12 +2727,17 @@ impl ImageRegistrationMethod {
         enum Kernel {
             MeanSquares,
             Correlation,
+            Mattes { bins: usize },
         }
         let kernel = match self.metric_kind {
             MetricKind::MeanSquares => Kernel::MeanSquares,
             MetricKind::Correlation => Kernel::Correlation,
-            MetricKind::MattesMutualInformation { .. }
-            | MetricKind::AntsNeighborhoodCorrelation { .. }
+            MetricKind::MattesMutualInformation {
+                number_of_histogram_bins,
+            } => Kernel::Mattes {
+                bins: number_of_histogram_bins,
+            },
+            MetricKind::AntsNeighborhoodCorrelation { .. }
             | MetricKind::JointHistogramMutualInformation { .. }
             | MetricKind::Demons { .. } => return Err(DeviceRegistrationError::UnsupportedMetric),
         };
@@ -2843,6 +2848,16 @@ impl ImageRegistrationMethod {
                         moving_mask.as_deref(),
                         samples.as_deref(),
                     )?)
+                }
+                Kernel::Mattes { bins } => {
+                    DeviceMetric::Mattes(Box::new(DeviceMattesMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                        bins,
+                    )?))
                 }
             };
             let metric = ActiveMetric::Device(Box::new(DeviceActive::new(device_metric)));

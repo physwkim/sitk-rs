@@ -122,50 +122,44 @@ fn cubic_bspline_derivative(u: f64) -> f64 {
     }
 }
 
-/// The Mattes mutual-information metric. Holds the precomputed fixed samples,
-/// moving image, and the joint-histogram geometry (bin sizes and normalized
-/// minima) derived once from the fixed/moving intensity ranges.
-/// [`evaluate`](Self::evaluate) returns `value = −MI` plus its
-/// parameter-derivative for a given transform.
-pub struct MattesMutualInformationMetric {
-    fixed: FixedSamples,
-    moving: MovingImage,
-    num_bins: usize,
+/// The joint histogram's geometry, derived from the fixed and moving intensity
+/// ranges: where a pixel value lands on each axis.
+///
+/// Its own type, and derived in exactly one place ([`new`](Self::new)), because the
+/// **device** metric needs the same numbers and a second derivation of them would be
+/// a second chance to disagree in the last bits — after which every bin index in the
+/// run is a coin flip. The device is handed these, not a recipe for them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MattesGeometry {
+    pub(crate) num_bins: usize,
     /// Moving intensity range, used to reject out-of-range interpolated values.
-    moving_true_min: f64,
-    moving_true_max: f64,
+    pub(crate) moving_true_min: f64,
+    pub(crate) moving_true_max: f64,
     /// Histogram bin sizes: `(trueMax − trueMin) / (bins − 2·padding)`.
-    fixed_bin_size: f64,
-    moving_bin_size: f64,
+    pub(crate) fixed_bin_size: f64,
+    pub(crate) moving_bin_size: f64,
     /// Normalized minima: `trueMin / binSize − padding`. A pixel value `v` maps
     /// to the fractional bin coordinate `v / binSize − normalizedMin`.
-    fixed_normalized_min: f64,
-    moving_normalized_min: f64,
+    pub(crate) fixed_normalized_min: f64,
+    pub(crate) moving_normalized_min: f64,
 }
 
-impl MattesMutualInformationMetric {
-    /// Build the metric from a fixed and moving image and a histogram bin count
-    /// (ITK/SimpleITK default 50). Fails if dimensions disagree, the moving
-    /// direction matrix is singular, fewer than five bins are requested, or
-    /// either image is constant (MI is then undefined).
-    pub fn new(fixed: &Image, moving: &Image, number_of_histogram_bins: usize) -> Result<Self> {
-        if fixed.dimension() != moving.dimension() {
-            return Err(RegistrationError::DimensionMismatch {
-                fixed: fixed.dimension(),
-                moving: moving.dimension(),
-            });
-        }
+impl MattesGeometry {
+    /// Derive the geometry from the fixed sample set's and the moving volume's
+    /// intensity ranges. Fails on fewer than `2·padding + 1` bins, or a constant
+    /// image on either side (MI is then undefined).
+    pub(crate) fn new(
+        fixed_range: (f64, f64),
+        moving_range: (f64, f64),
+        number_of_histogram_bins: usize,
+    ) -> Result<Self> {
         if number_of_histogram_bins < 2 * PADDING + 1 {
             return Err(RegistrationError::TooFewHistogramBins {
                 bins: number_of_histogram_bins,
             });
         }
-
-        let fixed_samples = FixedSamples::from_image(fixed)?;
-        let moving_image = MovingImage::from_image(moving)?;
-
-        let (fixed_min, fixed_max) = fixed_samples.value_range();
-        let (moving_min, moving_max) = moving_image.value_range();
+        let (fixed_min, fixed_max) = fixed_range;
+        let (moving_min, moving_max) = moving_range;
         if fixed_max - fixed_min <= f64::EPSILON {
             return Err(RegistrationError::ConstantIntensity { which: "fixed" });
         }
@@ -180,8 +174,6 @@ impl MattesMutualInformationMetric {
         let moving_bin_size = (moving_max - moving_min) / denom;
 
         Ok(Self {
-            fixed: fixed_samples,
-            moving: moving_image,
             num_bins: number_of_histogram_bins,
             moving_true_min: moving_min,
             moving_true_max: moving_max,
@@ -189,6 +181,160 @@ impl MattesMutualInformationMetric {
             moving_bin_size,
             fixed_normalized_min: fixed_min / fixed_bin_size - PADDING as f64,
             moving_normalized_min: moving_min / moving_bin_size - PADDING as f64,
+        })
+    }
+
+    /// The Parzen-window bin index of a pixel `value` on the axis with bin size
+    /// `bin_size` and normalized minimum `normalized_min`, clamped to the
+    /// interior `[padding, bins − padding − 1]` so all four cubic-window taps
+    /// stay in range. Mirrors ITK's `ComputeSingleFixedImageParzenWindowIndex`
+    /// and the identical clamp applied to the moving index in `ProcessPoint`.
+    fn parzen_window_index(&self, value: f64, bin_size: f64, normalized_min: f64) -> usize {
+        let term = value / bin_size - normalized_min;
+        // ITK static_cast<OffsetValueType> truncates toward zero; `term` is
+        // always ≥ padding ≥ 0 by construction, so truncation == floor here.
+        let mut index = term as isize;
+        let lo = PADDING as isize;
+        let hi = self.num_bins as isize - PADDING as isize - 1;
+        if index < lo {
+            index = lo;
+        } else if index > hi {
+            index = hi;
+        }
+        index as usize
+    }
+
+    /// The same geometry, in the form the CUDA kernels take.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_bins(&self) -> sitk_cuda::MattesBins {
+        sitk_cuda::MattesBins {
+            bins: self.num_bins,
+            padding: PADDING,
+            fixed_bin_size: self.fixed_bin_size,
+            moving_bin_size: self.moving_bin_size,
+            fixed_normalized_min: self.fixed_normalized_min,
+            moving_normalized_min: self.moving_normalized_min,
+            moving_true_min: self.moving_true_min,
+            moving_true_max: self.moving_true_max,
+        }
+    }
+}
+
+/// What a finished joint histogram becomes: the metric value `−MI`, and the per-bin
+/// `pRatio · n_factor` table the derivative is taken against.
+///
+/// This is **the** Mattes tail, and there is one of it. The host's value-only path,
+/// the host's sparse-support path and the **device** path all call this — the device's
+/// histogram is bit-identical to the host's, and it is fed to the host's own tail
+/// rather than to a re-implementation of it, so the device's value is the host's value
+/// by construction and not by comparison. (`evaluate_global_support` keeps its own
+/// fused walk: it folds `n_factor` into the derivative array *before* multiplying by
+/// `pRatio`, and re-associating that would change the bits of a path nothing asked to
+/// change.)
+///
+/// `None` is the degenerate histogram — no valid sample, or no mass — for which the
+/// metric is `f64::MAX`.
+pub(crate) struct MattesTail {
+    pub(crate) value: f64,
+    /// `pRatio · n_factor`, row-major `[fixed_bin * bins + moving_bin]`, zero in every
+    /// bin the value sum skipped.
+    pub(crate) pratio: Vec<f64>,
+}
+
+/// Normalize the histogram, form `−MI`, and build the `pRatio` table. See [`MattesTail`].
+pub(crate) fn mattes_tail(
+    mut joint_pdf: Vec<f64>,
+    mut fixed_marginal: Vec<f64>,
+    valid: usize,
+    geom: &MattesGeometry,
+) -> Option<MattesTail> {
+    let bins = geom.num_bins;
+    if valid == 0 {
+        return None;
+    }
+    let joint_sum: f64 = joint_pdf.iter().sum();
+    if joint_sum < f64::EPSILON {
+        return None;
+    }
+
+    let n_factor = 1.0 / (geom.moving_bin_size * valid as f64);
+    let inv_sum = 1.0 / joint_sum;
+    for p in joint_pdf.iter_mut() {
+        *p *= inv_sum;
+    }
+    for p in fixed_marginal.iter_mut() {
+        *p *= inv_sum;
+    }
+
+    let mut moving_marginal = vec![0.0f64; bins];
+    for f in 0..bins {
+        for (m, mm) in moving_marginal.iter_mut().enumerate() {
+            *mm += joint_pdf[f * bins + m];
+        }
+    }
+
+    let close_to_zero = f64::EPSILON;
+    let mut sum = 0.0f64;
+    let mut pratio = vec![0.0f64; bins * bins];
+    for f in 0..bins {
+        let fm = fixed_marginal[f];
+        if fm <= close_to_zero {
+            continue;
+        }
+        let log_fm = fm.ln();
+        for m in 0..bins {
+            let mm = moving_marginal[m];
+            let jp = joint_pdf[f * bins + m];
+            if mm > close_to_zero && jp > close_to_zero {
+                let p_ratio = (jp / mm).ln();
+                sum += jp * (p_ratio - log_fm);
+                pratio[f * bins + m] = p_ratio * n_factor;
+            }
+        }
+    }
+
+    Some(MattesTail {
+        value: -sum,
+        pratio,
+    })
+}
+
+/// The Mattes mutual-information metric. Holds the precomputed fixed samples,
+/// moving image, and the joint-histogram geometry (bin sizes and normalized
+/// minima) derived once from the fixed/moving intensity ranges.
+/// [`evaluate`](Self::evaluate) returns `value = −MI` plus its
+/// parameter-derivative for a given transform.
+pub struct MattesMutualInformationMetric {
+    fixed: FixedSamples,
+    moving: MovingImage,
+    geom: MattesGeometry,
+}
+
+impl MattesMutualInformationMetric {
+    /// Build the metric from a fixed and moving image and a histogram bin count
+    /// (ITK/SimpleITK default 50). Fails if dimensions disagree, the moving
+    /// direction matrix is singular, fewer than five bins are requested, or
+    /// either image is constant (MI is then undefined).
+    pub fn new(fixed: &Image, moving: &Image, number_of_histogram_bins: usize) -> Result<Self> {
+        if fixed.dimension() != moving.dimension() {
+            return Err(RegistrationError::DimensionMismatch {
+                fixed: fixed.dimension(),
+                moving: moving.dimension(),
+            });
+        }
+
+        let fixed_samples = FixedSamples::from_image(fixed)?;
+        let moving_image = MovingImage::from_image(moving)?;
+        let geom = MattesGeometry::new(
+            fixed_samples.value_range(),
+            moving_image.value_range(),
+            number_of_histogram_bins,
+        )?;
+
+        Ok(Self {
+            fixed: fixed_samples,
+            moving: moving_image,
+            geom,
         })
     }
 
@@ -210,35 +356,16 @@ impl MattesMutualInformationMetric {
                 moving: moving.dim(),
             });
         }
-        if number_of_histogram_bins < 2 * PADDING + 1 {
-            return Err(RegistrationError::TooFewHistogramBins {
-                bins: number_of_histogram_bins,
-            });
-        }
-
-        let (fixed_min, fixed_max) = fixed.value_range();
-        let (moving_min, moving_max) = moving.value_range();
-        if fixed_max - fixed_min <= f64::EPSILON {
-            return Err(RegistrationError::ConstantIntensity { which: "fixed" });
-        }
-        if moving_max - moving_min <= f64::EPSILON {
-            return Err(RegistrationError::ConstantIntensity { which: "moving" });
-        }
-
-        let denom = (number_of_histogram_bins - 2 * PADDING) as f64;
-        let fixed_bin_size = (fixed_max - fixed_min) / denom;
-        let moving_bin_size = (moving_max - moving_min) / denom;
+        let geom = MattesGeometry::new(
+            fixed.value_range(),
+            moving.value_range(),
+            number_of_histogram_bins,
+        )?;
 
         Ok(Self {
             fixed,
             moving,
-            num_bins: number_of_histogram_bins,
-            moving_true_min: moving_min,
-            moving_true_max: moving_max,
-            fixed_bin_size,
-            moving_bin_size,
-            fixed_normalized_min: fixed_min / fixed_bin_size - PADDING as f64,
-            moving_normalized_min: moving_min / moving_bin_size - PADDING as f64,
+            geom,
         })
     }
 
@@ -255,26 +382,6 @@ impl MattesMutualInformationMetric {
         kind: ScalesEstimatorKind,
     ) -> ScalesEstimator {
         self.fixed.scales_estimator(transform, &self.moving, kind)
-    }
-
-    /// The Parzen-window bin index of a pixel `value` on the axis with bin size
-    /// `bin_size` and normalized minimum `normalized_min`, clamped to the
-    /// interior `[padding, bins − padding − 1]` so all four cubic-window taps
-    /// stay in range. Mirrors ITK's `ComputeSingleFixedImageParzenWindowIndex`
-    /// and the identical clamp applied to the moving index in `ProcessPoint`.
-    fn parzen_window_index(&self, value: f64, bin_size: f64, normalized_min: f64) -> usize {
-        let term = value / bin_size - normalized_min;
-        // ITK static_cast<OffsetValueType> truncates toward zero; `term` is
-        // always ≥ padding ≥ 0 by construction, so truncation == floor here.
-        let mut index = term as isize;
-        let lo = PADDING as isize;
-        let hi = self.num_bins as isize - PADDING as isize - 1;
-        if index < lo {
-            index = lo;
-        } else if index > hi {
-            index = hi;
-        }
-        index as usize
     }
 
     /// Evaluate `value = −MI` and its parameter-derivative for `transform`.
@@ -305,7 +412,7 @@ impl MattesMutualInformationMetric {
     /// fuses the histogram and the `bins² × nparams` joint-PDF derivative into
     /// one walk, and splitting them would cost it a second pass.
     fn build_histogram(&self, transform: &dyn ParametricTransform) -> (Vec<f64>, Vec<f64>, usize) {
-        let bins = self.num_bins;
+        let bins = self.geom.num_bins;
         let n = self.fixed.len();
 
         let mut joint_pdf = vec![0.0f64; bins * bins];
@@ -322,15 +429,21 @@ impl MattesMutualInformationMetric {
                 Some(v) => v,
                 None => continue, // maps outside the moving buffer
             };
-            if mv < self.moving_true_min || mv > self.moving_true_max {
+            if mv < self.geom.moving_true_min || mv > self.geom.moving_true_max {
                 continue;
             }
 
-            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
-            let moving_index =
-                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
-            let fixed_index =
-                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+            let moving_term = mv / self.geom.moving_bin_size - self.geom.moving_normalized_min;
+            let moving_index = self.geom.parzen_window_index(
+                mv,
+                self.geom.moving_bin_size,
+                self.geom.moving_normalized_min,
+            );
+            let fixed_index = self.geom.parzen_window_index(
+                fv,
+                self.geom.fixed_bin_size,
+                self.geom.fixed_normalized_min,
+            );
             fixed_marginal[fixed_index] += 1.0;
 
             let pdf_moving_start = moving_index - 1;
@@ -352,48 +465,11 @@ impl MattesMutualInformationMetric {
     /// the second sample walk of the sparse path is built, so this is the same
     /// for either transform category — there is nothing left to dispatch on.
     pub fn value(&self, transform: &dyn ParametricTransform) -> f64 {
-        let bins = self.num_bins;
-        let (mut joint_pdf, mut fixed_marginal, valid) = self.build_histogram(transform);
-        if valid == 0 {
-            return f64::MAX;
+        let (joint_pdf, fixed_marginal, valid) = self.build_histogram(transform);
+        match mattes_tail(joint_pdf, fixed_marginal, valid, &self.geom) {
+            Some(tail) => tail.value,
+            None => f64::MAX,
         }
-        let joint_sum: f64 = joint_pdf.iter().sum();
-        if joint_sum < f64::EPSILON {
-            return f64::MAX;
-        }
-
-        let inv_sum = 1.0 / joint_sum;
-        for p in joint_pdf.iter_mut() {
-            *p *= inv_sum;
-        }
-        for p in fixed_marginal.iter_mut() {
-            *p *= inv_sum;
-        }
-
-        let mut moving_marginal = vec![0.0f64; bins];
-        for f in 0..bins {
-            for (m, mm) in moving_marginal.iter_mut().enumerate() {
-                *mm += joint_pdf[f * bins + m];
-            }
-        }
-
-        let close_to_zero = f64::EPSILON;
-        let mut sum = 0.0f64;
-        for f in 0..bins {
-            let fm = fixed_marginal[f];
-            if fm <= close_to_zero {
-                continue;
-            }
-            let log_fm = fm.ln();
-            for m in 0..bins {
-                let mm = moving_marginal[m];
-                let jp = joint_pdf[f * bins + m];
-                if mm > close_to_zero && jp > close_to_zero {
-                    sum += jp * ((jp / mm).ln() - log_fm);
-                }
-            }
-        }
-        -sum
     }
 
     pub fn evaluate(&self, transform: &dyn ParametricTransform) -> MetricValue {
@@ -416,7 +492,7 @@ impl MattesMutualInformationMetric {
     /// per-bin joint-PDF parameter derivatives; the second walks the histogram
     /// to form `−MI` and folds each bin's `pRatio` into the derivative.
     fn evaluate_global_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        let bins = self.num_bins;
+        let bins = self.geom.num_bins;
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
 
@@ -441,15 +517,21 @@ impl MattesMutualInformationMetric {
             // Reject values outside the histogram's moving range (matches ITK;
             // a linear interpolant of in-range values only exceeds this by
             // round-off, but the guard keeps the bin index well-defined).
-            if mv < self.moving_true_min || mv > self.moving_true_max {
+            if mv < self.geom.moving_true_min || mv > self.geom.moving_true_max {
                 continue;
             }
 
-            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
-            let moving_index =
-                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
-            let fixed_index =
-                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+            let moving_term = mv / self.geom.moving_bin_size - self.geom.moving_normalized_min;
+            let moving_index = self.geom.parzen_window_index(
+                mv,
+                self.geom.moving_bin_size,
+                self.geom.moving_normalized_min,
+            );
+            let fixed_index = self.geom.parzen_window_index(
+                fv,
+                self.geom.fixed_bin_size,
+                self.geom.fixed_normalized_min,
+            );
 
             // Fixed marginal: zero-order (box) window ⇒ increment one bin.
             fixed_marginal[fixed_index] += 1.0;
@@ -507,7 +589,7 @@ impl MattesMutualInformationMetric {
         // flip the mean-squares metric makes by differencing `M − F` where ITK
         // differences `F − M`. Hence the positive sign here. The finite-
         // difference test pins this down: `derivative == d(value)/d(param)`.
-        let n_factor = 1.0 / (self.moving_bin_size * valid as f64);
+        let n_factor = 1.0 / (self.geom.moving_bin_size * valid as f64);
         for d in joint_pdf_derivatives.iter_mut() {
             *d *= n_factor;
         }
@@ -608,67 +690,26 @@ impl MattesMutualInformationMetric {
     /// [`BSplineTransform::sparse_jacobian_wrt_parameters`]: sitk_transform::BSplineTransform
     /// [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
     fn evaluate_sparse_support(&self, transform: &dyn ParametricTransform) -> MetricValue {
-        let bins = self.num_bins;
+        let bins = self.geom.num_bins;
         let nparams = transform.number_of_parameters();
         let n = self.fixed.len();
 
         // Pass 1: joint histogram + fixed marginal only.
-        let (mut joint_pdf, mut fixed_marginal, valid) = self.build_histogram(transform);
+        let (joint_pdf, fixed_marginal, valid) = self.build_histogram(transform);
 
-        if valid == 0 {
-            return MetricValue {
-                value: f64::MAX,
-                derivative: vec![0.0; nparams],
-                valid_points: 0,
-            };
-        }
-        let joint_sum: f64 = joint_pdf.iter().sum();
-        if joint_sum < f64::EPSILON {
-            return MetricValue {
-                value: f64::MAX,
-                derivative: vec![0.0; nparams],
-                valid_points: valid,
-            };
-        }
-
-        let n_factor = 1.0 / (self.moving_bin_size * valid as f64);
-        let inv_sum = 1.0 / joint_sum;
-        for p in joint_pdf.iter_mut() {
-            *p *= inv_sum;
-        }
-        for p in fixed_marginal.iter_mut() {
-            *p *= inv_sum;
-        }
-
-        let mut moving_marginal = vec![0.0f64; bins];
-        for f in 0..bins {
-            for (m, mm) in moving_marginal.iter_mut().enumerate() {
-                *mm += joint_pdf[f * bins + m];
-            }
-        }
-
-        // Value pass, identical in form to `evaluate_global_support`, but
-        // recording pRatio·n_factor per bin for pass 2 below instead of
-        // folding it into a dense derivative array immediately.
-        let close_to_zero = f64::EPSILON;
-        let mut sum = 0.0f64;
-        let mut pratio = vec![0.0f64; bins * bins];
-        for f in 0..bins {
-            let fm = fixed_marginal[f];
-            if fm <= close_to_zero {
-                continue;
-            }
-            let log_fm = fm.ln();
-            for m in 0..bins {
-                let mm = moving_marginal[m];
-                let jp = joint_pdf[f * bins + m];
-                if mm > close_to_zero && jp > close_to_zero {
-                    let p_ratio = (jp / mm).ln();
-                    sum += jp * (p_ratio - log_fm);
-                    pratio[f * bins + m] = p_ratio * n_factor;
+        // The value and the pRatio table, from the shared tail — the same walk the
+        // value-only path and the device path make.
+        let MattesTail { value, pratio } =
+            match mattes_tail(joint_pdf, fixed_marginal, valid, &self.geom) {
+                Some(t) => t,
+                None => {
+                    return MetricValue {
+                        value: f64::MAX,
+                        derivative: vec![0.0; nparams],
+                        valid_points: valid,
+                    };
                 }
-            }
-        }
+            };
 
         // Pass 2: re-walk the samples, scatter-adding each one's sparse
         // Jacobian contribution weighted by the now-finished per-bin pRatio.
@@ -683,7 +724,7 @@ impl MattesMutualInformationMetric {
                 Some(vg) => vg,
                 None => continue,
             };
-            if mv < self.moving_true_min || mv > self.moving_true_max {
+            if mv < self.geom.moving_true_min || mv > self.geom.moving_true_max {
                 continue;
             }
             let entries = match transform.sparse_jacobian_wrt_parameters(fp) {
@@ -691,11 +732,17 @@ impl MattesMutualInformationMetric {
                 _ => continue, // outside every parameter's support: zero derivative
             };
 
-            let moving_term = mv / self.moving_bin_size - self.moving_normalized_min;
-            let moving_index =
-                self.parzen_window_index(mv, self.moving_bin_size, self.moving_normalized_min);
-            let fixed_index =
-                self.parzen_window_index(fv, self.fixed_bin_size, self.fixed_normalized_min);
+            let moving_term = mv / self.geom.moving_bin_size - self.geom.moving_normalized_min;
+            let moving_index = self.geom.parzen_window_index(
+                mv,
+                self.geom.moving_bin_size,
+                self.geom.moving_normalized_min,
+            );
+            let fixed_index = self.geom.parzen_window_index(
+                fv,
+                self.geom.fixed_bin_size,
+                self.geom.fixed_normalized_min,
+            );
             let moving_start = moving_index - 1;
 
             for (idx, col) in &entries {
@@ -712,7 +759,7 @@ impl MattesMutualInformationMetric {
         }
 
         MetricValue {
-            value: -sum,
+            value,
             derivative,
             valid_points: valid,
         }

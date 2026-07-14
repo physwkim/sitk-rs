@@ -237,6 +237,176 @@ extern "C" __global__ void hist_atomic(
 }
 "#;
 
+/// The counting sort's working set, allocated once and reused.
+///
+/// The kernels are the same either way; this exists so a caller in an optimizer loop
+/// — the Mattes metric, which runs this once per iteration — does not allocate
+/// `ntiles·nbins` integers and an `n`-long scratch on every evaluation. Only
+/// `tilecount` is *accumulated* into, so only `tilecount` is cleared per run
+/// ([`DeviceBuffer::zero`], on the device); every other buffer is fully overwritten by
+/// the kernel that reads it.
+///
+/// The reuse changes nothing about the result. `ntiles` and `chunk` are functions of
+/// `(n, nbins)` alone, exactly as they were when they were locals, and the summation
+/// order is a function of the entry list — see [`TILES`].
+pub(crate) struct HistogramScratch {
+    n: usize,
+    nbins: usize,
+    ntiles: usize,
+    chunk: usize,
+    tilecount: DeviceBuffer<i32>,
+    total: DeviceBuffer<i64>,
+    offset: DeviceBuffer<i64>,
+    cursor: DeviceBuffer<i64>,
+    sorted: DeviceBuffer<f64>,
+    out: DeviceBuffer<f64>,
+}
+
+impl HistogramScratch {
+    /// Size the working set for an `n`-entry list over `nbins` bins.
+    pub(crate) fn new(backend: &Backend, n: usize, nbins: usize) -> Result<Self, CudaError> {
+        if n == 0 || nbins == 0 {
+            return Err(CudaError::HistogramShape(format!(
+                "{n} entries over {nbins} bins"
+            )));
+        }
+        let ntiles = TILES.min(n.div_ceil(SUB)).max(1);
+        Ok(Self {
+            n,
+            nbins,
+            ntiles,
+            chunk: n.div_ceil(ntiles),
+            tilecount: DeviceBuffer::zeros(backend, ntiles * nbins)?,
+            total: DeviceBuffer::zeros(backend, nbins)?,
+            offset: DeviceBuffer::zeros(backend, nbins)?,
+            cursor: DeviceBuffer::zeros(backend, ntiles * nbins)?,
+            sorted: DeviceBuffer::zeros(backend, n)?,
+            out: DeviceBuffer::zeros(backend, nbins)?,
+        })
+    }
+
+    /// `out[keys[i]] += values[i]`, summed in ascending `i` within each bin — the whole
+    /// of the module's guarantee, over buffers that are **already on the device**.
+    ///
+    /// The keys are **not** re-checked here: a host-side check would mean a D2H of the
+    /// entry list, which is the round trip this entry point exists to delete. The
+    /// producer is responsible for emitting keys in `0..nbins`, and every producer in
+    /// this crate does so by construction — the Mattes entry kernel clamps its Parzen
+    /// index into the interior and sends a dropped sample to a dedicated dead bin, so
+    /// no key it can emit names a bin that does not exist. The host-slice
+    /// [`histogram`] still checks, because there the list is already on the host.
+    pub(crate) fn run(
+        &mut self,
+        backend: &Backend,
+        keys: &DeviceBuffer<u32>,
+        values: &DeviceBuffer<f64>,
+        block: usize,
+    ) -> Result<Vec<f64>, CudaError> {
+        if keys.len() < self.n || values.len() < self.n {
+            return Err(CudaError::HistogramShape(format!(
+                "{} keys and {} values for {} entries",
+                keys.len(),
+                values.len(),
+                self.n
+            )));
+        }
+        // The only buffer the kernels accumulate into rather than overwrite.
+        self.tilecount.zero(backend)?;
+
+        let (n_i, chunk_i, nbins_i, ntiles_i) = (
+            self.n as i64,
+            self.chunk as i64,
+            self.nbins as i32,
+            self.ntiles as i32,
+        );
+
+        let f = backend.function_exact(HISTOGRAM, "count_tiles")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(keys.device())
+            .arg(self.tilecount.device_mut())
+            .arg(&n_i)
+            .arg(&chunk_i)
+            .arg(&nbins_i)
+            .arg(&ntiles_i);
+        // SAFETY: six parameters, six arguments, matching in order and type. The grid-stride
+        // loop is bounded by `i < n`; `t` is clamped to `ntiles - 1` and every key is in
+        // `0..nbins` (checked on the host by `histogram`, by construction for a device
+        // producer — see this method's docs), so `t * nbins + key` stays inside `tilecount`.
+        unsafe { launch.launch(cfg(self.n, block))? };
+
+        let f = backend.function_exact(HISTOGRAM, "bin_totals")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(self.tilecount.device())
+            .arg(self.total.device_mut())
+            .arg(&nbins_i)
+            .arg(&ntiles_i);
+        // SAFETY: four parameters, four arguments. One thread per bin, guarded by `b < nbins`;
+        // the inner loop indexes `tilecount` inside `ntiles * nbins`.
+        unsafe { launch.launch(cfg(self.nbins, BINS_PER_BLOCK))? };
+
+        let f = backend.function_exact(HISTOGRAM, "bin_offsets")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(self.total.device())
+            .arg(self.offset.device_mut())
+            .arg(&nbins_i);
+        // SAFETY: three parameters, three arguments. A single thread walks `0..nbins`.
+        unsafe { launch.launch(cfg(1, 1))? };
+
+        let f = backend.function_exact(HISTOGRAM, "tile_cursors")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(self.tilecount.device())
+            .arg(self.offset.device())
+            .arg(self.cursor.device_mut())
+            .arg(&nbins_i)
+            .arg(&ntiles_i);
+        // SAFETY: five parameters, five arguments. One thread per bin, guarded by `b < nbins`;
+        // both matrices are `ntiles * nbins`.
+        unsafe { launch.launch(cfg(self.nbins, BINS_PER_BLOCK))? };
+
+        let f = backend.function_exact(HISTOGRAM, "scatter_stable")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(keys.device())
+            .arg(values.device())
+            .arg(self.cursor.device_mut())
+            .arg(self.sorted.device_mut())
+            .arg(&n_i)
+            .arg(&chunk_i)
+            .arg(&nbins_i);
+        // SAFETY: seven parameters, seven arguments. The block size is exactly `SUB`, which is
+        // the shared arrays' length, and the kernel indexes them by `threadIdx.x < m <= SUB`.
+        // Every write to `sorted` is at `cursor[t][b] + rank`, and the cursors partition
+        // `0..n` by construction (they are the exclusive prefix sums of the same counts the
+        // entries were counted into), so the writes are in range and non-overlapping.
+        unsafe {
+            launch.launch(LaunchConfig {
+                grid_dim: (self.ntiles as u32, 1, 1),
+                block_dim: (SUB as u32, 1, 1),
+                shared_mem_bytes: 0,
+            })?
+        };
+
+        let f = backend.function_exact(HISTOGRAM, "segment_sums")?;
+        let mut launch = backend.stream().launch_builder(&f);
+        launch
+            .arg(self.sorted.device())
+            .arg(self.offset.device())
+            .arg(self.total.device())
+            .arg(self.out.device_mut())
+            .arg(&nbins_i);
+        // SAFETY: five parameters, five arguments. One thread per bin, guarded by `b < nbins`;
+        // `offset[b] + total[b] <= n` because the offsets are the prefix sums of the totals.
+        unsafe { launch.launch(cfg(self.nbins, BINS_PER_BLOCK))? };
+
+        backend.synchronize()?;
+        self.out.to_host(backend)
+    }
+}
+
 fn cfg(n: usize, block: usize) -> LaunchConfig {
     let block = block as u32;
     LaunchConfig {
@@ -295,104 +465,10 @@ pub fn histogram_with_block(
 ) -> Result<Vec<f64>, CudaError> {
     check(keys, values, nbins)?;
     let backend: &Backend = backend()?;
-    let n = keys.len();
-    let ntiles = TILES.min(n.div_ceil(SUB)).max(1);
-    let chunk = n.div_ceil(ntiles);
-
     let d_keys = DeviceBuffer::from_host(backend, keys)?;
     let d_vals = DeviceBuffer::from_host(backend, values)?;
-    let mut tilecount = DeviceBuffer::<i32>::zeros(backend, ntiles * nbins)?;
-    let mut total = DeviceBuffer::<i64>::zeros(backend, nbins)?;
-    let mut offset = DeviceBuffer::<i64>::zeros(backend, nbins)?;
-    let mut cursor = DeviceBuffer::<i64>::zeros(backend, ntiles * nbins)?;
-    let mut sorted = DeviceBuffer::<f64>::zeros(backend, n)?;
-    let mut out = DeviceBuffer::<f64>::zeros(backend, nbins)?;
-
-    let (n_i, chunk_i, nbins_i, ntiles_i) = (n as i64, chunk as i64, nbins as i32, ntiles as i32);
-
-    let f = backend.function_exact(HISTOGRAM, "count_tiles")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(d_keys.device())
-        .arg(tilecount.device_mut())
-        .arg(&n_i)
-        .arg(&chunk_i)
-        .arg(&nbins_i)
-        .arg(&ntiles_i);
-    // SAFETY: six parameters, six arguments, matching in order and type. The grid-stride
-    // loop is bounded by `i < n`; `t` is clamped to `ntiles - 1` and `keys[i] < nbins` was
-    // checked on the host, so `t * nbins + key` stays inside `tilecount`.
-    unsafe { launch.launch(cfg(n, block))? };
-
-    let f = backend.function_exact(HISTOGRAM, "bin_totals")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(tilecount.device())
-        .arg(total.device_mut())
-        .arg(&nbins_i)
-        .arg(&ntiles_i);
-    // SAFETY: four parameters, four arguments. One thread per bin, guarded by `b < nbins`;
-    // the inner loop indexes `tilecount` inside `ntiles * nbins`.
-    unsafe { launch.launch(cfg(nbins, BINS_PER_BLOCK))? };
-
-    let f = backend.function_exact(HISTOGRAM, "bin_offsets")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(total.device())
-        .arg(offset.device_mut())
-        .arg(&nbins_i);
-    // SAFETY: three parameters, three arguments. A single thread walks `0..nbins`.
-    unsafe { launch.launch(cfg(1, 1))? };
-
-    let f = backend.function_exact(HISTOGRAM, "tile_cursors")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(tilecount.device())
-        .arg(offset.device())
-        .arg(cursor.device_mut())
-        .arg(&nbins_i)
-        .arg(&ntiles_i);
-    // SAFETY: five parameters, five arguments. One thread per bin, guarded by `b < nbins`;
-    // both matrices are `ntiles * nbins`.
-    unsafe { launch.launch(cfg(nbins, BINS_PER_BLOCK))? };
-
-    let f = backend.function_exact(HISTOGRAM, "scatter_stable")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(d_keys.device())
-        .arg(d_vals.device())
-        .arg(cursor.device_mut())
-        .arg(sorted.device_mut())
-        .arg(&n_i)
-        .arg(&chunk_i)
-        .arg(&nbins_i);
-    // SAFETY: seven parameters, seven arguments. The block size is exactly `SUB`, which is
-    // the shared arrays' length, and the kernel indexes them by `threadIdx.x < m <= SUB`.
-    // Every write to `sorted` is at `cursor[t][b] + rank`, and the cursors partition
-    // `0..n` by construction (they are the exclusive prefix sums of the same counts the
-    // entries were counted into), so the writes are in range and non-overlapping.
-    unsafe {
-        launch.launch(LaunchConfig {
-            grid_dim: (ntiles as u32, 1, 1),
-            block_dim: (SUB as u32, 1, 1),
-            shared_mem_bytes: 0,
-        })?
-    };
-
-    let f = backend.function_exact(HISTOGRAM, "segment_sums")?;
-    let mut launch = backend.stream().launch_builder(&f);
-    launch
-        .arg(sorted.device())
-        .arg(offset.device())
-        .arg(total.device())
-        .arg(out.device_mut())
-        .arg(&nbins_i);
-    // SAFETY: five parameters, five arguments. One thread per bin, guarded by `b < nbins`;
-    // `offset[b] + total[b] <= n` because the offsets are the prefix sums of the totals.
-    unsafe { launch.launch(cfg(nbins, BINS_PER_BLOCK))? };
-
-    backend.synchronize()?;
-    out.to_host(backend)
+    let mut scratch = HistogramScratch::new(backend, keys.len(), nbins)?;
+    scratch.run(backend, &d_keys, &d_vals, block)
 }
 
 /// The same histogram, accumulated with `atomicAdd` on `double` — **not deterministic**,
