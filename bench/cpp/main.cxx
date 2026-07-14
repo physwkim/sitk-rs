@@ -184,9 +184,30 @@ struct SizeSpec
 static const SizeSpec SIZES[] = { { "small", 64 }, { "medium", 256 }, { "large", 512 } };
 
 // doc/bench-spec.md: `large` is skipped for ops whose ITK implementation would
-// take > 120 s. Enforced by timing the (untimed, not-reported) warmup call and
-// bailing out if it exceeds this budget.
+// take > 120 s. Enforced by timing the first (untimed, not-reported) warmup call
+// and bailing out if it exceeds this budget.
 static constexpr double LARGE_BUDGET_MS = 120000.0;
+
+// Warm up until this much wall time has been spent in untimed calls, not for a
+// fixed *count* of calls.
+//
+// This box ramps: after it has been idle, the first ~2 s of a 96-thread pass runs
+// up to 70% slow and decays (measured in bench/results/harness-instability-result.md
+// -- criterion's own per-sample times on the Rust side reach within 5% of steady at
+// 1.63 s of measured work, ~2.1 s counting the warm-up before them). That is a
+// property of the machine, not of the language, so the C++ harness pays it too.
+//
+// A single warmup call cannot cover it. At 64^3 an ITK op takes 0.6-37 ms, so one
+// call is <2% of the ramp and *all ten* samples then land inside it -- the harness
+// reports how cold the box was, not what ITK costs. The Rust harness had the same
+// defect with a 500 ms warm-up and it inflated its own 64^3 numbers by up to 2.02x.
+//
+// 3 s covers the measured 2.1 s ramp with margin. It is the same number the Rust
+// harness uses (`WARM_UP_MS` in benches/bench_ops.rs) and it is derived from the
+// ramp, not tuned until an ITK number came out somewhere pleasant. Expensive cells
+// (a 512^3 op costing seconds) still get exactly one warmup call, which is what the
+// loop condition already gives them.
+static constexpr double WARM_UP_MS = 3000.0;
 
 int
 main(int argc, char ** argv)
@@ -463,11 +484,18 @@ main(int argc, char ** argv)
         out->flush();
       };
 
-      // Warmup: also the >120 s gate for `large`.
+      // Warmup: also the >120 s gate for `large`. Repeated until WARM_UP_MS of
+      // wall time has been spent, so the box's ramp is inside the warm-up instead
+      // of inside the ten reported samples.
       RunResult warm;
       try
       {
-        warm = fn();
+        const auto warmStart = std::chrono::steady_clock::now();
+        do
+        {
+          warm = fn();
+        } while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warmStart).count() <
+                 WARM_UP_MS);
       }
       catch (const itk::ExceptionObject & e)
       {
