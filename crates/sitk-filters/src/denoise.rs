@@ -909,25 +909,28 @@ pub fn discrete_gaussian_derivative(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        let out: Vec<f64> = iter
-            .map(|(_, nb)| {
-                let mut off = vec![0i64; dim];
-                let acc: f64 = kernel
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &c)| {
-                        off[d] = k as i64 - half as i64;
-                        c * nb.get(&off)
-                    })
-                    .sum();
-                // Real-valued intermediate: the separable passes accumulate in
-                // f64 and quantize to `pixel_id` exactly once, at the end (via
-                // `image_from_f64`). ITK's `RealOutputImageType` alias is
-                // misdeclared `Image<OutputPixelType>`, truncating every partial
-                // derivative on integer images; this port carries the real type.
-                acc
-            })
-            .collect();
+        // The window is 1-D along axis `d` (radius is zero on every other axis),
+        // so its slot stride along `d` is 1 and tap `k` sits at slot `k`. That is
+        // the whole of the ND-offset arithmetic `Neighborhood::get` was
+        // re-deriving per tap, per voxel.
+        //
+        // Parallel over output voxels: the taps are summed over `k` in kernel
+        // order, exactly as the serial `map(..).sum()` summed them, and nothing
+        // accumulates across voxels. The axis loop itself stays sequential — each
+        // pass reads the previous pass's whole output — so the separable cascade
+        // is unchanged.
+        let out: Vec<f64> = iter.par_map_window(|_, w| {
+            // Real-valued intermediate: the separable passes accumulate in
+            // f64 and quantize to `pixel_id` exactly once, at the end (via
+            // `image_from_f64`). ITK's `RealOutputImageType` alias is
+            // misdeclared `Image<OutputPixelType>`, truncating every partial
+            // derivative on integer images; this port carries the real type.
+            kernel
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| c * w.get_f64(k))
+                .sum()
+        });
 
         current = Image::from_vec(&size, out)?;
         current.copy_geometry_from(img);
@@ -2503,6 +2506,177 @@ mod bilateral_thread_parity {
                              with {threads} threads: {a:?} vs serial {b:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Thread-count parity pin for `discrete_gaussian_derivative`'s separable pass.
+///
+/// This is a **summing** stencil: each output voxel is `Σ_k kernel[k] · w[k]` in
+/// `f64`, and `f64` addition is not associative — so the non-vacuity guard here
+/// *is* the fold-order one
+/// ([`crate::stencil_test_support::window_sum_order_is_observable`]), and it is
+/// asserted on the volume the pin actually uses.
+///
+/// `-0.0` does not apply. The conversion did not turn an accumulate into a store
+/// or a skip into an add: the sum still starts at `0.0` and runs over the same
+/// taps in the same `k` order. The only thing that changed is *where* tap `k` is
+/// read from — slot `k` of a borrowed 1-D window, instead of an ND offset vector
+/// re-derived per tap — and reading the same value from a different expression
+/// cannot move a bit.
+#[cfg(test)]
+mod gaussian_derivative_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{
+        PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
+    };
+    use sitk_core::parallel;
+
+    const MAX_ERROR: f64 = 0.01;
+    const MAX_WIDTH: u32 = 32;
+
+    /// The exact serial cascade that was deleted: same kernels, same axis order,
+    /// same `Neighborhood::get` ND-offset tap read.
+    fn serial(
+        img: &Image,
+        variance: &[f64],
+        order: &[u32],
+        use_image_spacing: bool,
+        normalize_across_scale: bool,
+    ) -> Vec<f64> {
+        let dim = img.dimension();
+        let maximum_error = clamp_maximum_error(MAX_ERROR);
+        let spacing = img.spacing().to_vec();
+        let size = img.size().to_vec();
+        let mut current = scratch_f64(img).unwrap();
+
+        for d in (0..dim).rev() {
+            let pixel_variance = if use_image_spacing {
+                variance[d] / (spacing[d] * spacing[d])
+            } else {
+                variance[d]
+            };
+            let mut kernel = gaussian_derivative_operator_coefficients(
+                pixel_variance,
+                maximum_error,
+                MAX_WIDTH,
+                order[d],
+                normalize_across_scale,
+            );
+            kernel.reverse();
+            let half = kernel.len() / 2;
+            let mut radius = vec![0usize; dim];
+            radius[d] = half;
+
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &current,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+            let out: Vec<f64> = iter
+                .map(|(_, nb)| {
+                    let mut off = vec![0i64; dim];
+                    kernel
+                        .iter()
+                        .enumerate()
+                        .map(|(k, &c)| {
+                            off[d] = k as i64 - half as i64;
+                            c * nb.get(&off)
+                        })
+                        .sum()
+                })
+                .collect();
+
+            current = Image::from_vec(&size, out).unwrap();
+            current.copy_geometry_from(img);
+        }
+        current.to_f64_vec().unwrap()
+    }
+
+    /// Narrow a serial reference through the same exit the filter takes.
+    /// `discrete_gaussian_derivative` keeps the input's pixel type, so on an `f32`
+    /// input its output is `f32`-rounded; comparing against an un-rounded `f64`
+    /// reference would fail on the rounding rather than on the parallelization.
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    /// Non-vacuity. The taps are summed in `f64`; if that sum could not round on
+    /// this volume, re-associating it would be invisible and the pin would pass on
+    /// a filter that summed its window in any order at all. This asserts the order
+    /// *is* observable — reversing a window's terms moves the bits on at least one
+    /// voxel — on the same `f64` volume the pin runs on.
+    ///
+    /// The `f32` volume is pinned as well, but for a different reason: it exercises
+    /// the widening-per-access path, not the fold order. It is not asserted to be
+    /// order-sensitive, and it must not be read as proving anything about it.
+    #[test]
+    fn the_window_sum_order_is_observable_on_the_float64_volume() {
+        let img = volume(PixelId::Float64);
+        assert!(
+            window_sum_order_is_observable(&img, &[4, 0, 0]),
+            "no voxel changed bits when its window sum was reversed, so this volume cannot \
+             observe a re-association and the pin below would pass even on a filter that \
+             summed its taps in a different order"
+        );
+    }
+
+    #[test]
+    fn the_reference_output_is_not_degenerate() {
+        let img = volume(PixelId::Float64);
+        let values = serial(&img, &[2.0, 2.0, 2.0], &[1, 0, 0], true, false);
+        let nonzero = values.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero > values.len() / 2,
+            "only {nonzero}/{} voxels are non-zero — the volume is too flat to pin anything",
+            values.len()
+        );
+    }
+
+    #[test]
+    fn discrete_gaussian_derivative_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (order, use_image_spacing, normalize) in [
+                (vec![1u32, 0, 0], true, false),
+                (vec![0, 2, 0], true, false),
+                (vec![1, 1, 0], false, true),
+            ] {
+                let variance = vec![2.0f64, 1.5, 3.0];
+                let expected = narrowed_like(
+                    &img,
+                    &serial(&img, &variance, &order, use_image_spacing, normalize),
+                );
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        discrete_gaussian_derivative(
+                            &img,
+                            &variance,
+                            &order,
+                            MAX_ERROR,
+                            MAX_WIDTH,
+                            use_image_spacing,
+                            normalize,
+                        )
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "discrete_gaussian_derivative({pixel:?}, order={order:?}, \
+                             spacing={use_image_spacing}, normalize={normalize}, \
+                             {threads} threads)"
+                        ),
+                    );
                 }
             }
         }
