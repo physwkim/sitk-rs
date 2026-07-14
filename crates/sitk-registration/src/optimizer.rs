@@ -14,6 +14,8 @@
 //! `min_step_tolerance`, or — when convergence monitoring is enabled — when the
 //! metric value plateaus (see [`crate::convergence`]).
 
+use sitk_core::compensated::compensated_sum;
+
 use crate::convergence::WindowConvergenceMonitor;
 
 /// The scalar objective the line-search optimizers minimize.
@@ -391,7 +393,22 @@ impl RegularStepGradientDescentOptimizer {
 
         loop {
             let scaled: Vec<f64> = (0..n).map(|k| grad[k] / scales[k]).collect();
-            let gradient_magnitude = scaled.iter().map(|g| g * g).sum::<f64>().sqrt();
+            // Compensated, because ITK compensates it and because of what it feeds. Both
+            // reductions in this loop go through `CompensatedSummation` upstream
+            // (`itkRegularStepGradientDescentOptimizerv4.hxx:107-113` for the magnitude,
+            // `:126-133` for the scalar product) and both are read by a **branch**: the
+            // stop test immediately below, and the direction-reversal test after it. A
+            // reduction a discrete decision is taken on is exactly the reduction whose
+            // last bits are not free — §2.157 measured this loop amplifying a 1e-12
+            // derivative difference ~500× per step, precisely *because* the reversal test
+            // is a branch that a rounding difference can flip.
+            //
+            // Parity, not merely accuracy: upstream sums over the parameters in index
+            // order on one thread, and so does this, so the compensated result is
+            // upstream's number. The sum is short for an affine (12 terms) and long for a
+            // displacement field (3 per voxel), which is the case ITK's compensation is
+            // really for.
+            let gradient_magnitude = compensated_sum(scaled.iter().map(|g| g * g)).sqrt();
 
             // A near-zero gradient is a stationary point; stop before stepping.
             if gradient_magnitude < self.gradient_magnitude_tolerance {
@@ -405,11 +422,12 @@ impl RegularStepGradientDescentOptimizer {
             // learning rate and an extra `1/scale` factor; for the uniform
             // scales of a translation (and the sign that actually matters here)
             // this reduces to the plain reversal test used below.
-            let scalar_product: f64 = scaled
-                .iter()
-                .zip(previous_scaled.iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
+            let scalar_product = compensated_sum(
+                scaled
+                    .iter()
+                    .zip(previous_scaled.iter())
+                    .map(|(&a, &b)| a * b),
+            );
             if scalar_product < 0.0 {
                 relaxation *= self.relaxation_factor;
             }
@@ -1072,6 +1090,80 @@ impl ConjugateGradientLineSearchOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The scalar product decides a branch, and a naive walk gets its SIGN wrong.**
+    ///
+    /// This is the sharpest pin in the compensated-summation family, because it does not
+    /// argue about last bits: it exhibits a gradient pair for which the naive sum of
+    /// `g·g_prev` is **−1** and the true sum is **+1**. Upstream compensates this reduction
+    /// (`itkRegularStepGradientDescentOptimizerv4.hxx:126-133`) and then *tests its sign*
+    /// to decide whether the descent direction reversed and the step must be relaxed. So
+    /// the accumulator's error is not a small error in a reported number — it flips a
+    /// discrete decision, halving a step that should not have been halved.
+    ///
+    /// The products are `[1e16, 1, 1, −1e16, −1]`, summed left to right. Naively, both
+    /// `1`s vanish into `1e16`'s ulp (which is 2), the `−1e16` then cancels to exactly
+    /// zero, and the trailing `−1` lands the sum at **−1 → "reversed, relax"**. Kahan
+    /// carries the lost `2` across the cancellation and lands at **+1 → "not reversed"**.
+    /// §2.157 recorded this exact branch amplifying a 1e-12 difference ~500× per step;
+    /// this test is that mechanism in the small.
+    ///
+    /// Reverting either `compensated_sum` in the loop to `.sum()` relaxes the step and the
+    /// final parameters move half as far — which is what the assertion catches.
+    #[test]
+    fn the_reversal_test_is_compensated_and_a_naive_walk_flips_the_branch() {
+        // Iteration 1's gradient. Iteration 2's is all ones, so the elementwise products
+        // at iteration 2 are exactly this vector.
+        let g1 = [1.0e16, 1.0, 1.0, -1.0e16, -1.0];
+        let g2 = [1.0, 1.0, 1.0, 1.0, 1.0];
+
+        let naive: f64 = g1.iter().zip(g2.iter()).map(|(&a, &b)| a * b).sum();
+        let compensated = compensated_sum(g1.iter().zip(g2.iter()).map(|(&a, &b)| a * b));
+        assert!(
+            naive < 0.0 && compensated > 0.0,
+            "the fixture must be one where the two walks disagree on the SIGN, or this \
+             pin cannot fail: naive {naive}, compensated {compensated}"
+        );
+
+        // Two iterations, unit scales, learning rate 1, relaxation 0.5 (the default).
+        let mut opt = RegularStepGradientDescentOptimizer::new(1.0, 1.0e-12, 2);
+        opt.set_relaxation_factor(0.5);
+
+        let mut call = 0usize;
+        let r = opt.optimize(vec![0.0; 5], |_p| {
+            call += 1;
+            // eval #1 seeds the loop with g1; every later eval returns g2.
+            let g = if call == 1 { g1 } else { g2 };
+            (0.0, g.to_vec())
+        });
+
+        // Each iteration moves `p` by `(step_length / ‖scaled‖) · scaled`, and with the
+        // reversal branch correctly NOT taken the step length stays `1 · learning_rate = 1`.
+        // Iteration 1 cannot relax either way (the previous gradient is still zero), so
+        // parameter 1 — whose component is `+1` in both gradients — isolates iteration 2's
+        // step length: it moves by `g1[1]/‖g1‖` (a negligible 7e-17, as ‖g1‖ ≈ 1.4e16) and
+        // then by `g2[1]/‖g2‖ = 1/√5 ≈ 0.447`.
+        let magnitude_1 = compensated_sum(g1.iter().map(|g| g * g)).sqrt();
+        let magnitude_2 = compensated_sum(g2.iter().map(|g| g * g)).sqrt();
+        let unrelaxed = -(g1[1] / magnitude_1) - (g2[1] / magnitude_2);
+        // What a naive scalar product produces: the branch fires, relaxation halves, and
+        // iteration 2's step is half as long. The two land a factor of two apart, so this
+        // pin discriminates by a mile rather than by an ulp.
+        let relaxed = -(g1[1] / magnitude_1) - 0.5 * (g2[1] / magnitude_2);
+        assert!(
+            (unrelaxed - relaxed).abs() > 0.2,
+            "the two outcomes must be far apart, or this pin is measuring rounding"
+        );
+
+        assert_eq!(r.iterations, 2, "the fixture must take both steps");
+        assert!(
+            (r.parameters[1] - unrelaxed).abs() < 1e-12 * unrelaxed.abs().max(1.0),
+            "the step was relaxed, so the reversal branch fired — the scalar product was \
+             summed naively and came out negative. got {}, expected {unrelaxed} (a relaxed \
+             step lands at {relaxed})",
+            r.parameters[1]
+        );
+    }
 
     #[test]
     fn minimizes_a_quadratic_bowl() {

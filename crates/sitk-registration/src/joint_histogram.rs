@@ -167,6 +167,9 @@
 //! [`MattesMutualInformationMetric`]: crate::MattesMutualInformationMetric
 
 use sitk_core::Image;
+use sitk_core::compensated::CompensatedSum;
+#[cfg(test)]
+use sitk_core::compensated::neumaier_sum;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
@@ -368,6 +371,38 @@ fn convolve_axis(data: &[f64], rows: usize, cols: usize, axis: usize, kernel: &[
         }
     }
     out
+}
+
+/// The two marginals of the smoothed joint PDF, **by compensated summation** — and there
+/// is one of these, so the reduction cannot be re-hand-rolled naive at a second site.
+///
+/// ITK sums each marginal line through a `CompensatedSummation`
+/// (`itkJointHistogramMutualInformationImageToImageMetricv4.hxx:254-290`, one accumulator
+/// reset per line). Each marginal bin sums `bins` smoothed-PDF terms spanning the
+/// histogram's whole dynamic range, and the marginals then become a **denominator**
+/// (`denom = px · py`) — so their error lands in every one of the `bins²` MI terms.
+///
+/// **This buys accuracy, not parity, and the distinction is load-bearing here.** The port
+/// deliberately computes both marginals *correctly* rather than reproducing ITK's
+/// documented content swap (see the module docs: upstream's two arrays hold each other's
+/// contents), so these are not upstream's numbers and no compensation could make them so.
+/// What compensation buys is a smaller error against the true sum of the terms this port
+/// means to add. Compare [`crate::mattes`]'s `joint_pdf_sum`, which walks the same terms
+/// in the same order as upstream and therefore buys **parity**.
+fn marginals(bins: usize, jp: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut fixed = vec![CompensatedSum::new(); bins];
+    let mut moving = vec![CompensatedSum::new(); bins];
+    for f in 0..bins {
+        for m in 0..bins {
+            let v = jp[f * bins + m];
+            fixed[f] += v;
+            moving[m] += v;
+        }
+    }
+    (
+        fixed.iter().map(CompensatedSum::sum).collect(),
+        moving.iter().map(CompensatedSum::sum).collect(),
+    )
 }
 
 /// The joint-histogram mutual-information metric. Holds the precomputed fixed
@@ -647,15 +682,7 @@ impl JointHistogramMutualInformationMetric {
         let smoothed_once = convolve_axis(&hist, bins, bins, 0, &kernel);
         let jp = convolve_axis(&smoothed_once, bins, bins, 1, &kernel);
 
-        let mut fixed_marginal = vec![0.0f64; bins];
-        let mut moving_marginal = vec![0.0f64; bins];
-        for f in 0..bins {
-            for m in 0..bins {
-                let v = jp[f * bins + m];
-                fixed_marginal[f] += v;
-                moving_marginal[m] += v;
-            }
-        }
+        let (fixed_marginal, moving_marginal) = marginals(bins, &jp);
 
         (jp, fixed_marginal, moving_marginal, valid)
     }
@@ -669,7 +696,16 @@ impl JointHistogramMutualInformationMetric {
         moving_marginal: &[f64],
     ) -> f64 {
         let eps = f64::EPSILON;
-        let mut total = 0.0f64;
+        // Compensated: ITK accumulates the MI sum through a `CompensatedSummation`
+        // (`…Metricv4.hxx:348`, `total_mi`), in this same `(i, j)` order. `bins²` terms
+        // (1 024 at the 32-bin default, 2 500 at 50) of wildly mixed magnitude — most bins
+        // are near-empty and contribute ~0, a few carry the whole mass — which is the
+        // shape of sum a naive walk is worst at, and the result *is* the metric value.
+        //
+        // Accuracy, not parity: the marginals this is contracted against are the port's
+        // corrected ones, not ITK's swapped pair, so the number was never going to be
+        // upstream's bit for bit. See `joint_pdf_and_marginals`.
+        let mut total = CompensatedSum::new();
         for i in 0..bins {
             let px = fixed_marginal[i];
             for j in 0..bins {
@@ -681,7 +717,7 @@ impl JointHistogramMutualInformationMetric {
                 }
             }
         }
-        -total / std::f64::consts::LN_2
+        -total.sum() / std::f64::consts::LN_2
     }
 
     /// The metric value alone at `transform`: the first (value-only) pass of
@@ -798,6 +834,126 @@ impl JointHistogramMutualInformationMetric {
 mod tests {
     use super::*;
     use sitk_transform::{TransformBase, TranslationTransform};
+
+    /// A joint PDF built to defeat naive summation: one bin holds nearly all the mass and
+    /// the rest hold terms far below its ulp — the shape a smoothed histogram genuinely
+    /// takes when a registration is near alignment (the diagonal carries the mass, the
+    /// off-diagonal bins carry the Gaussian's tails).
+    ///
+    /// The magnitudes are not arbitrary, and the first draft of this fixture was **too
+    /// weak** — its tail terms were `1e-18`, so the *whole tail* of a row summed to less
+    /// than half an ulp of the peak and no algorithm on earth could recover it: the
+    /// compensated walk, the naive walk and the Neumaier reference all returned exactly
+    /// `1.0`, and the non-vacuity assertion below caught it. What is needed is the regime
+    /// where each term is *individually* below the peak's ulp (so a naive walk drops every
+    /// one of them) while the tail's *total* exceeds it (so a compensated walk gets it
+    /// back): with `bins = 24` and a peak of `1.0` (ulp `2.2e-16`), tail terms of `1e-17`
+    /// are each lost naively, and their 23-term total of `2.3e-16` is one ulp of recovered
+    /// mass. The peak sits at `m = 0` so the accumulator is large from the first term —
+    /// which is the order Kahan is *for*, and the order a real near-aligned histogram row
+    /// takes.
+    fn ill_conditioned_joint_pdf(bins: usize) -> Vec<f64> {
+        let mut jp = vec![0.0f64; bins * bins];
+        for f in 0..bins {
+            for m in 0..bins {
+                jp[f * bins + m] = if f == bins / 2 && m == 0 {
+                    1.0
+                } else {
+                    1.0e-17
+                };
+            }
+        }
+        jp
+    }
+
+    /// **The marginals are compensated, and a naive walk is not good enough.** Asserts the
+    /// non-vacuity first (the fixture *does* defeat a naive walk, else this proves
+    /// nothing), then that the shipped reduction is not the naive one's bits, then that it
+    /// is strictly closer to the true sum. Reverting [`marginals`] to `+=` on plain `f64`
+    /// fails the middle assertion — which is the only one that catches a regression.
+    #[test]
+    fn the_marginals_are_compensated_and_a_naive_walk_is_not_good_enough() {
+        const BINS: usize = 24;
+        let jp = ill_conditioned_joint_pdf(BINS);
+
+        // The naive walk this replaced, kept here as the thing that must *not* be equal.
+        let mut naive = [0.0f64; BINS];
+        for f in 0..BINS {
+            for m in 0..BINS {
+                naive[f] += jp[f * BINS + m];
+            }
+        }
+        // Neumaier reference — the residual folded back in, strictly better than ITK's
+        // `GetSum()`, so it is a fair judge of both.
+        let reference: Vec<f64> = (0..BINS)
+            .map(|f| neumaier_sum((0..BINS).map(|m| jp[f * BINS + m])))
+            .collect();
+
+        let peak = BINS / 2;
+        assert_ne!(
+            naive[peak].to_bits(),
+            reference[peak].to_bits(),
+            "the fixture must defeat naive summation, or the pin below is vacuous"
+        );
+
+        let (fixed, _moving) = marginals(BINS, &jp);
+        assert_ne!(
+            fixed[peak].to_bits(),
+            naive[peak].to_bits(),
+            "the marginal is the naive sum's bits: the compensation is gone"
+        );
+        assert!(
+            (fixed[peak] - reference[peak]).abs() < (naive[peak] - reference[peak]).abs(),
+            "the compensated marginal must be closer to the true sum than the naive one"
+        );
+    }
+
+    /// **The MI accumulation is compensated too** (ITK's `total_mi`,
+    /// `…Metricv4.hxx:348`), and it *is* the metric's value — so its last bits are the
+    /// value's last bits. Same three-part shape: non-vacuity, then not-the-naive-bits,
+    /// then strictly-closer.
+    #[test]
+    fn the_mi_sum_is_compensated_and_a_naive_walk_is_not_good_enough() {
+        const BINS: usize = 24;
+        let jp = ill_conditioned_joint_pdf(BINS);
+        let (fixed, moving) = marginals(BINS, &jp);
+
+        // The terms `compute_value` adds, in the order it adds them.
+        let eps = f64::EPSILON;
+        let mut terms: Vec<f64> = Vec::new();
+        for i in 0..BINS {
+            let px = fixed[i];
+            for j in 0..BINS {
+                let denom = px * moving[j];
+                let pxy = jp[i * BINS + j];
+                if denom.abs() > eps && pxy / denom > eps {
+                    terms.push(pxy * (pxy / denom).ln());
+                }
+            }
+        }
+
+        let naive: f64 = terms.iter().sum();
+        let reference = neumaier_sum(terms.iter().copied());
+        assert_ne!(
+            naive.to_bits(),
+            reference.to_bits(),
+            "the fixture must defeat naive summation, or the pin below is vacuous"
+        );
+
+        let got = JointHistogramMutualInformationMetric::compute_value(BINS, &jp, &fixed, &moving);
+        let naive_value = -naive / std::f64::consts::LN_2;
+        assert_ne!(
+            got.to_bits(),
+            naive_value.to_bits(),
+            "the MI sum is the naive sum's bits: the compensation is gone"
+        );
+
+        let reference_value = -reference / std::f64::consts::LN_2;
+        assert!(
+            (got - reference_value).abs() < (naive_value - reference_value).abs(),
+            "the compensated value must be closer to the true sum than the naive one"
+        );
+    }
 
     /// A 2-D Gaussian blob of amplitude `amp` and width `sigma`, centred at
     /// `(cx, cy)` in physical (== index, unit spacing) coordinates, on a small
