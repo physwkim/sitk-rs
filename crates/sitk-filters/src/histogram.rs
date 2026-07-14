@@ -31,7 +31,140 @@
 //! `f64` uniformly for every caller, matching that rule exactly.
 
 use crate::error::{FilterError, Result};
-use sitk_core::parallel;
+use sitk_core::{Image, parallel};
+
+/// The mask of the `HistogramThresholdImageFilter` family — **one owner for all
+/// twelve** of this crate's histogram-driven thresholds, because twelve local mask
+/// branches is twelve chances to disagree about what a mask means.
+///
+/// ITK routes a masked threshold's histogram through
+/// `Statistics::MaskedImageToHistogramFilter` (`itkHistogramThresholdImageFilter.hxx:78-89`),
+/// and the mask changes the *threshold*, not just the output: the histogram — and,
+/// under `AutoMinimumMaximum`, its **bin range** — is built from the admitted voxels
+/// only (`itkMaskedImageToHistogramFilter.hxx`, `ThreadedComputeMinimumAndMaximum` and
+/// `ThreadedStreamedGenerateData`, both gated on `maskIt.Get() == maskValue`).
+///
+/// # Two different mask comparisons, in one filter, on purpose
+///
+/// Reproduced exactly, because it is not what a reader would guess:
+///
+/// * **Histogram inclusion** is `mask == mask_value` — an *exact equality*, not
+///   `!= 0`. `mask_value` defaults to `NumericTraits<MaskPixelType>::max()`, i.e.
+///   **255** (`itkHistogramThresholdImageFilter.hxx`'s ctor; SimpleITK's yaml carries
+///   the same `255u` default).
+/// * **Output masking**, when [`mask_output`](Self::mask_output) is true (ITK's and
+///   SimpleITK's default), runs the thresholded image through `MaskImageFilter`
+///   (`.hxx:113-125`), which zeroes where the mask equals its *masking value* — and
+///   that is **`0`**, not `mask_value`.
+///
+/// So with the default `mask_value == 255`, a voxel whose mask is `7` is **excluded
+/// from the histogram** and **kept in the output**. That asymmetry is upstream's, it
+/// is reachable from SimpleITK, and this port reproduces it rather than tidying it.
+pub struct ThresholdMask<'a> {
+    image: &'a Image,
+    mask_value: u8,
+    mask_output: bool,
+}
+
+impl<'a> ThresholdMask<'a> {
+    /// ITK's and SimpleITK's defaults: `mask_value = 255`, `mask_output = true`.
+    pub fn new(image: &'a Image) -> Self {
+        Self {
+            image,
+            mask_value: 255,
+            mask_output: true,
+        }
+    }
+
+    /// The value a mask voxel must **equal** to be admitted to the histogram.
+    pub fn with_mask_value(mut self, mask_value: u8) -> Self {
+        self.mask_value = mask_value;
+        self
+    }
+
+    /// When true (the default), output voxels whose mask is **`0`** are set to `0`.
+    /// Note the value: `0`, not `mask_value` — see the type docs.
+    pub fn with_mask_output(mut self, mask_output: bool) -> Self {
+        self.mask_output = mask_output;
+        self
+    }
+
+    /// The voxels this mask admits to the histogram: `mask == mask_value`, exactly.
+    ///
+    /// Errors with [`FilterError::MaskAdmitsNoVoxels`] when the selection is empty —
+    /// see that variant for why the port refuses instead of reproducing (upstream
+    /// throws in eleven calculators and returns a `NaN` threshold in two).
+    fn selected(&self, img: &Image, vals: &[f64]) -> Result<Vec<f64>> {
+        if self.image.size() != img.size() {
+            return Err(FilterError::SizeMismatch {
+                a: img.size().to_vec(),
+                b: self.image.size().to_vec(),
+            });
+        }
+        // ITK does not *sample* the mask: it is a second `ImageToImageFilter` input, so
+        // `VerifyInputInformation` (`itkImageToImageFilter.hxx:148-223`) throws "Inputs do
+        // not occupy the same physical space!" unless the mask's origin, spacing and
+        // direction agree with the image's. Same grid or refuse; no resampling, no
+        // index-aligned-but-physically-elsewhere mask.
+        if !crate::geometry::same_physical_space(img, self.image) {
+            return Err(FilterError::PhysicalSpaceMismatch { index: 1 });
+        }
+        let mask = self.image.to_f64_vec()?;
+        let wanted = f64::from(self.mask_value);
+        let selected: Vec<f64> = vals
+            .iter()
+            .zip(mask.iter())
+            .filter(|&(_, &m)| m == wanted)
+            .map(|(&v, _)| v)
+            .collect();
+        if selected.is_empty() {
+            return Err(FilterError::MaskAdmitsNoVoxels {
+                mask_value: self.mask_value,
+            });
+        }
+        Ok(selected)
+    }
+
+    /// `MaskImageFilter` on the thresholded output: zero where the mask is **`0`**.
+    fn apply_to_output(&self, out: &mut [u8]) -> Result<()> {
+        if !self.mask_output {
+            return Ok(());
+        }
+        let mask = self.image.to_f64_vec()?;
+        for (o, &m) in out.iter_mut().zip(mask.iter()) {
+            if m == 0.0 {
+                *o = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The histogram every one of this crate's twelve histogram thresholds is built from:
+/// all voxels, or — when a mask is given — exactly the voxels it admits, whose min/max
+/// then set the bin range too. The single place the masked/unmasked choice is made.
+pub(crate) fn threshold_histogram(
+    img: &Image,
+    vals: &[f64],
+    bins: u32,
+    mask: Option<&ThresholdMask>,
+) -> Result<Histogram> {
+    match mask {
+        None => Histogram::from_values(vals, bins),
+        Some(m) => Histogram::from_values(&m.selected(img, vals)?, bins),
+    }
+}
+
+/// The output-masking half of the same rule, so no caller hand-rolls it.
+pub(crate) fn apply_threshold_mask_output(
+    out: &mut [u8],
+    mask: Option<&ThresholdMask>,
+) -> Result<()> {
+    match mask {
+        None => Ok(()),
+        Some(m) => m.apply_to_output(out),
+    }
+}
 
 /// See the module docs for the construction convention. Single dimension
 /// only (this crate's images are scalar-pixel, so the 1-D case is all

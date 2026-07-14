@@ -26,6 +26,26 @@ use sitk_core::{
     dispatch_scalar, matrix,
 };
 
+/// Whether a filter's secondary input (a mask, a second series member) sits on
+/// the same physical grid as its primary — `ImageBase::IsCongruentImageGeometry`
+/// (`itkImageBase.hxx:391-406`), which every `ImageToImageFilter` applies to its
+/// extra inputs in `VerifyInputInformation` before it will run.
+///
+/// The predicate itself lives in `sitk-core` as
+/// [`Image::is_congruent_image_geometry`]; this is only the point that pins the
+/// tolerances to `ImageToImageFilter`'s `GlobalDefaultCoordinateTolerance` /
+/// `GlobalDefaultDirectionTolerance` (`itkImageToImageFilter.h`), which none of
+/// this crate's filters override. It is one function because it was three: two
+/// filter modules had grown byte-identical private copies, and the masked
+/// thresholds (§2.173) needed a third.
+pub(crate) fn same_physical_space(primary: &Image, other: &Image) -> bool {
+    primary.is_congruent_image_geometry(
+        other,
+        Image::DEFAULT_IMAGE_COORDINATE_TOLERANCE,
+        Image::DEFAULT_IMAGE_DIRECTION_TOLERANCE,
+    )
+}
+
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
     let mut s = vec![1usize; size.len()];
