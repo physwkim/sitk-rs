@@ -1,0 +1,12 @@
+00:05:35 r0 v0 wall=  34.3s busy_max= 90.2 clean
+00:06:10 r0 v4 wall=  35.2s busy_max= 83.5 clean
+  round r0 KEPT — 4/4 legs clean
+00:06:57 r1 v4 wall=  31.4s busy_max= 91.6 clean
+00:07:27 r1 v0 wall=  30.4s busy_max= 83.9 clean
+  round r1 KEPT — 4/4 legs clean
+00:08:17 r2 v0 wall=  34.0s busy_max= 91.1 clean
+00:08:52 r2 v4 wall=  35.2s busy_max= 90.9 clean
+  round r2 KEPT — 4/4 legs clean
+00:09:39 r3 v4 wall=  32.6s busy_max= 91.4 clean
+00:10:15 r3 v0 wall=  35.8s busy_max= 87.0 clean
+  round r3 KEPT — 4/4 legs clean

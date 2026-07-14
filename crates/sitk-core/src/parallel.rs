@@ -86,20 +86,64 @@ const REDUCE_CHUNK: usize = 1 << 16;
 /// better, because a short input simply does not contain more parallelism.
 const TARGET_TASKS: usize = 256;
 
-/// The finest grain any pass is cut to — the floor on per-task work.
+/// The floor on per-task work for the **elementwise and reduce** passes —
+/// [`fill_zip`], [`for_each_mut`], [`min_max`], [`bin_counts`], and the line pass.
 ///
-/// Derived, not tuned. The smallest volume in `doc/bench-spec.md` is 64³ =
-/// 262 144 elements; feeding a 96-worker pool from it needs a grain of at most
-/// 262144/96 = 2730, and 2048 is the largest power of two under that. It raises
-/// 128 tasks. A 4096 floor would raise 64 — fewer tasks than this box has
-/// workers, which is the defect this floor exists to close.
+/// A floor exists to keep the work in one task well above the cost of dispatching
+/// one (order 1 µs for a rayon job). That is a floor on **work**; it is spelled in
+/// **elements**, and the conversion between them is the pass's cost per element. So
+/// the floor is a property of the *cost class*, not of the module — which is why
+/// there are two of them, this one and [`MIN_GRAIN_INDEXED`].
 ///
-/// Measured against the floor's other side, on `otsu_threshold` at 64³ (whose
-/// `bin_counts` is the heaviest per-element reduction here, a binary search per
-/// value): 65 536 → 14.06 ms, 16 384 → 4.22, 8192 → 1.58, 4096 → 1.52, **2048 →
-/// 1.57**, 1024 → 1.38. The basin from 8192 down is flat, so 2048 is not a
-/// knife-edge; it is the derived value sitting inside the measured flat.
+/// This class does one or two ops per element, well under a nanosecond each. At
+/// 2048 elements a task carries ~2 µs, already the same order as its own dispatch;
+/// below that the pass starts paying more to schedule than to compute. Measured, on
+/// 64³/`tN`, 1024 against 2048, paired within each round over 10 clean rounds across
+/// two independent windows: `otsu_threshold` **1.141×** (band [1.10, 1.18]) and
+/// **1.145×** ([1.04, 1.31]) — a replicated regression, and the reason this class's
+/// floor does not follow the indexed class's down to 1024.
+///
+/// (That measurement supersedes a single-shot 64³ grain sweep previously recorded
+/// here, which read 1024 → 1.38 ms against 2048 → 1.57 ms and so pointed the other
+/// way. It was one leg on an unpinned process shape; the number above is paired
+/// within-round and replicated, and this port's noise floor — ~60% on process shape
+/// — is larger than the gap that sweep claimed to see.)
 const MIN_GRAIN: usize = 2048;
+
+/// The floor on per-task work for the **indexed/stencil** pass ([`fill_indexed`]),
+/// whose cost per element is ~100× this module's elementwise class.
+///
+/// Derived from what a floor is for, evaluated with *this* class's cost per element.
+/// A 3³–5³ window is 27–125 fused multiply-adds per element (~50–100 ns), so a
+/// 1024-element task is 50–100 µs of work against a ~1 µs dispatch: scheduling
+/// overhead is under 2%, and the floor is simply not what protects this class. What
+/// binds here is [`TARGET_TASKS`], so the floor's only remaining job is to **not
+/// fight the target at the smallest volume the port supports**:
+///
+/// ```text
+/// MIN_GRAIN_INDEXED = SMALL / TARGET_TASKS = 262144 / 256 = 1024
+/// ```
+///
+/// At 64³ that is the difference between 128 tasks and the 256 the rule asked for.
+/// Measured, paired within-round over 10 clean rounds in two independent windows
+/// (64³/`tN`, against the 2048 floor): `mean` **0.30×**, `binary_dilate`
+/// **0.33–0.52×**, `median` **0.45–0.48×**, `gradient_magnitude` **0.62–0.64×**.
+///
+/// This is the same split the module already makes for the leaf cap — see
+/// [`fill_indexed`], which applies `with_max_len(1)` to this class and withholds it
+/// from the cheap one, "and the split policy follows from which one you are in, not
+/// from a tuned number." The grain floor now follows the class for the same reason.
+/// A single floor was wrong for both: too low to protect the elementwise class, too
+/// high to feed the stencil one.
+///
+/// Where the two classes can differ at all, as integers: `grain` reaches a floor
+/// only while `len / TARGET_TASKS` is under it, so the *elementwise* floor is the
+/// last one to let go, at `TARGET_TASKS * MIN_GRAIN = 524 288` elements. At and
+/// above that length both classes emit the same chunk boundaries, and this constant
+/// is a **no-op** — which puts every volume from `medium` (16.7 M) up on the same
+/// integers as before. Pinned in
+/// `the_two_grain_floors_emit_the_same_chunks_once_neither_can_bind`.
+const MIN_GRAIN_INDEXED: usize = 1024;
 
 /// Elements per chunk for a pass over `len` elements, at most `ceiling`.
 ///
@@ -125,10 +169,17 @@ const MIN_GRAIN: usize = 2048;
 ///   grain at `ceiling`, and the emitted chunk boundaries are the same integers
 ///   they were before this rule existed.
 const fn grain(len: usize, ceiling: usize) -> usize {
+    grain_floored(len, ceiling, MIN_GRAIN)
+}
+
+/// [`grain`] with the floor named by the caller, so no pass silently inherits a
+/// floor derived for a cost class it is not in. Every grain helper below states
+/// which class it is: the floor is a parameter of the rule, not a global.
+const fn grain_floored(len: usize, ceiling: usize, floor: usize) -> usize {
     // `clamp` is not `const`; this is the same expression.
     let g = len.div_ceil(TARGET_TASKS);
-    if g < MIN_GRAIN {
-        MIN_GRAIN
+    if g < floor {
+        floor
     } else if g > ceiling {
         ceiling
     } else {
@@ -136,10 +187,17 @@ const fn grain(len: usize, ceiling: usize) -> usize {
     }
 }
 
-/// [`grain`] for the elementwise maps — [`map_indexed`], [`map_slice`],
-/// [`for_each_mut`] and the `_into`/`_init` forms behind them.
+/// [`grain`] for the **elementwise** maps — [`map_slice`] and [`for_each_mut`],
+/// a few nanoseconds per element. Cheap class: [`MIN_GRAIN`].
 const fn map_grain(len: usize) -> usize {
     grain(len, GRAIN)
+}
+
+/// [`grain`] for the **indexed/stencil** fill behind [`map_indexed`],
+/// [`map_indexed_init`] and `Neighborhood::par_map_window*` — tens to hundreds of
+/// ops per element. Expensive class: [`MIN_GRAIN_INDEXED`].
+const fn indexed_grain(len: usize) -> usize {
+    grain_floored(len, GRAIN, MIN_GRAIN_INDEXED)
 }
 
 /// [`grain`] for the chunked reductions — [`min_max`] and [`bin_counts`].
@@ -393,6 +451,12 @@ where
 /// elementwise work that is nearly free per element — and the split policy
 /// follows from which one you are in, not from a tuned number.
 ///
+/// **The grain floor follows the same split, for the same reason** — this fill is
+/// cut at [`indexed_grain`] and the cheap ones at [`map_grain`]. A floor is a bound
+/// on per-task *work* written in *elements*, so it converts through the class's cost
+/// per element; one number could not serve both, and the one that did was too low to
+/// protect the cheap class and too high to feed this one. See [`MIN_GRAIN_INDEXED`].
+///
 /// [`with_max_len(1)`]: rayon::iter::IndexedParallelIterator::with_max_len
 fn fill_indexed<R, S, I, F>(slots: &mut [MaybeUninit<R>], init: I, f: F)
 where
@@ -408,7 +472,7 @@ where
         }
         return;
     }
-    let g = map_grain(slots.len());
+    let g = indexed_grain(slots.len());
     slots
         .par_chunks_mut(g)
         .enumerate()
@@ -1012,7 +1076,7 @@ mod tests {
     #[test]
     fn the_grain_is_a_pure_function_of_the_length() {
         for &len in &[0, 1, SERIAL_THRESHOLD, SMALL, MEDIUM, LARGE, LARGE * 3 + 7] {
-            let (m, r) = (map_grain(len), reduce_grain(len));
+            let (m, r, x) = (map_grain(len), reduce_grain(len), indexed_grain(len));
             for _ in 0..4 {
                 assert_eq!(map_grain(len), m, "map_grain({len}) is not deterministic");
                 assert_eq!(
@@ -1020,7 +1084,16 @@ mod tests {
                     r,
                     "reduce_grain({len}) is not deterministic"
                 );
+                assert_eq!(
+                    indexed_grain(len),
+                    x,
+                    "indexed_grain({len}) is not deterministic"
+                );
             }
+            assert!(
+                (MIN_GRAIN_INDEXED..=GRAIN).contains(&x),
+                "indexed_grain({len}) = {x}"
+            );
             assert!((MIN_GRAIN..=GRAIN).contains(&m), "map_grain({len}) = {m}");
             assert!(
                 (MIN_GRAIN..=REDUCE_CHUNK).contains(&r),
@@ -1037,6 +1110,58 @@ mod tests {
         assert_eq!(SMALL.div_ceil(reduce_grain(SMALL)), 128); // was 4, at a 65536 grain
         assert_eq!(map_grain(SMALL), 2048);
         assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128); // was 64, at a 4096 grain
+    }
+
+    /// Adding a second floor is safe at scale because the two floors stop being
+    /// distinguishable as soon as neither can bind. A floor is reached only while
+    /// `len / TARGET_TASKS` is below it, so the *elementwise* floor — the higher of
+    /// the two — is the last to let go, at `TARGET_TASKS * MIN_GRAIN` elements. From
+    /// there up, both classes cut at `len/TARGET_TASKS` (or the ceiling) and emit
+    /// **the same chunk boundaries**, so no volume at or above that length can move.
+    ///
+    /// `medium` (16.7 M) and `large` (134 M) are 32× and 256× past it. This is the
+    /// integer statement behind P10, and Campaigns M and L then measured those
+    /// volumes not moving — but the proof is here, in the integers, not there.
+    #[test]
+    fn the_two_grain_floors_emit_the_same_chunks_once_neither_can_bind() {
+        let converged = TARGET_TASKS * MIN_GRAIN; // 524_288
+        for &len in &[converged, converged + 1, MEDIUM, LARGE, LARGE * 3 + 7] {
+            assert_eq!(
+                boundaries(len, indexed_grain(len)),
+                boundaries(len, map_grain(len)),
+                "the two floors emit different chunks at len = {len}, which is at \
+                 or above {converged} and must be a no-op"
+            );
+        }
+
+        // Non-vacuity: the two rules DO diverge below that length, or the equality
+        // above is a tautology and this test pins nothing. 64³ is the case the
+        // second floor exists for — the elementwise class holds at 2048 while the
+        // stencil class falls to 1024, which is twice the chunks and exactly the
+        // measured win.
+        assert!(SMALL < converged);
+        assert_eq!(map_grain(SMALL), MIN_GRAIN);
+        assert_eq!(indexed_grain(SMALL), MIN_GRAIN_INDEXED);
+        assert_ne!(
+            boundaries(SMALL, indexed_grain(SMALL)),
+            boundaries(SMALL, map_grain(SMALL)),
+            "the floors must differ at 64³, or the no-op above is vacuous"
+        );
+    }
+
+    /// What the indexed floor buys at the volume it was derived for: 64³ is cut
+    /// into exactly `TARGET_TASKS` chunks — the count the rule asks for, which the
+    /// 2048 floor overrode down to 128.
+    #[test]
+    fn the_indexed_pass_meets_the_task_target_at_the_smallest_bench_volume() {
+        assert_eq!(indexed_grain(SMALL), MIN_GRAIN_INDEXED);
+        assert_eq!(SMALL.div_ceil(indexed_grain(SMALL)), TARGET_TASKS);
+
+        // And the elementwise/reduce class is untouched — same 128 tasks it had.
+        assert_eq!(map_grain(SMALL), MIN_GRAIN);
+        assert_eq!(SMALL.div_ceil(map_grain(SMALL)), 128);
+        assert_eq!(reduce_grain(SMALL), MIN_GRAIN);
+        assert_eq!(SMALL.div_ceil(reduce_grain(SMALL)), 128);
     }
 
     /// The three bench volumes, cubic, as `for_each_line_mut` sees them.
