@@ -1,17 +1,21 @@
 //! The straddle probes, shared by every device test — one copy, so the two metrics
 //! cannot drift apart in what they mean by "no sample sits on a boundary".
 //!
-//! # What a straddle is
+//! # What a straddle is, and why these probes now expect to find none
 //!
-//! The host evaluates the transform's own expression (for a Euler transform,
-//! `R·(x − c) + c + t`). The device is handed an **affine form probed from it**
-//! (`b = T(0)`, `A[d][e] = T(e_e)[d] − b[d]`) and evaluates `p = A·x + b`. The two are
-//! the same map in exact arithmetic. In f64 they differ in the last ulp, because
-//! recovering `A[d][e]` from `T(e_e) − T(0)` subtracts the offset back off and loses
-//! bits when the offset is large.
+//! The host evaluates the transform's own expression. The device is handed the
+//! transform's own **stages** ([`ParametricTransform::point_map_stages`]) — its stored
+//! `matrix`/`offset` pairs, one per map it applies, in the order it applies them — and
+//! replays them, one rounded `mat_vec` plus one rounded add per stage. Same operations,
+//! same order, so the mapped point and the continuous index are the host's **bit for
+//! bit**.
 //!
-//! That ulp is invisible in every *continuous* output and decisive in every *discrete*
-//! one. This module has one probe per discrete decision the sampler makes:
+//! They were not always. The device used to be handed an affine form *probed* out of the
+//! transform (`b = T(0)`, `A[d][e] = T(e_e)[d] − b[d]`), which is the same map in exact
+//! arithmetic and differs in the last ulp in f64, because recovering `A[d][e]` from
+//! `T(e_e) − T(0)` subtracts the offset back off. That ulp was invisible in every
+//! *continuous* output and decisive in every *discrete* one, and this module has one probe
+//! per discrete decision the sampler makes:
 //!
 //! * [`cell_boundary_straddles`] — `floor(c)`, which cell of the moving grid the sample
 //!   sits in. The trilinear interpolant is continuous across a cell wall; **its gradient
@@ -22,17 +26,29 @@
 //! * [`moving_mask_straddles`] — `round(c_d)`, which mask voxel gates the sample. Same
 //!   consequence: the sample exists or it does not.
 //!
-//! The last two are the ones the pins assert *exactly* (`valid_points` is an integer and
-//! is compared with `assert_eq!`), so a disagreement there is not a band, it is a lie.
+//! Under the stage list all three are **empty by construction**, for every transform the
+//! device accepts: two chains that perform the same operations on the same bits in the
+//! same order cannot disagree about a branch. The probes are kept, and the pins that call
+//! them assert emptiness rather than banding a disagreement — they are the standing
+//! evidence that the property holds, and the thing that fails loudly if a future change
+//! reintroduces a second arithmetic for the point map.
 //!
 //! # Why these reproduce the paths rather than approximating them
 //!
 //! Both matrices come from the same `sitk_transform` helpers the metric itself calls
-//! (`index_to_physical_matrix`, `physical_to_index_matrix`), and both accumulator chains
-//! are written in the order the two paths write them (`VirtualGrid::write_point`;
-//! `resident.rs`'s `fmadd_rn`, which is a rounded multiply and a rounded add, not a fused
-//! one). A probe that computed a third arithmetic of its own would answer a question
-//! nobody asked.
+//! (`index_to_physical_matrix`, `physical_to_index_matrix`); the device point map is the
+//! stage replay the kernel performs ([`replay_stages`], whose per-stage arithmetic is
+//! `mat_vec` then `+ offset`, which is what the kernel's `fmadd_rn` chain and its final
+//! `__dadd_rn` are); and both accumulator chains are written in the order the two paths
+//! write them (`VirtualGrid::write_point`; `resident.rs`'s `fmadd_rn`, a rounded multiply
+//! and a rounded add, not a fused one). A probe that computed a third arithmetic of its
+//! own would answer a question nobody asked.
+//!
+//! What these probes model is the kernel's chain, not the kernel itself — the device's `c`
+//! is not observable from the host. What *is* observable is every discrete decision taken
+//! on it: the valid-sample count and the metric moments. Those are pinned against the CPU
+//! path on the device itself (`cuda_boundary.rs`, `cuda_mean_squares.rs`), and it is the
+//! agreement of those that closes the loop the model opens.
 //!
 //! 3-D only, and the direction matrix must be the identity — asserted, not assumed. Every
 //! test image in this crate is built that way, and a probe that silently mis-handled an
@@ -42,6 +58,7 @@
 use sitk_core::Image;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{index_to_physical_matrix, physical_to_index_matrix};
+use sitk_transform::matrix_offset::replay_stages;
 
 /// True when the device is absent — a supported configuration, and the reason the
 /// fallback exists.
@@ -95,18 +112,12 @@ fn for_each_sample(
         .expect("singular moving direction");
     let _ = msize;
 
-    // The affine form the device is given, probed exactly as `cuda::affine_form` probes
-    // it: the offset from the origin, the columns from the unit points minus it.
-    let b0 = t.transform_point(&[0.0, 0.0, 0.0]);
-    let mut a = [[0.0f64; 3]; 3];
-    for e in 0..3 {
-        let mut basis = [0.0f64; 3];
-        basis[e] = 1.0;
-        let te = t.transform_point(&basis);
-        for (d, row) in a.iter_mut().enumerate() {
-            row[e] = te[d] - b0[d];
-        }
-    }
+    // The point map the device is given: the transform's own stages, exactly as
+    // `cuda::affine_form` takes them. A transform with no stages is not a transform the
+    // device runs, so a probe of one would be measuring nothing.
+    let stages = t
+        .point_map_stages()
+        .expect("the probes model the device path, which only accepts a transform with stages");
 
     // c = M·(p − origin), accumulated from zero, left to right — `MovingImage::
     // continuous_index` and the kernel's `c` loop write it in this order.
@@ -140,14 +151,10 @@ fn for_each_sample(
                 let ph = t.transform_point(&x);
                 let host_p = [ph[0], ph[1], ph[2]];
 
-                let mut dev_p = [0.0f64; 3];
-                for (d, pd) in dev_p.iter_mut().enumerate() {
-                    let mut acc = 0.0f64;
-                    for (e, &xe) in x.iter().enumerate() {
-                        acc += a[d][e] * xe;
-                    }
-                    *pd = acc + b0[d];
-                }
+                // The kernel's chain: one stage at a time, `mat_vec` then `+ offset`,
+                // rounding once per stage — not the stages folded into one matrix.
+                let pd = replay_stages(&stages, &x, 3);
+                let dev_p = [pd[0], pd[1], pd[2]];
 
                 f(Mapped {
                     index: idx,
@@ -333,6 +340,55 @@ pub fn on_round_tie(
     for_each_sample(fixed, moving, t, |s| {
         for d in 0..3 {
             if (s.host_c[d] - s.host_c[d].floor()) == 0.5 {
+                out.push((s, d));
+            }
+        }
+    });
+    out
+}
+
+/// **The invariant.** Samples whose continuous index differs between the two paths *in any
+/// bit* — `to_bits()` equality, not a tolerance.
+///
+/// Every other probe here reports a *consequence* (a different cell, a different side of
+/// the buffer wall, a different mask voxel), and each of them can be empty by luck of the
+/// pose while the underlying indices still differ. This is the property itself, and for
+/// every transform the device accepts it must be empty at every sample of every pose.
+pub fn index_bit_mismatches(
+    fixed: &Image,
+    moving: &Image,
+    t: &dyn ParametricTransform,
+) -> Vec<Mapped> {
+    let mut out = Vec::new();
+    for_each_sample(fixed, moving, t, |s| {
+        if (0..3).any(|d| s.host_c[d].to_bits() != s.dev_c[d].to_bits()) {
+            out.push(s);
+        }
+    });
+    out
+}
+
+/// Samples whose **host** continuous index lands exactly on a moving-grid cell wall —
+/// `c_d == floor(c_d)` — where `floor` picks the cell and the trilinear gradient is
+/// discontinuous. Returned: `(sample, axis)` per axis that lands on a wall.
+///
+/// The counterpart of [`on_buffer_boundary`] and [`on_round_tie`] for the cell wall, and
+/// used the same way: [`cell_boundary_straddles`] reports where the two paths *disagree*,
+/// which is now empty by construction, so a pin that asserts agreement needs this to prove
+/// the pose actually puts a sample on the wall — otherwise it agrees about nothing.
+pub fn on_cell_wall(
+    fixed: &Image,
+    moving: &Image,
+    t: &dyn ParametricTransform,
+) -> Vec<(Mapped, usize)> {
+    let msize = moving.size().to_vec();
+    let mut out = Vec::new();
+    for_each_sample(fixed, moving, t, |s| {
+        if !inside(&s.host_c, &msize) {
+            return;
+        }
+        for d in 0..3 {
+            if s.host_c[d] == s.host_c[d].floor() {
                 out.push((s, d));
             }
         }

@@ -79,6 +79,16 @@ pub enum CudaError {
     )]
     PassCountMismatch { sums: usize, moments: usize },
 
+    /// The point map handed to a resident metric has no stages, or more than the
+    /// device replays ([`MAX_STAGES`](crate::MAX_STAGES)).
+    ///
+    /// The device replays the host's stages in the host's order — that is what makes
+    /// the continuous index bit-identical — so it cannot silently drop, fold or
+    /// truncate them. An empty list is refused too: a zero-stage replay is the
+    /// identity map, which is a *plausible* wrong answer rather than an obvious one.
+    #[error("the point map has {stages} stages; the device replays 1..={max}")]
+    PointMapStageCount { stages: usize, max: usize },
+
     /// The image is a vector/complex image, or its buffer does not match its
     /// declared pixel type — `sitk_core` already names this precisely, so
     /// carry its message rather than reclassifying it.

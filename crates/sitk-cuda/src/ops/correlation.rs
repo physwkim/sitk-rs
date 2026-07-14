@@ -90,7 +90,9 @@ use crate::backend::{Backend, backend};
 use crate::error::CudaError;
 use crate::image::DeviceImage;
 use crate::mask::DeviceMask;
-use crate::ops::resident::{DIM, FixedPoints, MovingGeometry, Partials, Resident, SAMPLER_SRC};
+use crate::ops::resident::{
+    DIM, FixedPoints, MovingGeometry, Partials, PointStage, Resident, SAMPLER_SRC,
+};
 
 /// `Σf`, `Σm`, `count`.
 const NSLOT_SUMS: usize = 3;
@@ -126,7 +128,8 @@ extern "C" __global__ void ncc_sums(
     const int has_mask,
     const unsigned char* __restrict__ fmask,
     const int has_fmask,
-    const double* __restrict__ ab,
+    const double* __restrict__ stages,
+    const int nstage,
     double* __restrict__ partials)
 {
     double acc[NSLOT_SUMS];
@@ -137,7 +140,8 @@ extern "C" __global__ void ncc_sums(
         Sample sm;
         if (!take_sample<false>(s, fvals, fpts, mode, fidx, fsize, forigin, fmat,
                                 mbuf, msize, mstride, morigin, mmat,
-                                mmask, has_mask, fmask, has_fmask, ab, &sm)) continue;
+                                mmask, has_mask, fmask, has_fmask,
+                                stages, nstage, &sm)) continue;
         acc[0] += sm.fval;
         acc[1] += sm.value;
         acc[2] += 1.0;
@@ -168,7 +172,8 @@ extern "C" __global__ void ncc_moments(
     const int has_mask,
     const unsigned char* __restrict__ fmask,
     const int has_fmask,
-    const double* __restrict__ ab,
+    const double* __restrict__ stages,
+    const int nstage,
     const double favg,
     const double mavg,
     double* __restrict__ partials)
@@ -181,7 +186,8 @@ extern "C" __global__ void ncc_moments(
         Sample sm;
         if (!take_sample<true>(s, fvals, fpts, mode, fidx, fsize, forigin, fmat,
                                mbuf, msize, mstride, morigin, mmat,
-                               mmask, has_mask, fmask, has_fmask, ab, &sm)) continue;
+                               mmask, has_mask, fmask, has_fmask,
+                               stages, nstage, &sm)) continue;
 
         // The host forms exactly these two, from the same means.
         const double f1 = sm.fval - favg;
@@ -258,7 +264,7 @@ pub struct CorrelationMoments {
 /// number of transforms without re-uploading either.
 ///
 /// Two launches per evaluation and two D2H folds (`512·3·8` = 12 KiB and
-/// `512·28·8` = 114 KiB); 96 bytes go up. The sample set, the masks and the volumes
+/// `512·28·8` = 114 KiB); 96 bytes per point-map stage go up. The sample set, the masks and the volumes
 /// are [`Resident`] — the same ones mean squares uses, so a fixed mask, a sampled
 /// index list and an explicit point list mean here exactly what they mean there,
 /// including [`CudaError::MaskedExplicitPoints`].
@@ -311,21 +317,19 @@ impl ResidentCorrelation {
         self.res.vols.bytes()
     }
 
-    /// Evaluate both passes for the point map `x ↦ A·x + b`.
+    /// Evaluate both passes for the point map given as [`PointStage`]s — the
+    /// transform's own stored maps, in the order the host applies them.
     ///
-    /// `a` is row-major `3 × 3`, `b` is length 3. Deterministic: the same inputs give
-    /// bit-identical moments on every call and every run.
+    /// Deterministic: the same inputs give bit-identical moments on every call and
+    /// every run. `stages` must be `1..=MAX_STAGES` long, or
+    /// [`CudaError::PointMapStageCount`].
     ///
     /// If no sample is valid the moments are all zero with `count == 0`, and the host
     /// takes the degenerate branch — the same one `CorrelationMetric::evaluate` takes
     /// when `means()` returns `None`.
-    pub fn evaluate(
-        &mut self,
-        a: &[f64; 9],
-        b: &[f64; 3],
-    ) -> Result<CorrelationMoments, CudaError> {
+    pub fn evaluate(&mut self, stages: &[PointStage]) -> Result<CorrelationMoments, CudaError> {
         let backend: &Backend = backend()?;
-        self.res.upload_point_map(backend, a, b)?;
+        self.res.upload_point_map(backend, stages)?;
 
         // Pass 1: the sums that give the means.
         let s = self.launch(backend, Pass::Sums)?;
@@ -371,7 +375,7 @@ impl ResidentCorrelation {
         Ok(m)
     }
 
-    /// One launch and its fold. The two passes take the same eighteen resident
+    /// One launch and its fold. The two passes take the same nineteen resident
     /// arguments in the same order and differ only in the two scalars pass 2 adds —
     /// so the argument list exists **once**, and a change to the sampler's inputs
     /// cannot reach one pass and miss the other.
@@ -393,7 +397,8 @@ impl ResidentCorrelation {
             has_mask,
             d_fmask,
             has_fmask,
-            d_ab,
+            d_stages,
+            nstage,
         } = &mut self.res;
 
         let n_i64 = *n as i64;
@@ -429,7 +434,8 @@ impl ResidentCorrelation {
                     .arg(&*has_mask)
                     .arg(d_fmask.device())
                     .arg(&*has_fmask)
-                    .arg(d_ab.device());
+                    .arg(d_stages.device())
+                    .arg(&*nstage);
                 // Pass 2's two extra scalars, and only pass 2's.
                 let means;
                 if let Pass::Moments(favg, mavg) = pass {
@@ -438,8 +444,8 @@ impl ResidentCorrelation {
                 }
                 launch.arg(d_partials.device_mut());
                 // SAFETY: the arguments match the launched kernel's parameters in
-                // order and type — the eighteen resident ones for `ncc_sums`, and the
-                // same eighteen plus `favg`/`mavg` for `ncc_moments`, which is the only
+                // order and type — the nineteen resident ones for `ncc_sums`, and the
+                // same nineteen plus `favg`/`mavg` for `ncc_moments`, which is the only
                 // way `Pass` can select the name. `fvals` is `FSCALAR` and `mbuf` is
                 // `MSCALAR` by the same `Volumes::scalars` match that chose the source.
                 //
@@ -454,7 +460,9 @@ impl ResidentCorrelation {
                 // geometry buffers (3, 3, 3, 9). `d_mmask` is read only when
                 // `has_mask != 0` and the sampler bounds-checks the index it builds;
                 // `d_fmask` only when `has_fmask != 0`, where `build` checked it covers
-                // the fixed grid. `d_ab` holds 12. `d_partials` holds `GRID * nslot` for
+                // the fixed grid. `d_stages` holds `MAX_STAGES * 12` and the kernel reads
+                // `nstage * 12` of them, where `upload_point_map` has checked
+                // `1 <= nstage <= MAX_STAGES`. `d_partials` holds `GRID * nslot` for
                 // this pass's `nslot`, and `emit_partials` writes
                 // `blockIdx.x * nslot + k` for `blockIdx.x < GRID`, `k < nslot`. Shared
                 // memory is declared statically at `BLOCK` doubles, matching `block_dim`.

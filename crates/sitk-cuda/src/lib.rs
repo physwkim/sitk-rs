@@ -40,7 +40,9 @@ pub use mask::DeviceMask;
 pub use ops::correlation::{CorrelationMoments, ResidentCorrelation};
 pub use ops::device::rescale_intensity;
 pub use ops::gaussian::smooth_gaussian;
-pub use ops::mean_squares::{DIM, FixedPoints, Moments, MovingGeometry, ResidentMetric};
+pub use ops::mean_squares::{
+    DIM, FixedPoints, MAX_STAGES, Moments, MovingGeometry, PointStage, ResidentMetric,
+};
 pub use ops::pyramid::{
     recursive_gaussian, resample_linear, resample_linear_through, resample_nearest,
     resample_nearest_through, shrink, shrunk_geometry,

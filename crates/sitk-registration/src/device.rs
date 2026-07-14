@@ -9,7 +9,8 @@
 //! item in the measured chain, larger than both filter D2Hs combined. This type
 //! consumes the [`DeviceImage`]s the filters produced, so the registration half of
 //! the pipeline moves **nothing** across the bus: the volumes are already there,
-//! and each iteration exchanges 96 bytes up and 57 KiB of partials down.
+//! and each iteration exchanges 96 bytes per point-map stage up and 57 KiB of partials
+//! down.
 //!
 //! # No per-call fallback, on purpose
 //!
@@ -63,12 +64,37 @@ pub enum DeviceMetricError {
     SingularDirection,
 
     /// The moment identity the kernel evaluates holds only for a transform whose
-    /// point map *and* Jacobian are affine in the point — every globally affine
-    /// transform (translation, rigid, Euler, versor, similarity, affine). A
-    /// B-spline or displacement field is not, and this metric says so rather than
-    /// quietly evaluating it somewhere else.
-    #[error("transform is not affine in the point; the device metric has no kernel for it")]
+    /// **Jacobian** is affine in the point — every globally affine transform
+    /// (translation, rigid, Euler, versor, similarity, affine). A B-spline or
+    /// displacement field is not, and this metric says so rather than quietly
+    /// evaluating it somewhere else.
+    #[error(
+        "transform's Jacobian is not affine in the point; the device metric has no kernel for it"
+    )]
     NonAffineTransform,
+
+    /// The transform has no point map the device can reproduce **bit for bit**: it
+    /// reports no [`point_map_stages`](sitk_transform::TransformBase::point_map_stages).
+    ///
+    /// The device replays the transform's own stages, so the continuous index it
+    /// computes is the host's, bit for bit — which the sampler's *discrete* decisions
+    /// (`floor`, `is_inside`, `round`) require. A transform whose `transform_point`
+    /// evaluates some other expression — `ScaleTransform` and
+    /// `ScaleLogarithmicTransform` (centred: `(p − c)·s + c`), `BSplineTransform`,
+    /// `DisplacementFieldTransform`, or a composite containing one — cannot be handed
+    /// over as stages, and the alternative (an affine form *probed* out of it, exact
+    /// in algebra and wrong in the last bits) is the defect this replaced.
+    ///
+    /// Refused by name, like [`UnsupportedFixedInitialTransform`]: the CPU evaluates
+    /// these correctly, but the *device metric* will not silently substitute a map
+    /// that merely approximates the host's.
+    ///
+    /// [`UnsupportedFixedInitialTransform`]: DeviceRegistrationError::UnsupportedFixedInitialTransform
+    #[error(
+        "transform has no bitwise point map for the device (scale, B-spline, displacement field, \
+         or a composite containing one); it is evaluated on the host"
+    )]
+    NoBitwisePointMap,
 
     /// The device declined: no driver, no device, NVRTC failure, out of memory.
     #[error(transparent)]
@@ -287,8 +313,11 @@ impl DeviceMeanSquaresMetric {
     /// The metric value and its derivative with respect to the transform's
     /// parameters, at `transform`.
     ///
-    /// Fails with [`DeviceMetricError::NonAffineTransform`] for a transform the
-    /// moment identity does not cover. Deterministic: the reduction order is fixed,
+    /// Fails with [`DeviceMetricError::NonAffineTransform`] for a transform the moment
+    /// identity does not cover, and with [`DeviceMetricError::NoBitwisePointMap`] for one
+    /// whose point map the device cannot reproduce bit for bit (a scale transform has an
+    /// affine Jacobian and no bitwise point map, so the two refusals are not the same
+    /// refusal and are not reported as one). Deterministic: the reduction order is fixed,
     /// so the same inputs give bit-identical results on every call and every run.
     pub fn evaluate(
         &self,
@@ -299,8 +328,8 @@ impl DeviceMeanSquaresMetric {
                 transform.dimension(),
             ));
         }
-        let form = affine_form(transform).ok_or(DeviceMetricError::NonAffineTransform)?;
-        let moments = self.lock().evaluate(&form.a, &form.b)?;
+        let form = affine_form(transform)?;
+        let moments = self.lock().evaluate(&form.stages)?;
         Ok(contract(&moments, &form))
     }
 
@@ -512,8 +541,8 @@ impl DeviceCorrelationMetric {
         if transform.has_local_support() {
             return Err(DeviceMetricError::RequiresGlobalTransform);
         }
-        let form = affine_form(transform).ok_or(DeviceMetricError::NonAffineTransform)?;
-        let moments = self.lock().evaluate(&form.a, &form.b)?;
+        let form = affine_form(transform)?;
+        let moments = self.lock().evaluate(&form.stages)?;
         Ok(contract_correlation(&moments, &form))
     }
 

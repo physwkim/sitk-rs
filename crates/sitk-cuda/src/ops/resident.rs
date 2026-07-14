@@ -47,6 +47,32 @@ pub(crate) const MODE_INDICES: i32 = 2;
 /// are written for `dim = 3` and a 2-D caller falls back to the CPU.
 pub const DIM: usize = 3;
 
+/// One stage of the transform's point map: `p ↦ mat_vec(matrix, p) + offset`, with
+/// `matrix` row-major `3 × 3`.
+///
+/// The caller hands the device the transform's **stored** matrix and offset — the
+/// fields its own `transform_point` evaluates — and one stage per map the host
+/// applies, in the host's application order. Not a form probed out of the transform,
+/// and not several maps folded into one: either would be algebraically equal to the
+/// host and differ from it in the last bits, and the last bits of the continuous
+/// index decide `floor`, `is_inside` and `round`, which are branches. See
+/// [`SAMPLER_SRC`] for the argument in full.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointStage {
+    /// Row-major `3 × 3`.
+    pub matrix: [f64; DIM * DIM],
+    pub offset: [f64; DIM],
+}
+
+/// The most stages the device replays in one point map.
+///
+/// A composed registration transform is two stages (the optimized transform and a
+/// moving-initial), and a composite of a handful more; there is no legitimate map
+/// with dozens. The cap keeps the stage buffer a fixed-size allocation and the
+/// replay a bounded loop, and a longer map is refused by name
+/// ([`CudaError::PointMapStageCount`]) rather than truncated.
+pub const MAX_STAGES: usize = 8;
+
 /// The sampler, the mode defines and the reduction — prepended to every metric
 /// kernel. `FSCALAR`/`MSCALAR` are `#define`d by [`kernel_src`](Self) before this
 /// is concatenated.
@@ -129,7 +155,8 @@ __device__ __forceinline__ bool take_sample(
     const int has_mask,
     const unsigned char* __restrict__ fmask,
     const int has_fmask,
-    const double* __restrict__ ab,
+    const double* __restrict__ stages,
+    const int nstage,
     Sample* out)
 {
     // The sample's voxel in the FIXED GRID. In MODE_GRID sample `s` *is* grid
@@ -174,16 +201,37 @@ __device__ __forceinline__ bool take_sample(
         }
     }
 
-    // p = A*x + b --- the transform's point map, whatever transform it is.
-    // `TransformBase::transform_point` is `mat_vec(matrix, x)` and THEN the
-    // offset, so the accumulator starts at zero and `b` lands last.
-    double p[3];
-    for (int d = 0; d < 3; ++d) {
-        double acc_d = 0.0;
-        acc_d = fmadd_rn(acc_d, ab[d*3+0], x[0]);
-        acc_d = fmadd_rn(acc_d, ab[d*3+1], x[1]);
-        acc_d = fmadd_rn(acc_d, ab[d*3+2], x[2]);
-        p[d] = __dadd_rn(acc_d, ab[9+d]);
+    // The transform's point map: `nstage` stages of `p <- mat_vec(M, p) + t`, each
+    // 12 doubles (M row-major, then t), replayed IN THE HOST'S ORDER.
+    //
+    // The stages are the transform's OWN stored matrix/offset pairs, not a form
+    // probed out of it, and they are replayed rather than folded into one map.
+    // Both of those are bit-identity requirements, not style:
+    //
+    //   - A probe (`b = T(0)`, `A[:,e] = T(e_e) - b`) recovers the matrix through a
+    //     subtraction that cancels the offset back off -- algebraically exact, not
+    //     bitwise. The stored fields have no such cancellation.
+    //   - Folding two stages into one matrix product is algebraically equal and NOT
+    //     bit equal: the host rounds ONCE PER STAGE (`Composed::transform_point`
+    //     applies its maps in sequence), so the device must round once per stage
+    //     too. A transform whose host evaluation is not this expression has no
+    //     stages and is refused on the host, by name.
+    //
+    // Within a stage, `mat_vec` starts the accumulator at zero and the offset lands
+    // last, which is exactly `sitk_core::matrix::mat_vec` followed by the `+ offset`
+    // of `MatrixOffsetTransformBase::transform_point`.
+    double p[3] = { x[0], x[1], x[2] };
+    for (int st = 0; st < nstage; ++st) {
+        const double* ab = stages + st * 12;
+        double q[3];
+        for (int d = 0; d < 3; ++d) {
+            double acc_d = 0.0;
+            acc_d = fmadd_rn(acc_d, ab[d*3+0], p[0]);
+            acc_d = fmadd_rn(acc_d, ab[d*3+1], p[1]);
+            acc_d = fmadd_rn(acc_d, ab[d*3+2], p[2]);
+            q[d] = __dadd_rn(acc_d, ab[9+d]);
+        }
+        p[0] = q[0]; p[1] = q[1]; p[2] = q[2];
     }
 
     // c = M * (p - origin): continuous index in the moving image. The host
@@ -410,7 +458,8 @@ pub enum FixedPoints<'a> {
 ///
 /// Built once per pyramid level and evaluated against any number of transforms
 /// without re-uploading anything: [`upload_point_map`](Self::upload_point_map)
-/// moves **96 bytes up** per iteration, and the metric's partials come back down.
+/// moves **96 bytes per point-map stage up** per iteration, and the metric's partials
+/// come back down.
 pub(crate) struct Resident {
     pub(crate) n: usize,
     pub(crate) vols: Volumes,
@@ -429,9 +478,12 @@ pub(crate) struct Resident {
     pub(crate) has_mask: i32,
     pub(crate) d_fmask: DeviceBuffer<u8>,
     pub(crate) has_fmask: i32,
-    /// Reused across iterations: the per-iteration H2D writes into this rather
-    /// than allocating (`copy_from_host`, not `from_host`).
-    pub(crate) d_ab: DeviceBuffer<f64>,
+    /// The point map's stages, `MAX_STAGES * 12` doubles, of which the first
+    /// `nstage * 12` are live. Reused across iterations: the per-iteration H2D writes
+    /// into this rather than allocating (`copy_from_host`, not `from_host`).
+    pub(crate) d_stages: DeviceBuffer<f64>,
+    /// How many of them the kernel replays. Set by [`Resident::upload_point_map`].
+    pub(crate) nstage: i32,
 }
 
 impl Resident {
@@ -584,7 +636,11 @@ impl Resident {
             has_mask,
             d_fmask,
             has_fmask,
-            d_ab: DeviceBuffer::zeros(backend, 12)?,
+            d_stages: DeviceBuffer::zeros(backend, MAX_STAGES * 12)?,
+            // No point map has been uploaded yet. A zero-stage replay is the identity,
+            // which would be a *plausible* wrong answer, so `upload_point_map` refuses
+            // an empty stage list and every metric calls it before every launch.
+            nstage: 0,
         })
     }
 
@@ -598,18 +654,32 @@ impl Resident {
         }
     }
 
-    /// Push this iteration's point map `x ↦ A·x + b` (12 doubles, 96 bytes) into the
-    /// buffer the kernel reads. The only per-iteration H2D in a registration run.
+    /// Push this iteration's point map — `stages.len()` stages of 12 doubles — into
+    /// the buffer the kernel reads. The only per-iteration H2D in a registration run
+    /// (96 bytes per stage).
+    ///
+    /// Refuses an empty list, and a list longer than [`MAX_STAGES`], by name: the
+    /// device replays what the host evaluates or it does not run at all.
     pub(crate) fn upload_point_map(
         &mut self,
         backend: &Backend,
-        a: &[f64; 9],
-        b: &[f64; 3],
+        stages: &[PointStage],
     ) -> Result<(), CudaError> {
-        let mut ab = [0.0f64; 12];
-        ab[..9].copy_from_slice(a);
-        ab[9..].copy_from_slice(b);
-        self.d_ab.copy_from_host(backend, &ab)
+        if stages.is_empty() || stages.len() > MAX_STAGES {
+            return Err(CudaError::PointMapStageCount {
+                stages: stages.len(),
+                max: MAX_STAGES,
+            });
+        }
+        let mut flat = [0.0f64; MAX_STAGES * 12];
+        for (st, chunk) in stages.iter().zip(flat.chunks_exact_mut(12)) {
+            chunk[..9].copy_from_slice(&st.matrix);
+            chunk[9..].copy_from_slice(&st.offset);
+        }
+        self.nstage = stages.len() as i32;
+        // The whole buffer, not the live prefix: one fixed-size transfer, and the
+        // dead tail is never read (`nstage` bounds the replay).
+        self.d_stages.copy_from_host(backend, &flat)
     }
 
     /// The launch geometry every metric kernel uses. Fixed, so the reduction order is.

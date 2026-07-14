@@ -53,10 +53,13 @@
 //!   where the transform rounds per point, and the two differ in the last bits. The
 //!   last bits are the whole reason this function exists, so it does not fold: it
 //!   refuses.
-//! - [`CompositeTransform`](crate::CompositeTransform) applies its stages in sequence,
-//!   each rounding on its own (`composite.rs:144-149`). Multiplying the stage matrices
-//!   together is the same error as folding a scale. If a backend ever wants a composite,
-//!   it transcribes the stages **in order**; it does not get one matrix from here.
+//! - [`CompositeTransform`](crate::CompositeTransform) **of two or more maps** applies them
+//!   in sequence, each rounding on its own (`composite.rs:144-149`). Multiplying the stage
+//!   matrices together is the same error as folding a scale. A backend that wants such a
+//!   composite transcribes the stages **in order** ([`TransformBase::point_map_stages`]);
+//!   it does not get one matrix from here. (A composite of exactly *one* map applies
+//!   exactly that map, so it has a single bitwise form — its member's — and is not
+//!   refused. The rule is about the sequence, not about the type's name.)
 //! - `BSpline` / `DisplacementField` are not linear at all.
 //!
 //! # The one variant that rests on an argument
@@ -70,6 +73,7 @@
 //! test here that could genuinely fail, and if it ever does the answer is a translation
 //! form of its own in the consumer — not a refusal.
 
+use crate::TransformBase;
 use crate::erased::Transform;
 
 /// A point map a backend can reproduce bit for bit: `x ↦ mat_vec(matrix, x) + offset`.
@@ -83,6 +87,27 @@ pub struct MatrixOffsetMap {
     pub offset: Vec<f64>,
 }
 
+/// Apply a stage list to a point, in order: `p ← mat_vec(Mᵢ, p) + tᵢ` for each stage.
+///
+/// This is the *definition* of what a stage list means, and the contract every
+/// [`point_map_stages`](crate::TransformBase::point_map_stages) impl signs: for a
+/// transform that reports stages, `replay_stages(&stages, p, dim)` is
+/// `transform_point(p)` **bit for bit** — not to a tolerance
+/// (`the_stages_replay_transform_point_on_the_bits`). A backend that reproduces this
+/// arithmetic reproduces the host's continuous index exactly, which is what the
+/// discrete decisions downstream of it (`floor`, `is_inside`, `round`) require.
+///
+/// Panics in debug if a stage's `matrix`/`offset` do not have `dim × dim` / `dim`
+/// elements (`mat_vec`'s own `debug_assert`).
+pub fn replay_stages(stages: &[MatrixOffsetMap], p: &[f64], dim: usize) -> Vec<f64> {
+    let mut q = p.to_vec();
+    for s in stages {
+        let mq = sitk_core::matrix::mat_vec(&s.matrix, &q, dim);
+        q = (0..dim).map(|d| mq[d] + s.offset[d]).collect();
+    }
+    q
+}
+
 impl Transform {
     /// The stored matrix-offset form of this transform's point map, or `None` when it
     /// has none that is **bitwise** equal to its own `transform_point`.
@@ -90,52 +115,30 @@ impl Transform {
     /// See the [module docs](self) for the contract and for the variants that are
     /// mathematically linear yet refused here.
     ///
-    /// The match is exhaustive on purpose, and it lives in this crate for that reason:
-    /// [`Transform`] is `#[non_exhaustive]`, so a match in a *downstream* crate is
-    /// forced to carry a wildcard and would silently accept a new variant. Here a new
-    /// variant is a compile error, and whoever adds it has to decide — in this file,
-    /// against this contract — whether its arithmetic is `mat_vec(M, p) + b` on the bit.
+    /// It is **derived** from [`TransformBase::point_map_stages`], which every variant
+    /// implements against this same contract: a transform whose `transform_point` is one
+    /// `mat_vec(M, p) + b` reports exactly one stage, and that stage IS this map. A
+    /// transform that reports *several* stages (a composite) has a single map only after a
+    /// fold — and folding is exactly what this function must not do, so it returns `None`
+    /// rather than multiply the stages together. A transform that reports none
+    /// (`ScaleTransform`, a B-spline) has no bitwise form at all.
+    ///
+    /// One decision per transform, taken once, in that transform's own impl — so the
+    /// caller that needs the **stages** (the CUDA metric, which replays them in order) and
+    /// the caller that needs a **single map** (the device resample, which cannot replay
+    /// anything) can never end up with two different answers about what a transform's
+    /// arithmetic is. A new variant that overrides nothing gets the trait's `None` default
+    /// and is refused, which is the safe direction.
+    ///
+    /// [`TransformBase::point_map_stages`]: crate::TransformBase::point_map_stages
     pub fn matrix_offset_map(&self) -> Option<MatrixOffsetMap> {
-        fn stored(matrix: &[f64], offset: &[f64]) -> Option<MatrixOffsetMap> {
-            Some(MatrixOffsetMap {
-                matrix: matrix.to_vec(),
-                offset: offset.to_vec(),
-            })
-        }
-
-        match self {
-            // The matrix-offset family: `transform_point` multiplies these very fields.
-            Transform::Affine(t) => stored(t.matrix(), t.offset()),
-            Transform::Euler2D(t) => stored(t.matrix(), t.offset()),
-            Transform::Euler3D(t) => stored(t.matrix(), t.offset()),
-            Transform::Similarity2D(t) => stored(t.matrix(), t.offset()),
-            Transform::Similarity3D(t) => stored(t.matrix(), t.offset()),
-            Transform::Versor(t) => stored(t.matrix(), t.offset()),
-            Transform::VersorRigid3D(t) => stored(t.matrix(), t.offset()),
-            Transform::ScaleVersor3D(t) => stored(t.matrix(), t.offset()),
-            Transform::ScaleSkewVersor3D(t) => stored(t.matrix(), t.offset()),
-            Transform::ComposeScaleSkewVersor3D(t) => stored(t.matrix(), t.offset()),
-
-            // Synthesized, and pinned: `p + t` is `mat_vec(I, p) + t` to the bit.
-            Transform::Translation(t) => {
-                let dim = t.translation().len();
-                let mut matrix = vec![0.0; dim * dim];
-                for d in 0..dim {
-                    matrix[d * dim + d] = 1.0;
-                }
-                Some(MatrixOffsetMap {
-                    matrix,
-                    offset: t.translation().to_vec(),
-                })
-            }
-
-            // Linear, but `(p − c)·s + c` is a different rounding from `M·p + b`.
-            Transform::Scale(_) | Transform::ScaleLogarithmic(_) => None,
-            // Linear iff every stage is — but a composed matrix is not the stages'
-            // arithmetic. Transcribe the stages in order, or refuse. Refuse.
-            Transform::Composite(_) => None,
-            // Not linear.
-            Transform::BSpline(_) | Transform::DisplacementField(_) => None,
+        let mut stages = self.point_map_stages()?;
+        match stages.len() {
+            1 => stages.pop(),
+            // Zero stages (an empty composite) is the identity, and this API has no way to
+            // say "identity" that a caller could not also get wrong; several stages must be
+            // replayed, not folded. Both refuse.
+            _ => None,
         }
     }
 }
@@ -409,6 +412,207 @@ mod tests {
         assert!(
             Transform::BSpline(bspline).matrix_offset_map().is_none(),
             "a B-spline transform is not linear"
+        );
+    }
+
+    use super::replay_stages as replay;
+
+    /// **The stage contract, on the bits.** Replaying the stages IS `transform_point` —
+    /// for a single-stage transform and, the interesting case, for a composite, whose
+    /// stages must be replayed *in order* rather than folded.
+    #[test]
+    fn the_stages_replay_transform_point_on_the_bits() {
+        let t3 = [3.5, -2.25, 7.125];
+        let c3 = [12.0, -4.5, 33.25];
+
+        let euler = Transform::Euler3D(Euler3DTransform::new(0.31, -0.17, 0.44, t3, c3));
+        let translation = Transform::Translation(TranslationTransform::new(vec![1.5, -2.5, 0.125]));
+        let affine = Transform::Affine(AffineTransform::new(
+            3,
+            vec![0.97, -0.21, 0.11, 0.19, 0.95, -0.24, -0.14, 0.22, 0.96],
+            t3.to_vec(),
+            c3.to_vec(),
+        ));
+
+        let mut composite = CompositeTransform::new(3);
+        composite.add_transform(euler.clone()).unwrap();
+        composite.add_transform(translation.clone()).unwrap();
+        composite.add_transform(affine.clone()).unwrap();
+        let composite = Transform::Composite(composite);
+
+        for (name, t, want_stages) in [
+            ("Euler3D", euler, 1usize),
+            ("Translation", translation, 1),
+            ("Affine", affine, 1),
+            ("Composite(3)", composite, 3),
+        ] {
+            let stages = t
+                .point_map_stages()
+                .unwrap_or_else(|| panic!("{name}: expected stages, got none"));
+            assert_eq!(stages.len(), want_stages, "{name}: stage count");
+
+            for p in probes(3) {
+                let got = t.transform_point(&p);
+                let replayed = replay(&stages, &p, 3);
+                for d in 0..3 {
+                    assert_eq!(
+                        got[d].to_bits(),
+                        replayed[d].to_bits(),
+                        "{name}: axis {d} at {p:?}: transform_point gave {}, replaying the \
+                         stages gave {} --- the stage list is NOT the transform's own \
+                         arithmetic, and a backend that trusted it would compute a \
+                         different point",
+                        got[d],
+                        replayed[d],
+                    );
+                }
+            }
+        }
+    }
+
+    /// A composite reports its stages and is still refused as a **single** matrix — and
+    /// the fold really is lossy, so the refusal is not pedantry.
+    #[test]
+    fn a_composite_hands_over_stages_and_refuses_to_be_folded() {
+        let mut composite = CompositeTransform::new(3);
+        composite
+            .add_transform(Transform::Euler3D(Euler3DTransform::new(
+                0.31,
+                -0.17,
+                0.44,
+                [3.5, -2.25, 7.125],
+                [12.0, -4.5, 33.25],
+            )))
+            .unwrap();
+        composite
+            .add_transform(Transform::Translation(TranslationTransform::new(vec![
+                1.5, -2.5, 0.125,
+            ])))
+            .unwrap();
+        let t = Transform::Composite(composite);
+
+        let stages = t.point_map_stages().expect("two eligible stages");
+        assert_eq!(stages.len(), 2);
+        assert!(
+            t.matrix_offset_map().is_none(),
+            "a composite has no SINGLE bitwise matrix form: folding rounds once where the \
+             transform rounds twice"
+        );
+
+        // And the fold is measurably not the transform: at least one probe disagrees on
+        // the bits. Without this the refusal above would be a claim, not a finding.
+        let folded_matrix = sitk_core::matrix::matmul(&stages[1].matrix, &stages[0].matrix, 3);
+        let m1_b0 = mat_vec(&stages[1].matrix, &stages[0].offset, 3);
+        let folded_offset: Vec<f64> = (0..3).map(|d| m1_b0[d] + stages[1].offset[d]).collect();
+        let folded = MatrixOffsetMap {
+            matrix: folded_matrix,
+            offset: folded_offset,
+        };
+
+        let mut disagreements = 0;
+        for p in probes(3) {
+            let got = t.transform_point(&p);
+            let one_shot = replay(std::slice::from_ref(&folded), &p, 3);
+            for d in 0..3 {
+                if got[d].to_bits() != one_shot[d].to_bits() {
+                    disagreements += 1;
+                }
+            }
+        }
+        assert!(
+            disagreements > 0,
+            "the folded matrix agreed with the composite on every probe, so this test is no \
+             longer evidence that folding a composite is lossy"
+        );
+        println!("folding the composite disagrees on {disagreements} probe components");
+    }
+
+    /// A composite of **one** map is not refused: it applies exactly that map, so there is
+    /// nothing to fold and the single form it hands over is its member's own arithmetic.
+    ///
+    /// The refusal above is about the *sequence*, not about the type's name — and this is
+    /// the boundary between the two, pinned on the bits so that a future "refuse every
+    /// composite" shortcut has to argue with a test rather than with a comment.
+    #[test]
+    fn a_single_map_composite_is_that_map() {
+        let member = Euler3DTransform::new(0.2, -0.1, 0.05, [11.0, -7.0, 3.0], [12.0, 9.0, -4.0]);
+        let mut c = CompositeTransform::new(3);
+        c.add_transform(member.clone().into()).unwrap();
+        let t = Transform::Composite(c);
+
+        let map = t
+            .matrix_offset_map()
+            .expect("one map in, one map out -- nothing to fold");
+        assert_eq!(map, member.point_map_stages().unwrap()[0]);
+        for p in probes(3) {
+            let want = t.transform_point(&p);
+            let got = replay(std::slice::from_ref(&map), &p, 3);
+            for d in 0..3 {
+                assert_eq!(got[d].to_bits(), want[d].to_bits());
+            }
+        }
+    }
+
+    /// The transforms with no bitwise form report **no stages** — the trait default, and
+    /// the safe direction: a backend that needs the bits refuses them.
+    #[test]
+    fn the_transforms_with_no_bitwise_form_report_no_stages() {
+        let scale = Transform::Scale(ScaleTransform::new(
+            vec![2.0, 2.0, 2.0],
+            vec![1.0, 1.0, 1.0],
+        ));
+        assert!(
+            scale.point_map_stages().is_none(),
+            "ScaleTransform evaluates (p - c)*s + c; no stage list reproduces that rounding"
+        );
+
+        let slog = Transform::ScaleLogarithmic(ScaleLogarithmicTransform::new(
+            vec![0.5, 0.5, 0.5],
+            vec![1.0, 1.0, 1.0],
+        ));
+        assert!(slog.point_map_stages().is_none());
+
+        let bspline = Transform::BSpline(
+            BSplineTransform::new(
+                3,
+                &[0.0; 3],
+                &[10.0; 3],
+                &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                &[2, 2, 2],
+            )
+            .unwrap(),
+        );
+        assert!(bspline.point_map_stages().is_none());
+
+        let field = Transform::DisplacementField(
+            DisplacementFieldTransform::new(
+                3,
+                &[4, 4, 4],
+                &[0.0; 3],
+                &[1.0; 3],
+                &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap(),
+        );
+        assert!(field.point_map_stages().is_none());
+
+        // And a composite is only as eligible as its worst stage.
+        let mut mixed = CompositeTransform::new(3);
+        mixed
+            .add_transform(Transform::Translation(TranslationTransform::new(vec![
+                1.0, 2.0, 3.0,
+            ])))
+            .unwrap();
+        mixed
+            .add_transform(Transform::Scale(ScaleTransform::new(
+                vec![2.0, 2.0, 2.0],
+                vec![1.0, 1.0, 1.0],
+            )))
+            .unwrap();
+        assert!(
+            Transform::Composite(mixed).point_map_stages().is_none(),
+            "one ineligible stage makes the whole queue ineligible --- there is no partial \
+             bit-exactness"
         );
     }
 }

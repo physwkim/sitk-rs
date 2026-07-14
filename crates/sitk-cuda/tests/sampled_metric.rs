@@ -16,7 +16,8 @@
 
 use sitk_core::Image;
 use sitk_cuda::{
-    CudaError, DeviceImage, FixedPoints, Moments, MovingGeometry, ResidentMetric, backend,
+    CudaError, DeviceImage, FixedPoints, Moments, MovingGeometry, PointStage, ResidentMetric,
+    backend,
 };
 
 fn no_device() -> bool {
@@ -77,6 +78,13 @@ fn index_points(idx: &[i64]) -> FixedPoints<'_> {
 const A: [f64; 9] = [0.98, -0.15, 0.03, 0.14, 0.97, -0.06, -0.02, 0.05, 0.99];
 const B: [f64; 3] = [0.7, -0.4, 0.25];
 
+/// The point map as the metric now takes it: one stage of `mat_vec(matrix, p) + offset`,
+/// which is what a single matrix-offset transform hands over.
+const MAP: [PointStage; 1] = [PointStage {
+    matrix: A,
+    offset: B,
+}];
+
 fn moments(fixed_points: FixedPoints<'_>) -> Moments {
     let (f, m) = (volume(1), volume(9));
     let (d_f, d_m) = (
@@ -85,7 +93,7 @@ fn moments(fixed_points: FixedPoints<'_>) -> Moments {
     );
     ResidentMetric::from_device(&d_f, fixed_points, &d_m, &moving_geometry())
         .unwrap()
-        .evaluate(&A, &B)
+        .evaluate(&MAP)
         .unwrap()
 }
 
@@ -209,7 +217,7 @@ fn a_sampled_index_list_evaluates_the_voxels_it_names() {
         &moving_geometry(),
     )
     .unwrap()
-    .evaluate(&A, &B)
+    .evaluate(&MAP)
     .unwrap();
 
     assert_eq!(

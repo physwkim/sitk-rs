@@ -48,11 +48,17 @@
 //! global-affine family**, the device never learns what a transform *is*, and the
 //! host does the contraction in `f64` using the transform's own existing
 //! `jacobian_wrt_parameters` — no downcast, no type whitelist, no per-transform
-//! kernel. The device is told only the point map `x ↦ A·x + b` (12 doubles).
+//! kernel. The device is told only the point map, as [`PointStage`]s: the
+//! transform's own stored `matrix`/`offset` pairs, one per map it applies, in the
+//! order it applies them (12 doubles each).
 //!
-//! A transform whose point map or Jacobian is *not* affine in the point (B-spline,
-//! displacement field) fails the caller's linearity probe and falls back to the
-//! CPU. The fallback is a property of the mathematics, not of a type list.
+//! A transform that cannot state its point map that way — because its
+//! `transform_point` evaluates some *other* expression (B-spline, displacement
+//! field, `ScaleTransform`'s centred `(p − c)·s + c`) — has no stages, and the
+//! caller refuses it by name and falls back to the CPU. The requirement is bitwise,
+//! not algebraic: the last bits of the continuous index decide `floor`, `is_inside`
+//! and `round`, which are branches, so a form that is *equal* to the host's but
+//! rounds differently is not good enough.
 //!
 //! # What this module is, and what it is not
 //!
@@ -81,7 +87,7 @@ use crate::image::DeviceImage;
 use crate::mask::DeviceMask;
 use crate::ops::resident::{Partials, Resident, SAMPLER_SRC, Volumes};
 
-pub use crate::ops::resident::{DIM, FixedPoints, MovingGeometry};
+pub use crate::ops::resident::{DIM, FixedPoints, MAX_STAGES, MovingGeometry, PointStage};
 
 /// `sq` (1) + `S0[3]` (3) + `S1[3][3]` (9) + `count` (1).
 const NSLOT: usize = 14;
@@ -110,7 +116,8 @@ extern "C" __global__ void ms_moments(
     const int has_mask,
     const unsigned char* __restrict__ fmask, // fixed-grid mask, n; unused if !has_fmask
     const int has_fmask,
-    const double* __restrict__ ab,        // A (9, row-major) then b (3)
+    const double* __restrict__ stages,    // nstage * (M (9, row-major) then t (3))
+    const int nstage,
     double* __restrict__ partials)        // GRID * NSLOT
 {
     double acc[NSLOT];
@@ -121,7 +128,8 @@ extern "C" __global__ void ms_moments(
         Sample sm;
         if (!take_sample<true>(s, fvals, fpts, mode, fidx, fsize, forigin, fmat,
                                mbuf, msize, mstride, morigin, mmat,
-                               mmask, has_mask, fmask, has_fmask, ab, &sm)) continue;
+                               mmask, has_mask, fmask, has_fmask,
+                               stages, nstage, &sm)) continue;
 
         const double diff = sm.value - sm.fval;
         acc[0] += diff * diff;
@@ -172,9 +180,9 @@ pub struct Moments {
 /// of transforms without re-uploading either.
 ///
 /// Built once per pyramid level; [`evaluate`](Self::evaluate) is then called once
-/// (or twice) per optimizer iteration and moves **96 bytes up** (the point map)
-/// and **`GRID · 14 · 8` = 57 KiB down** (the per-block partials). Nothing else
-/// crosses the bus, and nothing is reallocated per iteration.
+/// (or twice) per optimizer iteration and moves **96 bytes per stage up** (the
+/// point map) and **`GRID · 14 · 8` = 57 KiB down** (the per-block partials).
+/// Nothing else crosses the bus, and nothing is reallocated per iteration.
 pub struct ResidentMetric {
     res: Resident,
     partials: Partials,
@@ -312,13 +320,15 @@ impl ResidentMetric {
         self.res.vols.bytes()
     }
 
-    /// Evaluate the moments for the point map `x ↦ A·x + b`.
+    /// Evaluate the moments for the point map given as [`PointStage`]s — the
+    /// transform's own stored maps, in the order the host applies them.
     ///
-    /// `a` is row-major `3 × 3`, `b` is length 3. Deterministic: the same inputs
-    /// give bit-identical moments on every call and every run.
-    pub fn evaluate(&mut self, a: &[f64; 9], b: &[f64; 3]) -> Result<Moments, CudaError> {
+    /// Deterministic: the same inputs give bit-identical moments on every call and
+    /// every run. `stages` must be `1..=MAX_STAGES` long, or
+    /// [`CudaError::PointMapStageCount`].
+    pub fn evaluate(&mut self, stages: &[PointStage]) -> Result<Moments, CudaError> {
         let backend: &Backend = backend()?;
-        self.res.upload_point_map(backend, a, b)?;
+        self.res.upload_point_map(backend, stages)?;
 
         // Field-by-field, so the volumes can be matched on while the partials
         // buffer is borrowed mutably for the same launch.
@@ -339,7 +349,8 @@ impl ResidentMetric {
             has_mask,
             d_fmask,
             has_fmask,
-            d_ab,
+            d_stages,
+            nstage,
         } = &mut self.res;
 
         let n_i64 = *n as i64;
@@ -371,9 +382,10 @@ impl ResidentMetric {
                     .arg(&*has_mask)
                     .arg(d_fmask.device())
                     .arg(&*has_fmask)
-                    .arg(d_ab.device())
+                    .arg(d_stages.device())
+                    .arg(&*nstage)
                     .arg(d_partials.device_mut());
-                // SAFETY: the nineteen arguments match the kernel's nineteen
+                // SAFETY: the twenty arguments match the kernel's twenty
                 // parameters in order and type — `fvals` is `FSCALAR` and `mbuf` is
                 // `MSCALAR`, which are the element types of the buffers this arm
                 // matched (`Volumes::scalars`, the same match).
@@ -396,7 +408,9 @@ impl ResidentMetric {
                 // `has_mask != 0`, in which case it has one byte per moving voxel and
                 // the sampler bounds-checks the index it builds. `d_fmask` is read only
                 // when `has_fmask != 0`, in which case `build` has checked it covers
-                // the fixed grid. `d_ab` holds 12; `d_partials` holds `GRID * NSLOT`,
+                // the fixed grid. `d_stages` holds `MAX_STAGES * 12` and the kernel
+                // reads `nstage * 12` of them, where `upload_point_map` has checked
+                // `1 <= nstage <= MAX_STAGES`. `d_partials` holds `GRID * NSLOT`,
                 // and `emit_partials` writes `blockIdx.x * NSLOT + k` for
                 // `blockIdx.x < GRID`, `k < NSLOT`. Shared memory is declared
                 // statically at `BLOCK` doubles, matching `block_dim`.
