@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # What this job does NOT cover, stated where it cannot be missed: the `cuda`
+  # feature. GitHub-hosted runners have no GPU, so the device path — the kernels,
+  # the device-resident registration, and the bit-identity pins that compare it
+  # against the host — is neither built nor run here. Those tests exist and are
+  # run on a machine with a GPU. A green check on this workflow means the CPU
+  # path is green, and nothing more.
+  cpu:
+    name: CPU gates (does not cover the cuda feature — no GPU on the runner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo nextest run --workspace
+
+      - name: Doctests
+        run: cargo test --doc --workspace
+
+  # The manifest claims `rust-version = "1.89"`. This job is what makes that
+  # claim true rather than aspirational: it compiles every target on exactly
+  # that toolchain. It does not run the tests — the CPU job above owns that —
+  # so a failure here means the MSRV claim is false, not that the code is wrong.
+  msrv:
+    name: MSRV 1.89 builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build every target on the declared MSRV
+        run: cargo check --workspace --all-targets
