@@ -314,9 +314,15 @@ on `binary_dilate` **0.03×**, `connected_component` 0.25×, `signed_maurer_dist
 `fft_convolution` 0.87×; and **loses on `smoothing_recursive_gaussian` (1.02×)**.
 At 512³ `gradient_magnitude` and `gmrg` are ties (1.02×, 1.01×) — ties, not wins.
 
-**Where the port loses now is small volumes**, not large ones: at 64³,
-`gradient_magnitude` is 2.91×, `otsu` 6.62× and `mean` 4.52× — fixed per-call cost
-that the reference size amortizes away.
+**Small volumes used to be where the port lost, and one seam closed most of it.**
+The chunk grain was a *constant*, so a 64³ volume could raise **four tasks on a
+96-worker pool** no matter what the kernel did. Cutting the grain from the input
+length instead (`clamp(len.div_ceil(256), 2048, ceiling)`) moved every 64³ cell and
+**no other size** — proved a no-op at and above 256³ by comparing the emitted chunk
+boundaries *as integers*, not by asserting it. At 64³: `otsu` **6.62× → 0.68×** (a
+win), `gradient_magnitude` **2.91× → 1.05×** (a tie, from the worst cell in the
+table), `mean` 4.52× → **2.82×** — improved, still losing, and now the last 64³
+loss. Its cause is window locality, not task count.
 
 The interesting one is `mean`. It used to lose by **4.39×**, and the cause was not
 the kernel, the decomposition, bandwidth, or NUMA — each eliminated by measurement.
@@ -343,20 +349,22 @@ each one you can trust.
 
 ## Roadmap
 
-1. **Small-volume overhead** — now the port's only real loss. `gradient_magnitude`
-   is 2.91× at 64³, `otsu` 6.62×, `mean` 4.52×: fixed per-call cost that the
-   reference size amortizes away and the headline hides. None of the three
-   `gradient.rs` fixes moved `gradient_magnitude`'s small case by more than its own
-   noise, because it is overhead-bound, not bandwidth-bound.
-2. **`smoothing_recursive_gaussian` at 512³ (1.75×)**, not investigated. And three
-   un-parallelized stencils next to the ones just fixed — `derivative`, `laplacian`,
-   `sobel_edge_detection` still run a serial `iter().map().collect()`. They are not
-   in the benchmarked twelve, so no number is claimed for them.
-3. **Device coverage.** A **Correlation** metric — its moments are the same shape
-   the mean-squares kernel already reduces deterministically, so it inherits the
-   exactness story unchanged. Mattes needs a deterministic histogram built first
-   (above); ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs are
-   present and device 0 is the only one used.
+1. **`mean` at 64³ (2.82×)** — the last small-volume loss, and the one the grain
+   seam did not close. It is **window locality**, not task count: a 125-tap window
+   measured 1.85× faster on *eight* workers than on 96. No rule has been written,
+   because the taps are non-monotonic (a 3-tap histogram *wins* on a narrow pool, a
+   6-tap stencil *loses*, a 125-tap window *wins*) and `gradient_magnitude`'s optimal
+   pool width flips with the call shape — so no rule keyed on the op's own structure
+   can be right in both places.
+2. **The line pass.** `for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor is under
+   this box's 96 workers — the same arithmetic the grain seam closed, but it
+   decomposes by whole blocks, so it needs a different rule. `smoothing_recursive_gaussian`
+   (1.82× at 512³) and `gmrg` spend their time there and moved **0%** under the grain
+   seam.
+3. **Device coverage.** **Mattes** — the deterministic histogram it was refused for
+   now exists and is pinned bit-identical to the host's naive loop; the metric is not
+   built on it yet. ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs
+   are present and device 0 is the only one used.
 4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
