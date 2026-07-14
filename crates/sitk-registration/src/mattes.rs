@@ -241,6 +241,35 @@ pub(crate) struct MattesTail {
     pub(crate) pratio: Vec<f64>,
 }
 
+/// The joint histogram's total mass, by **compensated (Kahan) summation** — and there
+/// is one of these, called by every path that needs the number.
+///
+/// This is the one reduction ITK compensates
+/// (`itk::CompensatedSummation`, `itkMattesMutualInformationImageToImageMetricv4.hxx:536-541`)
+/// and the *only* one in the metric: the `sum` that forms `−MI` is a plain accumulator
+/// upstream, and is one here. Upstream is telling us where the error matters, and it is
+/// right to: this sum becomes the normalizer `1/jointPDFSum`, so its error multiplies
+/// **every** bin of the joint PDF and the fixed marginal, and through them the value,
+/// every `pRatio`, and the derivative. A naive walk of `bins²` terms (2 500 at the
+/// default 50 bins) carries up to `n·ε ≈ 5.5e-13` relative; that was the port's error
+/// until this existed.
+///
+/// The recurrence is ITK's exactly, including the detail that `GetSum()` returns the
+/// running sum **without** folding the final compensation back in
+/// (`itkCompensatedSummation.hxx:40-48`, `:132-135`) — so this is bit-identical to
+/// upstream's reduction, not merely more accurate than the naive one.
+fn joint_pdf_sum(joint_pdf: &[f64]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut compensation = 0.0f64;
+    for &bin in joint_pdf {
+        let compensated_input = bin - compensation;
+        let temp_sum = sum + compensated_input;
+        compensation = (temp_sum - sum) - compensated_input;
+        sum = temp_sum;
+    }
+    sum
+}
+
 /// Normalize the histogram, form `−MI`, and build the `pRatio` table. See [`MattesTail`].
 pub(crate) fn mattes_tail(
     mut joint_pdf: Vec<f64>,
@@ -252,7 +281,7 @@ pub(crate) fn mattes_tail(
     if valid == 0 {
         return None;
     }
-    let joint_sum: f64 = joint_pdf.iter().sum();
+    let joint_sum = joint_pdf_sum(&joint_pdf);
     if joint_sum < f64::EPSILON {
         return None;
     }
@@ -568,8 +597,10 @@ impl MattesMutualInformationMetric {
         }
 
         // Total histogram mass; each valid sample contributes ~1 (the cubic
-        // window's four taps sum to 1), so this ≈ valid.
-        let joint_sum: f64 = joint_pdf.iter().sum();
+        // window's four taps sum to 1), so this ≈ valid. Compensated, through the
+        // shared owner — see [`joint_pdf_sum`] for why this one sum, and only this
+        // one, is Kahan-summed on both sides.
+        let joint_sum = joint_pdf_sum(&joint_pdf);
         if joint_sum < f64::EPSILON {
             return MetricValue {
                 value: f64::MAX,
@@ -813,6 +844,63 @@ mod tests {
             let an = cubic_bspline_derivative(u);
             assert!((fd - an).abs() < 1e-4, "u {u}: fd {fd} vs analytic {an}");
         }
+    }
+
+    /// The joint-PDF sum is the one reduction ITK compensates, and the port must too.
+    ///
+    /// The pin has to be able to fail when the code is wrong, so it measures three
+    /// things rather than asserting that a number is "accurate": that the input really
+    /// does defeat a naive walk (else the test proves nothing), that the compensated sum
+    /// is *not the naive sum's bits* (it fails the moment someone writes
+    /// `joint_pdf.iter().sum()` again), and that it is strictly closer to the reference.
+    #[test]
+    fn the_joint_pdf_sum_is_compensated_and_the_naive_sum_is_not_good_enough() {
+        // A histogram shaped like a real one: `bins²` non-negative terms of widely
+        // differing magnitude — a few heavy bins where the images agree, a long tail of
+        // light ones — none of them exactly representable.
+        let bins = 50usize;
+        let h: Vec<f64> = (0..bins * bins)
+            .map(|i| {
+                let heavy = i % 97 == 0;
+                let base = if heavy { 613.7 } else { 0.1 };
+                base * (1.0 + (i % 13) as f64 / 7.0)
+            })
+            .collect();
+
+        // Reference: Neumaier compensated summation *with* the final correction folded
+        // back in — strictly more accurate than ITK's Kahan, which drops it.
+        let reference = {
+            let (mut sum, mut c) = (0.0f64, 0.0f64);
+            for &t in &h {
+                let s = sum + t;
+                c += if sum.abs() >= t.abs() {
+                    (sum - s) + t
+                } else {
+                    (t - s) + sum
+                };
+                sum = s;
+            }
+            sum + c
+        };
+        let naive: f64 = h.iter().sum();
+        let compensated = joint_pdf_sum(&h);
+
+        assert_ne!(
+            naive.to_bits(),
+            reference.to_bits(),
+            "the fixture does not defeat naive summation, so this test cannot fail when \
+             the compensation is removed — pick a worse-conditioned histogram"
+        );
+        assert_ne!(
+            compensated.to_bits(),
+            naive.to_bits(),
+            "the joint-PDF sum is the naive sum's bits: the compensation is gone"
+        );
+        let (err_c, err_n) = ((compensated - reference).abs(), (naive - reference).abs());
+        assert!(
+            err_c < err_n,
+            "compensated error {err_c:e} is not below the naive error {err_n:e}"
+        );
     }
 
     #[test]
