@@ -64,3 +64,25 @@ The harness writes an `output_checksum` per cell. Across all 20 legs of S, all 1
 S2, all 12 of M and all 12 of L, **every op has exactly one checksum class** — no
 variant, at any size, moved a bit. The grain is a scheduling knob and this is the
 evidence, not the argument.
+
+## `M2` — V4 at 256³, and a confound the first attempt walked into
+
+| | ops | size | rounds kept | what it grades |
+|---|---|---|---|---|
+| `M2` | the 4 `fill_indexed` ops | 256³ | 4 (v0, v4) | P10 |
+
+The first `M2` reported `gradient_magnitude` at **1.111×, band [1.09, 1.25]** — a
+regression that never dipped below 1.09, at a volume where the integers say V4 is a
+no-op. It was not a result. The driver rotates variant order by round and *also*
+reverses on odd rounds, and for a **two**-variant campaign the reverse exactly
+cancels the rotation: `v0` ran first in every single round. The ratio was confounded
+with leg position.
+
+Re-run with the reverse suppressed at `n == 2` (rotation alone already alternates a
+pair), so each variant takes each slot twice, the same cell reads **1.147×, band
+[0.69, 1.34]** — straddling 1.0 with no direction. That widening is the confound
+being removed, not the noise growing.
+
+The kept `M2/` legs are the corrected run. The lesson is the general one for this
+directory: a paired design only cancels drift if the pairing is actually balanced,
+and a rotation rule that looks balanced at `n = 4` can be degenerate at `n = 2`.
