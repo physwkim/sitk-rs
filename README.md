@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,369 tests** on the CPU, **3,469** with the CUDA
+> implemented and tested — **3,408 tests** on the CPU, **3,509** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -245,8 +245,8 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,369), with it **on** (3,469), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,469) — a machine with no GPU is a supported configuration, not a crash.
+(3,408), with it **on** (3,509), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,509) — a machine with no GPU is a supported configuration, not a crash.
 
 ## ITK parity — and what we found in ITK
 
@@ -350,8 +350,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,369 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,469, needs CUDA 13
+cargo nextest run --workspace                        # 3,408 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,509, needs CUDA 13
 ```
 
 License: Apache-2.0.
