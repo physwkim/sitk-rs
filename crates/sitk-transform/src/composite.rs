@@ -149,6 +149,22 @@ impl TransformBase for CompositeTransform {
         out
     }
 
+    /// The queue's stages, **in application order** (last-added first), concatenated —
+    /// `None` if any sub-transform has no bitwise stage form of its own.
+    ///
+    /// This is the one place where folding would be a lie that passes every algebraic
+    /// test: `transform_point` above applies its stages *sequentially*, each rounding on
+    /// its own, so the product of the stage matrices is the same map and not the same
+    /// arithmetic. The stages are therefore handed over as stages, in the order this very
+    /// loop applies them, and the consumer replays the loop.
+    fn point_map_stages(&self) -> Option<Vec<crate::matrix_offset::MatrixOffsetMap>> {
+        let mut stages = Vec::new();
+        for t in self.transforms.iter().rev() {
+            stages.extend(t.point_map_stages()?);
+        }
+        Some(stages)
+    }
+
     fn dimension(&self) -> usize {
         self.dimension
     }

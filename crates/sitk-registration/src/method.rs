@@ -57,8 +57,10 @@
 //! [`set_fixed_initial_transform`]: ImageRegistrationMethod::set_fixed_initial_transform
 //! [`metric_evaluate`]: ImageRegistrationMethod::metric_evaluate
 
-use sitk_core::Image;
-use sitk_filters::{recursive_gaussian, shrink};
+use std::borrow::Cow;
+
+use sitk_core::{Image, PixelId};
+use sitk_filters::{cast, recursive_gaussian, shrink};
 use sitk_transform::{
     AffineTransform, BSplineTransform, Interpolator, ParametricTransform, ResampleImageFilter,
     Transform, TransformBase, TranslationTransform,
@@ -67,6 +69,11 @@ use sitk_transform::{
 use crate::ants_correlation::AntsNeighborhoodCorrelationMetric;
 use crate::correlation::CorrelationMetric;
 use crate::demons::DemonsMetric;
+#[cfg(feature = "cuda")]
+use crate::device::{
+    DeviceActive, DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetric,
+    DeviceRegistrationError,
+};
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
@@ -175,6 +182,12 @@ enum MetricKind {
 /// [`physical_shift_scales`]: Self::physical_shift_scales
 enum ActiveMetric {
     MeanSquares(MeanSquaresMetric),
+    /// Mean squares over two volumes that are already on the device
+    /// ([`ImageRegistrationMethod::execute_on_device`]). Selected at construction,
+    /// like every other variant here — the optimizer loop never asks per call where
+    /// a metric lives.
+    #[cfg(feature = "cuda")]
+    Device(Box<DeviceActive>),
     Mattes(MattesMutualInformationMetric),
     Correlation(CorrelationMetric),
     AntsNeighborhoodCorrelation(AntsNeighborhoodCorrelationMetric),
@@ -240,6 +253,27 @@ impl<T: ParametricTransform + ?Sized> TransformBase for Composed<'_, T> {
                 mat_mul(&jg, &jf, self.dimension())
             }
         }
+    }
+
+    /// The stages of `transform_point` above, in the order `transform_point` applies
+    /// them: the optimized transform's, then the moving-initial's.
+    ///
+    /// The two maps are **not folded** into one. `transform_point` evaluates
+    /// `g(f(x))`, rounding once in `f` and once in `g`; the product matrix `G·F` is
+    /// algebraically the same map and rounds *once*, so it agrees with the host to an
+    /// ulp and not to the bit — and an ulp of the continuous index is a flipped
+    /// `floor`/`is_inside`/`round` at a sample that lands on a voxel plane. A backend
+    /// that replays these stages in this order performs exactly the host's operations
+    /// in exactly the host's order.
+    ///
+    /// `None` from either side propagates: a composition is reproducible only if both
+    /// of its halves are.
+    fn point_map_stages(&self) -> Option<Vec<sitk_transform::matrix_offset::MatrixOffsetMap>> {
+        let mut stages = self.optimized.point_map_stages()?;
+        if let Some(g) = self.moving_initial {
+            stages.extend(g.point_map_stages()?);
+        }
+        Some(stages)
     }
 }
 
@@ -326,6 +360,24 @@ fn with_geometry_of(reference: &Image, values: Vec<f64>) -> Result<Image> {
     Ok(image)
 }
 
+/// A mask's predicate as a 0/1 `Float64` volume on the mask's own grid — the same
+/// `nonzero → inside` rule `FixedSamples::from_image_with` applies, applied early.
+///
+/// The device path uploads this rather than the raw mask. Nearest-neighbour resampling
+/// picks a voxel's value or the default, so thresholding before or after the pick is
+/// the same predicate — and thresholding on the host keeps a mask whose nonzero values
+/// underflow `f32` (an `f64` mask holding 1e-320) from silently becoming empty on a
+/// device that stores `f32`.
+#[cfg(feature = "cuda")]
+fn binary_volume(mask: &Image) -> Result<Image> {
+    let values = mask
+        .to_f64_vec()?
+        .iter()
+        .map(|&v| f64::from(v != 0.0))
+        .collect();
+    with_geometry_of(mask, values)
+}
+
 /// The pointwise AND of two binary masks on one grid, `None` when neither is
 /// present. A voxel survives only if it is nonzero in every mask given.
 fn intersect_masks(a: Option<Image>, b: Option<Image>) -> Result<Option<Image>> {
@@ -403,6 +455,8 @@ impl ActiveMetric {
     ) -> MetricValue {
         match self {
             ActiveMetric::MeanSquares(m) => m.evaluate(transform, backend),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.evaluate(transform),
             ActiveMetric::Mattes(m) => m.evaluate(transform),
             ActiveMetric::Correlation(m) => m.evaluate(transform),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.evaluate(transform),
@@ -419,6 +473,8 @@ impl ActiveMetric {
         match self {
             ActiveMetric::Correlation(m) => m.check_transform(transform),
             ActiveMetric::Demons(m) => m.check_transform(transform),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(_) => Ok(()),
             ActiveMetric::MeanSquares(_)
             | ActiveMetric::Mattes(_)
             | ActiveMetric::AntsNeighborhoodCorrelation(_)
@@ -437,6 +493,8 @@ impl ActiveMetric {
     fn value(&self, transform: &dyn ParametricTransform, backend: &dyn MetricBackend) -> f64 {
         match self {
             ActiveMetric::MeanSquares(m) => m.value(transform, backend),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.value(transform),
             ActiveMetric::Mattes(m) => m.value(transform),
             ActiveMetric::Correlation(m) => m.value(transform),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.value(transform),
@@ -453,6 +511,8 @@ impl ActiveMetric {
     ) -> ScalesEstimator {
         match self {
             ActiveMetric::MeanSquares(m) => m.scales_estimator(transform, kind),
+            #[cfg(feature = "cuda")]
+            ActiveMetric::Device(m) => m.scales_estimator(transform, kind),
             ActiveMetric::Mattes(m) => m.scales_estimator(transform, kind),
             ActiveMetric::Correlation(m) => m.scales_estimator(transform, kind),
             ActiveMetric::AntsNeighborhoodCorrelation(m) => m.scales_estimator(transform, kind),
@@ -640,6 +700,49 @@ impl VirtualDomain {
         image.set_direction(&self.direction)?;
         Ok(image)
     }
+
+    /// The same grid as [`grid`](Self::grid), as a geometry and **without the
+    /// volume** — what the device path needs. `grid` allocates one `f64` per virtual
+    /// voxel (134 MB at 256³) purely to carry a few dozen numbers; on the device
+    /// those numbers are all that is ever read.
+    #[cfg(feature = "cuda")]
+    fn device_geometry(&self) -> sitk_cuda::Geometry {
+        sitk_cuda::Geometry {
+            size: self.size.clone(),
+            spacing: self.spacing.clone(),
+            origin: self.origin.clone(),
+            direction: self.direction.clone(),
+        }
+    }
+}
+
+/// What one resolution level of a run did.
+///
+/// A multi-resolution run optimizes once per level, and until this existed only
+/// the *last* level's diagnostics survived: a caller could not see that a coarse
+/// level had burned its iteration cap, or had converged in two steps, or had run
+/// on a level whose valid-sample count was a fraction of the native grid's. Those
+/// are the facts you need to tell a pyramid that is doing work from one that is
+/// only costing you time.
+#[derive(Clone, Debug)]
+pub struct LevelResult {
+    /// This level's index in the schedule, coarsest (0) to finest.
+    pub level: usize,
+    /// The shrink factors this level's grid was built with, per axis.
+    pub shrink_factors: Vec<usize>,
+    /// The scalar smoothing sigma configured for this level (before the
+    /// physical-units conversion, i.e. the number the caller set).
+    pub smoothing_sigma: f64,
+    /// Metric value at this level's final iterate.
+    pub metric_value: f64,
+    /// Optimizer steps taken at this level.
+    pub iterations: usize,
+    /// Why this level's optimizer stopped.
+    pub stop_reason: StopReason,
+    /// Fixed samples that mapped inside the moving image at this level's final
+    /// iterate. Counted on *this level's* grid, so a coarse level's count is
+    /// smaller than the native level's by construction.
+    pub valid_points: usize,
 }
 
 /// The optimized transform plus diagnostics from a registration run.
@@ -650,11 +753,52 @@ pub struct RegistrationResult<T> {
     /// Metric value at that transform (lower is better for mean squares).
     pub metric_value: f64,
     /// Optimizer steps taken.
+    ///
+    /// For a multi-resolution run this is the **last (finest) level's** count,
+    /// not the sum over levels — the meaning it has always had. Per-level counts
+    /// are in [`levels`](Self::levels).
     pub iterations: usize,
-    /// Why the optimizer stopped.
+    /// Why the optimizer stopped. Multi-resolution: the last level's reason.
     pub stop_reason: StopReason,
     /// Fixed samples that mapped inside the moving image at the final transform.
+    /// Multi-resolution: counted on the last level's grid.
     pub valid_points: usize,
+    /// One entry per resolution level, coarsest first. A single-level run has
+    /// exactly one entry, whose fields equal the four above.
+    pub levels: Vec<LevelResult>,
+}
+
+impl<T> RegistrationResult<T> {
+    /// Assemble the run's result from its per-level records — the **only** place
+    /// a `RegistrationResult` is built, so `execute` and `execute_on_device`
+    /// cannot drift on what the top-level fields mean.
+    ///
+    /// The top-level fields are the *last* level's, which is what they have
+    /// always been: a caller reading `iterations` today keeps reading the same
+    /// number.
+    fn from_levels(transform: T, levels: Vec<LevelResult>) -> Self {
+        let last = levels
+            .last()
+            .expect("a level schedule always has at least one level");
+        Self {
+            metric_value: last.metric_value,
+            iterations: last.iterations,
+            stop_reason: last.stop_reason,
+            valid_points: last.valid_points,
+            transform,
+            levels,
+        }
+    }
+}
+
+/// Which level of the schedule is being run — the metadata `drive` needs to
+/// stamp onto the [`LevelResult`] it produces, carried as one value so both
+/// entry points hand over the same thing.
+#[derive(Clone, Copy, Debug)]
+struct LevelSpec<'a> {
+    index: usize,
+    factors: &'a [usize],
+    sigma: f64,
 }
 
 /// The registration driver. Configure the optimizer (and optionally parameter
@@ -1946,7 +2090,7 @@ impl ImageRegistrationMethod {
         self.check_dimensions(fixed, moving)?;
 
         let dim = fixed.dimension();
-        let schedule = self.level_schedule(fixed)?;
+        let schedule = self.level_schedule(dim)?;
 
         if let Some(mask) = &self.fixed_mask
             && mask.size() != fixed.size()
@@ -1968,32 +2112,29 @@ impl ImageRegistrationMethod {
         }
 
         let mut transform = initial;
-        let mut diagnostics = None;
+        let mut levels = Vec::with_capacity(schedule.len());
         for (level, (level_factors, level_sigma)) in schedule.iter().enumerate() {
             adapt(level, level_factors, &mut transform)?;
-            let sigma = self.physical_sigma(fixed, *level_sigma);
+            let sigma = self.physical_sigma(fixed.spacing(), *level_sigma);
             let (fixed_level, moving_level, fixed_mask_level) =
                 self.prepare_level(fixed, moving, &sigma, level_factors, dim)?;
-            let r = self.run_single_level(
+            let spec = LevelSpec {
+                index: level,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.run_single_level(
                 &fixed_level,
                 &moving_level,
                 fixed_mask_level.as_ref(),
-                level,
+                spec,
                 transform,
             )?;
-            diagnostics = Some((r.metric_value, r.iterations, r.stop_reason, r.valid_points));
-            transform = r.transform;
+            levels.push(record);
+            transform = t;
         }
-        let (metric_value, iterations, stop_reason, valid_points) =
-            diagnostics.expect("level schedule always has at least one level");
 
-        Ok(RegistrationResult {
-            transform,
-            metric_value,
-            iterations,
-            stop_reason,
-            valid_points,
-        })
+        Ok(RegistrationResult::from_levels(transform, levels))
     }
 
     /// Register `moving` onto `fixed` starting from the transform stored by
@@ -2042,7 +2183,7 @@ impl ImageRegistrationMethod {
         // null adaptor; this port rejects both so the caller's per-level intent
         // is unambiguous (ledger §2.146). An empty list runs no adaptation.
         if !scale_factors.is_empty() {
-            let num_levels = self.level_schedule(fixed)?.len();
+            let num_levels = self.level_schedule(fixed.dimension())?.len();
             if scale_factors.len() != num_levels {
                 return Err(RegistrationError::BSplineScaleFactorLength {
                     got: scale_factors.len(),
@@ -2196,8 +2337,7 @@ impl ImageRegistrationMethod {
     /// The per-level `(shrink_factors, sigma)` schedule, coarsest first. With no
     /// schedule configured this is one full-resolution level (factor 1, sigma 0).
     /// Errors if the shrink and smoothing schedules differ in length.
-    fn level_schedule(&self, fixed: &Image) -> Result<Vec<(Vec<usize>, f64)>> {
-        let dim = fixed.dimension();
+    fn level_schedule(&self, dim: usize) -> Result<Vec<(Vec<usize>, f64)>> {
         if self.shrink_factors_per_level.is_empty() && self.smoothing_sigmas_per_level.is_empty() {
             return Ok(vec![(vec![1; dim], 0.0)]);
         }
@@ -2218,11 +2358,15 @@ impl ImageRegistrationMethod {
     /// Per-dimension physical smoothing sigma for a scalar level sigma. When the
     /// schedule is given in voxel units, scale by the fixed image's spacing
     /// (matching ITK, whose smoother always works in physical units).
-    fn physical_sigma(&self, fixed: &Image, sigma: f64) -> Vec<f64> {
+    ///
+    /// Takes the fixed image's `spacing` rather than the image, so the device path
+    /// — which holds a geometry, not an `Image` — computes the same sigma through
+    /// the same function instead of a parallel one that could drift from it.
+    fn physical_sigma(&self, spacing: &[f64], sigma: f64) -> Vec<f64> {
         if self.smoothing_sigmas_in_physical_units {
-            vec![sigma; fixed.dimension()]
+            vec![sigma; spacing.len()]
         } else {
-            fixed.spacing().iter().map(|&sp| sigma * sp).collect()
+            spacing.iter().map(|&sp| sigma * sp).collect()
         }
     }
 
@@ -2236,6 +2380,12 @@ impl ImageRegistrationMethod {
     /// resolution, so the recursive filter's ≥4-pixels-per-smoothed-axis
     /// requirement bites only on a pathologically small input (a level with
     /// `sigma == 0` is a no-op and imposes nothing).
+    ///
+    /// **The level is built in floating point.** A non-floating input is cast to
+    /// [`PixelId::Float32`] before it is smoothed, so no level re-quantizes the
+    /// smoothed intensities back to the input's integer type; a `Float64` input
+    /// keeps its width. See the body for why this is upstream's behaviour and not
+    /// a divergence from it (ledger §5.12).
     ///
     /// The moving image is only smoothed (it is resampled through the transform,
     /// so it is not shrunk). The fixed image is smoothed and then placed on the
@@ -2283,19 +2433,91 @@ impl ImageRegistrationMethod {
     /// gradient flows through (ledger §4.66).
     ///
     /// [`set_interpolator`]: Self::set_interpolator
-    fn prepare_level(
+    fn prepare_level<'a>(
         &self,
-        fixed: &Image,
-        moving: &Image,
+        fixed: &'a Image,
+        moving: &'a Image,
         sigma: &[f64],
         factors: &[usize],
         dim: usize,
-    ) -> Result<(Image, Image, Option<Image>)> {
-        let smoothed_fixed = recursive_gaussian(fixed, sigma)?;
-        let coarse_grid = match &self.virtual_domain {
-            Some(v) => shrink(&v.grid()?, factors)?,
-            None => shrink(&smoothed_fixed, factors)?,
+    ) -> Result<(Cow<'a, Image>, Cow<'a, Image>, Option<Image>)> {
+        // The level pipeline runs in floating point, whatever the caller handed in.
+        //
+        // `recursive_gaussian` narrows back to its *input's* pixel type, so on an
+        // integer volume every level used to round the smoothed intensities back to
+        // the integer type before resampling — and the resample onto a shrunk grid
+        // interpolates, so it rounded a second time. A CT registered as `UInt16` was
+        // being re-quantized once per level, which is a precision loss this
+        // function's parity claim does not have and no caller asked for.
+        //
+        // Promoting is not a divergence from upstream, it is the only way to *have*
+        // this case: SimpleITK's `ImageRegistrationMethod::Execute` registers only
+        // `RealPixelIDTypeList` (`sitkImageRegistrationMethod.cxx:749`), so it refuses
+        // an integer image outright and the user casts to float first. ITK's own
+        // pyramid smoother is `SmoothingRecursiveGaussianImageFilter<FixedImageType,
+        // FixedImageType>` (`itkImageRegistrationMethodv4.hxx:593`) — output type is
+        // the *image* type, not `float` — so for the types upstream accepts, "smooth
+        // in the image's own float type" is exactly what upstream does. A `Float64`
+        // volume therefore stays `Float64` here; narrowing it to `Float32` (which the
+        // standalone `smoothing_recursive_gaussian` filter would do, since its yaml
+        // rebinds unconditionally to `float`) would be a *new* precision loss on the
+        // one type ITK keeps at full width. Only a non-floating type is promoted, and
+        // it is promoted to `Float32` — what `DeviceImage::upload` already does, so
+        // the host and device pyramids build the same level images (ledger §5.12).
+        let level_type = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            Ok(if img.pixel_id().is_floating_point() {
+                Cow::Borrowed(img)
+            } else {
+                Cow::Owned(cast(img, PixelId::Float32)?)
+            })
         };
+
+        // A zero-sigma level does not smooth, and `recursive_gaussian` returns its
+        // input unchanged there (verified bit-for-bit). Running it anyway is not
+        // free: it materializes a fresh copy of the volume, and at 256³ the two
+        // copies cost 246 ms of first-touch page faults — pure waste for a level
+        // that smooths nothing. Borrow instead.
+        let no_smoothing = sigma.iter().all(|&s| s == 0.0);
+        let smooth = |img: &'a Image| -> Result<Cow<'a, Image>> {
+            let img = level_type(img)?;
+            Ok(if no_smoothing {
+                img
+            } else {
+                Cow::Owned(recursive_gaussian(&img, sigma)?)
+            })
+        };
+        let smoothed_fixed = smooth(fixed)?;
+
+        // When no virtual domain and no fixed-initial transform are configured and
+        // the level does not shrink, the virtual grid *is* the smoothed fixed
+        // image's own grid: `shrink(x, [1,…])` is `x`, and resampling `x` onto its
+        // own grid through the identity samples every output voxel at its own
+        // physical point, so every interpolation weight is exactly 1. The whole
+        // pipeline below is then the identity by construction — and at 256³ that
+        // identity cost 6.4 s of resampling plus a 407 ms copy, which was the
+        // single largest term in a GPU registration run.
+        //
+        // This is *not* true for a shrinking level: `shrink` subsamples voxels
+        // while the resample interpolates at the shrunk grid's centers, and for an
+        // even factor those centers fall between input voxels — measured, every
+        // value differs. So a pyramid level still resamples, exactly as before.
+        //
+        // The gate is the same condition the `inside_fixed` predicate below already
+        // keys on, for the same reason: with no virtual domain and no fixed-initial
+        // transform, nothing moves relative to the fixed grid.
+        let native_grid = self.virtual_domain.is_none()
+            && self.fixed_initial_transform.is_none()
+            && factors.iter().all(|&f| f == 1);
+
+        let coarse_grid = if native_grid {
+            None
+        } else {
+            Some(match &self.virtual_domain {
+                Some(v) => shrink(&v.grid()?, factors)?,
+                None => shrink(&smoothed_fixed, factors)?,
+            })
+        };
+        let grid_ref = coarse_grid.as_ref().unwrap_or(&smoothed_fixed);
 
         // Output point x ↦ input point fixed_initial(x): `ResampleImageFilter`
         // maps each output voxel's physical point through the transform and
@@ -2303,7 +2525,7 @@ impl ImageRegistrationMethod {
         let onto_virtual = |input: &Image, interpolator: Interpolator| -> Result<Image> {
             let mut resampler = ResampleImageFilter::new();
             resampler
-                .set_reference_image(&coarse_grid)
+                .set_reference_image(grid_ref)
                 .set_interpolator(interpolator)
                 .set_default_pixel_value(0.0);
             Ok(match &self.fixed_initial_transform {
@@ -2312,9 +2534,37 @@ impl ImageRegistrationMethod {
             })
         };
 
-        let fixed_level = onto_virtual(&smoothed_fixed, Interpolator::Linear)?;
-        let moving_level = recursive_gaussian(moving, sigma)?;
+        let resampled_fixed = if native_grid {
+            None
+        } else {
+            Some(onto_virtual(&smoothed_fixed, Interpolator::Linear)?)
+        };
+        let moving_level = smooth(moving)?;
 
+        // This *is* ITK's in-buffer predicate, not an approximation of it, and the
+        // nearest-neighbour resample is what makes it one — do not "simplify" it.
+        //
+        // ITK tests `m_FixedInterpolator->IsInsideBuffer(mappedFixedPoint)`
+        // (`itkImageToImageMetricv4.hxx:313`) → `ImageFunction::IsInsideBuffer(Point)`
+        // (`itkImageFunction.h:176-184`) → the continuous-index overload
+        // (`itkImageFunction.h:159-170`), whose bounds are
+        // `m_StartContinuousIndex = start - 0.5`, `m_EndContinuousIndex = end + 0.5`
+        // (`itkImageFunction.hxx:63-64`): inside ⟺ `c ∈ [-0.5, size - 0.5)` per axis.
+        //
+        // The resample below accepts a point exactly when `interpolator::is_inside`
+        // does, i.e. `c >= -0.5 && c < size - 0.5` — the same interval. The
+        // `floor(c + 0.5)` inside `nearest_at` runs *after* that gate and only picks
+        // which voxel to copy; it neither widens nor narrows the accepted set. (Nor
+        // would a rounded-index formulation: `floor(c + 0.5) ∈ [0, size-1]` ⟺
+        // `c ∈ [-0.5, size - 0.5)`, the identical set — which is also why the user
+        // mask, whose ITK test *is* rounded-index (`itkImageMaskSpatialObject.hxx:36-47`),
+        // is exact under the same resample.)
+        //
+        // Resolution matches too: ITK's per-level metric fixed image is
+        // `m_FixedSmoothImages[n]` — smoothed, **not** shrunk
+        // (`itkImageRegistrationMethodv4.hxx:609`, `:636`, set at `:654`; only the
+        // virtual domain is shrunk, `:447-451`) — so the buffer ITK's predicate tests
+        // is the full-resolution fixed buffer, which is the grid these ones are on.
         let inside_fixed =
             if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
                 let ones = with_geometry_of(fixed, vec![1.0f64; fixed.size().iter().product()])?;
@@ -2328,7 +2578,539 @@ impl ImageRegistrationMethod {
         };
         let fixed_mask_level = intersect_masks(inside_fixed, user_mask)?;
 
+        // `grid_ref`'s last use is above, so the borrow of `smoothed_fixed` has
+        // ended and the native path can hand the buffer over rather than copy it.
+        let fixed_level = match resampled_fixed {
+            Some(img) => Cow::Owned(img),
+            None => smoothed_fixed,
+        };
+
         Ok((fixed_level, moving_level, fixed_mask_level))
+    }
+
+    /// Register two volumes that are **already on the device**, driving the
+    /// configured optimizer against a [`DeviceMeanSquaresMetric`] — the public
+    /// entry point for the resident pipeline.
+    ///
+    /// This is a separate entry point rather than an overload of
+    /// [`execute`](Self::execute) on purpose, and it is the same reason
+    /// `DeviceMeanSquaresMetric` is a separate type: `execute` must not grow a
+    /// per-iteration "is this on the device?" branch. **The fallback lives here, at
+    /// the boundary.** Every condition the device path cannot take is decided
+    /// *before* the first iteration and returned to the caller by name; the caller
+    /// then runs [`execute`](Self::execute) on the host images. Once optimization
+    /// starts, the metric's identity is fixed and the optimizer — the very same
+    /// driver the host path uses — never asks again.
+    ///
+    /// What the device path takes:
+    ///
+    /// - the **mean-squares** metric (the only one with a kernel);
+    /// - a transform with a **bitwise point map** *and* a Jacobian that is affine in
+    ///   the point: translation, rigid, Euler, versor, similarity, affine, and any
+    ///   composite of those. The device replays the transform's own stages
+    ///   ([`TransformBase::point_map_stages`](sitk_transform::TransformBase::point_map_stages)),
+    ///   in the transform's own order, so the continuous index it computes is the
+    ///   host's bit for bit. A B-spline or displacement field has neither property; a
+    ///   `ScaleTransform` / `ScaleLogarithmicTransform` has the affine Jacobian but no
+    ///   bitwise point map (it evaluates the centred `(p − c)·s + c`, which is not
+    ///   `mat_vec(M, p) + b` on the bits) and is refused by name as
+    ///   [`NoBitwisePointMap`](DeviceMetricError::NoBitwisePointMap);
+    /// - **linear** interpolation and the default sampling *strategy*
+    ///   ([`SamplingStrategy::None`](crate::metric::SamplingStrategy::None), every
+    ///   voxel of the fixed grid). A configured sampling *percentage* is accepted:
+    ///   the `None` strategy ignores it on the host too, so refusing it would have
+    ///   cost the caller this path for a value that changes nothing;
+    /// - a **multi-resolution pyramid**: each level is built on the device by the
+    ///   same ops in the same order [`prepare_level`](Self::prepare_level) uses —
+    ///   `recursive_gaussian`, the shrunk grid, `resample_linear` onto it — and each
+    ///   is bit-identical to the CPU filter it transcribes (`pyramid_parity.rs`);
+    /// - a **fixed mask** and a **moving mask**. The fixed mask is nearest-neighbour
+    ///   resampled onto each level's grid and folded with the in-buffer predicate
+    ///   exactly as `prepare_level` folds them; the level's mask is pinned *byte for
+    ///   byte* against the host's and the level's valid-point count *exactly*
+    ///   (`method::device_level_tests`);
+    /// - a **virtual domain**: the level's grid is the shrunk virtual grid, and the
+    ///   in-buffer predicate that a virtual grid requires — which virtual points map
+    ///   inside the fixed buffer at all — is a nearest-neighbour resample of an
+    ///   all-ones volume, built on the device and never uploaded;
+    /// - a **moving-initial** transform. It composes with the optimized transform, and
+    ///   the composition's stages are the optimized transform's followed by the
+    ///   moving-initial's — the order `Composed::transform_point` applies them, replayed
+    ///   rather than folded into one matrix, because folding rounds once where the host
+    ///   rounds twice.
+    ///
+    /// - a **fixed-initial transform**, of any class with a bitwise point map — including
+    ///   a multi-member `CompositeTransform`. The fixed image *and its in-buffer
+    ///   predicate* are resampled **through** it on the device
+    ///   ([`fixed_initial_stages`](Self::fixed_initial_stages) +
+    ///   `sitk_cuda::resample_*_through`), replaying the transform's stages in the
+    ///   transform's own order, and the result is pinned bit-identical to
+    ///   `ResampleImageFilter` on a grid where every continuous index is a half-voxel tie
+    ///   (`pyramid_parity.rs`).
+    ///
+    /// What is left refused, by name, as
+    /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform):
+    /// a fixed-initial transform with no bitwise stage list at all — the centred scale
+    /// family, a B-spline, a displacement field, or a composite containing one. The
+    /// refusal is not a missing kernel, it is a missing *guarantee*: the predicate's
+    /// boundary is decided by rounding a continuous index, the mask resample rounds it
+    /// with `floor(c + 0.5)`, and a point map 1e-12 from the host's picks a different
+    /// voxel — so the valid-point count that the device path pins as *exactly* the host's
+    /// would move.
+    ///
+    /// # The images this reproduces are the ones you uploaded
+    ///
+    /// A [`DeviceImage`](sitk_cuda::DeviceImage) holds `f32`, so what this path
+    /// reproduces is `execute` run on the **`Float32` casts** of the two volumes —
+    /// which is exactly what [`upload`](sitk_cuda::DeviceImage::upload) put on the
+    /// device. For an integer input that is now the same thing as `execute` on the
+    /// original volumes: [`prepare_level`](Self::prepare_level) promotes a
+    /// non-floating input to `Float32` before smoothing, so the host pyramid no
+    /// longer re-quantizes a `UInt16` CT at every level while this one does not
+    /// (ledger §5.12; the gap was a worst-parameter 5.5e-4 and a 1.4% coarse-level
+    /// metric difference, pinned in `pyramid_precision.rs`). A `Float64` input still
+    /// differs: the host keeps `f64` levels and the device holds `f32`.
+    ///
+    /// If a device failure occurs *during* the run, the run is discarded and the
+    /// error returned — see [`DeviceActive`].
+    ///
+    /// # This does not always land where [`execute`](Self::execute) lands
+    ///
+    /// **What is guaranteed:** the device metric computes the *same objective* as the
+    /// host metric. At any given transform, value and derivative agree to ~1e-12
+    /// relative and the valid-sample count agrees exactly (`the_device_metric_is_the_
+    /// same_objective_as_the_host_metric` pins this). The residual is reduction
+    /// rounding: the CPU sums N terms left to right, and no parallel reduction
+    /// reproduces that order.
+    ///
+    /// **What is not:** the *optimizer's endpoint*. A gradient descent is a feedback
+    /// loop, and this one branches discretely — `RegularStepGradientDescent` halves
+    /// its step whenever the gradient direction reverses. A 1e-12 difference in the
+    /// derivative can flip such a decision, after which the two runs are on different
+    /// trajectories. Measured at 256³ against `execute`, starting from the same
+    /// transform: the parameters agree to 4e-13 after one iteration, 2e-10 after two,
+    /// 5e-8 after three — growing ~500× per step — and the two runs converge (both
+    /// `StepTooSmall`) to *different local minima*, 7.5e-3 apart in the worst
+    /// parameter. Converging harder does not fix it: the gap is the same at a step
+    /// tolerance of 1e-8 as at 1e-4.
+    ///
+    /// **What makes it go away:** that amplification is a property of an
+    /// ill-conditioned parameter space, not of the device. With unit scales, a
+    /// 1-radian rotation step is the same size as a 1-mm translation step, and the
+    /// descent is chaotic *for the host too* — the host run is simply the one you
+    /// happened to see first. Call
+    /// [`set_optimizer_scales_from_physical_shift`](Self::set_optimizer_scales_from_physical_shift)
+    /// (or set scales yourself), and at 256³ the two paths take the **same 33
+    /// iterations** to the **same 16 580 608 valid points** and the same metric, with
+    /// the worst parameter disagreeing by **7.7e-14** — the rounding floor.
+    ///
+    /// So: a well-conditioned registration lands in the same place on both paths. An
+    /// ill-conditioned one lands in *a* minimum on both paths, but not necessarily the
+    /// same one, and that is worth knowing before you diff two result files.
+    ///
+    /// This is **upstream's behaviour, not this port's**: ITK initializes `m_Scales` to
+    /// all 1's when no scales and no estimator are set, and its estimators are opt-in,
+    /// so an ITK user registering a rotation without one runs the identical
+    /// ill-conditioned descent. Recorded as §2.157 of `doc/upstream-findings.md`, which
+    /// carries the measurements above and the reasoning for *not* gating this entry
+    /// point against a configuration `execute` accepts.
+    #[cfg(feature = "cuda")]
+    pub fn execute_on_device<T: ParametricTransform>(
+        &self,
+        fixed: &sitk_cuda::DeviceImage,
+        moving: &sitk_cuda::DeviceImage,
+        initial: T,
+    ) -> std::result::Result<RegistrationResult<T>, DeviceRegistrationError> {
+        // Which device kernel this run wants — decided once, here, and matched
+        // exhaustively so that a metric added to `MetricKind` is a compile error at this
+        // boundary rather than a silent `UnsupportedMetric`.
+        enum Kernel {
+            MeanSquares,
+            Correlation,
+        }
+        let kernel = match self.metric_kind {
+            MetricKind::MeanSquares => Kernel::MeanSquares,
+            MetricKind::Correlation => Kernel::Correlation,
+            MetricKind::MattesMutualInformation { .. }
+            | MetricKind::AntsNeighborhoodCorrelation { .. }
+            | MetricKind::JointHistogramMutualInformation { .. }
+            | MetricKind::Demons { .. } => return Err(DeviceRegistrationError::UnsupportedMetric),
+        };
+        if self.interpolator != Interpolator::Linear {
+            return Err(DeviceRegistrationError::UnsupportedInterpolator(
+                self.interpolator,
+            ));
+        }
+        // Sampling is no longer refused. Every strategy is a *selection* of fixed-grid
+        // voxels, `crate::metric::draw_samples` is the one function that makes it, and
+        // the device is handed the list it made (`level_samples` below). The device does
+        // not draw: there is nothing here for the two paths to disagree about.
+        //
+        // Matched exhaustively rather than with a wildcard, so a new strategy is a
+        // compile error at this boundary and not a silent accept — the same discipline
+        // the fixed-initial transform's classification is under.
+        match self.sampling_strategy {
+            SamplingStrategy::None | SamplingStrategy::Regular | SamplingStrategy::Random => {}
+        }
+        // Masks, virtual domains and fixed-initial transforms are no longer refused as
+        // *configurations*: the level carries a device fixed mask
+        // (`level_mask_on_device`), the metric takes a moving mask, the level's grid can
+        // be the virtual one (`level_grid`), and the fixed image and its in-buffer
+        // predicate are resampled *through* the fixed-initial transform
+        // (`fixed_initial_stages` + `resample_*_through`, pinned bit-identical to
+        // `ResampleImageFilter`).
+        //
+        // What is still refused is a fixed-initial transform whose **arithmetic** the
+        // device cannot reproduce to the bit — and that refusal is not made here. It is
+        // made where the stages are taken (`fixed_initial_stages`), by name, per transform
+        // class, so a `ScaleTransform` is refused while an `Euler3DTransform` is not.
+        // Doing it here would mean re-deriving that classification at a second site.
+
+        let geom = fixed.geometry();
+        let schedule = self.level_schedule(geom.dimension())?;
+
+        // The user's fixed mask crosses the bus **once**, for the whole run, as a 0/1
+        // volume — thresholded here rather than on the device so that a mask whose
+        // nonzero values underflow `f32` does not silently become empty (see
+        // `level_mask_on_device`). Each level then resamples it onto that level's grid
+        // without touching the bus again.
+        let fixed_mask = match &self.fixed_mask {
+            Some(m) => Some(
+                sitk_cuda::DeviceImage::upload(&binary_volume(m)?)
+                    .map_err(DeviceRegistrationError::Pyramid)?,
+            ),
+            None => None,
+        };
+
+        // The moving mask is **not** resampled and **not** smoothed, on either path:
+        // `build_metric` hands `MovingImage::with_moving_mask` the mask the user set,
+        // and the moving volume is only ever smoothed, never shrunk — so its grid is
+        // the same at every level and the mask's indices line up throughout. It becomes
+        // a predicate once, here, by the same `nonzero → inside` rule the host uses.
+        let moving_mask: Option<Vec<bool>> = match &self.moving_mask {
+            Some(m) => Some(
+                m.to_f64_vec()
+                    .map_err(|e| DeviceRegistrationError::Registration(e.into()))?
+                    .iter()
+                    .map(|&v| v != 0.0)
+                    .collect(),
+            ),
+            None => None,
+        };
+
+        let mut transform = initial;
+        let mut levels = Vec::with_capacity(schedule.len());
+        for (index, (level_factors, level_sigma)) in schedule.iter().enumerate() {
+            let sigma = self.physical_sigma(&geom.spacing, *level_sigma);
+            let (fl, ml) = self.prepare_level_on_device(fixed, moving, &sigma, level_factors)?;
+            let fixed_level = fl.as_ref().unwrap_or(fixed);
+            let moving_level = ml.as_ref().unwrap_or(moving);
+
+            let grid = self.level_grid(geom, level_factors)?;
+            let level_mask =
+                self.level_mask_on_device(fixed, fixed_mask.as_ref(), grid.as_ref())?;
+
+            // Which voxels this level samples. Drawn by `draw_samples` — the same
+            // function, the same percentage, the same seed the host path draws with — so
+            // the device is handed the host's sample set rather than reproducing it.
+            //
+            // The draw is *unfiltered* by the fixed mask: the kernel gates the mask by
+            // grid voxel, which an index list still knows, and the host filters the same
+            // draw by the same mask. A masked-out draw contributes nothing on either
+            // side, so the two evaluate the same samples.
+            let samples = crate::metric::draw_samples(
+                fixed_level.len(),
+                self.sampling_strategy,
+                self.sampling_percentage(index),
+                self.sampling_seed,
+            );
+
+            let device_metric = match kernel {
+                Kernel::MeanSquares => {
+                    DeviceMetric::MeanSquares(DeviceMeanSquaresMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                    )?)
+                }
+                Kernel::Correlation => {
+                    DeviceMetric::Correlation(DeviceCorrelationMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                    )?)
+                }
+            };
+            let metric = ActiveMetric::Device(Box::new(DeviceActive::new(device_metric)));
+
+            // The boundary probe: one evaluation at this level's starting transform,
+            // composed exactly as the optimizer will compose it. This is what turns
+            // "the device cannot take this transform" from a mid-run surprise into a
+            // named refusal the caller can act on.
+            {
+                let composed = Composed {
+                    optimized: &mut transform,
+                    moving_initial: self.moving_initial_transform.as_ref(),
+                };
+                if let ActiveMetric::Device(d) = &metric {
+                    d.metric_evaluate_probe(&composed)?;
+                }
+            }
+
+            let spec = LevelSpec {
+                index,
+                factors: level_factors,
+                sigma: *level_sigma,
+            };
+            let (t, record) = self.drive(&metric, spec, transform)?;
+
+            // A device failure during the run invalidates the run, not just the
+            // iteration it happened in.
+            if let ActiveMetric::Device(d) = &metric
+                && let Some(e) = d.take_failure()
+            {
+                return Err(e.into());
+            }
+
+            levels.push(record);
+            transform = t;
+        }
+
+        Ok(RegistrationResult::from_levels(transform, levels))
+    }
+
+    /// One resolution level's `(fixed, moving)` pair, built **on the device** — the
+    /// device twin of [`prepare_level`](Self::prepare_level), following it step for
+    /// step so the two land on the same images.
+    ///
+    /// The steps, and why each is the one it is:
+    ///
+    /// - both volumes are smoothed at full resolution with the **recursive (IIR)**
+    ///   Gaussian — not the FIR `smooth_gaussian` this crate also has on the device;
+    ///   `prepare_level` calls the recursive one, and a level smoothed by a different
+    ///   filter is a different level;
+    /// - the moving volume is *only* smoothed (the metric interpolates it through the
+    ///   transform, so it is never shrunk);
+    /// - the coarse grid comes from **shrinking** the smoothed fixed volume, and the
+    ///   fixed level's *values* come from **resampling** the smoothed fixed volume
+    ///   onto that grid. Not from the shrink's values: the shrink samples at the
+    ///   center shift *rounded to an integer* while the grid's origin carries the
+    ///   unrounded shift, so reusing them would bias the fixed image by up to half a
+    ///   voxel against the grid the metric samples on;
+    /// - a level that neither smooths nor shrinks copies nothing and resamples
+    ///   nothing — the same `native_grid` short-circuit `prepare_level` takes, and
+    ///   for the same reason (at factor 1 the resample is provably the identity).
+    ///
+    /// The level's grid is [`level_grid`](Self::level_grid): the shrunk **virtual**
+    /// grid when a virtual domain is configured, and the shrunk fixed grid otherwise
+    /// — the same choice `prepare_level` makes.
+    ///
+    /// There is no fixed-initial-transform branch because
+    /// [`execute_on_device`](Self::execute_on_device) refuses one at the boundary:
+    /// both device resamples map an output point straight to the input's continuous
+    /// index, and neither can resample *through* a transform.
+    ///
+    /// `None` means *the uploaded volume already is this level* — the level neither
+    /// smooths nor shrinks — so the caller registers against the volume it was
+    /// handed rather than a copy of it. `prepare_level` says the same thing with a
+    /// `Cow::Borrowed`; a [`DeviceImage`](sitk_cuda::DeviceImage) is not `Clone`
+    /// (cloning one is a device allocation and a device-to-device copy, not a cheap
+    /// mistake to make by accident), so it says it with an `Option` instead.
+    #[cfg(feature = "cuda")]
+    fn prepare_level_on_device(
+        &self,
+        fixed: &sitk_cuda::DeviceImage,
+        moving: &sitk_cuda::DeviceImage,
+        sigma: &[f64],
+        factors: &[usize],
+    ) -> std::result::Result<
+        (
+            Option<sitk_cuda::DeviceImage>,
+            Option<sitk_cuda::DeviceImage>,
+        ),
+        DeviceRegistrationError,
+    > {
+        use sitk_cuda::DeviceImage;
+
+        let no_smoothing = sigma.iter().all(|&s| s == 0.0);
+        let smooth = |img: &DeviceImage| -> std::result::Result<
+            Option<DeviceImage>,
+            DeviceRegistrationError,
+        > {
+            if no_smoothing {
+                return Ok(None);
+            }
+            Ok(Some(
+                sitk_cuda::recursive_gaussian(img, sigma)
+                    .map_err(DeviceRegistrationError::Pyramid)?,
+            ))
+        };
+
+        let smoothed_fixed = smooth(fixed)?;
+        let moving_level = smooth(moving)?;
+
+        let Some(grid) = self.level_grid(fixed.geometry(), factors)? else {
+            return Ok((smoothed_fixed, moving_level));
+        };
+
+        let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
+        let fixed_level = match self.fixed_initial_stages()? {
+            Some(stages) => sitk_cuda::resample_linear_through(sf, &grid, 0.0, &stages),
+            None => sitk_cuda::resample_linear(sf, &grid, 0.0),
+        }
+        .map_err(DeviceRegistrationError::Pyramid)?;
+
+        Ok((Some(fixed_level), moving_level))
+    }
+
+    /// The fixed-initial transform's point map, in the only form the device resample
+    /// may take: the **stages the transform itself evaluates**, in the order it
+    /// evaluates them ([`TransformBase::point_map_stages`](sitk_transform::TransformBase::point_map_stages)),
+    /// converted and bitwise-checked by [`crate::cuda::point_stages`].
+    ///
+    /// `None` when no fixed-initial transform is configured — the device then resamples
+    /// through the identity, which is what the host does too (`prepare_level`'s
+    /// `onto_virtual` passes `AffineTransform::identity(dim)`, not nothing).
+    ///
+    /// A composite is handed over as **several stages, not one folded matrix**, and the
+    /// kernel replays them. Folding `M₂·M₁` is the same map algebraically and rounds
+    /// once where the transform rounds twice; the difference is in the last bits of the
+    /// continuous index, and the level's *predicate* is a 0/1 field whose border is
+    /// decided by rounding that index — `resample_nearest_through`'s `floor(c + 0.5)`
+    /// turns one ulp into a whole voxel. One ulp there flips a shell of voxels, moves
+    /// the valid-point count, and breaks the one thing the device path pins as *exactly*
+    /// equal to the host's.
+    ///
+    /// A transform with no bitwise stage list at all — the centred scale family, which
+    /// evaluates `(p − c)·s + c` and has no stored `matrix`/`offset` to hand over — is
+    /// refused **by name**
+    /// ([`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform)),
+    /// not approximated by a probe. So: the transform's own bits, or nothing.
+    #[cfg(feature = "cuda")]
+    fn fixed_initial_stages(
+        &self,
+    ) -> std::result::Result<Option<Vec<sitk_cuda::PointStage>>, DeviceRegistrationError> {
+        match &self.fixed_initial_transform {
+            None => Ok(None),
+            Some(t) => match crate::cuda::point_stages(t) {
+                Some(stages) => Ok(Some(stages)),
+                None => Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(
+                    t.kind(),
+                )),
+            },
+        }
+    }
+
+    /// The grid this level's samples live on, as a geometry — `prepare_level`'s
+    /// `coarse_grid` (`shrink` of the virtual grid when one is configured, of the
+    /// fixed grid otherwise), and `None` for the `native_grid` short-circuit where
+    /// the fixed image's own grid *is* the level's.
+    ///
+    /// A geometry, not a volume: a virtual domain has no voxels to shrink (ITK
+    /// allocates `m_VirtualDomainImage` and never reads its pixels), and
+    /// materializing one on the device to read its geometry back would allocate a
+    /// volume nothing samples.
+    #[cfg(feature = "cuda")]
+    fn level_grid(
+        &self,
+        fixed: &sitk_cuda::Geometry,
+        factors: &[usize],
+    ) -> std::result::Result<Option<sitk_cuda::Geometry>, DeviceRegistrationError> {
+        // The same gate `prepare_level` uses, for the same reason: with no virtual
+        // domain, no fixed-initial transform and no shrink, nothing moves relative to
+        // the fixed grid and the whole pipeline is the identity.
+        if self.virtual_domain.is_none()
+            && self.fixed_initial_transform.is_none()
+            && factors.iter().all(|&f| f == 1)
+        {
+            return Ok(None);
+        }
+        let base = match &self.virtual_domain {
+            Some(v) => v.device_geometry(),
+            None => fixed.clone(),
+        };
+        Ok(Some(
+            sitk_cuda::shrunk_geometry(&base, factors).map_err(DeviceRegistrationError::Pyramid)?,
+        ))
+    }
+
+    /// This level's fixed mask, built **on the device** — the device twin of the
+    /// `inside_fixed` / `user_mask` / `intersect_masks` block of
+    /// [`prepare_level`](Self::prepare_level), following it term for term.
+    ///
+    /// Two masks are folded, and each is nearest-neighbour resampled onto the level's
+    /// grid because that is what the host does — and what ITK does, once per point
+    /// instead of once per level: `IsInsideInWorldSpace` →
+    /// `ImageMaskSpatialObject::IsInsideInObjectSpace`
+    /// (`itkImageMaskSpatialObject.hxx:36-47`) → `TransformPhysicalPointToIndex`, which
+    /// rounds with `Math::RoundHalfIntegerUp` (`itkImageBase.h:476`) and then tests the
+    /// voxel for nonzero. `sitk_cuda::resample_nearest` implements exactly that rounding
+    /// rule, and is pinned bit-identical to `ResampleImageFilter` before anything used
+    /// it. Linear here would be a *different predicate*, not a smoother one.
+    ///
+    /// - **the in-buffer predicate**: an all-ones volume over the fixed grid,
+    ///   resampled onto the level's grid with a default of 0 — so a level voxel is 1
+    ///   exactly when it maps inside the fixed buffer at all. Present only when a
+    ///   virtual domain or a fixed-initial transform makes the level's grid something
+    ///   other than the fixed grid, which is the same gate `prepare_level` uses. The
+    ///   ones are built with [`DeviceImage::filled`], never uploaded: they are a
+    ///   constant, and at 256³ uploading them would cost 67 MB *per level*.
+    /// - **the user's fixed mask**, resampled the same way.
+    ///
+    /// `fixed_mask` arrives as an already-thresholded 0/1 volume (see
+    /// [`execute_on_device`](Self::execute_on_device)) rather than as the raw mask the
+    /// host resamples. The two give the *same* predicate — nearest-neighbour picks a
+    /// voxel's value or the default, so thresholding before or after picking commutes
+    /// exactly — and thresholding on the host keeps a mask whose nonzero values
+    /// underflow `f32` (an `f64` mask holding 1e-320) from silently becoming empty on a
+    /// device that stores `f32`.
+    #[cfg(feature = "cuda")]
+    fn level_mask_on_device(
+        &self,
+        fixed: &sitk_cuda::DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceImage>,
+        grid: Option<&sitk_cuda::Geometry>,
+    ) -> std::result::Result<Option<sitk_cuda::DeviceMask>, DeviceRegistrationError> {
+        use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
+
+        let grid_ref = grid.unwrap_or(fixed.geometry());
+        // The same transform the level's fixed image goes through, and it must be the
+        // same one *to the bit*: the host resamples the ones volume and the user mask
+        // through `onto_virtual` — the identical closure it resamples the image with —
+        // so a device that mapped the predicate with even a 1-ulp-different point would
+        // disagree with the host on a shell of border voxels.
+        let stages = self.fixed_initial_stages()?;
+        let onto_level = |img: &DeviceImage| -> std::result::Result<DeviceMask, CudaError> {
+            let resampled = match &stages {
+                Some(stages) => sitk_cuda::resample_nearest_through(img, grid_ref, 0.0, stages)?,
+                None => sitk_cuda::resample_nearest(img, grid_ref, 0.0)?,
+            };
+            DeviceMask::from_device_image(&resampled)
+        };
+
+        let inside_fixed =
+            if self.virtual_domain.is_some() || self.fixed_initial_transform.is_some() {
+                let ones = DeviceImage::filled(fixed.geometry().clone(), 1.0)
+                    .map_err(DeviceRegistrationError::Pyramid)?;
+                Some(onto_level(&ones).map_err(DeviceRegistrationError::Pyramid)?)
+            } else {
+                None
+            };
+        let user_mask = match fixed_mask {
+            Some(m) => Some(onto_level(m).map_err(DeviceRegistrationError::Pyramid)?),
+            None => None,
+        };
+
+        // `intersect_masks`, in the same three cases: neither, one, or both.
+        Ok(match (inside_fixed, user_mask) {
+            (None, None) => None,
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (Some(a), Some(b)) => Some(a.intersect(&b).map_err(DeviceRegistrationError::Pyramid)?),
+        })
     }
 
     /// Optimize `initial` against one already shrunk/smoothed fixed/moving pair
@@ -2338,16 +3120,33 @@ impl ImageRegistrationMethod {
         fixed: &Image,
         moving: &Image,
         fixed_mask: Option<&Image>,
-        level: usize,
+        spec: LevelSpec<'_>,
         initial: T,
-    ) -> Result<RegistrationResult<T>> {
+    ) -> Result<(T, LevelResult)> {
         let metric = self.build_metric(
             fixed,
             moving,
             fixed_mask,
             self.sampling_strategy,
-            self.sampling_percentage(level),
+            self.sampling_percentage(spec.index),
         )?;
+        self.drive(&metric, spec, initial)
+    }
+
+    /// Drive the configured optimizer against an already-built metric.
+    ///
+    /// Split out of [`run_single_level`](Self::run_single_level) so that a metric
+    /// which is *not* built from host images — the device-resident one
+    /// ([`execute_on_device`](Self::execute_on_device)) — is optimized by exactly
+    /// this code, rather than by a parallel driver that would drift from it. The
+    /// metric's identity is fixed before the first iteration; nothing in here asks
+    /// per call where it lives.
+    fn drive<T: ParametricTransform>(
+        &self,
+        metric: &ActiveMetric,
+        spec: LevelSpec<'_>,
+        initial: T,
+    ) -> Result<(T, LevelResult)> {
         let nparams = initial.number_of_parameters();
         let mut transform = initial;
         let start = transform.parameters();
@@ -2719,20 +3518,25 @@ impl ImageRegistrationMethod {
             return Err(RegistrationError::NoValidSamples);
         }
 
-        Ok(RegistrationResult {
+        Ok((
             transform,
-            metric_value: final_metric.value,
-            iterations: result.iterations,
-            stop_reason: result.stop_reason,
-            valid_points: final_metric.valid_points,
-        })
+            LevelResult {
+                level: spec.index,
+                shrink_factors: spec.factors.to_vec(),
+                smoothing_sigma: spec.sigma,
+                metric_value: final_metric.value,
+                iterations: result.iterations,
+                stop_reason: result.stop_reason,
+                valid_points: final_metric.valid_points,
+            },
+        ))
     }
 }
 
 #[cfg(test)]
 mod initial_transform_tests {
     use super::*;
-    use sitk_transform::{Euler2DTransform, ScaleTransform};
+    use sitk_transform::{Euler2DTransform, Euler3DTransform, ScaleTransform};
 
     /// A 2-D Gaussian blob of width `sigma` centred at the **physical** point
     /// `center`, sampled on a grid of `size` voxels at `spacing` from `origin`
@@ -2897,6 +3701,86 @@ mod initial_transform_tests {
         assert_eq!(composed.transform_point(&[3.0, 5.0]), vec![8.0, 10.0]);
         // The reversed order, translate(scale(x)) = (2x₀ + 1, 2x₁), would give
         // [7, 10] — this is the assertion that fixes the order.
+    }
+
+    /// **The composition's stages are its two maps, in its own order, and replaying them
+    /// IS its `transform_point` — on the bits.**
+    ///
+    /// This is what the device metric replays for a moving-initial registration. The
+    /// alternative it must not take is the fold: `G·F` is the same map in exact arithmetic
+    /// and rounds *once* where `g(f(x))` rounds twice, so it agrees with the host to an ulp
+    /// and not to the bit — and an ulp of the continuous index is a flipped
+    /// `floor`/`is_inside`/`round`. Pinned with `to_bits()`, and pinned against the fold:
+    /// the folded matrix is shown to disagree.
+    #[test]
+    fn composed_hands_over_both_stages_in_application_order() {
+        let moving_initial: Transform =
+            Euler3DTransform::new(0.13, -0.07, 0.21, [11.0, -6.0, 4.0], [9.0, -3.0, 7.0]).into();
+        let mut optimized =
+            Euler3DTransform::new(-0.05, 0.09, 0.02, [-8.0, 12.0, 5.0], [2.0, 6.0, -4.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: Some(&moving_initial),
+        };
+
+        let stages = composed.point_map_stages().expect("both halves are rigid");
+        assert_eq!(
+            stages.len(),
+            2,
+            "two maps, two stages -- not one folded one"
+        );
+
+        for p in [
+            [1.7, -3.1, 2.3],
+            [-137.0, 91.5, 204.25],
+            [0.0, 0.0, 0.0],
+            [-0.0, 61.5, -0.0],
+        ] {
+            let want = composed.transform_point(&p);
+            let got = sitk_transform::matrix_offset::replay_stages(&stages, &p, 3);
+            for d in 0..3 {
+                assert_eq!(
+                    got[d].to_bits(),
+                    want[d].to_bits(),
+                    "axis {d} at {p:?}: the stage replay must reproduce transform_point on \
+                     the bits, not merely to a tolerance"
+                );
+            }
+        }
+
+        // And the fold really is lossy, so the stage list is not ceremony: G·F applied in
+        // one shot differs from g(f(x)) in the last bits at a point of this magnitude.
+        let folded = sitk_core::matrix::matmul(&stages[1].matrix, &stages[0].matrix, 3);
+        let folded_offset = {
+            let m = sitk_core::matrix::mat_vec(&stages[1].matrix, &stages[0].offset, 3);
+            (0..3)
+                .map(|d| m[d] + stages[1].offset[d])
+                .collect::<Vec<_>>()
+        };
+        let p = [-137.0, 91.5, 204.25];
+        let one_shot = sitk_core::matrix::mat_vec(&folded, &p, 3);
+        let want = composed.transform_point(&p);
+        assert!(
+            (0..3).any(|d| (one_shot[d] + folded_offset[d]).to_bits() != want[d].to_bits()),
+            "the folded matrix agreed with the host on every bit at this point. It is still \
+             not the host's arithmetic -- but if this ever holds everywhere, the argument \
+             for the stage list has changed and should be re-stated, not quietly dropped"
+        );
+    }
+
+    /// A composition is reproducible only if **both** halves are: a moving-initial
+    /// transform with no bitwise point map (a centred scale) takes the whole composition
+    /// off the device path, rather than the device silently replaying the half it likes.
+    #[test]
+    fn composed_reports_no_stages_when_either_half_has_none() {
+        let moving_initial: Transform =
+            ScaleTransform::new(vec![1.2, 0.9, 1.1], vec![4.0, 5.0, 6.0]).into();
+        let mut optimized = Euler3DTransform::new(0.1, 0.2, 0.3, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: Some(&moving_initial),
+        };
+        assert!(composed.point_map_stages().is_none());
     }
 
     /// Without a moving-initial transform the composition is the identity
@@ -3342,6 +4226,75 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// A pyramid reports what every level did, not only the last one — and the
+    /// top-level fields keep meaning the last level's, which is what callers
+    /// already read.
+    #[test]
+    fn every_level_of_a_pyramid_reports_its_own_diagnostics() {
+        let (w, h, sigma, amp) = (64usize, 64usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 32.0, 32.0, sigma, amp);
+        let moving = gaussian(w, h, 35.0, 30.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8)
+            .set_shrink_factors_per_level(vec![4, 2, 1])
+            .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 3, "one record per scheduled level");
+        for (i, lv) in r.levels.iter().enumerate() {
+            assert_eq!(lv.level, i, "levels are reported coarsest first");
+        }
+        assert_eq!(r.levels[0].shrink_factors, vec![4, 4]);
+        assert_eq!(r.levels[2].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 2.0);
+        assert_eq!(r.levels[2].smoothing_sigma, 0.0);
+
+        // The coarse level samples a coarse grid: 16x16 against the native 64x64.
+        // This is the fact the old result could not express at all.
+        assert!(
+            r.levels[0].valid_points < r.levels[2].valid_points,
+            "coarse level sampled {} points, native {}",
+            r.levels[0].valid_points,
+            r.levels[2].valid_points
+        );
+        for lv in &r.levels {
+            assert!(lv.iterations > 0, "level {} took no step at all", lv.level);
+        }
+
+        // The four top-level fields are the last level's, unchanged in meaning.
+        let last = r.levels.last().unwrap();
+        assert_eq!(r.iterations, last.iterations);
+        assert_eq!(r.valid_points, last.valid_points);
+        assert_eq!(r.stop_reason, last.stop_reason);
+        assert_eq!(r.metric_value, last.metric_value);
+    }
+
+    /// A single-level run reports exactly one level, so a caller can read
+    /// `levels` unconditionally.
+    #[test]
+    fn a_single_level_run_reports_one_level() {
+        let (w, h, sigma, amp) = (40usize, 40usize, 7.0, 1.0);
+        let fixed = gaussian(w, h, 20.0, 20.0, sigma, amp);
+        let moving = gaussian(w, h, 23.0, 18.0, sigma, amp);
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_optimizer_scales_from_physical_shift()
+            .set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 100, 1e-8);
+        let r = reg
+            .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(r.levels.len(), 1);
+        assert_eq!(r.levels[0].level, 0);
+        assert_eq!(r.levels[0].shrink_factors, vec![1, 1]);
+        assert_eq!(r.levels[0].smoothing_sigma, 0.0);
+        assert_eq!(r.levels[0].iterations, r.iterations);
     }
 
     #[test]
@@ -6011,6 +6964,543 @@ mod tests {
                     .is_ok(),
                 "{name}: unweighted gradient-free run should succeed"
             );
+        }
+    }
+}
+
+/// The device pyramid level against the host pyramid level — the *actual* functions,
+/// not a transcription of them.
+///
+/// `tests/pyramid_parity.rs` compares the device ops against the CPU filters by
+/// re-implementing `prepare_level`'s steps in the test. That pins the **ops**, and it
+/// is what pinned them before anything was wired to them. It cannot pin the
+/// **wiring**: a `prepare_level_on_device` that chose the wrong grid, or dropped the
+/// mask, would still agree with a test that made the same choice. These tests call
+/// `prepare_level` and `prepare_level_on_device` themselves and compare what the two
+/// return, so a divergence between them fails here whatever the ops do.
+#[cfg(all(test, feature = "cuda"))]
+mod device_level_tests {
+    use super::*;
+    use sitk_cuda::{DeviceImage, DeviceMask};
+    use sitk_transform::{Euler3DTransform, Transform};
+
+    fn no_device() -> bool {
+        matches!(sitk_cuda::backend(), Err(sitk_cuda::CudaError::NoDevice(_)))
+    }
+
+    /// A textured `f32` volume with a non-trivial spacing and origin, so a grid that
+    /// is *nearly* right is still wrong.
+    fn volume(n: usize, shift: f64) -> Image {
+        let c = n as f64 / 2.0;
+        let mut v = Vec::with_capacity(n * n * n);
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    let (x, y, z) = (i as f64 - c + shift, j as f64 - c, k as f64 - c);
+                    let r = (x * x + y * y + z * z).sqrt();
+                    v.push(
+                        (300.0 * (-(r * r) / (0.2 * n as f64).powi(2)).exp()
+                            + 40.0 * (0.7 * x).sin() * (0.5 * y).cos()
+                            + 17.0 * (0.3 * z).sin()) as f32,
+                    );
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+        img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+        img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+        img
+    }
+
+    /// A mask on the fixed grid that drops voxels in the interior as well as at the
+    /// border, and is asymmetric in every axis, so a flipped or swapped axis shows up.
+    fn slab_mask(n: usize) -> Image {
+        let v: Vec<f32> = (0..n * n * n)
+            .map(|s| {
+                let (i, j, k) = (s % n, (s / n) % n, s / (n * n));
+                f32::from(u8::from(
+                    2 * i + j + 3 * k > n && i < 3 * n / 4 && j > n / 8,
+                ))
+            })
+            .collect();
+        let mut img = Image::from_vec(&[n, n, n], v).unwrap();
+        img.set_spacing(&[0.8, 0.9, 1.1]).unwrap();
+        img.set_origin(&[-3.0, 2.0, 1.0]).unwrap();
+        img
+    }
+
+    fn assert_same_image(host: &Image, device: &Image, what: &str) {
+        assert_eq!(host.size(), device.size(), "{what}: size");
+        assert_eq!(host.spacing(), device.spacing(), "{what}: spacing");
+        assert_eq!(host.origin(), device.origin(), "{what}: origin");
+        assert_eq!(host.direction(), device.direction(), "{what}: direction");
+        let (a, b) = (
+            host.scalar_slice::<f32>().unwrap(),
+            device.scalar_slice::<f32>().unwrap(),
+        );
+        let differing = a
+            .iter()
+            .zip(b.iter())
+            .filter(|&(&x, &y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "{what}: {differing} of {} voxels differ",
+            a.len()
+        );
+    }
+
+    /// The host's level mask as a byte predicate in grid order — `nonzero → inside`,
+    /// the rule `FixedSamples::from_image_with` applies to it.
+    fn host_mask_bytes(mask: &Image) -> Vec<u8> {
+        mask.to_f64_vec()
+            .unwrap()
+            .iter()
+            .map(|&v| u8::from(v != 0.0))
+            .collect()
+    }
+
+    fn device_mask_bytes(mask: &DeviceMask) -> Vec<u8> {
+        mask.to_host()
+            .unwrap()
+            .scalar_slice::<u8>()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// C2: with a **virtual domain**, the device level image is the host level image
+    /// — bit for bit, on the grid the host chose.
+    ///
+    /// Failure mode this catches: the device silently builds the level on the *fixed*
+    /// grid instead of the shrunk virtual one. The run would still converge; it would
+    /// just be optimizing a different objective than `execute` optimizes. (Checked by
+    /// deleting the virtual-domain arm of `level_grid`: this test fails.)
+    #[test]
+    fn the_device_level_image_is_the_host_level_image_on_a_virtual_grid() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+
+        // A virtual grid that is neither image's: different size, spacing, origin.
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_virtual_domain(
+            vec![24, 20, 28],
+            vec![-8.0, -4.0, -6.0],
+            vec![1.5, 2.0, 2.0],
+            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+
+        for (factors, level_sigma) in [(vec![2usize; 3], 1.0f64), (vec![1usize; 3], 0.0)] {
+            let sigma: Vec<f64> = fixed.spacing().iter().map(|&s| level_sigma * s).collect();
+            let (host_fixed, host_moving, host_mask) = reg
+                .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                .unwrap();
+            let (dev_fixed, dev_moving) = reg
+                .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                .unwrap();
+
+            let what = format!("virtual domain, factors {factors:?}, sigma {level_sigma}");
+            assert_same_image(
+                &host_fixed,
+                &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                &format!("{what}: fixed level"),
+            );
+            assert_same_image(
+                &host_moving,
+                &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                &format!("{what}: moving level"),
+            );
+            // The level is on the virtual grid, not the fixed one — otherwise the
+            // comparison above would be comparing two wrong images to each other.
+            assert_ne!(
+                host_fixed.size(),
+                fixed.size(),
+                "{what}: the level was built on the fixed grid; the test proves nothing"
+            );
+            // A virtual domain always makes the host build an in-buffer predicate.
+            assert!(host_mask.is_some(), "{what}: the host built no level mask");
+        }
+    }
+
+    /// C3: the device level mask is the host's `fixed_mask_level`, **byte for byte**,
+    /// in every configuration that produces one.
+    ///
+    /// Four configurations, because each folds a different set of terms: a user mask
+    /// alone (no predicate), a virtual domain alone (predicate only), both (the
+    /// intersection), and neither (both `None`).
+    ///
+    /// Byte equality is the pin and a tolerance would be meaningless here: the level
+    /// mask decides *which voxels are samples*, so a wrong mask does not produce a
+    /// wrong number, it produces a right number over the wrong sample set — the value
+    /// stays plausible, the gradient stays smooth, and every value comparison passes.
+    /// The anti-vacuity assertions below are what stop this test from passing against a
+    /// host that also dropped the mask: the host mask must exist, and it must actually
+    /// contain zeros.
+    #[test]
+    fn the_device_level_mask_is_the_host_level_mask_byte_for_byte() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        let virtual_domain = |reg: &mut ImageRegistrationMethod| {
+            reg.set_virtual_domain(
+                vec![24, 20, 28],
+                vec![-8.0, -4.0, -6.0],
+                vec![1.5, 2.0, 2.0],
+                vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            )
+            .unwrap();
+        };
+
+        for (name, with_mask, with_domain) in [
+            ("user mask only", true, false),
+            ("virtual domain only", false, true),
+            ("mask and virtual domain", true, true),
+            ("neither", false, false),
+        ] {
+            let mut reg = ImageRegistrationMethod::new();
+            if with_mask {
+                reg.set_metric_fixed_mask(&mask);
+            }
+            if with_domain {
+                virtual_domain(&mut reg);
+            }
+
+            for factors in [vec![2usize; 3], vec![1usize; 3]] {
+                let sigma = vec![0.0; 3];
+                let what = format!("{name}, factors {factors:?}");
+
+                let (host_fixed, _, host_mask) = reg
+                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                    .unwrap();
+                let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+                let dev_mask = reg
+                    .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
+                    .unwrap();
+
+                match (&host_mask, &dev_mask) {
+                    (None, None) => {
+                        assert!(
+                            !with_mask && !with_domain,
+                            "{what}: no level mask, but one was configured"
+                        );
+                        continue;
+                    }
+                    (Some(h), Some(d)) => {
+                        assert_eq!(
+                            d.geometry().size,
+                            host_fixed.size(),
+                            "{what}: the mask is not on the level's grid"
+                        );
+                        let (hb, db) = (host_mask_bytes(h), device_mask_bytes(d));
+                        let zeros = hb.iter().filter(|&&x| x == 0).count();
+                        let ones = hb.len() - zeros;
+                        assert!(
+                            zeros > 0 && ones > 0,
+                            "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); \
+                             a device that ignored the mask would pass this test"
+                        );
+                        let differing = hb.iter().zip(db.iter()).filter(|&(a, b)| a != b).count();
+                        assert_eq!(
+                            differing,
+                            0,
+                            "{what}: {differing} of {} mask voxels differ from the host's",
+                            hb.len()
+                        );
+                    }
+                    (h, d) => panic!(
+                        "{what}: one path built a level mask and the other did not \
+                         (host {}, device {})",
+                        h.is_some(),
+                        d.is_some()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// C3, the other half: a masked **device metric** at a level walks exactly the
+    /// sample set the masked **host metric** walks — `valid_points` equal, not close —
+    /// and the mask actually drops samples.
+    #[test]
+    fn a_masked_level_walks_the_same_valid_points_on_both_paths() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        let mut reg = ImageRegistrationMethod::new();
+        reg.set_metric_fixed_mask(&mask);
+
+        let c = n as f64 / 2.0;
+        let t = Euler3DTransform::new(0.05, -0.03, 0.02, [1.5, -0.9, 0.4], [c, c, c]);
+
+        for factors in [vec![2usize; 3], vec![1usize; 3]] {
+            let sigma = vec![0.0; 3];
+            let what = format!("factors {factors:?}");
+
+            let (host_fixed, host_moving, host_mask) = reg
+                .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                .unwrap();
+            let host = MeanSquaresMetric::from_samples(
+                FixedSamples::from_image_with(
+                    &host_fixed,
+                    SamplingStrategy::None,
+                    1.0,
+                    0,
+                    host_mask.as_ref(),
+                )
+                .unwrap(),
+                MovingImage::from_image(&host_moving).unwrap(),
+            )
+            .unwrap();
+            let cpu = host.evaluate(&t, &CpuBackend);
+
+            let (fl, ml) = reg
+                .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                .unwrap();
+            let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+            let level_mask = reg
+                .level_mask_on_device(&d_fixed, Some(&d_mask), grid.as_ref())
+                .unwrap();
+            let device = DeviceMeanSquaresMetric::from_device_masked(
+                fl.as_ref().unwrap_or(&d_fixed),
+                ml.as_ref().unwrap_or(&d_moving),
+                level_mask.as_ref(),
+                None,
+            )
+            .unwrap();
+            let gpu = device.evaluate(&t).unwrap();
+
+            // Anti-vacuity: the mask must bite. An unmasked run at this level walks
+            // strictly more points, so a device that ignored the mask fails here.
+            let unmasked = DeviceMeanSquaresMetric::from_device(
+                fl.as_ref().unwrap_or(&d_fixed),
+                ml.as_ref().unwrap_or(&d_moving),
+            )
+            .unwrap()
+            .evaluate(&t)
+            .unwrap();
+            assert!(
+                gpu.valid_points < unmasked.valid_points,
+                "{what}: the mask dropped no samples ({} vs {} unmasked)",
+                gpu.valid_points,
+                unmasked.valid_points
+            );
+
+            assert_eq!(
+                gpu.valid_points, cpu.valid_points,
+                "{what}: the masked device level walked a different sample set"
+            );
+            let rel = |g: f64, c: f64| (g - c).abs() / (1.0 + c.abs());
+            let v_err = rel(gpu.value, cpu.value);
+            let d_err = gpu
+                .derivative
+                .iter()
+                .zip(cpu.derivative.iter())
+                .map(|(&g, &c)| rel(g, c))
+                .fold(0.0f64, f64::max);
+            println!(
+                "{what}: valid_points {} (both) | value rel err {v_err:e} | deriv rel err {d_err:e}",
+                cpu.valid_points
+            );
+            assert!(
+                v_err <= 1e-9,
+                "{what}: value rel err {v_err:e} exceeds 1e-9"
+            );
+            assert!(
+                d_err <= 1e-9,
+                "{what}: deriv rel err {d_err:e} exceeds 1e-9"
+            );
+        }
+    }
+
+    /// D3: with a **fixed-initial transform**, the device level image is the host's bit
+    /// for bit and the device level mask is the host's **byte for byte** — the transform
+    /// carried through the image resample, the in-buffer predicate and the user mask
+    /// alike, exactly as `prepare_level`'s single `onto_virtual` closure carries it.
+    ///
+    /// The anti-vacuity here is not optional, and it is stronger than C3's. A transform
+    /// that moved nothing would leave the predicate all-ones and this test would pass on
+    /// a device that ignored the transform entirely. So it asserts, before comparing:
+    ///
+    /// - the host's predicate actually gates (it has zeros *and* ones), and
+    /// - the level mask **differs** from the mask the same configuration produces with
+    ///   the transform removed — i.e. the transform genuinely pushed part of the fixed
+    ///   image off the level's grid, which is the shell where a 1-ulp point map does its
+    ///   damage.
+    ///
+    /// (Checked by deleting the map from `level_mask_on_device`'s `onto_level`: the mask
+    /// comparison then fails on a shell of border voxels.)
+    #[test]
+    fn the_device_level_is_the_host_level_through_a_fixed_initial_transform() {
+        if no_device() {
+            println!("SKIPPED: no CUDA device");
+            return;
+        }
+        let n = 32;
+        let (fixed, moving) = (volume(n, 0.0), volume(n, 2.5));
+        let mask = slab_mask(n);
+        let d_fixed = DeviceImage::upload(&fixed).unwrap();
+        let d_moving = DeviceImage::upload(&moving).unwrap();
+        let d_mask = DeviceImage::upload(&binary_volume(&mask).unwrap()).unwrap();
+
+        // A rotation about a corner plus a translation: it swings a slab of the fixed
+        // image off the level grid, so the in-buffer predicate has real work to do.
+        let euler = Transform::Euler3D(Euler3DTransform::new(
+            0.15,
+            -0.10,
+            0.35,
+            [4.0, -3.0, 2.0],
+            [0.0, 0.0, 0.0],
+        ));
+        // The same thing as a **two-stage composite**: the device replays both stages in
+        // the transform's own order instead of folding them into one matrix. The level
+        // mask is where a fold would show — it is 0/1 and its border is a rounded
+        // continuous index.
+        let composite = {
+            let mut c = sitk_transform::CompositeTransform::new(3);
+            c.add_transform(Transform::Euler3D(Euler3DTransform::new(
+                0.15,
+                -0.10,
+                0.35,
+                [4.0, -3.0, 2.0],
+                [0.0, 0.0, 0.0],
+            )))
+            .unwrap();
+            c.add_transform(Transform::Translation(TranslationTransform::new(vec![
+                2.0, -1.5, 1.0,
+            ])))
+            .unwrap();
+            Transform::Composite(c)
+        };
+
+        for (tname, initial) in [("Euler3D", &euler), ("Composite of two maps", &composite)] {
+            for (name, with_mask, with_domain) in [
+                ("fixed-initial transform only", false, false),
+                ("with a user mask", true, false),
+                ("with a virtual domain", false, true),
+                ("with both", true, true),
+            ] {
+                let name = &format!("{tname}, {name}");
+                let build = |transform: Option<&Transform>| {
+                    let mut reg = ImageRegistrationMethod::new();
+                    if with_mask {
+                        reg.set_metric_fixed_mask(&mask);
+                    }
+                    if with_domain {
+                        reg.set_virtual_domain(
+                            vec![24, 20, 28],
+                            vec![-8.0, -4.0, -6.0],
+                            vec![1.5, 2.0, 2.0],
+                            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        )
+                        .unwrap();
+                    }
+                    if let Some(t) = transform {
+                        reg.set_fixed_initial_transform(t.clone());
+                    }
+                    reg
+                };
+
+                let reg = build(Some(initial));
+                // The same configuration with the transform removed — the mask this must
+                // *not* equal, or the transform is not reaching the predicate.
+                let no_transform = build(None);
+
+                for factors in [vec![2usize; 3], vec![1usize; 3]] {
+                    let sigma = vec![0.0; 3];
+                    let what = format!("{name}, factors {factors:?}");
+
+                    let (host_fixed, host_moving, host_mask) = reg
+                        .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                        .unwrap();
+                    let (dev_fixed, dev_moving) = reg
+                        .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                        .unwrap();
+                    let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+                    let dev_mask = reg
+                        .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
+                        .unwrap();
+
+                    // The level image, through the transform, bit for bit.
+                    assert_same_image(
+                        &host_fixed,
+                        &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                        &format!("{what}: fixed level"),
+                    );
+                    assert_same_image(
+                        &host_moving,
+                        &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                        &format!("{what}: moving level"),
+                    );
+
+                    // A fixed-initial transform always makes the host build a predicate.
+                    let host_mask =
+                        host_mask.expect("a fixed-initial transform builds a predicate");
+                    let dev_mask = dev_mask.expect("the device built no level mask");
+
+                    let hb = host_mask_bytes(&host_mask);
+                    let db = device_mask_bytes(&dev_mask);
+
+                    // Anti-vacuity 1: the mask must gate something.
+                    let zeros = hb.iter().filter(|&&b| b == 0).count();
+                    let ones = hb.len() - zeros;
+                    assert!(
+                        zeros > 0 && ones > 0,
+                        "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); the \
+                     comparison below would pass on a device that ignored the transform"
+                    );
+
+                    // Anti-vacuity 2: the transform must have *moved* the predicate.
+                    let (_, _, plain_mask) = no_transform
+                        .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                        .unwrap();
+                    let plain = plain_mask.map(|m| host_mask_bytes(&m));
+                    match &plain {
+                        None => {} // no domain, no user mask: without the transform there is no mask at all
+                        Some(p) => assert!(
+                            p.len() != hb.len() || p != &hb,
+                            "{what}: the level mask is identical with and without the \
+                         fixed-initial transform; the transform is not reaching the \
+                         predicate and this test proves nothing"
+                        ),
+                    }
+
+                    assert_eq!(
+                        db.len(),
+                        hb.len(),
+                        "{what}: the device mask is not on the level's grid"
+                    );
+                    let differing = hb.iter().zip(db.iter()).filter(|&(&h, &d)| h != d).count();
+                    assert_eq!(
+                        differing,
+                        0,
+                        "{what}: {differing} of {} mask bytes differ (host zeros {zeros}, ones {ones})",
+                        hb.len()
+                    );
+                    println!("{what}: level mask byte-equal ({zeros} zeros, {ones} ones)");
+                }
+            }
         }
     }
 }

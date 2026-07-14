@@ -129,7 +129,7 @@ use crate::denoise::curvature_flow_update;
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
-    Image, Neighborhood, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition,
+    Image, NeighborhoodIterator, PixelId, Stencil, ZeroFluxNeumannBoundaryCondition, parallel,
 };
 
 /// `itk::Math::Round<SizeValueType>`: round to nearest, halves upward
@@ -185,14 +185,14 @@ fn stencil_operator(dim: usize, radius: usize) -> Vec<f64> {
 /// The centered, spacing-scaled gradient the three `ComputeThreshold` overloads
 /// share: `0.5·(I[+e_d] − I[−e_d])·ScaleCoefficients[d]`. Note this uses the raw
 /// `ScaleCoefficients`, *not* `ComputeNeighborhoodScales`'s `/radius[d]` form.
-fn threshold_gradient(nb: &Neighborhood<f64>, dim: usize, coeff: &[f64]) -> Vec<f64> {
+fn threshold_gradient<S: Stencil + ?Sized>(nb: &S, dim: usize, coeff: &[f64]) -> Vec<f64> {
     let mut off = vec![0i64; dim];
     (0..dim)
         .map(|d| {
             off[d] = 1;
-            let plus = nb.get(&off);
+            let plus = nb.at(&off);
             off[d] = -1;
-            let minus = nb.get(&off);
+            let minus = nb.at(&off);
             off[d] = 0;
             0.5 * (plus - minus) * coeff[d]
         })
@@ -205,8 +205,8 @@ fn threshold_gradient(nb: &Neighborhood<f64>, dim: usize, coeff: &[f64]) -> Vec<
 /// Euclidean norm `>= radius` and whose cosine against the gradient is
 /// `< 0.262` in absolute value (i.e. within ~74.8° of perpendicular). Returns
 /// `0` when no pixel qualifies, and `0` when the gradient is exactly zero.
-fn compute_threshold_generic(
-    nb: &Neighborhood<f64>,
+fn compute_threshold_generic<S: Stencil + ?Sized>(
+    nb: &S,
     dim: usize,
     radius: usize,
     coeff: &[f64],
@@ -223,7 +223,9 @@ fn compute_threshold_generic(
     let mut threshold = 0.0f64;
     let mut num_pixels = 0usize;
 
-    for &value in nb.values() {
+    // The window in slot order — the same dimension-0-fastest sequence
+    // `nb.values()` walked, now readable from a borrowed window too.
+    for value in nb.slots() {
         let mut dot_product = 0.0f64;
         let mut vector_magnitude = 0.0f64;
         for (d, &g) in gradient.iter().enumerate() {
@@ -259,7 +261,7 @@ fn compute_threshold_generic(
 /// `MinMaxCurvatureFlowFunction::ComputeThreshold(const Dispatch<2> &, ...)`:
 /// rescale the gradient to length `radius`, rotate it ±90°, round both
 /// endpoints onto the lattice, average the two pixels. `0` on a zero gradient.
-fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold_2d<S: Stencil + ?Sized>(nb: &S, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 2, coeff);
     let mut grad_magnitude = gradient[0] * gradient[0] + gradient[1] * gradient[1];
     if grad_magnitude == 0.0 {
@@ -271,10 +273,9 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 
     let r = radius as f64;
     let span = 2 * radius + 1;
-    let values = nb.values();
 
-    let first = values[itk_round(r - gradient[1]) + span * itk_round(r + gradient[0])];
-    let second = values[itk_round(r + gradient[1]) + span * itk_round(r - gradient[0])];
+    let first = nb.slot(itk_round(r - gradient[1]) + span * itk_round(r + gradient[0]));
+    let second = nb.slot(itk_round(r + gradient[1]) + span * itk_round(r - gradient[0]));
     (first + second) * 0.5
 }
 
@@ -287,7 +288,7 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 /// is the angle of the *unit* gradient, so `theta` is `acos(gradient[2] /
 /// radius)`, not upstream's `acos(gradient[2])`. The clamp into `[-1, 1]` is
 /// kept as a pure rounding guard — the quotient is in range by construction.
-fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold_3d<S: Stencil + ?Sized>(nb: &S, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 3, coeff);
     let mut grad_magnitude: f64 = gradient.iter().map(|g| g * g).sum();
     if grad_magnitude == 0.0 {
@@ -322,8 +323,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
     let r_cos_phi = r * cos_phi;
 
     let span = 2 * radius + 1;
-    let values = nb.values();
-    let at = |x: usize, y: usize, z: usize| values[x + span * y + span * span * z];
+    let at = |x: usize, y: usize, z: usize| nb.slot(x + span * y + span * span * z);
 
     // angle = 0, 90, 180, 270 around the (intended) gradient axis
     let p1 = at(
@@ -343,7 +343,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 }
 
 /// `MinMaxCurvatureFlowFunction::ComputeThreshold(Dispatch<ImageDimension>(), it)`.
-fn compute_threshold(nb: &Neighborhood<f64>, dim: usize, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold<S: Stencil + ?Sized>(nb: &S, dim: usize, radius: usize, coeff: &[f64]) -> f64 {
     match dim {
         2 => compute_threshold_2d(nb, radius, coeff),
         3 => compute_threshold_3d(nb, radius, coeff),
@@ -414,20 +414,38 @@ fn min_max_flow(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        for ((_, nb), v) in iter.zip(buf.iter_mut()) {
-            let update = curvature_flow_update(&nb, dim, &coeff);
+        // Parallel over voxels, reading the **borrowed** window. Each voxel's
+        // update is a function of its own window in `snapshot` — a separate image,
+        // cloned from `buf` before the sweep — so no voxel reads another voxel's
+        // new value and the sweep is a map, not a recurrence. The iteration loop
+        // itself stays sequential: each pass reads the whole previous pass.
+        //
+        // The window used to be *materialized* into per-task scratch here, because
+        // `curvature_flow_update` and `compute_threshold` took a `&Neighborhood`.
+        // They now take a `Stencil` — the capability they actually use — so the
+        // borrowed `WindowView` satisfies them directly and nothing is copied. The
+        // values they see are the identical ones in the identical order, which is
+        // what `WindowView::get_offset` and `Stencil::slot` are pinned on in
+        // `sitk-core`.
+        //
+        // `None` is NOT "an update of zero". The serial loop `continue`d when
+        // `update == 0.0`, skipping the `+=` entirely, and that is not the same as
+        // adding `0.0`: `buf[i]` can be `-0.0`, and `-0.0 + 0.0` is `+0.0` while
+        // no-op leaves `-0.0`. The skip is carried through as `None` and honored
+        // below, so the sign bit survives exactly as it did.
+        let gated: Vec<Option<f64>> = iter.par_map_window(|_, w| {
+            let update = curvature_flow_update(&w, dim, &coeff);
             if update == 0.0 {
-                continue;
+                return None;
             }
-            let avg_value: f64 = nb
-                .values()
-                .iter()
+            let avg_value: f64 = w
+                .iter_f64()
                 .zip(&operator)
                 .map(|(pixel, weight)| pixel * weight)
                 .sum();
-            let gated = match gate {
+            Some(match gate {
                 Gate::MinMax => {
-                    let threshold = compute_threshold(&nb, dim, stencil_radius, &coeff);
+                    let threshold = compute_threshold(&w, dim, stencil_radius, &coeff);
                     if avg_value < threshold {
                         update.max(0.0)
                     } else {
@@ -441,9 +459,14 @@ fn min_max_flow(
                         update.max(0.0)
                     }
                 }
-            };
-            *v += time_step * gated;
-        }
+            })
+        });
+
+        parallel::for_each_mut(&mut buf, |i, v| {
+            if let Some(g) = gated[i] {
+                *v += time_step * g;
+            }
+        });
     }
 
     image_from_f64(pixel_id, &size, img, &buf)
@@ -513,6 +536,10 @@ pub fn binary_min_max_curvature_flow(
 mod tests {
     use super::*;
     use crate::denoise::curvature_flow;
+    // These tests hand the threshold helpers an OWNED window, and they still
+    // compile and pass against the `Stencil` signatures: the owned path did not
+    // go away, it stopped being mandatory.
+    use sitk_core::Neighborhood;
 
     const EPS: f64 = 1e-12;
 
@@ -1218,5 +1245,260 @@ mod tests {
             );
         }
         assert!(base.iter().zip(&unit).any(|(b, u)| (u - b).abs() > 1e-6));
+    }
+}
+
+/// Thread-count parity pin for the min/max curvature-flow sweep.
+///
+/// A **summing** stencil (`curvature_flow_update`, the stencil average and
+/// `compute_threshold` all sum `f64` terms over the window), so the non-vacuity
+/// guard is the fold-order one, asserted on the volume the pin runs on.
+///
+/// # `-0.0` — this one applies, in the *reverse* direction
+///
+/// The serial loop `continue`d when `update == 0.0`, skipping the `+=` entirely.
+/// Turning that skip into `*v += time_step * 0.0` would look harmless and is not:
+/// `buf[i]` can hold `-0.0`, and `-0.0 + 0.0` is `+0.0` while the skip leaves
+/// `-0.0`. That is the same `0.0 + x == x` hole that bit `laplacian_recursive_-
+/// gaussian`, entered from the other side — there the danger was folding a first
+/// *accumulate* into a *store*; here it is folding a *skip* into an *add*.
+///
+/// So the skip is carried out of the parallel pass as `None` and honored on the
+/// way back in. [`the_skip_path_is_taken_and_carries_negative_zero`] proves the
+/// hole is real on this input rather than theoretical: it asserts that the sweep
+/// really does skip voxels, and that at least one skipped voxel really does hold a
+/// `-0.0` that a `+= 0.0` would have flipped.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{
+        PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
+    };
+    use sitk_core::parallel;
+
+    const TIME_STEP: f64 = 0.05;
+    const ITERATIONS: u32 = 3;
+    const STENCIL: usize = 2;
+
+    /// The exact serial sweep that was deleted, `continue` and all.
+    fn serial(
+        img: &Image,
+        iterations: u32,
+        time_step: f64,
+        stencil_radius: usize,
+        use_image_spacing: bool,
+        gate: Gate,
+    ) -> Vec<f64> {
+        let dim = img.dimension();
+        let stencil_radius = stencil_radius.max(1);
+        let coeff: Vec<f64> = img
+            .spacing()
+            .iter()
+            .map(|&s| if use_image_spacing { 1.0 / s } else { 1.0 })
+            .collect();
+        let operator = stencil_operator(dim, stencil_radius);
+        let size = img.size().to_vec();
+        let radius = vec![stencil_radius; dim];
+        let mut buf = img.to_f64_vec().unwrap();
+
+        for _ in 0..iterations {
+            let mut snapshot = Image::from_vec(&size, buf.clone()).unwrap();
+            snapshot.copy_geometry_from(img);
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &snapshot,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+            for ((_, nb), v) in iter.zip(buf.iter_mut()) {
+                let update = curvature_flow_update(&nb, dim, &coeff);
+                if update == 0.0 {
+                    continue;
+                }
+                let avg_value: f64 = nb
+                    .values()
+                    .iter()
+                    .zip(&operator)
+                    .map(|(pixel, weight)| pixel * weight)
+                    .sum();
+                let gated = match gate {
+                    Gate::MinMax => {
+                        let threshold = compute_threshold(&nb, dim, stencil_radius, &coeff);
+                        if avg_value < threshold {
+                            update.max(0.0)
+                        } else {
+                            update.min(0.0)
+                        }
+                    }
+                    Gate::Binary(threshold) => {
+                        if avg_value < threshold {
+                            update.min(0.0)
+                        } else {
+                            update.max(0.0)
+                        }
+                    }
+                };
+                *v += time_step * gated;
+            }
+        }
+        buf
+    }
+
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    #[test]
+    fn the_window_sum_order_is_observable() {
+        let img = volume(PixelId::Float64);
+        assert!(
+            window_sum_order_is_observable(&img, &[STENCIL, STENCIL, STENCIL]),
+            "no voxel changed bits when its window sum was reversed — this volume cannot \
+             observe a re-association, so the pin below would pass even on a sweep that \
+             summed its stencil in a different order"
+        );
+    }
+
+    /// The `-0.0` guard, and the reason the skip is carried as `None`.
+    ///
+    /// Runs the sweep's first pass by hand and asserts two things that make the
+    /// distinction between "skip" and "add zero" a real one on this input:
+    ///
+    /// 1. some voxels really are skipped (`update == 0.0`), and
+    /// 2. at least one of them holds a `-0.0` in `buf`, which `+= time_step * 0.0`
+    ///    would silently turn into `+0.0`.
+    ///
+    /// Without (2) the `Option<f64>` in the sweep would be defensive
+    /// scaffolding against an impossible input. With it, the pin has teeth: a
+    /// version of the sweep that folded the skip into an add would change bits on
+    /// this volume and fail.
+    #[test]
+    fn the_skip_path_is_taken_and_carries_negative_zero() {
+        // A volume that reaches zero from below, so `buf` genuinely carries `-0.0`
+        // at the voxels where the flow has nothing to do: `-0.0` is what
+        // `f64::from(-0.0)` stores, and the flat interior of this field makes
+        // `curvature_flow_update` return exactly `0.0` there.
+        let n = 32usize;
+        let mut data = vec![0.0f64; n * n * n];
+        for (idx, cell) in data.iter_mut().enumerate() {
+            let i = idx % n;
+            // A flat plateau (so the update is exactly zero) held at -0.0, next to a
+            // ramp (so the rest of the volume is not degenerate).
+            *cell = if i < n / 2 { -0.0 } else { (i - n / 2) as f64 };
+        }
+        let img = Image::from_vec(&[n, n, n], data.clone()).unwrap();
+
+        let dim = 3usize;
+        let coeff = vec![1.0f64; dim];
+        let radius = vec![1usize; dim];
+        let iter =
+            NeighborhoodIterator::<f64, _>::new(&img, &radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+
+        let mut skipped = 0usize;
+        let mut skipped_negative_zero = 0usize;
+        for (i, (_, nb)) in iter.enumerate() {
+            if curvature_flow_update(&nb, dim, &coeff) == 0.0 {
+                skipped += 1;
+                if data[i].to_bits() == (-0.0f64).to_bits() {
+                    skipped_negative_zero += 1;
+                }
+            }
+        }
+
+        assert!(
+            skipped > 0,
+            "no voxel took the `update == 0.0` skip, so the sweep's `None` path is never \
+             exercised and this guard proves nothing"
+        );
+        assert!(
+            skipped_negative_zero > 0,
+            "{skipped} voxels took the skip, but none of them held a -0.0 — the difference \
+             between skipping and adding 0.0 would be unobservable on this input, and the \
+             `Option<f64>` in the sweep would be untestable scaffolding"
+        );
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn min_max_curvature_flow_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for use_image_spacing in [true, false] {
+                let expected = narrowed_like(
+                    &img,
+                    &serial(
+                        &img,
+                        ITERATIONS,
+                        TIME_STEP,
+                        STENCIL,
+                        use_image_spacing,
+                        Gate::MinMax,
+                    ),
+                );
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        min_max_curvature_flow(
+                            &img,
+                            ITERATIONS,
+                            TIME_STEP,
+                            STENCIL,
+                            use_image_spacing,
+                        )
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "min_max_curvature_flow({pixel:?}, spacing={use_image_spacing}, \
+                             {threads} threads)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_min_max_curvature_flow_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            let threshold = 20.0f64;
+            let expected = narrowed_like(
+                &img,
+                &serial(
+                    &img,
+                    ITERATIONS,
+                    TIME_STEP,
+                    STENCIL,
+                    true,
+                    Gate::Binary(threshold),
+                ),
+            );
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    binary_min_max_curvature_flow(
+                        &img, ITERATIONS, TIME_STEP, STENCIL, threshold, true,
+                    )
+                })
+                .unwrap()
+                .to_f64_vec()
+                .unwrap();
+                assert_bits_eq(
+                    &got,
+                    &expected,
+                    &format!("binary_min_max_curvature_flow({pixel:?}, {threads} threads)"),
+                );
+            }
+        }
     }
 }

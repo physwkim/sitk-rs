@@ -33,7 +33,9 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use sitk_core::{Image, NeighborhoodIterator, ZeroFluxNeumannBoundaryCondition};
+use sitk_core::{
+    Image, NeighborhoodIterator, Scalar, ZeroFluxNeumannBoundaryCondition, dispatch_scalar,
+};
 
 /// `NoiseImageFilter`: the local sample standard deviation of `img` over a
 /// per-axis `radius` neighborhood (see the module docs for the exact
@@ -49,27 +51,43 @@ pub fn noise(img: &Image, radius: &[usize]) -> Result<Image> {
         });
     }
 
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
-    scratch.copy_geometry_from(img);
+    let out = dispatch_scalar!(img.pixel_id(), noise_pass, img, radius)?;
+    image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
 
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, radius, ZeroFluxNeumannBoundaryCondition)?;
+/// The stencil, as a parallel map over output voxels.
+///
+/// Reads `T` and widens per access rather than materializing an `f64` copy of
+/// the whole volume first. That is the same `Scalar::as_f64` the copy's
+/// `to_f64_vec` applied, so every value the accumulation sees is the one the copy
+/// held — and the copy's scalar-pixel rejection survives its deletion, because
+/// `NeighborhoodIterator::new` takes a `scalar_view::<T>()` and returns the same
+/// [`sitk_core::Error::RequiresScalarPixelType`].
+///
+/// `sum` and `sum_of_squares` accumulate over **one voxel's own window**, in
+/// window order (`WindowView::rows` concatenated is exactly the order
+/// `Neighborhood::values` held, so the two accumulators see the identical
+/// sequence ITK's single `bit.GetPixel(i)` loop fed them), and the interleaving
+/// `sum += value; sum_of_squares += value * value;` is preserved. No accumulator
+/// crosses voxels, so no thread count can reach the arithmetic: the result is
+/// bit-identical to the serial walk by construction.
+fn noise_pass<T: Scalar>(img: &Image, radius: &[usize]) -> Result<Vec<f64>> {
+    let iter = NeighborhoodIterator::<T, _>::new(img, radius, ZeroFluxNeumannBoundaryCondition)?;
     let num = iter.len() as f64;
 
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
-            let mut sum = 0.0f64;
-            let mut sum_of_squares = 0.0f64;
-            for &value in nb.values() {
+    Ok(iter.par_map_window(|_, w| {
+        let mut sum = 0.0f64;
+        let mut sum_of_squares = 0.0f64;
+        for run in w.rows() {
+            for &v in run {
+                let value = v.as_f64();
                 sum += value;
                 sum_of_squares += value * value;
             }
-            let var = (sum_of_squares - (sum * sum / num)) / (num - 1.0);
-            var.sqrt()
-        })
-        .collect();
-
-    image_from_f64(img.pixel_id(), img.size(), img, &out)
+        }
+        let var = (sum_of_squares - (sum * sum / num)) / (num - 1.0);
+        var.sqrt()
+    }))
 }
 
 #[cfg(test)]
@@ -127,5 +145,185 @@ mod tests {
                 got: 1
             }
         );
+    }
+}
+
+/// Thread-count parity for [`noise`], which was a serial `iter().map().collect()`
+/// over a `Neighborhood<f64>` copied out per voxel, fed by a full `f64` copy of
+/// the input volume. Both are gone; the pass is now a
+/// [`NeighborhoodIterator::par_map_window`] over a borrowed
+/// [`sitk_core::WindowView`] of the input's own pixels.
+///
+/// **No `-0.0` exposure.** That trap is specific to converting a first
+/// accumulate into a store — `0.0 + x` and `x` differ only at `x == -0.0`. This
+/// filter converts nothing: `sum` and `sum_of_squares` still start at `0.0` and
+/// still accumulate, and `var.sqrt()` is unchanged. There is no store to
+/// substitute.
+#[cfg(test)]
+mod thread_parity {
+    use super::*;
+    use sitk_core::{PixelId, parallel};
+
+    /// The `f64` copy of the whole volume and the serial neighborhood walk that
+    /// [`noise`] used to run. The reference the parallel pass is pinned against.
+    fn noise_serial(img: &Image, radius: &[usize]) -> Vec<f64> {
+        let mut scratch = Image::from_vec(img.size(), img.to_f64_vec().unwrap()).unwrap();
+        scratch.copy_geometry_from(img);
+
+        let iter =
+            NeighborhoodIterator::<f64, _>::new(&scratch, radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        let num = iter.len() as f64;
+
+        iter.map(|(_, nb)| {
+            let mut sum = 0.0f64;
+            let mut sum_of_squares = 0.0f64;
+            for &value in nb.values() {
+                sum += value;
+                sum_of_squares += value * value;
+            }
+            let var = (sum_of_squares - (sum * sum / num)) / (num - 1.0);
+            var.sqrt()
+        })
+        .collect()
+    }
+
+    /// A 32³ volume — 32 768 voxels, over `parallel`'s 16 384 serial threshold, so
+    /// the window pass really runs on rayon instead of falling back to the serial
+    /// fast path and pinning nothing.
+    ///
+    /// Both pixel types are pinned, for different reasons. `Float64` carries full
+    /// 53-bit mantissas, so the window's `sum` genuinely rounds and the order of
+    /// its terms is observable — that is what gives the pin teeth against a
+    /// re-association. `Float32` exercises the widening-per-access path that
+    /// replaced the deleted volume copy.
+    fn volume(pixel: PixelId) -> Image {
+        let n = 32usize;
+        let value = |i: usize, j: usize, k: usize| {
+            let (x, y, z) = (i as f64, j as f64, k as f64);
+            (0.7 * x).sin() * 40.0
+                + (0.3 * y).cos() * 25.0
+                + (x * y * 0.01 + z * 0.9).sin() * 13.0
+                + ((i * 37 + j * 11 + k * 7) % 29) as f64
+        };
+        let mut data = vec![0.0f64; n * n * n];
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    data[(k * n + j) * n + i] = value(i, j, k);
+                }
+            }
+        }
+        match pixel {
+            PixelId::Float64 => Image::from_vec(&[n, n, n], data).unwrap(),
+            PixelId::Float32 => {
+                let d: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+                Image::from_vec(&[n, n, n], d).unwrap()
+            }
+            other => panic!("volume() does not build {other:?}"),
+        }
+    }
+
+    const PIXELS: [PixelId; 2] = [PixelId::Float64, PixelId::Float32];
+
+    /// Narrow a reference's raw `f64` values through the same exit [`noise`] takes
+    /// — it keeps the input's pixel type, so on an `f32` input its output is
+    /// `f32`-rounded, and comparing against an un-rounded reference would fail on
+    /// the rounding rather than on anything the parallelization did.
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    /// The pin would assert nothing if this filter's window accumulation were
+    /// order-insensitive: a sum that cannot round is unchanged by any
+    /// re-association, so "the bits match" would hold no matter what the code did.
+    ///
+    /// On the `Float64` volume the order must be observable — reversing a voxel's
+    /// window must move `sum`'s bits somewhere. That is the teeth.
+    ///
+    /// On `Float32` it need not be, and the pin does not claim it is: the values
+    /// carry 24-bit mantissas, so short window sums can be exact. The `Float32`
+    /// volume is pinned for the widening path, not for the fold order. This test
+    /// records which volume carries which claim, so neither pin can later be read
+    /// as proving the other's.
+    #[test]
+    fn the_within_window_sum_order_is_observable_on_float64() {
+        let img = volume(PixelId::Float64);
+        let radius = [1usize, 1, 1];
+        let mut scratch = Image::from_vec(img.size(), img.to_f64_vec().unwrap()).unwrap();
+        scratch.copy_geometry_from(&img);
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        let mut moved = 0usize;
+        for (_, nb) in iter {
+            let forward = nb.values().iter().fold(0.0f64, |a, &v| a + v);
+            let backward = nb.values().iter().rev().fold(0.0f64, |a, &v| a + v);
+            if forward.to_bits() != backward.to_bits() {
+                moved += 1;
+            }
+        }
+        assert!(
+            moved > 0,
+            "no voxel's window sum changed bits when its values were reversed, so \
+             this volume cannot observe a re-association and the pin below would \
+             pass even if the window accumulation were reordered"
+        );
+    }
+
+    /// The other axis of vacuity: the filter must actually depend on the input. A
+    /// flat volume gives every voxel zero noise and makes every comparison
+    /// trivially true.
+    #[test]
+    fn the_reference_output_is_not_degenerate() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            let values = noise_serial(&img, &[1, 1, 1]);
+            let nonzero = values.iter().filter(|v| **v != 0.0).count();
+            assert!(
+                nonzero > values.len() / 2,
+                "{pixel:?}: only {nonzero}/{} voxels have non-zero noise — the test \
+                 volume is too flat to pin anything",
+                values.len()
+            );
+        }
+    }
+
+    /// `noise` is bit-identical to the deleted serial loop at every thread count,
+    /// on both pixel types, at an isotropic and an anisotropic radius (the latter
+    /// gives the window a different shape per axis, so a wrong stride shows up).
+    #[test]
+    fn noise_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            assert!(
+                img.number_of_pixels() > 1 << 14,
+                "volume must exceed the serial threshold, or the parallel path never runs"
+            );
+
+            for radius in [[1usize, 1, 1], [2, 1, 3]] {
+                let expected = narrowed_like(&img, &noise_serial(&img, &radius));
+                for threads in [1usize, 4, 48, 96] {
+                    let got = parallel::with_threads(threads, || noise(&img, &radius).unwrap());
+                    let got = got.to_f64_vec().unwrap();
+                    assert_eq!(got.len(), expected.len());
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "noise({pixel:?}, radius={radius:?}) moved at voxel {i} with \
+                             {threads} threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

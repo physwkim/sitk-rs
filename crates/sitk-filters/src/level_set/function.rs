@@ -732,3 +732,127 @@ mod tests {
         assert_eq!(gd.dx[0], 0.5);
     }
 }
+
+/// The level-set solver is the **other consumer** of the curvature-flow update,
+/// and the one a signature change can break silently: it holds no window at all
+/// — it reads a bare `f64` buffer through a clamping closure — so it does not go
+/// through `Stencil`, and nothing about it fails to compile if the two sides of
+/// the seam ever drift apart.
+///
+/// This pins them together. `CurvatureFlowFunction::compute_update` and
+/// [`crate::denoise::curvature_flow_update`] must return **bit-identical** `f64`
+/// for the same field at the same voxel — the solver reaching the body through
+/// its `FnMut` closure, the filter reaching it through a borrowed
+/// [`sitk_core::WindowView`] and through an owned [`sitk_core::Neighborhood`].
+/// Three routes into one body; if any of them ever computes something different,
+/// this fails.
+#[cfg(test)]
+mod seam_parity {
+    use super::*;
+    use crate::denoise::curvature_flow_update;
+    use crate::level_set::grid::Grid;
+    use sitk_core::{
+        Image, NeighborhoodIterator, Stencil, ZeroFluxNeumannBoundaryCondition, parallel,
+    };
+
+    /// A field with real curvature — a smooth ramp would make every second
+    /// derivative vanish and the update identically zero, and the pin would hold
+    /// for the wrong reason.
+    fn field(size: &[usize]) -> Vec<f64> {
+        let n: usize = size.iter().product();
+        (0..n)
+            .map(|i| {
+                let (x, y, z) = (
+                    (i % size[0]) as f64,
+                    ((i / size[0]) % size[1]) as f64,
+                    (i / (size[0] * size[1])) as f64,
+                );
+                (0.6 * x).sin() * 9.0 + (0.4 * y).cos() * 5.0 + (0.3 * z + 0.2 * x).sin() * 3.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_solvers_update_is_the_filters_update_bit_for_bit() {
+        let size = [9usize, 8, 7];
+        let phi = field(&size);
+        let grid = Grid::new(&size);
+        let scales = vec![1.0f64, 1.0, 1.0];
+        let solver = CurvatureFlowFunction::new(scales.clone());
+
+        let mut img = Image::from_vec(&size, phi.clone()).unwrap();
+        img.set_spacing(&[1.0, 1.0, 1.0]).unwrap();
+        let radius = vec![1usize; 3];
+        let iter =
+            NeighborhoodIterator::<f64, _>::new(&img, &radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+
+        // Route 1: the filter's borrowed window (the code this refactor ships).
+        let borrowed: Vec<f64> = iter.par_map_window(|_, w| curvature_flow_update(&w, 3, &scales));
+
+        // Route 2: the filter's owned window (the code it replaced).
+        let owned_iter =
+            NeighborhoodIterator::<f64, _>::new(&img, &radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        let owned: Vec<f64> = owned_iter
+            .map(|(_, nb)| curvature_flow_update(&nb, 3, &scales))
+            .collect();
+
+        // Route 3: the solver's closure — no window of any kind, clamping reads
+        // straight out of the buffer.
+        let solved: Vec<f64> = (0..phi.len())
+            .map(|i| solver.compute_update(&phi, &grid, i))
+            .collect();
+
+        // Non-vacuity: an all-zero update field would make all three agree no
+        // matter how badly one of them was broken.
+        let nonzero = solved.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero > solved.len() / 2,
+            "only {nonzero}/{} updates are non-zero — the field is too flat for this pin to \
+             mean anything",
+            solved.len()
+        );
+
+        for i in 0..phi.len() {
+            assert_eq!(
+                borrowed[i].to_bits(),
+                owned[i].to_bits(),
+                "voxel {i}: the borrowed window and the owned window disagree ({:?} vs {:?})",
+                borrowed[i],
+                owned[i]
+            );
+            assert_eq!(
+                solved[i].to_bits(),
+                owned[i].to_bits(),
+                "voxel {i}: the level-set solver and the filter disagree ({:?} vs {:?})",
+                solved[i],
+                owned[i]
+            );
+        }
+
+        // And the borrowed route does not depend on the thread count.
+        for threads in [1usize, 4, 48, 96] {
+            let got: Vec<f64> = parallel::with_threads(threads, || {
+                iter.par_map_window(|_, w| curvature_flow_update(&w, 3, &scales))
+            });
+            for (i, (a, b)) in got.iter().zip(&borrowed).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "voxel {i} moved with {threads} threads"
+                );
+            }
+        }
+
+        // The `Stencil` trait's own two routes to the same value, at one voxel:
+        // by offset, and by slot. `compute_threshold` reads windows both ways.
+        let center = [4usize, 4, 3];
+        let nb = iter.neighborhood_at(&center);
+        assert_eq!(
+            Stencil::center(&nb).to_bits(),
+            Stencil::at(&nb, &[0i64, 0, 0]).to_bits(),
+            "the center slot and the zero offset name different values"
+        );
+    }
+}

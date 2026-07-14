@@ -107,11 +107,18 @@
 //! ## GPU seam
 //!
 //! The metric's per-sample reduction is isolated behind [`MetricBackend`]; the
-//! shipped [`CpuBackend`] runs on the host. A CUDA (`cudarc`) or portable
-//! `wgpu`/Metal backend implements the same trait and drops in via
-//! [`ImageRegistrationMethod::set_metric_backend`] — no change to the metric or
-//! the registration loop. (This crate builds and is tested CPU-only; a GPU
-//! backend requires GPU hardware, absent on the development machine.)
+//! shipped [`CpuBackend`] runs on the host. A backend implementing the same trait
+//! drops in via [`ImageRegistrationMethod::set_metric_backend`] — no change to
+//! the metric or the registration loop.
+//!
+//! `CudaMetricBackend` (behind the `cuda` feature, **default off**, so it is
+//! absent from these docs unless the feature is on) is one such backend: it keeps
+//! the fixed samples and the moving volume resident on the device across the whole
+//! optimizer run, so each iteration ships only the transform's twelve affine
+//! coefficients up and a fixed-size moment vector back. It is a strict accelerator
+//! — it falls back to [`CpuBackend`] on every condition that is not a GPU success
+//! (no driver, no device, a non-affine transform), so it cannot turn a working
+//! registration into a failing one.
 //!
 //! [`AffineTransform`]: sitk_transform::AffineTransform
 //! [`TranslationTransform`]: sitk_transform::TranslationTransform
@@ -122,7 +129,11 @@ pub mod bspline_initializer;
 pub mod centered_versor;
 pub mod convergence;
 pub mod correlation;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod demons;
+#[cfg(feature = "cuda")]
+pub mod device;
 mod eigen;
 pub mod error;
 pub mod gradient_free;
@@ -142,7 +153,13 @@ pub use bspline_initializer::BSplineTransformInitializer;
 pub use centered_versor::CenteredVersorTransformInitializer;
 pub use convergence::WindowConvergenceMonitor;
 pub use correlation::CorrelationMetric;
+#[cfg(feature = "cuda")]
+pub use cuda::CudaMetricBackend;
 pub use demons::DemonsMetric;
+#[cfg(feature = "cuda")]
+pub use device::{
+    DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
+};
 pub use error::{RegistrationError, Result};
 pub use gradient_free::{
     AmoebaOptimizer, ExhaustiveOptimizer, OnePlusOneEvolutionaryOptimizer, PowellOptimizer,
@@ -153,7 +170,7 @@ pub use landmark::LandmarkBasedTransformInitializer;
 pub use lbfgs2::{LBFGS2Optimizer, LineSearchMethod};
 pub use lbfgsb::LBFGSBOptimizer;
 pub use mattes::MattesMutualInformationMetric;
-pub use method::{EstimateLearningRate, ImageRegistrationMethod, RegistrationResult};
+pub use method::{EstimateLearningRate, ImageRegistrationMethod, LevelResult, RegistrationResult};
 pub use metric::{CpuBackend, MeanSquaresMetric, MetricBackend, MetricValue, SamplingStrategy};
 pub use optimizer::{
     ConjugateGradientLineSearchOptimizer, GradientDescentLineSearchOptimizer,

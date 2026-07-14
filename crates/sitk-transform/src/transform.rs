@@ -5,6 +5,7 @@
 //! image's physical space (ITK's backward mapping convention).
 
 use crate::error::{Result, TransformError};
+use crate::matrix_offset::MatrixOffsetMap;
 use sitk_core::matrix;
 
 /// A spatial coordinate transform.
@@ -13,6 +14,45 @@ pub trait TransformBase {
     fn transform_point(&self, point: &[f64]) -> Vec<f64>;
     /// Spatial dimension the transform operates on.
     fn dimension(&self) -> usize;
+
+    /// The **ordered stages** this transform's [`transform_point`] evaluates, each one
+    /// exactly `mat_vec(matrix, p) + offset`, applied in the order returned — or `None`
+    /// when there is no such decomposition that is exact **on the bits**.
+    ///
+    /// > if `point_map_stages()` returns `Some(stages)`, then for every finite `p`,
+    /// > `transform_point(p)` **is** `stages.fold(p, |q, s| mat_vec(s.matrix, q) +
+    /// > s.offset)` — the same operations, in the same order, on the same operands.
+    ///
+    /// # Why a list and not one matrix
+    ///
+    /// A transform that composes (`CompositeTransform`, or a registration's optimized
+    /// transform followed by a moving-initial one) evaluates its stages **sequentially**,
+    /// each rounding on its own. Multiplying the stage matrices together is algebraically
+    /// the same map and is *not* the same arithmetic — it rounds once where the transform
+    /// rounds twice. So the stages are handed over as stages, and a backend that wants
+    /// the bits reproduces the sequence rather than folding it.
+    ///
+    /// # Who needs the bits
+    ///
+    /// The CUDA metric. Its sampler makes three **discrete** decisions per sample —
+    /// `floor(c)` (which cell), `is_inside(c)` (whether the sample exists at all), and
+    /// `round(c)` (which moving-mask voxel) — and one ulp in the mapped point flips any
+    /// of them. Reconstructing the map by *probing* it (`b = T(0)`,
+    /// `A[:,e] = T(e_e) − T(0)`) is ~1e-14 away from the transform's own arithmetic:
+    /// fine for a value gated at 1e-9, and fatal for a predicate (ledger §2.158).
+    ///
+    /// # The default is `None`, and that is the safe direction
+    ///
+    /// A transform that does not override this is refused by any backend that needs bit
+    /// equality — it falls back to the host rather than being approximated. See
+    /// [`crate::matrix_offset`] for the contract in full and for the variants that are
+    /// mathematically linear and still refused (`ScaleTransform` evaluates
+    /// `(p − c)·s + c`, which is a different rounding from `M·p + b`).
+    ///
+    /// [`transform_point`]: TransformBase::transform_point
+    fn point_map_stages(&self) -> Option<Vec<MatrixOffsetMap>> {
+        None
+    }
 
     /// Whether `transform_point` is `x ↦ M·x + b` for some constant matrix
     /// `M` and offset `b` (independent of `x`), mirroring
@@ -149,11 +189,32 @@ macro_rules! matrix_jacobian_wrt_position {
     };
 }
 
+/// [`TransformBase::point_map_stages`] for the matrix-offset family: **one** stage, and
+/// it is the very matrix and offset `transform_point` multiplies and adds
+/// (`mat_vec(&self.matrix, point) + self.offset`). The accessor and the evaluator read
+/// the same field, so they cannot disagree — that is what makes the bitwise claim
+/// structural rather than a numerical coincidence.
+macro_rules! matrix_point_map_stages {
+    () => {
+        fn point_map_stages(&self) -> Option<Vec<MatrixOffsetMap>> {
+            Some(vec![MatrixOffsetMap {
+                matrix: self.matrix.clone(),
+                offset: self.offset.clone(),
+            }])
+        }
+    };
+}
+
 /// A transform whose action is controlled by a flat parameter vector, and which
 /// exposes the Jacobian of the mapped point with respect to those parameters.
 /// This is the interface registration optimizes over, mirroring ITK's
 /// `Transform::GetJacobianWithRespectToParameters`.
-pub trait ParametricTransform: TransformBase {
+///
+/// `Sync` is required: a metric evaluates the transform at every fixed sample,
+/// and those evaluations run in parallel over a shared `&dyn
+/// ParametricTransform`. Every transform here is plain data with no interior
+/// mutability, so the bound is free — it exists to keep it that way.
+pub trait ParametricTransform: TransformBase + Sync {
     /// Number of free parameters.
     fn number_of_parameters(&self) -> usize;
 
@@ -311,6 +372,24 @@ impl TranslationTransform {
 }
 
 impl TransformBase for TranslationTransform {
+    /// One stage, with a **synthesized** identity matrix: this transform has no `matrix`
+    /// field — it evaluates `p[d] + t[d]` — so the bitwise claim here is an IEEE-754
+    /// argument rather than a shared field. `mat_vec(I, p)[d]` is
+    /// `0.0 + 1.0·p_d + 0.0·p_e + 0.0·p_f`, and adding `±0.0` to a finite value is exact,
+    /// so it is `p[d]` on the bit. Pinned, not trusted:
+    /// `matrix_offset::tests::translation_is_bitwise_the_identity_matrix_form`.
+    fn point_map_stages(&self) -> Option<Vec<MatrixOffsetMap>> {
+        let dim = self.translation.len();
+        let mut matrix = vec![0.0; dim * dim];
+        for d in 0..dim {
+            matrix[d * dim + d] = 1.0;
+        }
+        Some(vec![MatrixOffsetMap {
+            matrix,
+            offset: self.translation.clone(),
+        }])
+    }
+
     /// `T(x) = x + t`, so `dT/dx` is the identity.
     fn jacobian_wrt_position(&self, _point: &[f64]) -> Vec<f64> {
         let dim = self.translation.len();
@@ -462,6 +541,7 @@ impl AffineTransform {
 
 impl TransformBase for AffineTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), self.dim);
@@ -619,6 +699,7 @@ impl Euler2DTransform {
 
 impl TransformBase for Euler2DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 2);
@@ -765,6 +846,7 @@ impl Similarity2DTransform {
 
 impl TransformBase for Similarity2DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 2);
@@ -973,6 +1055,7 @@ impl Euler3DTransform {
 
 impl TransformBase for Euler3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -1278,6 +1361,7 @@ impl VersorRigid3DTransform {
 
 impl TransformBase for VersorRigid3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -1522,6 +1606,7 @@ impl Similarity3DTransform {
 
 impl TransformBase for Similarity3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -1803,6 +1888,7 @@ impl ScaleVersor3DTransform {
 
 impl TransformBase for ScaleVersor3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -2106,6 +2192,7 @@ impl ScaleSkewVersor3DTransform {
 
 impl TransformBase for ScaleSkewVersor3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -2424,6 +2511,7 @@ impl ComposeScaleSkewVersor3DTransform {
 
 impl TransformBase for ComposeScaleSkewVersor3DTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);
@@ -2706,6 +2794,7 @@ impl VersorTransform {
 
 impl TransformBase for VersorTransform {
     matrix_jacobian_wrt_position!();
+    matrix_point_map_stages!();
 
     fn transform_point(&self, point: &[f64]) -> Vec<f64> {
         debug_assert_eq!(point.len(), 3);

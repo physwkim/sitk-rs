@@ -148,9 +148,13 @@ impl PixelBuffer {
     }
 
     /// Widen every stored component to `f64`, preserving interleaved order.
+    ///
+    /// Nearly every filter starts here, so the widening runs through
+    /// [`crate::parallel::map_slice`]: a pure elementwise cast, bit-identical
+    /// to the sequential map at any thread count.
     pub fn to_f64_vec(&self) -> Vec<f64> {
         fn widen<T: Scalar>(v: &[T]) -> Vec<f64> {
-            v.iter().map(|&x| x.as_f64()).collect()
+            crate::parallel::map_slice(v, |&x| x.as_f64())
         }
         match self {
             PixelBuffer::UInt8(v) => widen(v),
@@ -1577,22 +1581,60 @@ impl fmt::Display for Image {
 /// ```
 #[macro_export]
 macro_rules! dispatch_scalar {
-    ($id:expr, $func:ident $(, $arg:expr)* $(,)?) => {{
+    // The one type table, shared by every public form below. `$extra` is the
+    // tail of the turbofish, so a caller whose `$func` carries further generic
+    // parameters (an inferred closure type, say) can leave them to inference
+    // instead of forcing a second copy of this table.
+    (@table $id:expr, $func:ident, [$($extra:tt)*] $(, $arg:expr)* $(,)?) => {{
         match $id {
-            $crate::PixelId::UInt8 | $crate::PixelId::VectorUInt8 => $func::<u8>($($arg),*),
-            $crate::PixelId::Int8 | $crate::PixelId::VectorInt8 => $func::<i8>($($arg),*),
-            $crate::PixelId::UInt16 | $crate::PixelId::VectorUInt16 => $func::<u16>($($arg),*),
-            $crate::PixelId::Int16 | $crate::PixelId::VectorInt16 => $func::<i16>($($arg),*),
-            $crate::PixelId::UInt32 | $crate::PixelId::VectorUInt32 => $func::<u32>($($arg),*),
-            $crate::PixelId::Int32 | $crate::PixelId::VectorInt32 => $func::<i32>($($arg),*),
-            $crate::PixelId::UInt64 | $crate::PixelId::VectorUInt64 => $func::<u64>($($arg),*),
-            $crate::PixelId::Int64 | $crate::PixelId::VectorInt64 => $func::<i64>($($arg),*),
+            $crate::PixelId::UInt8
+            | $crate::PixelId::VectorUInt8 => $func::<u8 $($extra)*>($($arg),*),
+            $crate::PixelId::Int8
+            | $crate::PixelId::VectorInt8 => $func::<i8 $($extra)*>($($arg),*),
+            $crate::PixelId::UInt16
+            | $crate::PixelId::VectorUInt16 => $func::<u16 $($extra)*>($($arg),*),
+            $crate::PixelId::Int16
+            | $crate::PixelId::VectorInt16 => $func::<i16 $($extra)*>($($arg),*),
+            $crate::PixelId::UInt32
+            | $crate::PixelId::VectorUInt32 => $func::<u32 $($extra)*>($($arg),*),
+            $crate::PixelId::Int32
+            | $crate::PixelId::VectorInt32 => $func::<i32 $($extra)*>($($arg),*),
+            $crate::PixelId::UInt64
+            | $crate::PixelId::VectorUInt64 => $func::<u64 $($extra)*>($($arg),*),
+            $crate::PixelId::Int64
+            | $crate::PixelId::VectorInt64 => $func::<i64 $($extra)*>($($arg),*),
             $crate::PixelId::Float32
             | $crate::PixelId::ComplexFloat32
-            | $crate::PixelId::VectorFloat32 => $func::<f32>($($arg),*),
+            | $crate::PixelId::VectorFloat32 => $func::<f32 $($extra)*>($($arg),*),
             $crate::PixelId::Float64
             | $crate::PixelId::ComplexFloat64
-            | $crate::PixelId::VectorFloat64 => $func::<f64>($($arg),*),
+            | $crate::PixelId::VectorFloat64 => $func::<f64 $($extra)*>($($arg),*),
         }
     }};
+    ($id:expr, $func:ident $(, $arg:expr)* $(,)?) => {
+        $crate::dispatch_scalar!(@table $id, $func, [] $(, $arg)*)
+    };
+}
+
+/// [`dispatch_scalar!`] for a `$func` that is generic over the scalar type **and**
+/// over further parameters left to inference — typically a closure type, which
+/// cannot be named and so cannot be written into a turbofish.
+///
+/// Switches on the same [`PixelId`] table. The dispatched scalar type is always
+/// the **first** generic parameter of `$func`; `$infer` supplies the rest as
+/// `_`, one per remaining parameter:
+///
+/// ```text
+/// dispatch_scalar_infer!([, _]    id, f, a)  =>  f::<u8, _>(a)
+/// dispatch_scalar_infer!([, _, _] id, f, a)  =>  f::<u8, _, _>(a)
+/// ```
+///
+/// [`crate::fused::map_pixels`] nests two of these to monomorphize its pass over
+/// the *(input, output)* type pair while the caller's `f64 -> f64` closure stays
+/// a generic parameter — so the inner loop keeps no dynamic dispatch.
+#[macro_export]
+macro_rules! dispatch_scalar_infer {
+    ([$($infer:tt)*] $id:expr, $func:ident $(, $arg:expr)* $(,)?) => {
+        $crate::dispatch_scalar!(@table $id, $func, [$($infer)*] $(, $arg)*)
+    };
 }

@@ -73,7 +73,8 @@
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
-    Image, Neighborhood, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition,
+    Image, NeighborhoodIterator, PixelId, Stencil, WindowView, ZeroFluxNeumannBoundaryCondition,
+    parallel,
 };
 
 /// `CurvatureNDAnisotropicDiffusionFunction::m_MIN_NORM`, the additive floor
@@ -115,22 +116,64 @@ fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result
     let iter =
         NeighborhoodIterator::<f64, _>::new(snapshot, &radius, ZeroFluxNeumannBoundaryCondition)?;
 
+    // This is the one place in the module that is a **reduction across pixels**,
+    // not a map: `accumulator` sums one squared term per pixel *and axis* over the
+    // whole volume, and `f64` addition is not associative, so a rayon `fold`/`sum`
+    // would make the result depend on how the work happened to be split.
+    //
+    // It therefore goes through `map_rows_fold_in_order`, which is the only
+    // reduction seam in this port that is bit-stable by construction: the per-pixel
+    // terms are computed in parallel into that pixel's own row, and the `+=` runs
+    // on one thread, over the rows in index order. `accumulator` sees the identical
+    // addition sequence the serial loop fed it — pixel by pixel, axis by axis —
+    // so the mean is bit-identical at any thread count, and `combine` is never
+    // handed to rayon, so a later caller cannot re-associate it by accident.
+    let size = snapshot.size();
     let mut accumulator = 0.0f64;
     let mut counter = 0usize;
-    let mut off = vec![0i64; dim];
 
-    for (_, nb) in iter {
-        counter += 1;
-        for (i, &s) in scale.iter().enumerate() {
-            off[i] = 1;
-            let plus = nb.get(&off);
-            off[i] = -1;
-            let minus = nb.get(&off);
-            off[i] = 0;
-            let val = (plus - minus) / -2.0 * s;
-            accumulator += val * val;
-        }
-    }
+    parallel::map_rows_fold_in_order(
+        snapshot.number_of_pixels(),
+        dim,
+        || (iter.window_scratch(), vec![0usize; dim], vec![0i64; dim]),
+        |(scratch, center, off), i, row| {
+            // Unrank the linear index into an ND center, dimension 0 fastest — the
+            // inverse of `Image::linear_index`, and the order the serial walk
+            // visited pixels in.
+            let mut rest = i;
+            for (c, &extent) in center.iter_mut().zip(size) {
+                *c = rest % extent;
+                rest /= extent;
+            }
+
+            // The window is **borrowed**, not materialized. This reduction's
+            // decomposition is fixed by `map_rows_fold_in_order` rather than by the
+            // iterator's own walk, so `par_map_window` cannot serve it — but
+            // `with_window_at` can, and `scratch` is touched only at the ~2% of
+            // centers whose window overhangs the image.
+            iter.with_window_at(center, scratch, |w| {
+                for (a, (&s, cell)) in scale.iter().zip(row.iter_mut()).enumerate() {
+                    off[a] = 1;
+                    let plus = w.get_offset(off);
+                    off[a] = -1;
+                    let minus = w.get_offset(off);
+                    off[a] = 0;
+                    let val = (plus - minus) / -2.0 * s;
+                    *cell = val * val;
+                }
+            });
+            true
+        },
+        |_, row| {
+            // One thread, rows in index order: `counter` advances once per pixel and
+            // `accumulator` takes the pixel's `dim` squared terms in axis order —
+            // exactly the sequence the serial loop produced.
+            counter += 1;
+            for &term in row {
+                accumulator += term;
+            }
+        },
+    );
 
     if counter == 0 {
         return Ok(0.0);
@@ -144,18 +187,18 @@ fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result
 /// cross-axis centered differences (`0.25·(dx[j] + dx_aug)²`), which is the
 /// "more robust technique for gradient magnitude estimation" the class doc
 /// refers to.
-fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+fn gradient_update<S: Stencil + ?Sized>(nb: &S, scale: &[f64], k: f64) -> f64 {
     let dim = scale.len();
-    let center = nb.center_value();
+    let center = nb.center();
     let mut off = vec![0i64; dim];
 
     // Centralized derivatives, one per dimension.
     let mut dx = vec![0.0f64; dim];
     for (i, d) in dx.iter_mut().enumerate() {
         off[i] = 1;
-        let plus = nb.get(&off);
+        let plus = nb.at(&off);
         off[i] = -1;
-        let minus = nb.get(&off);
+        let minus = nb.at(&off);
         off[i] = 0;
         *d = (plus - minus) / 2.0 * scale[i];
     }
@@ -163,9 +206,9 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
     let mut delta = 0.0f64;
     for i in 0..dim {
         off[i] = 1;
-        let plus_i = nb.get(&off);
+        let plus_i = nb.at(&off);
         off[i] = -1;
-        let minus_i = nb.get(&off);
+        let minus_i = nb.at(&off);
         off[i] = 0;
 
         // "Half" directional derivatives.
@@ -182,13 +225,13 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
             }
             off[i] = 1;
             off[j] = 1;
-            let aug_plus = nb.get(&off);
+            let aug_plus = nb.at(&off);
             off[j] = -1;
-            let aug_minus = nb.get(&off);
+            let aug_minus = nb.at(&off);
             off[i] = -1;
-            let dim_minus = nb.get(&off);
+            let dim_minus = nb.at(&off);
             off[j] = 1;
-            let dim_plus = nb.get(&off);
+            let dim_plus = nb.at(&off);
             off[i] = 0;
             off[j] = 0;
 
@@ -229,9 +272,9 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
 /// `(dx[j] + dx_aug)²`, with both terms produced the same way, so this port
 /// uses the un-negated centered difference for both and the square is
 /// identical.
-fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+fn curvature_update<S: Stencil + ?Sized>(nb: &S, scale: &[f64], k: f64) -> f64 {
     let dim = scale.len();
-    let center = nb.center_value();
+    let center = nb.center();
     let mut off = vec![0i64; dim];
 
     let mut dx_forward = vec![0.0f64; dim];
@@ -239,9 +282,9 @@ fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
     let mut dx = vec![0.0f64; dim];
     for i in 0..dim {
         off[i] = 1;
-        let plus = nb.get(&off);
+        let plus = nb.at(&off);
         off[i] = -1;
-        let minus = nb.get(&off);
+        let minus = nb.at(&off);
         off[i] = 0;
 
         dx_forward[i] = (plus - center) * scale[i];
@@ -260,13 +303,13 @@ fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
             }
             off[i] = 1;
             off[j] = 1;
-            let aug_plus = nb.get(&off);
+            let aug_plus = nb.at(&off);
             off[j] = -1;
-            let aug_minus = nb.get(&off);
+            let aug_minus = nb.at(&off);
             off[i] = -1;
-            let dim_minus = nb.get(&off);
+            let dim_minus = nb.at(&off);
             off[j] = 1;
-            let dim_plus = nb.get(&off);
+            let dim_plus = nb.at(&off);
             off[i] = 0;
             off[j] = 0;
 
@@ -314,7 +357,7 @@ fn diffuse(
     conductance_scaling_update_interval: u32,
     number_of_iterations: u32,
     use_image_spacing: bool,
-    update: fn(&Neighborhood<f64>, &[f64], f64) -> f64,
+    update: impl for<'w> Fn(&WindowView<'w, f64>, &[f64], f64) -> f64 + Sync + Send,
 ) -> Result<Image> {
     let pixel_id = img.pixel_id();
     if !matches!(pixel_id, PixelId::Float32 | PixelId::Float64) {
@@ -345,9 +388,21 @@ fn diffuse(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        for ((_, nb), v) in iter.zip(buf.iter_mut()) {
-            *v += time_step * update(&nb, &scale, k);
-        }
+        // Parallel over voxels, reading the **borrowed** window. Each voxel's update
+        // reads its own window in `snapshot` — a separate image, cloned from `buf`
+        // before the sweep — so no voxel reads another's new value: the sweep is a
+        // map, not a recurrence. The iteration loop stays sequential; each pass
+        // reads the whole previous one.
+        //
+        // The window used to be materialized into per-task scratch here, because
+        // `gradient_update`/`curvature_update` took a `&Neighborhood`. They now take
+        // a `Stencil`, so the borrowed window satisfies them and nothing is copied.
+        //
+        // Unlike `min_max_curvature_flow`'s sweep, this one has no `continue` to
+        // preserve: every voxel takes the `+=` unconditionally, so there is no skip
+        // that a `+= 0.0` could silently turn a stored `-0.0` into `+0.0`.
+        let deltas: Vec<f64> = iter.par_map_window(|_, w| time_step * update(&w, &scale, k));
+        parallel::for_each_mut(&mut buf, |i, v| *v += deltas[i]);
     }
 
     image_from_f64(pixel_id, &size, img, &buf)
@@ -381,7 +436,7 @@ pub fn gradient_anisotropic_diffusion(
         conductance_scaling_update_interval,
         number_of_iterations,
         use_image_spacing,
-        gradient_update,
+        |w, scale, k| gradient_update(w, scale, k),
     )
 }
 
@@ -412,7 +467,7 @@ pub fn curvature_anisotropic_diffusion(
         conductance_scaling_update_interval,
         number_of_iterations,
         use_image_spacing,
-        curvature_update,
+        |w, scale, k| curvature_update(w, scale, k),
     )
 }
 
@@ -796,5 +851,294 @@ mod tests {
         // Scale coefficients enter squared: halving them quarters the mean.
         let scaled = average_gradient_magnitude_squared(&img, &[0.5, 0.5]).unwrap();
         assert!((scaled - expected / 4.0).abs() < 1e-12);
+    }
+}
+
+/// Thread-count parity pins for the diffusion sweep **and** for the one true
+/// cross-pixel reduction in this crate's stencil work.
+///
+/// # Two different things are pinned here, and only one of them is a map
+///
+/// The sweep is a map: each voxel's delta is a function of its own window in the
+/// snapshot, so parallelizing it cannot reach the arithmetic. `-0.0` does not
+/// apply to it — unlike [`crate::min_max_curvature_flow`]'s sweep, there is no
+/// `continue` to preserve; every voxel takes the `+=` unconditionally, so no skip
+/// could be silently turned into a `+= 0.0` that flips a stored `-0.0`.
+///
+/// `average_gradient_magnitude_squared` is **not** a map. It sums one squared term
+/// per pixel *and* axis over the whole volume into a single `f64`, and `f64`
+/// addition is not associative: a rayon `fold`/`sum` would make the answer depend
+/// on how the work happened to be split, which is exactly the thing this port
+/// forbids. It goes through `parallel::map_rows_fold_in_order` instead — terms
+/// computed in parallel, the `+=` replayed on one thread in pixel order — and
+/// [`the_reduction_is_order_sensitive_and_thread_stable`] is the pin that this
+/// buys anything: it asserts both that the sum genuinely re-associates on this
+/// input (so a rayon fold *would* have moved it) and that the shipped
+/// reduction does not move.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{
+        PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
+    };
+    // The serial references below deliberately keep the OWNED window: they are
+    // copies of the loops that were deleted, and those loops materialized a
+    // `Neighborhood` per voxel. That the same `gradient_update`/`curvature_update`
+    // bodies can still be driven from an owned window — instantiated here as
+    // `gradient_update::<Neighborhood<f64>>` — is what makes them a valid reference
+    // for the borrowed-window code they are pinning.
+    use sitk_core::{Neighborhood, parallel};
+
+    const TIME_STEP: f64 = 0.0625;
+    const CONDUCTANCE: f64 = 3.0;
+    const ITERATIONS: u32 = 3;
+
+    // ---- the serial references: the exact loops that were deleted -----------
+
+    /// `average_gradient_magnitude_squared`, as the serial loop computed it:
+    /// one `accumulator +=` per pixel per axis, in pixel-then-axis order.
+    fn average_gradient_magnitude_squared_serial(snapshot: &Image, scale: &[f64]) -> f64 {
+        let dim = snapshot.dimension();
+        let radius = vec![1usize; dim];
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            snapshot,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        let mut accumulator = 0.0f64;
+        let mut counter = 0usize;
+        let mut off = vec![0i64; dim];
+
+        for (_, nb) in iter {
+            counter += 1;
+            for (i, &s) in scale.iter().enumerate() {
+                off[i] = 1;
+                let plus = nb.at(&off);
+                off[i] = -1;
+                let minus = nb.at(&off);
+                off[i] = 0;
+                let val = (plus - minus) / -2.0 * s;
+                accumulator += val * val;
+            }
+        }
+        if counter == 0 {
+            return 0.0;
+        }
+        accumulator / counter as f64
+    }
+
+    /// The exact serial `diffuse` loop that was deleted.
+    fn diffuse_serial(
+        img: &Image,
+        time_step: f64,
+        conductance_parameter: f64,
+        interval: u32,
+        iterations: u32,
+        use_image_spacing: bool,
+        update: fn(&Neighborhood<f64>, &[f64], f64) -> f64,
+    ) -> Vec<f64> {
+        let dim = img.dimension();
+        let scale = scale_coefficients(img, use_image_spacing);
+        let size = img.size().to_vec();
+        let radius = vec![1usize; dim];
+        let mut buf = img.to_f64_vec().unwrap();
+        let mut k = 0.0f64;
+
+        for elapsed in 0..iterations {
+            let mut snapshot = Image::from_vec(&size, buf.clone()).unwrap();
+            snapshot.copy_geometry_from(img);
+
+            if elapsed % interval == 0 {
+                let average = average_gradient_magnitude_squared_serial(&snapshot, &scale);
+                k = average * conductance_parameter * conductance_parameter * -2.0;
+            }
+
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &snapshot,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+            for ((_, nb), v) in iter.zip(buf.iter_mut()) {
+                *v += time_step * update(&nb, &scale, k);
+            }
+        }
+        buf
+    }
+
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    // ---- non-vacuity --------------------------------------------------------
+
+    #[test]
+    fn the_window_sum_order_is_observable() {
+        let img = volume(PixelId::Float64);
+        assert!(
+            window_sum_order_is_observable(&img, &[1, 1, 1]),
+            "no voxel changed bits when its window sum was reversed — this volume cannot \
+             observe a re-association, so the sweep pins below would pass even on an update \
+             that summed its window in a different order"
+        );
+    }
+
+    /// The pin that earns `map_rows_fold_in_order` its place.
+    ///
+    /// Two assertions, and the first is what makes the second mean something:
+    ///
+    /// 1. **The reduction really does re-associate on this input.** Summing the
+    ///    same per-pixel terms in reverse order gives a *different* `f64` — so a
+    ///    rayon `fold`/`sum`, whose split depends on thread count and steal order,
+    ///    could have landed on a different answer here. Without this, the second
+    ///    assertion would hold trivially and prove nothing about the seam.
+    ///
+    /// 2. **The shipped reduction does not move.** `average_gradient_magnitude_-
+    ///    squared` is bit-identical to the serial `accumulator +=` loop at 1, 4, 48
+    ///    and 96 threads. It can be: the terms are computed in parallel into each
+    ///    pixel's own row, and the `+=` is replayed on one thread over the rows in
+    ///    index order, so the accumulator sees the identical addition sequence the
+    ///    serial loop fed it — a fixed decomposition that is a function of the input
+    ///    length alone, never of how many threads showed up.
+    #[test]
+    fn the_reduction_is_order_sensitive_and_thread_stable() {
+        let img = volume(PixelId::Float64);
+        let scale = scale_coefficients(&img, true);
+        let dim = img.dimension();
+
+        // (1) the sum is genuinely non-associative on this data
+        let radius = vec![1usize; dim];
+        let iter =
+            NeighborhoodIterator::<f64, _>::new(&img, &radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        let mut terms = Vec::with_capacity(img.number_of_pixels() * dim);
+        let mut off = vec![0i64; dim];
+        for (_, nb) in iter {
+            for (i, &s) in scale.iter().enumerate() {
+                off[i] = 1;
+                let plus = nb.at(&off);
+                off[i] = -1;
+                let minus = nb.at(&off);
+                off[i] = 0;
+                let val = (plus - minus) / -2.0 * s;
+                terms.push(val * val);
+            }
+        }
+        let forward: f64 = terms.iter().fold(0.0, |a, b| a + b);
+        let backward: f64 = terms.iter().rev().fold(0.0, |a, b| a + b);
+        assert_ne!(
+            forward.to_bits(),
+            backward.to_bits(),
+            "summing the reduction's terms forwards and backwards gave the identical f64, so \
+             this input cannot observe a re-association: a rayon fold would have passed here \
+             too, and the thread-stability assertion below would prove nothing about the \
+             ordered seam"
+        );
+
+        // (2) the shipped reduction is bit-identical to the serial fold, at every
+        //     thread count
+        let expected = average_gradient_magnitude_squared_serial(&img, &scale);
+        for threads in THREADS {
+            let got = parallel::with_threads(threads, || {
+                average_gradient_magnitude_squared(&img, &scale)
+            })
+            .unwrap();
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "average_gradient_magnitude_squared moved with {threads} threads: {got:?} vs \
+                 serial {expected:?}"
+            );
+        }
+    }
+
+    // ---- the pins -----------------------------------------------------------
+
+    #[test]
+    fn gradient_anisotropic_diffusion_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for interval in [1u32, 2] {
+                let expected = narrowed_like(
+                    &img,
+                    &diffuse_serial(
+                        &img,
+                        TIME_STEP,
+                        CONDUCTANCE,
+                        interval,
+                        ITERATIONS,
+                        true,
+                        gradient_update::<Neighborhood<f64>>,
+                    ),
+                );
+                for threads in THREADS {
+                    let got = parallel::with_threads(threads, || {
+                        gradient_anisotropic_diffusion(
+                            &img,
+                            TIME_STEP,
+                            CONDUCTANCE,
+                            interval,
+                            ITERATIONS,
+                            true,
+                        )
+                    })
+                    .unwrap()
+                    .to_f64_vec()
+                    .unwrap();
+                    assert_bits_eq(
+                        &got,
+                        &expected,
+                        &format!(
+                            "gradient_anisotropic_diffusion({pixel:?}, interval={interval}, \
+                             {threads} threads)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curvature_anisotropic_diffusion_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            let expected = narrowed_like(
+                &img,
+                &diffuse_serial(
+                    &img,
+                    TIME_STEP,
+                    CONDUCTANCE,
+                    1,
+                    ITERATIONS,
+                    true,
+                    curvature_update::<Neighborhood<f64>>,
+                ),
+            );
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    curvature_anisotropic_diffusion(
+                        &img,
+                        TIME_STEP,
+                        CONDUCTANCE,
+                        1,
+                        ITERATIONS,
+                        true,
+                    )
+                })
+                .unwrap()
+                .to_f64_vec()
+                .unwrap();
+                assert_bits_eq(
+                    &got,
+                    &expected,
+                    &format!("curvature_anisotropic_diffusion({pixel:?}, {threads} threads)"),
+                );
+            }
+        }
     }
 }

@@ -38,6 +38,9 @@
 //! The struct-style filter API and the remaining ~290 filters arrive with the
 //! yaml codegen in a later phase.
 
+#[cfg(test)]
+pub(crate) mod stencil_test_support;
+
 pub mod adaptive_histogram_equalization;
 pub mod anisotropic_diffusion;
 pub mod attribute_morphology;
@@ -293,7 +296,7 @@ pub use scalar_connected_component::scalar_connected_component;
 pub use scalar_to_rgb_colormap::{Colormap, scalar_to_rgb_colormap};
 pub use sharpening::{laplacian_sharpening, unsharp_mask};
 pub use shrink::{bin_shrink, shrink};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar, parallel};
 pub use slic::{SlicResult, SlicSettings, slic};
 pub use slice::slice;
 pub use smoothing::smooth_gaussian;
@@ -380,7 +383,9 @@ impl_binary_functor_float!(f32, f64);
 // ---- shared helpers -------------------------------------------------------
 
 fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Result<Image> {
-    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
+    // The narrowing exit path of most filters: an elementwise `T::from_f64`
+    // cast, bit-identical to the sequential map at any thread count.
+    let out: Vec<T> = parallel::map_slice(vals, |&v| T::from_f64(v));
     let mut img = Image::from_vec(size, out)?;
     img.copy_geometry_from(geom);
     Ok(img)
@@ -758,25 +763,57 @@ pub fn binary_threshold(
 
 /// `RescaleIntensityImageFilter`: linearly remap the actual `[min, max]` of the
 /// image onto `[output_min, output_max]`. Output pixel type follows input.
+///
+/// With the `cuda` feature on, this tries `sitk-cuda` first and falls back to
+/// the CPU implementation below whenever the GPU declines — which includes
+/// every environmental failure (no driver, no device, NVRTC failure, out of
+/// memory) as well as an unsupported pixel type or a degenerate input. The GPU
+/// is therefore never able to turn a working call into a failing one, and the
+/// user-visible error for a degenerate image stays [`FilterError::DegenerateRange`],
+/// raised below.
 pub fn rescale_intensity(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
-    let vals = img.to_f64_vec()?;
-    if vals.is_empty() {
+    #[cfg(feature = "cuda")]
+    if let Some(gpu) = sitk_cuda::try_rescale_intensity(img, output_min, output_max) {
+        return Ok(gpu);
+    }
+    rescale_intensity_cpu(img, output_min, output_max)
+}
+
+/// The CPU implementation of [`rescale_intensity`]; also the fallback the GPU
+/// path defers to.
+///
+/// Public because the GPU correctness gate in `doc/bench-spec.md` is defined
+/// against the CPU result, and with the `cuda` feature on
+/// [`rescale_intensity`] itself no longer reaches this code.
+pub fn rescale_intensity_cpu(img: &Image, output_min: f64, output_max: f64) -> Result<Image> {
+    if img.number_of_pixels() == 0 {
         return Err(FilterError::DegenerateRange);
     }
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &v in &vals {
-        lo = lo.min(v);
-        hi = hi.max(v);
-    }
+    // Two passes over the *native* buffer, with no `f64` copy of the volume in
+    // between. `min`/`max` select an element of the input set, so the chunked
+    // scan returns the same `f64` bits as the former sequential
+    // `lo.min(v)` / `hi.max(v)` fold, at any thread count; and the map widens,
+    // scales and narrows in-register, so every stored value is the `from_f64` of
+    // the same `f64` the staged form computed. See `sitk_core::fused`.
+    let (lo, hi) = min_max_pixels(img)?.ok_or(FilterError::DegenerateRange)?;
     if lo == hi {
         return Err(FilterError::DegenerateRange);
     }
     let scale = (output_max - output_min) / (hi - lo);
-    let out: Vec<f64> = vals
-        .iter()
-        .map(|&v| (v - lo) * scale + output_min)
-        .collect();
-    image_from_f64(img.pixel_id(), img.size(), img, &out)
+    Ok(sitk_core::map_pixels(img, img.pixel_id(), |v| {
+        (v - lo) * scale + output_min
+    })?)
+}
+
+/// `parallel::min_max` over an image's own pixel buffer — no `f64` copy.
+///
+/// `scalar_slice` is the scalar-only seam: a vector or complex image errors here
+/// rather than being silently read as its component type.
+fn min_max_pixels(img: &Image) -> Result<Option<(f64, f64)>> {
+    fn scan<T: Scalar>(img: &Image) -> Result<Option<(f64, f64)>> {
+        Ok(parallel::min_max(img.scalar_slice::<T>()?))
+    }
+    dispatch_scalar!(img.pixel_id(), scan, img)
 }
 
 // ---- reductions -----------------------------------------------------------

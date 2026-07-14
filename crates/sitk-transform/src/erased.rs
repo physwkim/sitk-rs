@@ -310,6 +310,14 @@ impl TransformBase for Transform {
         dispatch!(self, t => t.dimension())
     }
 
+    /// Delegated to the variant, which is where the knowledge of "is my arithmetic
+    /// literally `mat_vec(M, p) + b`" belongs. [`Transform::matrix_offset_map`] is derived
+    /// from this, so there is exactly one place that decides, per transform, whether its
+    /// point map can be reproduced on the bits.
+    fn point_map_stages(&self) -> Option<Vec<crate::matrix_offset::MatrixOffsetMap>> {
+        dispatch!(self, t => t.point_map_stages())
+    }
+
     fn is_linear(&self) -> bool {
         dispatch!(self, t => t.is_linear())
     }

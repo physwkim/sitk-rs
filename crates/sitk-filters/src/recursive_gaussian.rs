@@ -9,31 +9,22 @@
 //! a truncated Gaussian kernel — this approximates the continuous Gaussian
 //! (or its derivative) by a fourth-order recursive filter whose cost is
 //! independent of `sigma`, and it reproduces ITK's arithmetic
-//! operation-for-operation. The coefficients are the improved Deriche set
-//! from Farnebäck & Westin, *"Improving Deriche-style Recursive Gaussian
-//! Filters"* (J. Math. Imaging Vis. 2006, Table 3): three columns of
-//! `A1,B1,A2,B2` — one per [`GaussianOrder`] — sharing the same poles
-//! `W1,L1,W2,L2`, exactly as ITK's `SetUp` / `ComputeNCoefficients` /
-//! `ComputeDCoefficients` / `ComputeRemainingCoefficients` compute them.
+//! operation-for-operation.
 //!
-//! The forward/backward recursion itself
-//! (`RecursiveSeparableImageFilter::FilterDataArray`, ported here as
-//! the private `filter_line`/`filter_axis`) does not depend on the order at
-//! all — only the coefficients `Coefficients::new` builds do, so all three
-//! orders share the same recursion code:
-//! - **Normalization.** `ZeroOrder` scales its numerator for unity DC gain
-//!   (`alpha0`); `FirstOrder`/`SecondOrder` instead scale so the filter's
-//!   gain matches the true derivative operator (`alpha1`/`alpha2`, derived
-//!   from `SD`/`DD`/`ED` — the recursion denominator and its 1st/2nd
-//!   "z-derivative" weighted sums). `SecondOrder` additionally blends the
-//!   `ZeroOrder` and `SecondOrder` Farnebäck columns through a `beta`
-//!   coefficient so the result has zero net DC gain.
-//! - **Symmetry.** `ZeroOrder`/`SecondOrder` use a *symmetric* anti-causal
-//!   numerator (`Mi = Ni - Di·N0`, matching a filter whose true impulse
-//!   response is even); `FirstOrder` is *anti-symmetric*
-//!   (`Mi = -(Ni - Di·N0)`, with `M4`'s sign flipped too), matching an odd
-//!   impulse response. This is ITK's `ComputeRemainingCoefficients(symmetric)`
-//!   flag.
+//! **The coefficients are not here.** They are
+//! [`sitk_core::deriche::Coefficients`] — ITK's `SetUp` / `ComputeDCoefficients`
+//! / `ComputeNCoefficients` / `ComputeRemainingCoefficients`, over the improved
+//! Deriche set of Farnebäck & Westin (J. Math. Imaging Vis. 2006, Table 3). They
+//! sit in `sitk-core` rather than in this module because `sitk-cuda`'s device
+//! pyramid runs the same recursion on the GPU and needs the same twenty numbers,
+//! and `sitk-filters` depends on `sitk-cuda` — so `sitk-core` is the only crate
+//! both can reach. See that module's docs for the normalization and symmetry
+//! rules each [`GaussianOrder`] follows.
+//!
+//! What *is* here is the recursion the coefficients drive
+//! (`RecursiveSeparableImageFilter::FilterDataArray`, ported as the private
+//! [`filter_line`]/[`filter_axis`]). It does not depend on the order at all —
+//! only the coefficients do — so all three orders share this one recursion.
 //!
 //! `NormalizeAcrossScale` (Lindeberg scale-space normalization) multiplies
 //! `FirstOrder`/`SecondOrder` output by an extra `sigma^order` so a feature's
@@ -75,20 +66,10 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use sitk_core::{Image, PixelId};
+use sitk_core::deriche::Coefficients;
+use sitk_core::{Image, PixelId, parallel};
 
-/// Order of the Gaussian derivative approximated by the recursive filter,
-/// matching ITK's `RecursiveGaussianImageFilterEnums::GaussianOrder`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GaussianOrder {
-    /// Convolve with the Gaussian itself (smoothing). ITK's `ZeroOrder`.
-    ZeroOrder,
-    /// Convolve with the first derivative of the Gaussian. ITK's `FirstOrder`.
-    FirstOrder,
-    /// Convolve with the second derivative of the Gaussian. ITK's
-    /// `SecondOrder`.
-    SecondOrder,
-}
+pub use sitk_core::deriche::GaussianOrder;
 
 /// Gaussian-smooth `img` with a per-dimension physical-space `sigma`, using
 /// the recursive (IIR) filter that ports `itk::RecursiveGaussianImageFilter`
@@ -145,27 +126,61 @@ pub(crate) fn recursive_gaussian_f64(
     normalize_across_scale: bool,
 ) -> Result<Vec<f64>> {
     let dim = img.dimension();
-    if sigma.len() != dim {
-        return Err(FilterError::DimensionLength {
-            expected: dim,
-            got: sigma.len(),
-        });
-    }
-    if orders.len() != dim {
-        return Err(FilterError::DimensionLength {
-            expected: dim,
-            got: orders.len(),
-        });
-    }
-    if sigma.iter().any(|&s| s < 0.0) {
-        return Err(FilterError::InvalidSigma(sigma.to_vec()));
-    }
+    // Validated before `to_f64_vec`, so a bad `sigma`/`orders` length still
+    // reports itself ahead of a non-scalar pixel type, exactly as it did when
+    // this function held the axis loop itself.
+    check_sigma_and_orders(dim, sigma, orders)?;
 
     let size = img.size().to_vec();
     let spacing = img.spacing().to_vec();
-    let strides = strides(&size);
     let mut buf = img.to_f64_vec()?;
+    recursive_gaussian_f64_into(
+        &mut buf,
+        &size,
+        &spacing,
+        sigma,
+        orders,
+        normalize_across_scale,
+    )?;
+    Ok(buf)
+}
 
+/// [`recursive_gaussian_f64`] run on a buffer the **caller owns** — the axis
+/// loop, and the only place it lives.
+///
+/// [`recursive_gaussian_f64`] is this function plus `to_f64_vec`: one recursion,
+/// not two that can drift.
+///
+/// It exists because the recursion is separable and a caller composes it: a
+/// gradient magnitude runs the whole `dim`-axis cascade once *per axis*, so
+/// anything the recursion allocates internally, that caller allocates `dim`
+/// times. Every one of those is a full volume — 134 MB at 256³ — and a fresh
+/// volume is not merely a `malloc`: its pages are faulted in one at a time under
+/// a kernel lock, which is why [`sitk_core::parallel::map_indexed`]'s allocating
+/// form measures a parallel efficiency of 0.09 against 0.90 for the same map
+/// writing into a buffer that already exists. Handing the recursion a `&mut
+/// [f64]` is what makes those volumes unwritable rather than merely unwise: a
+/// caller holding a slice has no way to allocate one.
+///
+/// `buf` is `size.iter().product()` elements, dimension-0-fastest, and is
+/// filtered **in place**. `spacing` is the image's, in the same axis order; the
+/// recursion reparametrizes as `sigma[d] / spacing[d]`.
+///
+/// Errors if `sigma` or `orders` has the wrong length, any `sigma` value is
+/// negative, or a filtered axis (`sigma[d] > 0`) has fewer than four pixels.
+pub(crate) fn recursive_gaussian_f64_into(
+    buf: &mut [f64],
+    size: &[usize],
+    spacing: &[f64],
+    sigma: &[f64],
+    orders: &[GaussianOrder],
+    normalize_across_scale: bool,
+) -> Result<()> {
+    let dim = size.len();
+    check_sigma_and_orders(dim, sigma, orders)?;
+    debug_assert_eq!(buf.len(), size.iter().product::<usize>());
+
+    let strides = strides(size);
     for d in 0..dim {
         if sigma[d] <= 0.0 {
             continue;
@@ -182,10 +197,105 @@ pub(crate) fn recursive_gaussian_f64(
             sigma[d],
             normalize_across_scale,
         );
-        filter_axis(&mut buf, &size, &strides, d, &coeff);
+        filter_axis(buf, size, &strides, d, &coeff);
     }
 
-    Ok(buf)
+    Ok(())
+}
+
+/// [`recursive_gaussian_f64_into`] reading its input from `src` instead of from
+/// the buffer it writes — for the caller that runs the whole cascade **once per
+/// axis** off one unchanging input.
+///
+/// That caller (a gradient magnitude, a Laplacian, a per-axis derivative) cannot
+/// use the in-place form directly: the recursion destroys its input, so every
+/// axis needs its own copy of `src`. Copying it is what this replaces, and the
+/// copy was not free — `work.copy_from_slice(&src)` is `std`'s **single-threaded**
+/// `memcpy`, and at 512³ it is also where a freshly-allocated `dst` gets its 1.07 GB
+/// of pages faulted in, on one core. Measured, that copy cost 517 ms on the first
+/// axis and 684 ms across the three, **42% of the whole filter**, against 80 ms for
+/// the *parallel* widening that fills a buffer of exactly the same size.
+///
+/// So the copy is not made parallel here, it is **removed**: the first filtered
+/// axis reads `src` and writes `dst`, and every later axis runs in place on `dst`,
+/// exactly as before. `dst`'s pages are then first touched by a parallel line pass
+/// rather than by a serial `memcpy`.
+///
+/// This cannot move a bit. [`filter_line`] runs on a line that is fully gathered
+/// into a contiguous scratch buffer before it is called, and it writes the line
+/// back only after it returns, so each output element is computed from exactly the
+/// values it was computed from before, in the same order — the only thing that
+/// changed is *which buffer those values were read out of*.
+///
+/// `src` and `dst` must be the same length; `dst`'s prior contents are ignored.
+/// If no axis is filtered at all (every `sigma[d] <= 0`), the result is `src`
+/// unchanged, so `dst` is filled from `src` — that is the one case where a copy is
+/// still the correct answer, because there is no pass to fold it into.
+pub(crate) fn recursive_gaussian_f64_from_into(
+    src: &[f64],
+    dst: &mut [f64],
+    size: &[usize],
+    spacing: &[f64],
+    sigma: &[f64],
+    orders: &[GaussianOrder],
+    normalize_across_scale: bool,
+) -> Result<()> {
+    let dim = size.len();
+    check_sigma_and_orders(dim, sigma, orders)?;
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(dst.len(), size.iter().product::<usize>());
+
+    let strides = strides(size);
+    let mut wrote_dst = false;
+    for d in 0..dim {
+        if sigma[d] <= 0.0 {
+            continue;
+        }
+        if size[d] < 4 {
+            return Err(FilterError::AxisTooShortForRecursion {
+                axis: d,
+                len: size[d],
+            });
+        }
+        let coeff = Coefficients::new(
+            orders[d],
+            sigma[d] / spacing[d],
+            sigma[d],
+            normalize_across_scale,
+        );
+        if wrote_dst {
+            filter_axis(dst, size, &strides, d, &coeff);
+        } else {
+            filter_axis_from(src, dst, size, &strides, d, &coeff);
+            wrote_dst = true;
+        }
+    }
+
+    if !wrote_dst {
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+
+/// The `sigma`/`orders` shape checks both entry points above make, in the order
+/// they have always been made in.
+fn check_sigma_and_orders(dim: usize, sigma: &[f64], orders: &[GaussianOrder]) -> Result<()> {
+    if sigma.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: sigma.len(),
+        });
+    }
+    if orders.len() != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: orders.len(),
+        });
+    }
+    if sigma.iter().any(|&s| s < 0.0) {
+        return Err(FilterError::InvalidSigma(sigma.to_vec()));
+    }
+    Ok(())
 }
 
 /// `SmoothingRecursiveGaussianImageFilter`
@@ -280,251 +390,76 @@ pub fn smoothing_recursive_gaussian(
     }
 }
 
-/// The coefficients of the fourth-order recursion for one `sigmad`
-/// (index-space sigma) and [`GaussianOrder`]. Field names mirror ITK's
-/// members: `n*` numerator (causal), `d*` denominator (shared), `m*` numerator
-/// of the anti-causal pass, `bn*`/`bm*` the boundary coefficients.
-#[derive(Clone, Copy, Debug)]
-struct Coefficients {
-    n0: f64,
-    n1: f64,
-    n2: f64,
-    n3: f64,
-    d1: f64,
-    d2: f64,
-    d3: f64,
-    d4: f64,
-    m1: f64,
-    m2: f64,
-    m3: f64,
-    m4: f64,
-    bn1: f64,
-    bn2: f64,
-    bn3: f64,
-    bn4: f64,
-    bm1: f64,
-    bm2: f64,
-    bm3: f64,
-    bm4: f64,
-}
-
-impl Coefficients {
-    /// Coefficients of the fourth-order recursion for one `sigmad`
-    /// (index-space sigma) and [`GaussianOrder`], reproducing ITK's
-    /// `SetUp(order)` in full: `ComputeDCoefficients` (order-independent) →
-    /// `ComputeNCoefficients` (one or two Farnebäck columns, depending on the
-    /// order) → the order-specific `alpha0`/`alpha1`/`alpha2` normalization →
-    /// `ComputeRemainingCoefficients(symmetric)`.
-    ///
-    /// `sigma` is the *physical* sigma (used only by the
-    /// `normalize_across_scale` scale-space factor, `sigma^order`); `sigmad`
-    /// is `sigma / spacing`, the index-space sigma the trigonometric and
-    /// exponential terms are actually evaluated at.
-    fn new(order: GaussianOrder, sigmad: f64, sigma: f64, normalize_across_scale: bool) -> Self {
-        // Improved Deriche constants (Farnebäck & Westin 2006, Table 3): the
-        // poles (W1,L1,W2,L2) are shared by all three orders; A1,B1,A2,B2
-        // hold one column per order ([ZeroOrder, FirstOrder, SecondOrder]),
-        // read by ITK's `SetUp` as e.g. `A1[static_cast<int>(m_Order)]`.
-        const W1: f64 = 0.6681;
-        const L1: f64 = -1.3932;
-        const W2: f64 = 2.0787;
-        const L2: f64 = -1.3732;
-        const A1: [f64; 3] = [1.3530, -0.6724, -1.3563];
-        const B1: [f64; 3] = [1.8151, -3.4327, 5.2318];
-        const A2: [f64; 3] = [-0.3531, 0.6724, 0.3446];
-        const B2: [f64; 3] = [0.0902, 0.6100, -2.2355];
-
-        // ComputeDCoefficients: the shared denominator (recursion)
-        // coefficients, plus SD/DD/ED — order-independent, since W1,L1,W2,L2
-        // are shared by every column.
-        let (d1, d2, d3, d4, sd, dd, ed) = compute_d_coefficients(sigmad, W1, L1, W2, L2);
-
-        // ComputeNCoefficients plus the order-specific normalization (SetUp's
-        // switch on m_Order), producing the final N coefficients and the
-        // `symmetric` flag ComputeRemainingCoefficients needs.
-        let (n0, n1, n2, n3, symmetric) = match order {
-            GaussianOrder::ZeroOrder => {
-                let (n0, n1, n2, n3, sn, _dn, _en) =
-                    compute_n_coefficients(sigmad, A1[0], B1[0], W1, L1, A2[0], B2[0], W2, L2);
-                // Unity DC gain; `across_scale_normalization` is always 1 for
-                // the zero order — ITK never rescales it by sigma.
-                let alpha0 = 2.0 * sn / sd - n0;
-                (n0 / alpha0, n1 / alpha0, n2 / alpha0, n3 / alpha0, true)
-            }
-            GaussianOrder::FirstOrder => {
-                let (n0, n1, n2, n3, sn, dn, _en) =
-                    compute_n_coefficients(sigmad, A1[1], B1[1], W1, L1, A2[1], B2[1], W2, L2);
-                let alpha1 = 2.0 * (sn * dd - dn * sd) / (sd * sd);
-                let across_scale = if normalize_across_scale { sigma } else { 1.0 };
-                let scale = across_scale / alpha1;
-                (n0 * scale, n1 * scale, n2 * scale, n3 * scale, false)
-            }
-            GaussianOrder::SecondOrder => {
-                let (n0_0, n1_0, n2_0, n3_0, sn0, dn0, en0) =
-                    compute_n_coefficients(sigmad, A1[0], B1[0], W1, L1, A2[0], B2[0], W2, L2);
-                let (n0_2, n1_2, n2_2, n3_2, sn2, dn2, en2) =
-                    compute_n_coefficients(sigmad, A1[2], B1[2], W1, L1, A2[2], B2[2], W2, L2);
-                // Blend the ZeroOrder and SecondOrder Farnebäck columns so
-                // the result has zero net DC gain.
-                let beta = -(2.0 * sn2 - sd * n0_2) / (2.0 * sn0 - sd * n0_0);
-                let n0 = n0_2 + beta * n0_0;
-                let n1 = n1_2 + beta * n1_0;
-                let n2 = n2_2 + beta * n2_0;
-                let n3 = n3_2 + beta * n3_0;
-                let sn = sn2 + beta * sn0;
-                let dn = dn2 + beta * dn0;
-                let en = en2 + beta * en0;
-
-                let alpha2 = (en * sd * sd - ed * sn * sd - 2.0 * dn * dd * sd
-                    + 2.0 * dd * dd * sn)
-                    / (sd * sd * sd);
-                let across_scale = if normalize_across_scale {
-                    sigma * sigma
-                } else {
-                    1.0
-                };
-                let scale = across_scale / alpha2;
-                (n0 * scale, n1 * scale, n2 * scale, n3 * scale, true)
-            }
-        };
-
-        // ComputeRemainingCoefficients(symmetric): the anti-causal numerator
-        // M and the causal/anti-causal boundary coefficients.
-        let (m1, m2, m3, m4) = if symmetric {
-            (n1 - d1 * n0, n2 - d2 * n0, n3 - d3 * n0, -d4 * n0)
-        } else {
-            (-(n1 - d1 * n0), -(n2 - d2 * n0), -(n3 - d3 * n0), d4 * n0)
-        };
-
-        let sn = n0 + n1 + n2 + n3;
-        let sm = m1 + m2 + m3 + m4;
-
-        let bn1 = d1 * sn / sd;
-        let bn2 = d2 * sn / sd;
-        let bn3 = d3 * sn / sd;
-        let bn4 = d4 * sn / sd;
-
-        let bm1 = d1 * sm / sd;
-        let bm2 = d2 * sm / sd;
-        let bm3 = d3 * sm / sd;
-        let bm4 = d4 * sm / sd;
-
-        Coefficients {
-            n0,
-            n1,
-            n2,
-            n3,
-            d1,
-            d2,
-            d3,
-            d4,
-            m1,
-            m2,
-            m3,
-            m4,
-            bn1,
-            bn2,
-            bn3,
-            bn4,
-            bm1,
-            bm2,
-            bm3,
-            bm4,
-        }
-    }
-}
-
-/// Port of `ComputeDCoefficients`: the shared fourth-order recursion
-/// denominator coefficients (`D1..D4`), plus `SD` (the sum `1+D1+D2+D3+D4`),
-/// `DD` (the same terms weighted `0,1,2,3,4`) and `ED` (weighted
-/// `0,1,4,9,16`) — the sums the order-specific `alpha1`/`alpha2`
-/// normalization in [`Coefficients::new`] needs. Order-independent: `W1,L1,
-/// W2,L2` (the shared poles) are the only inputs besides `sigmad`.
-fn compute_d_coefficients(
-    sigmad: f64,
-    w1: f64,
-    l1: f64,
-    w2: f64,
-    l2: f64,
-) -> (f64, f64, f64, f64, f64, f64, f64) {
-    let cos1 = (w1 / sigmad).cos();
-    let cos2 = (w2 / sigmad).cos();
-    let exp1 = (l1 / sigmad).exp();
-    let exp2 = (l2 / sigmad).exp();
-
-    let d4 = exp1 * exp1 * exp2 * exp2;
-    let d3 = -2.0 * cos1 * exp1 * exp2 * exp2 - 2.0 * cos2 * exp2 * exp1 * exp1;
-    let d2 = 4.0 * cos2 * cos1 * exp1 * exp2 + exp1 * exp1 + exp2 * exp2;
-    let d1 = -2.0 * (exp2 * cos2 + exp1 * cos1);
-
-    let sd = 1.0 + d1 + d2 + d3 + d4;
-    let dd = d1 + 2.0 * d2 + 3.0 * d3 + 4.0 * d4;
-    let ed = d1 + 4.0 * d2 + 9.0 * d3 + 16.0 * d4;
-    (d1, d2, d3, d4, sd, dd, ed)
-}
-
-/// Port of `ComputeNCoefficients`: the causal numerator coefficients
-/// (`N0..N3`) for one Farnebäck column (`a1,b1,a2,b2` select the
-/// ZeroOrder/FirstOrder/SecondOrder column), plus `SN`/`DN`/`EN` — the same
-/// `1`/`1,2,3`/`1,4,9`-weighted sums of `N1..N3` (no `N0` term, since it
-/// carries no `z^-1` power) used by the order-specific normalization in
-/// [`Coefficients::new`].
-#[allow(clippy::too_many_arguments)]
-fn compute_n_coefficients(
-    sigmad: f64,
-    a1: f64,
-    b1: f64,
-    w1: f64,
-    l1: f64,
-    a2: f64,
-    b2: f64,
-    w2: f64,
-    l2: f64,
-) -> (f64, f64, f64, f64, f64, f64, f64) {
-    let sin1 = (w1 / sigmad).sin();
-    let sin2 = (w2 / sigmad).sin();
-    let cos1 = (w1 / sigmad).cos();
-    let cos2 = (w2 / sigmad).cos();
-    let exp1 = (l1 / sigmad).exp();
-    let exp2 = (l2 / sigmad).exp();
-
-    let n0 = a1 + a2;
-    let n1 =
-        exp2 * (b2 * sin2 - (a2 + 2.0 * a1) * cos2) + exp1 * (b1 * sin1 - (a1 + 2.0 * a2) * cos1);
-    let n2 = ((a1 + a2) * cos2 * cos1 - b1 * cos2 * sin1 - b2 * cos1 * sin2) * 2.0 * exp1 * exp2
-        + a2 * exp1 * exp1
-        + a1 * exp2 * exp2;
-    let n3 =
-        exp2 * exp1 * exp1 * (b2 * sin2 - a2 * cos2) + exp1 * exp2 * exp2 * (b1 * sin1 - a1 * cos1);
-
-    let sn = n0 + n1 + n2 + n3;
-    let dn = n1 + 2.0 * n2 + 3.0 * n3;
-    let en = n1 + 4.0 * n2 + 9.0 * n3;
-    (n0, n1, n2, n3, sn, dn, en)
-}
-
 /// Filter every line of `buf` along axis `d` in place, gathering each line into
 /// a contiguous buffer, running the recursion, and scattering it back.
+///
+/// **Parallel over lines** ([`parallel::for_each_line_mut`]). A line along axis
+/// `d` reads and writes only its own elements, so lines are independent and the
+/// pass is bit-identical to the sequential line loop: [`filter_line`]'s
+/// fourth-order recursion — the only place floats accumulate — runs in its own
+/// unchanged sequential order *within* each line, and no value crosses lines.
+/// The three scratch buffers are per-task, not per-line, so the recursion still
+/// allocates once rather than once per line.
+///
+/// `strides` is unused by the decomposition (the primitive derives the line
+/// stride from `size` and `d` itself); it stays in the signature because the
+/// callers already carry it.
 fn filter_axis(buf: &mut [f64], size: &[usize], strides: &[usize], d: usize, coeff: &Coefficients) {
-    let stride = strides[d];
+    debug_assert_eq!(strides[d], size[..d].iter().product::<usize>());
     let ln = size[d];
-    let mut line = vec![0.0f64; ln];
-    let mut outs = vec![0.0f64; ln];
-    let mut scratch = vec![0.0f64; ln];
+    parallel::for_each_line_mut(
+        buf,
+        size,
+        d,
+        || (vec![0.0f64; ln], vec![0.0f64; ln], vec![0.0f64; ln]),
+        |(line, outs, scratch), mut slot| {
+            for (k, v) in line.iter_mut().enumerate() {
+                *v = slot.get(k);
+            }
+            filter_line(line, coeff, outs, scratch);
+            for (k, &v) in outs.iter().enumerate() {
+                slot.set(k, v);
+            }
+        },
+    );
+}
 
-    for p in 0..buf.len() {
-        // Each line is identified by its first element (coordinate 0 on axis d).
-        if !(p / stride).is_multiple_of(ln) {
-            continue;
-        }
-        for (k, slot) in line.iter_mut().enumerate() {
-            *slot = buf[p + k * stride];
-        }
-        filter_line(&line, coeff, &mut outs, &mut scratch);
-        for (k, &v) in outs.iter().enumerate() {
-            buf[p + k * stride] = v;
-        }
-    }
+/// [`filter_axis`] reading each line from `src` rather than from the buffer it
+/// writes. `src` and `dst` have the same shape, so a line's `k`-th element lives
+/// at `slot.start() + k * slot.stride()` in **either** buffer — which is what
+/// `Line`'s `start`/`stride` are exposed for.
+///
+/// The gather, the recursion, and the write-back are the same three steps as
+/// [`filter_axis`], in the same order; only the buffer the gather reads from
+/// differs. The line is fully materialized into a contiguous scratch buffer
+/// before [`filter_line`] sees it, so every output element is computed from the
+/// same values in the same order as before: bit-identical, by construction.
+fn filter_axis_from(
+    src: &[f64],
+    dst: &mut [f64],
+    size: &[usize],
+    strides: &[usize],
+    d: usize,
+    coeff: &Coefficients,
+) {
+    debug_assert_eq!(strides[d], size[..d].iter().product::<usize>());
+    let ln = size[d];
+    parallel::for_each_line_mut(
+        dst,
+        size,
+        d,
+        || (vec![0.0f64; ln], vec![0.0f64; ln], vec![0.0f64; ln]),
+        |(line, outs, scratch), mut slot| {
+            let (start, stride) = (slot.start(), slot.stride());
+            for (k, v) in line.iter_mut().enumerate() {
+                *v = src[start + k * stride];
+            }
+            filter_line(line, coeff, outs, scratch);
+            for (k, &v) in outs.iter().enumerate() {
+                slot.set(k, v);
+            }
+        },
+    );
 }
 
 /// One line through the fourth-order causal + anti-causal recursion, porting
@@ -1071,6 +1006,68 @@ mod tests {
         let img = Image::from_vec(&[9, 9], vec![5u8; 81]).unwrap();
         let out = smoothing_recursive_gaussian(&img, &[1.0, 1.0], false).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    /// The out-of-place first pass must be **bit-identical** to copying the input
+    /// and filtering in place — that equality is the entire licence for
+    /// `recursive_gaussian_f64_from_into` to exist, so it is pinned rather than
+    /// argued. `assert_eq!` on `f64` is exact here on purpose: a value that is
+    /// merely close is a failure.
+    ///
+    /// Anisotropic spacing, a non-cubic volume, and every `GaussianOrder`,
+    /// including the axis-skipping `sigma == 0` case (whose fallback is the one
+    /// path that still copies) and the all-zero case (where nothing is filtered
+    /// and the result must be the input).
+    #[test]
+    fn out_of_place_first_pass_is_bit_identical_to_copy_then_filter_in_place() {
+        let size = [9usize, 7, 5];
+        let spacing = [1.0f64, 0.75, 1.3];
+        let n: usize = size.iter().product();
+
+        // Deterministic, non-degenerate, and not symmetric about any axis.
+        let src: Vec<f64> = (0..n)
+            .map(|i| ((i * 37 % 101) as f64) * 0.5 - 11.0 + (i % 7) as f64)
+            .collect();
+
+        use GaussianOrder::{FirstOrder, SecondOrder, ZeroOrder};
+        let cases: &[([GaussianOrder; 3], [f64; 3])] = &[
+            ([FirstOrder, ZeroOrder, ZeroOrder], [1.5, 1.5, 1.5]),
+            ([ZeroOrder, FirstOrder, ZeroOrder], [1.5, 1.5, 1.5]),
+            ([ZeroOrder, ZeroOrder, SecondOrder], [2.0, 1.0, 0.8]),
+            ([SecondOrder, FirstOrder, ZeroOrder], [0.9, 1.7, 2.3]),
+            // sigma == 0 on the leading axis: the first *filtered* axis is axis 1,
+            // so the out-of-place pass must land there, not on axis 0.
+            ([ZeroOrder, FirstOrder, ZeroOrder], [0.0, 1.5, 1.5]),
+            // Nothing filtered at all: the result is the input, unchanged.
+            ([ZeroOrder, ZeroOrder, ZeroOrder], [0.0, 0.0, 0.0]),
+        ];
+
+        for (normalize, (orders, sigma)) in [false, true]
+            .into_iter()
+            .flat_map(|nz| cases.iter().map(move |c| (nz, c)))
+        {
+            // Reference: the in-place recursion, fed the copy it has always been fed.
+            let mut reference = src.clone();
+            recursive_gaussian_f64_into(&mut reference, &size, &spacing, sigma, orders, normalize)
+                .unwrap();
+
+            // Under test: the same cascade, with the first pass reading `src`.
+            // `dst` starts full of a poison value, so a pass that fails to write
+            // an element cannot pass by accidentally holding the right one.
+            let mut dst = vec![f64::NAN; n];
+            recursive_gaussian_f64_from_into(
+                &src, &mut dst, &size, &spacing, sigma, orders, normalize,
+            )
+            .unwrap();
+
+            assert_eq!(
+                dst, reference,
+                "out-of-place first pass diverged from copy-then-filter-in-place \
+                 (orders={orders:?}, sigma={sigma:?}, normalize={normalize})"
+            );
+            // And `src` itself is untouched — the caller reuses it on the next axis.
+            assert!(src.iter().all(|v| v.is_finite()));
+        }
     }
 
     #[test]

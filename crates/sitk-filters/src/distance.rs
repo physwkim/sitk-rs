@@ -126,7 +126,7 @@
 
 use crate::error::FilterError;
 use crate::{Result, quantize_to_pixel_type};
-use sitk_core::Image;
+use sitk_core::{Image, parallel};
 
 // ---- shared N-D index geometry ---------------------------------------------
 
@@ -262,6 +262,14 @@ fn maurer_remove(d1: f64, d2: f64, df: f64, x1: f64, x2: f64, xf: f64) -> bool {
 /// One dimension's worth of `SignedMaurerDistanceMapImageFilter::Voronoi`,
 /// applied to every line along axis `d`. `buf` holds the running signed
 /// squared distance (or `f64::INFINITY` for not-yet-reached pixels).
+///
+/// **Parallel over lines** ([`parallel::for_each_line_mut`]). A line's lower
+/// envelope is built from, and written back to, only that line's own `buf`
+/// slots, so lines are independent; the envelope build and walk stay sequential
+/// *within* a line, and every `d1` is a fresh two-term expression rather than a
+/// running accumulator. Output is bit-identical to the sequential pass. The
+/// axis passes themselves stay sequential — each consumes the previous one's
+/// `buf` — and the `g`/`h` parabola stacks are per-task instead of shared.
 fn maurer_voronoi_pass(
     buf: &mut [f64],
     is_object: &[bool],
@@ -270,67 +278,68 @@ fn maurer_voronoi_pass(
     inside_is_positive: bool,
 ) {
     let nd = geo.size[d];
-    let stride = geo.strides[d];
     let spacing_d = geo.spacing[d];
-    let mut g = vec![0.0f64; nd];
-    let mut h = vec![0.0f64; nd];
 
-    for p0 in 0..buf.len() {
-        if !(p0 / stride).is_multiple_of(nd) {
-            continue;
-        }
+    parallel::for_each_line_mut(
+        buf,
+        &geo.size,
+        d,
+        || (vec![0.0f64; nd], vec![0.0f64; nd]),
+        |(g, h), mut line| {
+            let p0 = line.start();
+            let stride = line.stride();
 
-        // Build the lower envelope of parabolas from the finite (non-sentinel)
-        // samples along this line.
-        let mut l: isize = -1;
-        for i in 0..nd {
-            let p = p0 + i * stride;
-            let di = buf[p];
-            if di == f64::INFINITY {
-                continue;
-            }
-            let iw = i as f64 * spacing_d;
-            if l >= 1 {
-                while l >= 1
-                    && maurer_remove(
-                        g[(l - 1) as usize],
-                        g[l as usize],
-                        di,
-                        h[(l - 1) as usize],
-                        h[l as usize],
-                        iw,
-                    )
-                {
-                    l -= 1;
+            // Build the lower envelope of parabolas from the finite
+            // (non-sentinel) samples along this line.
+            let mut l: isize = -1;
+            for i in 0..nd {
+                let di = line.get(i);
+                if di == f64::INFINITY {
+                    continue;
                 }
-            }
-            l += 1;
-            g[l as usize] = di;
-            h[l as usize] = iw;
-        }
-
-        if l == -1 {
-            continue; // no source on this line yet; leave as sentinel.
-        }
-        let ns = l;
-
-        // Walk the envelope, writing the combined signed squared distance.
-        let mut lw: isize = 0;
-        for i in 0..nd {
-            let iw = i as f64 * spacing_d;
-            let mut d1 = g[lw as usize].abs() + (h[lw as usize] - iw).powi(2);
-            while lw < ns {
-                let d2 = g[(lw + 1) as usize].abs() + (h[(lw + 1) as usize] - iw).powi(2);
-                if d1 <= d2 {
-                    break;
+                let iw = i as f64 * spacing_d;
+                if l >= 1 {
+                    while l >= 1
+                        && maurer_remove(
+                            g[(l - 1) as usize],
+                            g[l as usize],
+                            di,
+                            h[(l - 1) as usize],
+                            h[l as usize],
+                            iw,
+                        )
+                    {
+                        l -= 1;
+                    }
                 }
-                lw += 1;
-                d1 = d2;
+                l += 1;
+                g[l as usize] = di;
+                h[l as usize] = iw;
             }
-            let p = p0 + i * stride;
-            buf[p] = signed_value(d1, is_object[p], inside_is_positive);
-        }
-    }
+
+            if l == -1 {
+                return; // no source on this line yet; leave as sentinel.
+            }
+            let ns = l;
+
+            // Walk the envelope, writing the combined signed squared distance.
+            let mut lw: isize = 0;
+            for i in 0..nd {
+                let iw = i as f64 * spacing_d;
+                let mut d1 = g[lw as usize].abs() + (h[lw as usize] - iw).powi(2);
+                while lw < ns {
+                    let d2 = g[(lw + 1) as usize].abs() + (h[(lw + 1) as usize] - iw).powi(2);
+                    if d1 <= d2 {
+                        break;
+                    }
+                    lw += 1;
+                    d1 = d2;
+                }
+                let p = p0 + i * stride;
+                line.set(i, signed_value(d1, is_object[p], inside_is_positive));
+            }
+        },
+    );
 }
 
 /// `SignedMaurerDistanceMapImageFilter`: exact Euclidean (or squared
@@ -351,27 +360,27 @@ pub fn signed_maurer_distance_map(
     let geo = Geometry::new(img, use_image_spacing);
     let n = geo.n();
     let input_vals = img.to_f64_vec()?;
-    let is_object: Vec<bool> = input_vals.iter().map(|&v| v != background_value).collect();
+    let is_object: Vec<bool> = parallel::map_slice(&input_vals, |&v| v != background_value);
     let offsets = full_connectivity_offsets(geo.dim);
 
     // Seed: 0 at object pixels adjacent (full connectivity) to a background
     // pixel, +inf elsewhere. Mirrors BinaryThresholdImageFilter (background ->
     // max, object -> 0) followed by BinaryContourImageFilter(foreground=0,
     // background=max, fully connected).
-    let mut buf = vec![f64::INFINITY; n];
-    for (p, is_boundary) in buf.iter_mut().enumerate() {
+    //
+    // Parallel per-pixel: a pixel's seed depends only on its own neighborhood of
+    // the (already fixed) `is_object` mask, never on another pixel's seed.
+    let mut buf: Vec<f64> = parallel::map_indexed(n, |p| {
         if !is_object[p] {
-            continue;
+            return f64::INFINITY;
         }
         let coord = geo.coords_of(p);
         let on_boundary = offsets.iter().any(|off| {
             geo.neighbor_index(&coord, off)
                 .is_some_and(|np| !is_object[np])
         });
-        if on_boundary {
-            *is_boundary = 0.0;
-        }
-    }
+        if on_boundary { 0.0 } else { f64::INFINITY }
+    });
 
     for d in 0..geo.dim {
         maurer_voronoi_pass(&mut buf, &is_object, &geo, d, inside_is_positive);
@@ -380,10 +389,9 @@ pub fn signed_maurer_distance_map(
     let out_vals: Vec<f64> = if squared_distance {
         buf
     } else {
-        buf.iter()
-            .zip(&is_object)
-            .map(|(&v, &obj)| signed_value(v.abs().sqrt(), obj, inside_is_positive))
-            .collect()
+        parallel::map_indexed(n, |p| {
+            signed_value(buf[p].abs().sqrt(), is_object[p], inside_is_positive)
+        })
     };
 
     let mut out = Image::from_vec(&geo.size, out_vals)?;

@@ -234,6 +234,42 @@ pub struct VirtualGrid {
 }
 
 impl VirtualGrid {
+    /// The grid as `(size, origin, index_to_physical)` — everything a device
+    /// backend needs to derive a sample's physical point from its index, instead
+    /// of being sent the whole precomputed points array.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn parts(&self) -> (&[usize], &[f64], &[f64]) {
+        (&self.size, &self.origin, &self.idx_to_phys)
+    }
+
+    /// The physical point of the voxel whose **flat** index is `flat`, in the
+    /// dim-0-fastest traversal order the sample set is built in, written into
+    /// `out` (length ≥ `dim`).
+    ///
+    /// This is *the* definition of "where sample `s` is" for an unsampled,
+    /// unmasked virtual domain, and it is the only one: the CPU metric calls it
+    /// per sample, the CUDA kernel reimplements exactly this arithmetic in the
+    /// same order, and `FixedSamples`' sampled strategies call it to materialize
+    /// the points they cannot derive. Nine flops and `dim` divisions — cheaper
+    /// than the 402 MB (at 256³) of `f64` the port used to memoize it into.
+    ///
+    /// `scratch` holds the multi-index; it is a caller-supplied buffer of length
+    /// `dim` purely so the hot loop does not allocate one per sample.
+    #[inline]
+    pub(crate) fn write_point(&self, mut flat: usize, scratch: &mut [usize], out: &mut [f64]) {
+        for (d, id) in scratch.iter_mut().enumerate() {
+            *id = flat % self.size[d];
+            flat /= self.size[d];
+        }
+        for (r, pr) in out.iter_mut().enumerate().take(self.dim) {
+            let mut acc = self.origin[r];
+            for (c, &idx) in scratch.iter().enumerate() {
+                acc += self.idx_to_phys[r * self.dim + c] * idx as f64;
+            }
+            *pr = acc;
+        }
+    }
+
     pub(crate) fn new(
         dim: usize,
         size: Vec<usize>,

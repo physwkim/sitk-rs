@@ -42,8 +42,29 @@
 //! `wgpu`/Metal backend implements the same trait — marshalling the sample
 //! arrays, moving buffer, and transform parameters to the device — without any
 //! change to [`MeanSquaresMetric`] or the registration method above it.
+//!
+//! ## Parallelism, and why the numbers do not move
+//!
+//! [`CpuBackend`] evaluates the samples on every core, and returns **the same
+//! bits it returned when it was serial**, at any thread count. It gets that by
+//! construction, from [`sitk_core::parallel::map_rows_fold_in_order`]: the
+//! expensive per-sample work (transform, interpolation, Jacobian) never touches
+//! an accumulator, so it runs in parallel; the accumulators are then fed the
+//! per-sample contributions on a single thread, in sample order, executing the
+//! identical sequence of additions the serial loop did. Nothing is
+//! re-associated, so no float sum is re-rounded — which matters because the
+//! optimizer is a feedback loop, and a metric value that shifted by one ulp
+//! would walk to a different registration result.
+//!
+//! One path stays serial: the derivative of a transform with a **sparse**
+//! Jacobian (B-spline, displacement field). Its per-sample contribution is a
+//! scattered, variable-length entry list; staging that into a fixed-width row
+//! would cost `O(nparams)` per sample and defeat the sparsity. Its value-only
+//! reduction ([`MetricBackend::mean_squares_value`]) is parallel like every
+//! other transform's.
 
-use sitk_core::Image;
+use sitk_core::parallel;
+use sitk_core::{Image, Scalar, dispatch_scalar};
 use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
@@ -100,39 +121,210 @@ impl SplitMix64 {
     }
 }
 
-/// The physical point at multi-index `index`, via `origin + idx_to_phys ·
-/// index`. Shared by every [`FixedSamples`] sampling strategy.
-fn point_at(idx_to_phys: &[f64], origin: &[f64], dim: usize, index: &[usize]) -> Vec<f64> {
-    let mut p = vec![0.0; dim];
-    for (r, pr) in p.iter_mut().enumerate() {
-        let mut acc = origin[r];
-        for (c, &idx) in index.iter().enumerate() {
-            acc += idx_to_phys[r * dim + c] * idx as f64;
-        }
-        *pr = acc;
-    }
-    p
+/// A process-unique identity for one prepared [`FixedSamples`] / [`MovingImage`].
+///
+/// A compute backend that keeps a *device-resident* copy of these buffers — the
+/// CUDA backend uploads them once and reuses them across hundreds of optimizer
+/// iterations — needs to answer "is this the same data I already have?" on every
+/// call. The [`MetricBackend`] trait hands it a `&FixedSamples` with no identity,
+/// and a pointer address is not an identity (a freed allocation's address can be
+/// handed back to a different one). So each prepared buffer carries a serial
+/// number, minted once at construction and never reused within the process.
+///
+/// Costs one relaxed increment per `FixedSamples`/`MovingImage` built, which is
+/// per pyramid level, not per iteration. The CPU path never reads it — so the
+/// counter and the fields that hold it are compiled out entirely when the `cuda`
+/// feature is off, and a CPU-only build carries neither the atomic nor the extra
+/// eight bytes per buffer.
+#[cfg(feature = "cuda")]
+fn next_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The multi-index (dim-0-fastest) of flat voxel index `flat`, the inverse of
-/// the traversal order [`increment`] produces.
-fn linear_to_multi(mut flat: usize, size: &[usize]) -> Vec<usize> {
-    let mut index = vec![0usize; size.len()];
-    for (d, id) in index.iter_mut().enumerate() {
-        *id = flat % size[d];
-        flat /= size[d];
-    }
-    index
+/// The fixed image's sample values, kept in the image's **native pixel type**.
+///
+/// The port used to widen the whole volume to `f64` up front
+/// ([`Image::to_f64_vec`]) and hold that copy for the life of the metric — 134 MB
+/// at 256³ for a `u16` CT that is 34 MB on disk, allocated and first-touched
+/// before a single iteration runs, and then re-read on every iteration at twice
+/// or four times the memory traffic the native buffer would cost.
+///
+/// The widening itself is not the problem and is not removed: `T::as_f64` is
+/// **exactly** the conversion `to_f64_vec` performed, so deferring it to the
+/// point of use changes no bit of any metric value. What is removed is the
+/// *materialized f64 volume*. This is the same distinction that let
+/// `sitk_core::fused::map_pixels` keep bit-parity while deleting the port's
+/// dominant filter cost.
+///
+/// # Where the widen is not lossless
+///
+/// `u64`/`i64` above 2^53 do not survive `as f64` exactly. That is **not a new
+/// loss**: `to_f64_vec` applied the identical `as f64` at construction, so a
+/// 64-bit-integer fixed image already fed the metric rounded values, and it now
+/// feeds it the same rounded values one sample later. Nothing narrows anywhere —
+/// the arithmetic stays `f64` end to end. The only honest statement is that a
+/// metric over `u64` intensities beyond 2^53 was, and remains, computed on
+/// `f64`-rounded inputs.
+macro_rules! sample_values {
+    ($($variant:ident($ty:ty)),+ $(,)?) => {
+        /// One value per sample, length `N`, in the fixed image's own type.
+        #[derive(Clone, Debug, PartialEq)]
+        pub(crate) enum SampleValues {
+            $($variant(Vec<$ty>),)+
+        }
+
+        impl SampleValues {
+            pub(crate) fn len(&self) -> usize {
+                match self { $(Self::$variant(v) => v.len(),)+ }
+            }
+
+            /// Sample `s`, widened to `f64` — the same `as f64` the eager
+            /// `to_f64_vec` applied, just not stored.
+            #[inline]
+            pub(crate) fn get(&self, s: usize) -> f64 {
+                match self { $(Self::$variant(v) => v[s].as_f64(),)+ }
+            }
+
+            /// The `(min, max)` over every sample, widened. Exact and
+            /// order-independent, so this is the sequential scan's answer.
+            fn min_max(&self) -> Option<(f64, f64)> {
+                match self { $(Self::$variant(v) => parallel::min_max(v),)+ }
+            }
+
+            /// Hand the native slice to `w`. **One branch per call** — the
+            /// interpolators are generic over the pixel type, so an interpolation
+            /// that reads 64 corners resolves the type once, not once per corner.
+            #[inline]
+            fn with<W: WithBuf>(&self, w: W) -> W::Out {
+                match self { $(Self::$variant(v) => w.call(v),)+ }
+            }
+        }
+
+        /// Lets a `Vec<T>` name its own [`SampleValues`] variant, so the gather
+        /// below can be generic over the scalar type and still build the enum.
+        trait IntoSampleValues: Scalar {
+            fn wrap(v: Vec<Self>) -> SampleValues;
+        }
+
+        $(impl IntoSampleValues for $ty {
+            fn wrap(v: Vec<Self>) -> SampleValues { SampleValues::$variant(v) }
+        })+
+    };
+}
+
+/// An operation that is generic over a [`SampleValues`] buffer's native pixel
+/// type. Rust closures cannot be generic, so the work has to arrive as a trait
+/// impl for [`SampleValues::with`] to monomorphize it per type.
+trait WithBuf {
+    type Out;
+    fn call<T: Scalar>(self, buf: &[T]) -> Self::Out;
+}
+
+sample_values!(
+    UInt8(u8),
+    Int8(i8),
+    UInt16(u16),
+    Int16(i16),
+    UInt32(u32),
+    Int32(i32),
+    UInt64(u64),
+    Int64(i64),
+    Float32(f32),
+    Float64(f64),
+);
+
+/// The selected samples' values, in the image's native type — the whole buffer
+/// when the selection is the identity, a gather otherwise.
+///
+/// Parallel, and not as an optimization of the copy itself: the destination is a
+/// fresh allocation, so *whichever* thread writes a page first faults it in. A
+/// serial `to_vec` here faults 67 MB of pages on one thread and costs an order of
+/// magnitude more than the same copy spread over the pool (measured 232 ms vs
+/// 22 ms of setup at 256³). This is the same first-touch cost the eager
+/// `Image::to_f64_vec` avoided by going through [`parallel::map_slice`].
+fn gather_values<T: IntoSampleValues>(
+    img: &Image,
+    selected: Option<&[usize]>,
+) -> Result<SampleValues> {
+    let src = img.scalar_slice::<T>()?;
+    Ok(T::wrap(match selected {
+        None => parallel::map_slice(src, |&v| v),
+        Some(flats) => parallel::map_slice(flats, |&f| src[f]),
+    }))
+}
+
+/// Where a sample's physical point comes from.
+///
+/// The unsampled, unmasked default — the SimpleITK default, and what a
+/// registration actually runs — samples *every voxel of the virtual grid, in
+/// grid order*. For that set the point of sample `s` is a closed-form function
+/// of `s` alone ([`VirtualGrid::write_point`]: `dim` divisions and nine flops),
+/// so the port used to spend 402 MB (at 256³) and a full page-fault pass
+/// memoizing a function it can evaluate in the loop that reads it. Now it does
+/// not exist.
+///
+/// Every other strategy — [`SamplingStrategy::Regular`], `Random`, or any mask —
+/// selects an arbitrary subset, for which there is no closed form from `s`, so
+/// those points are materialized. That is the *only* case that allocates, it is
+/// proportional to the sample count rather than the volume, and it is named here
+/// rather than being a flag on a buffer that always exists.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SamplePoints {
+    /// Sample `s` is voxel `s` of [`FixedSamples::grid`]; its point is derived.
+    Grid,
+    /// A selected subset. `flats[s]` is the sample's voxel in the grid and `points`
+    /// holds its physical point, row-major `N × dim`.
+    ///
+    /// The points are what the host reads in its hot loop, and the `flats` are what
+    /// the *selection* actually was — the two are the same object seen twice, since
+    /// `points[s]` is the grid's point at `flats[s]`. Keeping the flats is what lets a
+    /// device backend be handed the selection itself rather than a bag of points it
+    /// would have to trust: an index still knows which voxel it is, so the device can
+    /// derive the point and read the value the same way a full-grid run does, and a
+    /// fixed mask still means something against it.
+    Explicit { flats: Vec<usize>, points: Vec<f64> },
+}
+
+/// Per-task scratch for [`FixedSamples::point`], so the derivation in the hot
+/// loop allocates nothing. One per thread, not one per sample.
+pub(crate) struct PointScratch {
+    index: Vec<usize>,
+    point: Vec<f64>,
+}
+
+/// The physical points of an arbitrary sample set, given as flat voxel indices
+/// into `grid` — the materialization the derived path exists to avoid, kept for
+/// the sampled/masked strategies that genuinely have no closed form.
+///
+/// Bit-identical to the serial loop it replaces: every component is
+/// [`VirtualGrid::write_point`]'s, computed from its own sample index alone.
+fn explicit_points(grid: &VirtualGrid, flats: &[usize], dim: usize) -> Vec<f64> {
+    parallel::map_indexed_init(
+        flats.len() * dim,
+        || (vec![0usize; dim], vec![0.0f64; dim]),
+        |(index, point), i| {
+            grid.write_point(flats[i / dim], index, point);
+            point[i % dim]
+        },
+    )
 }
 
 /// The fixed image reduced to its sample set (the registration *virtual
 /// domain*): every pixel's value and its physical point, precomputed once.
 pub struct FixedSamples {
     pub(crate) dim: usize,
-    /// One value per sample, length `N`.
-    pub(crate) values: Vec<f64>,
-    /// Physical points, row-major `N × dim`.
-    pub(crate) points: Vec<f64>,
+    /// Identity for a device-resident copy of these buffers — see [`next_id`].
+    #[cfg(feature = "cuda")]
+    pub(crate) id: u64,
+    /// One value per sample, length `N`, in the fixed image's native pixel type
+    /// — read through [`value`](Self::value), which widens. See [`SampleValues`].
+    pub(crate) values: SampleValues,
+    /// Where each sample's physical point comes from — derived from the grid for
+    /// the full-grid default, materialized only for a sampled or masked subset.
+    /// Read through [`point`](Self::point), never directly.
+    pub(crate) points: SamplePoints,
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
     /// The virtual domain as a grid. The metric never reads it — only the
@@ -143,50 +335,70 @@ pub struct FixedSamples {
     /// sampling strategy, its own `central_region_radius`, and ITK's rule that
     /// neither the metric's sampling percentage nor its fixed mask narrows the
     /// scale estimate.
-    grid: VirtualGrid,
+    ///
+    /// `pub(crate)` rather than private because the CPU metric and the device
+    /// backend both derive their sample points from this geometry — see
+    /// [`SamplePoints`].
+    pub(crate) grid: VirtualGrid,
+}
+
+/// **Which voxels a sampling strategy draws.** The single owner of that question.
+///
+/// Returns the drawn voxels as flat grid indices *in sample order*, or `None` for the
+/// identity selection ([`SamplingStrategy::None`]: every voxel, in grid order — the one
+/// selection that needs no list). `Random` draws with replacement, so the list may repeat
+/// a voxel, and must: the metric counts it twice.
+///
+/// A fixed mask is **not** applied here. The host filters this draw by its mask
+/// ([`FixedSamples::from_image_with`]); a device backend gates the same mask inside its
+/// kernel, by grid index, and so takes the draw unfiltered. Both see the same samples — a
+/// masked-out draw contributes nothing on either side — and, what matters, both see the
+/// same *draw*, because there is one draw and this function is it.
+///
+/// That is the whole design of device sampling: **the device does not draw.** It is handed
+/// the list. So "do the two paths sample the same voxels" is not a property two
+/// implementations have to agree on, and that a test has to catch them failing — there is
+/// one implementation, and this is it.
+pub fn draw_samples(
+    voxels: usize,
+    strategy: SamplingStrategy,
+    percentage: f64,
+    seed: u64,
+) -> Option<Vec<usize>> {
+    match strategy {
+        SamplingStrategy::None => None,
+        SamplingStrategy::Regular => {
+            let stride = ((1.0 / percentage).ceil() as usize).max(1);
+            Some((0..voxels).step_by(stride).collect())
+        }
+        SamplingStrategy::Random => {
+            let sample_count = (voxels as f64 * percentage) as usize;
+            let mut rng = SplitMix64::new(seed);
+            Some((0..sample_count).map(|_| rng.next_below(voxels)).collect())
+        }
+    }
 }
 
 impl FixedSamples {
+    /// The voxels this sample set walks, as flat grid indices in sample order, or `None`
+    /// if it is the whole grid in grid order.
+    ///
+    /// This is the selection **after** a fixed mask has filtered it — what the host
+    /// actually evaluates.
+    pub fn selected_indices(&self) -> Option<&[usize]> {
+        match &self.points {
+            SamplePoints::Grid => None,
+            SamplePoints::Explicit { flats, .. } => Some(flats),
+        }
+    }
+
     /// Reduce a fixed image to its full sample set (sampling strategy = None:
     /// every pixel, matching SimpleITK's default).
     ///
     /// Fails on a vector `fixed` image, like every scalar consumer of
     /// [`sitk_core::Image::to_f64_vec`].
     pub fn from_image(fixed: &Image) -> Result<Self> {
-        let dim = fixed.dimension();
-        let size = fixed.size().to_vec();
-        let values = fixed.to_f64_vec()?;
-        let n = values.len();
-
-        // point = origin + (D · diag(spacing)) · index
-        let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
-        let origin = fixed.origin();
-
-        let mut points = vec![0.0; n * dim];
-        let mut index = vec![0usize; dim];
-        for s in 0..n {
-            points[s * dim..(s + 1) * dim].copy_from_slice(&point_at(
-                &idx_to_phys,
-                origin,
-                dim,
-                &index,
-            ));
-            increment(&mut index, &size);
-        }
-
-        let min_spacing = fixed
-            .spacing()
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min);
-
-        Ok(Self {
-            dim,
-            values,
-            points,
-            min_spacing,
-            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
-        })
+        Self::from_image_with(fixed, SamplingStrategy::None, 1.0, 0, None)
     }
 
     /// Reduce a fixed image to its sample set under an explicit sampling
@@ -210,6 +422,17 @@ impl FixedSamples {
     /// and `Random`'s count exactly reproducible without porting a
     /// normal-variate generator.
     ///
+    /// # The sample set is a list of voxels, and that is all it is
+    ///
+    /// Each strategy is a *selection*: which flat voxel indices, in which order,
+    /// with what multiplicity. Everything downstream — the values, the physical
+    /// points — is a function of that selection and the grid. Writing it that way
+    /// is what lets the default case (every voxel, in grid order) carry **no
+    /// index list and no points buffer at all**: its selection is the identity,
+    /// and [`VirtualGrid::write_point`] recovers any sample's point from its
+    /// index in nine flops. The buffer that used to hold those points was 402 MB
+    /// at 256³ and the largest single term in a GPU registration's setup.
+    ///
     /// Fails if `mask` does not share `fixed`'s size.
     pub fn from_image_with(
         fixed: &Image,
@@ -220,11 +443,10 @@ impl FixedSamples {
     ) -> Result<Self> {
         let dim = fixed.dimension();
         let size = fixed.size().to_vec();
-        let values_all = fixed.to_f64_vec()?;
-        let n = values_all.len();
+        let n = fixed.number_of_pixels();
 
         let idx_to_phys = index_to_physical_matrix(fixed.direction(), fixed.spacing(), dim);
-        let origin = fixed.origin();
+        let grid = VirtualGrid::new(dim, size, fixed.origin().to_vec(), idx_to_phys);
 
         let mask_buf = match mask {
             Some(m) => {
@@ -244,44 +466,36 @@ impl FixedSamples {
             Some(m) => m[flat] != 0.0,
         };
 
-        let mut values = Vec::new();
-        let mut points = Vec::new();
+        // The selected voxels, as flat indices in sample order. `None` is the
+        // identity selection — every voxel, in grid order — and is the one case
+        // that needs neither this list nor a points buffer.
+        //
+        // The *draw* is [`draw_samples`]; the mask filter is here. They are separate
+        // because a device backend gates the mask in its kernel, by grid index, and so
+        // wants the draw before the filter — while still needing it to be the same
+        // draw. See [`draw_samples`].
+        let selected: Option<Vec<usize>> = match draw_samples(n, strategy, percentage, seed) {
+            None if mask_buf.is_none() => None,
+            None => Some((0..n).filter(|&s| mask_allows(s)).collect()),
+            Some(draws) => Some(
+                draws
+                    .into_iter()
+                    .filter(|&flat| mask_allows(flat))
+                    .collect(),
+            ),
+        };
 
-        match strategy {
-            SamplingStrategy::None => {
-                let mut index = vec![0usize; dim];
-                for (s, &fv) in values_all.iter().enumerate() {
-                    if mask_allows(s) {
-                        values.push(fv);
-                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
-                    }
-                    increment(&mut index, &size);
-                }
-            }
-            SamplingStrategy::Regular => {
-                let stride = ((1.0 / percentage).ceil() as usize).max(1);
-                let mut index = vec![0usize; dim];
-                for (s, &fv) in values_all.iter().enumerate() {
-                    if s % stride == 0 && mask_allows(s) {
-                        values.push(fv);
-                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
-                    }
-                    increment(&mut index, &size);
-                }
-            }
-            SamplingStrategy::Random => {
-                let sample_count = (n as f64 * percentage) as usize;
-                let mut rng = SplitMix64::new(seed);
-                for _ in 0..sample_count {
-                    let flat = rng.next_below(n);
-                    if mask_allows(flat) {
-                        let index = linear_to_multi(flat, &size);
-                        values.push(values_all[flat]);
-                        points.extend(point_at(&idx_to_phys, origin, dim, &index));
-                    }
-                }
-            }
-        }
+        // The values never become an `f64` volume: the native buffer is taken (or
+        // gathered) as-is, and every read widens one sample.
+        let values: SampleValues =
+            dispatch_scalar!(fixed.pixel_id(), gather_values, fixed, selected.as_deref())?;
+        let points = match &selected {
+            None => SamplePoints::Grid,
+            Some(flats) => SamplePoints::Explicit {
+                points: explicit_points(&grid, flats, dim),
+                flats: flats.clone(),
+            },
+        };
 
         let min_spacing = fixed
             .spacing()
@@ -291,11 +505,39 @@ impl FixedSamples {
 
         Ok(Self {
             dim,
+            #[cfg(feature = "cuda")]
+            id: next_id(),
             values,
             points,
             min_spacing,
-            grid: VirtualGrid::new(dim, size, origin.to_vec(), idx_to_phys),
+            grid,
         })
+    }
+
+    /// Scratch for [`point`](Self::point), one per thread.
+    pub(crate) fn scratch(&self) -> PointScratch {
+        PointScratch {
+            index: vec![0usize; self.dim],
+            point: vec![0.0f64; self.dim],
+        }
+    }
+
+    /// The physical point of sample `s`, length `dim`.
+    ///
+    /// Derived from the grid for the full-grid sample set (no buffer exists to
+    /// read), or read out of the materialized points for a sampled/masked one.
+    /// Which it is, is not the caller's business — this is the single accessor,
+    /// so the storage can be a closed form without 24 call sites knowing.
+    #[inline]
+    pub(crate) fn point<'a>(&'a self, s: usize, scratch: &'a mut PointScratch) -> &'a [f64] {
+        match &self.points {
+            SamplePoints::Explicit { points, .. } => &points[s * self.dim..(s + 1) * self.dim],
+            SamplePoints::Grid => {
+                self.grid
+                    .write_point(s, &mut scratch.index, &mut scratch.point);
+                &scratch.point
+            }
+        }
     }
 
     /// Number of samples `N`.
@@ -305,7 +547,13 @@ impl FixedSamples {
 
     /// Whether there are no samples.
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.values.len() == 0
+    }
+
+    /// The value of sample `s`, widened to `f64`.
+    #[inline]
+    pub(crate) fn value(&self, s: usize) -> f64 {
+        self.values.get(s)
     }
 
     /// The `(min, max)` of the sampled fixed-image values. `(0, 0)` when empty.
@@ -313,17 +561,7 @@ impl FixedSamples {
     /// sampling ⇒ the whole image), which the Mattes MI metric uses to size the
     /// joint-histogram fixed axis.
     pub(crate) fn value_range(&self) -> (f64, f64) {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &v in &self.values {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        if self.values.is_empty() {
-            (0.0, 0.0)
-        } else {
-            (lo, hi)
-        }
+        self.values.min_max().unwrap_or((0.0, 0.0))
     }
 
     /// Build a scale/learning-rate estimator of `kind` for `transform` over
@@ -349,12 +587,33 @@ impl FixedSamples {
     }
 }
 
-/// The moving image as an `f64` buffer plus the geometry needed to map a
-/// physical point to a continuous index and to convert an index-space gradient
-/// to a physical-space gradient.
+/// Everything a device-resident metric backend needs to reproduce the moving
+/// image's sampling, borrowed from a [`MovingImage`]. See
+/// [`MovingImage::device_view`].
+#[cfg(feature = "cuda")]
+pub(crate) struct MovingView<'a> {
+    pub(crate) id: u64,
+    pub(crate) buf: &'a SampleValues,
+    pub(crate) size: &'a [usize],
+    pub(crate) strides: &'a [usize],
+    pub(crate) origin: &'a [f64],
+    pub(crate) phys_to_index: &'a [f64],
+    pub(crate) interpolator: Interpolator,
+    pub(crate) mask: Option<&'a [bool]>,
+}
+
+/// The moving image plus the geometry needed to map a physical point to a
+/// continuous index and to convert an index-space gradient to a physical-space
+/// gradient.
 pub struct MovingImage {
     dim: usize,
-    buf: Vec<f64>,
+    /// Identity for a device-resident copy of this buffer — see [`next_id`].
+    #[cfg(feature = "cuda")]
+    pub(crate) id: u64,
+    /// The voxels, in the image's **native** pixel type — the interpolators are
+    /// generic over it and widen at each load, so no `f64` copy of the volume is
+    /// ever made (see [`SampleValues`]).
+    buf: SampleValues,
     size: Vec<usize>,
     strides: Vec<usize>,
     origin: Vec<f64>,
@@ -364,6 +623,12 @@ pub struct MovingImage {
     interpolator: Interpolator,
     /// Precomputed cubic B-spline coefficients, present only when
     /// `interpolator == BSpline` (see [`bspline_coefficients`]).
+    ///
+    /// These are `f64` and volume-sized, and that is not removable the way the
+    /// pixel buffers were: a coefficient is not a pixel — it is the result of the
+    /// prefilter's recursion and does not fit the source type. **The B-spline path
+    /// therefore still materializes one `f64` volume**; every other interpolator
+    /// materializes none.
     bspline_coeffs: Option<Vec<f64>>,
     /// Binary moving mask, same size/traversal order as `buf`. `None` = no
     /// mask (every in-buffer point is valid).
@@ -390,11 +655,17 @@ impl MovingImage {
         let phys_to_index = physical_to_index_matrix(moving.direction(), moving.spacing(), dim)
             .ok_or(RegistrationError::SingularDirection)?;
         let strides_v = strides(&size);
-        let buf = moving.to_f64_vec()?;
-        let bspline_coeffs = matches!(interpolator, Interpolator::BSpline)
-            .then(|| bspline_coefficients(&buf, &size, &strides_v));
+        let buf: SampleValues = dispatch_scalar!(moving.pixel_id(), gather_values, moving, None)?;
+        let bspline_coeffs = matches!(interpolator, Interpolator::BSpline).then(|| {
+            buf.with(Coefficients {
+                size: &size,
+                strides: &strides_v,
+            })
+        });
         Ok(Self {
             dim,
+            #[cfg(feature = "cuda")]
+            id: next_id(),
             buf,
             strides: strides_v,
             size,
@@ -427,6 +698,24 @@ impl MovingImage {
     /// Spatial dimension.
     pub(crate) fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The moving-image buffer and the geometry a device-resident backend needs
+    /// to reproduce [`value_and_physical_gradient`](Self::value_and_physical_gradient)
+    /// on its own. `pub(crate)`: the CUDA backend lives in this crate, so none of
+    /// this widens the public API.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_view(&self) -> MovingView<'_> {
+        MovingView {
+            id: self.id,
+            buf: &self.buf,
+            size: &self.size,
+            strides: &self.strides,
+            origin: &self.origin,
+            phys_to_index: &self.phys_to_index,
+            interpolator: self.interpolator,
+            mask: self.mask.as_deref(),
+        }
     }
 
     /// Continuous index of physical point `p`: `M · (p − origin)`.
@@ -466,60 +755,7 @@ impl MovingImage {
     /// Sample and its exact index-space gradient at continuous index `c`
     /// under this image's interpolator, or `None` if outside the buffer.
     fn value_and_gradient(&self, c: &[f64]) -> Option<(f64, Vec<f64>)> {
-        match self.interpolator {
-            Interpolator::NearestNeighbor => {
-                nearest_value_and_gradient(&self.buf, &self.size, &self.strides, c)
-            }
-            Interpolator::Linear => {
-                linear_value_and_gradient(&self.buf, &self.size, &self.strides, c)
-            }
-            Interpolator::BSpline => bspline_value_and_gradient(
-                self.bspline_coeffs
-                    .as_deref()
-                    .expect("bspline_coeffs is Some whenever interpolator == BSpline"),
-                &self.size,
-                &self.strides,
-                c,
-            ),
-            Interpolator::Gaussian => {
-                gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, c)
-            }
-            Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                c,
-                SincWindow::Hamming,
-            ),
-            Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                c,
-                SincWindow::Cosine,
-            ),
-            Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                c,
-                SincWindow::Welch,
-            ),
-            Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                c,
-                SincWindow::Lanczos,
-            ),
-            Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                c,
-                SincWindow::Blackman,
-            ),
-        }
+        self.buf.with(ValueAndGradient { img: self, c })
     }
 
     /// Sample of physical point `p` under this image's interpolator and its
@@ -569,80 +805,84 @@ impl MovingImage {
         if !self.mask_allows(&cidx) {
             return None;
         }
-        match self.interpolator {
-            Interpolator::NearestNeighbor => {
-                nearest_at(&self.buf, &self.size, &self.strides, &cidx)
-            }
-            Interpolator::Linear => linear_at(&self.buf, &self.size, &self.strides, &cidx),
-            Interpolator::BSpline => bspline_value_and_gradient(
-                self.bspline_coeffs
-                    .as_deref()
-                    .expect("bspline_coeffs is Some whenever interpolator == BSpline"),
-                &self.size,
-                &self.strides,
-                &cidx,
-            )
-            .map(|(v, _)| v),
-            Interpolator::Gaussian => {
-                gaussian_value_and_gradient(&self.buf, &self.size, &self.strides, &cidx)
-                    .map(|(v, _)| v)
-            }
-            Interpolator::HammingWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                &cidx,
-                SincWindow::Hamming,
-            )
-            .map(|(v, _)| v),
-            Interpolator::CosineWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                &cidx,
-                SincWindow::Cosine,
-            )
-            .map(|(v, _)| v),
-            Interpolator::WelchWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                &cidx,
-                SincWindow::Welch,
-            )
-            .map(|(v, _)| v),
-            Interpolator::LanczosWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                &cidx,
-                SincWindow::Lanczos,
-            )
-            .map(|(v, _)| v),
-            Interpolator::BlackmanWindowedSinc => windowed_sinc_value_and_gradient(
-                &self.buf,
-                &self.size,
-                &self.strides,
-                &cidx,
-                SincWindow::Blackman,
-            )
-            .map(|(v, _)| v),
-        }
+        self.buf.with(ValueOnly {
+            img: self,
+            c: &cidx,
+        })
     }
 
     /// The `(min, max)` of the moving-image buffer. `(0, 0)` when empty. The
     /// Mattes MI metric uses this to size the joint-histogram moving axis.
     pub(crate) fn value_range(&self) -> (f64, f64) {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &v in &self.buf {
-            lo = lo.min(v);
-            hi = hi.max(v);
+        self.buf.min_max().unwrap_or((0.0, 0.0))
+    }
+}
+
+/// The cubic B-spline prefilter, run on the moving image's native buffer.
+struct Coefficients<'a> {
+    size: &'a [usize],
+    strides: &'a [usize],
+}
+
+impl WithBuf for Coefficients<'_> {
+    type Out = Vec<f64>;
+
+    fn call<T: Scalar>(self, buf: &[T]) -> Vec<f64> {
+        bspline_coefficients(buf, self.size, self.strides)
+    }
+}
+
+/// [`MovingImage::value_and_gradient`], monomorphized over the buffer's type.
+struct ValueAndGradient<'a> {
+    img: &'a MovingImage,
+    c: &'a [f64],
+}
+
+impl WithBuf for ValueAndGradient<'_> {
+    type Out = Option<(f64, Vec<f64>)>;
+
+    fn call<T: Scalar>(self, buf: &[T]) -> Self::Out {
+        let (size, strides, c) = (&self.img.size, &self.img.strides, self.c);
+        let sinc = |w| windowed_sinc_value_and_gradient(buf, size, strides, c, w);
+        match self.img.interpolator {
+            Interpolator::NearestNeighbor => nearest_value_and_gradient(buf, size, strides, c),
+            Interpolator::Linear => linear_value_and_gradient(buf, size, strides, c),
+            Interpolator::BSpline => bspline_value_and_gradient(
+                self.img
+                    .bspline_coeffs
+                    .as_deref()
+                    .expect("bspline_coeffs is Some whenever interpolator == BSpline"),
+                size,
+                strides,
+                c,
+            ),
+            Interpolator::Gaussian => gaussian_value_and_gradient(buf, size, strides, c),
+            Interpolator::HammingWindowedSinc => sinc(SincWindow::Hamming),
+            Interpolator::CosineWindowedSinc => sinc(SincWindow::Cosine),
+            Interpolator::WelchWindowedSinc => sinc(SincWindow::Welch),
+            Interpolator::LanczosWindowedSinc => sinc(SincWindow::Lanczos),
+            Interpolator::BlackmanWindowedSinc => sinc(SincWindow::Blackman),
         }
-        if self.buf.is_empty() {
-            (0.0, 0.0)
-        } else {
-            (lo, hi)
+    }
+}
+
+/// [`MovingImage::value_at`], monomorphized over the buffer's type.
+struct ValueOnly<'a> {
+    img: &'a MovingImage,
+    c: &'a [f64],
+}
+
+impl WithBuf for ValueOnly<'_> {
+    type Out = Option<f64>;
+
+    fn call<T: Scalar>(self, buf: &[T]) -> Self::Out {
+        let (size, strides, c) = (&self.img.size, &self.img.strides, self.c);
+        match self.img.interpolator {
+            Interpolator::NearestNeighbor => nearest_at(buf, size, strides, c),
+            Interpolator::Linear => linear_at(buf, size, strides, c),
+            _ => ValueAndGradient { img: self.img, c }
+                .call(buf)
+                .map(|(v, _)| v),
         }
     }
 }
@@ -699,55 +939,99 @@ impl MetricBackend for CpuBackend {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> MetricValue {
-        let dim = fixed.dim;
         let nparams = transform.number_of_parameters();
-        let n = fixed.values.len();
+        let n = fixed.len();
 
         let mut value_sum = 0.0;
         let mut deriv = vec![0.0; nparams];
         let mut valid = 0usize;
 
-        for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
-            let fv = fixed.values[s];
+        // Sparseness is a property of the transform *type*, not of a point: a
+        // transform that has a sparse Jacobian returns `Some` at every point,
+        // empty where the point contributes nothing (see
+        // `ParametricTransform::sparse_jacobian_wrt_parameters`). So this reads
+        // it once, on the first sample, and picks the loop.
+        let mut scratch = fixed.scratch();
+        let sparse = n > 0
+            && transform
+                .sparse_jacobian_wrt_parameters(fixed.point(0, &mut scratch))
+                .is_some();
 
-            let mp = transform.transform_point(fp);
-            let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
-                Some(vg) => vg,
-                None => continue,
-            };
+        if sparse {
+            // Sequential. A sample's sparse contribution is a scattered,
+            // variable-length list of (parameter, column) entries; staging it
+            // as a dense `nparams`-wide row for the parallel fold would cost
+            // O(nparams) per sample and destroy the very sparsity this path
+            // exists for. Left serial deliberately — see the metric's parallel
+            // note in the module docs.
+            for s in 0..n {
+                let fp = fixed.point(s, &mut scratch);
+                let mp = transform.transform_point(fp);
+                let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {
+                    Some(vg) => vg,
+                    None => continue,
+                };
 
-            let diff = mv - fv;
-            value_sum += diff * diff;
+                let diff = mv - fixed.value(s);
+                value_sum += diff * diff;
 
-            // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k]. A transform with
-            // a sparse Jacobian (BSpline, DisplacementField) touches only its
-            // affected parameters; every other transform falls back to the
-            // dense Jacobian, unchanged from before.
-            match transform.sparse_jacobian_wrt_parameters(fp) {
-                Some(entries) => {
-                    for (idx, col) in &entries {
-                        let g: f64 = col
-                            .iter()
-                            .zip(grad_phys.iter())
-                            .map(|(&c, &gp)| c * gp)
-                            .sum();
-                        deriv[*idx] += 2.0 * diff * g;
-                    }
+                // deriv_k += 2·diff · Σ_d grad_phys[d] · J[d][k], over the
+                // affected parameters only.
+                let entries = transform
+                    .sparse_jacobian_wrt_parameters(fp)
+                    .expect("a sparse transform returns Some at every point");
+                for (idx, col) in &entries {
+                    let g: f64 = col
+                        .iter()
+                        .zip(grad_phys.iter())
+                        .map(|(&c, &gp)| c * gp)
+                        .sum();
+                    deriv[*idx] += 2.0 * diff * g;
                 }
-                None => {
+
+                valid += 1;
+            }
+        } else {
+            // Parallel, and bit-identical to the loop above. Every sample's
+            // contribution — the transform, the interpolation, the dense
+            // Jacobian, the `2·diff·g` product for each parameter — is computed
+            // in parallel into its own row and touches no accumulator. The
+            // accumulators are then fed those rows on one thread, in sample
+            // order, performing the exact sequence of `+=` a serial loop would.
+            // No float sum is re-associated, so the result does not depend on
+            // the thread count. See `sitk_core::parallel::map_rows_fold_in_order`.
+            parallel::map_rows_fold_in_order(
+                n,
+                1 + nparams,
+                || fixed.scratch(),
+                |scratch, s, row| {
+                    let fp = fixed.point(s, scratch);
+                    let mp = transform.transform_point(fp);
+                    let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                        return false;
+                    };
+
+                    let diff = mv - fixed.value(s);
+                    row[0] = diff * diff;
+
                     let jac = transform.jacobian_wrt_parameters(fp);
-                    for (k, dk) in deriv.iter_mut().enumerate() {
+                    for (k, slot) in row[1..].iter_mut().enumerate() {
                         let mut g = 0.0;
                         for (d, &gp) in grad_phys.iter().enumerate() {
                             g += gp * jac[d * nparams + k];
                         }
-                        *dk += 2.0 * diff * g;
+                        *slot = 2.0 * diff * g;
                     }
-                }
-            }
-
-            valid += 1;
+                    true
+                },
+                |_, row| {
+                    value_sum += row[0];
+                    for (dk, &contribution) in deriv.iter_mut().zip(&row[1..]) {
+                        *dk += contribution;
+                    }
+                    valid += 1;
+                },
+            );
         }
 
         if valid == 0 {
@@ -771,26 +1055,37 @@ impl MetricBackend for CpuBackend {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> f64 {
-        let dim = fixed.dim;
-        let n = fixed.values.len();
+        let n = fixed.len();
 
         let mut value_sum = 0.0;
         let mut valid = 0usize;
 
-        for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
-            let mp = transform.transform_point(fp);
-            // No gradient, no Jacobian: `value_at` decides validity by exactly
-            // the same predicate `value_and_physical_gradient` does, so this
-            // walks the identical sample set as `mean_squares`.
-            let mv = match moving.value_at(&mp) {
-                Some(v) => v,
-                None => continue,
-            };
-            let diff = mv - fixed.values[s];
-            value_sum += diff * diff;
-            valid += 1;
-        }
+        // Parallel per sample, accumulated on one thread in sample order — the
+        // same additions in the same order as a serial loop, so the value is
+        // bit-identical at any thread count. No Jacobian here, so this needs no
+        // dense/sparse split: it covers every transform.
+        parallel::map_rows_fold_in_order(
+            n,
+            1,
+            || fixed.scratch(),
+            |scratch, s, row| {
+                let fp = fixed.point(s, scratch);
+                let mp = transform.transform_point(fp);
+                // No gradient, no Jacobian: `value_at` decides validity by exactly
+                // the same predicate `value_and_physical_gradient` does, so this
+                // walks the identical sample set as `mean_squares`.
+                let Some(mv) = moving.value_at(&mp) else {
+                    return false;
+                };
+                let diff = mv - fixed.value(s);
+                row[0] = diff * diff;
+                true
+            },
+            |_, row| {
+                value_sum += row[0];
+                valid += 1;
+            },
+        );
 
         if valid == 0 {
             return f64::MAX;
@@ -918,21 +1213,10 @@ pub(crate) fn local_support_block(
     Some((offset, block))
 }
 
-/// Increment a multi-index in place (first index fastest).
-fn increment(index: &mut [usize], size: &[usize]) {
-    for d in 0..index.len() {
-        index[d] += 1;
-        if index[d] < size[d] {
-            return;
-        }
-        index[d] = 0;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_transform::TranslationTransform;
+    use sitk_transform::{Euler3DTransform, TransformBase, TranslationTransform};
 
     // A separable ramp f(x,y) = 3x + 5y makes the mean-squares gradient exactly
     // analytic, so we can check the derivative sign and magnitude precisely.
@@ -944,6 +1228,142 @@ mod tests {
             }
         }
         Image::from_vec(&[w, h], v).unwrap()
+    }
+
+    /// The parallel metric must return the **bits** of the serial loop it
+    /// replaced, at every thread count — not a value within some tolerance. The
+    /// optimizer is a feedback loop, so a metric that shifted by one ulp would
+    /// walk to a different registration result. The reference here is the serial
+    /// loop itself, written out, not a `with_threads(1)` run of the same code:
+    /// that would only prove thread-independence, not that the sum is still the
+    /// sequential sum.
+    #[test]
+    fn mean_squares_is_bit_identical_to_the_serial_loop_at_every_thread_count() {
+        // 40³ = 64 000 samples, well past the parallel threshold, with an
+        // intensity pattern whose sum is rounding-sensitive (any re-association
+        // of the accumulation shows up in the low bits).
+        let n = 40usize;
+        let wave = |phase: f64| {
+            let mut v = vec![0.0f64; n * n * n];
+            for z in 0..n {
+                for y in 0..n {
+                    for x in 0..n {
+                        let (fx, fy, fz) = (x as f64, y as f64, z as f64);
+                        v[(z * n + y) * n + x] =
+                            137.0 * (0.7 * fx + 1.3 * fy + 2.1 * fz + phase).sin() + 0.001 * fx;
+                    }
+                }
+            }
+            Image::from_vec(&[n, n, n], v).unwrap()
+        };
+        let metric = MeanSquaresMetric::new(&wave(0.0), &wave(0.35)).unwrap();
+        // Rigid Euler3D: 6 dense parameters, the benchmark's transform.
+        let t = Euler3DTransform::new(0.11, -0.07, 0.05, [1.5, -2.5, 0.75], [20.0, 20.0, 20.0]);
+
+        // The serial loop, verbatim — the code the parallel path replaced.
+        let (fixed, moving) = (&metric.fixed, &metric.moving);
+        let nparams = t.number_of_parameters();
+        let mut want_value = 0.0f64;
+        let mut want_deriv = vec![0.0f64; nparams];
+        let mut want_valid = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let mp = t.transform_point(fp);
+            let Some((mv, grad_phys)) = moving.value_and_physical_gradient(&mp) else {
+                continue;
+            };
+            let diff = mv - fixed.value(s);
+            want_value += diff * diff;
+            let jac = t.jacobian_wrt_parameters(fp);
+            for (k, dk) in want_deriv.iter_mut().enumerate() {
+                let mut g = 0.0;
+                for (d, &gp) in grad_phys.iter().enumerate() {
+                    g += gp * jac[d * nparams + k];
+                }
+                *dk += 2.0 * diff * g;
+            }
+            want_valid += 1;
+        }
+        // The primitive runs serially below 1<<14 *samples* (valid or not), so
+        // the parallel path must actually be the one under test here — and
+        // enough samples must survive the transform to make the sum nontrivial.
+        assert!(
+            fixed.len() > (1 << 14),
+            "the parallel path must be taken: only {} samples",
+            fixed.len()
+        );
+        assert!(want_valid > 1000, "only {want_valid} valid samples");
+        let inv = 1.0 / want_valid as f64;
+        let want_value = want_value * inv;
+        let want_deriv: Vec<f64> = want_deriv.iter().map(|d| d * inv).collect();
+        let mut want_only = 0.0f64;
+        let mut only_valid = 0usize;
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            let Some(mv) = moving.value_at(&t.transform_point(fp)) else {
+                continue;
+            };
+            let diff = mv - fixed.value(s);
+            want_only += diff * diff;
+            only_valid += 1;
+        }
+        let want_only = want_only / only_valid as f64;
+
+        // This fixture has teeth: re-associating the very same contributions
+        // into 64-wide chunks and folding the partials in order — a textbook
+        // "deterministic" chunked reduction, and exactly what this metric must
+        // *not* do — lands on different bits. So the assertions below would
+        // catch a re-association, rather than passing because the sum happens to
+        // be exact.
+        let mut contributions = Vec::new();
+        let mut scratch = fixed.scratch();
+        for s in 0..fixed.len() {
+            let fp = fixed.point(s, &mut scratch);
+            if let Some(mv) = moving.value_at(&t.transform_point(fp)) {
+                let diff = mv - fixed.value(s);
+                contributions.push(diff * diff);
+            }
+        }
+        let chunked: f64 = contributions
+            .chunks(64)
+            .map(|c| c.iter().sum::<f64>())
+            .sum::<f64>()
+            / only_valid as f64;
+        assert_ne!(
+            chunked.to_bits(),
+            want_only.to_bits(),
+            "fixture is not rounding-sensitive, so the bit assertions prove nothing"
+        );
+
+        for threads in [1usize, 2, 3, 8, 32] {
+            let (got, got_only) = sitk_core::parallel::with_threads(threads, || {
+                (
+                    metric.evaluate(&t, &CpuBackend),
+                    metric.value(&t, &CpuBackend),
+                )
+            });
+            assert_eq!(got.valid_points, want_valid, "{threads} threads");
+            assert_eq!(
+                got.value.to_bits(),
+                want_value.to_bits(),
+                "{threads} threads moved the value: {} vs {want_value}",
+                got.value
+            );
+            for (k, (&g, &w)) in got.derivative.iter().zip(&want_deriv).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "{threads} threads moved derivative[{k}]: {g} vs {w}"
+                );
+            }
+            assert_eq!(
+                got_only.to_bits(),
+                want_only.to_bits(),
+                "{threads} threads moved the value-only reduction: {got_only} vs {want_only}"
+            );
+        }
     }
 
     #[test]
@@ -1011,7 +1431,8 @@ mod tests {
             FixedSamples::from_image_with(&img, SamplingStrategy::Regular, 0.1, 0, None).unwrap();
         assert_eq!(samples.len(), 10);
         let expected: Vec<f64> = (0..10).map(|k| (k * 10) as f64).collect();
-        assert_eq!(samples.values, expected);
+        let got: Vec<f64> = (0..samples.len()).map(|s| samples.value(s)).collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -1099,17 +1520,17 @@ mod tests {
         moving: &MovingImage,
         transform: &dyn ParametricTransform,
     ) -> MetricValue {
-        let dim = fixed.dim;
         let nparams = transform.number_of_parameters();
-        let n = fixed.values.len();
+        let n = fixed.len();
 
         let mut value_sum = 0.0;
         let mut deriv = vec![0.0; nparams];
         let mut valid = 0usize;
 
+        let mut scratch = fixed.scratch();
         for s in 0..n {
-            let fp = &fixed.points[s * dim..(s + 1) * dim];
-            let fv = fixed.values[s];
+            let fp = fixed.point(s, &mut scratch);
+            let fv = fixed.value(s);
 
             let mp = transform.transform_point(fp);
             let (mv, grad_phys) = match moving.value_and_physical_gradient(&mp) {

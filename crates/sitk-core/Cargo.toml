@@ -8,4 +8,6 @@ repository.workspace = true
 description = "Core Image type and pixel dispatch for sitk-rs"
 
 [dependencies]
+libc.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
