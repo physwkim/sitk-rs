@@ -175,6 +175,23 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   walk exactly the same valid points — fixed mask 59,647 on both, moving mask
   59,617 on both, virtual domain 31,124 on both, both together 12,489 on both, 25
   iterations either way.
+- **That equality has one measured exception, and it is stated rather than
+  claimed away.** The device recovers the transform's affine by *probing* it
+  (`b = T(0)`, `A[:,e] = T(e_e) − b`), which lands ~1e-14 from the host's own
+  arithmetic — fine for the metric's continuous quantities, and **not** fine for
+  its three discrete ones (`floor` picks the cell, `is_inside` decides validity,
+  `round` picks the mask voxel). Constructed deliberately and measured: with a
+  face of samples placed on the buffer boundary under a **z-rotation**, 3 of 17
+  ulp-swept poses disagree about `valid_points` by 16 samples; with a moving-mask
+  wall on a half-integer, 4 of 17 disagree by 16, *in the opposite direction*.
+  Under a pure **translation** the probe recovers the identity exactly and both
+  paths agree bit for bit. So the honest contract today is "`valid_points` is
+  exact except at poses where a sample lands within ~1e-14 of the buffer boundary
+  or of a mask rounding tie" (`cuda_boundary.rs`). This is a **port-side** gap,
+  not the interpolant property of §2.158, and it is closable: taking `A`/`b` from
+  the transform's stored matrix and offset instead of probing them makes the
+  device's continuous index bit-identical to the host's, which removes all three
+  exposures by construction. That work is in flight.
 - **On a sampled run the device does not draw.** `FixedSamples::from_image_with`
   stays the single owner of *which voxels*, and the device is handed its flat-index
   list (8 bytes per sample, and the kernel derives the point from the same closed
