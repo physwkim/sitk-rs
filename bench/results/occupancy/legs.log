@@ -1,0 +1,15 @@
+# Round 6 — occupancy timeline legs. 64^3, t96, warm pool built once, release profile.
+# occG_r*.ndjson: grain sweep 2048/1024/512/256/128, 16 reps, grains alternating per rep.
+# occA_r1.ndjson: the 2048-vs-1024 A/B, 24 reps, grains alternating per rep.
+# One NDJSON line per chunk: op, grain, threads, rep, worker, chunk, start_ns, end_ns (t0 = 0).
+# Discarded, not reported: the first take ran in the DEV profile (walls 40-190 ms, 10-50x the
+# bench cell). Also discarded: a take whose load trace showed foreign=['nvidia-smi','pgrep'].
+
+# Load trace of each kept round (/proc/stat busy cores; loadavg is not trustworthy on this box):
+occG_r1: busy_max=55.31 foreign=none
+occG_r2: busy_max=54.22 foreign=none
+occG_r3: busy_max=53.04 foreign=none
+occA_r1: busy_max=51.40 foreign=none
+
+# busy_max is ~50-55 of 96 cores DURING MY OWN RUN -- that is the finding, not contamination:
+# the pass cannot fill the box. foreign=none on every kept round.
