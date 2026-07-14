@@ -19,6 +19,7 @@
 
 pub mod alloc;
 pub mod boundary;
+pub mod compensated;
 pub mod deriche;
 pub mod error;
 pub mod fused;

@@ -80,6 +80,7 @@
 //! [`DisplacementFieldTransform`]: sitk_transform::DisplacementFieldTransform
 
 use sitk_core::Image;
+use sitk_core::compensated::compensated_sum;
 use sitk_transform::ParametricTransform;
 
 use crate::error::{RegistrationError, Result};
@@ -254,20 +255,18 @@ pub(crate) struct MattesTail {
 /// default 50 bins) carries up to `n·ε ≈ 5.5e-13` relative; that was the port's error
 /// until this existed.
 ///
-/// The recurrence is ITK's exactly, including the detail that `GetSum()` returns the
+/// The recurrence lives in [`sitk_core::compensated::CompensatedSum`], which is ITK's
+/// `CompensatedSummation` exactly — including the detail that `GetSum()` returns the
 /// running sum **without** folding the final compensation back in
-/// (`itkCompensatedSummation.hxx:40-48`, `:132-135`) — so this is bit-identical to
-/// upstream's reduction, not merely more accurate than the naive one.
+/// (`itkCompensatedSummation.hxx:40-48`, `:132-135`). So this is bit-identical to
+/// upstream's reduction, not merely more accurate than the naive one: this walk is over
+/// the same terms in the same order as upstream's, so what it buys is **parity**, not
+/// only accuracy.
+///
+/// This was the first member of the family found (§2.161) and it is no longer the only
+/// one; the accumulator is shared so that the next site cannot re-hand-roll it wrong.
 fn joint_pdf_sum(joint_pdf: &[f64]) -> f64 {
-    let mut sum = 0.0f64;
-    let mut compensation = 0.0f64;
-    for &bin in joint_pdf {
-        let compensated_input = bin - compensation;
-        let temp_sum = sum + compensated_input;
-        compensation = (temp_sum - sum) - compensated_input;
-        sum = temp_sum;
-    }
-    sum
+    compensated_sum(joint_pdf.iter().copied())
 }
 
 /// Normalize the histogram, form `−MI`, and build the `pRatio` table. See [`MattesTail`].

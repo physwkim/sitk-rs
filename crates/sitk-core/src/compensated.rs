@@ -21,17 +21,31 @@
 //!
 //! - **[`sum`](CompensatedSum::sum) does not fold the residual back in.** ITK's `GetSum()`
 //!   returns `m_Sum` and ignores `m_Compensation` (`itkCompensatedSummation.hxx:132-135`).
-//!   Folding it (Neumaier's correction) is *strictly more accurate* — and would make this
-//!   port disagree with upstream in the last bit at every site. Accuracy is not the goal
-//!   here; being the reduction ITK computes is. [`corrected`](CompensatedSum::corrected)
-//!   exposes the folded value for tests that want a better reference to measure against,
-//!   and is deliberately not what `sum()` returns.
+//!   Reproduced as-is. (Folding Kahan's residual back would in any case buy almost nothing
+//!   — the recurrence holds it at or below half an ulp of the sum by construction. A
+//!   genuinely better answer needs a *different* recurrence: see [`neumaier_sum`], which is
+//!   the reference the family's pins measure against and which no port path may call.)
+//! - **Kahan's blind spot is reproduced, not fixed.** When a term arrives that is larger
+//!   than the running sum, the classic recurrence discards the accumulator's low bits
+//!   rather than the term's: `[1.0, 1e100, 1.0, −1e100]` sums to **0.0** under ITK's
+//!   algorithm and this one, and to **2.0** under Neumaier's. That is upstream's number, so
+//!   it is this port's number.
 //! - **Assignment resets the compensation** (`.hxx:120-127`), so `s = x` is a fresh
 //!   accumulator seeded at `x`, not `x` added to the running one. `GaussianDerivative-
 //!   Operator` depends on this: it assigns a *naive* `std::accumulate` into a
 //!   `CompensatedSummation` and keeps summing, so the compensation is discarded there.
-//! - **`+=` of another accumulator adds the other's compensation first, then its sum**
-//!   (`.hxx:76-83`) — not the same as adding `other.sum()`.
+//!
+//! ITK also offers `operator+=(const Self &)` (merge one accumulator into another) and
+//! `operator*=` / `operator/=` (scale sum and compensation together). **Neither is ported,
+//! and the first is why.** `operator+=(const Self &)` adds the other's `m_Compensation`
+//! (`.hxx:76-83`) — but the recurrence defines the compensation as the *negation* of the
+//! part that was lost (`total ≈ m_Sum − m_Compensation`), so a correct merge must
+//! **subtract** it. Upstream adds it, i.e. it moves the merged total the wrong way by twice
+//! the residual. Nothing in ITK calls it — the metric base folds its per-thread partials
+//! through the `TFloat` overload (`sum += partial.GetSum()`), not this one — so it is a
+//! latent upstream defect, not a live one, and this port has no reduction that needs a
+//! merge at all. Reproducing an unused sign error as public API would be shipping a trap;
+//! porting it *corrected* would be a silent divergence. Ported: neither. See ledger §2.171.
 //!
 //! # What compensating a reduction buys — and it is not always the same good
 //!
@@ -97,34 +111,59 @@ impl CompensatedSum {
         self.sum = temp_sum;
     }
 
-    /// Fold another accumulator in, ITK's `operator+=(const Self &)` (`.hxx:76-83`): the
-    /// other's **compensation first**, then its sum. Not equivalent to `add(other.sum())`.
-    pub fn add_sum(&mut self, other: &Self) {
-        self.add(other.compensation);
-        self.add(other.sum);
-    }
-
-    /// Scale both the sum and the carried compensation — ITK's `operator*=`
-    /// (`.hxx:94-101`).
-    pub fn scale(&mut self, factor: f64) {
-        self.sum *= factor;
-        self.compensation *= factor;
-    }
-
     /// The running sum, **without** the residual folded in — ITK's `GetSum()`
     /// (`.hxx:130-135`). This is the value upstream computes, and so the value this port
-    /// computes. For a strictly more accurate figure, see [`corrected`](Self::corrected),
-    /// which upstream never returns.
+    /// computes. For a strictly more accurate figure to measure *against*, see
+    /// [`neumaier_sum`], which upstream never computes and no port path may call.
     pub fn sum(&self) -> f64 {
         self.sum
     }
 
-    /// The sum with the residual folded back in (Neumaier). **More accurate than ITK, and
-    /// therefore not what this port uses in a metric** — it exists so a test can measure
-    /// [`sum`](Self::sum) against a better reference than the naive walk.
-    pub fn corrected(&self) -> f64 {
-        self.sum - self.compensation
+    /// The low-order part this accumulator is carrying and has not yet folded into
+    /// [`sum`](Self::sum) — i.e. `−m_Compensation`. Exposed so a test can *see* the state
+    /// the recurrence maintains (whether a reseed cleared it, whether a fold carried it).
+    ///
+    /// **This is not "the correction that would make the sum exact".** Folding it back
+    /// (`sum + residual`) is very nearly always a no-op in `f64`, because the Kahan
+    /// recurrence keeps `|residual|` at or below half an ulp of `sum` *by construction* —
+    /// that is what makes it the residual. An earlier draft of this type shipped a
+    /// `corrected()` that did exactly that fold and advertised it as Neumaier's; the gate
+    /// caught it, and the three tests it broke are still below. See [`neumaier_sum`] for
+    /// what an actually-better reference requires.
+    pub fn residual(&self) -> f64 {
+        -self.compensation
     }
+}
+
+/// **Neumaier's compensated summation — strictly more accurate than ITK's, and therefore
+/// forbidden in any port path that owes upstream a number.** It exists to be the *judge* in
+/// the family's pins: a test that only compares the compensated walk against the naive one
+/// cannot tell which is closer to the truth, so it needs a third, better answer.
+///
+/// Kahan (what [`CompensatedSum`] and ITK implement) has a known blind spot: it assumes
+/// each new term is *smaller* than the running sum. When a term arrives that is **larger**,
+/// the low-order bits lost are the ones from the accumulator, not from the term, and the
+/// classic recurrence discards them — `[1.0, 1e100, 1.0, −1e100]` sums to **0.0** under
+/// Kahan and to **2.0** here. Neumaier's variant branches on the magnitude comparison and
+/// keeps the right half in both cases, then folds the residual once at the end (which is
+/// sound *here*, unlike in Kahan, precisely because this residual is not bounded by half an
+/// ulp).
+///
+/// Reproducing ITK's blind spot is deliberate: the port owes upstream's reduction, not the
+/// best available one. See the [module docs](self).
+pub fn neumaier_sum<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+    let mut sum = 0.0f64;
+    let mut correction = 0.0f64;
+    for v in values {
+        let t = sum + v;
+        correction += if sum.abs() >= v.abs() {
+            (sum - t) + v
+        } else {
+            (v - t) + sum
+        };
+        sum = t;
+    }
+    sum + correction
 }
 
 impl std::ops::AddAssign<f64> for CompensatedSum {
@@ -170,89 +209,68 @@ mod tests {
 
         let naive: f64 = terms.iter().sum();
         assert_ne!(
-            naive, 1.0e17 + 1000.0,
+            naive,
+            1.0e17 + 1000.0,
             "the fixture must defeat naive summation, or the pin below is vacuous"
         );
 
         assert_eq!(compensated_sum(terms.iter().copied()), 1.0e17 + 1000.0);
     }
 
-    /// **`sum()` must NOT fold the residual in — it is ITK's `GetSum()`, and ITK's is
-    /// lossy.** The two differ exactly when a residual is outstanding, and the port owes
-    /// upstream's number, not the better one. If this ever starts holding as an equality,
-    /// someone has "improved" the accumulator and silently diverged every call site from
-    /// ITK in the last bit.
+    /// **This port reproduces Kahan's blind spot, because ITK has it.** When a term larger
+    /// than the running sum arrives, the classic recurrence throws away the accumulator's
+    /// low bits instead of the term's: the canonical `[1, 1e100, 1, −1e100]` comes back as
+    /// **0.0**, losing both `1`s. Neumaier's variant gets **2.0**.
+    ///
+    /// The port owes upstream's number, not the best available one, so `sum()` must stay
+    /// 0.0 here. If this test ever starts returning 2.0, someone has "improved" the
+    /// accumulator into Neumaier and silently diverged every call site in this family from
+    /// ITK — which would be the same defect as the naive walk, only in the other direction.
     #[test]
-    fn the_sum_is_itks_lossy_getsum_and_not_the_corrected_one() {
-        let mut s = CompensatedSum::new();
-        s += 1.0;
-        s += 1.0e-20;
-        s += 1.0e-20;
+    fn the_accumulator_keeps_itks_blind_spot_and_does_not_quietly_become_neumaier() {
+        let terms = [1.0, 1.0e100, 1.0, -1.0e100];
 
-        assert_eq!(s.sum(), 1.0, "GetSum() returns m_Sum, residual unfolded");
-        assert_ne!(
-            s.corrected().to_bits(),
-            s.sum().to_bits(),
-            "the residual must be real here, or this test cannot detect a fold"
+        assert_eq!(
+            compensated_sum(terms),
+            0.0,
+            "ITK's Kahan loses both 1s here, and this port must lose them too"
         );
-        assert!(s.corrected() > 1.0);
+        assert_eq!(
+            neumaier_sum(terms),
+            2.0,
+            "the reference must be strictly better, or it cannot judge the pins"
+        );
+    }
+
+    /// `sum()` is ITK's `GetSum()`: `m_Sum`, with the carried residual left out
+    /// (`.hxx:130-135`). The residual is real — the accumulator is holding it — and it is
+    /// still not in the reported number.
+    #[test]
+    fn the_sum_is_itks_lossy_getsum_and_leaves_the_residual_behind() {
+        // One add of 1.0 into 1e16 (whose ulp is 2) loses the whole term: the sum does not
+        // move, and the accumulator carries the lost 1.0 as its residual.
+        let mut s = CompensatedSum::seeded(1.0e16);
+        s += 1.0;
+
+        assert_eq!(s.sum(), 1.0e16, "GetSum() returns m_Sum, residual unfolded");
+        assert_eq!(s.residual(), 1.0, "the residual must be real and carried");
     }
 
     /// Assignment resets the compensation (ITK `.hxx:120-127`) — `GaussianDerivative-
     /// Operator` relies on it when it assigns a naive `std::accumulate` into the
-    /// accumulator and keeps going.
+    /// accumulator and keeps summing.
     #[test]
     fn seeding_drops_the_carried_compensation() {
-        let mut s = CompensatedSum::new();
+        let mut s = CompensatedSum::seeded(1.0e16);
         s += 1.0;
-        s += 1.0e-20;
-        assert!(s.corrected() > 1.0);
+        assert_eq!(s.residual(), 1.0);
 
         let reseeded = CompensatedSum::seeded(s.sum());
-        assert_eq!(reseeded.sum(), 1.0);
+        assert_eq!(reseeded.sum(), 1.0e16);
         assert_eq!(
-            reseeded.corrected(),
-            1.0,
+            reseeded.residual(),
+            0.0,
             "a reseeded accumulator carries no residual"
         );
-    }
-
-    /// Folding one accumulator into another adds the other's **compensation first**, then
-    /// its sum (ITK `.hxx:76-83`) — which is not `add(other.sum())`.
-    #[test]
-    fn folding_an_accumulator_carries_its_compensation() {
-        let mut part = CompensatedSum::new();
-        part += 1.0;
-        part += 1.0e-20;
-        part += 1.0e-20;
-
-        let mut folded = CompensatedSum::seeded(1.0e17);
-        folded.add_sum(&part);
-
-        let mut dropped = CompensatedSum::seeded(1.0e17);
-        dropped += part.sum();
-
-        // Both land on 1e17 in the sum; the difference is the residual each carries, which
-        // is what the next addition will see.
-        assert_ne!(
-            folded.corrected().to_bits(),
-            dropped.corrected().to_bits(),
-            "add_sum must carry the other's compensation, or it is just add(other.sum())"
-        );
-    }
-
-    /// Scaling scales the residual too (ITK `operator*=`), so a later `sum()` is still the
-    /// compensated one.
-    #[test]
-    fn scaling_scales_the_compensation() {
-        let mut s = CompensatedSum::new();
-        s += 1.0;
-        s += 1.0e-20;
-        let before = s.corrected() - s.sum();
-
-        s.scale(2.0);
-        let after = s.corrected() - s.sum();
-
-        assert_eq!(after, before * 2.0);
     }
 }
