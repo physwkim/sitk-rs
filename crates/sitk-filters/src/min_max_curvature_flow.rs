@@ -129,7 +129,7 @@ use crate::denoise::curvature_flow_update;
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
-    Image, Neighborhood, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition, parallel,
+    Image, NeighborhoodIterator, PixelId, Stencil, ZeroFluxNeumannBoundaryCondition, parallel,
 };
 
 /// `itk::Math::Round<SizeValueType>`: round to nearest, halves upward
@@ -185,14 +185,14 @@ fn stencil_operator(dim: usize, radius: usize) -> Vec<f64> {
 /// The centered, spacing-scaled gradient the three `ComputeThreshold` overloads
 /// share: `0.5·(I[+e_d] − I[−e_d])·ScaleCoefficients[d]`. Note this uses the raw
 /// `ScaleCoefficients`, *not* `ComputeNeighborhoodScales`'s `/radius[d]` form.
-fn threshold_gradient(nb: &Neighborhood<f64>, dim: usize, coeff: &[f64]) -> Vec<f64> {
+fn threshold_gradient<S: Stencil + ?Sized>(nb: &S, dim: usize, coeff: &[f64]) -> Vec<f64> {
     let mut off = vec![0i64; dim];
     (0..dim)
         .map(|d| {
             off[d] = 1;
-            let plus = nb.get(&off);
+            let plus = nb.at(&off);
             off[d] = -1;
-            let minus = nb.get(&off);
+            let minus = nb.at(&off);
             off[d] = 0;
             0.5 * (plus - minus) * coeff[d]
         })
@@ -205,8 +205,8 @@ fn threshold_gradient(nb: &Neighborhood<f64>, dim: usize, coeff: &[f64]) -> Vec<
 /// Euclidean norm `>= radius` and whose cosine against the gradient is
 /// `< 0.262` in absolute value (i.e. within ~74.8° of perpendicular). Returns
 /// `0` when no pixel qualifies, and `0` when the gradient is exactly zero.
-fn compute_threshold_generic(
-    nb: &Neighborhood<f64>,
+fn compute_threshold_generic<S: Stencil + ?Sized>(
+    nb: &S,
     dim: usize,
     radius: usize,
     coeff: &[f64],
@@ -223,7 +223,9 @@ fn compute_threshold_generic(
     let mut threshold = 0.0f64;
     let mut num_pixels = 0usize;
 
-    for &value in nb.values() {
+    // The window in slot order — the same dimension-0-fastest sequence
+    // `nb.values()` walked, now readable from a borrowed window too.
+    for value in nb.slots() {
         let mut dot_product = 0.0f64;
         let mut vector_magnitude = 0.0f64;
         for (d, &g) in gradient.iter().enumerate() {
@@ -259,7 +261,7 @@ fn compute_threshold_generic(
 /// `MinMaxCurvatureFlowFunction::ComputeThreshold(const Dispatch<2> &, ...)`:
 /// rescale the gradient to length `radius`, rotate it ±90°, round both
 /// endpoints onto the lattice, average the two pixels. `0` on a zero gradient.
-fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold_2d<S: Stencil + ?Sized>(nb: &S, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 2, coeff);
     let mut grad_magnitude = gradient[0] * gradient[0] + gradient[1] * gradient[1];
     if grad_magnitude == 0.0 {
@@ -271,10 +273,9 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 
     let r = radius as f64;
     let span = 2 * radius + 1;
-    let values = nb.values();
 
-    let first = values[itk_round(r - gradient[1]) + span * itk_round(r + gradient[0])];
-    let second = values[itk_round(r + gradient[1]) + span * itk_round(r - gradient[0])];
+    let first = nb.slot(itk_round(r - gradient[1]) + span * itk_round(r + gradient[0]));
+    let second = nb.slot(itk_round(r + gradient[1]) + span * itk_round(r - gradient[0]));
     (first + second) * 0.5
 }
 
@@ -287,7 +288,7 @@ fn compute_threshold_2d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 /// is the angle of the *unit* gradient, so `theta` is `acos(gradient[2] /
 /// radius)`, not upstream's `acos(gradient[2])`. The clamp into `[-1, 1]` is
 /// kept as a pure rounding guard — the quotient is in range by construction.
-fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold_3d<S: Stencil + ?Sized>(nb: &S, radius: usize, coeff: &[f64]) -> f64 {
     let mut gradient = threshold_gradient(nb, 3, coeff);
     let mut grad_magnitude: f64 = gradient.iter().map(|g| g * g).sum();
     if grad_magnitude == 0.0 {
@@ -322,8 +323,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
     let r_cos_phi = r * cos_phi;
 
     let span = 2 * radius + 1;
-    let values = nb.values();
-    let at = |x: usize, y: usize, z: usize| values[x + span * y + span * span * z];
+    let at = |x: usize, y: usize, z: usize| nb.slot(x + span * y + span * span * z);
 
     // angle = 0, 90, 180, 270 around the (intended) gradient axis
     let p1 = at(
@@ -343,7 +343,7 @@ fn compute_threshold_3d(nb: &Neighborhood<f64>, radius: usize, coeff: &[f64]) ->
 }
 
 /// `MinMaxCurvatureFlowFunction::ComputeThreshold(Dispatch<ImageDimension>(), it)`.
-fn compute_threshold(nb: &Neighborhood<f64>, dim: usize, radius: usize, coeff: &[f64]) -> f64 {
+fn compute_threshold<S: Stencil + ?Sized>(nb: &S, dim: usize, radius: usize, coeff: &[f64]) -> f64 {
     match dim {
         2 => compute_threshold_2d(nb, radius, coeff),
         3 => compute_threshold_3d(nb, radius, coeff),
@@ -414,59 +414,53 @@ fn min_max_flow(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        // Parallel over voxels. Each voxel's update is a function of its own
-        // window in `snapshot` — a *separate* image, cloned from `buf` before the
-        // sweep — so no voxel reads another voxel's new value and the sweep is a
-        // map, not a recurrence. The iteration loop itself stays sequential: each
-        // pass reads the whole previous pass.
+        // Parallel over voxels, reading the **borrowed** window. Each voxel's
+        // update is a function of its own window in `snapshot` — a separate image,
+        // cloned from `buf` before the sweep — so no voxel reads another voxel's
+        // new value and the sweep is a map, not a recurrence. The iteration loop
+        // itself stays sequential: each pass reads the whole previous pass.
         //
-        // The window is refilled into per-task scratch rather than borrowed,
-        // because `curvature_flow_update` and `compute_threshold` are shared with
-        // the level-set solver and take a `&Neighborhood`. That deletes the
-        // per-voxel *allocation* the serial walk made, and the values the helpers
-        // see are the identical ones in the identical order, so the arithmetic is
-        // untouched. The zero-copy `WindowView` form is not applied here; see the
-        // report.
+        // The window used to be *materialized* into per-task scratch here, because
+        // `curvature_flow_update` and `compute_threshold` took a `&Neighborhood`.
+        // They now take a `Stencil` — the capability they actually use — so the
+        // borrowed `WindowView` satisfies them directly and nothing is copied. The
+        // values they see are the identical ones in the identical order, which is
+        // what `WindowView::get_offset` and `Stencil::slot` are pinned on in
+        // `sitk-core`.
         //
         // `None` is NOT "an update of zero". The serial loop `continue`d when
         // `update == 0.0`, skipping the `+=` entirely, and that is not the same as
         // adding `0.0`: `buf[i]` can be `-0.0`, and `-0.0 + 0.0` is `+0.0` while
         // no-op leaves `-0.0`. The skip is carried through as `None` and honored
         // below, so the sign bit survives exactly as it did.
-        let gated: Vec<Option<f64>> = iter.par_map_window_init(
-            || (iter.window_buffer(), vec![0i64; dim]),
-            |(nb, nd), center, _| {
-                iter.refill(center, nd, nb);
-
-                let update = curvature_flow_update(nb, dim, &coeff);
-                if update == 0.0 {
-                    return None;
+        let gated: Vec<Option<f64>> = iter.par_map_window(|_, w| {
+            let update = curvature_flow_update(&w, dim, &coeff);
+            if update == 0.0 {
+                return None;
+            }
+            let avg_value: f64 = w
+                .iter_f64()
+                .zip(&operator)
+                .map(|(pixel, weight)| pixel * weight)
+                .sum();
+            Some(match gate {
+                Gate::MinMax => {
+                    let threshold = compute_threshold(&w, dim, stencil_radius, &coeff);
+                    if avg_value < threshold {
+                        update.max(0.0)
+                    } else {
+                        update.min(0.0)
+                    }
                 }
-                let avg_value: f64 = nb
-                    .values()
-                    .iter()
-                    .zip(&operator)
-                    .map(|(pixel, weight)| pixel * weight)
-                    .sum();
-                Some(match gate {
-                    Gate::MinMax => {
-                        let threshold = compute_threshold(nb, dim, stencil_radius, &coeff);
-                        if avg_value < threshold {
-                            update.max(0.0)
-                        } else {
-                            update.min(0.0)
-                        }
+                Gate::Binary(threshold) => {
+                    if avg_value < threshold {
+                        update.min(0.0)
+                    } else {
+                        update.max(0.0)
                     }
-                    Gate::Binary(threshold) => {
-                        if avg_value < threshold {
-                            update.min(0.0)
-                        } else {
-                            update.max(0.0)
-                        }
-                    }
-                })
-            },
-        );
+                }
+            })
+        });
 
         parallel::for_each_mut(&mut buf, |i, v| {
             if let Some(g) = gated[i] {
@@ -542,6 +536,10 @@ pub fn binary_min_max_curvature_flow(
 mod tests {
     use super::*;
     use crate::denoise::curvature_flow;
+    // These tests hand the threshold helpers an OWNED window, and they still
+    // compile and pass against the `Stencil` signatures: the owned path did not
+    // go away, it stopped being mandatory.
+    use sitk_core::Neighborhood;
 
     const EPS: f64 = 1e-12;
 
