@@ -38,14 +38,22 @@
 //! ITK also offers `operator+=(const Self &)` (merge one accumulator into another) and
 //! `operator*=` / `operator/=` (scale sum and compensation together). **Neither is ported,
 //! and the first is why.** `operator+=(const Self &)` adds the other's `m_Compensation`
-//! (`.hxx:76-83`) — but the recurrence defines the compensation as the *negation* of the
+//! (`.hxx:79-83`) — but the recurrence defines the compensation as the *negation* of the
 //! part that was lost (`total ≈ m_Sum − m_Compensation`), so a correct merge must
 //! **subtract** it. Upstream adds it, i.e. it moves the merged total the wrong way by twice
-//! the residual. Nothing in ITK calls it — the metric base folds its per-thread partials
-//! through the `TFloat` overload (`sum += partial.GetSum()`), not this one — so it is a
-//! latent upstream defect, not a live one, and this port has no reduction that needs a
-//! merge at all. Reproducing an unused sign error as public API would be shipping a trap;
-//! porting it *corrected* would be a silent divergence. Ported: neither. See ledger §2.171.
+//! the residual, which leaves the merge *worse than not compensating at all*.
+//!
+//! This is a **live** ITK defect, not a latent one: three filters merge their per-thread
+//! accumulators through it — `StatisticsImageFilter` (`.hxx:130-131`, and its Sum, Mean,
+//! Variance and Sigma outputs), `DirectedHausdorffDistanceImageFilter` (`.hxx:188`, the
+//! average distance) and `PointSetToPointSetMetricWithIndexv4` (`.hxx:198`, `:373`, the
+//! metric value). The error is coherent across work units, so it **grows with the thread
+//! count** — the exact property `CompensatedSummation` was introduced to remove. Written up
+//! as ledger §1.75; the port-side reasoning is §2.171.
+//!
+//! This port has no reduction that merges two accumulators, so reproducing the sign error
+//! as public API would be shipping a trap that buys parity with nothing, while porting it
+//! *corrected* would be a silent divergence from upstream's written code. Ported: neither.
 //!
 //! # What compensating a reduction buys — and it is not always the same good
 //!
