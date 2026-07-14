@@ -95,26 +95,16 @@ impl<'a> ThresholdMask<'a> {
     /// see that variant for why the port refuses instead of reproducing (upstream
     /// throws in eleven calculators and returns a `NaN` threshold in two).
     fn selected(&self, img: &Image, vals: &[f64]) -> Result<Vec<f64>> {
-        if self.image.size() != img.size() {
-            return Err(FilterError::SizeMismatch {
-                a: img.size().to_vec(),
-                b: self.image.size().to_vec(),
-            });
-        }
-        // ITK does not *sample* the mask: it is a second `ImageToImageFilter` input, so
-        // `VerifyInputInformation` (`itkImageToImageFilter.hxx:148-223`) throws "Inputs do
-        // not occupy the same physical space!" unless the mask's origin, spacing and
-        // direction agree with the image's. Same grid or refuse; no resampling, no
-        // index-aligned-but-physically-elsewhere mask.
-        if !crate::geometry::same_physical_space(img, self.image) {
-            return Err(FilterError::PhysicalSpaceMismatch { index: 1 });
-        }
-        let mask = self.image.to_f64_vec()?;
-        let wanted = f64::from(self.mask_value);
+        // The mask's three preconditions — `UInt8` (SimpleITK's yaml gives these filters
+        // `MaskImageType = OutputImageType = itk::Image<uint8_t, Dim>`, reached through the
+        // `dynamic_cast` in `CastImageToITK`), the image's size, and the image's *grid*
+        // (`VerifyInputInformation`; ITK never samples a mask) — belong to
+        // [`crate::mask_input`], which owns them for every mask input in this crate.
+        let mask = crate::mask_input::uint8_mask_voxels(img, self.image)?;
         let selected: Vec<f64> = vals
             .iter()
             .zip(mask.iter())
-            .filter(|&(_, &m)| m == wanted)
+            .filter(|&(_, &m)| m == self.mask_value)
             .map(|(&v, _)| v)
             .collect();
         if selected.is_empty() {
@@ -126,13 +116,13 @@ impl<'a> ThresholdMask<'a> {
     }
 
     /// `MaskImageFilter` on the thresholded output: zero where the mask is **`0`**.
-    fn apply_to_output(&self, out: &mut [u8]) -> Result<()> {
+    fn apply_to_output(&self, img: &Image, out: &mut [u8]) -> Result<()> {
         if !self.mask_output {
             return Ok(());
         }
-        let mask = self.image.to_f64_vec()?;
+        let mask = crate::mask_input::uint8_mask_voxels(img, self.image)?;
         for (o, &m) in out.iter_mut().zip(mask.iter()) {
-            if m == 0.0 {
+            if m == 0 {
                 *o = 0;
             }
         }
@@ -210,12 +200,13 @@ pub(crate) fn threshold_histogram(
 
 /// The output-masking half of the same rule, so no caller hand-rolls it.
 pub(crate) fn apply_threshold_mask_output(
+    img: &Image,
     out: &mut [u8],
     mask: Option<&ThresholdMask>,
 ) -> Result<()> {
     match mask {
         None => Ok(()),
-        Some(m) => m.apply_to_output(out),
+        Some(m) => m.apply_to_output(img, out),
     }
 }
 
