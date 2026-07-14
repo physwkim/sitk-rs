@@ -11,6 +11,8 @@
 //! Only compiled with the `cuda` feature.
 #![cfg(feature = "cuda")]
 
+mod support;
+
 use sitk_core::Image;
 use sitk_cuda::{CudaError, DeviceImage, DeviceMask};
 use sitk_registration::metric::{FixedSamples, MovingImage, SamplingStrategy};
@@ -19,6 +21,7 @@ use sitk_registration::{
     ImageRegistrationMethod, MeanSquaresMetric, RegistrationError,
 };
 use sitk_transform::{BSplineTransform, Euler3DTransform, ParametricTransform};
+use support::cell_boundary_straddles;
 
 const OUT_MIN: f64 = 0.0;
 const OUT_MAX: f64 = 255.0;
@@ -56,6 +59,36 @@ fn probe_transform(n: usize) -> Euler3DTransform {
 
 fn no_device() -> bool {
     matches!(sitk_cuda::backend(), Err(CudaError::NoDevice(_)))
+}
+
+/// **The precondition every 1e-9 derivative band in this file rests on, asserted rather
+/// than assumed.**
+///
+/// Those bands are claims about *reduction rounding*: the host sums N per-sample terms
+/// left to right, the device folds a fixed tree, and the two differ by ~√N·ε. The claim
+/// holds only where the two paths walk the same cells of the moving grid.
+///
+/// Where a sample lands on a cell wall they do not. The device's point map is an affine
+/// form **probed** from the transform (`A[d][e] = T(e_e)[d] − T(0)[d]`) and the host's is
+/// the transform's own expression; they agree to the last ulp, and that ulp decides which
+/// side of the wall the sample sits on. The trilinear interpolant is continuous there and
+/// **its gradient is not**, so the two paths take different one-sided limits of `∂M/∂x`
+/// and the derivative moves by ~5.7e-6 relative — nearly four decades outside these bands
+/// — on a *single* sample out of 262144 (ledger §2.158; measured in
+/// `cuda_mean_squares.rs::a_sample_on_a_cell_boundary_costs_one_derivative_component`).
+///
+/// Without this assertion a pin below would report that failure as a kernel regression,
+/// and a pin that *passed* would be reporting a property of its geometry as a property of
+/// the reduction. The probe is the shared one in `tests/support`, so the two metrics and
+/// the pipeline cannot drift apart in what they mean by "no sample sits on a wall".
+fn assert_no_straddle(fixed: &Image, moving: &Image, t: &dyn ParametricTransform, at: &str) {
+    let straddles = cell_boundary_straddles(fixed, moving, t);
+    assert!(
+        straddles.is_empty(),
+        "{at}: {} sample(s) land on a moving-grid cell wall ({straddles:?}) --- the derivative \
+         band below would then be measuring a gradient discontinuity, not the reduction",
+        straddles.len()
+    );
 }
 
 // The crossing's pixel-type contract — every scalar type casts on the device,
@@ -150,6 +183,7 @@ fn a_metric_built_from_device_images_matches_the_cpu_metric() {
     let n = 64;
     let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
     let t = probe_transform(n);
+    assert_no_straddle(&fixed, &moving, &t, "probe pose");
 
     let host = MeanSquaresMetric::from_samples(
         FixedSamples::from_image(&fixed).unwrap(),
@@ -230,6 +264,7 @@ fn a_masked_device_metric_matches_the_masked_host_metric() {
     let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
     let mask = ellipsoid_mask(n);
     let t = probe_transform(n);
+    assert_no_straddle(&fixed, &moving, &t, "probe pose, fixed mask");
 
     let kept = mask
         .scalar_slice::<f32>()
@@ -353,6 +388,7 @@ fn the_resident_chain_agrees_with_the_host_chain() {
     // Host chain.
     let f = sitk_filters::rescale_intensity(&fixed, OUT_MIN, OUT_MAX).unwrap();
     let m = sitk_filters::rescale_intensity(&moving, OUT_MIN, OUT_MAX).unwrap();
+    assert_no_straddle(&f, &m, &t, "probe pose, rescaled chain");
     let host = MeanSquaresMetric::from_samples(
         FixedSamples::from_image(&f).unwrap(),
         MovingImage::from_image(&m).unwrap(),
@@ -561,6 +597,12 @@ fn the_full_resident_pipeline_agrees_with_the_host_pipeline() {
         let r = sitk_filters::rescale_intensity(img, OUT_MIN, OUT_MAX).unwrap();
         sitk_filters::smooth_gaussian(&r, &sigma).unwrap()
     };
+    assert_no_straddle(
+        &host_chain(&fixed),
+        &host_chain(&moving),
+        &t,
+        "probe pose, rescale+gaussian chain",
+    );
     let host = MeanSquaresMetric::from_samples(
         FixedSamples::from_image(&host_chain(&fixed)).unwrap(),
         MovingImage::from_image(&host_chain(&moving)).unwrap(),
@@ -927,6 +969,7 @@ fn the_device_metric_is_the_same_objective_as_the_host_metric() {
     let mut worst_v = 0.0f64;
     let mut worst_d = 0.0f64;
     for (k, t) in transforms.iter().enumerate() {
+        assert_no_straddle(&fixed, &moving, t, &format!("transform {k}"));
         let cpu = host.evaluate(t, &CpuBackend);
         let gpu = device.evaluate(t).unwrap();
 
@@ -1199,6 +1242,12 @@ fn the_device_metric_agrees_with_the_host_on_a_sample_that_lands_on_a_voxel_plan
 
     let c = n as f64 / 2.0;
     let identity = Euler3DTransform::new(0.0, 0.0, 0.0, [0.0; 3], [c, c, c]);
+    // Samples land ON the voxel planes here, and the two paths still agree about which
+    // cell each one is in: at the identity the probed affine form is the host's matrix
+    // exactly, so there is no ulp between them to straddle with. That is *why* this pin
+    // passes, and it is worth asserting rather than leaving to be inferred from the fact
+    // that it does.
+    assert_no_straddle(&fixed, &moving, &identity, "identity on a voxel plane");
 
     let host = MeanSquaresMetric::from_samples(
         FixedSamples::from_image(&fixed).unwrap(),
@@ -1257,6 +1306,7 @@ fn a_moving_mask_on_the_device_metric_matches_the_host() {
     let (fixed, moving) = (volume(n, [0.0; 3]), volume(n, [3.0, -2.0, 1.5]));
     let mask = ellipsoid_mask(n);
     let t = probe_transform(n);
+    assert_no_straddle(&fixed, &moving, &t, "probe pose, moving mask");
 
     let host = MeanSquaresMetric::from_samples(
         FixedSamples::from_image(&fixed).unwrap(),

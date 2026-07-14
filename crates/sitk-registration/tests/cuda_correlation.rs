@@ -22,6 +22,8 @@
 //! Only compiled with the `cuda` feature.
 #![cfg(feature = "cuda")]
 
+mod support;
+
 use sitk_core::Image;
 use sitk_cuda::DeviceImage;
 use sitk_registration::metric::{FixedSamples, MetricValue, MovingImage};
@@ -29,6 +31,7 @@ use sitk_registration::{CorrelationMetric, DeviceCorrelationMetric, DeviceMetric
 use sitk_transform::{
     DisplacementFieldTransform, Euler3DTransform, ParametricTransform, TranslationTransform,
 };
+use support::{cell_boundary_straddles, no_device};
 
 /// The same textured volume the mean-squares pins use: three Gaussian blobs plus a
 /// low-frequency sine texture, so the moments are conditioned like a real image and
@@ -94,12 +97,6 @@ fn device(fixed: &Image, moving: &Image) -> DeviceCorrelationMetric {
         &DeviceImage::upload(moving).unwrap(),
     )
     .unwrap()
-}
-
-/// True when the device is absent — a supported configuration, and the reason the
-/// fallback exists.
-fn no_device() -> bool {
-    matches!(sitk_cuda::backend(), Err(sitk_cuda::CudaError::NoDevice(_)))
 }
 
 /// Four poses: the identity, a small rotation, the shift that aligns the two volumes, and
@@ -196,105 +193,6 @@ fn sfm_conditioning(fixed: &Image, moving: &Image, t: &dyn ParametricTransform) 
         abs += prod.abs();
     }
     (abs / sfm.abs(), pairs.len())
-}
-
-/// The fixed samples whose continuous moving index lands on a **different cell** under
-/// the host's point map than under the affine form the device is given.
-///
-/// The device is handed `A` and `b` probed from the transform (`p = A·x + b`); the host
-/// evaluates the transform's own expression (for a Euler transform, `R·(x − c) + c + t`).
-/// The two are the same map in exact arithmetic and differ in the last ulp in f64. The
-/// *value* does not care — trilinear interpolation is continuous across a cell boundary,
-/// so a 1-ulp difference in the index moves the interpolated value by ~1e-16. Its
-/// **gradient** is not continuous across a cell boundary: `∂M/∂x` on one side is built
-/// from one pair of voxels and on the other side from the next, and the jump is O(1).
-///
-/// So a sample whose index lands *exactly* on an integer is a coin toss between two
-/// different gradients, and the two paths can call it differently. This function finds
-/// those samples. Returned: `(fixed index, axis, |Δ∂M/∂axis|)`.
-fn cell_boundary_straddles(
-    fixed: &Image,
-    moving: &Image,
-    t: &dyn ParametricTransform,
-) -> Vec<([usize; 3], usize, f64)> {
-    let m = moving.to_f64_vec().unwrap();
-    let size = fixed.size().to_vec();
-    let forigin = fixed.origin().to_vec();
-    let msize = moving.size().to_vec();
-    let mstride = [1usize, msize[0], msize[0] * msize[1]];
-
-    // The gradient of the trilinear interpolant at a continuous index — the quantity
-    // whose discontinuity is under test.
-    let grad = |c: [f64; 3]| -> Option<[f64; 3]> {
-        for (d, &cd) in c.iter().enumerate() {
-            if !(cd >= -0.5 && cd < msize[d] as f64 - 0.5) {
-                return None;
-            }
-        }
-        let mut g = [0.0f64; 3];
-        for corner in 0..8usize {
-            let mut offset = 0usize;
-            let mut dw = [1.0f64; 3];
-            for (d, &cd) in c.iter().enumerate() {
-                let base = cd.floor();
-                let frac = cd - base;
-                let bit = (corner >> d) & 1;
-                let wd = if bit == 1 { frac } else { 1.0 - frac };
-                let dwd = if bit == 1 { 1.0 } else { -1.0 };
-                for (e, dwe) in dw.iter_mut().enumerate() {
-                    *dwe *= if e == d { dwd } else { wd };
-                }
-                let idx = (base as isize + bit as isize).clamp(0, msize[d] as isize - 1) as usize;
-                offset += idx * mstride[d];
-            }
-            for (e, ge) in g.iter_mut().enumerate() {
-                *ge += dw[e] * m[offset];
-            }
-        }
-        Some(g)
-    };
-
-    // The affine form the device is given, probed exactly as `cuda::affine_form` probes it.
-    let b0 = t.transform_point(&[0.0, 0.0, 0.0]);
-    let mut a = [[0.0f64; 3]; 3];
-    for e in 0..3 {
-        let mut basis = [0.0f64; 3];
-        basis[e] = 1.0;
-        let te = t.transform_point(&basis);
-        for (d, row) in a.iter_mut().enumerate() {
-            row[e] = te[d] - b0[d];
-        }
-    }
-
-    let mut out = Vec::new();
-    for k in 0..size[2] {
-        for j in 0..size[1] {
-            for i in 0..size[0] {
-                let x = [
-                    i as f64 + forigin[0],
-                    j as f64 + forigin[1],
-                    k as f64 + forigin[2],
-                ];
-                let ph = t.transform_point(&x);
-                let host_c = [ph[0], ph[1], ph[2]];
-                let mut dev_c = [0.0f64; 3];
-                for (d, dc) in dev_c.iter_mut().enumerate() {
-                    // The kernel's fused chain, so the probe predicts the kernel and not
-                    // some third arithmetic of its own.
-                    *dc =
-                        a[d][0].mul_add(x[0], a[d][1].mul_add(x[1], a[d][2].mul_add(x[2], b0[d])));
-                }
-                if let (Some(gh), Some(gd)) = (grad(host_c), grad(dev_c)) {
-                    for (e, (&a, &b)) in gh.iter().zip(gd.iter()).enumerate() {
-                        if (a - b).abs() > 1e-6 {
-                            out.push(([i, j, k], e, (a - b).abs()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 /// The bands, stated.
