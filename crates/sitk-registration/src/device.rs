@@ -652,10 +652,20 @@ impl DeviceMattesMetric {
     /// [`DeviceMeanSquaresMetric::from_device_sampled`].
     ///
     /// The histogram's axes are sized from the **fixed sample set's** intensity range and
-    /// the **moving volume's**, which is what the host reduces over
-    /// (`FixedSamples::value_range` is over the samples that survived the mask and the
-    /// draw; `MovingImage::value_range` is over every voxel). The device reduces the same
-    /// two sets. Min and max are *selections*, not sums, so the device tree and the host's
+    /// the **moving volume's masked** range — the two sets the host reduces over.
+    /// `FixedSamples::value_range` sees the samples that survived the fixed mask and the
+    /// draw; `MovingImage::value_range` sees the voxels the **moving mask** admits. The
+    /// device reduces the same two sets, through kernels that take the same two masks.
+    ///
+    /// The moving mask belongs here and not merely in the sampler: this range sizes the
+    /// moving axis, so a masked-out voxel brighter than anything the mask admits would
+    /// stretch every bin and move every sample's Parzen index. Both sides read the whole
+    /// volume until 2026-07-14, *together* — which is exactly the defect a host-vs-device
+    /// bit-identity pin cannot see, and why the mask had to land on both sides at once
+    /// (ledger §2.162; ITK masks it at
+    /// `itkMattesMutualInformationImageToImageMetricv4.hxx:199-214`).
+    ///
+    /// Min and max are *selections*, not sums, so the device tree and the host's
     /// sequential scan agree on the bits without agreeing on an order.
     pub fn from_device_sampled(
         fixed: &DeviceImage,

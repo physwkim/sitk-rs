@@ -446,10 +446,23 @@ extern "C" __global__ void fixed_range(
     emit_range(mn, mx, cnt, partials);
 }
 
-// The MOVING VOLUME's intensity range -- every voxel, masked or not, which is what the
-// host's `MovingImage::value_range` reduces over (`self.buf.min_max()`).
+// The MOVING VOLUME's intensity range -- over the voxels THE MOVING MASK ADMITS, which
+// is what the host's `MovingImage::value_range` reduces over.
+//
+// The mask is not optional here and it is not a filter on the answer -- it decides the
+// question. This range sizes the histogram's moving axis, so a masked-out voxel brighter
+// than anything the mask admits would stretch every bin and move every sample's Parzen
+// index. The host reduced over the whole buffer and so did this kernel, together, which
+// is exactly the failure a host-vs-device bit-identity pin cannot see: both were wrong in
+// the same direction. Fixed on both sides at once (see the port's ledger 2.162); ITK masks
+// it at itkMattesMutualInformationImageToImageMetricv4.hxx:199-214.
+//
+// The mask is in the buffer's own traversal order, so this indexes it with `i` directly --
+// no continuous index, no rounding. Same as `fixed_range` one kernel up.
 extern "C" __global__ void moving_range(
     const MSCALAR* __restrict__ mbuf,
+    const unsigned char* __restrict__ mmask,
+    const int has_mmask,
     const long long len,
     double* __restrict__ partials)
 {
@@ -458,6 +471,7 @@ extern "C" __global__ void moving_range(
     double mn = inf, mx = -inf, cnt = 0.0;
     const long long stride = (long long)blockDim.x * gridDim.x;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < len; i += stride) {
+        if (has_mmask && !mmask[i]) continue;
         const double v = (double)mbuf[i];
         mn = fmin(mn, v);
         mx = fmax(mx, v);
@@ -635,12 +649,21 @@ impl ResidentMattes {
         let (fscalar, mscalar) = self.res.vols.scalars();
         let f = backend.function(&kernel_src(fscalar, mscalar), "moving_range")?;
 
+        let has_mmask = self.res.has_mask;
+
         macro_rules! launch_range {
             ($mbuf:expr) => {{
                 let mut launch = backend.stream().launch_builder(&f);
-                launch.arg($mbuf.device()).arg(&len_i).arg(out.device_mut());
-                // SAFETY: three parameters, three arguments. The grid-stride loop is bounded
-                // by `i < len`, which is `mbuf`'s length, and `partials` holds `GRID * 3`.
+                launch
+                    .arg($mbuf.device())
+                    .arg(self.res.d_mmask.device())
+                    .arg(&has_mmask)
+                    .arg(&len_i)
+                    .arg(out.device_mut());
+                // SAFETY: five parameters, five arguments. The grid-stride loop is bounded
+                // by `i < len`, which is `mbuf`'s length and — when `has_mmask` — `d_mmask`'s
+                // (the mask is the moving buffer's own traversal order); `partials` holds
+                // `GRID * 3`.
                 unsafe { launch.launch(Self::launch_config())? };
             }};
         }
