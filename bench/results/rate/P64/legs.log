@@ -1,0 +1,9 @@
+01:16:24 r0 g2048 wall=  12.0s busy_max= 44.2 clean
+01:16:35 r0 g1024 wall=  10.6s busy_max= 52.3 clean
+  round r0 KEPT — 4/4 legs clean
+01:17:00 r1 g1024 wall=  10.3s busy_max= 53.9 clean
+01:17:12 r1 g2048 wall=  11.5s busy_max= 48.6 clean
+  round r1 KEPT — 4/4 legs clean
+01:17:40 r2 g2048 wall=  12.9s busy_max= 44.4 clean
+01:17:50 r2 g1024 wall=  10.7s busy_max= 49.5 clean
+  round r2 KEPT — 4/4 legs clean
