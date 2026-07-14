@@ -402,12 +402,56 @@ number, `binary_dilate`'s 37× win becomes **26×** and `connected_component`'s 
 win becomes a **1.7× loss**. Stated here so the headline ratio is not read as more
 than it is.
 
+## 5.1 A fix that was measured, worked, and was withdrawn anyway
+
+Worth recording because the *refutation* is the finding, and because a reader who
+sees "64³ is per-call overhead" in §4.1 above deserves to know it was tested.
+
+The hypothesis was that at 64³ the 96-thread pool is too wide for the work: the
+same stencil pass cost 4.28 ms on 96 workers and 2.28 ms on 8. A rule was written —
+`workers = clamp(len / 32768, 1, ambient)`, at one place all five parallel entry
+points cross — and it was verified to be **live on the published path**: a counter
+in the dispatcher recorded that the narrow pool ran on *every* call
+(`NARROWED=915/1132/228`, zero inline, zero nested, zero refused).
+
+It still had to be withdrawn. Twins through the harness's real path (fresh
+96-thread pool per measurement, `pool.install` per iteration, criterion's own
+statistics, five alternating rounds each):
+
+| op, 64³ tN | pre-fix | post-fix | |
+|---|---|---|---|
+| `mean` | 21.74 ms | **11.77** | 1.85× — distributions do not overlap |
+| `otsu_threshold` | 15.16 ms | **13.49** | 1.12× — do not overlap |
+| `gradient_magnitude` | 6.07 ms | 6.65 | **0.91× — a 9% tax** |
+
+**The rule keys on the wrong quantity.** All three ops have 262,144 elements, so
+element count cannot tell them apart — but `mean` is a 125-tap window, `otsu` a
+histogram, and `gradient_magnitude` a 6-tap stencil. The narrow pool wins where the
+per-element work is heavy and *loses* where the kernel is light. The constant
+`32768` had been derived from the gradient-magnitude stencil on the **direct** call
+path, which is not the path the published table measures; on the published path
+that crossover does not reproduce for the op it was derived from. Re-fitting the
+constant until `gradient_magnitude` stopped complaining would have been
+curve-fitting to the benchmark, so the branch was dropped rather than tuned.
+
+What survives is the measurement, not the code:
+
+- `mean` at 64³ really does lose **1.85×** to running on 96 workers instead of 8,
+  reproducibly, on the published path. That is a live optimization awaiting a rule
+  keyed on *work per element* rather than element count.
+- `otsu_threshold` likewise, 1.12×.
+- **`gradient_magnitude` at 64³ is not pool-width-bound.** Four candidates were
+  priced and all four are now refuted: pool wake-up, a fixed allocation, window
+  setup, and a `t1`/`tN` crossover. Its 2.81× against ITK is unexplained, and the
+  next investigation starts from an empty board rather than from these.
+
 ## 6. What is still open
 
-- **Small volumes (64³) are where the port loses now.** `gradient_magnitude` 2.91×,
-  `otsu_threshold` 6.62×, `mean` 4.52× — fixed per-call overhead that the reference
-  size amortizes away and the headline hides. `gradient_magnitude` at small is the
-  worst cell in the table and none of the §4/§4.1 fixes touched it.
+- **Small volumes (64³) are where the port loses now.** `gradient_magnitude` 2.81×,
+  `otsu_threshold` 6.20×, `mean` 4.16× — the reference size amortizes this away and
+  the headline hides it. `gradient_magnitude` at small is the worst cell in the
+  table; none of the §4/§4.1 fixes touched it, and §5.1's pool-width rule is now
+  refuted for it specifically.
 - **`smoothing_recursive_gaussian` at large (1.75×)**, not investigated.
 - **The §2 pipeline table's `setup` / `20 iterations` rows** are re-measured; the
   `cast` / `rescale` / `smooth` rows still carry their original numbers.
