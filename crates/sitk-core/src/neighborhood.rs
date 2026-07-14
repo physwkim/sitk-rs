@@ -70,6 +70,100 @@ impl<T: Copy> Neighborhood<T> {
     }
 }
 
+/// A stencil that can be read by **ND offset from its center**.
+///
+/// # Why this exists
+///
+/// A stencil kernel — a curvature flow, a Perona-Malik conductance, a min/max
+/// threshold — is written against *offsets*: `at([-1, 0, 0])`, `at([0, 1, 0])`.
+/// It does not care whether those values live in an owned [`Neighborhood`] or in
+/// a borrowed [`WindowView`] onto the image itself.
+///
+/// Before this trait, such kernels took `&Neighborhood<f64>` — and a parameter
+/// type is a demand. Every caller had to *materialize* a window to satisfy it,
+/// including callers that already held a borrowed one and needed nothing copied.
+/// The copy was not a cost the kernel needed; it was a cost its signature
+/// imposed. That is the structural defect this closes: the kernels now ask for
+/// the capability they use (read one value at one offset) instead of a
+/// representation that happens to provide it.
+///
+/// # Bit-parity
+///
+/// Every implementation returns the value `Neighborhood::get` would have
+/// returned for the same offset — same boundary condition, same slot arithmetic.
+/// A kernel reading through this trait computes on the identical `f64` bits, in
+/// the identical sequence, whichever side of the seam its values come from.
+pub trait Stencil {
+    /// The value at ND `offset` from the center, widened to `f64`.
+    ///
+    /// `offset[d]` must be within `[-radius[d], radius[d]]`.
+    fn at(&self, offset: &[i64]) -> f64;
+
+    /// The `j`-th value in dimension-0-fastest window order — the order
+    /// [`Neighborhood::values`] is in, and the order [`WindowView::get`] indexes.
+    ///
+    /// Kernels that scan the *whole* window (a min/max threshold's ball average)
+    /// read it this way rather than by offset. `slot`, not `values() -> &[f64]`,
+    /// is what lets a borrowed window answer: the borrowed window has no
+    /// contiguous `f64` slice to hand back, and demanding one is precisely the
+    /// demand that used to force the copy.
+    fn slot(&self, j: usize) -> f64;
+
+    /// The number of values in the window.
+    fn len(&self) -> usize;
+
+    /// `true` if the window holds no values.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The value at the center of the window — slot `len / 2`, which is what
+    /// both [`Neighborhood::center_value`] and [`WindowView::center`] return.
+    fn center(&self) -> f64 {
+        self.slot(self.len() / 2)
+    }
+
+    /// The window's values, in slot order — the iteration
+    /// `for &v in nb.values()` used to express.
+    fn slots(&self) -> impl Iterator<Item = f64> {
+        (0..self.len()).map(|j| self.slot(j))
+    }
+}
+
+impl<T: Scalar> Stencil for Neighborhood<T> {
+    #[inline]
+    fn at(&self, offset: &[i64]) -> f64 {
+        self.get(offset).as_f64()
+    }
+
+    #[inline]
+    fn slot(&self, j: usize) -> f64 {
+        self.values()[j].as_f64()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        Neighborhood::len(self)
+    }
+}
+
+impl<T: Scalar> Stencil for WindowView<'_, T> {
+    #[inline]
+    fn at(&self, offset: &[i64]) -> f64 {
+        self.get_offset(offset).as_f64()
+    }
+
+    #[inline]
+    fn slot(&self, j: usize) -> f64 {
+        self.get_f64(j)
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        WindowView::len(self)
+    }
+}
+
 /// A **zero-copy** view of the window at one center.
 ///
 /// # Why this exists
@@ -115,6 +209,10 @@ pub struct WindowView<'a, T> {
     /// The window's extent along axis 0 — the length of each contiguous run.
     /// See [`Self::rows`].
     row_len: usize,
+    /// The window's extent along every axis, dimension-0-fastest — the same
+    /// `size` a [`Neighborhood`] carries, and it is what makes an ND offset
+    /// addressable on a borrowed window. See [`Self::get_offset`].
+    size: &'a [usize],
 }
 
 impl<'a, T: Scalar> WindowView<'a, T> {
@@ -148,6 +246,37 @@ impl<'a, T: Scalar> WindowView<'a, T> {
     /// The value at the center of the window.
     pub fn center(&self) -> T {
         self.get(self.len() / 2)
+    }
+
+    /// The value at ND `offset` from the center; `offset[d]` must be within
+    /// `[-radius[d], radius[d]]`.
+    ///
+    /// This is `Neighborhood::get`'s arithmetic, unchanged — the same
+    /// dimension-0-fastest accumulation of `offset[d] * stride[d]` from the
+    /// center slot — applied to the borrowed window instead of a copied one. It
+    /// can be, because slot `j` of this view *is* `Neighborhood::values()[j]`:
+    /// same order, same boundary fallback. So it returns the identical value the
+    /// materializing path returned, and a kernel that walks offsets computes on
+    /// identical bits.
+    ///
+    /// This is the read a stencil kernel is written against, and its absence is
+    /// what used to force every such kernel to demand an owned window. See
+    /// [`Stencil`].
+    #[inline]
+    pub fn get_offset(&self, offset: &[i64]) -> T {
+        let mut slot = self.len() as i64 / 2;
+        let mut stride = 1i64;
+        for (d, &o) in offset.iter().enumerate() {
+            slot += o * stride;
+            stride *= self.size[d] as i64;
+        }
+        self.get(slot as usize)
+    }
+
+    /// [`Self::get_offset`], widened to `f64`.
+    #[inline]
+    pub fn get_offset_f64(&self, offset: &[i64]) -> f64 {
+        self.get_offset(offset).as_f64()
     }
 
     /// The window's **contiguous runs** along axis 0, in window order.
@@ -225,7 +354,7 @@ struct Cursor {
 /// pixel" contract hold on the boundary path, which is the one path that used to
 /// break it.
 #[derive(Debug)]
-struct WindowScratch<T> {
+pub struct WindowScratch<T> {
     /// The window's values, materialized only when it overhangs the image edge.
     /// On the interior path this is never even written — the window is borrowed.
     values: Vec<T>,
@@ -477,6 +606,51 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
         self.wrap(Vec::with_capacity(self.len()))
     }
 
+    /// Per-task working storage for [`Self::with_window_at`] — the boundary
+    /// window's buffer and its ND index scratch, allocated once per task.
+    ///
+    /// This is [`Self::window_buffer`]'s counterpart for the *borrowed* path, and
+    /// it is the one a caller should reach for: `window_buffer` hands back an
+    /// owned [`Neighborhood`] whose values are copied at every center, whereas
+    /// this is touched only at the ~2% of centers whose window overhangs the
+    /// image.
+    pub fn window_scratch(&self) -> WindowScratch<T> {
+        WindowScratch {
+            values: Vec::with_capacity(self.len()),
+            nd: vec![0i64; self.view.image().dimension()],
+        }
+    }
+
+    /// Calls `f` with the [`WindowView`] at `center` — borrowing the image when
+    /// the window is interior, falling back to `scratch` when it overhangs.
+    ///
+    /// [`Self::par_map_window`] is the seam for the common case, where the window
+    /// being read is the one being walked. This is the seam for the two cases it
+    /// cannot serve:
+    ///
+    /// * a pass that reads a **second, aligned image** at the same center
+    ///   (`sitk-filters`' Canny gate reads both the smoothed image and the
+    ///   derivative field), and
+    /// * a **reduction** whose parallel decomposition is fixed by
+    ///   [`crate::parallel::map_rows_fold_in_order`] rather than by this type's
+    ///   own walk, and which therefore needs the window at an index it is handed.
+    ///
+    /// Both used to materialize a [`Neighborhood`] per center for want of this.
+    /// The window `f` sees is the same one `par_map_window` would have handed it,
+    /// with the same boundary condition and the same values in the same order.
+    ///
+    /// `scratch` is per-task storage from [`Self::window_scratch`]; on the
+    /// interior path it is not touched at all.
+    pub fn with_window_at<R>(
+        &self,
+        center: &[usize],
+        scratch: &mut WindowScratch<T>,
+        f: impl FnOnce(WindowView<'_, T>) -> R,
+    ) -> R {
+        let linear = self.view.image().linear_index(center);
+        f(self.window_view(center, linear, scratch))
+    }
+
     /// Refills `window` — which must come from [`Self::window_buffer`] on this
     /// same iterator — with the values at `center`, reusing its buffer.
     ///
@@ -531,6 +705,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
                 base: linear,
                 deltas: &self.neighbor_deltas,
                 row_len,
+                size: &self.window_size,
             }
         } else {
             scratch.values.clear();
@@ -540,6 +715,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
                 base: 0,
                 deltas: &self.identity_deltas,
                 row_len,
+                size: &self.window_size,
             }
         }
     }
@@ -1225,5 +1401,99 @@ mod tests {
         iter.par_map_window_into(&mut dst, sum);
 
         assert_eq!(dst, allocated);
+    }
+}
+
+/// The seam's own pin: a borrowed [`WindowView`] read by ND offset must return
+/// exactly what a materialized [`Neighborhood`] would have returned.
+///
+/// This is the assertion the whole `Stencil` refactor rests on. Every stencil
+/// kernel that used to demand `&Neighborhood<f64>` now reads through
+/// [`WindowView::get_offset`] instead, and it is bit-identical *only* if that
+/// method addresses the same slot the materializing path did — including on the
+/// boundary path, where the view is backed by scratch and its deltas are the
+/// identity rather than the image's.
+#[cfg(test)]
+mod offset_read_parity {
+    use super::*;
+    use crate::boundary::ZeroFluxNeumannBoundaryCondition;
+
+    /// Every offset of every window of a small volume, on both paths.
+    ///
+    /// The volume is deliberately small (5×4×3) so that a large fraction of its
+    /// voxels are *boundary* voxels: the interior path and the scratch-backed
+    /// path have different `values`, different `base` and different `deltas`, and
+    /// a `get_offset` that worked on one and not the other would be a live bug in
+    /// exactly the 2.3%-of-voxels case that is hardest to notice.
+    #[test]
+    fn a_borrowed_offset_read_is_the_materialized_one_everywhere() {
+        let size = [5usize, 4, 3];
+        let n: usize = size.iter().product();
+        let data: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).sin() * 100.0).collect();
+        let img = Image::from_vec(&size, data).unwrap();
+
+        for radius in [vec![1usize, 1, 1], vec![2, 1, 0]] {
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &img,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+
+            // Every offset inside the window, unranked dimension-0-fastest — the
+            // same enumeration order the window's slots are in.
+            let extents: Vec<i64> = radius.iter().map(|&r| 2 * r as i64 + 1).collect();
+            let total: i64 = extents.iter().product();
+            let offsets: Vec<Vec<i64>> = (0..total)
+                .map(|mut rank| {
+                    let mut offset = vec![0i64; radius.len()];
+                    for (d, &extent) in extents.iter().enumerate() {
+                        offset[d] = rank % extent - radius[d] as i64;
+                        rank /= extent;
+                    }
+                    offset
+                })
+                .collect();
+
+            let mut interior_seen = 0usize;
+            let mut boundary_seen = 0usize;
+
+            let checked: Vec<usize> = iter.par_map_window(|center, w| {
+                let nb = iter.neighborhood_at(center);
+                for offset in &offsets {
+                    assert_eq!(
+                        w.get_offset(offset).to_bits(),
+                        nb.get(offset).to_bits(),
+                        "radius {radius:?}, center {center:?}, offset {offset:?}: the borrowed \
+                         window read {:?} where the materialized one read {:?}",
+                        w.get_offset(offset),
+                        nb.get(offset)
+                    );
+                }
+                usize::from(iter.is_interior(center))
+            });
+
+            for c in checked {
+                if c == 1 {
+                    interior_seen += 1;
+                } else {
+                    boundary_seen += 1;
+                }
+            }
+
+            // Non-vacuity: both paths must actually have been walked. If every
+            // voxel were interior, this test would say nothing about the
+            // scratch-backed view — which is the one whose `base` and `deltas`
+            // differ and is therefore the one that can break.
+            assert!(
+                interior_seen > 0,
+                "radius {radius:?}: no interior voxel — the borrowed fast path was never taken"
+            );
+            assert!(
+                boundary_seen > 0,
+                "radius {radius:?}: no boundary voxel — the scratch-backed path was never \
+                 taken, so this test does not cover the case it exists for"
+            );
+        }
     }
 }

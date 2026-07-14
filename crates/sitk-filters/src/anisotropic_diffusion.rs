@@ -73,7 +73,8 @@
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use sitk_core::{
-    Image, Neighborhood, NeighborhoodIterator, PixelId, ZeroFluxNeumannBoundaryCondition, parallel,
+    Image, NeighborhoodIterator, PixelId, Stencil, WindowView, ZeroFluxNeumannBoundaryCondition,
+    parallel,
 };
 
 /// `CurvatureNDAnisotropicDiffusionFunction::m_MIN_NORM`, the additive floor
@@ -134,15 +135,8 @@ fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result
     parallel::map_rows_fold_in_order(
         snapshot.number_of_pixels(),
         dim,
-        || {
-            (
-                iter.window_buffer(),
-                vec![0usize; dim],
-                vec![0i64; dim],
-                vec![0i64; dim],
-            )
-        },
-        |(nb, center, nd, off), i, row| {
+        || (iter.window_scratch(), vec![0usize; dim], vec![0i64; dim]),
+        |(scratch, center, off), i, row| {
             // Unrank the linear index into an ND center, dimension 0 fastest — the
             // inverse of `Image::linear_index`, and the order the serial walk
             // visited pixels in.
@@ -151,17 +145,23 @@ fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result
                 *c = rest % extent;
                 rest /= extent;
             }
-            iter.refill(center, nd, nb);
 
-            for (a, (&s, cell)) in scale.iter().zip(row.iter_mut()).enumerate() {
-                off[a] = 1;
-                let plus = nb.get(off);
-                off[a] = -1;
-                let minus = nb.get(off);
-                off[a] = 0;
-                let val = (plus - minus) / -2.0 * s;
-                *cell = val * val;
-            }
+            // The window is **borrowed**, not materialized. This reduction's
+            // decomposition is fixed by `map_rows_fold_in_order` rather than by the
+            // iterator's own walk, so `par_map_window` cannot serve it — but
+            // `with_window_at` can, and `scratch` is touched only at the ~2% of
+            // centers whose window overhangs the image.
+            iter.with_window_at(center, scratch, |w| {
+                for (a, (&s, cell)) in scale.iter().zip(row.iter_mut()).enumerate() {
+                    off[a] = 1;
+                    let plus = w.get_offset(off);
+                    off[a] = -1;
+                    let minus = w.get_offset(off);
+                    off[a] = 0;
+                    let val = (plus - minus) / -2.0 * s;
+                    *cell = val * val;
+                }
+            });
             true
         },
         |_, row| {
@@ -187,18 +187,18 @@ fn average_gradient_magnitude_squared(snapshot: &Image, scale: &[f64]) -> Result
 /// cross-axis centered differences (`0.25·(dx[j] + dx_aug)²`), which is the
 /// "more robust technique for gradient magnitude estimation" the class doc
 /// refers to.
-fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+fn gradient_update<S: Stencil + ?Sized>(nb: &S, scale: &[f64], k: f64) -> f64 {
     let dim = scale.len();
-    let center = nb.center_value();
+    let center = nb.center();
     let mut off = vec![0i64; dim];
 
     // Centralized derivatives, one per dimension.
     let mut dx = vec![0.0f64; dim];
     for (i, d) in dx.iter_mut().enumerate() {
         off[i] = 1;
-        let plus = nb.get(&off);
+        let plus = nb.at(&off);
         off[i] = -1;
-        let minus = nb.get(&off);
+        let minus = nb.at(&off);
         off[i] = 0;
         *d = (plus - minus) / 2.0 * scale[i];
     }
@@ -206,9 +206,9 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
     let mut delta = 0.0f64;
     for i in 0..dim {
         off[i] = 1;
-        let plus_i = nb.get(&off);
+        let plus_i = nb.at(&off);
         off[i] = -1;
-        let minus_i = nb.get(&off);
+        let minus_i = nb.at(&off);
         off[i] = 0;
 
         // "Half" directional derivatives.
@@ -225,13 +225,13 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
             }
             off[i] = 1;
             off[j] = 1;
-            let aug_plus = nb.get(&off);
+            let aug_plus = nb.at(&off);
             off[j] = -1;
-            let aug_minus = nb.get(&off);
+            let aug_minus = nb.at(&off);
             off[i] = -1;
-            let dim_minus = nb.get(&off);
+            let dim_minus = nb.at(&off);
             off[j] = 1;
-            let dim_plus = nb.get(&off);
+            let dim_plus = nb.at(&off);
             off[i] = 0;
             off[j] = 0;
 
@@ -272,9 +272,9 @@ fn gradient_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
 /// `(dx[j] + dx_aug)²`, with both terms produced the same way, so this port
 /// uses the un-negated centered difference for both and the square is
 /// identical.
-fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
+fn curvature_update<S: Stencil + ?Sized>(nb: &S, scale: &[f64], k: f64) -> f64 {
     let dim = scale.len();
-    let center = nb.center_value();
+    let center = nb.center();
     let mut off = vec![0i64; dim];
 
     let mut dx_forward = vec![0.0f64; dim];
@@ -282,9 +282,9 @@ fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
     let mut dx = vec![0.0f64; dim];
     for i in 0..dim {
         off[i] = 1;
-        let plus = nb.get(&off);
+        let plus = nb.at(&off);
         off[i] = -1;
-        let minus = nb.get(&off);
+        let minus = nb.at(&off);
         off[i] = 0;
 
         dx_forward[i] = (plus - center) * scale[i];
@@ -303,13 +303,13 @@ fn curvature_update(nb: &Neighborhood<f64>, scale: &[f64], k: f64) -> f64 {
             }
             off[i] = 1;
             off[j] = 1;
-            let aug_plus = nb.get(&off);
+            let aug_plus = nb.at(&off);
             off[j] = -1;
-            let aug_minus = nb.get(&off);
+            let aug_minus = nb.at(&off);
             off[i] = -1;
-            let dim_minus = nb.get(&off);
+            let dim_minus = nb.at(&off);
             off[j] = 1;
-            let dim_plus = nb.get(&off);
+            let dim_plus = nb.at(&off);
             off[i] = 0;
             off[j] = 0;
 
@@ -357,7 +357,7 @@ fn diffuse(
     conductance_scaling_update_interval: u32,
     number_of_iterations: u32,
     use_image_spacing: bool,
-    update: fn(&Neighborhood<f64>, &[f64], f64) -> f64,
+    update: impl for<'w> Fn(&WindowView<'w, f64>, &[f64], f64) -> f64 + Sync + Send,
 ) -> Result<Image> {
     let pixel_id = img.pixel_id();
     if !matches!(pixel_id, PixelId::Float32 | PixelId::Float64) {
@@ -388,27 +388,20 @@ fn diffuse(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        // Parallel over voxels. Each voxel's update reads its own window in
-        // `snapshot` — a separate image, cloned from `buf` before the sweep — so no
-        // voxel reads another's new value: the sweep is a map, not a recurrence.
-        // The iteration loop stays sequential; each pass reads the whole previous
-        // one.
+        // Parallel over voxels, reading the **borrowed** window. Each voxel's update
+        // reads its own window in `snapshot` — a separate image, cloned from `buf`
+        // before the sweep — so no voxel reads another's new value: the sweep is a
+        // map, not a recurrence. The iteration loop stays sequential; each pass
+        // reads the whole previous one.
         //
-        // The window is refilled into per-task scratch rather than borrowed,
-        // because `gradient_update`/`curvature_update` take a `&Neighborhood`. The
-        // per-voxel *allocation* the serial walk made is gone; the values the
-        // update sees are the identical ones in the identical order.
+        // The window used to be materialized into per-task scratch here, because
+        // `gradient_update`/`curvature_update` took a `&Neighborhood`. They now take
+        // a `Stencil`, so the borrowed window satisfies them and nothing is copied.
         //
         // Unlike `min_max_curvature_flow`'s sweep, this one has no `continue` to
         // preserve: every voxel takes the `+=` unconditionally, so there is no skip
         // that a `+= 0.0` could silently turn a stored `-0.0` into `+0.0`.
-        let deltas: Vec<f64> = iter.par_map_window_init(
-            || (iter.window_buffer(), vec![0i64; dim]),
-            |(nb, nd), center, _| {
-                iter.refill(center, nd, nb);
-                time_step * update(nb, &scale, k)
-            },
-        );
+        let deltas: Vec<f64> = iter.par_map_window(|_, w| time_step * update(&w, &scale, k));
         parallel::for_each_mut(&mut buf, |i, v| *v += deltas[i]);
     }
 
@@ -443,7 +436,7 @@ pub fn gradient_anisotropic_diffusion(
         conductance_scaling_update_interval,
         number_of_iterations,
         use_image_spacing,
-        gradient_update,
+        |w, scale, k| gradient_update(w, scale, k),
     )
 }
 
@@ -474,7 +467,7 @@ pub fn curvature_anisotropic_diffusion(
         conductance_scaling_update_interval,
         number_of_iterations,
         use_image_spacing,
-        curvature_update,
+        |w, scale, k| curvature_update(w, scale, k),
     )
 }
 
@@ -888,7 +881,13 @@ mod stencil_thread_parity {
     use crate::stencil_test_support::{
         PIXELS, THREADS, assert_bits_eq, volume, window_sum_order_is_observable,
     };
-    use sitk_core::parallel;
+    // The serial references below deliberately keep the OWNED window: they are
+    // copies of the loops that were deleted, and those loops materialized a
+    // `Neighborhood` per voxel. That the same `gradient_update`/`curvature_update`
+    // bodies can still be driven from an owned window — instantiated here as
+    // `gradient_update::<Neighborhood<f64>>` — is what makes them a valid reference
+    // for the borrowed-window code they are pinning.
+    use sitk_core::{Neighborhood, parallel};
 
     const TIME_STEP: f64 = 0.0625;
     const CONDUCTANCE: f64 = 3.0;
@@ -916,9 +915,9 @@ mod stencil_thread_parity {
             counter += 1;
             for (i, &s) in scale.iter().enumerate() {
                 off[i] = 1;
-                let plus = nb.get(&off);
+                let plus = nb.at(&off);
                 off[i] = -1;
-                let minus = nb.get(&off);
+                let minus = nb.at(&off);
                 off[i] = 0;
                 let val = (plus - minus) / -2.0 * s;
                 accumulator += val * val;
@@ -1022,9 +1021,9 @@ mod stencil_thread_parity {
         for (_, nb) in iter {
             for (i, &s) in scale.iter().enumerate() {
                 off[i] = 1;
-                let plus = nb.get(&off);
+                let plus = nb.at(&off);
                 off[i] = -1;
-                let minus = nb.get(&off);
+                let minus = nb.at(&off);
                 off[i] = 0;
                 let val = (plus - minus) / -2.0 * s;
                 terms.push(val * val);
@@ -1074,7 +1073,7 @@ mod stencil_thread_parity {
                         interval,
                         ITERATIONS,
                         true,
-                        gradient_update,
+                        gradient_update::<Neighborhood<f64>>,
                     ),
                 );
                 for threads in THREADS {
@@ -1117,7 +1116,7 @@ mod stencil_thread_parity {
                     1,
                     ITERATIONS,
                     true,
-                    curvature_update,
+                    curvature_update::<Neighborhood<f64>>,
                 ),
             );
             for threads in THREADS {

@@ -167,46 +167,45 @@ fn positional_gate_field(smoothed: &Image, deriv_field: &Image) -> Result<Vec<f6
 
     // This is the one stencil in the module that reads **two** aligned images at
     // the same voxel, which `par_map_window` alone does not cover: it hands out
-    // one image's window. The second image's window is refilled into per-task
-    // scratch instead (`window_buffer` once per task, `refill` per voxel), so
-    // `deriv_field`'s window is still materialized exactly as the serial
-    // `iter_s.zip(iter_d)` materialized it — same values, same order — while
-    // `smoothed`'s is borrowed and neither is allocated per voxel.
+    // one image's window, and this pass needs both `smoothed`'s and
+    // `deriv_field`'s at the same center.
     //
-    // `dx`, `dx1` and the refilled window are scratch that each voxel fully
-    // overwrites; nothing is carried between voxels, and nothing accumulates
-    // across them.
+    // It used to materialize the second one (`window_buffer` once per task,
+    // `refill` per voxel) for want of any way to borrow a window at a center it
+    // was handed. `with_window_at` is that way: `deriv_field`'s window is now
+    // borrowed straight out of the image exactly as `smoothed`'s is, and
+    // `scratch` is touched only at the ~2% of centers whose window overhangs the
+    // edge. Neither image is copied, per voxel or otherwise.
+    //
+    // `dx` and `dx1` are per-task scratch that each voxel fully overwrites;
+    // nothing is carried between voxels, and nothing accumulates across them.
     let out = iter_s.par_map_window_init(
         || {
             (
-                iter_d.window_buffer(),
-                vec![0i64; dim],
+                iter_d.window_scratch(),
                 vec![0.0f64; dim],
                 vec![0.0f64; dim],
             )
         },
-        |(nb_d, nd, dx, dx1), center, w_s| {
-            iter_d.refill(center, nd, nb_d);
-
-            let mut off = vec![0i64; dim];
-            let mut grad_mag_sq = 0.0001;
-            for a in 0..dim {
-                let mut sx = 0.0;
-                let mut sx1 = 0.0;
-                for (k, &delta) in taps.iter().enumerate() {
-                    let slot = (center_slot as i64 + delta * window_stride[a]) as usize;
-                    off[a] = delta;
-                    sx += d1[k] * w_s.get_f64(slot);
-                    sx1 += d1[k] * nb_d.get(&off);
+        |(scratch, dx, dx1), center, w_s| {
+            iter_d.with_window_at(center, scratch, |w_d| {
+                let mut grad_mag_sq = 0.0001;
+                for a in 0..dim {
+                    let mut sx = 0.0;
+                    let mut sx1 = 0.0;
+                    for (k, &delta) in taps.iter().enumerate() {
+                        let slot = (center_slot as i64 + delta * window_stride[a]) as usize;
+                        sx += d1[k] * w_s.get_f64(slot);
+                        sx1 += d1[k] * w_d.get_f64(slot);
+                    }
+                    dx[a] = sx;
+                    dx1[a] = sx1;
+                    grad_mag_sq += sx * sx;
                 }
-                off[a] = 0;
-                dx[a] = sx;
-                dx1[a] = sx1;
-                grad_mag_sq += sx * sx;
-            }
-            let grad_mag = grad_mag_sq.sqrt();
-            let deriv_pos: f64 = (0..dim).map(|a| dx1[a] * (dx[a] / grad_mag)).sum();
-            if deriv_pos <= 0.0 { grad_mag } else { 0.0 }
+                let grad_mag = grad_mag_sq.sqrt();
+                let deriv_pos: f64 = (0..dim).map(|a| dx1[a] * (dx[a] / grad_mag)).sum();
+                if deriv_pos <= 0.0 { grad_mag } else { 0.0 }
+            })
         },
     );
     Ok(out)

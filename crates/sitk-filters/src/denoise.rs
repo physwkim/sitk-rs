@@ -95,8 +95,8 @@ use crate::error::{FilterError, Result};
 use crate::gradient::derivative_operator_coefficients;
 use crate::image_from_f64;
 use sitk_core::{
-    Image, Neighborhood, NeighborhoodIterator, PixelId, Scalar, ZeroFluxNeumannBoundaryCondition,
-    dispatch_scalar,
+    Image, NeighborhoodIterator, PixelId, Scalar, Stencil, ZeroFluxNeumannBoundaryCondition,
+    dispatch_scalar, parallel,
 };
 
 /// An `f64` copy of `img`'s pixels with `img`'s geometry, the working buffer
@@ -1175,9 +1175,22 @@ fn bilateral_pass<T: Scalar>(
 /// and therefore passes `ScaleCoefficients[d] / r` — see
 /// [`crate::min_max_curvature_flow`], which reuses this update unchanged.
 ///
-/// `nb` may carry any radius `>= 1` per axis; only the `±1` offsets are read.
-pub(crate) fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &[f64]) -> f64 {
-    curvature_flow_update_at(dim, scale, |offset| nb.get(offset))
+/// The stencil may carry any radius `>= 1` per axis; only the `±1` offsets are
+/// read.
+///
+/// Takes a [`Stencil`] — anything readable by ND offset — and not a
+/// `&Neighborhood`. That is the difference between asking for the *capability*
+/// this update uses (one value at one offset) and asking for a *representation*:
+/// the `&Neighborhood` form forced every caller to materialize a window per
+/// voxel, including the sweeps below and in [`crate::anisotropic_diffusion`] and
+/// [`crate::min_max_curvature_flow`], which all already held a borrowed
+/// [`sitk_core::WindowView`] and copied it only to satisfy this signature.
+pub(crate) fn curvature_flow_update<S: Stencil + ?Sized>(
+    stencil: &S,
+    dim: usize,
+    scale: &[f64],
+) -> f64 {
+    curvature_flow_update_at(dim, scale, |offset| stencil.at(offset))
 }
 
 /// [`curvature_flow_update`] against an arbitrary stencil accessor: `at(offset)`
@@ -1185,8 +1198,12 @@ pub(crate) fn curvature_flow_update(nb: &Neighborhood<f64>, dim: usize, scale: &
 /// `±1` city-block and diagonal positions (and the all-zero center).
 ///
 /// The sparse-field level-set solver evolves a bare `f64` buffer rather than an
-/// `Image`, so it cannot hand over a [`Neighborhood`]; it reaches the same
-/// `CurvatureFlowFunction::ComputeUpdate` through this seam.
+/// `Image`, so it has no window of any kind to hand over — and its accessor is
+/// `FnMut`, because it reuses one coordinate buffer across neighbor reads rather
+/// than allocating per read. That is why this `FnMut` form is the implementation
+/// and [`curvature_flow_update`]'s [`Stencil`] form is a thin adapter onto it,
+/// rather than the other way round: one body, reached from both sides of the
+/// seam.
 pub(crate) fn curvature_flow_update_at(
     dim: usize,
     scale: &[f64],
@@ -1293,9 +1310,23 @@ pub fn curvature_flow(
             &radius,
             ZeroFluxNeumannBoundaryCondition,
         )?;
-        for ((_, nb), v) in iter.zip(buf.iter_mut()) {
-            *v += time_step * curvature_flow_update(&nb, dim, &scale);
-        }
+        // Parallel over voxels, reading the **borrowed** window: each voxel's
+        // update is a function of its own window in `snapshot` — a separate
+        // image, cloned from `buf` before the sweep — so no voxel reads another's
+        // new value. The iteration loop stays sequential; each pass reads the
+        // whole previous one.
+        //
+        // This sweep was serial for one reason: `curvature_flow_update` demanded
+        // a `&Neighborhood`, and there was no way to satisfy it from a borrowed
+        // window. Now that it asks for a `Stencil` instead, the window never has
+        // to be copied — and there is no scratch to carry, so no `_init` form.
+        //
+        // Every voxel takes the `+=` unconditionally (there is no `update == 0.0`
+        // skip here, unlike `min_max_curvature_flow`'s gated sweep), so no `-0.0`
+        // in `buf` can be flipped to `+0.0` by folding a skip into an add.
+        let deltas: Vec<f64> =
+            iter.par_map_window(|_, w| time_step * curvature_flow_update(&w, dim, &scale));
+        parallel::for_each_mut(&mut buf, |i, v| *v += deltas[i]);
     }
 
     image_from_f64(PixelId::Float64, &size, img, &buf)

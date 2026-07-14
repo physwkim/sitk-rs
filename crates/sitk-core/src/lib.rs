@@ -38,7 +38,7 @@ pub use error::{Error, Result};
 pub use fused::{map_pixels, map_pixels_into};
 pub use image::{Image, PixelBuffer, ScalarView};
 pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
-pub use neighborhood::{Neighborhood, NeighborhoodIterator, WindowView};
+pub use neighborhood::{Neighborhood, NeighborhoodIterator, Stencil, WindowScratch, WindowView};
 pub use pixel::{Complex, PixelId, Real, Scalar};
 
 #[cfg(test)]
