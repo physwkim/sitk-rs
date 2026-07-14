@@ -611,18 +611,23 @@ fn simple_contour_extractor_typed<T: Scalar>(
     let background = T::from_f64(input_background_value);
 
     let iter = NeighborhoodIterator::<T, _>::new(image, radius, ZeroFluxNeumannBoundaryCondition)?;
-    let output: Vec<u8> = iter
-        .map(|(_, nb)| {
-            if nb.center_value() != foreground {
-                return output_background_value;
-            }
-            if nb.values().contains(&background) {
-                output_foreground_value
-            } else {
-                output_background_value
-            }
-        })
-        .collect();
+    let center_slot = iter.len() / 2;
+
+    // Parallel over output voxels. Each output pixel is decided entirely by its
+    // own window — a center test and an existence test over that window's values,
+    // both on the borrowed window in its own order — so nothing crosses voxels.
+    // `iter().any` short-circuits at the first background neighbor exactly as
+    // `values().contains` did, and on the same comparison.
+    let output: Vec<u8> = iter.par_map_window(|_, w| {
+        if w.get(center_slot) != foreground {
+            return output_background_value;
+        }
+        if w.iter().any(|v| v == background) {
+            output_foreground_value
+        } else {
+            output_background_value
+        }
+    });
 
     let mut result = Image::from_vec(image.size(), output)?;
     result.copy_geometry_from(image);
@@ -1114,5 +1119,94 @@ mod tests {
                 got: 1
             }
         );
+    }
+}
+
+/// Thread-count parity pin for `simple_contour_extractor`'s window pass.
+///
+/// A **comparison** stencil: the output is a center equality test plus an
+/// existence test over the window. Order-insensitive by nature (`any` over a set
+/// of equality tests), so the non-vacuity guard is slot-dependence — the guard
+/// below shows a larger window really does mark more pixels, so a window read at
+/// the wrong slots could not have gone unnoticed.
+///
+/// `-0.0` does not apply: the output is one of two `u8` labels, and the input is
+/// only ever compared for equality (`-0.0 == 0.0` is true, and was true before).
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use crate::stencil_test_support::{THREADS, binary_volume};
+    use sitk_core::parallel;
+
+    const IN_FG: f64 = 1.0;
+    const IN_BG: f64 = 0.0;
+    const OUT_FG: f64 = 255.0;
+    const OUT_BG: f64 = 0.0;
+
+    /// The exact serial loop that was deleted.
+    fn contour_serial(image: &Image, radius: &[usize]) -> Vec<u8> {
+        let foreground = u8::from_f64(IN_FG);
+        let background = u8::from_f64(IN_BG);
+        let out_fg = u8::from_f64(OUT_FG);
+        let out_bg = u8::from_f64(OUT_BG);
+        let iter =
+            NeighborhoodIterator::<u8, _>::new(image, radius, ZeroFluxNeumannBoundaryCondition)
+                .unwrap();
+        iter.map(|(_, nb)| {
+            if nb.center_value() != foreground {
+                return out_bg;
+            }
+            if nb.values().contains(&background) {
+                out_fg
+            } else {
+                out_bg
+            }
+        })
+        .collect()
+    }
+
+    fn pixels(img: &Image) -> Vec<u8> {
+        img.scalar_slice::<u8>().unwrap().to_vec()
+    }
+
+    /// Non-vacuity. The contour must actually mark a non-trivial set of voxels,
+    /// and it must mark *more* of them as the window grows — that is the
+    /// dependence on which slots are read that a mis-addressed window would break.
+    #[test]
+    fn the_marked_set_depends_on_the_window() {
+        let img = binary_volume();
+        let thin = contour_serial(&img, &[1, 1, 1]);
+        let wide = contour_serial(&img, &[2, 2, 2]);
+        let count = |v: &[u8]| v.iter().filter(|&&p| p == 255).count();
+        let (thin_n, wide_n) = (count(&thin), count(&wide));
+        assert!(
+            thin_n > 100,
+            "the contour marked only {thin_n} voxels — too few to pin anything"
+        );
+        assert!(
+            wide_n > thin_n,
+            "a radius-2 window marked no more voxels ({wide_n}) than a radius-1 one \
+             ({thin_n}) — the output does not depend on the window, so this pin could not \
+             catch a mis-addressed one"
+        );
+    }
+
+    #[test]
+    fn simple_contour_extractor_is_bit_identical_at_every_thread_count() {
+        let img = binary_volume();
+        for radius in [vec![1usize, 1, 1], vec![2, 1, 3]] {
+            let expected = contour_serial(&img, &radius);
+            for threads in THREADS {
+                let got = parallel::with_threads(threads, || {
+                    simple_contour_extractor(&img, IN_FG, IN_BG, &radius, OUT_FG, OUT_BG)
+                })
+                .unwrap();
+                assert_eq!(
+                    pixels(&got),
+                    expected,
+                    "simple_contour_extractor({radius:?}) moved with {threads} threads"
+                );
+            }
+        }
     }
 }
