@@ -24,12 +24,14 @@
 
 use std::sync::Mutex;
 
-use sitk_cuda::{CudaError, DeviceImage, FixedPoints, MovingGeometry, ResidentMetric};
+use sitk_cuda::{
+    CudaError, DeviceImage, FixedPoints, MovingGeometry, ResidentCorrelation, ResidentMetric,
+};
 use sitk_transform::interpolator::{index_to_physical_matrix, physical_to_index_matrix, strides};
 use sitk_transform::{Interpolator, ParametricTransform};
 use thiserror::Error;
 
-use crate::cuda::{affine_form, contract};
+use crate::cuda::{affine_form, contract, contract_correlation};
 use crate::metric::MetricValue;
 use crate::scales::{ScalesEstimator, ScalesEstimatorKind, VirtualGrid};
 
@@ -37,9 +39,19 @@ use crate::scales::{ScalesEstimator, ScalesEstimatorKind, VirtualGrid};
 /// [module docs](self).
 #[derive(Debug, Error)]
 pub enum DeviceMetricError {
-    /// The kernel is written for `dim = 3`.
-    #[error("the device mean-squares metric is 3-D only; got {0}-D")]
+    /// The kernels are written for `dim = 3`.
+    #[error("the device metric is 3-D only; got {0}-D")]
     NotThreeDimensional(usize),
+
+    /// The correlation metric is **global-transform-only**, on the device exactly as on
+    /// the host: `CorrelationMetric::check_transform` refuses a local-support transform
+    /// by name (mirroring ITK's constructor, which throws). The device names it the same
+    /// way rather than letting it fall through to the affine probe and be reported as a
+    /// merely non-affine transform — it is not a kernel gap, it is the metric's rule.
+    #[error(
+        "the correlation metric is global-transform-only; a local-support transform has no derivative it can form"
+    )]
+    RequiresGlobalTransform,
 
     /// The fixed and moving images must share a dimension.
     #[error("fixed image is {fixed}-D but moving image is {moving}-D")]
@@ -218,62 +230,15 @@ impl DeviceMeanSquaresMetric {
         moving_mask: Option<&[bool]>,
         samples: Option<&[usize]>,
     ) -> Result<Self, DeviceMetricError> {
-        let f = fixed.geometry();
-        let m = moving.geometry();
-        if f.dimension() != sitk_cuda::DIM {
-            return Err(DeviceMetricError::NotThreeDimensional(f.dimension()));
-        }
-        if m.dimension() != f.dimension() {
-            return Err(DeviceMetricError::DimensionMismatch {
-                fixed: f.dimension(),
-                moving: m.dimension(),
-            });
-        }
-
-        let dim = f.dimension();
-        let idx_to_phys = index_to_physical_matrix(&f.direction, &f.spacing, dim);
-        let phys_to_index = physical_to_index_matrix(&m.direction, &m.spacing, dim)
-            .ok_or(DeviceMetricError::SingularDirection)?;
-        let mstrides = strides(&m.size);
-
-        let geom = MovingGeometry {
-            len: moving.len(),
-            size: &m.size,
-            strides: &mstrides,
-            origin: &m.origin,
-            phys_to_index: &phys_to_index,
-            // The moving mask, on the moving image's own grid. It is *not* resampled
-            // and *not* smoothed — the host does not resample it either
-            // (`MovingImage::with_moving_mask` takes the mask the user set, and the
-            // moving image is never shrunk), and a level's moving volume is the
-            // uploaded one smoothed, so the grid is the same at every level and the
-            // indices line up.
-            mask: moving_mask,
-        };
-        // The sample set: the whole grid, or the voxels the host's draw named.
-        let idx: Option<Vec<i64>> =
-            samples.map(|s| s.iter().map(|&v| v as i64).collect::<Vec<_>>());
-        let points = match &idx {
-            None => FixedPoints::Grid {
-                size: &f.size,
-                origin: &f.origin,
-                idx_to_phys: &idx_to_phys,
-            },
-            Some(idx) => FixedPoints::Indices {
-                idx,
-                size: &f.size,
-                origin: &f.origin,
-                idx_to_phys: &idx_to_phys,
-            },
-        };
-
-        let resident =
-            ResidentMetric::from_device_masked(fixed, points, fixed_mask, moving, &geom)?;
+        let (resident, layout) =
+            with_device_layout(fixed, moving, moving_mask, samples, |points, geom| {
+                ResidentMetric::from_device_masked(fixed, points, fixed_mask, moving, geom)
+            })?;
         Ok(Self {
             resident: Mutex::new(resident),
-            grid: VirtualGrid::new(dim, f.size.clone(), f.origin.clone(), idx_to_phys),
-            moving_phys_to_index: phys_to_index,
-            min_spacing: f.spacing.iter().copied().fold(f64::INFINITY, f64::min),
+            grid: layout.grid,
+            moving_phys_to_index: layout.moving_phys_to_index,
+            min_spacing: layout.min_spacing,
         })
     }
 
@@ -345,6 +310,215 @@ impl DeviceMeanSquaresMetric {
     /// wants the derivative, so this reuses the same reduction — the moment pass is
     /// `O(nsamples)` regardless of the parameter count, so there is nothing
     /// per-parameter to skip.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> Result<f64, DeviceMetricError> {
+        Ok(self.evaluate(transform)?.value)
+    }
+}
+
+/// Everything a device metric needs that is *not* its kernel: the fixed grid's
+/// index-to-physical map, the moving grid's inverse and strides, and the sample set.
+///
+/// The two metrics differ in what they reduce, not in where the samples are or how
+/// the geometry is derived — so this is computed **once**, here, and both call it.
+/// A second copy would be a second chance for the two device metrics to disagree
+/// with each other about the sample set, which is precisely the disagreement the
+/// index-list design exists to prevent.
+struct Layout {
+    grid: VirtualGrid,
+    moving_phys_to_index: Vec<f64>,
+    min_spacing: f64,
+}
+
+/// Derive the layout, hand the caller the `FixedPoints` and `MovingGeometry` that
+/// borrow from it, and return whatever the caller built alongside the layout.
+///
+/// The closure exists because `FixedPoints`/`MovingGeometry` borrow the matrices and
+/// the index list, which are locals here: the resident metric must be constructed
+/// while they are alive.
+fn with_device_layout<T>(
+    fixed: &DeviceImage,
+    moving: &DeviceImage,
+    moving_mask: Option<&[bool]>,
+    samples: Option<&[usize]>,
+    build: impl FnOnce(FixedPoints<'_>, &MovingGeometry<'_>) -> Result<T, CudaError>,
+) -> Result<(T, Layout), DeviceMetricError> {
+    let f = fixed.geometry();
+    let m = moving.geometry();
+    if f.dimension() != sitk_cuda::DIM {
+        return Err(DeviceMetricError::NotThreeDimensional(f.dimension()));
+    }
+    if m.dimension() != f.dimension() {
+        return Err(DeviceMetricError::DimensionMismatch {
+            fixed: f.dimension(),
+            moving: m.dimension(),
+        });
+    }
+
+    let dim = f.dimension();
+    let idx_to_phys = index_to_physical_matrix(&f.direction, &f.spacing, dim);
+    let phys_to_index = physical_to_index_matrix(&m.direction, &m.spacing, dim)
+        .ok_or(DeviceMetricError::SingularDirection)?;
+    let mstrides = strides(&m.size);
+
+    let geom = MovingGeometry {
+        len: moving.len(),
+        size: &m.size,
+        strides: &mstrides,
+        origin: &m.origin,
+        phys_to_index: &phys_to_index,
+        // The moving mask, on the moving image's own grid. It is *not* resampled
+        // and *not* smoothed — the host does not resample it either
+        // (`MovingImage::with_moving_mask` takes the mask the user set, and the
+        // moving image is never shrunk), and a level's moving volume is the
+        // uploaded one smoothed, so the grid is the same at every level and the
+        // indices line up.
+        mask: moving_mask,
+    };
+    // The sample set: the whole grid, or the voxels the host's draw named.
+    let idx: Option<Vec<i64>> = samples.map(|s| s.iter().map(|&v| v as i64).collect::<Vec<_>>());
+    let points = match &idx {
+        None => FixedPoints::Grid {
+            size: &f.size,
+            origin: &f.origin,
+            idx_to_phys: &idx_to_phys,
+        },
+        Some(idx) => FixedPoints::Indices {
+            idx,
+            size: &f.size,
+            origin: &f.origin,
+            idx_to_phys: &idx_to_phys,
+        },
+    };
+
+    let built = build(points, &geom)?;
+    Ok((
+        built,
+        Layout {
+            grid: VirtualGrid::new(dim, f.size.clone(), f.origin.clone(), idx_to_phys),
+            moving_phys_to_index: phys_to_index,
+            min_spacing: f.spacing.iter().copied().fold(f64::INFINITY, f64::min),
+        },
+    ))
+}
+
+/// Normalized cross-correlation over two [`DeviceImage`]s — `value = −sfm²/(sff·smm)`
+/// over the mean-subtracted samples.
+///
+/// The same sample set, masks and sampling as [`DeviceMeanSquaresMetric`] (it is the
+/// same [`Layout`] and the same `Resident` underneath), and the same refusals. What
+/// differs is the reduction: **two** device passes, because the sample means must be
+/// known before any mean-subtracted term can be formed. The one-pass form that would
+/// avoid the second launch is refused — see
+/// [`sitk_cuda::ResidentCorrelation`] and the `one_pass_moment_form` tests in
+/// [`crate::correlation`] — because it trades the host's stable `Σ(f−f̄)²` for
+/// `Σf² − N·f̄²`, whose error is a property of the caller's intensity range rather
+/// than of the algorithm.
+///
+/// # Global transforms only, and not by coincidence
+///
+/// [`CorrelationMetric::check_transform`](crate::CorrelationMetric::check_transform)
+/// refuses a local-support transform by name, mirroring ITK's constructor. The moment
+/// factorization the device evaluates requires the Jacobian to be affine in the point,
+/// which no local-support transform is. The metric's own precondition and the kernel's
+/// requirement are the same set — so this metric declines nothing the host would have
+/// accepted.
+pub struct DeviceCorrelationMetric {
+    /// See [`DeviceMeanSquaresMetric::resident`] — same reason, same shape.
+    resident: Mutex<ResidentCorrelation>,
+    /// The fixed image's grid and the moving image's inverse map, for the
+    /// scale/learning-rate estimators the driver builds.
+    layout: Layout,
+}
+
+impl DeviceCorrelationMetric {
+    /// Build from two device-resident images, over the whole fixed grid.
+    pub fn from_device(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+    ) -> Result<Self, DeviceMetricError> {
+        Self::from_device_sampled(fixed, moving, None, None, None)
+    }
+
+    /// [`from_device`](Self::from_device) with masks and an optional **sampled** subset
+    /// of the fixed grid — the same contract as
+    /// [`DeviceMeanSquaresMetric::from_device_sampled`], because it is the same sample
+    /// set: the device does not draw, it is told which voxels.
+    pub fn from_device_sampled(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceMask>,
+        moving_mask: Option<&[bool]>,
+        samples: Option<&[usize]>,
+    ) -> Result<Self, DeviceMetricError> {
+        let (resident, layout) =
+            with_device_layout(fixed, moving, moving_mask, samples, |points, geom| {
+                ResidentCorrelation::from_device_masked(fixed, points, fixed_mask, moving, geom)
+            })?;
+        Ok(Self {
+            resident: Mutex::new(resident),
+            layout,
+        })
+    }
+
+    /// Device bytes held by the fixed and moving volumes.
+    pub fn volume_bytes(&self) -> usize {
+        self.lock().volume_bytes()
+    }
+
+    /// Number of fixed samples the kernel walks.
+    pub fn sample_count(&self) -> usize {
+        self.lock().sample_count()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResidentCorrelation> {
+        self.resident
+            .lock()
+            .expect("the device metric's resident buffers are poisoned by an earlier panic")
+    }
+
+    /// Scale/learning-rate estimator of `kind` over the fixed image's grid — the same
+    /// estimator the host metric builds, from the same geometry.
+    pub fn scales_estimator(
+        &self,
+        transform: &dyn ParametricTransform,
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        ScalesEstimator::new(
+            &self.layout.grid,
+            transform,
+            &self.layout.moving_phys_to_index,
+            self.layout.min_spacing,
+            kind,
+        )
+    }
+
+    /// The metric value and its parameter-derivative at `transform`.
+    ///
+    /// Deterministic: the reduction order is fixed, so the same inputs give
+    /// bit-identical results on every call and every run.
+    pub fn evaluate(
+        &self,
+        transform: &dyn ParametricTransform,
+    ) -> Result<MetricValue, DeviceMetricError> {
+        if transform.dimension() != sitk_cuda::DIM {
+            return Err(DeviceMetricError::NotThreeDimensional(
+                transform.dimension(),
+            ));
+        }
+        // The host's precondition, on the host's terms. A displacement field would
+        // fail the affine probe below anyway, but it would fail it as
+        // `NonAffineTransform` — and this metric refuses local support *as a metric*,
+        // whichever backend it runs on. One rule, named the same way on both paths.
+        if transform.has_local_support() {
+            return Err(DeviceMetricError::RequiresGlobalTransform);
+        }
+        let form = affine_form(transform).ok_or(DeviceMetricError::NonAffineTransform)?;
+        let moments = self.lock().evaluate(&form.a, &form.b)?;
+        Ok(contract_correlation(&moments, &form))
+    }
+
+    /// The metric value alone. Both passes still run — the value needs the means, and
+    /// the means need a pass.
     pub fn value(&self, transform: &dyn ParametricTransform) -> Result<f64, DeviceMetricError> {
         Ok(self.evaluate(transform)?.value)
     }
