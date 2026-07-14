@@ -2639,13 +2639,24 @@ impl ImageRegistrationMethod {
     ///   rather than folded into one matrix, because folding rounds once where the host
     ///   rounds twice.
     ///
-    /// The one thing left is a **fixed-initial transform**, refused by name as
-    /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform).
-    /// It needs the fixed image *and its in-buffer predicate* resampled **through** the
-    /// transform, and both device resamples go through the identity only. That refusal
-    /// documents why the missing piece is not merely a kernel: a transformed resample
-    /// whose point map is 1e-12 from the host's would move the predicate's boundary by
-    /// a voxel, and the predicate is what makes the valid-point count exactly equal.
+    /// - a **fixed-initial transform**, of any class with a bitwise point map — including
+    ///   a multi-member `CompositeTransform`. The fixed image *and its in-buffer
+    ///   predicate* are resampled **through** it on the device
+    ///   ([`fixed_initial_stages`](Self::fixed_initial_stages) +
+    ///   `sitk_cuda::resample_*_through`), replaying the transform's stages in the
+    ///   transform's own order, and the result is pinned bit-identical to
+    ///   `ResampleImageFilter` on a grid where every continuous index is a half-voxel tie
+    ///   (`pyramid_parity.rs`).
+    ///
+    /// What is left refused, by name, as
+    /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform):
+    /// a fixed-initial transform with no bitwise stage list at all — the centred scale
+    /// family, a B-spline, a displacement field, or a composite containing one. The
+    /// refusal is not a missing kernel, it is a missing *guarantee*: the predicate's
+    /// boundary is decided by rounding a continuous index, the mask resample rounds it
+    /// with `floor(c + 0.5)`, and a point map 1e-12 from the host's picks a different
+    /// voxel — so the valid-point count that the device path pins as *exactly* the host's
+    /// would move.
     ///
     /// # The images this reproduces are the ones you uploaded
     ///
@@ -2746,12 +2757,12 @@ impl ImageRegistrationMethod {
         // (`level_mask_on_device`), the metric takes a moving mask, the level's grid can
         // be the virtual one (`level_grid`), and the fixed image and its in-buffer
         // predicate are resampled *through* the fixed-initial transform
-        // (`fixed_initial_map` + `resample_*_through`, pinned bit-identical to
+        // (`fixed_initial_stages` + `resample_*_through`, pinned bit-identical to
         // `ResampleImageFilter`).
         //
         // What is still refused is a fixed-initial transform whose **arithmetic** the
         // device cannot reproduce to the bit — and that refusal is not made here. It is
-        // made where the map is taken (`fixed_initial_map`), by name, per transform
+        // made where the stages are taken (`fixed_initial_stages`), by name, per transform
         // class, so a `ScaleTransform` is refused while an `Euler3DTransform` is not.
         // Doing it here would mean re-deriving that classification at a second site.
 
@@ -2947,8 +2958,8 @@ impl ImageRegistrationMethod {
         };
 
         let sf = smoothed_fixed.as_ref().unwrap_or(fixed);
-        let fixed_level = match self.fixed_initial_map()? {
-            Some(m) => sitk_cuda::resample_linear_through(sf, &grid, 0.0, &m.matrix, &m.offset),
+        let fixed_level = match self.fixed_initial_stages()? {
+            Some(stages) => sitk_cuda::resample_linear_through(sf, &grid, 0.0, &stages),
             None => sitk_cuda::resample_linear(sf, &grid, 0.0),
         }
         .map_err(DeviceRegistrationError::Pyramid)?;
@@ -2957,31 +2968,36 @@ impl ImageRegistrationMethod {
     }
 
     /// The fixed-initial transform's point map, in the only form the device resample
-    /// may take: the matrix and offset the transform **itself** multiplies, bit for
-    /// bit ([`sitk_transform::Transform::matrix_offset_map`]).
+    /// may take: the **stages the transform itself evaluates**, in the order it
+    /// evaluates them ([`TransformBase::point_map_stages`](sitk_transform::TransformBase::point_map_stages)),
+    /// converted and bitwise-checked by [`crate::cuda::point_stages`].
     ///
     /// `None` when no fixed-initial transform is configured — the device then resamples
     /// through the identity, which is what the host does too (`prepare_level`'s
     /// `onto_virtual` passes `AffineTransform::identity(dim)`, not nothing).
     ///
-    /// A transform with no such form is refused, by name, rather than approximated.
-    /// The metric's `affine_form` could hand one over for any affine transform — it
-    /// probes `T(0)` and `T(e_e) − T(0)` — but that reconstruction is ~1e-12 from the
-    /// transform's own arithmetic, and the level's *predicate* is a 0/1 field whose
-    /// border is decided by rounding a continuous index. One ulp there flips a shell of
-    /// voxels, moves the valid-point count, and breaks the one thing the device path
-    /// pins as *exactly* equal to the host's. So: the transform's own bits, or nothing.
+    /// A composite is handed over as **several stages, not one folded matrix**, and the
+    /// kernel replays them. Folding `M₂·M₁` is the same map algebraically and rounds
+    /// once where the transform rounds twice; the difference is in the last bits of the
+    /// continuous index, and the level's *predicate* is a 0/1 field whose border is
+    /// decided by rounding that index — `resample_nearest_through`'s `floor(c + 0.5)`
+    /// turns one ulp into a whole voxel. One ulp there flips a shell of voxels, moves
+    /// the valid-point count, and breaks the one thing the device path pins as *exactly*
+    /// equal to the host's.
+    ///
+    /// A transform with no bitwise stage list at all — the centred scale family, which
+    /// evaluates `(p − c)·s + c` and has no stored `matrix`/`offset` to hand over — is
+    /// refused **by name**
+    /// ([`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform)),
+    /// not approximated by a probe. So: the transform's own bits, or nothing.
     #[cfg(feature = "cuda")]
-    fn fixed_initial_map(
+    fn fixed_initial_stages(
         &self,
-    ) -> std::result::Result<
-        Option<sitk_transform::matrix_offset::MatrixOffsetMap>,
-        DeviceRegistrationError,
-    > {
+    ) -> std::result::Result<Option<Vec<sitk_cuda::PointStage>>, DeviceRegistrationError> {
         match &self.fixed_initial_transform {
             None => Ok(None),
-            Some(t) => match t.matrix_offset_map() {
-                Some(m) => Ok(Some(m)),
+            Some(t) => match crate::cuda::point_stages(t) {
+                Some(stages) => Ok(Some(stages)),
                 None => Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(
                     t.kind(),
                 )),
@@ -3067,12 +3083,10 @@ impl ImageRegistrationMethod {
         // through `onto_virtual` — the identical closure it resamples the image with —
         // so a device that mapped the predicate with even a 1-ulp-different point would
         // disagree with the host on a shell of border voxels.
-        let map = self.fixed_initial_map()?;
+        let stages = self.fixed_initial_stages()?;
         let onto_level = |img: &DeviceImage| -> std::result::Result<DeviceMask, CudaError> {
-            let resampled = match &map {
-                Some(m) => {
-                    sitk_cuda::resample_nearest_through(img, grid_ref, 0.0, &m.matrix, &m.offset)?
-                }
+            let resampled = match &stages {
+                Some(stages) => sitk_cuda::resample_nearest_through(img, grid_ref, 0.0, stages)?,
                 None => sitk_cuda::resample_nearest(img, grid_ref, 0.0)?,
             };
             DeviceMask::from_device_image(&resampled)
@@ -7352,116 +7366,140 @@ mod device_level_tests {
 
         // A rotation about a corner plus a translation: it swings a slab of the fixed
         // image off the level grid, so the in-buffer predicate has real work to do.
-        let initial = Transform::Euler3D(Euler3DTransform::new(
+        let euler = Transform::Euler3D(Euler3DTransform::new(
             0.15,
             -0.10,
             0.35,
             [4.0, -3.0, 2.0],
             [0.0, 0.0, 0.0],
         ));
+        // The same thing as a **two-stage composite**: the device replays both stages in
+        // the transform's own order instead of folding them into one matrix. The level
+        // mask is where a fold would show — it is 0/1 and its border is a rounded
+        // continuous index.
+        let composite = {
+            let mut c = sitk_transform::CompositeTransform::new(3);
+            c.add_transform(Transform::Euler3D(Euler3DTransform::new(
+                0.15,
+                -0.10,
+                0.35,
+                [4.0, -3.0, 2.0],
+                [0.0, 0.0, 0.0],
+            )))
+            .unwrap();
+            c.add_transform(Transform::Translation(TranslationTransform::new(vec![
+                2.0, -1.5, 1.0,
+            ])))
+            .unwrap();
+            Transform::Composite(c)
+        };
 
-        for (name, with_mask, with_domain) in [
-            ("fixed-initial transform only", false, false),
-            ("with a user mask", true, false),
-            ("with a virtual domain", false, true),
-            ("with both", true, true),
-        ] {
-            let build = |transform: Option<&Transform>| {
-                let mut reg = ImageRegistrationMethod::new();
-                if with_mask {
-                    reg.set_metric_fixed_mask(&mask);
-                }
-                if with_domain {
-                    reg.set_virtual_domain(
-                        vec![24, 20, 28],
-                        vec![-8.0, -4.0, -6.0],
-                        vec![1.5, 2.0, 2.0],
-                        vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-                    )
-                    .unwrap();
-                }
-                if let Some(t) = transform {
-                    reg.set_fixed_initial_transform(t.clone());
-                }
-                reg
-            };
+        for (tname, initial) in [("Euler3D", &euler), ("Composite of two maps", &composite)] {
+            for (name, with_mask, with_domain) in [
+                ("fixed-initial transform only", false, false),
+                ("with a user mask", true, false),
+                ("with a virtual domain", false, true),
+                ("with both", true, true),
+            ] {
+                let name = &format!("{tname}, {name}");
+                let build = |transform: Option<&Transform>| {
+                    let mut reg = ImageRegistrationMethod::new();
+                    if with_mask {
+                        reg.set_metric_fixed_mask(&mask);
+                    }
+                    if with_domain {
+                        reg.set_virtual_domain(
+                            vec![24, 20, 28],
+                            vec![-8.0, -4.0, -6.0],
+                            vec![1.5, 2.0, 2.0],
+                            vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                        )
+                        .unwrap();
+                    }
+                    if let Some(t) = transform {
+                        reg.set_fixed_initial_transform(t.clone());
+                    }
+                    reg
+                };
 
-            let reg = build(Some(&initial));
-            // The same configuration with the transform removed — the mask this must
-            // *not* equal, or the transform is not reaching the predicate.
-            let no_transform = build(None);
+                let reg = build(Some(initial));
+                // The same configuration with the transform removed — the mask this must
+                // *not* equal, or the transform is not reaching the predicate.
+                let no_transform = build(None);
 
-            for factors in [vec![2usize; 3], vec![1usize; 3]] {
-                let sigma = vec![0.0; 3];
-                let what = format!("{name}, factors {factors:?}");
+                for factors in [vec![2usize; 3], vec![1usize; 3]] {
+                    let sigma = vec![0.0; 3];
+                    let what = format!("{name}, factors {factors:?}");
 
-                let (host_fixed, host_moving, host_mask) = reg
-                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
-                    .unwrap();
-                let (dev_fixed, dev_moving) = reg
-                    .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
-                    .unwrap();
-                let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
-                let dev_mask = reg
-                    .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
-                    .unwrap();
+                    let (host_fixed, host_moving, host_mask) = reg
+                        .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                        .unwrap();
+                    let (dev_fixed, dev_moving) = reg
+                        .prepare_level_on_device(&d_fixed, &d_moving, &sigma, &factors)
+                        .unwrap();
+                    let grid = reg.level_grid(d_fixed.geometry(), &factors).unwrap();
+                    let dev_mask = reg
+                        .level_mask_on_device(&d_fixed, with_mask.then_some(&d_mask), grid.as_ref())
+                        .unwrap();
 
-                // The level image, through the transform, bit for bit.
-                assert_same_image(
-                    &host_fixed,
-                    &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
-                    &format!("{what}: fixed level"),
-                );
-                assert_same_image(
-                    &host_moving,
-                    &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
-                    &format!("{what}: moving level"),
-                );
+                    // The level image, through the transform, bit for bit.
+                    assert_same_image(
+                        &host_fixed,
+                        &dev_fixed.as_ref().unwrap_or(&d_fixed).to_host().unwrap(),
+                        &format!("{what}: fixed level"),
+                    );
+                    assert_same_image(
+                        &host_moving,
+                        &dev_moving.as_ref().unwrap_or(&d_moving).to_host().unwrap(),
+                        &format!("{what}: moving level"),
+                    );
 
-                // A fixed-initial transform always makes the host build a predicate.
-                let host_mask = host_mask.expect("a fixed-initial transform builds a predicate");
-                let dev_mask = dev_mask.expect("the device built no level mask");
+                    // A fixed-initial transform always makes the host build a predicate.
+                    let host_mask =
+                        host_mask.expect("a fixed-initial transform builds a predicate");
+                    let dev_mask = dev_mask.expect("the device built no level mask");
 
-                let hb = host_mask_bytes(&host_mask);
-                let db = device_mask_bytes(&dev_mask);
+                    let hb = host_mask_bytes(&host_mask);
+                    let db = device_mask_bytes(&dev_mask);
 
-                // Anti-vacuity 1: the mask must gate something.
-                let zeros = hb.iter().filter(|&&b| b == 0).count();
-                let ones = hb.len() - zeros;
-                assert!(
-                    zeros > 0 && ones > 0,
-                    "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); the \
+                    // Anti-vacuity 1: the mask must gate something.
+                    let zeros = hb.iter().filter(|&&b| b == 0).count();
+                    let ones = hb.len() - zeros;
+                    assert!(
+                        zeros > 0 && ones > 0,
+                        "{what}: the host mask gates nothing ({zeros} zeros, {ones} ones); the \
                      comparison below would pass on a device that ignored the transform"
-                );
+                    );
 
-                // Anti-vacuity 2: the transform must have *moved* the predicate.
-                let (_, _, plain_mask) = no_transform
-                    .prepare_level(&fixed, &moving, &sigma, &factors, 3)
-                    .unwrap();
-                let plain = plain_mask.map(|m| host_mask_bytes(&m));
-                match &plain {
-                    None => {} // no domain, no user mask: without the transform there is no mask at all
-                    Some(p) => assert!(
-                        p.len() != hb.len() || p != &hb,
-                        "{what}: the level mask is identical with and without the \
+                    // Anti-vacuity 2: the transform must have *moved* the predicate.
+                    let (_, _, plain_mask) = no_transform
+                        .prepare_level(&fixed, &moving, &sigma, &factors, 3)
+                        .unwrap();
+                    let plain = plain_mask.map(|m| host_mask_bytes(&m));
+                    match &plain {
+                        None => {} // no domain, no user mask: without the transform there is no mask at all
+                        Some(p) => assert!(
+                            p.len() != hb.len() || p != &hb,
+                            "{what}: the level mask is identical with and without the \
                          fixed-initial transform; the transform is not reaching the \
                          predicate and this test proves nothing"
-                    ),
-                }
+                        ),
+                    }
 
-                assert_eq!(
-                    db.len(),
-                    hb.len(),
-                    "{what}: the device mask is not on the level's grid"
-                );
-                let differing = hb.iter().zip(db.iter()).filter(|&(&h, &d)| h != d).count();
-                assert_eq!(
-                    differing,
-                    0,
-                    "{what}: {differing} of {} mask bytes differ (host zeros {zeros}, ones {ones})",
-                    hb.len()
-                );
-                println!("{what}: level mask byte-equal ({zeros} zeros, {ones} ones)");
+                    assert_eq!(
+                        db.len(),
+                        hb.len(),
+                        "{what}: the device mask is not on the level's grid"
+                    );
+                    let differing = hb.iter().zip(db.iter()).filter(|&(&h, &d)| h != d).count();
+                    assert_eq!(
+                        differing,
+                        0,
+                        "{what}: {differing} of {} mask bytes differ (host zeros {zeros}, ones {ones})",
+                        hb.len()
+                    );
+                    println!("{what}: level mask byte-equal ({zeros} zeros, {ones} ones)");
+                }
             }
         }
     }

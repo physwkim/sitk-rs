@@ -129,28 +129,33 @@ pub enum DeviceRegistrationError {
     ///
     /// The transform relocates the fixed image's sample points, so the level's fixed
     /// image *and* its in-buffer predicate are resampled *through* it. The device does
-    /// that now ([`sitk_cuda::resample_linear_through`] /
-    /// [`sitk_cuda::resample_nearest_through`]) — but only for a transform whose point
-    /// map is *literally* `mat_vec(matrix, p) + offset` on its own stored fields, which
-    /// is what [`Transform::matrix_offset_map`](sitk_transform::Transform::matrix_offset_map)
-    /// hands over and what its contract guarantees.
+    /// that ([`sitk_cuda::resample_linear_through`] /
+    /// [`sitk_cuda::resample_nearest_through`]) by replaying the transform's **own
+    /// stages** ([`point_map_stages`](sitk_transform::TransformBase::point_map_stages)),
+    /// in the transform's own order — so a composite is accepted and is *not* folded
+    /// into one matrix, because folding rounds once where the transform rounds per stage.
     ///
-    /// What is refused, and why it is refused rather than approximated: the predicate is
-    /// a 0/1 field whose value at the buffer border is decided by comparing a continuous
-    /// index against `[-0.5, size - 0.5)`. One ulp in the mapped point flips a shell of
-    /// voxels there, moves the valid-point count, and breaks the one property the device
-    /// path pins as *exactly* equal to the host's. So an approximate map is not a
-    /// slightly worse map — it is a different sample set. `ScaleTransform` and
-    /// `ScaleLogarithmicTransform` evaluate `(p − c)·s + c`, which is `M·p + b` in exact
-    /// arithmetic and **not** in the last bits; `CompositeTransform` rounds once per
-    /// stage, so a composed matrix is not its arithmetic either; `BSplineTransform` and
-    /// `DisplacementFieldTransform` are not linear at all. Each is named here rather
-    /// than folded into a matrix that would be *almost* right.
+    /// What is left to refuse: a transform that reports no stages at all, because its
+    /// `transform_point` evaluates some *other* expression. `ScaleTransform` and
+    /// `ScaleLogarithmicTransform` evaluate the centred `(p − c)·s + c`, which is
+    /// `M·p + b` in exact arithmetic and **not** in the last bits; `BSplineTransform` and
+    /// `DisplacementFieldTransform` are not linear at all; a `CompositeTransform`
+    /// containing any of them reports no stages either. Each is named here rather than
+    /// approximated by a probed matrix that would be *almost* right.
+    ///
+    /// Why "almost right" is not good enough here — and this is the sharpest form of the
+    /// argument anywhere in the device path: the predicate is a 0/1 field whose value at
+    /// the buffer border is decided by comparing a continuous index against
+    /// `[-0.5, size - 0.5)`, and the mask resample rounds that index with
+    /// `floor(c + 0.5)`. One ulp does not perturb an intensity by one ulp; it picks a
+    /// **different voxel**, flips a shell of border voxels, and moves the valid-point
+    /// count the device path pins as *exactly* equal to the host's. An approximate map is
+    /// not a slightly worse map — it is a different sample set.
     #[error(
-        "a fixed-initial {0:?} transform has no point map the device can reproduce bit \
-         for bit ({0:?} is not `mat_vec(matrix, p) + offset` on its own stored fields); \
-         the in-buffer predicate is 0/1 and one ulp at the border moves the valid-point \
-         count, so this is refused rather than approximated"
+        "a fixed-initial {0:?} transform reports no bitwise point-map stages ({0:?} does \
+         not evaluate `mat_vec(matrix, p) + offset` on its own stored fields); the \
+         in-buffer predicate is 0/1 and the mask resample rounds with floor(c + 0.5), so \
+         one ulp there is a whole voxel — refused rather than approximated"
     )]
     UnsupportedFixedInitialTransform(sitk_transform::TransformKind),
 

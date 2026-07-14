@@ -56,7 +56,7 @@ use std::sync::Mutex;
 use sitk_core::parallel;
 use sitk_cuda::{FixedPoints, MAX_STAGES, MovingGeometry, PointStage, ResidentMetric};
 use sitk_transform::matrix_offset::replay_stages;
-use sitk_transform::{Interpolator, ParametricTransform};
+use sitk_transform::{Interpolator, ParametricTransform, TransformBase};
 
 use crate::device::DeviceMetricError;
 use crate::metric::{
@@ -231,14 +231,21 @@ impl Default for CudaMetricBackend {
 /// The transform's point map, as stages the device can replay — or `None` if it has
 /// none, which is the refusal that keeps a transform on the CPU.
 ///
-/// The stages come from the transform itself ([`ParametricTransform`]'s
-/// `point_map_stages`); this only converts them to the device's fixed-size form and
-/// then **checks the bitwise claim** rather than trusting it: replaying the stages on
-/// the host must reproduce `transform_point` with `to_bits()` equality at both probe
-/// points. That check is the whole contract in one line — if it holds on the host and
-/// the kernel performs the same operations in the same order, the continuous index is
-/// bit-identical on both sides.
-fn point_stages(transform: &dyn ParametricTransform) -> Option<Vec<PointStage>> {
+/// The stages come from the transform itself ([`TransformBase::point_map_stages`]);
+/// this only converts them to the device's fixed-size form and then **checks the
+/// bitwise claim** rather than trusting it: replaying the stages on the host must
+/// reproduce `transform_point` with `to_bits()` equality at both probe points. That
+/// check is the whole contract in one line — if it holds on the host and the kernel
+/// performs the same operations in the same order, the continuous index is bit-identical
+/// on both sides.
+///
+/// Generic over `TransformBase`, not `ParametricTransform`, because it has **two**
+/// callers and only one of them optimizes: the metric hands over the transform being
+/// optimized, and [`ImageRegistrationMethod`](crate::ImageRegistrationMethod)'s device
+/// pyramid hands over the *fixed-initial* transform, which has no parameters to
+/// differentiate and only ever needs to map a point. One converter, one bitwise check,
+/// both consumers.
+pub(crate) fn point_stages<T: TransformBase + ?Sized>(transform: &T) -> Option<Vec<PointStage>> {
     let dim = sitk_cuda::DIM;
     let maps = transform.point_map_stages()?;
     if maps.is_empty() || maps.len() > MAX_STAGES {

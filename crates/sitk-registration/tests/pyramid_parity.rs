@@ -13,17 +13,39 @@
 #![cfg(feature = "cuda")]
 
 use sitk_core::Image;
-use sitk_cuda::{CudaError, DeviceImage, Geometry, backend};
+use sitk_cuda::{CudaError, DeviceImage, Geometry, PointStage, backend};
 use sitk_registration::metric::{FixedSamples, MovingImage};
 use sitk_registration::{CpuBackend, DeviceMeanSquaresMetric, MeanSquaresMetric};
 use sitk_transform::{
-    AffineTransform, ComposeScaleSkewVersor3DTransform, Euler3DTransform, Interpolator,
-    ResampleImageFilter, ScaleSkewVersor3DTransform, ScaleVersor3DTransform, Similarity3DTransform,
-    Transform, TranslationTransform, VersorRigid3DTransform, VersorTransform,
+    AffineTransform, ComposeScaleSkewVersor3DTransform, CompositeTransform, Euler3DTransform,
+    Interpolator, ResampleImageFilter, ScaleSkewVersor3DTransform, ScaleVersor3DTransform,
+    Similarity3DTransform, Transform, TransformBase, TranslationTransform, VersorRigid3DTransform,
+    VersorTransform,
 };
 
 fn no_device() -> bool {
     matches!(backend(), Err(CudaError::NoDevice(_)))
+}
+
+/// The transform's own point-map stages, in the device's fixed-size form — the *only*
+/// thing `resample_*_through` may be handed.
+///
+/// One conversion, no arithmetic: whatever `point_map_stages` reports is what the kernel
+/// replays. A test that folded a composite here, or probed an affine out of the
+/// transform, would be pinning the device against a map the host does not evaluate.
+fn stages_of(t: &Transform) -> Vec<PointStage> {
+    let maps = t
+        .point_map_stages()
+        .unwrap_or_else(|| panic!("{:?} reports no bitwise point map", t.kind()));
+    maps.iter()
+        .map(|m| {
+            let mut matrix = [0.0f64; 9];
+            let mut offset = [0.0f64; 3];
+            matrix.copy_from_slice(&m.matrix);
+            offset.copy_from_slice(&m.offset);
+            PointStage { matrix, offset }
+        })
+        .collect()
 }
 
 /// A volume with structure at several scales, so smoothing and interpolation have
@@ -562,15 +584,16 @@ fn the_pyramid_ops_refuse_a_shape_they_have_no_kernel_for() {
 
 /// **D2's pin, and the load-bearing one of the whole fixed-initial-transform round.**
 ///
-/// The device resample now carries a point map, and the claim is not "close": it is
-/// that `resample_*_through` is **bit-identical** to `ResampleImageFilter::execute(input,
-/// transform)` for every transform `Transform::matrix_offset_map` accepts. Everything
-/// downstream rests on it — the in-buffer predicate is 0/1, so one ulp in the mapped
-/// point flips a shell of border voxels and moves the valid-point count the device path
-/// pins as *exactly* equal to the host's.
+/// The device resample carries the transform's own point-map stages, and the claim is
+/// not "close": it is that `resample_*_through` is **bit-identical** to
+/// `ResampleImageFilter::execute(input, transform)` for every transform
+/// `point_map_stages` accepts — including a **multi-stage composite**, which is replayed
+/// stage by stage rather than folded. Everything downstream rests on it: the in-buffer
+/// predicate is 0/1, so one ulp in the mapped point flips a shell of border voxels and
+/// moves the valid-point count the device path pins as *exactly* equal to the host's.
 ///
 /// If this ever fails, the honest answer is to refuse the offending variant in
-/// `matrix_offset_map`, not to relax the assertion to a tolerance.
+/// `point_map_stages`, not to relax the assertion to a tolerance.
 ///
 /// Both interpolators, and both payloads: a textured volume (where a wrong index shows
 /// up in the value) and a binary mask (where it does not, which is the whole point).
@@ -666,6 +689,34 @@ fn the_device_resample_through_a_transform_is_bit_identical_to_the_host_filter()
                 c,
             )),
         ),
+        // The one that could not reach a device resample before this: a composite of
+        // THREE maps. `ResampleImageFilter` evaluates its `transform_point`, which
+        // applies the members one after another, each rounding on its own; the device
+        // replays the same three stages in the same order. A folded `M₃·M₂·M₁` is the
+        // same map in exact arithmetic and rounds ONCE — and the fold is exactly what a
+        // "just multiply them together" shortcut would do here.
+        ("Composite of three maps", {
+            let mut composite = CompositeTransform::new(3);
+            composite
+                .add_transform(Transform::Euler3D(Euler3DTransform::new(
+                    0.31, -0.17, 0.44, t, c,
+                )))
+                .unwrap();
+            composite
+                .add_transform(Transform::Translation(TranslationTransform::new(vec![
+                    1.5, -0.75, 2.25,
+                ])))
+                .unwrap();
+            composite
+                .add_transform(Transform::Affine(AffineTransform::new(
+                    3,
+                    vec![0.98, -0.13, 0.06, 0.12, 0.97, -0.15, -0.07, 0.14, 0.99],
+                    vec![-1.25, 0.5, -2.0],
+                    c.to_vec(),
+                )))
+                .unwrap();
+            Transform::Composite(composite)
+        }),
     ];
 
     // The grids the level actually resamples onto, including the half-voxel-offset one
@@ -686,9 +737,7 @@ fn the_device_resample_through_a_transform_is_bit_identical_to_the_host_filter()
     ];
 
     for (tname, transform) in &transforms {
-        let map = transform
-            .matrix_offset_map()
-            .unwrap_or_else(|| panic!("{tname}: matrix_offset_map refused an accepted variant"));
+        let stages = stages_of(transform);
 
         for (gname, grid) in &grids {
             for (payload, src, interp) in [
@@ -706,9 +755,9 @@ fn the_device_resample_through_a_transform_is_bit_identical_to_the_host_filter()
                 let g = Geometry::of(grid);
                 let device = match interp {
                     Interpolator::Linear => {
-                        sitk_cuda::resample_linear_through(&d, &g, 0.0, &map.matrix, &map.offset)
+                        sitk_cuda::resample_linear_through(&d, &g, 0.0, &stages)
                     }
-                    _ => sitk_cuda::resample_nearest_through(&d, &g, 0.0, &map.matrix, &map.offset),
+                    _ => sitk_cuda::resample_nearest_through(&d, &g, 0.0, &stages),
                 }
                 .expect("device resample through a transform")
                 .to_host()
@@ -748,8 +797,7 @@ fn the_transforms_in_that_pin_actually_move_the_resample() {
         [3.5, -2.25, 7.125],
         [24.0, 24.0, 24.0],
     ));
-    let map = euler.matrix_offset_map().unwrap();
-    let mapped = sitk_cuda::resample_linear_through(&d, &g, 0.0, &map.matrix, &map.offset)
+    let mapped = sitk_cuda::resample_linear_through(&d, &g, 0.0, &stages_of(&euler))
         .unwrap()
         .to_host()
         .unwrap();
@@ -782,12 +830,10 @@ fn the_transforms_in_that_pin_actually_move_the_resample() {
     );
 }
 
-/// The identity path did not move. `resample_linear`/`resample_nearest` now pack
-/// `M = I, b = 0` and run the same multiply the transform path runs, instead of
-/// skipping it — so this asserts the change was arithmetically inert, which is what
-/// `mat_vec(I, p) + 0 == p` bitwise claims. (The existing bit-identity pins above
-/// already cover it against the *host*; this covers it against the *device's own*
-/// through-form with an identity map, which is the substitution D3 will make.)
+/// The identity path did not move. `resample_linear`/`resample_nearest` pack a single
+/// `M = I, b = 0` stage and run the same multiply the transform path runs, instead of
+/// skipping it — so this asserts that packing is arithmetically inert, which is what
+/// `mat_vec(I, p) + 0 == p` bitwise claims.
 #[test]
 fn the_identity_map_is_the_identity_resample_on_the_device() {
     if no_device() {
@@ -799,19 +845,21 @@ fn the_identity_map_is_the_identity_resample_on_the_device() {
     let d = DeviceImage::upload(&img).unwrap();
     let g = Geometry::of(&grid);
 
-    let eye = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    let zero = [0.0, 0.0, 0.0];
+    let eye = [PointStage {
+        matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        offset: [0.0; 3],
+    }];
 
     for (name, plain, through) in [
         (
             "linear",
             sitk_cuda::resample_linear(&d, &g, 0.0).unwrap(),
-            sitk_cuda::resample_linear_through(&d, &g, 0.0, &eye, &zero).unwrap(),
+            sitk_cuda::resample_linear_through(&d, &g, 0.0, &eye).unwrap(),
         ),
         (
             "nearest",
             sitk_cuda::resample_nearest(&d, &g, 0.0).unwrap(),
-            sitk_cuda::resample_nearest_through(&d, &g, 0.0, &eye, &zero).unwrap(),
+            sitk_cuda::resample_nearest_through(&d, &g, 0.0, &eye).unwrap(),
         ),
     ] {
         assert_bit_identical(
@@ -822,9 +870,15 @@ fn the_identity_map_is_the_identity_resample_on_the_device() {
     }
 }
 
-/// A map of the wrong shape is refused, not silently padded.
+/// A stage list the device cannot replay is refused **by name**, not silently padded,
+/// truncated, or treated as the identity.
+///
+/// The empty list is the one that matters. A zero-stage replay *is* the identity map —
+/// it would resample without the transform, produce a perfectly plausible image, and be
+/// wrong. The identity is spelled `resample_linear` / `resample_nearest`; an empty stage
+/// list is a caller bug and says so.
 #[test]
-fn a_malformed_point_map_is_refused() {
+fn a_stage_list_the_device_cannot_replay_is_refused() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -833,19 +887,28 @@ fn a_malformed_point_map_is_refused() {
     let d = DeviceImage::upload(&img).unwrap();
     let g = Geometry::of(&img);
 
-    match sitk_cuda::resample_linear_through(&d, &g, 0.0, &[1.0, 0.0, 0.0, 1.0], &[0.0; 3]) {
-        Err(CudaError::UnsupportedGeometry(why)) => println!("refused: {why}"),
-        other => panic!("a 2x2 map was accepted: {:?}", other.map(|_| ())),
-    }
-    match sitk_cuda::resample_nearest_through(
-        &d,
-        &g,
-        0.0,
-        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-        &[0.0; 2],
-    ) {
-        Err(CudaError::UnsupportedGeometry(why)) => println!("refused: {why}"),
-        other => panic!("a 2-vector offset was accepted: {:?}", other.map(|_| ())),
+    let one = PointStage {
+        matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        offset: [1.0, 2.0, 3.0],
+    };
+    let too_many = vec![one; sitk_cuda::MAX_STAGES + 1];
+
+    for (what, got) in [
+        (
+            "empty",
+            sitk_cuda::resample_linear_through(&d, &g, 0.0, &[]),
+        ),
+        (
+            "over the cap",
+            sitk_cuda::resample_nearest_through(&d, &g, 0.0, &too_many),
+        ),
+    ] {
+        match got {
+            Err(CudaError::PointMapStageCount { stages, max }) => {
+                println!("{what} stage list refused: {stages} stages, the device replays 1..={max}")
+            }
+            other => panic!("a {what} stage list was accepted: {:?}", other.map(|_| ())),
+        }
     }
 }
 
@@ -919,8 +982,10 @@ fn the_point_map_addition_order_is_pinned_not_just_its_result() {
         let d = DeviceImage::upload(src).unwrap();
         let g = Geometry::of(&grid);
         let device = match interp {
-            Interpolator::Linear => sitk_cuda::resample_linear_through(&d, &g, 0.0, m, b),
-            _ => sitk_cuda::resample_nearest_through(&d, &g, 0.0, m, b),
+            Interpolator::Linear => {
+                sitk_cuda::resample_linear_through(&d, &g, 0.0, &stages_of(&euler))
+            }
+            _ => sitk_cuda::resample_nearest_through(&d, &g, 0.0, &stages_of(&euler)),
         }
         .expect("device resample through a transform")
         .to_host()
@@ -953,4 +1018,182 @@ fn the_point_map_addition_order_is_pinned_not_just_its_result() {
         }
     }
     println!("{ties} sampled indices are exact half-integer ties");
+}
+
+/// **The composite pin, at the tie — the load-bearing test of this round.**
+///
+/// A `CompositeTransform` fixed-initial transform was refused by the device path until
+/// now: the resample took one matrix and one offset, and a composite is not one matrix.
+/// The device replays its stages, so it is accepted — and the claim is bit-identity with
+/// `ResampleImageFilter::execute(input, composite)`, not a band.
+///
+/// It is pinned **at the straddle**, not away from it. The grid is built from the
+/// composite's folded map so that every continuous index is an exact half-integer:
+/// `floor(c + 0.5)` is then a tie at every sample, and `resample_nearest3` turns a
+/// last-bit difference into a *different voxel* — a whole intensity, not a limit.
+///
+/// The anti-vacuity check is the second half, and it is what makes the stage list
+/// load-bearing rather than ceremony: resampling through the **folded** map — `M₂·M₁`,
+/// `M₂·b₁ + b₂`, the same transform in exact arithmetic, one rounding instead of two —
+/// is measured against the same host output, and it must *differ*. If the fold agreed,
+/// there would be no reason to replay.
+#[test]
+fn a_composite_is_replayed_stage_by_stage_and_at_a_tie_the_fold_is_visible() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    // Isotropic with an identity direction, so a rotation of the grid stays a rotation
+    // of the index lattice and the tie construction below is exact.
+    let n = 32usize;
+    let img = {
+        let mut v = volume(n);
+        v.set_spacing(&[1.0, 1.0, 1.0]).unwrap();
+        v
+    };
+    let o = img.origin().to_vec();
+
+    // Two rigid maps, so the fold is still a rotation and the tie grid is constructible.
+    let composite = {
+        let mut c = CompositeTransform::new(3);
+        c.add_transform(Transform::Euler3D(Euler3DTransform::new(
+            0.0,
+            0.0,
+            0.37,
+            [2.5, -1.25, 0.0],
+            [0.0, 0.0, 0.0],
+        )))
+        .unwrap();
+        c.add_transform(Transform::Euler3D(Euler3DTransform::new(
+            0.0,
+            0.0,
+            -0.19,
+            [-1.75, 0.5, 0.0],
+            [3.0, -2.0, 0.0],
+        )))
+        .unwrap();
+        Transform::Composite(c)
+    };
+    let stages = stages_of(&composite);
+    assert_eq!(
+        stages.len(),
+        2,
+        "the composite must hand over two stages, or this test is the single-map pin again"
+    );
+
+    // The fold: q = M₂(M₁p + b₁) + b₂ = (M₂M₁)p + (M₂b₁ + b₂). Algebraically the composite;
+    // arithmetically one rounding where the composite does two.
+    let (folded_m, folded_b) = {
+        let mut m = sitk_core::matrix::identity(3);
+        let mut b = vec![0.0; 3];
+        for s in &stages {
+            m = sitk_core::matrix::matmul(&s.matrix, &m, 3);
+            let mb = sitk_core::matrix::mat_vec(&s.matrix, &b, 3);
+            b = (0..3).map(|d| mb[d] + s.offset[d]).collect();
+        }
+        (m, b)
+    };
+    let folded = [PointStage {
+        matrix: [
+            folded_m[0],
+            folded_m[1],
+            folded_m[2],
+            folded_m[3],
+            folded_m[4],
+            folded_m[5],
+            folded_m[6],
+            folded_m[7],
+            folded_m[8],
+        ],
+        offset: [folded_b[0], folded_b[1], folded_b[2]],
+    }];
+
+    // The grid on which every mapped continuous index is a half-integer: direction Mᵀ,
+    // origin Mᵀ(o + h − b), so `mapped = M·(Mᵀ(o + h − b) + Mᵀ·i) + b = o + h + i`.
+    let mt: Vec<f64> = (0..3)
+        .flat_map(|r| (0..3).map(move |c| (r, c)))
+        .map(|(r, c)| folded_m[c * 3 + r])
+        .collect();
+    let h = [0.5, 0.5, 0.0];
+    let shifted: Vec<f64> = (0..3).map(|d| o[d] + h[d] - folded_b[d]).collect();
+    let out_origin = sitk_core::matrix::mat_vec(&mt, &shifted, 3);
+
+    let mut grid = img.clone();
+    grid.set_direction(&mt).unwrap();
+    grid.set_origin(&out_origin).unwrap();
+    let g = Geometry::of(&grid);
+
+    // Anti-vacuity for the geometry: the samples must actually sit on ties.
+    {
+        let mut ties = 0usize;
+        for i in [[0usize, 0, 0], [5, 7, 3], [17, 2, 29], [31, 31, 31]] {
+            let idx: Vec<f64> = i.iter().map(|&x| x as f64).collect();
+            let phys = sitk_core::matrix::mat_vec(&mt, &idx, 3);
+            let phys: Vec<f64> = (0..3).map(|d| out_origin[d] + phys[d]).collect();
+            let mapped = composite.transform_point(&phys);
+            for d in 0..2 {
+                let c = mapped[d] - o[d];
+                let frac = (c - c.floor() - 0.5).abs();
+                assert!(
+                    frac < 1e-9,
+                    "index {i:?} axis {d}: continuous index {c} is not a tie (off by {frac:e}); \
+                     the construction is broken and this pins nothing about the replay"
+                );
+                ties += 1;
+            }
+        }
+        println!("{ties} sampled indices are exact half-integer ties");
+    }
+
+    let mask = binary_mask(&img);
+    let mut fold_diffs = 0usize;
+    let mut fold_total = 0usize;
+    for (payload, src, interp) in [
+        ("textured/linear", &img, Interpolator::Linear),
+        ("mask/nearest", &mask, Interpolator::NearestNeighbor),
+    ] {
+        let mut resampler = ResampleImageFilter::new();
+        resampler
+            .set_reference_image(&grid)
+            .set_interpolator(interp)
+            .set_default_pixel_value(0.0);
+        let host = resampler.execute(src, &composite).expect("host resample");
+
+        let d = DeviceImage::upload(src).unwrap();
+        let through = |st: &[PointStage]| {
+            match interp {
+                Interpolator::Linear => sitk_cuda::resample_linear_through(&d, &g, 0.0, st),
+                _ => sitk_cuda::resample_nearest_through(&d, &g, 0.0, st),
+            }
+            .expect("device resample through a composite")
+            .to_host()
+            .unwrap()
+        };
+
+        // The claim: replaying the composite's own stages is the host, bit for bit.
+        assert_bit_identical(
+            &host,
+            &through(&stages),
+            &format!("composite tie grid, {payload}"),
+        );
+
+        // The counter-claim: folding them is not.
+        let folded_out = through(&folded);
+        let a = host.scalar_slice::<f32>().unwrap();
+        let b = folded_out.scalar_slice::<f32>().unwrap();
+        let differ = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        println!(
+            "composite tie grid, {payload}: the fold differs from the host at {differ}/{} voxels",
+            a.len()
+        );
+        fold_diffs += differ;
+        fold_total += a.len();
+    }
+    assert!(
+        fold_diffs > 0,
+        "folding the composite's {} stages into one matrix reproduced the host at every one \
+         of {fold_total} voxels, on a grid where every index is a tie. Then the stage replay \
+         is buying nothing here and this test is not pinning what it claims to pin.",
+        stages.len()
+    );
 }

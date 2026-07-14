@@ -191,13 +191,20 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   project. **Correlation** is the next metric worth doing (its moments are the shape
   we already reduce deterministically); **ANTS** is last.
 - A **fixed-initial transform** works for the nine matrix-offset transform classes
-  (`Affine`, `Euler3D`, the versor/similarity family, `Translation`): the device
-  resample carries a point map and is bit-identical to `ResampleImageFilter` through
-  every one of them. **`Scale` and `ScaleLogarithmic` are refused, not approximated**
-  — they evaluate `(p−c)·s + c`, which is a *different rounding* from `M·p + b`, so
-  folding them into a matrix would be wrong in the fifteenth digit and the in-buffer
-  predicate is a 0/1 field that would notice. `Composite`, `BSpline` and
-  `DisplacementField` are refused too, by name, and fall to the host.
+  (`Affine`, `Euler3D`, the versor/similarity family, `Translation`) **and for a
+  `Composite` of them**: the device resample replays the transform's own point-map
+  stages, in the transform's own order, and is bit-identical to `ResampleImageFilter`
+  through every one of them — pinned on a grid where every continuous index is a
+  half-voxel tie, so `floor(c + 0.5)` is a tie at every sample. A composite is
+  *replayed*, not folded: `M₂·M₁` is the same map in exact arithmetic and rounds once
+  where the transform rounds twice, and on that tie grid the fold differs from the host
+  at 1,767 of 32,768 voxels (linear) and 158 of 32,768 (nearest). **`Scale` and
+  `ScaleLogarithmic` are refused, not approximated** — they evaluate `(p−c)·s + c`,
+  which is a *different rounding* from `M·p + b`, so probing a matrix out of them would
+  be wrong in the fifteenth digit, and the in-buffer predicate is a 0/1 field rounded
+  with `floor(c + 0.5)`, where one ulp is a whole voxel. `BSpline`,
+  `DisplacementField`, and any `Composite` containing one of these four, are refused
+  too, by name, and fall to the host.
 - **With a fixed-initial transform, the exactly-equal valid-point count above does
   not survive a converged run** — host 152,383 against device 152,385 at 25
   iterations — and the cause is not the transform. The device reduces residuals in a

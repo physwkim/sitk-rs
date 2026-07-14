@@ -770,11 +770,13 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
     }
 
     // A fixed-initial transform is refused **per transform class**, not as a
-    // configuration: what the device needs is a point map that is bitwise
-    // `mat_vec(matrix, p) + offset` on the transform's own stored fields, because the
-    // in-buffer predicate it carries is 0/1 and one ulp at the border moves the
-    // valid-point count. `ScaleTransform` evaluates `(p - c)*s + c`, which is that map
-    // in exact arithmetic and not in the last bits, so it is refused rather than folded.
+    // configuration, and what is left to refuse is exactly what has no bitwise point map
+    // at all: the device resample now replays the transform's own stages, so the question
+    // is no longer "is it one matrix?" but "does it evaluate `mat_vec(matrix, p) + offset`
+    // on its own stored fields, stage by stage?". `ScaleTransform` evaluates the centred
+    // `(p - c)*s + c`, which is such a map in exact arithmetic and not in the last bits —
+    // and the in-buffer predicate this transform carries is 0/1, rounded with
+    // `floor(c + 0.5)`, so one ulp there is a whole voxel. Refused, not probed.
     let mut reg = ImageRegistrationMethod::new();
     reg.set_fixed_initial_transform(sitk_transform::Transform::Scale(
         sitk_transform::ScaleTransform::new(vec![1.1, 1.0, 0.9], vec![0.0, 0.0, 0.0]),
@@ -789,11 +791,13 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         ),
     }
 
-    // Composite of TWO maps: linear, and still refused *here* — the device resample takes
-    // one `mat_vec(matrix, p) + offset` and cannot replay a sequence, and folding the two
-    // into one matrix product rounds once where the transform rounds twice. (The device
-    // *metric* can replay them, and does — it is handed the stages. This entry point is
-    // the resample, which has one map or none.)
+    // A composite of TWO maps is **accepted** — this is the refusal that closed. The
+    // resample is handed both stages and replays them in the transform's own order, so a
+    // composite is not a fold and does not need to be one. That it lands bit-identically
+    // through them is pinned by `pyramid_parity`'s
+    // `a_composite_is_replayed_stage_by_stage_and_at_a_tie_the_fold_is_visible`, on a grid
+    // where every index is a half-voxel tie; what is asserted here is only that the
+    // boundary no longer declines it.
     let mut composite = sitk_transform::CompositeTransform::new(3);
     composite
         .add_transform(sitk_transform::Transform::Translation(
@@ -807,35 +811,41 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         .unwrap();
     let mut reg = ImageRegistrationMethod::new();
     reg.set_fixed_initial_transform(sitk_transform::Transform::Composite(composite));
-    match run(&reg) {
-        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
-            assert_eq!(kind, sitk_transform::TransformKind::Composite);
-        }
-        other => panic!(
-            "a two-map CompositeTransform fixed-initial transform must be refused by name: {:?}",
-            other.map(|_| ())
+    assert!(
+        !matches!(
+            run(&reg),
+            Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
         ),
-    }
+        "a two-map composite hands over two bitwise stages and the device replays them; \
+         refusing it is the hole this round closed"
+    );
 
-    // A **one-map** composite is not refused, and that is not a hole: it applies exactly
-    // one `mat_vec + offset` — its member's — so there is nothing to fold and the device's
-    // single map is that member's own arithmetic, bit for bit. The refusal above is about
-    // the *sequence*, not about the type's name.
+    // ...but a composite *containing* the scale family still is refused, and by the
+    // composite's own name: one member with no bitwise map poisons the whole stage list,
+    // because `point_map_stages` is all-or-nothing. This is what keeps the acceptance
+    // above from being "composites are fine now".
     let mut composite = sitk_transform::CompositeTransform::new(3);
     composite
         .add_transform(sitk_transform::Transform::Translation(
             sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
         ))
         .unwrap();
+    composite
+        .add_transform(sitk_transform::Transform::Scale(
+            sitk_transform::ScaleTransform::new(vec![1.1, 1.0, 0.9], vec![0.0, 0.0, 0.0]),
+        ))
+        .unwrap();
     let mut reg = ImageRegistrationMethod::new();
     reg.set_fixed_initial_transform(sitk_transform::Transform::Composite(composite));
-    assert!(
-        !matches!(
-            run(&reg),
-            Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
+    match run(&reg) {
+        Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(kind)) => {
+            assert_eq!(kind, sitk_transform::TransformKind::Composite);
+        }
+        other => panic!(
+            "a composite containing a ScaleTransform must be refused by name: {:?}",
+            other.map(|_| ())
         ),
-        "a single-map composite has one bitwise point map and must not be refused"
-    );
+    }
 
     // ...and the classes the device *can* reproduce bit for bit are no longer refused.
     // A translation is one of them (`mat_vec(I, p) + t`, pinned bitwise), so it must not
@@ -1542,13 +1552,19 @@ fn the_configurations_the_boundary_now_accepts_land_where_execute_lands() {
     }
 }
 
-/// The four fixed-initial configurations the boundary now accepts: two transform
-/// classes, each bitwise-eligible by a *different* route — `Euler3D` reads a stored
-/// matrix and offset, `Translation` has neither and gets a synthesized identity matrix
-/// (`sitk_transform::matrix_offset`) — each alone and each crossed with a virtual
-/// domain, since the two compose in `prepare_level` and a device that pushed the
-/// transform through the image but not through the in-buffer predicate would still pass
-/// a transform-only test.
+/// The fixed-initial configurations the boundary accepts: three transform classes, each
+/// bitwise-eligible by a *different* route — `Euler3D` reads a stored matrix and offset,
+/// `Translation` has neither and gets a synthesized identity matrix
+/// (`sitk_transform::matrix_offset`), and a two-member `CompositeTransform` reports **two
+/// stages** that the device replays in the transform's own order rather than folding —
+/// each alone and each crossed with a virtual domain, since the two compose in
+/// `prepare_level` and a device that pushed the transform through the image but not
+/// through the in-buffer predicate would still pass a transform-only test.
+///
+/// The composite is the one this round added. It is a real sequence — a rotation about a
+/// corner *then* a shift — so the fold `M₂·M₁` and the replay differ in the last bits of
+/// every mapped point, and the level's 0/1 predicate is where that difference becomes a
+/// different sample set.
 fn fixed_initial_configs() -> Vec<(&'static str, sitk_transform::Transform, bool)> {
     // A rotation about a corner plus a shift, and a pure shift: both swing a slab of
     // the fixed image off the sample grid, so the predicate has real work to do.
@@ -1566,11 +1582,29 @@ fn fixed_initial_configs() -> Vec<(&'static str, sitk_transform::Transform, bool
             9.0, -7.0, 5.0,
         ]))
     };
+    let composite = || {
+        let mut c = sitk_transform::CompositeTransform::new(3);
+        c.add_transform(sitk_transform::Transform::Euler3D(Euler3DTransform::new(
+            0.10,
+            -0.06,
+            0.24,
+            [4.0, -3.0, 2.0],
+            [0.0, 0.0, 0.0],
+        )))
+        .unwrap();
+        c.add_transform(sitk_transform::Transform::Translation(
+            sitk_transform::TranslationTransform::new(vec![3.0, -2.0, 1.0]),
+        ))
+        .unwrap();
+        sitk_transform::Transform::Composite(c)
+    };
     vec![
         ("Euler3D", euler(), false),
         ("Translation", translation(), false),
+        ("Composite of two maps", composite(), false),
         ("Euler3D + virtual domain", euler(), true),
         ("Translation + virtual domain", translation(), true),
+        ("Composite of two maps + virtual domain", composite(), true),
     ]
 }
 
