@@ -91,6 +91,15 @@ pub enum CudaError {
     #[error("the point map has {stages} stages; the device replays 1..={max}")]
     PointMapStageCount { stages: usize, max: usize },
 
+    /// The histogram's entry list does not describe a histogram: the keys and values have
+    /// different lengths, the list is empty, there are no bins, or a key names no bin.
+    ///
+    /// Checked on the host before launch. A key outside `0..nbins` would scatter outside
+    /// the histogram, and a clamped key would silently land in the wrong bin — which is
+    /// the class of error this whole module exists to make impossible.
+    #[error("not a histogram: {0}")]
+    HistogramShape(String),
+
     /// The image is a vector/complex image, or its buffer does not match its
     /// declared pixel type — `sitk_core` already names this precisely, so
     /// carry its message rather than reclassifying it.

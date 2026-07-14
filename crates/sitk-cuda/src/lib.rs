@@ -40,6 +40,7 @@ pub use mask::DeviceMask;
 pub use ops::correlation::{CorrelationMoments, ResidentCorrelation};
 pub use ops::device::rescale_intensity;
 pub use ops::gaussian::smooth_gaussian;
+pub use ops::histogram::{histogram, histogram_atomic, histogram_host, histogram_with_block};
 pub use ops::mean_squares::{
     DIM, FixedPoints, MAX_STAGES, Moments, MovingGeometry, PointStage, ResidentMetric,
 };
