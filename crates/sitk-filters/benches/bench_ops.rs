@@ -158,6 +158,19 @@ fn max_abs_rel_err(cpu: &Image, gpu: &Image) -> (f64, f64) {
     (max_abs, max_rel)
 }
 
+/// A comma-separated allow-list from the environment; `None` when the variable
+/// is unset, which means "everything" — the published sweep sets none of these.
+fn env_list(var: &str) -> Option<Vec<String>> {
+    std::env::var(var)
+        .ok()
+        .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
+}
+
+/// Whether `name` passes an [`env_list`] allow-list.
+fn selected(list: &Option<Vec<String>>, name: &str) -> bool {
+    list.as_ref().is_none_or(|l| l.iter().any(|w| w == name))
+}
+
 fn main() {
     let root = workspace_root();
     let criterion_dir = root.join("target").join("criterion");
@@ -189,7 +202,21 @@ fn main() {
     let mut medium_t1_ms: std::collections::HashMap<&'static str, f64> =
         std::collections::HashMap::new();
 
+    // A/B twinning knob: restrict the sweep to a subset of cells, so the same
+    // (op, size, config) can be re-measured many times on two trees without
+    // paying for the other 33 cells each round. It gates *which* cells run and
+    // nothing inside one: a cell that runs still runs through the identical
+    // `bench_function` on the identical input, with the identical pool and the
+    // identical criterion configuration. Unset (the published sweep) = every
+    // cell, exactly as before.
+    let want_ops = env_list("SITK_BENCH_OPS");
+    let want_sizes = env_list("SITK_BENCH_SIZES");
+    let want_configs = env_list("SITK_BENCH_CONFIGS");
+
     for &(size_name, dim) in SIZES {
+        if !selected(&want_sizes, size_name) {
+            continue;
+        }
         let size = [dim, dim, dim];
         let voxels = (dim as u64).pow(3);
 
@@ -202,6 +229,9 @@ fn main() {
         let img_mask_f32 = Image::from_vec(&size, bin_f32).expect("build mask_f32 input");
 
         for op in OPS {
+            if !selected(&want_ops, op.key) {
+                continue;
+            }
             let input = match op.input {
                 InputKind::BaseF32 => &img_base_f32,
                 InputKind::MaskU8 => &img_mask_u8,
@@ -220,6 +250,9 @@ fn main() {
             let output_checksum = checksum_hex(checksum_buffer(reference_output.buffer()));
 
             for config in [ThreadConfig::T1, ThreadConfig::TN(tn_threads)] {
+                if !selected(&want_configs, config.label()) {
+                    continue;
+                }
                 // `t1` is serial by definition, so its `large` cost is fixed
                 // by voxel count once measured at `medium` -- skip the
                 // expensive 10-sample criterion run and report that
