@@ -1,8 +1,9 @@
-//! The **discrete** decisions the device sampler makes about a sample's existence,
-//! driven at geometries constructed so a sample lands exactly on the deciding boundary.
+//! The two **discrete** decisions the device sampler makes about a sample's existence —
+//! `is_inside` (the in-buffer predicate) and `round(c)` (the moving-mask lookup) — driven
+//! at geometries constructed so a sample lands exactly on each boundary.
 //!
-//! They are asserted *exactly* by every other pin in this crate (`valid_points` is an
-//! integer and is compared with `assert_eq!`) and have never been exercised at a
+//! Both are asserted *exactly* by every other pin in this crate (`valid_points` is an
+//! integer and is compared with `assert_eq!`). Neither has ever been exercised at a
 //! straddling geometry. These tests construct one and measure.
 //!
 //! Only compiled with the `cuda` feature.
@@ -15,7 +16,9 @@ use sitk_cuda::DeviceImage;
 use sitk_registration::metric::{FixedSamples, MovingImage};
 use sitk_registration::{CpuBackend, DeviceMeanSquaresMetric, MeanSquaresMetric};
 use sitk_transform::{Euler3DTransform, ParametricTransform, TransformBase, TranslationTransform};
-use support::{in_buffer_straddles, no_device, on_buffer_boundary};
+use support::{
+    in_buffer_straddles, mask_bits, moving_mask_straddles, no_device, on_buffer_boundary,
+};
 
 /// Textured volume, unit spacing, origin at zero — so a continuous moving index *is* a
 /// physical coordinate and a boundary can be constructed by inspection rather than by
@@ -50,6 +53,34 @@ fn counts(fixed: &Image, moving: &Image, t: &dyn ParametricTransform) -> (usize,
     let device = DeviceMeanSquaresMetric::from_device(
         &DeviceImage::upload(fixed).unwrap(),
         &DeviceImage::upload(moving).unwrap(),
+    )
+    .unwrap();
+    (
+        host.evaluate(t, &CpuBackend).valid_points,
+        device.evaluate(t).unwrap().valid_points,
+    )
+}
+
+fn masked_counts(
+    fixed: &Image,
+    moving: &Image,
+    mask: &Image,
+    t: &dyn ParametricTransform,
+) -> (usize, usize) {
+    let host = MeanSquaresMetric::from_samples(
+        FixedSamples::from_image(fixed).unwrap(),
+        MovingImage::from_image(moving)
+            .unwrap()
+            .with_moving_mask(mask)
+            .unwrap(),
+    )
+    .unwrap();
+    let bits = mask_bits(mask);
+    let device = DeviceMeanSquaresMetric::from_device_masked(
+        &DeviceImage::upload(fixed).unwrap(),
+        &DeviceImage::upload(moving).unwrap(),
+        None,
+        Some(&bits),
     )
     .unwrap();
     (
@@ -302,5 +333,123 @@ fn the_in_buffer_predicate_is_measured_across_the_boundary() {
         "no swept pose disagreed. Either the device's point map is now bit-identical to \
          the host's (good --- rewrite this pin) or the sweep no longer brackets the \
          crossing (bad --- the pin has gone vacuous)"
+    );
+}
+
+// ---------------------------------------------------------------------------------
+// 2. The moving-mask lookup: `round(c_d)`.
+// ---------------------------------------------------------------------------------
+
+/// A moving mask whose boundary lands on a **half-integer**: voxels with `i ≤ 20` are in,
+/// `i ≥ 21` are out, so the round-to-nearest tie at `c_x = 20.5` is exactly the wall.
+fn half_space_mask(n: usize, last_in: usize) -> Image {
+    let v: Vec<f32> = (0..n * n * n)
+        .map(|s| if s % n <= last_in { 1.0 } else { 0.0 })
+        .collect();
+    Image::from_vec(&[n, n, n], v).unwrap()
+}
+
+/// **The moving-mask lookup, measured across the tie: a sample is dropped on one path
+/// only.**
+///
+/// `round(c_x)` decides which mask voxel gates the sample. Both paths round half away
+/// from zero (Rust's `f64::round`, CUDA's `round`), so the *rounding rule* is not the
+/// problem: at `c_x` exactly 20.5 both would pick voxel 21. The problem is that the two
+/// paths do not have the same `c_x`. Measured, at the same geometry as the in-buffer
+/// sweep:
+///
+/// * **4 of the 17 swept poses disagree about `valid_points`**
+/// * at each, the device counts **16 more** valid samples than the host — again the whole
+///   `(15, 0, k)` line
+/// * the host has `c_x = 20.5` exactly → `round` → voxel **21** → outside the mask →
+///   sample dropped; the device has `c_x = 20.49999999999999289` → `round` → voxel **20**
+///   → inside the mask → sample kept
+///
+/// The direction is the opposite of the in-buffer sweep's (there the device dropped what
+/// the host kept), which is the point: this is not a bias in one predicate, it is the
+/// same 1e-14 gap in the point map being read by two different discrete rules.
+///
+/// So the moving mask carries the same qualification as the in-buffer predicate, and
+/// `a_moving_mask_on_the_device_metric_matches_the_host` — which asserts `valid_points`
+/// equal — holds at its pose, not in general.
+#[test]
+fn the_moving_mask_lookup_is_measured_across_the_tie() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    let moving = volume(32, [3.0, -2.0, 1.5]);
+    let fixed = volume(16, [0.0; 3]);
+    let mask = half_space_mask(32, 20);
+    let target = 20.5;
+
+    let t0 = critical_tx(&fixed, &moving, target);
+    println!("critical tx = {t0:.17e} (outermost sample lands on c_x = {target})");
+
+    let mut disagreements = 0usize;
+    let mut host_counts = Vec::new();
+    for tx in sweep(t0, 8) {
+        let t = rotated(tx);
+        let straddles = moving_mask_straddles(&fixed, &moving, &mask, &t);
+        let (h, d) = masked_counts(&fixed, &moving, &mask, &t);
+        host_counts.push(h);
+        println!(
+            "tx {tx:.17e}  host {h:>5}  device {d:>5}  delta {:>3}  probe straddles {}",
+            d as i64 - h as i64,
+            straddles.len(),
+        );
+        assert_eq!(
+            (d as i64 - h as i64).unsigned_abs() as usize,
+            straddles.len(),
+            "the probe and the two metrics disagree about which samples the mask gates"
+        );
+        if h == d {
+            continue;
+        }
+        disagreements += 1;
+
+        let s = straddles[0];
+        println!(
+            "    e.g. sample {:?}: host c_x {:.17e} -> voxel {}  device c_x {:.17e} -> voxel {}",
+            s.index,
+            s.host_c[0],
+            s.host_c[0].round(),
+            s.dev_c[0],
+            s.dev_c[0].round(),
+        );
+        assert_eq!(
+            d as i64 - h as i64,
+            16,
+            "the device is supposed to be the one that KEEPS them here: its c_x rounds \
+             down to the last masked-in voxel while the host's rounds up past it"
+        );
+        assert!(
+            straddles
+                .iter()
+                .all(|s| s.index[0] == 15 && s.index[1] == 0),
+            "the straddling samples are the (15, 0, k) line"
+        );
+        assert!(
+            straddles.iter().all(|s| s.host_c[0].round() == 21.0),
+            "the host rounds the tie away from zero, onto the first masked-OUT voxel"
+        );
+        assert!(
+            straddles.iter().all(|s| s.dev_c[0].round() == 20.0),
+            "and the device, a hair below the tie, rounds onto the last masked-IN one"
+        );
+    }
+
+    assert!(
+        host_counts.first() != host_counts.last(),
+        "the sweep did not move a sample across the mask's tie ({host_counts:?}), so it \
+         has not exercised the lookup at all"
+    );
+    println!(
+        "{disagreements} of {} swept poses disagree about valid_points, by 16 samples each",
+        2 * 8 + 1
+    );
+    assert!(
+        disagreements > 0,
+        "no swept pose disagreed --- see the in-buffer pin for what that would mean"
     );
 }
