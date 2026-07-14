@@ -158,7 +158,8 @@ pub use cuda::CudaMetricBackend;
 pub use demons::DemonsMetric;
 #[cfg(feature = "cuda")]
 pub use device::{
-    DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetricError, DeviceRegistrationError,
+    DeviceCorrelationMetric, DeviceMattesMetric, DeviceMeanSquaresMetric, DeviceMetricError,
+    DeviceRegistrationError,
 };
 pub use error::{RegistrationError, Result};
 pub use gradient_free::{
