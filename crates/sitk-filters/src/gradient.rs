@@ -8,12 +8,24 @@
 //! and `itkGradientRecursiveGaussianImageFilter.h`.
 //!
 //! The five direct (non-Gaussian) filters share one substrate: walk a
-//! [`NeighborhoodIterator`] over an `f64` copy of the input under
+//! [`NeighborhoodIterator`] over the input under
 //! [`ZeroFluxNeumannBoundaryCondition`] — the boundary condition all five use
 //! in ITK — narrowing back to the output pixel type (`crate::image_from_f64`)
 //! only once, at the end. [`gradient`] is the vector-output member of this
 //! group: it assembles all `dim` central-difference components per pixel in
 //! one neighborhood pass instead of returning a scalar.
+//!
+//! All five run that walk as a **parallel map over output voxels**
+//! ([`NeighborhoodIterator::par_map_window`]), reading each voxel's window as a
+//! borrowed [`sitk_core::WindowView`]. Two costs the group used to carry are
+//! therefore gone: a full `f64` copy of the input volume, made up front and
+//! read once (the stencils now read `T` and widen per access, which is the same
+//! `Scalar::as_f64` the copy applied — so no value changes); and a
+//! `Neighborhood<T>` copied out of the image for every voxel. Neither the axis
+//! sums nor the tap sums accumulate *across* voxels, so no thread count can
+//! reach the arithmetic — the outputs are bit-identical to the serial walk, and
+//! `stencil_thread_parity` pins that against the serial code it replaced at 1,
+//! 4, 48 and 96 threads.
 //!
 //! [`gradient_magnitude_recursive_gaussian`], [`laplacian_recursive_gaussian`]
 //! and [`gradient_recursive_gaussian`] instead compose per-axis calls to
@@ -55,12 +67,27 @@ use sitk_core::{
     dispatch_scalar, matrix, parallel,
 };
 
-/// An `f64` copy of `img`'s pixels with `img`'s geometry (spacing in
-/// particular), used as the working buffer for every filter in this module.
-fn scratch_f64(img: &Image) -> Result<Image> {
-    let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?)?;
-    scratch.copy_geometry_from(img);
-    Ok(scratch)
+/// Slot strides of a window: the step, **inside the window**, of a one-pixel
+/// move along image axis `d`.
+///
+/// A window is laid out dimension-0-fastest with axis `a`'s extent equal to
+/// `2 * radius[a] + 1`, so the stride along axis `d` is the product of the
+/// extents below it. This is the enumeration
+/// [`Neighborhood::get`](sitk_core::Neighborhood::get) re-derived on every
+/// single call, from an ND offset vector the caller had to allocate; computing
+/// it once per filter turns each neighbor access into one addition.
+///
+/// Every stencil in this module addresses its window through these, which is
+/// what lets them all read [`sitk_core::WindowView`] — a *borrowed* window —
+/// instead of a `Neighborhood<T>` copied out per pixel.
+fn window_strides(radius: &[usize]) -> Vec<usize> {
+    let mut strides = vec![0usize; radius.len()];
+    let mut stride = 1usize;
+    for (s, &r) in strides.iter_mut().zip(radius) {
+        *s = stride;
+        stride *= 2 * r + 1;
+    }
+    strides
 }
 
 // ---- gradient_magnitude ----------------------------------------------------
@@ -138,16 +165,9 @@ fn gradient_magnitude_pass<T: Scalar, R: Scalar>(img: &Image, scales: &[f64]) ->
     let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
 
     // Window strides, so a neighbor can be addressed by its linear slot
-    // rather than by re-deriving an ND index per access. Every axis of this
-    // window has extent 3, so the stride along axis `d` is `3^d` — exactly
-    // what `Neighborhood::get` computed, once per call, in a loop.
+    // rather than by re-deriving an ND index per access.
     let center = iter.len() / 2;
-    let mut window_stride = vec![0usize; dim];
-    let mut stride = 1usize;
-    for s in window_stride.iter_mut() {
-        *s = stride;
-        stride *= 3;
-    }
+    let window_stride = window_strides(&radius);
 
     // Parallel over output voxels. The `acc += g * g` sum runs over the axes
     // of one voxel's own window, in axis order, exactly as before — nothing
@@ -245,29 +265,43 @@ pub fn derivative(
             *c *= scale;
         }
     }
-    let half = coeff.len() / 2;
+    let out = dispatch_scalar!(img.pixel_id(), derivative_pass, img, direction, &coeff)?;
+    image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
 
-    let scratch = scratch_f64(img)?;
+/// [`derivative`]'s stencil: the 1-D convolution of `coeff` along `direction`.
+///
+/// Reads `T` and widens per access instead of materializing an `f64` copy of the
+/// whole volume first — lossless (`Scalar::as_f64` is exactly the widening the
+/// copy's `to_f64_vec` applied), and it deletes a full-volume allocation whose
+/// pages had to be faulted in on one thread. The scalar-pixel rejection the copy
+/// used to perform survives the deletion: `NeighborhoodIterator::new` takes a
+/// `scalar_view::<T>()`, which returns the same
+/// [`sitk_core::Error::RequiresScalarPixelType`] on a vector or complex image.
+///
+/// The taps are summed over `k` in coefficient order, exactly as the serial
+/// `map(..).sum()` summed them, and nothing accumulates across pixels — so the
+/// `f64` result is bit-identical at any thread count.
+fn derivative_pass<T: Scalar>(img: &Image, direction: usize, coeff: &[f64]) -> Result<Vec<f64>> {
+    let dim = img.dimension();
+    let half = coeff.len() / 2;
     let mut radius = vec![0usize; dim];
     radius[direction] = half;
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
+    let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
 
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
-            let mut off = vec![0i64; dim];
-            coeff
-                .iter()
-                .enumerate()
-                .map(|(k, &c)| {
-                    off[direction] = k as i64 - half as i64;
-                    c * nb.get(&off)
-                })
-                .sum()
-        })
-        .collect();
+    let center = iter.len() / 2;
+    let stride = window_strides(&radius)[direction] as i64;
 
-    image_from_f64(img.pixel_id(), img.size(), img, &out)
+    Ok(iter.par_map_window(|_, w| {
+        coeff
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| {
+                let slot = center as i64 + (k as i64 - half as i64) * stride;
+                c * w.get_f64(slot as usize)
+            })
+            .sum()
+    }))
 }
 
 // ---- laplacian --------------------------------------------------------------
@@ -288,29 +322,35 @@ pub fn laplacian(img: &Image, use_image_spacing: bool) -> Result<Image> {
             s * s
         })
         .collect();
-    let scratch = scratch_f64(img)?;
-    let radius = vec![1usize; dim];
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
-
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
-            let center = nb.center_value();
-            let mut acc = 0.0;
-            let mut off = vec![0i64; dim];
-            for d in 0..dim {
-                off[d] = 1;
-                let plus = nb.get(&off);
-                off[d] = -1;
-                let minus = nb.get(&off);
-                off[d] = 0;
-                acc += (plus + minus - 2.0 * center) / scales_sq[d];
-            }
-            acc
-        })
-        .collect();
-
+    let out = dispatch_scalar!(img.pixel_id(), laplacian_pass, img, &scales_sq)?;
     image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
+
+/// [`laplacian`]'s stencil. Reads `T` directly — see [`derivative_pass`] for why
+/// the deleted `f64` copy of the volume was lossless to delete, and why the
+/// scalar-pixel rejection survives it.
+///
+/// `acc` still runs over the axes of **one voxel's own window**, in axis order,
+/// with the same `(plus + minus - 2*center) / scales_sq[d]` term; no accumulator
+/// crosses voxels, so the result is bit-identical at any thread count.
+fn laplacian_pass<T: Scalar>(img: &Image, scales_sq: &[f64]) -> Result<Vec<f64>> {
+    let dim = img.dimension();
+    let radius = vec![1usize; dim];
+    let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    let center_slot = iter.len() / 2;
+    let window_stride = window_strides(&radius);
+
+    Ok(iter.par_map_window(|_, w| {
+        let center = w.get_f64(center_slot);
+        let mut acc = 0.0;
+        for d in 0..dim {
+            let plus = w.get_f64(center_slot + window_stride[d]);
+            let minus = w.get_f64(center_slot - window_stride[d]);
+            acc += (plus + minus - 2.0 * center) / scales_sq[d];
+        }
+        acc
+    }))
 }
 
 // ---- sobel_edge_detection ---------------------------------------------------
@@ -370,30 +410,73 @@ fn sobel_weight(offset: &[i64], direction: usize, use_legacy: bool) -> f64 {
 /// `[-1,0,1] * [1,2,1]` kernel — it only changes anything for a 3-D image.
 /// Output keeps `img`'s pixel type.
 pub fn sobel_edge_detection(img: &Image, use_legacy_operator_coefficients: bool) -> Result<Image> {
+    let out = dispatch_scalar!(
+        img.pixel_id(),
+        sobel_pass,
+        img,
+        use_legacy_operator_coefficients
+    )?;
+    image_from_f64(img.pixel_id(), img.size(), img, &out)
+}
+
+/// [`sobel_edge_detection`]'s stencil. Reads `T` directly — see
+/// [`derivative_pass`].
+///
+/// The per-offset weight and the per-offset window slot are hoisted out of the
+/// voxel loop: `sobel_weight` is a pure function of `(offset, direction,
+/// use_legacy)`, none of which vary per voxel, so it used to be recomputed
+/// `3^dim * dim` times *per voxel* for a value that was always the same. Hoisting
+/// it produces the identical `f64` weights, and `weights[direction]` and `slots`
+/// are both indexed in `offsets` order — so each `g` is still the sum of the same
+/// products in the same sequence, and `acc` still sums `g * g` over the axes in
+/// axis order. Nothing accumulates across voxels: bit-identical at any thread
+/// count.
+fn sobel_pass<T: Scalar>(img: &Image, use_legacy_operator_coefficients: bool) -> Result<Vec<f64>> {
     let dim = img.dimension();
-    let scratch = scratch_f64(img)?;
     let radius = vec![1usize; dim];
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
+    let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    let center_slot = iter.len() / 2;
+    let window_stride = window_strides(&radius);
     let offsets = unit_box_offsets(dim);
 
-    let out: Vec<f64> = iter
-        .map(|(_, nb)| {
-            let mut acc = 0.0;
-            for direction in 0..dim {
-                let g: f64 = offsets
-                    .iter()
-                    .map(|off| {
-                        sobel_weight(off, direction, use_legacy_operator_coefficients) * nb.get(off)
-                    })
-                    .sum();
-                acc += g * g;
-            }
-            acc.sqrt()
+    // The window slot of each ND offset, in `offsets` order.
+    let slots: Vec<usize> = offsets
+        .iter()
+        .map(|off| {
+            let delta: i64 = off
+                .iter()
+                .zip(&window_stride)
+                .map(|(&o, &s)| o * s as i64)
+                .sum();
+            (center_slot as i64 + delta) as usize
         })
         .collect();
 
-    image_from_f64(img.pixel_id(), img.size(), img, &out)
+    // `weights[direction][j]` is the Sobel coefficient at `offsets[j]`.
+    let weights: Vec<Vec<f64>> = (0..dim)
+        .map(|direction| {
+            offsets
+                .iter()
+                .map(|off| sobel_weight(off, direction, use_legacy_operator_coefficients))
+                .collect()
+        })
+        .collect();
+
+    Ok(iter.par_map_window(|_, w| {
+        let mut acc = 0.0;
+        // `weights` holds one row per axis, in axis order, so this walks the
+        // directions in the same order the serial `for direction in 0..dim` did.
+        for direction_weights in &weights {
+            let g: f64 = direction_weights
+                .iter()
+                .zip(&slots)
+                .map(|(&weight, &slot)| weight * w.get_f64(slot))
+                .sum();
+            acc += g * g;
+        }
+        acc.sqrt()
+    }))
 }
 
 // ---- gradient_magnitude_recursive_gaussian / laplacian_recursive_gaussian --
@@ -614,43 +697,71 @@ pub fn laplacian_recursive_gaussian(
 ///
 /// Scalar input only (`pixel_types: BasicPixelIDTypeList`, no vector variant)
 /// — a vector or complex image is rejected the same way every other
-/// scalar-only filter in this module is, through the `scratch_f64`/
-/// `to_f64_vec` scalar seam's [`sitk_core::Error::RequiresScalarPixelType`].
+/// scalar-only filter in this module is: [`NeighborhoodIterator::new`] takes a
+/// [`sitk_core::Image::scalar_view`], which returns
+/// [`sitk_core::Error::RequiresScalarPixelType`]. That is the same error, on the
+/// same images, that the `to_f64_vec` copy these stencils used to make returned
+/// before it was deleted.
 pub fn gradient(img: &Image, use_image_spacing: bool, use_image_direction: bool) -> Result<Image> {
     let dim = img.dimension();
-    let spacing = img.spacing().to_vec();
-    let direction = img.direction().to_vec();
-    let scratch = scratch_f64(img)?;
-    let radius = vec![1usize; dim];
-    let iter =
-        NeighborhoodIterator::<f64, _>::new(&scratch, &radius, ZeroFluxNeumannBoundaryCondition)?;
-
-    let data: Vec<f32> = iter
-        .flat_map(|(_, nb)| {
-            let mut off = vec![0i64; dim];
-            let mut vector = vec![0.0f64; dim];
-            for d in 0..dim {
-                off[d] = 1;
-                let plus = nb.get(&off);
-                off[d] = -1;
-                let minus = nb.get(&off);
-                off[d] = 0;
-                let mut g = 0.5 * (plus - minus);
-                if use_image_spacing {
-                    g /= spacing[d];
-                }
-                vector[d] = g;
-            }
-            if use_image_direction {
-                vector = matrix::mat_vec(&direction, &vector, dim);
-            }
-            vector.into_iter().map(f32::from_f64)
-        })
-        .collect();
-
+    let data = dispatch_scalar!(
+        img.pixel_id(),
+        gradient_pass,
+        img,
+        use_image_spacing,
+        use_image_direction
+    )?;
     let mut result = Image::from_vec_vector(img.size(), dim, data)?;
     result.copy_geometry_from(img);
     Ok(result)
+}
+
+/// [`gradient`]'s stencil. Reads `T` directly — see [`derivative_pass`].
+///
+/// This is the one filter in the module whose output is `dim` values per voxel
+/// rather than one, so its window pass yields a `Vec<f32>` per voxel and the
+/// result is flattened afterwards. That `dim`-element `Vec` is the only
+/// per-voxel allocation left, and it replaces three larger ones the serial path
+/// made *per voxel*: the `off` index vector, the `vector` accumulator, and — the
+/// expensive one — the `3^dim`-value `Neighborhood<f64>` copied out of the image
+/// for every voxel. The window is now borrowed ([`sitk_core::WindowView`]).
+///
+/// Each voxel's `dim` components are computed in axis order, rotated (if asked)
+/// by the same `matrix::mat_vec` on the same `f64` vector, and narrowed by the
+/// same `f32::from_f64` — nothing accumulates across voxels, so the output is
+/// bit-identical at any thread count.
+fn gradient_pass<T: Scalar>(
+    img: &Image,
+    use_image_spacing: bool,
+    use_image_direction: bool,
+) -> Result<Vec<f32>> {
+    let dim = img.dimension();
+    let spacing = img.spacing().to_vec();
+    let direction = img.direction().to_vec();
+    let radius = vec![1usize; dim];
+    let iter = NeighborhoodIterator::<T, _>::new(img, &radius, ZeroFluxNeumannBoundaryCondition)?;
+
+    let center_slot = iter.len() / 2;
+    let window_stride = window_strides(&radius);
+
+    let per_voxel: Vec<Vec<f32>> = iter.par_map_window(|_, w| {
+        let mut vector = vec![0.0f64; dim];
+        for (d, v) in vector.iter_mut().enumerate() {
+            let plus = w.get_f64(center_slot + window_stride[d]);
+            let minus = w.get_f64(center_slot - window_stride[d]);
+            let mut g = 0.5 * (plus - minus);
+            if use_image_spacing {
+                g /= spacing[d];
+            }
+            *v = g;
+        }
+        if use_image_direction {
+            vector = matrix::mat_vec(&direction, &vector, dim);
+        }
+        vector.into_iter().map(f32::from_f64).collect()
+    });
+
+    Ok(per_voxel.concat())
 }
 
 // ---- gradient_recursive_gaussian --------------------------------------------
@@ -1686,5 +1797,464 @@ mod tests {
             gradient_recursive_gaussian(&img, 1.0, false, false),
             Err(FilterError::AxisTooShortForRecursion { axis: 0, len: 2 })
         ));
+    }
+}
+
+/// Thread-count parity for the four direct stencils this module parallelized:
+/// [`derivative`], [`laplacian`], [`sobel_edge_detection`] and [`gradient`].
+///
+/// Each was a serial `iter().map().collect()` over a `Neighborhood<f64>` copied
+/// out per voxel, fed by a full `f64` copy of the input volume. Each is now a
+/// [`NeighborhoodIterator::par_map_window`] over a borrowed
+/// [`sitk_core::WindowView`] of the input's own pixels, with no copy of either.
+///
+/// Two things could have moved bits, and both are pinned here rather than
+/// argued:
+///
+/// * **Deleting the `f64` volume copy.** The stencils now read `T` and widen per
+///   access. That is the same `Scalar::as_f64` the copy's `to_f64_vec` applied,
+///   so every value the arithmetic sees is the one the copy held — pinned by
+///   running these against an `f32` input, where the widening actually happens.
+/// * **Hoisting per-voxel work out of the voxel loop** (Sobel's weights, every
+///   stencil's window slots). Same values, same sequence — but only if the
+///   sequence really is the same, which [`the_within_window_sum_order_is_observable`]
+///   shows is not free: reversing it moves the bits.
+///
+/// Nothing accumulates *across* voxels in any of the four, so thread count
+/// cannot reach the arithmetic at all. The pins say so at 1, 4, 48 and 96.
+#[cfg(test)]
+mod stencil_thread_parity {
+    use super::*;
+    use sitk_core::parallel;
+
+    /// The `f64` copy of the whole input volume that every stencil in this
+    /// module used to make. Deleted from the filters; kept here because the
+    /// serial references below are the code that read it.
+    fn scratch_f64(img: &Image) -> Result<Image> {
+        let mut scratch = Image::from_vec(img.size(), img.to_f64_vec()?).unwrap();
+        scratch.copy_geometry_from(img);
+        Ok(scratch)
+    }
+
+    // ---- the serial references: the exact loops that were deleted ----------
+
+    fn derivative_serial(img: &Image, direction: usize, order: u32, spacing_on: bool) -> Vec<f64> {
+        let dim = img.dimension();
+        let mut coeff = derivative_operator_coefficients(order);
+        coeff.reverse();
+        if spacing_on {
+            let scale = 1.0 / img.spacing()[direction];
+            for c in &mut coeff {
+                *c *= scale;
+            }
+        }
+        let half = coeff.len() / 2;
+
+        let scratch = scratch_f64(img).unwrap();
+        let mut radius = vec![0usize; dim];
+        radius[direction] = half;
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        iter.map(|(_, nb)| {
+            let mut off = vec![0i64; dim];
+            coeff
+                .iter()
+                .enumerate()
+                .map(|(k, &c)| {
+                    off[direction] = k as i64 - half as i64;
+                    c * nb.get(&off)
+                })
+                .sum()
+        })
+        .collect()
+    }
+
+    fn laplacian_serial(img: &Image, spacing_on: bool) -> Vec<f64> {
+        let dim = img.dimension();
+        let scales_sq: Vec<f64> = (0..dim)
+            .map(|d| {
+                let s = if spacing_on { img.spacing()[d] } else { 1.0 };
+                s * s
+            })
+            .collect();
+        let scratch = scratch_f64(img).unwrap();
+        let radius = vec![1usize; dim];
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        iter.map(|(_, nb)| {
+            let center = nb.center_value();
+            let mut acc = 0.0;
+            let mut off = vec![0i64; dim];
+            for d in 0..dim {
+                off[d] = 1;
+                let plus = nb.get(&off);
+                off[d] = -1;
+                let minus = nb.get(&off);
+                off[d] = 0;
+                acc += (plus + minus - 2.0 * center) / scales_sq[d];
+            }
+            acc
+        })
+        .collect()
+    }
+
+    fn sobel_serial(img: &Image, legacy: bool) -> Vec<f64> {
+        let dim = img.dimension();
+        let scratch = scratch_f64(img).unwrap();
+        let radius = vec![1usize; dim];
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+        let offsets = unit_box_offsets(dim);
+
+        iter.map(|(_, nb)| {
+            let mut acc = 0.0;
+            for direction in 0..dim {
+                let g: f64 = offsets
+                    .iter()
+                    .map(|off| sobel_weight(off, direction, legacy) * nb.get(off))
+                    .sum();
+                acc += g * g;
+            }
+            acc.sqrt()
+        })
+        .collect()
+    }
+
+    fn gradient_serial(img: &Image, spacing_on: bool, direction_on: bool) -> Vec<f32> {
+        let dim = img.dimension();
+        let spacing = img.spacing().to_vec();
+        let direction = img.direction().to_vec();
+        let scratch = scratch_f64(img).unwrap();
+        let radius = vec![1usize; dim];
+        let iter = NeighborhoodIterator::<f64, _>::new(
+            &scratch,
+            &radius,
+            ZeroFluxNeumannBoundaryCondition,
+        )
+        .unwrap();
+
+        iter.flat_map(|(_, nb)| {
+            let mut off = vec![0i64; dim];
+            let mut vector = vec![0.0f64; dim];
+            for d in 0..dim {
+                off[d] = 1;
+                let plus = nb.get(&off);
+                off[d] = -1;
+                let minus = nb.get(&off);
+                off[d] = 0;
+                let mut g = 0.5 * (plus - minus);
+                if spacing_on {
+                    g /= spacing[d];
+                }
+                vector[d] = g;
+            }
+            if direction_on {
+                vector = matrix::mat_vec(&direction, &vector, dim);
+            }
+            vector.into_iter().map(f32::from_f64)
+        })
+        .collect()
+    }
+
+    // ---- the input ---------------------------------------------------------
+
+    /// A 32³ volume — 32 768 voxels, over `parallel`'s serial threshold of
+    /// 16 384, so the window passes really do run on rayon rather than falling
+    /// back to the serial fast path and pinning nothing. Values are irregular
+    /// (not a smooth ramp, whose second differences vanish identically and would
+    /// hide a wrong tap) and the spacing is anisotropic (so a swapped axis moves
+    /// the numbers).
+    ///
+    /// Every pin runs on **both** pixel types, and they test different things:
+    ///
+    /// * [`PixelId::Float64`] is the one with teeth. Its values carry full 53-bit
+    ///   mantissas, so a window sum genuinely rounds and the order of the terms is
+    ///   observable — see [`the_within_window_sum_order_is_observable`].
+    /// * [`PixelId::Float32`] is the one that exercises the widening-per-access
+    ///   path that replaced the deleted `f64` volume copy. It has *no* teeth
+    ///   against a re-association, and that is not a flaw in the input: the Sobel
+    ///   and central-difference weights are exact powers of two and an `f32` value
+    ///   carries a 24-bit mantissa, so every partial sum of one window is exactly
+    ///   representable in `f64`. The arithmetic is exact, so re-ordering it cannot
+    ///   move a bit — which is precisely why the `f64` volume is also pinned.
+    fn volume(pixel: PixelId) -> Image {
+        let n = 32usize;
+        let value = |i: usize, j: usize, k: usize| {
+            let (x, y, z) = (i as f64, j as f64, k as f64);
+            (0.7 * x).sin() * 40.0
+                + (0.3 * y).cos() * 25.0
+                + (x * y * 0.01 + z * 0.9).sin() * 13.0
+                + ((i * 37 + j * 11 + k * 7) % 29) as f64
+        };
+        let mut f64_data = vec![0.0f64; n * n * n];
+        for k in 0..n {
+            for j in 0..n {
+                for i in 0..n {
+                    f64_data[(k * n + j) * n + i] = value(i, j, k);
+                }
+            }
+        }
+        let mut img = match pixel {
+            PixelId::Float64 => Image::from_vec(&[n, n, n], f64_data).unwrap(),
+            PixelId::Float32 => {
+                let data: Vec<f32> = f64_data.iter().map(|&v| v as f32).collect();
+                Image::from_vec(&[n, n, n], data).unwrap()
+            }
+            other => panic!("volume() does not build {other:?}"),
+        };
+        img.set_spacing(&[1.0, 0.75, 1.3]).unwrap();
+        img
+    }
+
+    /// Both pixel types, in the order every pin walks them.
+    const PIXELS: [PixelId; 2] = [PixelId::Float64, PixelId::Float32];
+
+    /// Narrow a serial reference's raw `f64` values through the *same* exit the
+    /// filter takes, then read both back as `f64`.
+    ///
+    /// [`derivative`], [`laplacian`] and [`sobel_edge_detection`] keep the input's
+    /// pixel type, so on an `f32` input their output is `f32`-rounded. Comparing
+    /// the filter's rounded output against an un-rounded reference would fail on
+    /// the rounding rather than on anything the parallelization did — it did, the
+    /// first time this module was run, which is what this function exists to stop.
+    fn narrowed_like(img: &Image, values: &[f64]) -> Vec<f64> {
+        image_from_f64(img.pixel_id(), img.size(), img, values)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap()
+    }
+
+    // ---- non-vacuity -------------------------------------------------------
+
+    /// The pins below would be worth nothing if the arithmetic they compare were
+    /// insensitive to the order of its terms: a stencil whose window sum cannot
+    /// round is order-independent, so "the bits match" would stay true no matter
+    /// how the code re-associated it.
+    ///
+    /// This measures whether the order is observable, per pixel type, and asserts
+    /// what each one is *for*:
+    ///
+    /// * On the `f64` volume it must be observable — reversing a voxel's Sobel taps
+    ///   must move the bits on at least one voxel. That is what gives the `f64` pins
+    ///   teeth against a re-association.
+    /// * On the `f32` volume it must **not** be, and that is not a defect in the
+    ///   input. The Sobel weights are exact powers of two and an `f32` carries a
+    ///   24-bit mantissa, so every partial sum of a window is exactly representable
+    ///   in `f64`: the arithmetic is exact and no ordering can change it. The `f32`
+    ///   volume is pinned for the widening path, not for the fold order — and this
+    ///   assertion records that, so nobody later reads the `f32` pins as proof of
+    ///   something they cannot show.
+    #[test]
+    fn the_within_window_sum_order_is_observable() {
+        let mut moved_by_pixel = Vec::new();
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            let dim = img.dimension();
+            let scratch = scratch_f64(&img).unwrap();
+            let radius = vec![1usize; dim];
+            let iter = NeighborhoodIterator::<f64, _>::new(
+                &scratch,
+                &radius,
+                ZeroFluxNeumannBoundaryCondition,
+            )
+            .unwrap();
+            let offsets = unit_box_offsets(dim);
+
+            let mut moved = 0usize;
+            for (_, nb) in iter {
+                let terms: Vec<f64> = offsets
+                    .iter()
+                    .map(|off| sobel_weight(off, 0, false) * nb.get(off))
+                    .collect();
+                let forward: f64 = terms.iter().sum();
+                let backward: f64 = terms.iter().rev().sum();
+                if forward.to_bits() != backward.to_bits() {
+                    moved += 1;
+                }
+            }
+            moved_by_pixel.push((pixel, moved));
+        }
+
+        let f64_moved = moved_by_pixel[0].1;
+        let f32_moved = moved_by_pixel[1].1;
+
+        assert!(
+            f64_moved > 0,
+            "no voxel of the Float64 volume changed bits when its Sobel window sum \
+             was reversed, so that volume cannot observe a re-association and the \
+             Float64 pins below would pass even if a window sum were reordered"
+        );
+        assert_eq!(
+            f32_moved, 0,
+            "the Float32 volume's window sums DID become order-sensitive ({f32_moved} \
+             voxels). The doc above claims they cannot be, because power-of-two \
+             weights times 24-bit mantissas sum exactly in f64. If that is no longer \
+             true, the reasoning in this module is wrong and needs rewriting — not \
+             this assertion"
+        );
+    }
+
+    /// The other axis of vacuity: the stencils must actually depend on the input.
+    /// A flat volume makes every derivative zero and every comparison trivially
+    /// true.
+    #[test]
+    fn the_reference_outputs_are_not_degenerate() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (name, values) in [
+                ("derivative", derivative_serial(&img, 0, 1, true)),
+                ("laplacian", laplacian_serial(&img, true)),
+                ("sobel", sobel_serial(&img, false)),
+            ] {
+                let nonzero = values.iter().filter(|v| **v != 0.0).count();
+                assert!(
+                    nonzero > values.len() / 2,
+                    "{name} on {pixel:?}: only {nonzero}/{} voxels are non-zero — the \
+                     test volume is too flat to pin anything",
+                    values.len()
+                );
+            }
+        }
+    }
+
+    // ---- the pins ----------------------------------------------------------
+
+    /// `derivative` is bit-identical to the deleted serial loop at every thread
+    /// count, for a first *and* a second derivative (the second widens the tap
+    /// window and can emit `-0.0`), with spacing on and off, on both pixel types.
+    #[test]
+    fn derivative_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            assert!(
+                img.number_of_pixels() > 1 << 14,
+                "volume must exceed the serial threshold, or the parallel path never runs"
+            );
+
+            for (direction, order, spacing_on) in [
+                (0usize, 1u32, true),
+                (1, 1, false),
+                (2, 2, true),
+                (0, 2, true),
+            ] {
+                let expected =
+                    narrowed_like(&img, &derivative_serial(&img, direction, order, spacing_on));
+
+                for threads in [1usize, 4, 48, 96] {
+                    let got = parallel::with_threads(threads, || {
+                        derivative(&img, direction, order, spacing_on).unwrap()
+                    });
+                    let got = got.to_f64_vec().unwrap();
+                    assert_eq!(got.len(), expected.len());
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "derivative({pixel:?}, direction={direction}, order={order}, \
+                             spacing={spacing_on}) moved at voxel {i} with {threads} \
+                             threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `laplacian` is bit-identical to the deleted serial loop at every thread
+    /// count, with spacing on and off, on both pixel types.
+    #[test]
+    fn laplacian_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for spacing_on in [true, false] {
+                let expected = narrowed_like(&img, &laplacian_serial(&img, spacing_on));
+                for threads in [1usize, 4, 48, 96] {
+                    let got =
+                        parallel::with_threads(threads, || laplacian(&img, spacing_on).unwrap());
+                    let got = got.to_f64_vec().unwrap();
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "laplacian({pixel:?}, spacing={spacing_on}) moved at voxel {i} \
+                             with {threads} threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sobel_edge_detection` is bit-identical to the deleted serial loop at every
+    /// thread count, for both the separable and the legacy 3-D stencil — the pin
+    /// that catches the hoisted weight table if it ever disagrees with
+    /// `sobel_weight` evaluated in place.
+    #[test]
+    fn sobel_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for legacy in [false, true] {
+                let expected = narrowed_like(&img, &sobel_serial(&img, legacy));
+                for threads in [1usize, 4, 48, 96] {
+                    let got = parallel::with_threads(threads, || {
+                        sobel_edge_detection(&img, legacy).unwrap()
+                    });
+                    let got = got.to_f64_vec().unwrap();
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "sobel({pixel:?}, legacy={legacy}) moved at voxel {i} with \
+                             {threads} threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `gradient` — the vector-output stencil — is bit-identical to the deleted
+    /// serial loop at every thread count, with the direction rotation on and off,
+    /// on both pixel types. Compared on the `f32` components the filter actually
+    /// emits (its output is always `VectorFloat32`, so no narrowing step is owed
+    /// here: `gradient_serial` already narrows).
+    #[test]
+    fn gradient_is_bit_identical_at_every_thread_count() {
+        for pixel in PIXELS {
+            let img = volume(pixel);
+            for (spacing_on, direction_on) in [(true, false), (true, true), (false, true)] {
+                let expected = gradient_serial(&img, spacing_on, direction_on);
+                for threads in [1usize, 4, 48, 96] {
+                    let got = parallel::with_threads(threads, || {
+                        gradient(&img, spacing_on, direction_on).unwrap()
+                    });
+                    let got = got.component_slice::<f32>().unwrap().to_vec();
+                    assert_eq!(got.len(), expected.len());
+                    for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "gradient({pixel:?}, spacing={spacing_on}, \
+                             direction={direction_on}) moved at component {i} with \
+                             {threads} threads: {a:?} vs serial {b:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
