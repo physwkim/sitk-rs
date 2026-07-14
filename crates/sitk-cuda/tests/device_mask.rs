@@ -20,8 +20,8 @@
 
 use sitk_core::Image;
 use sitk_cuda::{
-    CudaError, DeviceImage, DeviceMask, FixedPoints, Geometry, MovingGeometry, ResidentMetric,
-    backend,
+    CudaError, DeviceImage, DeviceMask, FixedPoints, Geometry, MovingGeometry, PointStage,
+    ResidentMetric, backend,
 };
 
 fn no_device() -> bool {
@@ -158,17 +158,19 @@ fn an_all_ones_mask_is_bit_identical_to_no_mask() {
         origin: &ORIGIN,
         idx_to_phys: &EYE,
     };
-    let a = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    let b = [0.5, -0.25, 0.75];
+    let map = [PointStage {
+        matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        offset: [0.5, -0.25, 0.75],
+    }];
 
     let unmasked = ResidentMetric::from_device(&d_f, grid(), &d_m, &moving_geometry())
         .unwrap()
-        .evaluate(&a, &b)
+        .evaluate(&map)
         .unwrap();
     let masked =
         ResidentMetric::from_device_masked(&d_f, grid(), Some(&ones), &d_m, &moving_geometry())
             .unwrap()
-            .evaluate(&a, &b)
+            .evaluate(&map)
             .unwrap();
 
     assert_eq!(masked.count, unmasked.count);
@@ -209,13 +211,15 @@ fn any_nonzero_voxel_is_inside_whatever_the_pixel_type() {
         origin: &ORIGIN,
         idx_to_phys: &EYE,
     };
-    let a = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    let b = [0.5, -0.25, 0.75];
+    let map = [PointStage {
+        matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        offset: [0.5, -0.25, 0.75],
+    }];
     let moments = |img: &Image| {
         let mask = DeviceMask::upload(img).unwrap();
         ResidentMetric::from_device_masked(&d_f, grid(), Some(&mask), &d_m, &moving_geometry())
             .unwrap()
-            .evaluate(&a, &b)
+            .evaluate(&map)
             .unwrap()
     };
 
@@ -414,7 +418,10 @@ fn a_fixed_mask_composes_with_an_index_list_and_gates_by_grid_index() {
     };
     let m = ResidentMetric::from_device_masked(&d_f, points, Some(&mask), &d_m, &moving_geometry())
         .expect("a fixed mask and an index list must compose")
-        .evaluate(&EYE, &[0.0, 0.0, 0.0])
+        .evaluate(&[PointStage {
+            matrix: EYE,
+            offset: [0.0, 0.0, 0.0],
+        }])
         .unwrap();
 
     // The identity map keeps every sample inside the moving image, so the only thing

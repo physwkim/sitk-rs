@@ -18,6 +18,7 @@ use sitk_registration::{CpuBackend, DeviceMeanSquaresMetric, MeanSquaresMetric};
 use sitk_transform::{Euler3DTransform, ParametricTransform, TransformBase, TranslationTransform};
 use support::{
     in_buffer_straddles, mask_bits, moving_mask_straddles, no_device, on_buffer_boundary,
+    on_round_tie,
 };
 
 /// Textured volume, unit spacing, origin at zero — so a continuous moving index *is* a
@@ -204,44 +205,32 @@ fn a_face_on_the_open_boundary_is_dropped_by_both_paths() {
     );
 }
 
-/// **The in-buffer predicate under a transform whose probed affine form is NOT exact:
-/// the two paths count different numbers of valid samples. Measured.**
+/// **The in-buffer predicate under a rotation whose offset is large: the two paths agree
+/// at every swept pose. Measured.**
 ///
-/// A rotation about z: the device's `A[0][0]` is recovered as `(cos γ + offset) − offset`
-/// with an offset of ~20, which loses about four bits. So the two paths' `c_x` differ by
-/// ~1e-14, and a sample within that gap of `c_x = 31.5` is *inside the buffer on one path
-/// and outside on the other*.
+/// This pin used to assert the opposite, and the flip is the evidence that the point map
+/// was fixed at the root. What it measured before: the device was handed an affine form
+/// *probed* out of the transform, so its `A[0][0]` was recovered as
+/// `(cos γ + offset) − offset` with an offset of ~20 — about four bits lost. The two
+/// paths' `c_x` then differed by ~1.07e-14, and a sample within that gap of `c_x = 31.5`
+/// was *inside the buffer on one path and outside on the other*: **3 of the 17 swept poses
+/// disagreed about `valid_points`, by 16 samples each** (the whole `(15, 0, k)` line — a
+/// z-rotation makes `c_x` a function of `(i, j)` alone, so the line flips as one).
 ///
-/// The sweep walks `tx` in ulp steps across the value at which the outermost samples
-/// cross. Measured, at 16³ fixed / 32³ moving:
+/// The device is now handed the transform's own **stages** and replays them, so its `c` is
+/// the host's bit for bit, and the disagreement is gone *by construction* rather than by
+/// luck of the pose. The sweep is kept — it still walks `tx` in ulp steps across the value
+/// at which the outermost samples cross `c_x = size − 0.5`, so the predicate is still
+/// exercised right at its discontinuity — and every pose must now agree:
 ///
-/// * **3 of the 17 swept poses disagree about `valid_points`**
-/// * at each, the device counts **16 fewer** valid samples than the host — the whole
-///   `(15, 0, k)` line, `k = 0..16`: a z-rotation makes `c_x` a function of `(i, j)`
-///   alone, so every sample on that line shares one `c_x` and all 16 flip together
-/// * `|c_host − c_dev|` at those samples: **1.07e-14**
+/// * the probe finds **no** sample whose `is_inside` differs between the paths, and
+/// * the two metrics count the **same** `valid_points`.
 ///
-/// So the device's honest contract is **not** "`valid_points` is exact". It is:
-///
-/// > `valid_points` is exact **except** at poses where a sample lands within ~1e-14 of
-/// > the moving buffer's boundary, where the two paths differ by the samples on that
-/// > plane.
-///
-/// Every other pin in this crate asserts `valid_points` with `assert_eq!` and does not
-/// state that qualification. They pass because their poses are not straddling ones — not
-/// because the equality holds in general.
-///
-/// This is **not** the §2.158 cell-boundary straddle, where both answers are valid
-/// one-sided limits of a genuinely discontinuous derivative and neither path is wrong.
-/// `is_inside` is not discontinuous mathematics — it is an exact predicate on an exact
-/// number, and the two paths disagree because they are evaluating **two different maps**
-/// that happen to agree to 1e-14. One of them (the host's) is the reference.
-///
-/// If this test ever reports zero disagreements, the device's point map has become
-/// bit-identical to the host's and the whole family is closed — rewrite the pin, do not
-/// delete it.
+/// `valid_points` is therefore exact without qualification, which is what every other pin
+/// in this crate has always asserted with `assert_eq!`. They passed because their poses
+/// were not straddling ones; now there are none.
 #[test]
-fn the_in_buffer_predicate_is_measured_across_the_boundary() {
+fn the_in_buffer_predicate_agrees_across_the_boundary() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -253,86 +242,41 @@ fn the_in_buffer_predicate_is_measured_across_the_boundary() {
     let t0 = critical_tx(&fixed, &moving, target);
     println!("critical tx = {t0:.17e} (outermost sample lands on c_x = {target})");
 
-    let mut disagreements = 0usize;
     let mut host_counts = Vec::new();
     for tx in sweep(t0, 8) {
         let t = rotated(tx);
         let straddles = in_buffer_straddles(&fixed, &moving, &t);
         let (h, d) = counts(&fixed, &moving, &t);
         host_counts.push(h);
-        let gap = straddles.first().map(|s| s.gap()).unwrap_or(0.0);
         println!(
-            "tx {tx:.17e}  host {h:>5}  device {d:>5}  delta {:>3}  probe straddles {} \
-             (|c_host − c_dev| = {gap:.3e})",
+            "tx {tx:.17e}  host {h:>5}  device {d:>5}  delta {:>3}  probe straddles {}",
             d as i64 - h as i64,
             straddles.len(),
         );
-        // The probe and the metrics must tell the same story: the probe's count of
-        // predicate disagreements *is* the count difference, sample for sample. This is
-        // what licenses the probe to be used as a precondition elsewhere.
+        assert!(
+            straddles.is_empty(),
+            "{} samples land on opposite sides of the in-buffer predicate at tx {tx:e}. The \
+             two paths are computing different continuous indices again --- e.g. {:?}",
+            straddles.len(),
+            straddles.first(),
+        );
         assert_eq!(
-            d as i64 - h as i64,
-            straddles
-                .iter()
-                .map(|s| if s.dev_c[0] < target { 1i64 } else { -1 })
-                .sum::<i64>(),
-            "the probe and the two metrics disagree about which samples are in --- one \
-             of them is not reproducing the path it claims to"
-        );
-        if h == d {
-            continue;
-        }
-        disagreements += 1;
-
-        // What a disagreement looks like, measured: the device drops a whole line of
-        // samples the host keeps.
-        assert_eq!(
-            h as i64 - d as i64,
-            16,
-            "the device is supposed to be the one that drops them (its c_x lands on the \
-             far side of size − 0.5), and it is supposed to drop the whole line"
-        );
-        assert_eq!(straddles.len(), 16);
-        assert!(
-            straddles
-                .iter()
-                .all(|s| s.index[0] == 15 && s.index[1] == 0),
-            "the straddling samples are the (15, 0, k) line --- a z-rotation makes c_x a \
-             function of (i, j) alone, so the line flips as one"
-        );
-        assert!(
-            straddles.iter().all(|s| s.host_c[0] < 31.5),
-            "the host has them inside"
-        );
-        assert!(
-            straddles.iter().all(|s| s.dev_c[0] >= 31.5),
-            "and the device has them outside"
-        );
-        assert!(
-            (1e-16..1e-12).contains(&gap),
-            "|c_host − c_dev| = {gap:e} at the straddle. Bounded above because a larger \
-             gap is a broken map, not a probed one; bounded BELOW because a gap of zero \
-             means the two paths now compute the same point and this pin's whole story \
-             has changed"
+            h, d,
+            "host and device disagree about valid_points at tx {tx:e}, right at the \
+             buffer boundary"
         );
     }
 
     // The construction has to have worked: the sweep must actually walk samples across
-    // the boundary, or it measured nothing.
+    // the boundary, or agreement is vacuous.
     assert!(
         host_counts.first() != host_counts.last(),
         "the sweep did not move a sample across the buffer boundary ({host_counts:?}), \
          so it has not exercised the predicate at all"
     );
     println!(
-        "{disagreements} of {} swept poses disagree about valid_points, by 16 samples each",
+        "all {} swept poses agree on valid_points, including the ones straddling the boundary",
         2 * 8 + 1
-    );
-    assert!(
-        disagreements > 0,
-        "no swept pose disagreed. Either the device's point map is now bit-identical to \
-         the host's (good --- rewrite this pin) or the sweep no longer brackets the \
-         crossing (bad --- the pin has gone vacuous)"
     );
 }
 
@@ -349,31 +293,28 @@ fn half_space_mask(n: usize, last_in: usize) -> Image {
     Image::from_vec(&[n, n, n], v).unwrap()
 }
 
-/// **The moving-mask lookup, measured across the tie: a sample is dropped on one path
-/// only.**
+/// **The moving-mask lookup across the round-to-nearest tie: the two paths agree at every
+/// swept pose. Measured.**
 ///
-/// `round(c_x)` decides which mask voxel gates the sample. Both paths round half away
-/// from zero (Rust's `f64::round`, CUDA's `round`), so the *rounding rule* is not the
-/// problem: at `c_x` exactly 20.5 both would pick voxel 21. The problem is that the two
-/// paths do not have the same `c_x`. Measured, at the same geometry as the in-buffer
-/// sweep:
+/// `round(c_x)` decides which mask voxel gates the sample, and the mask's wall is on the
+/// tie itself (`c_x = 20.5`). Both paths round half away from zero (Rust's `f64::round`,
+/// CUDA's `round`), so the rounding *rule* was never the problem — the two paths did not
+/// have the same `c_x`. What this pin measured under the probed affine form:
 ///
-/// * **4 of the 17 swept poses disagree about `valid_points`**
-/// * at each, the device counts **16 more** valid samples than the host — again the whole
-///   `(15, 0, k)` line
-/// * the host has `c_x = 20.5` exactly → `round` → voxel **21** → outside the mask →
-///   sample dropped; the device has `c_x = 20.49999999999999289` → `round` → voxel **20**
-///   → inside the mask → sample kept
+/// * **4 of the 17 swept poses disagreed about `valid_points`**, by 16 samples each
+/// * the host had `c_x = 20.5` exactly → voxel **21** → outside the mask → dropped; the
+///   device had `c_x = 20.49999999999999289` → voxel **20** → inside the mask → kept
 ///
-/// The direction is the opposite of the in-buffer sweep's (there the device dropped what
-/// the host kept), which is the point: this is not a bias in one predicate, it is the
-/// same 1e-14 gap in the point map being read by two different discrete rules.
+/// and the direction was the *opposite* of the in-buffer sweep's, which was the point: not
+/// a bias in one predicate, but the same 1e-14 gap in the point map read by two different
+/// discrete rules.
 ///
-/// So the moving mask carries the same qualification as the in-buffer predicate, and
-/// `a_moving_mask_on_the_device_metric_matches_the_host` — which asserts `valid_points`
-/// equal — holds at its pose, not in general.
+/// The stage replay gives the device the host's `c` bit for bit, so both rules now read
+/// the same number and both sweeps agree. The tie is still exercised at every pose — the
+/// host's `c_x` still lands exactly on 20.5 at the critical pose — and now the device's
+/// does too.
 #[test]
-fn the_moving_mask_lookup_is_measured_across_the_tie() {
+fn the_moving_mask_lookup_agrees_across_the_tie() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -386,8 +327,8 @@ fn the_moving_mask_lookup_is_measured_across_the_tie() {
     let t0 = critical_tx(&fixed, &moving, target);
     println!("critical tx = {t0:.17e} (outermost sample lands on c_x = {target})");
 
-    let mut disagreements = 0usize;
     let mut host_counts = Vec::new();
+    let mut on_the_tie = 0usize;
     for tx in sweep(t0, 8) {
         let t = rotated(tx);
         let straddles = moving_mask_straddles(&fixed, &moving, &mask, &t);
@@ -398,44 +339,24 @@ fn the_moving_mask_lookup_is_measured_across_the_tie() {
             d as i64 - h as i64,
             straddles.len(),
         );
-        assert_eq!(
-            (d as i64 - h as i64).unsigned_abs() as usize,
+        assert!(
+            straddles.is_empty(),
+            "{} samples are gated by different mask voxels on the two paths at tx {tx:e} \
+             --- e.g. {:?}",
             straddles.len(),
-            "the probe and the two metrics disagree about which samples the mask gates"
-        );
-        if h == d {
-            continue;
-        }
-        disagreements += 1;
-
-        let s = straddles[0];
-        println!(
-            "    e.g. sample {:?}: host c_x {:.17e} -> voxel {}  device c_x {:.17e} -> voxel {}",
-            s.index,
-            s.host_c[0],
-            s.host_c[0].round(),
-            s.dev_c[0],
-            s.dev_c[0].round(),
+            straddles.first(),
         );
         assert_eq!(
-            d as i64 - h as i64,
-            16,
-            "the device is supposed to be the one that KEEPS them here: its c_x rounds \
-             down to the last masked-in voxel while the host's rounds up past it"
+            h, d,
+            "host and device disagree about valid_points at tx {tx:e}, right on the mask's \
+             round-to-nearest tie"
         );
-        assert!(
-            straddles
+        // Agreement is only worth something if the tie was actually hit: a pose that
+        // never puts a sample exactly on 20.5 agrees trivially.
+        on_the_tie += usize::from(
+            on_round_tie(&fixed, &moving, &t)
                 .iter()
-                .all(|s| s.index[0] == 15 && s.index[1] == 0),
-            "the straddling samples are the (15, 0, k) line"
-        );
-        assert!(
-            straddles.iter().all(|s| s.host_c[0].round() == 21.0),
-            "the host rounds the tie away from zero, onto the first masked-OUT voxel"
-        );
-        assert!(
-            straddles.iter().all(|s| s.dev_c[0].round() == 20.0),
-            "and the device, a hair below the tie, rounds onto the last masked-IN one"
+                .any(|(s, d)| *d == 0 && s.host_c[0] == target),
         );
     }
 
@@ -444,12 +365,14 @@ fn the_moving_mask_lookup_is_measured_across_the_tie() {
         "the sweep did not move a sample across the mask's tie ({host_counts:?}), so it \
          has not exercised the lookup at all"
     );
-    println!(
-        "{disagreements} of {} swept poses disagree about valid_points, by 16 samples each",
-        2 * 8 + 1
-    );
     assert!(
-        disagreements > 0,
-        "no swept pose disagreed --- see the in-buffer pin for what that would mean"
+        on_the_tie > 0,
+        "no swept pose put a sample exactly on the tie, so the lookup was never asked the \
+         question this pin exists to ask"
+    );
+    println!(
+        "all {} swept poses agree on valid_points; {on_the_tie} of them put a sample exactly \
+         on the tie",
+        2 * 8 + 1
     );
 }

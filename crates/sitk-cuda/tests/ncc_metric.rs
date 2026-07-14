@@ -24,7 +24,7 @@
 use sitk_core::Image;
 use sitk_cuda::{
     CorrelationMoments, CudaError, DeviceImage, DeviceMask, FixedPoints, MovingGeometry,
-    ResidentCorrelation, backend,
+    PointStage, ResidentCorrelation, backend,
 };
 
 fn no_device() -> bool {
@@ -44,6 +44,14 @@ const PHYS_TO_INDEX: [f64; 9] = [0.9, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 0.8];
 /// A point map that moves the samples without throwing most of them out.
 const A: [f64; 9] = [0.98, -0.15, 0.03, 0.14, 0.97, -0.06, -0.02, 0.05, 0.99];
 const B: [f64; 3] = [0.7, -0.4, 0.25];
+
+/// One stage of `mat_vec(matrix, p) + offset` — the point map as the metric takes it.
+fn one_stage(a: &[f64; 9], b: &[f64; 3]) -> [PointStage; 1] {
+    [PointStage {
+        matrix: *a,
+        offset: *b,
+    }]
+}
 
 /// A volume with a **pedestal**, on purpose: NCC subtracts the mean, so a zero-mean
 /// volume would let a kernel that forgot to subtract it pass anyway.
@@ -98,7 +106,7 @@ fn moments_with(
     );
     ResidentCorrelation::from_device_masked(&d_f, fixed_points, mask, &d_m, &moving_geometry())
         .unwrap()
-        .evaluate(a, b)
+        .evaluate(&one_stage(a, b))
         .unwrap()
 }
 

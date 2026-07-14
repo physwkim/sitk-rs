@@ -69,13 +69,16 @@ fn no_device() -> bool {
 /// holds only where the two paths walk the same cells of the moving grid.
 ///
 /// Where a sample lands on a cell wall they do not. The device's point map is an affine
-/// form **probed** from the transform (`A[d][e] = T(e_e)[d] − T(0)[d]`) and the host's is
-/// the transform's own expression; they agree to the last ulp, and that ulp decides which
-/// side of the wall the sample sits on. The trilinear interpolant is continuous there and
-/// **its gradient is not**, so the two paths take different one-sided limits of `∂M/∂x`
-/// and the derivative moves by ~5.7e-6 relative — nearly four decades outside these bands
-/// — on a *single* sample out of 262144 (ledger §2.158; measured in
-/// `cuda_mean_squares.rs::a_sample_on_a_cell_boundary_costs_one_derivative_component`).
+/// form **probed** from the transform (`A[d][e] = T(e_e)[d] − T(0)[d]`) and the host's was
+/// the transform's own expression; they agreed to the last ulp, and that ulp decided which
+/// side of the wall the sample sat on. The trilinear interpolant is continuous there and
+/// **its gradient is not**, so the two paths took different one-sided limits of `∂M/∂x`
+/// and the derivative moved by ~5.7e-6 relative — nearly four decades outside these bands
+/// — on a *single* sample out of 262144 (ledger §2.158). The device now replays the
+/// transform's own stages and its continuous index is the host's bit for bit, so the two
+/// paths cannot pick different cells; the flip is measured in
+/// `cuda_mean_squares.rs::a_sample_on_a_cell_boundary_no_longer_costs_a_derivative_component`.
+/// This assertion stays as the regression guard.
 ///
 /// Without this assertion a pin below would report that failure as a kernel regression,
 /// and a pin that *passed* would be reporting a property of its geometry as a property of
@@ -786,12 +789,20 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
         ),
     }
 
-    // Composite: linear when its stages are, and still refused — folding the stages into
-    // one matrix rounds once where the transform rounds per stage.
+    // Composite of TWO maps: linear, and still refused *here* — the device resample takes
+    // one `mat_vec(matrix, p) + offset` and cannot replay a sequence, and folding the two
+    // into one matrix product rounds once where the transform rounds twice. (The device
+    // *metric* can replay them, and does — it is handed the stages. This entry point is
+    // the resample, which has one map or none.)
     let mut composite = sitk_transform::CompositeTransform::new(3);
     composite
         .add_transform(sitk_transform::Transform::Translation(
             sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
+        ))
+        .unwrap();
+    composite
+        .add_transform(sitk_transform::Transform::Euler3D(
+            sitk_transform::Euler3DTransform::new(0.1, 0.0, 0.0, [0.5, 0.0, 0.0], [4.0; 3]),
         ))
         .unwrap();
     let mut reg = ImageRegistrationMethod::new();
@@ -801,10 +812,30 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
             assert_eq!(kind, sitk_transform::TransformKind::Composite);
         }
         other => panic!(
-            "a CompositeTransform fixed-initial transform must be refused by name: {:?}",
+            "a two-map CompositeTransform fixed-initial transform must be refused by name: {:?}",
             other.map(|_| ())
         ),
     }
+
+    // A **one-map** composite is not refused, and that is not a hole: it applies exactly
+    // one `mat_vec + offset` — its member's — so there is nothing to fold and the device's
+    // single map is that member's own arithmetic, bit for bit. The refusal above is about
+    // the *sequence*, not about the type's name.
+    let mut composite = sitk_transform::CompositeTransform::new(3);
+    composite
+        .add_transform(sitk_transform::Transform::Translation(
+            sitk_transform::TranslationTransform::new(vec![1.0, 0.0, 0.0]),
+        ))
+        .unwrap();
+    let mut reg = ImageRegistrationMethod::new();
+    reg.set_fixed_initial_transform(sitk_transform::Transform::Composite(composite));
+    assert!(
+        !matches!(
+            run(&reg),
+            Err(DeviceRegistrationError::UnsupportedFixedInitialTransform(_))
+        ),
+        "a single-map composite has one bitwise point map and must not be refused"
+    );
 
     // ...and the classes the device *can* reproduce bit for bit are no longer refused.
     // A translation is one of them (`mat_vec(I, p) + t`, pinned bitwise), so it must not

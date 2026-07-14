@@ -20,7 +20,8 @@
 
 use sitk_core::{Image, PixelId};
 use sitk_cuda::{
-    CudaError, DeviceImage, FixedPoints, Moments, MovingGeometry, ResidentMetric, backend,
+    CudaError, DeviceImage, FixedPoints, Moments, MovingGeometry, PointStage, ResidentMetric,
+    backend,
 };
 
 fn no_device() -> bool {
@@ -80,6 +81,13 @@ const A: [f64; 9] = [
 ];
 const B: [f64; 3] = [1.25, -0.75, 0.5];
 
+/// The point map as the metric takes it: one stage of `mat_vec(matrix, p) + offset`, which
+/// is what a single matrix-offset transform hands over.
+const MAP: [PointStage; 1] = [PointStage {
+    matrix: A,
+    offset: B,
+}];
+
 fn moments_f64(fixed: &Image, moving: &Image, n: usize) -> Moments {
     let (size, strides, origin, mat) = geometry(n);
     let fvals = f32_slice(fixed).to_vec();
@@ -112,7 +120,7 @@ fn moments_f64(fixed: &Image, moving: &Image, n: usize) -> Moments {
         },
     )
     .unwrap();
-    m.evaluate(&A, &B).unwrap()
+    m.evaluate(&MAP).unwrap()
 }
 
 fn moments_split(fixed: &Image, moving: &Image, n: usize) -> Moments {
@@ -136,7 +144,7 @@ fn moments_split(fixed: &Image, moving: &Image, n: usize) -> Moments {
         &mg,
     )
     .unwrap();
-    m.evaluate(&A, &B).unwrap()
+    m.evaluate(&MAP).unwrap()
 }
 
 #[test]

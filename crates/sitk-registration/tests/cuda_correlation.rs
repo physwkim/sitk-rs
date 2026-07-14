@@ -31,7 +31,7 @@ use sitk_registration::{CorrelationMetric, DeviceCorrelationMetric, DeviceMetric
 use sitk_transform::{
     DisplacementFieldTransform, Euler3DTransform, ParametricTransform, TranslationTransform,
 };
-use support::{cell_boundary_straddles, no_device};
+use support::{cell_boundary_straddles, no_device, on_cell_wall};
 
 /// The same textured volume the mean-squares pins use: three Gaussian blobs plus a
 /// low-frequency sine texture, so the moments are conditioned like a real image and
@@ -106,8 +106,9 @@ fn device(fixed: &Image, moving: &Image) -> DeviceCorrelationMetric {
 /// Every translation here is a *non*-integral number of voxels, deliberately: an integral
 /// one puts the rotation-centre voxel exactly on a moving-grid cell boundary, which is a
 /// different measurement entirely — see
-/// [`a_sample_on_a_cell_boundary_costs_one_derivative_component`], which is the pose that
-/// does it on purpose. Pin 1 asserts the absence of such a sample rather than assuming it.
+/// [`a_sample_on_a_cell_boundary_no_longer_costs_a_derivative_component`], which is the
+/// pose that does it on purpose. Pin 1 still asserts the absence of a *straddle* (two paths,
+/// two cells) rather than assuming it, though the stage replay now makes it impossible.
 fn poses(n: usize) -> Vec<(&'static str, Euler3DTransform)> {
     let c = n as f64 / 2.0;
     vec![
@@ -205,11 +206,12 @@ fn sfm_conditioning(fixed: &Image, moving: &Image, t: &dyn ParametricTransform) 
 /// The measured numbers are printed at every pose, so a change that pushes them up names
 /// the pose it happened at.
 ///
-/// These bands hold **only where no sample lands on a moving-grid cell boundary** — see
-/// [`cell_boundary_straddles`], the pin below, and
-/// `a_sample_on_a_cell_boundary_costs_one_derivative_component`. Pin 1 asserts there is
-/// no straddle at its poses, so that its bands are measuring the reduction and nothing
-/// else.
+/// These bands measure the reduction. They used to hold only where no sample landed on a
+/// moving-grid cell wall — a sample there cost the x-translation column 2.9e-7, four
+/// decades outside them — and the device's stage replay closed that (see
+/// [`cell_boundary_straddles`] and the pin below). Pin 1 keeps asserting there is no
+/// straddle at its poses: the assertion is now a guard against a regression rather than a
+/// precondition that can fail on a pose choice.
 const VALUE_BAND: f64 = 1e-12;
 const DERIV_BAND: f64 = 1e-12;
 
@@ -279,37 +281,34 @@ fn the_device_ncc_is_the_hosts_ncc() {
     }
 }
 
-/// Pin 7: **one sample on a cell boundary costs one derivative component — reported, not
-/// banded away.**
+/// Pin 7: **a sample on a cell boundary no longer costs a derivative component.** The
+/// §2.158 exposure, at the pose that produced it, with the assertions flipped.
 ///
-/// This is not a Correlation defect and it is not a reduction error. It is the device
-/// path's point map (`p = A·x + b`, probed) differing from the host's (`R·(x − c) + c + t`,
-/// evaluated) in the last ulp, at a sample where that ulp decides which cell of the
-/// moving grid the sample sits in. The trilinear interpolant is continuous there; **its
-/// gradient is not**. So the value is untouched and the derivative moves.
+/// What this pin measured before, at 64³ — a Euler transform whose centre is the fixed
+/// volume's centre *voxel* and whose translation is a whole number of voxels, so the centre
+/// voxel maps exactly onto an integer index and is the only sample that does:
 ///
-/// The pose here makes it happen on purpose: a Euler transform whose centre is the fixed
-/// volume's centre *voxel* and whose translation is a whole number of voxels. The centre
-/// voxel is fixed by the rotation, so it maps to `centre + t` — exactly integral, exactly
-/// on a cell boundary — and it is the *only* such sample. Measured, at 64³:
+/// * straddling samples: **1** (the centre voxel, (32,32,32)) — the two paths put it in
+///   **different cells**
+/// * `|Δ∂M/∂x|` at that sample: **7.2e-1**, an O(1) jump
+/// * `|Δderivative|`: **2.9e-7** on the x-translation component, ≤1e-14 on the other five
+/// * `|Δvalue|`: 4.3e-15 — the interpolant is continuous, so the value never saw it
 ///
-/// * straddling samples: **1** (the centre voxel, (32,32,32))
-/// * `|Δ∂M/∂x|` at that sample: **7.2e-1** — an O(1) jump, as the mechanism predicts
-/// * `|Δvalue|`: **4.3e-15** — the interpolant is continuous, so the value does not see it
-/// * `|Δderivative|`: **2.9e-7** on the x-translation component, **≤1e-14** on the other five
+/// It was not a Correlation defect and not a reduction error: it was the device's point map
+/// (`p = A·x + b`, with `A` *probed*) differing from the host's evaluated `R·(x − c) + c + t`
+/// in the last ulp, at a sample where that ulp decides which cell the sample is in. The
+/// trilinear interpolant is continuous across a cell wall; its gradient is not.
 ///
-/// Why only that one component: the straddling sample *is* the rotation centre, so the
-/// rotation columns of its Jacobian vanish (`∂/∂θ` of a point at the centre is zero), and
-/// the gradient jump is along x alone. The mechanism explains the signature exactly, which
-/// is why it is recorded as a pin rather than absorbed into a wider band.
+/// The device is now handed the transform's own **stages** and replays them, so its
+/// continuous index is the host's bit for bit, both paths pick the same cell, and both take
+/// the same one-sided limit of `∂M/∂x`. The pose is unchanged — the sample is still on the
+/// wall, `on_cell_wall` asserts it — and the x-translation column is back inside the
+/// ordinary reduction band.
 ///
-/// **Mean squares has the same exposure** — any metric whose derivative uses `∇M` does. It
-/// is not visible in the existing mean-squares pins only because their probe pose maps no
-/// sample onto an integer index. Fixing it structurally would require the device's point
-/// map to be bit-identical to the host's, which the affine-probe design (one kernel for
-/// every affine transform, no transform-specific centre) does not permit.
+/// Mean squares had the same exposure at 1000× the size (it normalizes by nothing), and
+/// `cuda_mean_squares.rs` pins the same flip there.
 #[test]
-fn a_sample_on_a_cell_boundary_costs_one_derivative_component() {
+fn a_sample_on_a_cell_boundary_no_longer_costs_a_derivative_component() {
     if no_device() {
         println!("SKIPPED: no CUDA device");
         return;
@@ -321,24 +320,24 @@ fn a_sample_on_a_cell_boundary_costs_one_derivative_component() {
     // onto an integer index.
     let t = Euler3DTransform::new(0.15, 0.1, -0.12, [12.0, -9.0, 7.0], [c, c, c]);
 
-    let straddles = cell_boundary_straddles(&fixed, &moving, &t);
-    println!("straddling samples: {straddles:?}");
-    assert_eq!(
-        straddles.len(),
-        1,
-        "the pose is constructed so exactly one sample lands on a cell boundary"
-    );
-    let ([i, j, k], axis, jump) = straddles[0];
-    assert_eq!(
-        [i, j, k],
-        [32, 32, 32],
-        "and it is the rotation centre voxel"
-    );
-    assert_eq!(axis, 0, "the jump is along x");
+    // The construction still holds: the sample is still on the wall.
+    let walls = on_cell_wall(&fixed, &moving, &t);
+    println!("samples on a cell wall: {walls:?}");
     assert!(
-        jump > 1e-2,
-        "|Δ∂M/∂x| = {jump:e} --- the gradient jump across a cell boundary is O(1), not O(ε); \
-         if this ever shrinks to rounding, the mechanism this pin records has changed"
+        !walls.is_empty(),
+        "no sample of this pose lands on a cell wall, so the pin has gone vacuous"
+    );
+    assert!(
+        walls.iter().all(|(s, _)| s.index == [32, 32, 32]),
+        "the sample on the wall is the rotation-centre voxel"
+    );
+
+    // And the two paths now put it in the same cell.
+    let straddles = cell_boundary_straddles(&fixed, &moving, &t);
+    assert!(
+        straddles.is_empty(),
+        "{} sample(s) land in different moving-grid cells on the two paths ({straddles:?})",
+        straddles.len()
     );
 
     let hv = host(&fixed, &moving).evaluate(&t);
@@ -353,29 +352,23 @@ fn a_sample_on_a_cell_boundary_costs_one_derivative_component() {
         .map(|(&g, &c)| (g - c).abs())
         .collect();
     println!("|Δvalue|      = {v_err:.3e}");
-    println!("|Δderivative| = {d_err:?}");
+    println!("|Δderivative| = {d_err:?}   (x-translation was 2.9e-7)");
 
     assert!(
         v_err <= VALUE_BAND,
-        "the straddle moved the value by {v_err:e} --- it must not: the interpolant is \
-         continuous across the boundary the straddle is about"
+        "the value moved by {v_err:e} --- it did not even under the straddle"
     );
-    // The rotation columns (0..3) and the y/z translations (4, 5) are untouched, to the
-    // same band as a pose with no straddle at all.
-    for k in [0usize, 1, 2, 4, 5] {
+    for (k, &e) in d_err.iter().enumerate() {
         assert!(
-            d_err[k] <= 1e-12,
-            "param {k} moved by {:e}; only the x-translation column can see this straddle",
-            d_err[k]
+            e <= 1e-12,
+            "param {k} moved by {e:e}. The x-translation column (param 3) is the one this \
+             pose used to blow, at 2.9e-7; every column must now sit inside the ordinary \
+             reduction band"
         );
     }
-    // And the x-translation column moves by ~2.9e-7: bounded above (a wrong contraction is
-    // far larger) and below (if this ever collapses to rounding, the device's point map has
-    // become bit-identical to the host's and this pin's whole story needs rewriting).
     assert!(
-        (1e-9..1e-5).contains(&d_err[3]),
-        "the x-translation column moved by {:e}, outside the measured straddle cost",
-        d_err[3]
+        hv.derivative.iter().any(|d| d.abs() > 1e-9),
+        "the host derivative is ~zero here, so the comparison proves nothing"
     );
 }
 

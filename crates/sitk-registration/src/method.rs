@@ -254,6 +254,27 @@ impl<T: ParametricTransform + ?Sized> TransformBase for Composed<'_, T> {
             }
         }
     }
+
+    /// The stages of `transform_point` above, in the order `transform_point` applies
+    /// them: the optimized transform's, then the moving-initial's.
+    ///
+    /// The two maps are **not folded** into one. `transform_point` evaluates
+    /// `g(f(x))`, rounding once in `f` and once in `g`; the product matrix `G·F` is
+    /// algebraically the same map and rounds *once*, so it agrees with the host to an
+    /// ulp and not to the bit — and an ulp of the continuous index is a flipped
+    /// `floor`/`is_inside`/`round` at a sample that lands on a voxel plane. A backend
+    /// that replays these stages in this order performs exactly the host's operations
+    /// in exactly the host's order.
+    ///
+    /// `None` from either side propagates: a composition is reproducible only if both
+    /// of its halves are.
+    fn point_map_stages(&self) -> Option<Vec<sitk_transform::matrix_offset::MatrixOffsetMap>> {
+        let mut stages = self.optimized.point_map_stages()?;
+        if let Some(g) = self.moving_initial {
+            stages.extend(g.point_map_stages()?);
+        }
+        Some(stages)
+    }
 }
 
 impl<T: ParametricTransform + ?Sized> ParametricTransform for Composed<'_, T> {
@@ -2584,9 +2605,16 @@ impl ImageRegistrationMethod {
     /// What the device path takes:
     ///
     /// - the **mean-squares** metric (the only one with a kernel);
-    /// - a **globally affine** transform (translation, rigid, Euler, versor,
-    ///   similarity, affine) — the moment identity the kernel evaluates holds for
-    ///   exactly those, and a B-spline or displacement field is refused by name;
+    /// - a transform with a **bitwise point map** *and* a Jacobian that is affine in
+    ///   the point: translation, rigid, Euler, versor, similarity, affine, and any
+    ///   composite of those. The device replays the transform's own stages
+    ///   ([`TransformBase::point_map_stages`](sitk_transform::TransformBase::point_map_stages)),
+    ///   in the transform's own order, so the continuous index it computes is the
+    ///   host's bit for bit. A B-spline or displacement field has neither property; a
+    ///   `ScaleTransform` / `ScaleLogarithmicTransform` has the affine Jacobian but no
+    ///   bitwise point map (it evaluates the centred `(p − c)·s + c`, which is not
+    ///   `mat_vec(M, p) + b` on the bits) and is refused by name as
+    ///   [`NoBitwisePointMap`](DeviceMetricError::NoBitwisePointMap);
     /// - **linear** interpolation and the default sampling *strategy*
     ///   ([`SamplingStrategy::None`](crate::metric::SamplingStrategy::None), every
     ///   voxel of the fixed grid). A configured sampling *percentage* is accepted:
@@ -2605,8 +2633,11 @@ impl ImageRegistrationMethod {
     ///   in-buffer predicate that a virtual grid requires — which virtual points map
     ///   inside the fixed buffer at all — is a nearest-neighbour resample of an
     ///   all-ones volume, built on the device and never uploaded;
-    /// - a **moving-initial** transform (it composes with the optimized transform and
-    ///   the composition is probed for affineness like any other).
+    /// - a **moving-initial** transform. It composes with the optimized transform, and
+    ///   the composition's stages are the optimized transform's followed by the
+    ///   moving-initial's — the order `Composed::transform_point` applies them, replayed
+    ///   rather than folded into one matrix, because folding rounds once where the host
+    ///   rounds twice.
     ///
     /// The one thing left is a **fixed-initial transform**, refused by name as
     /// [`UnsupportedFixedInitialTransform`](DeviceRegistrationError::UnsupportedFixedInitialTransform).
@@ -3491,7 +3522,7 @@ impl ImageRegistrationMethod {
 #[cfg(test)]
 mod initial_transform_tests {
     use super::*;
-    use sitk_transform::{Euler2DTransform, ScaleTransform};
+    use sitk_transform::{Euler2DTransform, Euler3DTransform, ScaleTransform};
 
     /// A 2-D Gaussian blob of width `sigma` centred at the **physical** point
     /// `center`, sampled on a grid of `size` voxels at `spacing` from `origin`
@@ -3656,6 +3687,86 @@ mod initial_transform_tests {
         assert_eq!(composed.transform_point(&[3.0, 5.0]), vec![8.0, 10.0]);
         // The reversed order, translate(scale(x)) = (2x₀ + 1, 2x₁), would give
         // [7, 10] — this is the assertion that fixes the order.
+    }
+
+    /// **The composition's stages are its two maps, in its own order, and replaying them
+    /// IS its `transform_point` — on the bits.**
+    ///
+    /// This is what the device metric replays for a moving-initial registration. The
+    /// alternative it must not take is the fold: `G·F` is the same map in exact arithmetic
+    /// and rounds *once* where `g(f(x))` rounds twice, so it agrees with the host to an ulp
+    /// and not to the bit — and an ulp of the continuous index is a flipped
+    /// `floor`/`is_inside`/`round`. Pinned with `to_bits()`, and pinned against the fold:
+    /// the folded matrix is shown to disagree.
+    #[test]
+    fn composed_hands_over_both_stages_in_application_order() {
+        let moving_initial: Transform =
+            Euler3DTransform::new(0.13, -0.07, 0.21, [11.0, -6.0, 4.0], [9.0, -3.0, 7.0]).into();
+        let mut optimized =
+            Euler3DTransform::new(-0.05, 0.09, 0.02, [-8.0, 12.0, 5.0], [2.0, 6.0, -4.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: Some(&moving_initial),
+        };
+
+        let stages = composed.point_map_stages().expect("both halves are rigid");
+        assert_eq!(
+            stages.len(),
+            2,
+            "two maps, two stages -- not one folded one"
+        );
+
+        for p in [
+            [1.7, -3.1, 2.3],
+            [-137.0, 91.5, 204.25],
+            [0.0, 0.0, 0.0],
+            [-0.0, 61.5, -0.0],
+        ] {
+            let want = composed.transform_point(&p);
+            let got = sitk_transform::matrix_offset::replay_stages(&stages, &p, 3);
+            for d in 0..3 {
+                assert_eq!(
+                    got[d].to_bits(),
+                    want[d].to_bits(),
+                    "axis {d} at {p:?}: the stage replay must reproduce transform_point on \
+                     the bits, not merely to a tolerance"
+                );
+            }
+        }
+
+        // And the fold really is lossy, so the stage list is not ceremony: G·F applied in
+        // one shot differs from g(f(x)) in the last bits at a point of this magnitude.
+        let folded = sitk_core::matrix::matmul(&stages[1].matrix, &stages[0].matrix, 3);
+        let folded_offset = {
+            let m = sitk_core::matrix::mat_vec(&stages[1].matrix, &stages[0].offset, 3);
+            (0..3)
+                .map(|d| m[d] + stages[1].offset[d])
+                .collect::<Vec<_>>()
+        };
+        let p = [-137.0, 91.5, 204.25];
+        let one_shot = sitk_core::matrix::mat_vec(&folded, &p, 3);
+        let want = composed.transform_point(&p);
+        assert!(
+            (0..3).any(|d| (one_shot[d] + folded_offset[d]).to_bits() != want[d].to_bits()),
+            "the folded matrix agreed with the host on every bit at this point. It is still \
+             not the host's arithmetic -- but if this ever holds everywhere, the argument \
+             for the stage list has changed and should be re-stated, not quietly dropped"
+        );
+    }
+
+    /// A composition is reproducible only if **both** halves are: a moving-initial
+    /// transform with no bitwise point map (a centred scale) takes the whole composition
+    /// off the device path, rather than the device silently replaying the half it likes.
+    #[test]
+    fn composed_reports_no_stages_when_either_half_has_none() {
+        let moving_initial: Transform =
+            ScaleTransform::new(vec![1.2, 0.9, 1.1], vec![4.0, 5.0, 6.0]).into();
+        let mut optimized = Euler3DTransform::new(0.1, 0.2, 0.3, [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+        let composed = Composed {
+            optimized: &mut optimized,
+            moving_initial: Some(&moving_initial),
+        };
+        assert!(composed.point_map_stages().is_none());
     }
 
     /// Without a moving-initial transform the composition is the identity

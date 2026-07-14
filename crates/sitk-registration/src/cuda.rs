@@ -17,38 +17,64 @@
 //! can slow a registration down, but it cannot turn a working one into a failing
 //! or a wrong one.
 //!
-//! # Which transforms the GPU takes, and why it is not a type list
+//! # Which transforms the GPU takes
 //!
-//! The device is told the point map as `x ↦ A·x + b` and nothing else. `A` and `b`
-//! are recovered from the transform through the ordinary
-//! [`ParametricTransform::transform_point`] — `b = T(0)`, `A[:,e] = T(e_e) − b` —
-//! and then *verified* against `T` at an off-axis probe point. The same is done
-//! for the Jacobian, which the moment identity requires to be affine in the point.
+//! The device is told two things, and they are recovered in **two different ways**,
+//! because they are held to two different standards:
 //!
-//! So a transform qualifies by satisfying the algebra the kernel assumes, not by
-//! appearing on a whitelist. Every globally affine transform passes (translation,
-//! rigid, Euler, versor, similarity, affine); a B-spline or displacement field
-//! fails the probe and lands on the CPU, which is exactly where it belongs. A new
-//! affine-family transform added later works with no change here.
+//! - **The point map**, as the transform's own stages
+//!   ([`TransformBase::point_map_stages`]): the stored `matrix`/`offset` pairs its
+//!   `transform_point` evaluates, one per map it applies, in the order it applies
+//!   them. Not probed, and not folded. The kernel replays that arithmetic, so the
+//!   continuous index it computes is **bit-for-bit** the host's — and it must be,
+//!   because `floor(c)`, `is_inside(c)` and `round(c)` are *branches*: a 1-ulp
+//!   difference there is not a 1-ulp difference in the answer, it is the other side
+//!   of a discontinuity in the interpolant's gradient. A transform that reports no
+//!   stages is refused by name and runs on the CPU. That set is exactly the
+//!   transforms whose `transform_point` evaluates some other expression:
+//!   `ScaleTransform` and `ScaleLogarithmicTransform` (centred, `(p − c)·s + c`),
+//!   `BSplineTransform`, `DisplacementFieldTransform`, and any composite containing
+//!   one of them.
+//!
+//! - **The Jacobian's affine decomposition**, still *probed* — `J(0)` and
+//!   `C_e = J(e_e) − J(0)` — and verified against `J` at two probe points to a
+//!   tolerance. This is the right standard for it: `J` feeds a sum of millions of
+//!   products, a continuous function of its inputs with no branch anywhere
+//!   downstream, so an ulp in `J` is an ulp in the derivative. Nothing discrete
+//!   depends on it, and the probe is what rejects a Jacobian that is not affine in
+//!   the point at all.
+//!
+//! The probe *used* to supply both, and the point map it recovered
+//! (`A[d][e] = T(e_e)[d] − b[d]`) was algebraically exact and **bitwise wrong**: the
+//! subtraction cancels the offset back off, at a cost of an ulp or two. That is the
+//! straddle the stage list closes.
+//!
+//! [`TransformBase::point_map_stages`]: sitk_transform::TransformBase::point_map_stages
 
 use std::sync::Mutex;
 
 use sitk_core::parallel;
-use sitk_cuda::{FixedPoints, MovingGeometry, ResidentMetric};
+use sitk_cuda::{FixedPoints, MAX_STAGES, MovingGeometry, PointStage, ResidentMetric};
+use sitk_transform::matrix_offset::replay_stages;
 use sitk_transform::{Interpolator, ParametricTransform};
 
+use crate::device::DeviceMetricError;
 use crate::metric::{
     CpuBackend, FixedSamples, MetricBackend, MetricValue, MovingImage, SamplePoints,
 };
 
-/// Relative tolerance for the probes that decide whether a transform's point map
-/// and Jacobian really are affine in the point.
+/// Relative tolerance for the probe that decides whether a transform's **Jacobian**
+/// really is affine in the point.
 ///
-/// Recovering `A` by differencing `T` at basis points costs a few ulps, so an
-/// exactly-affine transform reproduces `T(q)` to ~1e-16 relative, and a
-/// *non*-affine one (B-spline, displacement field) misses by O(1). Any threshold
-/// between those separates them; 1e-9 is far above the rounding floor and far
-/// below any real nonlinearity, so it is not a tuned constant.
+/// Recovering `C_e` by differencing `J` at basis points costs a few ulps, so a
+/// transform whose Jacobian is exactly affine in the point reproduces `J(q)` to
+/// ~1e-16 relative, and one whose Jacobian is not (B-spline, displacement field)
+/// misses by O(1). Any threshold between those separates them; 1e-9 is far above the
+/// rounding floor and far below any real nonlinearity, so it is not a tuned constant.
+///
+/// It applies to the Jacobian **only**. The point map is not probed and is not
+/// compared to a tolerance: it is taken from the transform's stages and checked on
+/// the bits ([`point_stages`]), because the decisions downstream of it are branches.
 const AFFINE_TOL: f64 = 1e-9;
 
 /// Off-axis, irrational-ish, and not near any voxel centre: a probe point chosen
@@ -67,12 +93,15 @@ struct Resident {
     metric: ResidentMetric,
 }
 
-/// The affine point map `x ↦ A·x + b` plus the Jacobian's affine decomposition,
-/// all recovered from the transform through its public trait.
+/// What the device needs from a transform: its point map as **stages**, and its
+/// Jacobian's affine decomposition.
+///
+/// The two halves are recovered differently and held to different standards — see
+/// the [module docs](self). The stages are the transform's own arithmetic, taken
+/// bitwise; the Jacobian is probed to a tolerance.
 pub(crate) struct AffineForm {
-    /// Row-major 3 × 3.
-    pub(crate) a: [f64; 9],
-    pub(crate) b: [f64; 3],
+    /// The transform's point map: `1..=MAX_STAGES` stages, applied in this order.
+    pub(crate) stages: Vec<PointStage>,
     /// `J(0)`, row-major `dim × nparams`.
     pub(crate) j0: Vec<f64>,
     /// `C_e = J(e_e) − J(0)` for each basis direction `e`, same layout as `j0`.
@@ -124,7 +153,7 @@ impl CudaMetricBackend {
             return None;
         }
 
-        let form = affine_form(transform)?;
+        let form = affine_form(transform).ok()?;
 
         let mut guard = self.resident.lock().ok()?;
         let stale = match guard.as_ref() {
@@ -188,7 +217,7 @@ impl CudaMetricBackend {
         }
 
         let r = guard.as_mut()?;
-        let moments = r.metric.evaluate(&form.a, &form.b).ok()?;
+        let moments = r.metric.evaluate(&form.stages).ok()?;
         Some((moments, form))
     }
 }
@@ -199,86 +228,118 @@ impl Default for CudaMetricBackend {
     }
 }
 
-/// Recover `x ↦ A·x + b` and the Jacobian's affine decomposition from `transform`,
-/// or `None` if either is not affine in the point.
+/// The transform's point map, as stages the device can replay — or `None` if it has
+/// none, which is the refusal that keeps a transform on the CPU.
 ///
-/// `T` affine ⟹ `b = T(0)` and `A[:,e] = T(e_e) − T(0)`; likewise each Jacobian
-/// column satisfies `J(x) = J(0) + Σ_e x_e·(J(e_e) − J(0))`. Both reconstructions
-/// are then checked against the transform itself at two probe points. This is the
-/// whole of the GPU's transform support: pass the check, run on the device.
-pub(crate) fn affine_form(transform: &dyn ParametricTransform) -> Option<AffineForm> {
+/// The stages come from the transform itself ([`ParametricTransform`]'s
+/// `point_map_stages`); this only converts them to the device's fixed-size form and
+/// then **checks the bitwise claim** rather than trusting it: replaying the stages on
+/// the host must reproduce `transform_point` with `to_bits()` equality at both probe
+/// points. That check is the whole contract in one line — if it holds on the host and
+/// the kernel performs the same operations in the same order, the continuous index is
+/// bit-identical on both sides.
+fn point_stages(transform: &dyn ParametricTransform) -> Option<Vec<PointStage>> {
     let dim = sitk_cuda::DIM;
-    let nparams = transform.number_of_parameters();
-    if nparams == 0 {
+    let maps = transform.point_map_stages()?;
+    if maps.is_empty() || maps.len() > MAX_STAGES {
         return None;
     }
 
-    let zero = [0.0f64; 3];
-    let t0 = transform.transform_point(&zero);
-    let j0 = transform.jacobian_wrt_parameters(&zero);
-    if t0.len() != dim || j0.len() != dim * nparams {
-        return None;
-    }
-
-    let mut b = [0.0f64; 3];
-    b.copy_from_slice(&t0);
-
-    let mut a = [0.0f64; 9];
-    let mut c: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for e in 0..dim {
-        let mut basis = [0.0f64; 3];
-        basis[e] = 1.0;
-
-        let te = transform.transform_point(&basis);
-        for d in 0..dim {
-            // Column e of A, stored row-major: A[d][e].
-            a[d * dim + e] = te[d] - b[d];
-        }
-
-        let je = transform.jacobian_wrt_parameters(&basis);
-        if je.len() != dim * nparams {
+    let mut stages = Vec::with_capacity(maps.len());
+    for m in &maps {
+        if m.matrix.len() != dim * dim || m.offset.len() != dim {
             return None;
         }
-        c[e] = je.iter().zip(j0.iter()).map(|(&x, &y)| x - y).collect();
+
+        let mut matrix = [0.0f64; 9];
+        let mut offset = [0.0f64; 3];
+        matrix.copy_from_slice(&m.matrix);
+        offset.copy_from_slice(&m.offset);
+        stages.push(PointStage { matrix, offset });
     }
 
-    let form = AffineForm {
-        a,
-        b,
-        j0,
-        c,
-        nparams,
-    };
-
-    // Verify, rather than trust. A transform that is not affine in the point
-    // (B-spline, displacement field) misses these by O(1) and declines to the CPU.
     for probe in [PROBE, PROBE_FAR] {
         let truth = transform.transform_point(&probe);
         if truth.len() != dim {
             return None;
         }
-        for (d, &want) in truth.iter().enumerate() {
-            let predicted = form.b[d]
-                + (0..dim)
-                    .map(|e| form.a[d * dim + e] * probe[e])
-                    .sum::<f64>();
-            if !close(predicted, want) {
-                return None;
-            }
-        }
-
-        let jt = transform.jacobian_wrt_parameters(&probe);
-        if jt.len() != dim * nparams {
-            return None;
-        }
-        for (idx, &want) in jt.iter().enumerate() {
-            let predicted = form.j0[idx] + (0..dim).map(|e| probe[e] * form.c[e][idx]).sum::<f64>();
-            if !close(predicted, want) {
+        let replayed = replay_stages(&maps, &probe, dim);
+        for (got, want) in replayed.iter().zip(truth.iter()) {
+            // Bits, not a tolerance. A stage list that is merely *close* to the
+            // transform's own arithmetic is the bug this replaced.
+            if got.to_bits() != want.to_bits() {
                 return None;
             }
         }
     }
-    Some(form)
+    Some(stages)
+}
+
+/// Recover the point map's stages and the Jacobian's affine decomposition from
+/// `transform`, or `None` if it has no bitwise point map or its Jacobian is not
+/// affine in the point.
+///
+/// The Jacobian half is probed: `J` affine in the point ⟹
+/// `J(x) = J(0) + Σ_e x_e·(J(e_e) − J(0))`, checked against the transform at two
+/// probe points to [`AFFINE_TOL`]. The point-map half is not probed at all — see
+/// [`point_stages`] and the [module docs](self) for why the two are held to
+/// different standards.
+pub(crate) fn affine_form(
+    transform: &dyn ParametricTransform,
+) -> Result<AffineForm, DeviceMetricError> {
+    let dim = sitk_cuda::DIM;
+    let nparams = transform.number_of_parameters();
+    if nparams == 0 {
+        return Err(DeviceMetricError::NonAffineTransform);
+    }
+
+    let zero = [0.0f64; 3];
+    let j0 = transform.jacobian_wrt_parameters(&zero);
+    if j0.len() != dim * nparams {
+        return Err(DeviceMetricError::NonAffineTransform);
+    }
+
+    let mut c: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for e in 0..dim {
+        let mut basis = [0.0f64; 3];
+        basis[e] = 1.0;
+        let je = transform.jacobian_wrt_parameters(&basis);
+        if je.len() != dim * nparams {
+            return Err(DeviceMetricError::NonAffineTransform);
+        }
+        c[e] = je.iter().zip(j0.iter()).map(|(&x, &y)| x - y).collect();
+    }
+
+    // Verify, rather than trust. A Jacobian that is not affine in the point misses this
+    // by O(1) and the transform declines to the CPU.
+    for probe in [PROBE, PROBE_FAR] {
+        let jt = transform.jacobian_wrt_parameters(&probe);
+        if jt.len() != dim * nparams {
+            return Err(DeviceMetricError::NonAffineTransform);
+        }
+        for (idx, &want) in jt.iter().enumerate() {
+            let predicted = j0[idx] + (0..dim).map(|e| probe[e] * c[e][idx]).sum::<f64>();
+            if !close(predicted, want) {
+                return Err(DeviceMetricError::NonAffineTransform);
+            }
+        }
+    }
+
+    // The point map is asked for LAST, and its refusal is a DIFFERENT refusal with a
+    // different name. The order matters for what the caller is told: a B-spline fails
+    // both tests (no affine Jacobian, no stages) and keeps the name it always had; a
+    // scale transform fails only this one, and it is the only family that does. So
+    // `NoBitwisePointMap` names exactly the set the bitwise rule costs, and nothing else
+    // hides inside it.
+    let stages = point_stages(transform).ok_or(DeviceMetricError::NoBitwisePointMap)?;
+
+    let form = AffineForm {
+        stages,
+        j0,
+        c,
+        nparams,
+    };
+    Ok(form)
 }
 
 /// Relative-with-absolute-floor comparison, so a Jacobian entry that is exactly
