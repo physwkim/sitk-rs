@@ -71,8 +71,8 @@ use crate::correlation::CorrelationMetric;
 use crate::demons::DemonsMetric;
 #[cfg(feature = "cuda")]
 use crate::device::{
-    DeviceActive, DeviceCorrelationMetric, DeviceMeanSquaresMetric, DeviceMetric,
-    DeviceRegistrationError,
+    DeviceActive, DeviceCorrelationMetric, DeviceMattesMetric, DeviceMeanSquaresMetric,
+    DeviceMetric, DeviceRegistrationError,
 };
 use crate::error::{RegistrationError, Result};
 use crate::gradient_free::{
@@ -865,8 +865,14 @@ pub struct ImageRegistrationMethod {
 
 impl Default for ImageRegistrationMethod {
     fn default() -> Self {
+        // itk::GradientDescentOptimizerv4 enables its value-plateau convergence
+        // monitor by default; SimpleITK's SetOptimizerAsGradientDescent installs
+        // it with (ConvergenceWindowSize, ConvergenceMinimumValue). The optimizer
+        // has no minimum-step stop, so the monitor is its only early stop.
+        let mut default_optimizer = GradientDescentOptimizer::new(1.0, 100);
+        default_optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
         Self {
-            optimizer: OptimizerKind::GradientDescent(GradientDescentOptimizer::new(1.0, 100)),
+            optimizer: OptimizerKind::GradientDescent(default_optimizer),
             metric_kind: MetricKind::MeanSquares,
             scales_mode: ScalesMode::Unit,
             optimizer_weights: Vec::new(),
@@ -901,16 +907,19 @@ impl ImageRegistrationMethod {
     }
 
     /// Use gradient descent with a caller-supplied fixed learning rate and
-    /// iteration cap.
+    /// iteration cap. Stops on the value-plateau convergence monitor (or the
+    /// iteration cap), matching `itk::GradientDescentOptimizerv4` /
+    /// SimpleITK `SetOptimizerAsGradientDescent`, which enables the monitor with
+    /// its `ConvergenceWindowSize` / `ConvergenceMinimumValue` defaults. The
+    /// optimizer has no minimum-step stop.
     pub fn set_optimizer_as_gradient_descent(
         &mut self,
         learning_rate: f64,
         iterations: usize,
     ) -> &mut Self {
-        self.optimizer = OptimizerKind::GradientDescent(GradientDescentOptimizer::new(
-            learning_rate,
-            iterations,
-        ));
+        let mut optimizer = GradientDescentOptimizer::new(learning_rate, iterations);
+        optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
+        self.optimizer = OptimizerKind::GradientDescent(optimizer);
         self.learning_rate_mode = LearningRateMode::Manual;
         self
     }
@@ -918,9 +927,11 @@ impl ImageRegistrationMethod {
     /// Use gradient descent whose learning rate is **estimated** from physical
     /// shift (no hand-tuned rate), mirroring ITK/SimpleITK's learning-rate
     /// estimation. `estimate` selects [`EstimateLearningRate::Once`] (ITK's
-    /// default — refines to high precision) or
-    /// [`EstimateLearningRate::EachIteration`] (converges coarsely, stopped by
-    /// value-plateau monitoring). Pair with
+    /// default — the rate is estimated once and then held fixed) or
+    /// [`EstimateLearningRate::EachIteration`] (re-estimated every step). Both
+    /// stop on the value-plateau convergence monitor (or the iteration cap):
+    /// `itk::GradientDescentOptimizerv4` keeps the monitor on in every
+    /// learning-rate mode and has no minimum-step stop. Pair with
     /// [`set_optimizer_scales_from_physical_shift`] for a fully automatic
     /// optimizer.
     ///
@@ -933,11 +944,11 @@ impl ImageRegistrationMethod {
     ) -> &mut Self {
         // The stored rate is a placeholder; it is overwritten by the estimate.
         let mut optimizer = GradientDescentOptimizer::new(1.0, iterations);
-        if estimate == EstimateLearningRate::EachIteration {
-            // A non-shrinking step schedule needs value-plateau monitoring to
-            // stop; the once schedule stops via the min-step tolerance.
-            optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
-        }
+        // itk::GradientDescentOptimizerv4 keeps its value-plateau monitor on in
+        // every learning-rate mode (m_UseConvergenceMonitoring defaults true,
+        // independent of estimate-once vs estimate-each-iteration); it is the
+        // optimizer's only early stop.
+        optimizer.set_convergence(CONVERGENCE_WINDOW_SIZE, MINIMUM_CONVERGENCE_VALUE);
         self.optimizer = OptimizerKind::GradientDescent(optimizer);
         self.learning_rate_mode = LearningRateMode::Estimate(estimate);
         self
@@ -1387,37 +1398,6 @@ impl ImageRegistrationMethod {
     /// [`set_optimizer_weights`]: Self::set_optimizer_weights
     pub fn optimizer_weights(&self) -> &[f64] {
         &self.optimizer_weights
-    }
-
-    /// Set the minimum scaled-step length below which the optimizer stops early.
-    /// For regular-step gradient descent this is its `minimum_step_length`.
-    pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
-        match &mut self.optimizer {
-            OptimizerKind::GradientDescent(gd) => {
-                gd.set_min_step_tolerance(tol);
-            }
-            OptimizerKind::RegularStep(rs) => {
-                rs.set_minimum_step_length(tol);
-            }
-            OptimizerKind::LineSearch(ls) => {
-                ls.set_min_step_tolerance(tol);
-            }
-            OptimizerKind::ConjugateGradientLineSearch(cg) => {
-                cg.set_min_step_tolerance(tol);
-            }
-            // Neither L-BFGS variant has a scaled-step tolerance; they stop via
-            // their projected-gradient and function-decrease criteria instead.
-            OptimizerKind::Lbfgsb(_) | OptimizerKind::Lbfgs2(_) => {}
-            // Amoeba and Powell have their own parameter-convergence tolerances
-            // (`set_parameters_convergence_tolerance`, `set_step_tolerance`),
-            // set through their own SimpleITK setters; (1+1) evolutionary stops
-            // on its search radius (`epsilon`) and Exhaustive on its grid.
-            OptimizerKind::Amoeba(_)
-            | OptimizerKind::Powell(_)
-            | OptimizerKind::OnePlusOneEvolutionary(_)
-            | OptimizerKind::Exhaustive(_) => {}
-        }
-        self
     }
 
     /// Use the **mean-squares** metric (`itk::MeanSquaresImageToImageMetricv4`),
@@ -2727,12 +2707,17 @@ impl ImageRegistrationMethod {
         enum Kernel {
             MeanSquares,
             Correlation,
+            Mattes { bins: usize },
         }
         let kernel = match self.metric_kind {
             MetricKind::MeanSquares => Kernel::MeanSquares,
             MetricKind::Correlation => Kernel::Correlation,
-            MetricKind::MattesMutualInformation { .. }
-            | MetricKind::AntsNeighborhoodCorrelation { .. }
+            MetricKind::MattesMutualInformation {
+                number_of_histogram_bins,
+            } => Kernel::Mattes {
+                bins: number_of_histogram_bins,
+            },
+            MetricKind::AntsNeighborhoodCorrelation { .. }
             | MetricKind::JointHistogramMutualInformation { .. }
             | MetricKind::Demons { .. } => return Err(DeviceRegistrationError::UnsupportedMetric),
         };
@@ -2843,6 +2828,16 @@ impl ImageRegistrationMethod {
                         moving_mask.as_deref(),
                         samples.as_deref(),
                     )?)
+                }
+                Kernel::Mattes { bins } => {
+                    DeviceMetric::Mattes(Box::new(DeviceMattesMetric::from_device_sampled(
+                        fixed_level,
+                        moving_level,
+                        level_mask.as_ref(),
+                        moving_mask.as_deref(),
+                        samples.as_deref(),
+                        bins,
+                    )?))
                 }
             };
             let metric = ActiveMetric::Device(Box::new(DeviceActive::new(device_metric)));
@@ -5995,7 +5990,13 @@ mod tests {
             "single resolution unexpectedly captured this offset (err {single_err})"
         );
 
-        // Multi resolution: captures the alignment to sub-voxel accuracy.
+        // Multi resolution: captures the alignment to within about one voxel of
+        // this ~21.6-voxel offset. Finding A parity: the estimate-once gradient
+        // descent now stops on the value-plateau convergence monitor (SimpleITK
+        // SetOptimizerAsGradientDescent defaults, window 10 / value 1e-6), which
+        // settles ~1 voxel short of the minimum rather than the port's former
+        // min-step over-refinement — matching `itk::GradientDescentOptimizerv4`.
+        // Single resolution stays stuck an order of magnitude further out.
         let mut multi = ImageRegistrationMethod::new();
         multi
             .set_optimizer_scales_from_physical_shift()
@@ -6008,7 +6009,7 @@ mod tests {
             .transform
             .parameters());
         assert!(
-            multi_err < 0.5,
+            multi_err < 1.5,
             "multi resolution failed to capture the offset (err {multi_err})"
         );
     }
@@ -6074,12 +6075,14 @@ mod tests {
     }
 
     #[test]
-    fn regular_step_multiresolution_reaches_higher_precision_than_gradient_descent() {
-        // The regular-step optimizer closes the finest-level precision gap of
-        // the estimate-once gradient descent on the pyramid. On a cleanly
-        // registerable pair both converge, but the fixed-step-with-relaxation
-        // schedule reaches far below the gradient-descent result at the same
-        // iteration budget, and stops at a stationary point rather than the cap.
+    fn multiresolution_regular_step_and_gradient_descent_stop_via_their_own_criteria() {
+        // On a cleanly registerable pyramid both optimizers converge to sub-voxel
+        // precision, but via the stop condition each ITK optimizer actually owns
+        // (Finding A parity): estimate-once gradient descent stops on the
+        // value-plateau convergence monitor (`itk::GradientDescentOptimizerv4`
+        // has no minimum-step stop), while regular-step stops at a stationary
+        // point when the scaled gradient magnitude falls below tolerance
+        // (`itk::RegularStepGradientDescentOptimizerv4`). Neither hits the cap.
         let (w, h, sigma, amp) = (48usize, 48usize, 6.0, 1.0);
         let (tx, ty) = (5.0f64, -3.0f64);
         let fixed = gaussian(w, h, 24.0, 24.0, sigma, amp);
@@ -6091,11 +6094,10 @@ mod tests {
             .set_optimizer_as_gradient_descent_estimated(200, EstimateLearningRate::Once)
             .set_shrink_factors_per_level(vec![4, 2, 1])
             .set_smoothing_sigmas_per_level(vec![2.0, 1.0, 0.0]);
-        let gd_err = err(&gd
+        let gd_result = gd
             .execute(&fixed, &moving, TranslationTransform::new(vec![0.0, 0.0]))
-            .unwrap()
-            .transform
-            .parameters());
+            .unwrap();
+        let gd_err = err(&gd_result.transform.parameters());
 
         let mut rs = ImageRegistrationMethod::new();
         rs.set_optimizer_scales_from_physical_shift()
@@ -6112,19 +6114,26 @@ mod tests {
             .unwrap();
         let rs_err = err(&result.transform.parameters());
 
+        // Both reach sub-voxel precision.
+        assert!(
+            gd_err < 1e-3,
+            "gradient-descent multi-res err {gd_err} not below 1e-3"
+        );
         assert!(
             rs_err < 1e-3,
             "regular-step multi-res err {rs_err} not below 1e-3 (metric {})",
             result.metric_value
         );
-        assert!(
-            rs_err < gd_err,
-            "regular-step err {rs_err} not below gradient-descent err {gd_err}"
+        // Each stops on the criterion its ITK optimizer owns, not the cap.
+        assert_eq!(
+            gd_result.stop_reason,
+            StopReason::Converged,
+            "estimate-once gradient descent should stop on the value-plateau monitor"
         );
-        assert_ne!(
+        assert_eq!(
             result.stop_reason,
-            StopReason::MaxIterations,
-            "regular-step finest level hit the iteration cap instead of converging"
+            StopReason::GradientConverged,
+            "regular-step should stop at a stationary point (gradient-magnitude tolerance)"
         );
     }
 

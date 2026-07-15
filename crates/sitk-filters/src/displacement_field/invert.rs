@@ -86,6 +86,7 @@
 use sitk_core::Image;
 
 use super::{Field, field_to_image};
+use crate::geometry::require_same_physical_space;
 use crate::{FilterError, Result};
 
 /// The four `InvertDisplacementFieldImageFilter.yaml` members, with its
@@ -149,6 +150,7 @@ pub fn invert_displacement_field(
     // field on the forward lattice.
     let mut inverse = match inverse_field_initial_estimate {
         Some(estimate) => {
+            require_same_physical_space(displacement_field, estimate, 1)?;
             let field = Field::from_image(estimate)?;
             if field.size != forward.size {
                 return Err(FilterError::SizeMismatch {
@@ -529,13 +531,18 @@ mod tests {
         assert_eq!(out.mean_error_norm, f64::MAX);
     }
 
-    /// The output takes the *initial estimate's* geometry, because upstream
-    /// installs the duplicated estimate as output 0.
+    /// The output carries the *initial estimate's* geometry, because upstream
+    /// installs the duplicated estimate as output 0. ITK registers the estimate
+    /// via itkSetInputMacro(InverseFieldInitialEstimate), so the base
+    /// VerifyInputInformation requires it to occupy the same physical space as the
+    /// field (a mismatch is refused — pinned in
+    /// tests/physical_space_precondition.rs); under that congruent contract the
+    /// estimate's geometry equals the field's, and the output carries it.
     #[test]
     fn the_output_carries_the_initial_estimates_geometry() {
         let mut field = field_1d(&[0.0; 3]);
-        field.set_spacing(&[2.0]).unwrap();
-        field.set_origin(&[7.0]).unwrap();
+        field.set_spacing(&[0.5]).unwrap();
+        field.set_origin(&[-3.0]).unwrap();
 
         let mut estimate = field_1d(&[0.0; 3]);
         estimate.set_spacing(&[0.5]).unwrap();

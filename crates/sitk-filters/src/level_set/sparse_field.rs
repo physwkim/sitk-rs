@@ -217,6 +217,19 @@ impl SparseFieldSolver {
     /// `FiniteDifferenceImageFilter::Halt` (itkFiniteDifferenceImageFilter.hxx:210-233).
     /// The RMS test never fires on the first pass, and
     /// `number_of_iterations == 0` halts immediately.
+    ///
+    /// **Precision divergence from ITK (deliberate, ledger §4.126).** ITK's
+    /// `m_RMSChange` field is `double`, but the value is *computed* in
+    /// `ValueType` — the level-set pixel type, `float` for a `Float32` level
+    /// set: `SparseFieldLevelSetImageFilter::CalculateChange` accumulates
+    /// `rms_change_accumulator += sqr(new − old)` and divides by the counter in
+    /// `ValueType`, casting to `double` only for the final `sqrt`
+    /// (`itkSparseFieldLevelSetImageFilter.hxx:303,344,443`). This port computes
+    /// `rms_change` in `f64` throughout. When the true RMS lies within `float`
+    /// rounding of `maximum_rms_error`, `float(rms) > thresh` and `f64(rms) >
+    /// thresh` can disagree, so the port may run one more or one fewer iteration
+    /// than ITK near the threshold. The port keeps `f64` (uniform crate
+    /// precision, strictly more accurate).
     fn halt(&self, maximum_rms_error: f64, number_of_iterations: u32) -> bool {
         if self.elapsed_iterations >= number_of_iterations {
             return true;

@@ -44,7 +44,7 @@
 //! `outputDirection = inputDirection * flipMatrix`, which scales columns).
 
 use crate::error::{FilterError, Result};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use sitk_core::Image;
 
 fn require_dim(len: usize, dim: usize) -> Result<()> {
     if len != dim {
@@ -64,18 +64,6 @@ fn strides(size: &[usize]) -> Vec<usize> {
         s[d] = s[d - 1] * size[d - 1];
     }
     s
-}
-
-fn build_from_f64<T: Scalar>(size: &[usize], vals: &[f64]) -> Result<Image> {
-    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
-    Ok(Image::from_vec(size, out)?)
-}
-
-/// Build an image of `target` pixel type directly from `f64` values with no
-/// geometry (spacing/origin/direction are all recomputed by [`slice`] itself,
-/// unlike a plain same-geometry copy).
-fn bare_image_from_f64(target: PixelId, size: &[usize], vals: &[f64]) -> Result<Image> {
-    dispatch_scalar!(target, build_from_f64, size, vals)
 }
 
 /// `SliceImageFilter`: extract `img[start[d]:stop[d]:step[d]]` per axis,
@@ -148,19 +136,18 @@ pub fn slice(img: &Image, start: &[i32], stop: &[i32], step: &[i32]) -> Result<I
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec()?;
-    let mut out_vals = vec![0.0f64; out_count];
-    for (o, slot) in out_vals.iter_mut().enumerate() {
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for d in 0..dim {
             let oi = (o / out_strides[d]) % out_size[d];
             let src_idx = oi as i64 * step[d] as i64 + dt_start[d];
             in_flat += src_idx as usize * in_strides[d];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
-    let mut out = bare_image_from_f64(img.pixel_id(), &out_size, &out_vals)?;
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
     out.set_spacing(&out_spacing)?;
     out.set_origin(&out_origin)?;
     out.set_direction(&out_direction)?;
@@ -251,6 +238,26 @@ mod tests {
         let src = img(&[10, 1], (0..10).map(|v| v as f64).collect());
         let out = slice(&src, &[7, 0], &[2, i32::MAX], &[-2, 1]).unwrap();
         assert_eq!(out.to_f64_vec().unwrap(), vec![7.0, 5.0, 3.0]);
+    }
+
+    #[test]
+    fn slice_moves_u64_pixels_losslessly() {
+        // 2^53 + 1 is the smallest u64 an f64 cannot represent; the old seam
+        // rounded it. Non-vacuity guard proves the value would be corrupted.
+        let hi = (1u64 << 53) + 1;
+        assert_ne!(hi, (hi as f64) as u64);
+        let src = Image::from_vec(&[5, 1], (0..5).map(|v| hi + v).collect()).unwrap();
+        // Forward sub-range [1:4:1] and a full negative-step reversal.
+        let fwd = slice(&src, &[1, 0], &[4, i32::MAX], &[1, 1]).unwrap();
+        assert_eq!(
+            fwd.scalar_slice::<u64>().unwrap(),
+            &[hi + 1, hi + 2, hi + 3]
+        );
+        let rev = slice(&src, &[4, 0], &[-1, i32::MAX], &[-1, 1]).unwrap();
+        assert_eq!(
+            rev.scalar_slice::<u64>().unwrap(),
+            &[hi + 4, hi + 3, hi + 2, hi + 1, hi]
+        );
     }
 
     // ---- geometry: origin moves to the first sampled pixel ----

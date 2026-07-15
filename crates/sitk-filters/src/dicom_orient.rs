@@ -656,6 +656,26 @@ mod tests {
     }
 
     #[test]
+    fn ras_moves_u64_pixels_losslessly() {
+        // `dicom_orient` reindexes through `permute_axes`/`flip`, both now
+        // native; a `UInt64` value above 2^53 whose bits cannot survive an
+        // f64 round-trip proves the pixel path never widened. RAS reverses the
+        // two in-plane axes of a 2x3x1 row-major sequence.
+        const HI: u64 = (1 << 53) + 1;
+        // Non-vacuity guard: this value must genuinely differ from its f64
+        // round-trip, else recovering it exactly would prove nothing.
+        assert_ne!(HI, (HI as f64) as u64);
+        let seq: Vec<u64> = (0..6).map(|k| HI + k).collect();
+        let img = Image::from_vec(&[2, 3, 1], seq).unwrap();
+        let out = dicom_orient(&img, "RAS").unwrap();
+        assert_eq!(out.flip_axes, vec![true, true, false]);
+        assert_eq!(
+            out.image.scalar_slice::<u64>().unwrap(),
+            &[HI + 5, HI + 4, HI + 3, HI + 2, HI + 1, HI]
+        );
+    }
+
+    #[test]
     fn given_equals_desired_is_a_no_op() {
         // yaml "default" tag: FlipAxes [0,0,0], PermuteOrder [0,1,2].
         let img = img_f64(&[2, 2, 2], (0..8).map(|v| v as f64).collect());

@@ -141,6 +141,7 @@
 //! label filters ([`crate::overlap`], [`crate::label`]) take the same route.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::{image_from_f64, quantize_to_pixel_type, require_same_shape};
 use sitk_core::{Image, PixelId};
 use std::cmp::Ordering;
@@ -163,8 +164,9 @@ fn require_inputs(images: &[&Image]) -> Result<()> {
     let Some((first, rest)) = images.split_first() else {
         return Err(FilterError::EmptyImageList);
     };
-    for img in rest {
+    for (i, img) in rest.iter().enumerate() {
         require_same_shape(first, img)?;
+        require_same_physical_space(first, img, i + 1)?;
     }
     Ok(())
 }

@@ -222,7 +222,7 @@ fn op09_signed_maurer_distance_map() {
 fn op10_connected_component() {
     let img = binary_volume();
     assert_bit_parity("connected_component", 0x6fcb_a1e1_3b24_854f, || {
-        f::connected_component(&img, false).unwrap()
+        f::connected_component(&img, None, false).unwrap()
     });
 }
 
@@ -230,7 +230,7 @@ fn op10_connected_component() {
 fn op11_otsu_threshold() {
     let img = float_volume();
     assert_bit_parity("otsu_threshold", 0xdb21_aa5b_e685_6e85, || {
-        f::otsu_threshold(&img, 128, false, 1, 0).unwrap().0
+        f::otsu_threshold(&img, 128, false, 1, 0, None).unwrap().0
     });
 }
 
@@ -241,7 +241,7 @@ fn op11_otsu_threshold_value_is_thread_count_independent() {
     let img = float_volume();
     let mut seen: Option<u64> = None;
     for threads in [1usize, 3, 8, 32] {
-        let t = parallel::with_threads(threads, || f::otsu_threshold(&img, 128, false, 1, 0))
+        let t = parallel::with_threads(threads, || f::otsu_threshold(&img, 128, false, 1, 0, None))
             .unwrap()
             .1;
         if let Some(prev) = seen {

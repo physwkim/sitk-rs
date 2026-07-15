@@ -94,15 +94,29 @@
 //! `use_image_spacing = true` for the same reason: no public knob exists to
 //! turn it off through this filter's actual SimpleITK surface.
 //!
-//! ITK sums the per-pixel distances with `CompensatedSummation` (Kahan
-//! summation) before dividing by the pixel count; this port uses a plain
-//! `f64` accumulator, consistent with every other reduction in this crate
-//! ([`crate::statistics`], [`crate::label::label_statistics`]) — a
-//! deliberate precision simplification, not a formula change.
+//! ITK sums the per-pixel distances with `CompensatedSummation` (Kahan summation) before
+//! dividing by the pixel count, and **so does this port now**
+//! ([`sitk_core::compensated::CompensatedSum`]). It did not until 2026-07-15: it used a
+//! plain `f64` accumulator and this note called that "a deliberate precision
+//! simplification, not a formula change", justified by consistency with the other
+//! reductions in this crate. That justification was backwards, and the two sites it
+//! pointed at prove it. [`crate::statistics`] had the **same defect** — its upstream,
+//! `itkStatisticsImageFilter`, compensates both of its accumulators — and is fixed in the
+//! same sweep. [`crate::label::label_statistics`] is **correct as it stands**, because
+//! *its* upstream (`itkLabelStatisticsImageFilter`) accumulates into a plain `RealType`
+//! and compensates nothing, so a naive walk there is parity and compensating it would be
+//! the divergence.
+//!
+//! Which is the whole lesson: the answer is per-upstream, not per-crate. "Consistent with
+//! our other reductions" is not a reason — ITK reaches for `CompensatedSummation` in a
+//! specific set of reductions and not in others, and each site owes its own upstream. See
+//! the ledger's §2.161 family.
 
 use crate::distance::signed_maurer_distance_map;
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use sitk_core::Image;
+use sitk_core::compensated::CompensatedSum;
 use std::collections::BTreeMap;
 
 fn require_integer_pixel_type(img: &Image) -> Result<()> {
@@ -230,6 +244,7 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
     require_integer_pixel_type(source)?;
     require_integer_pixel_type(target)?;
     require_same_size(source, target)?;
+    require_same_physical_space(source, target, 1)?;
 
     let source_labels: Vec<i64> = source
         .to_f64_vec()?
@@ -368,6 +383,7 @@ pub fn directed_hausdorff_distance(
     image2: &Image,
 ) -> Result<DirectedHausdorffMeasures> {
     require_same_size(image1, image2)?;
+    require_same_physical_space(image1, image2, 1)?;
 
     // BeforeThreadedGenerateData: SignedMaurerDistanceMapImageFilter on
     // image2, SquaredDistance(false), UseImageSpacing(true),
@@ -377,7 +393,18 @@ pub fn directed_hausdorff_distance(
     let vals1 = image1.to_f64_vec()?;
 
     let mut max_distance = 0.0f64;
-    let mut sum = 0.0f64;
+    // Compensated, as upstream is: `itkDirectedHausdorffDistanceImageFilter` accumulates
+    // its distance sum through a `CompensatedSummationType m_Sum` (`.h`, and
+    // `.hxx:140` reads `m_Sum.GetSum() / m_PixelCount` for the average). The sum runs over
+    // every foreground voxel of image 1 — millions on a real segmentation — and the terms
+    // are non-negative distances of very mixed magnitude, so a naive walk loses the small
+    // ones behind the large. `directed_hausdorff_distance` (the max) is unaffected; the
+    // *average* is the number this protects.
+    //
+    // Accuracy, not parity: upstream sums per-thread over its region decomposition and
+    // combines the partials, this walks the buffer in raster order, so the orders differ
+    // by construction and bit-parity with ITK was never available.
+    let mut sum = CompensatedSum::new();
     let mut pixel_count = 0u64;
     for (&v1, &d) in vals1.iter().zip(&dist_vals) {
         if v1 != 0.0 {
@@ -396,7 +423,7 @@ pub fn directed_hausdorff_distance(
 
     Ok(DirectedHausdorffMeasures {
         directed_hausdorff_distance: max_distance,
-        average_hausdorff_distance: sum / pixel_count as f64,
+        average_hausdorff_distance: sum.sum() / pixel_count as f64,
     })
 }
 
@@ -461,6 +488,7 @@ pub fn hausdorff_distance(image1: &Image, image2: &Image) -> Result<HausdorffMea
 /// `image1`'s, which the ITK pipeline rejects downstream.
 pub fn similarity_index(image1: &Image, image2: &Image) -> Result<f64> {
     require_same_size(image1, image2)?;
+    require_same_physical_space(image1, image2, 1)?;
 
     let vals1 = image1.to_f64_vec()?;
     let vals2 = image2.to_f64_vec()?;
@@ -491,6 +519,84 @@ pub fn similarity_index(image1: &Image, image2: &Image) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The average Hausdorff distance is a compensated sum, and a naive walk of the same
+    /// distances is not the same number.**
+    ///
+    /// This pin could not be handed an adversarial fixture the way the histogram ones can:
+    /// the terms are *distances*, so their magnitudes are bounded by the image diagonal and
+    /// a caller cannot plant a `1e17` among them. What makes the compensation observable
+    /// here is `n`, not dynamic range — the sum runs over every foreground voxel — so the
+    /// fixture is a large foreground region and the assertion is bit inequality against the
+    /// naive walk over the *same* clamped distances, recomputed here from the filter's own
+    /// distance map.
+    ///
+    /// If this fails, it is not reporting a broken filter: it is reporting that at this
+    /// fixture size the two walks agree bit for bit and the compensation is unobservable.
+    /// That is a measurement and belongs in the report, not in a weakened assertion.
+    #[test]
+    fn the_average_distance_is_compensated_and_a_naive_walk_is_not_the_same_number() {
+        // A 64³ volume whose image-1 foreground is a large slab and whose image-2 object is
+        // a single far corner voxel — so every one of the ~130k foreground voxels carries a
+        // distinct, sizable distance and the sum is long.
+        const N: usize = 64;
+        let mut a = vec![0u8; N * N * N];
+        let mut b = vec![0u8; N * N * N];
+        for k in 0..N {
+            for j in 0..N {
+                for i in 0..N {
+                    if i >= 2 && j >= 2 && k >= 2 {
+                        a[(k * N + j) * N + i] = 1;
+                    }
+                }
+            }
+        }
+        b[0] = 1;
+        let image1 = Image::from_vec(&[N, N, N], a).unwrap();
+        let image2 = Image::from_vec(&[N, N, N], b).unwrap();
+
+        let measures = directed_hausdorff_distance(&image1, &image2).unwrap();
+
+        // Reproduce the filter's own walk, naively, over the same terms in the same order.
+        let distance_map = signed_maurer_distance_map(&image2, false, false, true, 0.0).unwrap();
+        let dist_vals = distance_map.to_f64_vec().unwrap();
+        let vals1 = image1.to_f64_vec().unwrap();
+        let mut naive = 0.0f64;
+        let mut terms: Vec<f64> = Vec::new();
+        let mut count = 0u64;
+        for (&v1, &d) in vals1.iter().zip(&dist_vals) {
+            if v1 != 0.0 {
+                let clamped = d.max(0.0);
+                naive += clamped;
+                terms.push(clamped);
+                count += 1;
+            }
+        }
+        assert!(
+            count > 100_000,
+            "the fixture must make the sum long: {count}"
+        );
+
+        let naive_average = naive / count as f64;
+        // Neumaier — the residual folded back in, better than both, so a fair judge.
+        let reference_average = sitk_core::compensated::neumaier_sum(terms) / count as f64;
+
+        assert_ne!(
+            naive_average.to_bits(),
+            reference_average.to_bits(),
+            "the fixture must defeat naive summation, or the pin below is vacuous"
+        );
+        assert_ne!(
+            measures.average_hausdorff_distance.to_bits(),
+            naive_average.to_bits(),
+            "the average distance is the naive sum's bits: the compensation is gone"
+        );
+        assert!(
+            (measures.average_hausdorff_distance - reference_average).abs()
+                < (naive_average - reference_average).abs(),
+            "the compensated average must be closer to the true sum than the naive one"
+        );
+    }
 
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()

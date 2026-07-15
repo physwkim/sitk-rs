@@ -100,6 +100,7 @@ use std::collections::BTreeMap;
 use sitk_core::{Image, LabelMap, PixelId};
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::label_shape::{
     LabelShapeStatisticsSettings, ShapeStatistics, determinant, index_to_physical, is_almost_zero,
     label_shape_statistics,
@@ -251,6 +252,7 @@ pub fn label_intensity_statistics(
             b: feature_image.size().to_vec(),
         });
     }
+    require_same_physical_space(label_image, feature_image, 1)?;
     if settings.number_of_bins == 0 {
         return Err(FilterError::InvalidHistogramBins(settings.number_of_bins));
     }

@@ -70,6 +70,7 @@
 //! every label value present in `label_img` gets an entry.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 use sitk_core::{Image, PixelId};
 use std::collections::{BTreeMap, HashMap};
@@ -346,9 +347,41 @@ pub(crate) fn create_consecutive(
 /// (8-connected in 2-D, 26-connected in 3-D). Output pixel type is `UInt32`;
 /// background stays 0 and object labels are consecutive starting at 1,
 /// assigned in raster-scan order of first appearance.
-pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> {
+///
+/// # The optional mask
+///
+/// SimpleITK exposes an optional `MaskImage` input (`UInt8`), and ITK implements
+/// it by running the *input* through `MaskImageFilter` before labeling anything
+/// (`itkConnectedComponentImageFilter.hxx:79-92`). `MaskImageFilter` replaces a
+/// voxel with its outside value (`0`) where the mask **equals** the masking value
+/// — which is `TMask{}`, i.e. **`0`** (`itkMaskImageFilter.h:55`, `:107`) — so a
+/// masked-out voxel arrives at the labeler as a zero, i.e. as background.
+///
+/// Hence: **a voxel is foreground iff it is nonzero *and* its mask voxel is
+/// nonzero.** Note the polarity — every mask value except `0` keeps the voxel, so
+/// a mask of all `1`s is a no-op here. That is the opposite of the threshold
+/// family's mask ([`crate::histogram::ThresholdMask`]), which admits a voxel only
+/// where the mask **equals** `mask_value` (default **255**), and a mask of all
+/// `1`s admits nothing. Two upstream classes, two conventions; see
+/// [`crate::mask_input`] and ledger §2.175.
+///
+/// The mask must be `UInt8`, the image's size, and on the image's grid — ITK's
+/// three preconditions for a mask *input*, enforced by
+/// [`crate::mask_input::uint8_mask_voxels`].
+pub fn connected_component(
+    img: &Image,
+    mask: Option<&Image>,
+    fully_connected: bool,
+) -> Result<Image> {
     let size = img.size();
     let total: usize = size.iter().product();
+
+    // Before the empty-image shortcut: ITK validates a mask input in
+    // `VerifyInputInformation`, i.e. before `GenerateData` looks at a single voxel.
+    let mask_voxels = match mask {
+        None => None,
+        Some(m) => Some(crate::mask_input::uint8_mask_voxels(img, m)?),
+    };
 
     if total == 0 {
         let mut result = Image::from_vec(size, Vec::<u32>::new())?;
@@ -358,7 +391,14 @@ pub fn connected_component(img: &Image, fully_connected: bool) -> Result<Image> 
 
     let xsize = size[0];
     let vals = img.to_f64_vec()?;
-    let is_fg: Vec<bool> = vals.iter().map(|&v| v != 0.0).collect();
+    let is_fg: Vec<bool> = match mask_voxels {
+        None => vals.iter().map(|&v| v != 0.0).collect(),
+        Some(m) => vals
+            .iter()
+            .zip(m)
+            .map(|(&v, &m)| v != 0.0 && m != 0)
+            .collect(),
+    };
 
     let mut components = scanline_components(&is_fg, size, fully_connected);
     // `CreateConsecutive(0)` skips 0 on its first assignment, so the object
@@ -479,6 +519,12 @@ pub struct LabelStatistics {
     pub count: u64,
     /// Inclusive `(min_index, max_index)` per axis, in `img`'s axis order.
     pub bounding_box: Vec<(i64, i64)>,
+    /// The **histogram** median: the centre of the bin in which the label's
+    /// cumulative frequency first passes half its count
+    /// (`itkLabelStatisticsImageFilter.hxx:410-441`). It is *not* the exact median
+    /// of the values, except for 8-bit input — see [`label_statistics`] for the bin
+    /// range, which is what decides the difference.
+    pub median: f64,
 }
 
 struct Accum {
@@ -488,13 +534,121 @@ struct Accum {
     sum: f64,
     sum_sq: f64,
     bbox: Vec<(i64, i64)>,
+    histogram: Vec<u64>,
+}
+
+/// SimpleITK's `LabelStatisticsImageFilter.yaml` `custom_itk_cast` calls
+/// `SetHistogramParameters(256, ...)` on both branches, and ITK's own default is 256
+/// (`itkLabelStatisticsImageFilter.hxx:36`).
+const HISTOGRAM_BINS: usize = 256;
+
+/// The bin range SimpleITK hands `SetHistogramParameters`, and the whole reason the
+/// median is exact for one pixel type and approximate for every other.
+///
+/// `LabelStatisticsImageFilter.yaml`'s `custom_itk_cast` branches on the *intensity*
+/// image's pixel type: for `uint8_t`/`int8_t` it pads the **pixel type's** range by half
+/// a unit — `[min - 0.5, max + 0.5]` — which with 256 bins puts exactly one integer in
+/// each bin, so the "histogram median" is the true median. ("NOTE: This is a heuristic
+/// that works exact median only for (unsigned) char images", says the yaml.) For every
+/// other type it runs `MinimumMaximumImageFilter` over the **whole intensity image** —
+/// not the label's voxels — and spreads 256 bins over that data range, so a label whose
+/// values occupy a narrow part of the image's range lands in a handful of bins and the
+/// median is quantized to a bin centre.
+fn histogram_bounds(img: &Image) -> Result<(f64, f64)> {
+    match img.pixel_id() {
+        PixelId::UInt8 => Ok((-0.5, 255.5)),
+        PixelId::Int8 => Ok((-128.5, 127.5)),
+        _ => {
+            let vals = img.to_f64_vec()?;
+            Ok(sitk_core::parallel::min_max(&vals).unwrap_or((0.0, 0.0)))
+        }
+    }
+}
+
+/// `itk::Statistics::Histogram::Initialize(size, lb, ub)`'s uniform bins — **computed in
+/// `float`, not `double`** (`itkHistogram.hxx:222-234`: `float interval = (float(ub) -
+/// float(lb)) / float(size)`, and every edge is `lb + float(j) * interval`). The last
+/// bin's max is the upper bound verbatim. The `f32` is upstream's, is visible in the bin
+/// centres a median reports, and is reproduced here rather than "cleaned up" to `f64`.
+fn bin_edges(lower: f64, upper: f64) -> (Vec<f64>, Vec<f64>) {
+    let interval = (upper as f32 - lower as f32) / HISTOGRAM_BINS as f32;
+    let mut mins = Vec::with_capacity(HISTOGRAM_BINS);
+    let mut maxs = Vec::with_capacity(HISTOGRAM_BINS);
+    for j in 0..HISTOGRAM_BINS - 1 {
+        mins.push(lower + (j as f32 * interval) as f64);
+        maxs.push(lower + ((j as f32 + 1.0) * interval) as f64);
+    }
+    mins.push(lower + ((HISTOGRAM_BINS as f32 - 1.0) * interval) as f64);
+    maxs.push(upper);
+    (mins, maxs)
+}
+
+/// `Histogram::GetIndex` (`itkHistogram.hxx:243-321`) with `m_ClipBinsAtEnds` at its
+/// default `true` (`itkHistogram.h:514`): below the first bin's min, or above the last
+/// bin's max by more than the last endpoint itself, the measurement is **dropped** — it
+/// is counted in no bin. Neither can happen for the two ranges `histogram_bounds`
+/// produces (the data range contains every value by construction; the padded 8-bit range
+/// contains every 8-bit value), so this returns `None` only for a caller that does not
+/// exist yet — and it drops rather than clamps, which is what upstream does.
+fn bin_of(v: f64, mins: &[f64], maxs: &[f64]) -> Option<usize> {
+    let last = mins.len() - 1;
+    if v < mins[0] {
+        return None;
+    }
+    if v >= maxs[last] {
+        return if v == maxs[last] { Some(last) } else { None };
+    }
+    // The bins are contiguous and monotone (`maxs[j] == mins[j + 1]` by construction),
+    // so a floor followed by a correcting step lands on the same bin ITK's binary search
+    // over these same edges would.
+    let width = maxs[0] - mins[0];
+    let mut b = if width > 0.0 {
+        (((v - mins[0]) / width) as usize).min(last)
+    } else {
+        0
+    };
+    while b > 0 && v < mins[b] {
+        b -= 1;
+    }
+    while b < last && v >= maxs[b] {
+        b += 1;
+    }
+    Some(b)
+}
+
+/// `GetMedian` (`itkLabelStatisticsImageFilter.hxx:410-441`): walk bins while the running
+/// total is `<= count / 2` (**integer** division — `m_Count` is an `IdentifierType`), step
+/// back one, and return that bin's **centre**. Not an interpolated quantile, and not a
+/// value that need occur in the image.
+fn histogram_median(hist: &[u64], count: u64, mins: &[f64], maxs: &[f64]) -> f64 {
+    let half = count / 2;
+    let mut total: u64 = 0;
+    let mut bin: usize = 0;
+    while total <= half && bin < HISTOGRAM_BINS {
+        total += hist[bin];
+        bin += 1;
+    }
+    bin -= 1;
+    mins[bin] + (maxs[bin] - mins[bin]) / 2.0
 }
 
 /// `LabelStatisticsImageFilter`: per-label min/max/mean/variance/sigma/sum/
-/// count/bounding-box of `img`'s intensities, grouped by the integer labels
+/// count/bounding-box/median of `img`'s intensities, grouped by the integer labels
 /// in `label_img` (same size as `img`). Every label value present in
 /// `label_img` gets an entry, including 0 — this filter has no notion of
 /// "background", unlike [`relabel_component`].
+///
+/// **The median is a 256-bin histogram median, and its bin range decides whether it is
+/// exact.** SimpleITK sets `UseHistograms: true` by *default* and configures the bins in
+/// `LabelStatisticsImageFilter.yaml`'s `custom_itk_cast`, so this filter always builds
+/// them (there is no "histograms off" mode to mirror — the getter would simply return
+/// `0.0`). The range is [`histogram_bounds`]: the padded **pixel-type** range for
+/// `UInt8`/`Int8`, which puts one integer per bin and makes the median exact; the **whole
+/// intensity image's** data range for every other type, which quantizes it to a bin
+/// centre — and note *whole image*, not *this label's voxels*, so a label confined to a
+/// narrow band of a wide-ranged image gets a coarse median. That is upstream's rule, and
+/// it is the same class of pixel-type-dependent bin range as the 8-bit thresholds
+/// (§2.174).
 pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, LabelStatistics>> {
     if img.size() != label_img.size() {
         return Err(FilterError::SizeMismatch {
@@ -502,6 +656,7 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
             b: label_img.size().to_vec(),
         });
     }
+    require_same_physical_space(img, label_img, 1)?;
 
     let size = img.size();
     let dim = size.len();
@@ -512,6 +667,9 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
         .iter()
         .map(|&v| v.round() as i64)
         .collect();
+
+    let (lower, upper) = histogram_bounds(img)?;
+    let (bin_mins, bin_maxs) = bin_edges(lower, upper);
 
     let mut acc: BTreeMap<i64, Accum> = BTreeMap::new();
     for flat in 0..vals.len() {
@@ -524,10 +682,14 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
             sum: 0.0,
             sum_sq: 0.0,
             bbox: vec![(i64::MAX, i64::MIN); dim],
+            histogram: vec![0; HISTOGRAM_BINS],
         });
         entry.count += 1;
         entry.sum += v;
         entry.sum_sq += v * v;
+        if let Some(bin) = bin_of(v, &bin_mins, &bin_maxs) {
+            entry.histogram[bin] += 1;
+        }
         entry.min = entry.min.min(v);
         entry.max = entry.max.max(v);
         let idx = multi_index(flat, size, &strides_);
@@ -556,6 +718,7 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
                 sum: a.sum,
                 count: a.count,
                 bounding_box: a.bbox,
+                median: histogram_median(&a.histogram, a.count, &bin_mins, &bin_maxs),
             },
         );
     }
@@ -585,13 +748,13 @@ mod tests {
             0, 1,
             1, 0,
         ]);
-        let face = connected_component(&img, false).unwrap();
+        let face = connected_component(&img, None, false).unwrap();
         assert_eq!(face.pixel_id(), PixelId::UInt32);
         let face_labels = face.scalar_slice::<u32>().unwrap();
         assert_ne!(face_labels[1], face_labels[2]); // the two 1s, separate components
         assert_eq!(face_labels.iter().filter(|&&v| v != 0).count(), 2);
 
-        let full = connected_component(&img, true).unwrap();
+        let full = connected_component(&img, None, true).unwrap();
         let full_labels = full.scalar_slice::<u32>().unwrap();
         assert_eq!(full_labels[1], full_labels[2]); // joined diagonally
     }
@@ -604,7 +767,7 @@ mod tests {
         data[7] = 1; // (1,1,1)
         let img = img_u8(&[2, 2, 2], data);
 
-        let face = connected_component(&img, false).unwrap();
+        let face = connected_component(&img, None, false).unwrap();
         let face_labels = face.scalar_slice::<u32>().unwrap();
         assert_ne!(face_labels[0], face_labels[7]);
         assert_eq!(
@@ -615,7 +778,7 @@ mod tests {
             3 // background(0) + 2 distinct object labels
         );
 
-        let full = connected_component(&img, true).unwrap();
+        let full = connected_component(&img, None, true).unwrap();
         let full_labels = full.scalar_slice::<u32>().unwrap();
         assert_eq!(full_labels[0], full_labels[7]);
         assert_ne!(full_labels[0], 0);
@@ -645,7 +808,7 @@ mod tests {
             }
         }
         let img = img_u8(&[w, h], xfastest);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         let labels = out.scalar_slice::<u32>().unwrap();
         let distinct: std::collections::HashSet<u32> =
             labels.iter().copied().filter(|&v| v != 0).collect();
@@ -661,7 +824,7 @@ mod tests {
     #[test]
     fn background_only_image_has_no_objects() {
         let img = img_u8(&[3, 3], vec![0; 9]);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         assert!(out.scalar_slice::<u32>().unwrap().iter().all(|&v| v == 0));
     }
 
@@ -674,7 +837,7 @@ mod tests {
             0, 0, 1,
             1, 0, 0,
         ]);
-        let out = connected_component(&img, false).unwrap();
+        let out = connected_component(&img, None, false).unwrap();
         let labels = out.scalar_slice::<u32>().unwrap();
         // flat index 2 = (x=2,y=0) comes before flat index 3 = (x=0,y=1)
         assert_eq!(labels[2], 1);
@@ -796,6 +959,76 @@ mod tests {
 
         let bg = &stats[&0];
         assert_eq!(bg.count, 5);
+    }
+
+    /// 8-bit intensities get the padded **pixel-type** range `[-0.5, 255.5]`, so each of
+    /// the 256 bins holds exactly one integer and the histogram median *is* the median.
+    ///
+    /// The even-count case also pins ITK's convention: `GetMedian` walks bins while the
+    /// running total is `<= count / 2` and then steps back one
+    /// (`itkLabelStatisticsImageFilter.hxx:427-434`), so for `[10, 20, 30, 40]` it reports
+    /// the **upper** middle value, 30 — not the interpolated 25 a textbook median gives.
+    #[test]
+    fn label_statistics_median_is_exact_for_8_bit_and_takes_the_upper_middle() {
+        let intensities = img_u8(&[5, 1], vec![10, 20, 30, 40, 100]);
+        let labels = img_u32(&[5, 1], vec![1, 1, 1, 1, 1]);
+        assert_eq!(
+            label_statistics(&intensities, &labels).unwrap()[&1].median,
+            30.0
+        );
+
+        // Even count: 10, 20, 30, 40 -> 30, not 25.
+        let intensities = img_u8(&[4, 1], vec![10, 20, 30, 40]);
+        let labels = img_u32(&[4, 1], vec![1, 1, 1, 1]);
+        assert_eq!(
+            label_statistics(&intensities, &labels).unwrap()[&1].median,
+            30.0
+        );
+    }
+
+    /// For any non-8-bit type the 256 bins are spread over the **whole intensity image's**
+    /// data range — not the label's own values — so a label confined to a narrow band gets
+    /// a median quantized to a coarse bin centre.
+    ///
+    /// Label 1 holds `0.0, 1.0, 2.0` (true median `1.0`) while label 2 holds a single
+    /// `1000.0`, which is what stretches the range. Bin width is `1000/256 = 3.90625`, all
+    /// three of label 1's values fall in bin 0, and the reported median is that bin's
+    /// centre, `1.953125`. Scope the range to the label's own voxels instead and the
+    /// answer moves to ≈`1.0` — which is the mutation this pin exists to catch.
+    #[test]
+    fn label_statistics_median_for_float_is_quantized_by_the_whole_images_range() {
+        let intensities = Image::from_vec(&[4, 1], vec![0.0f64, 1.0, 2.0, 1000.0]).unwrap();
+        let labels = img_u32(&[4, 1], vec![1, 1, 1, 2]);
+        let stats = label_statistics(&intensities, &labels).unwrap();
+
+        assert_eq!(
+            stats[&1].median, 1.953125,
+            "bin 0's centre, not the true median 1.0"
+        );
+        assert_ne!(stats[&1].median, 1.0);
+        // The single 1000.0 sits at the upper bound, which `GetIndex` folds into the last
+        // bin rather than dropping (`itkHistogram.hxx:275-284`).
+        assert_eq!(stats[&2].median, (996.09375 + 1000.0) / 2.0);
+    }
+
+    /// ITK computes the histogram's bin interval and every bin edge in **`float`**
+    /// (`itkHistogram.hxx:222-234`), so the edges — and therefore the bin centres a median
+    /// reports — carry `f32` rounding even for a `double` histogram. Reproduced, not
+    /// cleaned up: this asserts the edge differs from the `f64` computation.
+    #[test]
+    fn the_histogram_bin_edges_carry_itks_float_rounding() {
+        let (lower, upper) = (0.0f64, 1.0f64 / 3.0);
+        let (mins, _) = bin_edges(lower, upper);
+
+        let interval = (upper as f32 - lower as f32) / HISTOGRAM_BINS as f32;
+        let itk_edge = lower + (128.0f32 * interval) as f64;
+        let f64_edge = lower + 128.0 * (upper - lower) / HISTOGRAM_BINS as f64;
+
+        assert_eq!(mins[128], itk_edge);
+        assert_ne!(
+            mins[128], f64_edge,
+            "the f32 interval is upstream's and must survive: {itk_edge} vs {f64_edge}"
+        );
     }
 
     #[test]

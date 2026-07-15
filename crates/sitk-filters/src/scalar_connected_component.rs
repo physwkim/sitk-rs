@@ -46,9 +46,12 @@
 //! exactly; the numeric label assigned to a given component may not.
 //!
 //! `MaskImage` (optional; `TMaskImage` is fixed to `uint8_t` in
-//! `ScalarConnectedComponentImageFilter.yaml`'s `filter_type`) excludes a
-//! pixel from labeling entirely when the mask value quantizes to `0`
-//! (`MaskPixelType{}`): it is set to output `0` and is skipped both as a
+//! `ScalarConnectedComponentImageFilter.yaml`'s `filter_type`, and SimpleITK's
+//! `CastImageToITK` is a `dynamic_cast`, so any other pixel type is refused
+//! rather than converted) excludes a pixel from labeling entirely when the mask
+//! value **equals `0`** (`MaskPixelType{}`) — every other value keeps it, which
+//! is `MaskImageFilter`'s polarity and the opposite of the threshold family's
+//! (ledger §2.175). An excluded pixel is set to output `0` and is skipped both as a
 //! sweep target and as a candidate neighbor, matching the boundary
 //! condition's `ConstantBoundaryCondition<TOutputImage>` of `0` for
 //! out-of-frame neighbors (never satisfies `neighborLabel != 0`, so this
@@ -58,10 +61,10 @@
 //! Output pixel type is fixed `uint32_t`
 //! (`output_pixel_type: uint32_t`).
 
-use crate::error::{FilterError, Result};
+use crate::error::Result;
 use crate::quantize_to_pixel_type;
 use crate::reconstruction::{Half, NeighborWalker};
-use sitk_core::{Image, PixelId};
+use sitk_core::Image;
 
 fn find(parent: &mut [usize], x: usize) -> usize {
     let mut root = x;
@@ -88,23 +91,26 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// `ScalarConnectedComponentImageFilter`: labels pixels whose values chain
 /// together within `distance_threshold` (`|a - b| <= distance_threshold`,
 /// transitively -- see the module docs for why every non-masked pixel gets
-/// a label, unlike [`crate::label::connected_component`]). `mask`, if
-/// given, excludes pixels quantizing to `0` from labeling (they become
-/// output `0`); it must match `image`'s size.
+/// a label, unlike [`crate::label::connected_component`]).
+///
+/// `mask`, if given, excludes the pixels where it is **`0`** (they become output
+/// `0`) and keeps every other value —
+/// `ConnectedComponentFunctorImageFilter::GenerateData` open-codes exactly that
+/// test (`itkConnectedComponentFunctorImageFilter.hxx:97-110`:
+/// `if (mit.Get() == MaskPixelType{}) { oit.Set(OutputPixelType{}); }`), which is
+/// `MaskImageFilter`'s convention, not the threshold family's. It must be
+/// `UInt8`, `image`'s size, and on `image`'s grid — see
+/// [`crate::mask_input::uint8_mask_voxels`].
 pub fn scalar_connected_component(
     image: &Image,
     mask: Option<&Image>,
     distance_threshold: f64,
     fully_connected: bool,
 ) -> Result<Image> {
-    if let Some(m) = mask
-        && m.size() != image.size()
-    {
-        return Err(FilterError::SizeMismatch {
-            a: image.size().to_vec(),
-            b: m.size().to_vec(),
-        });
-    }
+    let mask_voxels = match mask {
+        None => None,
+        Some(m) => Some(crate::mask_input::uint8_mask_voxels(image, m)?),
+    };
 
     let size = image.size();
     let total: usize = size.iter().product();
@@ -112,13 +118,9 @@ pub fn scalar_connected_component(
     let id = image.pixel_id();
     let threshold = quantize_to_pixel_type(id, distance_threshold);
 
-    let included: Vec<bool> = match mask {
+    let included: Vec<bool> = match mask_voxels {
         None => vec![true; total],
-        Some(m) => m
-            .to_f64_vec()?
-            .into_iter()
-            .map(|v| quantize_to_pixel_type(PixelId::UInt8, v) != 0.0)
-            .collect(),
+        Some(m) => m.iter().map(|&v| v != 0).collect(),
     };
 
     let mut parent: Vec<usize> = (0..total).collect();
@@ -162,6 +164,8 @@ pub fn scalar_connected_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::FilterError;
+    use sitk_core::PixelId;
 
     fn img_i32(size: &[usize], data: Vec<i32>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -255,6 +259,38 @@ mod tests {
                 a: vec![3, 1],
                 b: vec![2, 1],
             })
+        );
+    }
+
+    /// SimpleITK fixes the mask template to `itk::Image<uint8_t, Dim>` and casts
+    /// it with `CastImageToITK` -- a `dynamic_cast`, so a mask of any other pixel
+    /// type throws upstream. This port refused nothing and quantized instead,
+    /// which silently accepted (say) a `Float64` mask of `0.4`s as all-background.
+    #[test]
+    fn a_mask_that_is_not_uint8_is_refused_by_name() {
+        let image = img_i32(&[3, 1], vec![5, 5, 5]);
+        let mask = Image::from_vec(&[3, 1], vec![1u16, 0, 1]).unwrap();
+        assert_eq!(
+            scalar_connected_component(&image, Some(&mask), 0.0, false),
+            Err(FilterError::RequiresUInt8MaskPixelType(PixelId::UInt16))
+        );
+    }
+
+    /// The mask is a pipeline input, so `VerifyInputInformation` compares its
+    /// physical space with the image's and throws on a mismatch. The aligned mask
+    /// is accepted first, or the refusal would prove nothing.
+    #[test]
+    fn a_mask_on_a_different_grid_is_refused() {
+        let image = img_i32(&[3, 1], vec![5, 5, 5]);
+        let aligned = img_u8(&[3, 1], vec![1, 0, 1]);
+        scalar_connected_component(&image, Some(&aligned), 0.0, false)
+            .expect("an aligned mask must be accepted, or the refusal below proves nothing");
+
+        let mut shifted = img_u8(&[3, 1], vec![1, 0, 1]);
+        shifted.set_origin(&[5.0, 0.0]).unwrap();
+        assert_eq!(
+            scalar_connected_component(&image, Some(&shifted), 0.0, false),
+            Err(FilterError::PhysicalSpaceMismatch { index: 1 })
         );
     }
 

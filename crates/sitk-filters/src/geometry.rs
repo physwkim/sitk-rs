@@ -19,12 +19,60 @@
 //! - `itkPermuteAxesImageFilter.h` / `.hxx` ([`permute_axes`])
 
 use crate::error::{FilterError, Result};
-use crate::image_from_f64;
 use sitk_core::{
     BoundaryCondition, ConstantBoundaryCondition, Image, MirrorBoundaryCondition,
-    PeriodicBoundaryCondition, PixelId, Scalar, ScalarView, ZeroFluxNeumannBoundaryCondition,
+    PeriodicBoundaryCondition, Scalar, ScalarView, ZeroFluxNeumannBoundaryCondition,
     dispatch_scalar, matrix,
 };
+
+/// Whether a filter's secondary input (a mask, a second series member) sits on
+/// the same physical grid as its primary — `ImageBase::IsCongruentImageGeometry`
+/// (`itkImageBase.hxx:391-406`), which every `ImageToImageFilter` applies to its
+/// extra inputs in `VerifyInputInformation` before it will run.
+///
+/// The predicate itself lives in `sitk-core` as
+/// [`Image::is_congruent_image_geometry`]; this is only the point that pins the
+/// tolerances to `ImageToImageFilter`'s `GlobalDefaultCoordinateTolerance` /
+/// `GlobalDefaultDirectionTolerance` (`itkImageToImageFilter.h`), which none of
+/// this crate's filters override. It is one function because it was three: two
+/// filter modules had grown byte-identical private copies, and the masked
+/// thresholds (§2.173) needed a third.
+pub(crate) fn same_physical_space(primary: &Image, other: &Image) -> bool {
+    primary.is_congruent_image_geometry(
+        other,
+        Image::DEFAULT_IMAGE_COORDINATE_TOLERANCE,
+        Image::DEFAULT_IMAGE_DIRECTION_TOLERANCE,
+    )
+}
+
+/// The one gate every multi-image filter that ITK *verifies* routes through:
+/// `other` (the filter's input number `index`, counting the primary as input 0)
+/// must sit on the primary's grid, or the whole family returns the *same*
+/// [`FilterError::PhysicalSpaceMismatch`]. A caller cannot tell `add` from `mask`
+/// by which error fired — exactly as ITK throws one "Inputs do not occupy the
+/// same physical space!" for every filter that inherits
+/// `ImageToImageFilter::VerifyInputInformation`.
+///
+/// The audit that decides who calls this is `doc/physical-space-audit.md`.
+/// VERIFIES-AND-ADDS filters (`masked_fft_normalized_correlation`) call this
+/// first and then add their own comparison beside it, mirroring an override that
+/// calls `Superclass::VerifyInputInformation()` first. Filters ITK exempts
+/// (`histogram_matching`, the convolution/deconvolution family, `paste`, `tile`,
+/// `demons_registration`) and those whose second image never becomes a pipeline
+/// input (`scalar_chan_and_vese_dense_level_set`'s initial level set,
+/// `normalized_correlation`'s template) must **not** call this — a check there is
+/// a divergence, not a fix.
+pub(crate) fn require_same_physical_space(
+    primary: &Image,
+    other: &Image,
+    index: usize,
+) -> Result<()> {
+    if same_physical_space(primary, other) {
+        Ok(())
+    } else {
+        Err(FilterError::PhysicalSpaceMismatch { index })
+    }
+}
 
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
@@ -61,21 +109,20 @@ fn extract_block(img: &Image, offset: &[usize], out_size: &[usize]) -> Result<Im
     let out_strides = strides(out_size);
     let out_count: usize = out_size.iter().product();
 
-    let in_vals = img.to_f64_vec()?;
-    let mut out_vals = vec![0.0f64; out_count];
-    for (o, slot) in out_vals.iter_mut().enumerate() {
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for d in 0..dim {
             let oi = (o / out_strides[d]) % out_size[d];
             in_flat += (oi + offset[d]) * in_strides[d];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
     let offset_f: Vec<f64> = offset.iter().map(|&o| o as f64).collect();
     let out_origin = img.continuous_index_to_physical_point(&offset_f);
 
-    let mut out = image_from_f64(img.pixel_id(), out_size, img, &out_vals)?;
+    let mut out = img.gather(out_size, &sources, 0.0)?;
     out.set_origin(&out_origin)?;
     Ok(out)
 }
@@ -129,18 +176,6 @@ pub fn region_of_interest(img: &Image, index: &[usize], size: &[usize]) -> Resul
 }
 
 // ---- extract ----------------------------------------------------------
-
-fn build_bare_from_f64<T: Scalar>(size: &[usize], vals: &[f64]) -> Result<Image> {
-    let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
-    Ok(Image::from_vec(size, out)?)
-}
-
-/// Build an image of `target` pixel type directly from `f64` values with no
-/// geometry, for [`extract`]'s dimension-changing case (`Image::copy_geometry_from`
-/// requires equal dimension, which does not hold when axes collapse).
-fn bare_image_from_f64(target: PixelId, size: &[usize], vals: &[f64]) -> Result<Image> {
-    dispatch_scalar!(target, build_bare_from_f64, size, vals)
-}
 
 /// `ExtractImageFilter` (itkExtractImageFilter.h, Core/Common): extract the
 /// block `[index, index + size)`, collapsing any axis where `size[d] == 0`
@@ -224,9 +259,8 @@ pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec()?;
-    let mut out_vals = vec![0.0f64; out_count];
-    for (o, slot) in out_vals.iter_mut().enumerate() {
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for d in 0..dim {
             if size[d] == 0 {
@@ -237,10 +271,10 @@ pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
             let oi = (o / out_strides[a]) % out_size[a];
             in_flat += (oi + index[d]) * in_strides[d];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
-    let mut out = bare_image_from_f64(img.pixel_id(), &out_size, &out_vals)?;
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
     out.set_spacing(&out_spacing)?;
     out.set_origin(&out_origin)?;
     out.set_direction(&out_direction)?;
@@ -455,19 +489,19 @@ pub fn flip(img: &Image, axes: &[bool], flip_about_origin: bool) -> Result<Image
     }
 
     let in_strides = strides(size);
-    let in_vals = img.to_f64_vec()?;
-    let mut out_vals = vec![0.0f64; in_vals.len()];
-    for (o, slot) in out_vals.iter_mut().enumerate() {
+    let out_count = img.number_of_pixels();
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for d in 0..dim {
             let oi = (o / in_strides[d]) % size[d];
             let ii = if axes[d] { size[d] - 1 - oi } else { oi };
             in_flat += ii * in_strides[d];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
-    let mut out = image_from_f64(img.pixel_id(), size, img, &out_vals)?;
+    let mut out = img.gather(size, &sources, 0.0)?;
     out.set_origin(&out_origin)?;
     out.set_direction(&out_direction)?;
     Ok(out)
@@ -513,19 +547,18 @@ pub fn permute_axes(img: &Image, order: &[usize]) -> Result<Image> {
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
-    let in_vals = img.to_f64_vec()?;
-    let mut out_vals = vec![0.0f64; out_count];
-    for (o_flat, slot) in out_vals.iter_mut().enumerate() {
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o_flat, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for j in 0..dim {
             let k = inverse_order[j];
             let idx_k = (o_flat / out_strides[k]) % out_size[k];
             in_flat += idx_k * in_strides[j];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
-    let mut out = image_from_f64(img.pixel_id(), &out_size, img, &out_vals)?;
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
     out.set_spacing(&out_spacing)?;
     out.set_direction(&out_direction)?;
     Ok(out)
@@ -977,6 +1010,161 @@ mod tests {
         assert_eq!(
             permute_axes(&img, &[0, 2]),
             Err(FilterError::InvalidPermutation(vec![0, 2], 2))
+        );
+    }
+
+    // ---- native pixel movement: lossless for u64 above 2^53 ----
+    //
+    // 2^53 + 1 (9007199254740993) is the smallest u64 an f64 cannot represent;
+    // the old `to_f64_vec` seam rounded it to 2^53. Each test's `assert_ne!`
+    // non-vacuity guard proves the input is a value the f64 round-trip would
+    // corrupt, so a pass demonstrates the native gather path really moved the
+    // exact bits.
+
+    const U64_NON_F64: u64 = (1 << 53) + 1;
+
+    fn u64_seq(len: usize) -> Vec<u64> {
+        (0..len as u64).map(|v| U64_NON_F64 + v).collect()
+    }
+
+    #[test]
+    fn crop_and_region_of_interest_move_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[4, 4], u64_seq(16)).unwrap();
+        let cropped = crop(&img, &[1, 1], &[1, 1]).unwrap();
+        assert_eq!(
+            cropped.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 6,
+                U64_NON_F64 + 9,
+                U64_NON_F64 + 10
+            ]
+        );
+        let roi = region_of_interest(&img, &[1, 0], &[2, 2]).unwrap();
+        assert_eq!(
+            roi.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 6
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 3, 3], u64_seq(27)).unwrap();
+        let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
+        // The z=1 slice collapses to 2-D; it is input pixels 9..18.
+        let expected: Vec<u64> = (9..18).map(|i| U64_NON_F64 + i).collect();
+        assert_eq!(out.dimension(), 2);
+        assert_eq!(out.scalar_slice::<u64>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn flip_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 2], u64_seq(6)).unwrap();
+        let out = flip(&img, &[true, false], false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 1,
+                U64_NON_F64,
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 4,
+                U64_NON_F64 + 3
+            ]
+        );
+    }
+
+    #[test]
+    fn permute_axes_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 2], u64_seq(6)).unwrap();
+        let out = permute_axes(&img, &[1, 0]).unwrap();
+        // output(y, x) = input(x, y): source offsets [0, 3, 1, 4, 2, 5].
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 4,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 5
+            ]
+        );
+    }
+
+    // The pad ops were already native (they read pixels through `ScalarView`,
+    // never `to_f64_vec`); these pin that interior pixels keep exact bits — the
+    // constant fill still quantizes, matching ITK's `static_cast` fill value.
+    #[test]
+    fn pads_move_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[4, 1], u64_seq(4)).unwrap();
+
+        let cp = constant_pad(&img, &[1, 0], &[1, 0], 9.0).unwrap();
+        assert_eq!(
+            cp.scalar_slice::<u64>().unwrap(),
+            &[
+                9,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                9
+            ]
+        );
+
+        let mp = mirror_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            mp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 1,
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 2
+            ]
+        );
+
+        let wp = wrap_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            wp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64,
+                U64_NON_F64 + 1
+            ]
+        );
+
+        let zp = zero_flux_neumann_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            zp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3
+            ]
         );
     }
 }

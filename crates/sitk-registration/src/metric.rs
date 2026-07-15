@@ -64,7 +64,7 @@
 //! other transform's.
 
 use sitk_core::parallel;
-use sitk_core::{Image, Scalar, dispatch_scalar};
+use sitk_core::{Image, Scalar, coord, dispatch_scalar};
 use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
@@ -255,6 +255,27 @@ fn gather_values<T: IntoSampleValues>(
     }))
 }
 
+/// The `(min, max)` of every voxel a mask admits — the [`FixedRangeScope::WholeFixedImage`]
+/// scan. `None` when the mask admits no voxel.
+///
+/// Streaming, not gathering: the unmasked case hands the native buffer straight to
+/// `parallel::min_max`, and the masked case folds without materializing the admitted subset.
+fn masked_min_max<T: Scalar>(img: &Image, mask: Option<&[f64]>) -> Result<Option<(f64, f64)>> {
+    let src = img.scalar_slice::<T>()?;
+    Ok(match mask {
+        None => parallel::min_max(src),
+        Some(m) => src
+            .iter()
+            .zip(m)
+            .filter(|&(_, &mv)| mv != 0.0)
+            .map(|(&v, _)| v.as_f64())
+            .fold(None, |acc, v| match acc {
+                None => Some((v, v)),
+                Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+            }),
+    })
+}
+
 /// Where a sample's physical point comes from.
 ///
 /// The unsampled, unmasked default — the SimpleITK default, and what a
@@ -313,6 +334,36 @@ fn explicit_points(grid: &VirtualGrid, flats: &[usize], dim: usize) -> Vec<f64> 
 
 /// The fixed image reduced to its sample set (the registration *virtual
 /// domain*): every pixel's value and its physical point, precomputed once.
+/// **Which voxel set a metric's fixed-axis intensity range is scoped to.** ITK's two
+/// joint-histogram metrics disagree, and the disagreement is deliberate on their side:
+///
+/// * `MattesMutualInformationImageToImageMetricv4::Initialize` branches on
+///   `m_UseSampledPointSet` and, when sampling is on, takes the fixed min/max **from the
+///   sampled points alone** — its own comment says so:
+///   *"If m_UseSampledPointSet is true, then \*ONLY\* the sparse sampled points are used for
+///   analysis of the metric, and the fixed space intensity range values will be fixed to
+///   those values identified in the sparse sampled points"*
+///   (`itkMattesMutualInformationImageToImageMetricv4.hxx:102-155`).
+/// * `JointHistogramMutualInformationImageToImageMetricv4::Initialize` has **no such
+///   branch**: it walks the fixed image's whole requested region with an
+///   `ImageRegionConstIteratorWithIndex`, gated only by the fixed *mask*, and the sampled
+///   point set never touches that scan
+///   (`itkJointHistogramMutualInformationImageToImageMetricv4.hxx:86-111`).
+///
+/// So with `Regular`/`Random` sampling the two metrics size their fixed axis from
+/// different voxels, and a range owner shared between them cannot have a default: whichever
+/// one it picks, the other metric silently inherits the wrong scope, which is exactly what
+/// this port did (ledger §2.177). Naming the scope is therefore a *parameter of the ask*,
+/// not a setting — a caller cannot forget what it never had a default for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FixedRangeScope {
+    /// The drawn (and fixed-mask-admitted) samples only — `MattesMutualInformation`.
+    SampledPoints,
+    /// Every fixed-image voxel the fixed mask admits, whatever the sampling strategy —
+    /// `JointHistogramMutualInformation`.
+    WholeFixedImage,
+}
+
 pub struct FixedSamples {
     pub(crate) dim: usize,
     /// Identity for a device-resident copy of these buffers — see [`next_id`].
@@ -325,6 +376,12 @@ pub struct FixedSamples {
     /// the full-grid default, materialized only for a sampled or masked subset.
     /// Read through [`point`](Self::point), never directly.
     pub(crate) points: SamplePoints,
+    /// The fixed image's `(min, max)` over **every mask-admitted voxel**, whatever the
+    /// sampling strategy — [`FixedRangeScope::WholeFixedImage`]. Computed once at
+    /// construction because the samples cannot reconstruct it: a `Regular`/`Random` draw
+    /// that misses the extremes has a strictly narrower range, and that is the whole point
+    /// of the distinction.
+    whole_image_range: (f64, f64),
     /// Minimum fixed-image spacing (the maximum physical step for optimization).
     min_spacing: f64,
     /// The virtual domain as a grid. The metric never reads it — only the
@@ -497,6 +554,13 @@ impl FixedSamples {
             },
         };
 
+        // The other scope, and it is not derivable from `values`: the whole fixed image,
+        // gated by the fixed mask and by nothing else. Streamed rather than gathered — a
+        // 256³ index list would cost more than the scan it feeds.
+        let whole_image_range: (f64, f64) =
+            dispatch_scalar!(fixed.pixel_id(), masked_min_max, fixed, mask_buf.as_deref())?
+                .unwrap_or((0.0, 0.0));
+
         let min_spacing = fixed
             .spacing()
             .iter()
@@ -509,6 +573,7 @@ impl FixedSamples {
             id: next_id(),
             values,
             points,
+            whole_image_range,
             min_spacing,
             grid,
         })
@@ -556,12 +621,20 @@ impl FixedSamples {
         self.values.get(s)
     }
 
-    /// The `(min, max)` of the sampled fixed-image values. `(0, 0)` when empty.
-    /// This is the fixed-image intensity range over the analysis region (full
-    /// sampling ⇒ the whole image), which the Mattes MI metric uses to size the
-    /// joint-histogram fixed axis.
-    pub(crate) fn value_range(&self) -> (f64, f64) {
-        self.values.min_max().unwrap_or((0.0, 0.0))
+    /// The fixed-image intensity range that sizes a joint histogram's **fixed
+    /// axis** — over the voxel set the caller's upstream class scopes it to.
+    ///
+    /// `scope` is not a convenience: ITK's two joint-histogram metrics scope this
+    /// range to *different* voxel sets, and taking the wrong one changes every bin
+    /// index (see [`FixedRangeScope`]). It has no default, because a default is how
+    /// the second metric inherited the first one's scope.
+    ///
+    /// `(0, 0)` when the scope admits no voxel.
+    pub(crate) fn fixed_value_range(&self, scope: FixedRangeScope) -> (f64, f64) {
+        match scope {
+            FixedRangeScope::SampledPoints => self.values.min_max().unwrap_or((0.0, 0.0)),
+            FixedRangeScope::WholeFixedImage => self.whole_image_range,
+        }
     }
 
     /// Build a scale/learning-rate estimator of `kind` for `transform` over
@@ -734,8 +807,13 @@ impl MovingImage {
     }
 
     /// Whether continuous index `c` is allowed by the moving mask (always
-    /// `true` when there is no mask). Rounds to the nearest voxel, matching
-    /// ITK's `ImageMaskSpatialObject` point-in-mask test.
+    /// `true` when there is no mask). Rounds to the nearest voxel with
+    /// `RoundHalfIntegerUp` (half toward +∞), matching ITK's
+    /// `ImageMaskSpatialObject` point-in-mask test — which rounds via
+    /// `TransformPhysicalPointToIndex` (itkImageBase.h:476), not Rust's
+    /// half-away-from-zero `f64::round`. The two differ at a negative half:
+    /// `c = −0.5` is inside the buffer (`≥ −0.5`), ITK keeps voxel 0, half-away
+    /// would drop it (`−1`).
     fn mask_allows(&self, c: &[f64]) -> bool {
         let mask = match &self.mask {
             None => return true,
@@ -743,8 +821,8 @@ impl MovingImage {
         };
         let mut flat = 0usize;
         for (d, &cd) in c.iter().enumerate() {
-            let r = cd.round();
-            if r < 0.0 || r as usize >= self.size[d] {
+            let r = coord::round_half_integer_up(cd);
+            if r < 0 || r as usize >= self.size[d] {
                 return false;
             }
             flat += r as usize * self.strides[d];
@@ -811,10 +889,61 @@ impl MovingImage {
         })
     }
 
-    /// The `(min, max)` of the moving-image buffer. `(0, 0)` when empty. The
-    /// Mattes MI metric uses this to size the joint-histogram moving axis.
+    /// The `(min, max)` of the moving image **over the voxels the moving mask
+    /// admits** — every voxel when there is no mask. `(0, 0)` when the admitted
+    /// set is empty.
+    ///
+    /// The mask is not decoration here: this range *sizes* the moving axis of a
+    /// joint histogram. Both callers — [`crate::mattes`] and
+    /// [`crate::joint_histogram`] — turn it into a bin size, a normalized
+    /// minimum, and an out-of-range **reject** that drops the sample entirely, so
+    /// a masked-out voxel that is brighter than everything the mask admits does
+    /// not merely fail to contribute: it stretches every bin and moves every
+    /// sample's bin index. ITK masks both metrics' moving range for exactly this
+    /// reason (`itkMattesMutualInformationImageToImageMetricv4.hxx:199-214`,
+    /// `itkJointHistogramMutualInformationImageToImageMetricv4.hxx:122`), and
+    /// this port did not until 2026-07-14 — see §2.162.
+    ///
+    /// The fixed side needs no equivalent: a fixed mask filters the sample set
+    /// before it is ever reduced ([`FixedSamples::from_image_with`]), so
+    /// [`FixedSamples::value_range`] already sees only admitted voxels.
+    ///
+    /// min/max are **selections**, not sums: exact and order-independent, so this
+    /// is the same answer at any grain and on any backend.
     pub(crate) fn value_range(&self) -> (f64, f64) {
-        self.buf.min_max().unwrap_or((0.0, 0.0))
+        let range = match &self.mask {
+            None => self.buf.min_max(),
+            Some(mask) => self.buf.with(MaskedRange { mask }),
+        };
+        range.unwrap_or((0.0, 0.0))
+    }
+}
+
+/// [`MovingImage::value_range`] under a moving mask, monomorphized over the
+/// buffer's type. The mask is in the buffer's own traversal order, so this is a
+/// straight zip — no continuous index, no rounding, no interpolation.
+///
+/// Seeded and folded exactly as [`sitk_core::parallel::min_max`]'s serial scan is
+/// (`±∞`, then `f64::min`/`f64::max`, which skip NaN), and `None` on an empty
+/// admitted set, so masking narrows *which voxels* are reduced and changes nothing
+/// about *how*.
+struct MaskedRange<'a> {
+    mask: &'a [bool],
+}
+
+impl WithBuf for MaskedRange<'_> {
+    type Out = Option<(f64, f64)>;
+
+    fn call<T: Scalar>(self, buf: &[T]) -> Self::Out {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut any = false;
+        for (v, _) in buf.iter().zip(self.mask).filter(|&(_, &m)| m) {
+            let v = v.as_f64();
+            lo = lo.min(v);
+            hi = hi.max(v);
+            any = true;
+        }
+        any.then_some((lo, hi))
     }
 }
 
@@ -1508,6 +1637,36 @@ mod tests {
             after < before,
             "moving mask should drop previously-valid points: after {after} vs before {before}"
         );
+    }
+
+    // The mask point-in-buffer test rounds the continuous index with ITK's
+    // RoundHalfIntegerUp, not Rust's half-away-from-zero f64::round. They diverge
+    // at exactly a negative half: continuous index -0.5 is inside the buffer,
+    // ITK's ImageMaskSpatialObject keeps voxel 0, so a set voxel-0 mask ALLOWS it.
+    // The pre-fix port rounded -0.5 with f64::round -> -1 -> out of bounds ->
+    // wrongly rejected the sample.
+    #[test]
+    fn mask_allows_keeps_negative_half_index_at_voxel_zero() {
+        let img = Image::from_vec(&[4, 4], vec![1.0; 16]).unwrap();
+        // Mask allows only voxel (0,0); every other voxel is masked out.
+        let mut mv = vec![0.0f64; 16];
+        mv[0] = 1.0;
+        let mask = Image::from_vec(&[4, 4], mv).unwrap();
+        let moving = MovingImage::from_image(&img)
+            .unwrap()
+            .with_moving_mask(&mask)
+            .unwrap();
+
+        // Continuous index (-0.5, -0.5): RoundHalfIntegerUp -> (0, 0), inside the
+        // set voxel -> allowed.
+        assert!(moving.mask_allows(&[-0.5, -0.5]));
+        // Non-vacuity: Rust f64::round would send -0.5 -> -1 (out of bounds), so a
+        // regressed mask_allows using it would return false here.
+        assert_eq!((-0.5f64).round() as i64, -1);
+        // And a component just past the half (-0.6) does round to -1 under ITK too,
+        // so the mask correctly rejects it — proving the -0.5 accept is the boundary,
+        // not blanket acceptance of all negatives.
+        assert!(!moving.mask_allows(&[-0.6, -0.5]));
     }
 
     /// The pre-fast-path mean-squares reduction: always uses the dense

@@ -27,9 +27,9 @@
 
 use crate::error::Result;
 use crate::logic::require_integer_pixel_type;
-use crate::{image_from_f64, quantize_to_pixel_type};
-use sitk_core::Image;
+use sitk_core::{Image, PixelId, Scalar};
 use std::collections::HashMap;
+use std::hash::Hash;
 
 /// `ChangeLabelImageFilter::SetChangeMap`: `change_map` is a list of
 /// `(original, result)` pairs, matching `std::map<double, double>`'s
@@ -37,25 +37,61 @@ use std::collections::HashMap;
 /// whose value matches no `original` entry passes through unchanged.
 pub fn change_label(image: &Image, change_map: &[(f64, f64)]) -> Result<Image> {
     require_integer_pixel_type(image)?;
-    let id = image.pixel_id();
 
     let mut pairs: Vec<(f64, f64)> = change_map.to_vec();
     pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    let mut lookup: HashMap<u64, f64> = HashMap::with_capacity(pairs.len());
-    for (original, result) in pairs {
-        let key = quantize_to_pixel_type(id, original);
-        let value = quantize_to_pixel_type(id, result);
-        lookup.insert(key.to_bits(), value);
+    // Dispatch on the (integer) component type and build the map natively, so an
+    // un-remapped `UInt64`/`Int64` pixel above `2^53` passes through bit-for-bit
+    // rather than being collapsed by a `to_f64_vec` round-trip (`2^53 + 1 ->
+    // 2^53`). `require_integer_pixel_type` has already rejected floating-point
+    // images, so the float arm is unreachable; a *vector* integer image resolves
+    // to its component type here and then errors in `scalar_slice`, exactly as
+    // the old `to_f64_vec` did.
+    match image.pixel_id().component_id() {
+        PixelId::UInt8 => change_label_native::<u8>(image, &pairs),
+        PixelId::Int8 => change_label_native::<i8>(image, &pairs),
+        PixelId::UInt16 => change_label_native::<u16>(image, &pairs),
+        PixelId::Int16 => change_label_native::<i16>(image, &pairs),
+        PixelId::UInt32 => change_label_native::<u32>(image, &pairs),
+        PixelId::Int32 => change_label_native::<i32>(image, &pairs),
+        PixelId::UInt64 => change_label_native::<u64>(image, &pairs),
+        PixelId::Int64 => change_label_native::<i64>(image, &pairs),
+        other => unreachable!(
+            "change_label: require_integer_pixel_type rejects non-integer pixel \
+             types (got component {other:?})"
+        ),
+    }
+}
+
+/// The native remap for one integer pixel type: quantize each `(original,
+/// result)` pair to `T` (the `f64`-sourced keys/values collapse to `T` via
+/// [`Scalar::from_f64`], the same quantization the public `f64` API always
+/// implied), then map every pixel through a `HashMap<T, T>`, passing an
+/// unmapped pixel through unchanged. The pass-through is a plain `T` copy, so it
+/// is exact for `T = u64`/`i64` above `2^53`.
+///
+/// The sorted `pairs` give `std::map<double, double>`'s ascending-raw-key,
+/// last-write-wins resolution: two raw keys that quantize to the same `T`
+/// collide in the map and the larger raw key (inserted later) wins.
+fn change_label_native<T: Scalar + Eq + Hash>(
+    image: &Image,
+    pairs: &[(f64, f64)],
+) -> Result<Image> {
+    let mut lookup: HashMap<T, T> = HashMap::with_capacity(pairs.len());
+    for &(original, result) in pairs {
+        lookup.insert(T::from_f64(original), T::from_f64(result));
     }
 
-    let vals = image.to_f64_vec()?;
-    let out: Vec<f64> = vals
+    let vals = image.scalar_slice::<T>()?;
+    let out: Vec<T> = vals
         .iter()
-        .map(|&v| lookup.get(&v.to_bits()).copied().unwrap_or(v))
+        .map(|&v| lookup.get(&v).copied().unwrap_or(v))
         .collect();
 
-    image_from_f64(id, image.size(), image, &out)
+    let mut img = Image::from_vec(image.size(), out)?;
+    img.copy_geometry_from(image);
+    Ok(img)
 }
 
 #[cfg(test)]
@@ -121,6 +157,19 @@ mod tests {
         let image = img_i32(&[2, 1], vec![1, 2]);
         let out = change_label(&image, &[(1.0, 9.0)]).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Int32);
+    }
+
+    /// An un-remapped `UInt64` pixel above `2^53` passes through bit-for-bit.
+    /// `2^53 + 1` is not `f64`-representable, so the old `to_f64_vec` path
+    /// collapsed it to `2^53`; the native `HashMap<u64, u64>` pass-through does
+    /// not. A remapped small label is still rewritten.
+    #[test]
+    fn unmapped_u64_above_2_53_passes_through_losslessly() {
+        let hard = (1u64 << 53) + 1; // 9_007_199_254_740_993
+        let image = Image::from_vec(&[3, 1], vec![1u64, hard, u64::MAX]).unwrap();
+        let out = change_label(&image, &[(1.0, 7.0)]).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt64);
+        assert_eq!(out.scalar_slice::<u64>().unwrap(), &[7, hard, u64::MAX]);
     }
 
     /// `pixel_types: IntegerPixelIDTypeList` -- a floating-point image is

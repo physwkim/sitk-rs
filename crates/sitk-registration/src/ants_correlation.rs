@@ -100,7 +100,7 @@
 //!   `derivWRTImage · J_T`, exactly the sign flip documented in
 //!   [`mattes`](crate::mattes).
 
-use sitk_core::Image;
+use sitk_core::{Image, coord};
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{physical_to_index_matrix, strides};
 
@@ -274,8 +274,10 @@ impl AntsNeighborhoodCorrelationMetric {
                     .zip(p.iter().zip(origin.iter()))
                     .map(|(&m, (&pj, &oj))| m * (pj - oj))
                     .sum();
+                // RoundHalfIntegerUp (half toward +∞) to locate the sample's
+                // voxel, matching ITK's index rounding — not half-away `f64::round`.
                 sample_index[s * dim + d] =
-                    c.round().clamp(0.0, (raster_size[d] - 1) as f64) as usize;
+                    coord::round_half_integer_up(c).clamp(0, raster_size[d] as i64 - 1) as usize;
             }
         }
 

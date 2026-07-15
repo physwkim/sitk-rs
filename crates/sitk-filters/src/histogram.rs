@@ -23,15 +23,207 @@
 //! `margin == 0`, so every bin edge collapses to the same value and every
 //! pixel clips into the *last* bin — not bin 0.
 //!
-//! ITK computes bin edges in `NumericTraits<T>::RealType`, which is `double`
-//! for **every** scalar pixel type including `float`
-//! (itkNumericTraits.h:1349/1356) — and `ScalarImageToHistogramGenerator`
-//! hardcodes `Histogram<double>` outright — so both upstream Otsu paths run
-//! bin edges in `double` for every input. This port computes bin edges in
-//! `f64` uniformly for every caller, matching that rule exactly.
+//! **This port diverges from ITK on bin-edge precision (deliberate, §4.124).**
+//! `itk::Statistics::Histogram::Initialize(size, lower, upper)` computes the bin
+//! interval and every bin edge in `float`, *regardless* of the histogram's
+//! `MeasurementType`: `float interval = (float(upper) − float(lower)) /
+//! float(size)`, then `SetBinMin/Max(… (MeasurementType)(lower + float(j) *
+//! interval))` (`itkHistogram.hxx:224-235`). Both upstream paths reach exactly
+//! that method — `ImageToHistogramFilter` for the `HistogramThresholdImageFilter`
+//! family (`itkImageToHistogramFilter.hxx:178,237`) and `SampleToHistogramFilter`
+//! for `OtsuMultipleThresholds` via `ScalarImageToHistogramGenerator`
+//! (`itkSampleToHistogramFilter.hxx:248`) — so a `Histogram<double>` does *not*
+//! make the edge arithmetic `double`; the edges are float-precision positions
+//! widened to the measurement type. This port instead computes bin edges in
+//! `f64` uniformly for every caller. Away from float-exact intervals (e.g.
+//! 100/200/250 bins, or a float data range) a pixel can land in a different bin
+//! than ITK and shift the selected threshold — see ledger §4.124. The port keeps
+//! `f64` (uniform crate precision, strictly more accurate; SimpleITK's default
+//! 128-bin/`[0,255]` is float-exact, so defaults do not diverge).
 
 use crate::error::{FilterError, Result};
-use sitk_core::parallel;
+use sitk_core::{Image, PixelId, parallel};
+
+/// The mask of the `HistogramThresholdImageFilter` family — **one owner for all
+/// twelve** of this crate's histogram-driven thresholds, because twelve local mask
+/// branches is twelve chances to disagree about what a mask means.
+///
+/// ITK routes a masked threshold's histogram through
+/// `Statistics::MaskedImageToHistogramFilter` (`itkHistogramThresholdImageFilter.hxx:78-89`),
+/// and the mask changes the *threshold*, not just the output: the histogram — and,
+/// under `AutoMinimumMaximum`, its **bin range** — is built from the admitted voxels
+/// only (`itkMaskedImageToHistogramFilter.hxx`, `ThreadedComputeMinimumAndMaximum` and
+/// `ThreadedStreamedGenerateData`, both gated on `maskIt.Get() == maskValue`).
+///
+/// # Two different mask comparisons, in one filter, on purpose
+///
+/// Reproduced exactly, because it is not what a reader would guess:
+///
+/// * **Histogram inclusion** is `mask == mask_value` — an *exact equality*, not
+///   `!= 0`. `mask_value` defaults to `NumericTraits<MaskPixelType>::max()`, i.e.
+///   **255** (`itkHistogramThresholdImageFilter.hxx`'s ctor; SimpleITK's yaml carries
+///   the same `255u` default).
+/// * **Output masking**, when [`mask_output`](Self::mask_output) is true (ITK's and
+///   SimpleITK's default), runs the thresholded image through `MaskImageFilter`
+///   (`.hxx:113-125`), which zeroes where the mask equals its *masking value* — and
+///   that is **`0`**, not `mask_value`.
+///
+/// So with the default `mask_value == 255`, a voxel whose mask is `7` is **excluded
+/// from the histogram** and **kept in the output**. That asymmetry is upstream's, it
+/// is reachable from SimpleITK, and this port reproduces it rather than tidying it.
+pub struct ThresholdMask<'a> {
+    image: &'a Image,
+    mask_value: u8,
+    mask_output: bool,
+}
+
+impl<'a> ThresholdMask<'a> {
+    /// ITK's and SimpleITK's defaults: `mask_value = 255`, `mask_output = true`.
+    pub fn new(image: &'a Image) -> Self {
+        Self {
+            image,
+            mask_value: 255,
+            mask_output: true,
+        }
+    }
+
+    /// The value a mask voxel must **equal** to be admitted to the histogram.
+    pub fn with_mask_value(mut self, mask_value: u8) -> Self {
+        self.mask_value = mask_value;
+        self
+    }
+
+    /// When true (the default), output voxels whose mask is **`0`** are set to `0`.
+    /// Note the value: `0`, not `mask_value` — see the type docs.
+    pub fn with_mask_output(mut self, mask_output: bool) -> Self {
+        self.mask_output = mask_output;
+        self
+    }
+
+    /// The voxels this mask admits to the histogram: `mask == mask_value`, exactly.
+    ///
+    /// Errors with [`FilterError::MaskAdmitsNoVoxels`] when the selection is empty —
+    /// see that variant for why the port refuses instead of reproducing (upstream
+    /// throws in eleven calculators and, in the two Otsu ones, returns **bin zero's
+    /// upper edge** — a finite, plausible-looking threshold no voxel voted for, because
+    /// every `varBetween > maxVarBetween` comparison against a `NaN` is false and the
+    /// search returns its own initializer; see §1.76 and
+    /// [`FilterError::MaskAdmitsNoVoxels`]).
+    fn selected(&self, img: &Image, vals: &[f64]) -> Result<Vec<f64>> {
+        // The mask's three preconditions — `UInt8` (SimpleITK's yaml gives these filters
+        // `MaskImageType = OutputImageType = itk::Image<uint8_t, Dim>`, reached through the
+        // `dynamic_cast` in `CastImageToITK`), the image's size, and the image's *grid*
+        // (`VerifyInputInformation`; ITK never samples a mask) — belong to
+        // [`crate::mask_input`], which owns them for every mask input in this crate.
+        let mask = crate::mask_input::uint8_mask_voxels(img, self.image)?;
+        let selected: Vec<f64> = vals
+            .iter()
+            .zip(mask.iter())
+            .filter(|&(_, &m)| m == self.mask_value)
+            .map(|(&v, _)| v)
+            .collect();
+        if selected.is_empty() {
+            return Err(FilterError::MaskAdmitsNoVoxels {
+                mask_value: self.mask_value,
+            });
+        }
+        Ok(selected)
+    }
+
+    /// `MaskImageFilter` on the thresholded output: zero where the mask is **`0`**.
+    fn apply_to_output(&self, img: &Image, out: &mut [u8]) -> Result<()> {
+        if !self.mask_output {
+            return Ok(());
+        }
+        let mask = crate::mask_input::uint8_mask_voxels(img, self.image)?;
+        for (o, &m) in out.iter_mut().zip(mask.iter()) {
+            if m == 0 {
+                *o = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `HistogramThresholdImageFilter`'s constructor turns `AutoMinimumMaximum` **off**
+/// for the three 8-bit pixel types and leaves it on for every other
+/// (`itkHistogramThresholdImageFilter.hxx:44-53`):
+///
+/// ```text
+/// if (typeid(ValueType) == typeid(signed char) || typeid(ValueType) == typeid(unsigned char) ||
+///     typeid(ValueType) == typeid(char))
+///   { m_AutoMinimumMaximum = false; }
+/// else
+///   { m_AutoMinimumMaximum = true; }
+/// ```
+///
+/// With it off, and with no explicit `HistogramBinMinimum`/`Maximum` (the filter never
+/// sets one), `ImageToHistogramFilter::InitializeOutputHistogram` bins over
+/// `[NonpositiveMin() - 0.5, max() + 0.5]` — the **pixel type's** range, half-integer
+/// offsets and all, with no marginal scale (`itkImageToHistogramFilter.hxx:155-175`).
+/// So an 8-bit image's threshold is computed against `[-0.5, 255.5]` no matter how
+/// narrow its data is, and 128 bins are 2 grey levels wide by construction.
+///
+/// Returns `None` for every other pixel type, which then bins over the data range.
+///
+/// **This is the family's rule, not the crate's.** `OtsuMultipleThresholdsImageFilter`
+/// is a different ITK class: it builds its histogram through
+/// `ScalarImageToHistogramGenerator` → `SampleToHistogramFilter`, whose constructor sets
+/// `AutoMinimumMaximum = true` unconditionally, with no pixel-type branch
+/// (`itkSampleToHistogramFilter.hxx:35`), and the filter never turns it off. It therefore
+/// bins over the *data* range for 8-bit input too — so ITK's two Otsu implementations
+/// disagree with each other on an 8-bit image (ledger §2.174). `otsu_multiple_thresholds`
+/// calls `Histogram::from_values` directly and must keep doing so; only the twelve that
+/// route through [`threshold_histogram`] take this rule.
+fn fixed_bin_range(pixel_id: PixelId) -> Option<(f64, f64)> {
+    match pixel_id {
+        PixelId::UInt8 => Some((-0.5, 255.5)),
+        PixelId::Int8 => Some((-128.5, 127.5)),
+        _ => None,
+    }
+}
+
+/// The histogram every one of this crate's twelve histogram thresholds is built from:
+/// all voxels, or — when a mask is given — exactly the voxels it admits. The single place
+/// both the masked/unmasked choice and the bin-range choice are made.
+///
+/// The two interact, and not in the direction the flag's name suggests: the mask scopes
+/// the bin range **only** on the auto path. `MaskedImageToHistogramFilter` overrides
+/// `ThreadedComputeMinimumAndMaximum`, but that scan is called from inside
+/// `InitializeOutputHistogram`'s `AutoMinimumMaximum` branch alone
+/// (`itkImageToHistogramFilter.hxx:140-152`) — so on an 8-bit image the mask selects
+/// which voxels are *counted* and has no say in the range at all.
+pub(crate) fn threshold_histogram(
+    img: &Image,
+    vals: &[f64],
+    bins: u32,
+    mask: Option<&ThresholdMask>,
+) -> Result<Histogram> {
+    let selected;
+    let counted = match mask {
+        None => vals,
+        Some(m) => {
+            selected = m.selected(img, vals)?;
+            &selected
+        }
+    };
+    match fixed_bin_range(img.pixel_id()) {
+        Some((lower, upper)) => Histogram::from_fixed_range(counted, bins, lower, upper),
+        None => Histogram::from_values(counted, bins),
+    }
+}
+
+/// The output-masking half of the same rule, so no caller hand-rolls it.
+pub(crate) fn apply_threshold_mask_output(
+    img: &Image,
+    out: &mut [u8],
+    mask: Option<&ThresholdMask>,
+) -> Result<()> {
+    match mask {
+        None => Ok(()),
+        Some(m) => m.apply_to_output(img, out),
+    }
+}
 
 /// See the module docs for the construction convention. Single dimension
 /// only (this crate's images are scalar-pixel, so the 1-D case is all
@@ -51,7 +243,6 @@ impl Histogram {
         if vals.is_empty() {
             return Err(FilterError::DegenerateRange);
         }
-        let bins = bins as usize;
 
         // `min`/`max` select an element of the input set: exactly associative, so
         // the chunked scan returns the same bits as the sequential one.
@@ -60,10 +251,40 @@ impl Histogram {
         // `itkImageToHistogramFilter.hxx`'s `ApplyMarginalScale` /
         // `itkSampleToHistogramFilter.hxx`'s equivalent: margin added only to
         // the upper bound, `marginalScale` defaults to 100 in both.
-        let margin = (hi - lo) / bins as f64 / 100.0;
-        let lower = lo;
-        let upper = hi + margin;
-        // `itkHistogram.hxx`'s `Initialize(size, lowerBound, upperBound)`.
+        let margin = (hi - lo) / f64::from(bins) / 100.0;
+        Self::over_range(vals, bins, lo, hi + margin)
+    }
+
+    /// The **non-`AutoMinimumMaximum`** path of `itkImageToHistogramFilter`
+    /// (`.hxx:155-175`): the bin range is fixed, no marginal scale is applied
+    /// ("No marginal scaling is applied in this case"), and the values are
+    /// counted into it with `ClipBinsAtEnds` still `true`.
+    ///
+    /// The range is the *pixel type's*, not the data's — see [`fixed_bin_range`],
+    /// which is where the choice between this and [`from_values`](Self::from_values)
+    /// is made.
+    pub(crate) fn from_fixed_range(
+        vals: &[f64],
+        bins: u32,
+        lower: f64,
+        upper: f64,
+    ) -> Result<Self> {
+        if bins == 0 {
+            return Err(FilterError::InvalidHistogramBins(0));
+        }
+        if vals.is_empty() {
+            return Err(FilterError::DegenerateRange);
+        }
+        Self::over_range(vals, bins, lower, upper)
+    }
+
+    /// `itkHistogram.hxx`'s `Initialize(size, lowerBound, upperBound)` with
+    /// `ClipBinsAtEnds(true)`: equal-width bins spanning `[lower, upper]`, and
+    /// every value counted (clipped into the first/last bin if it falls outside),
+    /// so `total` is `vals.len()`. The two range rules above differ only in how
+    /// they arrive at `lower`/`upper`; the binning itself is one function.
+    fn over_range(vals: &[f64], bins: u32, lower: f64, upper: f64) -> Result<Self> {
+        let bins = bins as usize;
         let interval = (upper - lower) / bins as f64;
 
         let mut bin_min = Vec::with_capacity(bins);

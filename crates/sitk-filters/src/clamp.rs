@@ -10,7 +10,8 @@
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
 use crate::morphology::bounds_for;
-use sitk_core::{Image, PixelId};
+use crate::{FromWide, read_pixels_i128};
+use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
 /// `ClampImageFilter`: casts `img` to `output_type`, clamping the result to
 /// `[lower_bound, upper_bound]`.
@@ -34,12 +35,33 @@ use sitk_core::{Image, PixelId};
 /// undefined behaviour in C++); it only casts a bound that is actually
 /// tighter than the type's own limit.
 ///
-/// The per-pixel functor (`Functor::Clamp::operator()`) then compares the
-/// input value against `[lower, upper]` in `f64` and, for an in-range pixel,
-/// casts the *original* pixel value directly to `output_type` (not the
-/// double-clamped copy — irrelevant for values already in range, but keeps
-/// this a faithful `static_cast`, e.g. truncating a fractional float toward
-/// zero rather than rounding).
+/// The per-pixel functor (`Functor::Clamp::operator()`,
+/// `itkClampImageFilter.h`) is, verbatim:
+///
+/// ```text
+/// const auto dA = static_cast<double>(A);
+/// if (dA < m_LowerBound) return m_LowerBound;
+/// if (dA > m_UpperBound) return m_UpperBound;
+/// return static_cast<OutputType>(A);
+/// ```
+///
+/// — so the **comparison is done in `double`** (`dA`, the input widened to
+/// `f64`), and the in-range pixel returns `static_cast<OutputType>(A)` of the
+/// *original* `A`, **not** of `dA`. This port keeps both halves exactly: the
+/// comparison stays in `f64` (a `UInt64` above `2^53` compares as its rounded
+/// `f64`, matching ITK's `dA` — including ITK's own rounding quirk at a bound),
+/// while the in-range cast goes through the native integer value so it is a true
+/// `static_cast<Out>(A)`.
+///
+/// The old port cast the *`f64` copy* in the in-range branch
+/// (`static_cast<Out>(dA)`), collapsing a `UInt64`/`Int64` value above `2^53`
+/// (e.g. `2^53 + 1 -> 2^53`). For **integer input to integer output** the value
+/// path now runs through `i128` ([`read_pixels_i128`] / [`build_clamp_from_i128`]),
+/// so `static_cast<Out>(A)` is exact. **Any float on either side** keeps the
+/// `f64` path: for a float input it is already exact (`f32 -> f64` lossless), and
+/// for an integer input clamped to `Float32` it preserves the existing
+/// `native -> f64 -> f32` rounding (integer input to `Float64` is identical
+/// either way).
 ///
 /// Errors ([`FilterError::InvalidClampBounds`]) if, after that intersection,
 /// `lower > upper` — matching `itk::Functor::Clamp::SetBounds`, which throws
@@ -75,21 +97,72 @@ pub fn clamp(
         return Err(FilterError::InvalidClampBounds { lower, upper });
     }
 
-    let vals = img.to_f64_vec()?;
-    let out: Vec<f64> = vals
+    if img.pixel_id().is_integer_scalar() && output_type.is_integer_scalar() {
+        // Integer -> integer: compare `(double)A` against the `f64` bounds
+        // (ITK's `dA`), but cast the *native* pixel for the in-range branch.
+        let wide = read_pixels_i128(img)?;
+        dispatch_scalar!(
+            output_type,
+            build_clamp_from_i128,
+            img.size(),
+            img,
+            &wide,
+            lower,
+            upper
+        )
+    } else {
+        // Any float on either side: the `f64` path is exact for a float input
+        // and preserves the existing rounding for an integer input to a float
+        // output.
+        let vals = img.to_f64_vec()?;
+        let out: Vec<f64> = vals
+            .iter()
+            .map(|&v| {
+                if v < lower {
+                    lower
+                } else if v > upper {
+                    upper
+                } else {
+                    crate::quantize_to_pixel_type(output_type, v)
+                }
+            })
+            .collect();
+
+        image_from_f64(output_type, img.size(), img, &out)
+    }
+}
+
+/// The in-range native cast for integer-input clamp (see [`clamp`]): compares
+/// `static_cast<double>(A)` against the `f64` bounds — ITK's `dA` — and returns
+/// the native `static_cast<Out>(A)` for an in-range pixel, or the output-type
+/// bound otherwise. The bounds narrow to `Out` exactly as the `f64` path's
+/// `image_from_f64` would, so the clamped branch is unchanged.
+fn build_clamp_from_i128<T: Scalar + FromWide>(
+    size: &[usize],
+    geom: &Image,
+    wide: &[i128],
+    lower: f64,
+    upper: f64,
+) -> Result<Image> {
+    let lower_out = T::from_f64(lower);
+    let upper_out = T::from_f64(upper);
+    let out: Vec<T> = wide
         .iter()
-        .map(|&v| {
-            if v < lower {
-                lower
-            } else if v > upper {
-                upper
+        .map(|&a| {
+            let da = a as f64; // static_cast<double>(A), ITK's dA
+            if da < lower {
+                lower_out
+            } else if da > upper {
+                upper_out
             } else {
-                crate::quantize_to_pixel_type(output_type, v)
+                T::from_i128(a) // static_cast<Out>(A), native
             }
         })
         .collect();
 
-    image_from_f64(output_type, img.size(), img, &out)
+    let mut out_img = Image::from_vec(size, out)?;
+    out_img.copy_geometry_from(geom);
+    Ok(out_img)
 }
 
 #[cfg(test)]
@@ -156,6 +229,23 @@ mod tests {
         let a = Image::from_vec(&[3, 1], vec![-5.0f64, 0.0, 5.0]).unwrap();
         let out = clamp(&a, PixelId::Float64, 2.0, 2.0).unwrap();
         assert_eq!(out.scalar_slice::<f64>().unwrap(), &[2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn integer_above_2_53_clamps_and_passes_through_losslessly() {
+        // 2^53 + 1 is not f64-representable; the old `native -> f64 -> f64` path
+        // collapsed it to 2^53. With full-range bounds every pixel is in range,
+        // so a same-type clamp is the identity, bit-for-bit.
+        let hard = (1u64 << 53) + 1;
+        let a = Image::from_vec(&[3, 1], vec![0u64, hard, u64::MAX]).unwrap();
+        let out = clamp(&a, PixelId::UInt64, -f64::MAX, f64::MAX).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt64);
+        assert_eq!(out.scalar_slice::<u64>().unwrap(), &[0, hard, u64::MAX]);
+
+        // A tight upper bound below the hard value still clamps it exactly to the
+        // (integer) bound, and the in-range small value casts natively.
+        let clamped = clamp(&a, PixelId::UInt64, 0.0, 1000.0).unwrap();
+        assert_eq!(clamped.scalar_slice::<u64>().unwrap(), &[0, 1000, 1000]);
     }
 
     #[test]

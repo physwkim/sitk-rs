@@ -95,7 +95,7 @@
 
 use crate::functor::{self, BinaryFunctor, ComparisonFunctor, UnaryFunctor, UnaryPixelFunctor};
 use crate::{FilterError, Result, require_same_shape};
-use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
+use sitk_core::{Image, Scalar, dispatch_scalar};
 
 pub(crate) fn require_integer_pixel_type(img: &Image) -> Result<()> {
     if img.pixel_id().is_floating_point() {
@@ -585,30 +585,6 @@ functor::binary_functor! {
 
 // ---- masked_assign (image, UInt8 mask, assign image or constant) ----------
 
-/// Checked by every `masked_assign*` function: `mask` must be `UInt8`. See
-/// the module docs and [`FilterError::RequiresUInt8MaskPixelType`]'s doc for
-/// why this is a hard error rather than an implicit cast.
-fn require_uint8_mask(mask: &Image) -> Result<()> {
-    if mask.pixel_id() != PixelId::UInt8 {
-        return Err(FilterError::RequiresUInt8MaskPixelType(mask.pixel_id()));
-    }
-    Ok(())
-}
-
-/// Size-only shape check between `image` and `mask`: `mask`'s pixel type is
-/// independently pinned to `UInt8` by [`require_uint8_mask`], so
-/// [`require_same_shape`] (which also checks pixel type) would reject a
-/// valid call.
-fn require_same_size(a: &Image, b: &Image) -> Result<()> {
-    if a.size() != b.size() {
-        return Err(FilterError::SizeMismatch {
-            a: a.size().to_vec(),
-            b: b.size().to_vec(),
-        });
-    }
-    Ok(())
-}
-
 fn masked_assign_typed<T: Scalar>(image: &Image, mask: &[u8], assign: &Image) -> Result<Image> {
     let s = image.scalar_slice::<T>()?;
     let a = assign.scalar_slice::<T>()?;
@@ -639,13 +615,12 @@ fn masked_assign_typed_in_place<T: Scalar>(
 }
 
 /// `MaskedAssignImageFilter`: pixel-wise `mask != 0 ? assign : image` (see
-/// the module docs). `mask` must be `UInt8` and share `image`'s size;
-/// `assign` must share `image`'s pixel type and size.
+/// the module docs). `mask` must be `UInt8`, share `image`'s size and sit on `image`'s
+/// grid ([`crate::mask_input::uint8_mask_voxels`]); `assign` must share `image`'s
+/// pixel type and size.
 pub fn masked_assign(image: &Image, mask: &Image, assign: &Image) -> Result<Image> {
-    require_uint8_mask(mask)?;
-    require_same_size(image, mask)?;
+    let mask_bytes = crate::mask_input::uint8_mask_voxels(image, mask)?;
     require_same_shape(image, assign)?;
-    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_typed,
@@ -657,10 +632,8 @@ pub fn masked_assign(image: &Image, mask: &Image, assign: &Image) -> Result<Imag
 
 /// In-place variant of [`masked_assign`]: reuses `image`'s buffer.
 pub fn masked_assign_in_place(image: Image, mask: &Image, assign: &Image) -> Result<Image> {
-    require_uint8_mask(mask)?;
-    require_same_size(&image, mask)?;
+    let mask_bytes = crate::mask_input::uint8_mask_voxels(&image, mask)?;
     require_same_shape(&image, assign)?;
-    let mask_bytes = mask.scalar_slice::<u8>()?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_typed_in_place,
@@ -706,12 +679,10 @@ fn masked_assign_constant_typed_in_place<T: Scalar>(
 /// `AssignImage` (`SetAssignConstant`, `AssignConstant` in
 /// `MaskedAssignImageFilter.yaml`): pixel-wise `mask != 0 ? assign_constant :
 /// image`. `assign_constant` is narrowed to `image`'s pixel type via
-/// `Scalar::from_f64` before use (see the module docs). `mask` must be
-/// `UInt8` and share `image`'s size.
+/// `Scalar::from_f64` before use (see the module docs). `mask` must be `UInt8`,
+/// share `image`'s size and sit on `image`'s grid.
 pub fn masked_assign_constant(image: &Image, mask: &Image, assign_constant: f64) -> Result<Image> {
-    require_uint8_mask(mask)?;
-    require_same_size(image, mask)?;
-    let mask_bytes = mask.scalar_slice::<u8>()?;
+    let mask_bytes = crate::mask_input::uint8_mask_voxels(image, mask)?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_constant_typed,
@@ -727,9 +698,7 @@ pub fn masked_assign_constant_in_place(
     mask: &Image,
     assign_constant: f64,
 ) -> Result<Image> {
-    require_uint8_mask(mask)?;
-    require_same_size(&image, mask)?;
-    let mask_bytes = mask.scalar_slice::<u8>()?;
+    let mask_bytes = crate::mask_input::uint8_mask_voxels(&image, mask)?;
     dispatch_scalar!(
         image.pixel_id(),
         masked_assign_constant_typed_in_place,
@@ -742,6 +711,7 @@ pub fn masked_assign_constant_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sitk_core::PixelId;
 
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -1192,6 +1162,31 @@ mod tests {
                 a: image.size().to_vec(),
                 b: mask.size().to_vec(),
             })
+        );
+    }
+
+    /// `MaskedAssignImageFilter` is a `TernaryGeneratorImageFilter`, so the mask is
+    /// `SetInput2` — a pipeline input, whose physical space
+    /// `ImageToImageFilter::VerifyInputInformation` compares against the image's. The
+    /// aligned mask is accepted first, or the refusal below proves nothing.
+    #[test]
+    fn masked_assign_rejects_a_mask_on_a_different_grid() {
+        let image = img_u8(&[2, 1], vec![10, 20]);
+        let assign = img_u8(&[2, 1], vec![100, 200]);
+
+        let aligned = img_u8(&[2, 1], vec![0, 1]);
+        masked_assign(&image, &aligned, &assign)
+            .expect("an aligned mask must be accepted, or the refusal below proves nothing");
+
+        let mut shifted = img_u8(&[2, 1], vec![0, 1]);
+        shifted.set_origin(&[5.0, 0.0]).unwrap();
+        assert_eq!(
+            masked_assign(&image, &shifted, &assign),
+            Err(FilterError::PhysicalSpaceMismatch { index: 1 })
+        );
+        assert_eq!(
+            masked_assign_constant(&image, &shifted, 7.0),
+            Err(FilterError::PhysicalSpaceMismatch { index: 1 })
         );
     }
 

@@ -32,7 +32,8 @@ use sitk_transform::interpolator::{index_to_physical_matrix, physical_to_index_m
 use sitk_transform::{Interpolator, ParametricTransform};
 use thiserror::Error;
 
-use crate::cuda::{affine_form, contract, contract_correlation};
+use crate::cuda::{affine_form, contract, contract_correlation, contract_mattes, point_stages};
+use crate::mattes::{MattesGeometry, MattesTail, mattes_tail};
 use crate::metric::MetricValue;
 use crate::scales::{ScalesEstimator, ScalesEstimatorKind, VirtualGrid};
 
@@ -96,6 +97,14 @@ pub enum DeviceMetricError {
     )]
     NoBitwisePointMap,
 
+    /// The joint histogram cannot be sized from these images: fewer than
+    /// `2·padding + 1` bins, or a constant intensity on one side (MI is then
+    /// undefined). The *host* metric's own refusal, raised by the *host* metric's own
+    /// code — the device metric derives the histogram geometry by calling
+    /// `MattesGeometry::new`, so the two cannot refuse different sets of inputs.
+    #[error(transparent)]
+    MattesGeometry(#[from] crate::RegistrationError),
+
     /// The device declined: no driver, no device, NVRTC failure, out of memory.
     #[error(transparent)]
     Cuda(#[from] CudaError),
@@ -108,8 +117,12 @@ pub enum DeviceMetricError {
 /// the host images instead.
 #[derive(Debug, Error)]
 pub enum DeviceRegistrationError {
-    /// Mean squares and correlation are the metrics with a device kernel.
-    #[error("the device path has kernels only for the mean-squares and correlation metrics")]
+    /// Mean squares, correlation and Mattes mutual information are the metrics with a
+    /// device kernel.
+    #[error(
+        "the device path has kernels only for the mean-squares, correlation and Mattes \
+         mutual-information metrics"
+    )]
     UnsupportedMetric,
 
     /// The device metric interpolates the moving image linearly.
@@ -558,12 +571,242 @@ impl DeviceCorrelationMetric {
     }
 }
 
+/// Mattes mutual information over two [`DeviceImage`]s.
+///
+/// # The value is the host's, on the bits. The derivative is not, and here is the
+/// # expression that stops it.
+///
+/// The joint Parzen histogram comes off [`sitk_cuda::ResidentMattes`], which builds it
+/// with the deterministic counting sort — so it is not merely *close* to
+/// `MattesMutualInformationMetric::build_histogram`, it is that loop's result, bit for
+/// bit, and invariant to the launch configuration. It is then handed to the host
+/// metric's **own tail** (`mattes_tail`), not to a device re-implementation of it, so
+/// `value` is the host's `value` by construction.
+///
+/// That much required one thing the shipped metrics did not: the interpolated moving
+/// value had to become a bit-identity surface. Mean squares and correlation only ever
+/// *add* it, and an ulp in a summand is the reduction-rounding band they already live
+/// in. Mattes **truncates** it — `(long long)(mv / binSize − normalizedMin)` picks the
+/// Parzen bin — so an ulp is a different bin and half a unit of histogram mass in the
+/// wrong cell. The sampler's trilinear arithmetic is pinned to `__dmul_rn`/`__dadd_rn`
+/// for that reason, in the one shared sampler.
+///
+/// The **derivative** cannot have the same guarantee, and the reason is exactly one
+/// expression: [`ParametricTransform::jacobian_wrt_parameters`]. ITK accumulates a
+/// `bins² × nparams` derivative histogram whose every entry contains
+/// `∇M · J(x)[·][k]`, and to reproduce it bitwise the device would have to evaluate the
+/// transform's own Jacobian at every sample. It does not: it is told the *probed affine
+/// decomposition* `J(x) = J(0) + Σ_e x_e·(J(e_e) − J(0))`, whose `C_e` is recovered by a
+/// cancelling subtraction — algebraically exact, wrong in the last bits. So the device's
+/// derivative sits in the same band the shipped mean-squares and correlation derivatives
+/// sit in, and it is the same band for the same reason.
+///
+/// # Why that band cannot hide a defect
+///
+/// Not "it is small". Three specific claims, each checkable:
+///
+/// 1. **Nothing discrete depends on it.** Every discrete decision Mattes makes — sample
+///    validity (`is_inside`), the moving-mask `round`, the moving-range reject, and both
+///    Parzen bin indices — is a function of the continuous index `c` and the interpolated
+///    value `mv`. Both are pinned bitwise. The Jacobian enters *after* every bin has been
+///    chosen, into a sum with no branch below it. The band cannot move a bin, and the
+///    value it is taken against is exact.
+/// 2. **A structural defect is not a rounding-sized defect.** A transposed Jacobian
+///    index, a dropped Parzen tap, a wrong sign in `B₃′`, a mis-flattened bin key: each
+///    moves the derivative by `O(1)` relative, not by `O(√N·ε)`.
+/// 3. **The band is tighter than a single misplaced sample.** One sample landing in the
+///    wrong bin perturbs the derivative by roughly `1/valid` relative — at 250 k samples,
+///    ~4e-6. The band the device derivative is held to is 1e-9 relative, which is three
+///    orders of magnitude below that. So even the *one-sample* straddle the whole
+///    bit-identity discipline exists to catch would fail this band, if it survived the
+///    value's bit-identity pin, which it would not.
+///
+/// The cost of the band is what buys the metric: substituting the affine decomposition
+/// collapses the `bins² × nparams` array to **twelve** parameter-free moments, so the
+/// device pass is `O(nsamples)` for any parameter count and the host contracts them with
+/// the transform's own Jacobian in `f64`.
+///
+/// [`ParametricTransform::jacobian_wrt_parameters`]: sitk_transform::ParametricTransform::jacobian_wrt_parameters
+pub struct DeviceMattesMetric {
+    /// See [`DeviceMeanSquaresMetric::resident`] — same reason, same shape.
+    resident: Mutex<sitk_cuda::ResidentMattes>,
+    /// The histogram geometry, derived by the **host** metric's own `MattesGeometry::new`
+    /// from the ranges the device reduced. One derivation, two consumers.
+    geom: MattesGeometry,
+    layout: Layout,
+}
+
+impl DeviceMattesMetric {
+    /// Build from two device-resident images and a bin count (ITK/SimpleITK default 50),
+    /// over the whole fixed grid.
+    pub fn from_device(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+        bins: usize,
+    ) -> Result<Self, DeviceMetricError> {
+        Self::from_device_sampled(fixed, moving, None, None, None, bins)
+    }
+
+    /// [`from_device`](Self::from_device) with masks and an optional **sampled** subset of
+    /// the fixed grid — the same sample set, and the same contract, as
+    /// [`DeviceMeanSquaresMetric::from_device_sampled`].
+    ///
+    /// The histogram's axes are sized from the **fixed sample set's** intensity range and
+    /// the **moving volume's masked** range — the two sets the host reduces over.
+    /// `FixedSamples::value_range` sees the samples that survived the fixed mask and the
+    /// draw; `MovingImage::value_range` sees the voxels the **moving mask** admits. The
+    /// device reduces the same two sets, through kernels that take the same two masks.
+    ///
+    /// The moving mask belongs here and not merely in the sampler: this range sizes the
+    /// moving axis, so a masked-out voxel brighter than anything the mask admits would
+    /// stretch every bin and move every sample's Parzen index. Both sides read the whole
+    /// volume until 2026-07-14, *together* — which is exactly the defect a host-vs-device
+    /// bit-identity pin cannot see, and why the mask had to land on both sides at once
+    /// (ledger §2.162; ITK masks it at
+    /// `itkMattesMutualInformationImageToImageMetricv4.hxx:199-214`).
+    ///
+    /// Min and max are *selections*, not sums, so the device tree and the host's
+    /// sequential scan agree on the bits without agreeing on an order.
+    pub fn from_device_sampled(
+        fixed: &DeviceImage,
+        moving: &DeviceImage,
+        fixed_mask: Option<&sitk_cuda::DeviceMask>,
+        moving_mask: Option<&[bool]>,
+        samples: Option<&[usize]>,
+        bins: usize,
+    ) -> Result<Self, DeviceMetricError> {
+        let (resident, layout) =
+            with_device_layout(fixed, moving, moving_mask, samples, |points, geom| {
+                sitk_cuda::ResidentMattes::from_device_masked(
+                    fixed, points, fixed_mask, moving, geom, bins,
+                )
+            })?;
+        let (fixed_range, moving_range) = resident.value_ranges();
+        // The host metric's own constructor for the geometry, and the host metric's own
+        // refusals (too few bins, constant intensity). Not a second copy of the formula.
+        let geom = MattesGeometry::new(fixed_range, moving_range, bins)?;
+        Ok(Self {
+            resident: Mutex::new(resident),
+            geom,
+            layout,
+        })
+    }
+
+    /// Device bytes held by the fixed and moving volumes.
+    pub fn volume_bytes(&self) -> usize {
+        self.lock().volume_bytes()
+    }
+
+    /// Number of fixed samples the kernel walks.
+    pub fn sample_count(&self) -> usize {
+        self.lock().sample_count()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, sitk_cuda::ResidentMattes> {
+        self.resident
+            .lock()
+            .expect("the device metric's resident buffers are poisoned by an earlier panic")
+    }
+
+    /// Scale/learning-rate estimator of `kind` over the fixed image's grid.
+    pub fn scales_estimator(
+        &self,
+        transform: &dyn ParametricTransform,
+        kind: ScalesEstimatorKind,
+    ) -> ScalesEstimator {
+        ScalesEstimator::new(
+            &self.layout.grid,
+            transform,
+            &self.layout.moving_phys_to_index,
+            self.layout.min_spacing,
+            kind,
+        )
+    }
+
+    /// The metric value `−MI` alone — **bit-identical to the host's**.
+    ///
+    /// One device pass (the entry list and the counting sort), then the host metric's own
+    /// tail. The derivative's second pass is not run and its Jacobian probe is not
+    /// performed, so this accepts transforms `evaluate` refuses: a value needs only a
+    /// bitwise point map, not an affine Jacobian.
+    pub fn value(&self, transform: &dyn ParametricTransform) -> Result<f64, DeviceMetricError> {
+        Ok(self.histogram_value(transform)?.0)
+    }
+
+    /// The value and the pRatio table, from one device histogram and the host's tail.
+    fn histogram_value(
+        &self,
+        transform: &dyn ParametricTransform,
+    ) -> Result<(f64, Option<MattesTail>, usize), DeviceMetricError> {
+        if transform.dimension() != sitk_cuda::DIM {
+            return Err(DeviceMetricError::NotThreeDimensional(
+                transform.dimension(),
+            ));
+        }
+        let stages = point_stages(transform).ok_or(DeviceMetricError::NoBitwisePointMap)?;
+        let hist = self
+            .lock()
+            .joint_histogram(&stages, &self.geom.device_bins())?;
+        let valid = hist.valid;
+        match mattes_tail(hist.joint_pdf, hist.fixed_marginal, valid, &self.geom) {
+            // The host's degenerate answer, from the host's degenerate branch.
+            None => Ok((f64::MAX, None, valid)),
+            Some(tail) => Ok((tail.value, Some(tail), valid)),
+        }
+    }
+
+    /// The value and its parameter-derivative at `transform`.
+    ///
+    /// Two device passes: the histogram, and — once the host's tail has turned it into the
+    /// pRatio table — the twelve derivative moments taken against that table. Both are
+    /// deterministic run to run. See the [type docs](Self) for exactly which half is
+    /// bit-identical to the host and which half is banded, and why the band cannot hide a
+    /// defect.
+    pub fn evaluate(
+        &self,
+        transform: &dyn ParametricTransform,
+    ) -> Result<MetricValue, DeviceMetricError> {
+        // The derivative needs the Jacobian's affine decomposition; the value does not.
+        // Probed first, so a transform this metric cannot differentiate is refused before
+        // a histogram is built for it.
+        let form = affine_form(transform)?;
+        let (value, tail, valid) = self.histogram_value(transform)?;
+        let nparams = form.nparams;
+
+        let tail = match tail {
+            None => {
+                return Ok(MetricValue {
+                    value,
+                    derivative: vec![0.0; nparams],
+                    valid_points: valid,
+                });
+            }
+            Some(t) => t,
+        };
+
+        let moments =
+            self.lock()
+                .derivative_moments(&form.stages, &self.geom.device_bins(), &tail.pratio)?;
+        Ok(MetricValue {
+            value,
+            derivative: contract_mattes(&moments, &form),
+            valid_points: valid,
+        })
+    }
+}
+
 /// The metrics that have a device kernel — one variant per kernel, matched
-/// exhaustively everywhere, so adding a third is a compile error at every site that
-/// has to know about it rather than a silent fallthrough to one of the first two.
+/// exhaustively everywhere, so adding a fourth is a compile error at every site that
+/// has to know about it rather than a silent fallthrough to one of the first three.
+///
+/// Mattes is boxed: it carries the joint histogram's counting-sort scratch (two
+/// `HistogramScratch`es, the pRatio table, the key/value entry lists), which makes it
+/// roughly twice the size of the next-largest variant, and the enum is moved around
+/// by value per level.
 pub(crate) enum DeviceMetric {
     MeanSquares(DeviceMeanSquaresMetric),
     Correlation(DeviceCorrelationMetric),
+    Mattes(Box<DeviceMattesMetric>),
 }
 
 impl DeviceMetric {
@@ -574,6 +817,7 @@ impl DeviceMetric {
         match self {
             Self::MeanSquares(m) => m.evaluate(transform),
             Self::Correlation(m) => m.evaluate(transform),
+            Self::Mattes(m) => m.evaluate(transform),
         }
     }
 
@@ -581,6 +825,7 @@ impl DeviceMetric {
         match self {
             Self::MeanSquares(m) => m.value(transform),
             Self::Correlation(m) => m.value(transform),
+            Self::Mattes(m) => m.value(transform),
         }
     }
 
@@ -592,6 +837,7 @@ impl DeviceMetric {
         match self {
             Self::MeanSquares(m) => m.scales_estimator(transform, kind),
             Self::Correlation(m) => m.scales_estimator(transform, kind),
+            Self::Mattes(m) => m.scales_estimator(transform, kind),
         }
     }
 }

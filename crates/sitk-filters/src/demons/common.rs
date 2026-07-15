@@ -6,6 +6,7 @@
 use sitk_core::{Image, PixelId};
 
 use super::field::Field;
+use crate::geometry::require_same_physical_space;
 use crate::{FilterError, Result};
 
 /// Take the first `dim` entries of a `dim_vec` parameter, as
@@ -41,6 +42,27 @@ pub(crate) fn validate_image_pair(fixed: &Image, moving: &Image, maximum_error: 
     if !(maximum_error > 0.0 && maximum_error < 1.0) {
         return Err(FilterError::GaussianMaximumErrorOutOfRange(maximum_error));
     }
+    Ok(())
+}
+
+/// The verifying variant, for the four `PDEDeformableRegistrationFilter`
+/// siblings that do *not* override `VerifyInputInformation`
+/// (`SymmetricForcesDemonsRegistrationFilter`,
+/// `FastSymmetricForcesDemonsRegistrationFilter`,
+/// `DiffeomorphicDemonsRegistrationFilter`, `LevelSetMotionRegistrationFilter`):
+/// they inherit the base's physical-space comparison over their fixed, moving
+/// and initial-field inputs (`itkPDEDeformableRegistrationFilter.h:119,125,131`).
+/// `DemonsRegistrationFilter` alone overrides it away
+/// (`itkDemonsRegistrationFilter.h:148-149`) and so keeps calling the plain
+/// [`validate_image_pair`]. Encoding the split in *which* helper each filter
+/// calls keeps the exemption structural, not a per-site comment.
+pub(crate) fn validate_verifying_image_pair(
+    fixed: &Image,
+    moving: &Image,
+    maximum_error: f64,
+) -> Result<()> {
+    validate_image_pair(fixed, moving, maximum_error)?;
+    require_same_physical_space(fixed, moving, 1)?;
     Ok(())
 }
 

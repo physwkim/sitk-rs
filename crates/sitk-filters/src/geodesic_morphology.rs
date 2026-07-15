@@ -90,6 +90,7 @@
 //! runtime check upstream performs.)
 
 use crate::error::Result;
+use crate::geometry::require_same_physical_space;
 use crate::morphology::{StructuringElement, bounds_for};
 use crate::require_same_shape;
 use sitk_core::{
@@ -250,6 +251,7 @@ pub fn grayscale_geodesic_dilate(
     fully_connected: bool,
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
+    require_same_physical_space(marker_image, mask_image, 1)?;
     let kernel = elementary_kernel(marker_image.dimension(), fully_connected);
     dispatch_scalar!(
         marker_image.pixel_id(),
@@ -270,6 +272,7 @@ pub fn grayscale_geodesic_erode(
     fully_connected: bool,
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
+    require_same_physical_space(marker_image, mask_image, 1)?;
     let kernel = elementary_kernel(marker_image.dimension(), fully_connected);
     dispatch_scalar!(
         marker_image.pixel_id(),

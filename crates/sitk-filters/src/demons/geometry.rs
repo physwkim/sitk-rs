@@ -3,24 +3,31 @@
 //! vector fields the diffeomorphic filter composes
 //! ([`super::compose`]).
 
-use sitk_core::{Error, Image, matrix};
+use sitk_core::{Error, Image, coord, matrix};
 
 use crate::Result;
 
-/// An image's grid: size, spacing, origin, direction cosines, and the
-/// precomputed inverse of the direction matrix.
+/// An image's grid: size, spacing, origin, direction cosines, and the two
+/// precomputed `itk::ImageBase` matrices, hoisted out of the per-pixel loops.
 ///
-/// The inverse is hoisted out of the per-pixel loops; `Image`'s own
-/// `physical_point_to_continuous_index` inverts on every call and returns a
-/// `Result`, neither of which belongs inside `ComputeUpdate`.
+/// The point transforms route through the shared [`sitk_core::coord`] primitive
+/// — the single implementation of `itk::ImageBase`'s index↔physical maps — so
+/// they cannot re-diverge from `Image`'s own methods. `Image`'s versions build
+/// the matrices per call and return a `Result`, neither of which belongs inside
+/// `ComputeUpdate`; the cached matrices here are the same ones it would build.
 pub(crate) struct Geometry {
     pub(crate) size: Vec<usize>,
     pub(crate) spacing: Vec<f64>,
     pub(crate) origin: Vec<f64>,
     /// Row-major `dim x dim`, as `Image::direction`.
     pub(crate) direction: Vec<f64>,
-    /// Row-major inverse of `direction`.
+    /// Row-major inverse of `direction` alone — for the vector transforms, which
+    /// ITK maps by `m_Direction`/`m_InverseDirection` with no spacing or origin.
     pub(crate) inverse_direction: Vec<f64>,
+    /// ITK `m_IndexToPhysicalPoint = Direction · diag(spacing)`.
+    index_to_physical: Vec<f64>,
+    /// ITK `m_PhysicalPointToIndex = inverse(Direction · diag(spacing))`.
+    physical_to_index: Vec<f64>,
 }
 
 /// Row `i` of a row-major `dim x dim` matrix.
@@ -36,12 +43,19 @@ impl Geometry {
         let dim = image.dimension();
         let inverse_direction =
             matrix::invert(image.direction(), dim).ok_or(Error::SingularDirection)?;
+        let index_to_physical =
+            coord::index_to_physical_matrix(image.direction(), image.spacing(), dim);
+        let physical_to_index =
+            coord::physical_to_index_matrix(image.direction(), image.spacing(), dim)
+                .ok_or(Error::SingularDirection)?;
         Ok(Geometry {
             size: image.size().to_vec(),
             spacing: image.spacing().to_vec(),
             origin: image.origin().to_vec(),
             direction: image.direction().to_vec(),
             inverse_direction,
+            index_to_physical,
+            physical_to_index,
         })
     }
 
@@ -49,45 +63,25 @@ impl Geometry {
         self.size.len()
     }
 
-    /// `ImageBase::TransformIndexToPhysicalPoint`:
-    /// `p = origin + Direction * (spacing ⊙ index)`.
+    /// `ImageBase::TransformIndexToPhysicalPoint` (integer method, origin-first),
+    /// via the shared [`sitk_core::coord`] primitive.
     pub(crate) fn index_to_physical_point(&self, index: &[usize]) -> Vec<f64> {
         let dim = self.dimension();
-        self.origin
-            .iter()
-            .enumerate()
-            .map(|(i, &origin)| {
-                let rotated: f64 = row(&self.direction, i, dim)
-                    .iter()
-                    .zip(index)
-                    .zip(&self.spacing)
-                    .map(|((&d, &idx), &spacing)| d * idx as f64 * spacing)
-                    .sum();
-                origin + rotated
-            })
-            .collect()
+        let widened: Vec<i64> = index.iter().map(|&i| i as i64).collect();
+        coord::index_to_physical_point(&self.index_to_physical, &self.origin, &widened, dim)
     }
 
-    /// `ImageBase::TransformPhysicalPointToContinuousIndex`.
+    /// `ImageBase::TransformPhysicalPointToContinuousIndex`, via the shared
+    /// [`sitk_core::coord`] primitive — `PhysicalPointToIndex · (p − origin)`
+    /// with the composed inverse, so a diagonal geometry reciprocal-multiplies
+    /// exactly as ITK does rather than dividing by spacing.
     pub(crate) fn physical_point_to_continuous_index(&self, point: &[f64]) -> Vec<f64> {
-        let dim = self.dimension();
-        let diff: Vec<f64> = point
-            .iter()
-            .zip(&self.origin)
-            .map(|(&p, &o)| p - o)
-            .collect();
-        self.spacing
-            .iter()
-            .enumerate()
-            .map(|(i, &spacing)| {
-                let unrotated: f64 = row(&self.inverse_direction, i, dim)
-                    .iter()
-                    .zip(&diff)
-                    .map(|(&m, &d)| m * d)
-                    .sum();
-                unrotated / spacing
-            })
-            .collect()
+        coord::physical_point_to_continuous_index(
+            &self.physical_to_index,
+            &self.origin,
+            point,
+            self.dimension(),
+        )
     }
 
     /// `ImageFunction::IsInsideBuffer(PointType)` (itkImageFunction.h:176-184),

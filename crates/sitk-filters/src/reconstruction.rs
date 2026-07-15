@@ -68,6 +68,7 @@
 //! the shared home for that geometry so neither module carries its own copy.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::{image_from_f64, quantize_to_pixel_type, require_same_shape};
 use sitk_core::Image;
 use std::collections::VecDeque;
@@ -321,6 +322,7 @@ fn reconstruct_images(
     kind: ReconstructionKind,
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
+    require_same_physical_space(marker_image, mask_image, 1)?;
 
     let marker = marker_image.to_f64_vec()?;
     let mask = mask_image.to_f64_vec()?;

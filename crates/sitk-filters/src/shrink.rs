@@ -90,23 +90,24 @@ pub fn shrink(img: &Image, factors: &[usize]) -> Result<Image> {
         *o += acc;
     }
 
-    let in_vals = img.to_f64_vec()?;
     let in_strides = strides(in_size);
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
 
-    let mut out_vals = vec![0.0f64; out_count];
-    for (o, slot) in out_vals.iter_mut().enumerate() {
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
         let mut in_flat = 0usize;
         for d in 0..dim {
             let oi = (o / out_strides[d]) % out_size[d];
             let ii = (oi * factors[d] + offset[d]).min(in_size[d] - 1);
             in_flat += ii * in_strides[d];
         }
-        *slot = in_vals[in_flat];
+        *slot = Some(in_flat);
     }
 
-    let mut out = image_from_f64(img.pixel_id(), &out_size, img, &out_vals)?;
+    // `shrink` preserves the input direction (only spacing/origin change), so
+    // gather inherits the input geometry and only spacing/origin are overridden.
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
     out.set_spacing(&out_spacing)?;
     out.set_origin(&out_origin)?;
     Ok(out)
@@ -269,6 +270,19 @@ mod tests {
         let out = shrink(&img, &[2, 1]).unwrap();
         assert_eq!(out.size(), &[2, 1]);
         assert_eq!(out.to_f64_vec().unwrap(), vec![11.0, 13.0]);
+    }
+
+    #[test]
+    fn shrink_moves_u64_pixels_losslessly() {
+        // Same subsampling as `subsamples_with_center_offset`, but with u64
+        // values above 2^53 that an f64 round-trip would round. The non-vacuity
+        // guard proves the samples are values the old seam would corrupt.
+        let hi = (1u64 << 53) + 1;
+        assert_ne!(hi, (hi as f64) as u64);
+        let img = Image::from_vec(&[4, 1], vec![hi, hi + 1, hi + 2, hi + 3]).unwrap();
+        let out = shrink(&img, &[2, 1]).unwrap();
+        // offset 1: samples in[1], in[3].
+        assert_eq!(out.scalar_slice::<u64>().unwrap(), &[hi + 1, hi + 3]);
     }
 
     #[test]

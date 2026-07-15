@@ -333,11 +333,24 @@ pub(crate) fn affine_form(
     }
 
     // The point map is asked for LAST, and its refusal is a DIFFERENT refusal with a
-    // different name. The order matters for what the caller is told: a B-spline fails
-    // both tests (no affine Jacobian, no stages) and keeps the name it always had; a
-    // scale transform fails only this one, and it is the only family that does. So
-    // `NoBitwisePointMap` names exactly the set the bitwise rule costs, and nothing else
-    // hides inside it.
+    // different name.
+    //
+    // What the two refusals actually separate -- MEASURED, not assumed
+    // (`mattes_device.rs::a_bspline_transform_is_refused_by_name_and_the_name_is_the_point_maps`):
+    //
+    //   - `NonAffineTransform` fires for a transform whose Jacobian is affine nowhere near
+    //     the probes -- a displacement field.
+    //   - `NoBitwisePointMap` fires for the rest, and the rest is larger than it looks. A
+    //     `ScaleTransform` has an affine Jacobian and no stages, which is the family this
+    //     refusal was written for. But a **B-spline** also lands here, and NOT because it
+    //     fails the probe: `PROBE` and `PROBE_FAR` lie outside any realistic B-spline
+    //     support region, where its Jacobian is identically zero -- and zero is trivially
+    //     affine in the point, so the probe above PASSES for it, vacuously. It is the
+    //     point map that catches it.
+    //
+    // The transform is refused either way, by name, and never approximated -- which is the
+    // guarantee that matters. But the probe is not the thing that rejects a B-spline, and
+    // the comment that used to sit here said it was.
     let stages = point_stages(transform).ok_or(DeviceMetricError::NoBitwisePointMap)?;
 
     let form = AffineForm {
@@ -475,6 +488,39 @@ pub(crate) fn contract_correlation(
         derivative,
         valid_points: moments.count,
     }
+}
+
+/// Contract the twelve pRatio-weighted moments with the transform's own Jacobian into
+/// the Mattes derivative — the host half of the device Mattes metric, and the **only**
+/// place its derivative formula exists on this path.
+///
+/// ```text
+/// ∂value/∂pₖ = Σ_d J(0)[d][k]·A[d] + Σ_d Σ_e C_e[d][k]·B[d][e]
+/// ```
+///
+/// The value is **not** formed here: it came off the device as a joint histogram that is
+/// bit-identical to the host's, and was turned into `−MI` by the host metric's own tail
+/// (`mattes_tail`). Only the derivative needs the Jacobian, and only the derivative
+/// carries the probe's band — see [`crate::device::DeviceMattesMetric`].
+pub(crate) fn contract_mattes(
+    moments: &sitk_cuda::DerivativeMoments,
+    form: &AffineForm,
+) -> Vec<f64> {
+    let dim = sitk_cuda::DIM;
+    let nparams = form.nparams;
+
+    let mut derivative = vec![0.0; nparams];
+    for (k, dk) in derivative.iter_mut().enumerate() {
+        let mut g = 0.0;
+        for d in 0..dim {
+            g += form.j0[d * nparams + k] * moments.a[d];
+            for e in 0..dim {
+                g += form.c[e][d * nparams + k] * moments.b[d][e];
+            }
+        }
+        *dk = g;
+    }
+    derivative
 }
 
 impl MetricBackend for CudaMetricBackend {

@@ -35,13 +35,90 @@ port is slower.**
 
 Read this before quoting any number.
 
+> ### RETRACTION AND REBUILD, 2026-07-15: both harnesses were wrong, in opposite directions
+>
+> **The 64³ table below has been withdrawn and rebuilt. Every 64³ "loss" this
+> document used to publish was an artifact of the measurement.** Three defects, and
+> the third is the one that matters:
+>
+> 1. **The rust column was penalised — the ramp was inside the window.** criterion's
+>    warm-up was 500 ms; this box's ramp after idling is **~2.1 s of work**. Worse,
+>    the rust harness's cell order is `for size { for op { t1 then tN } }`, so every
+>    `tN` leg was immediately preceded by a seconds-long **single-threaded** `t1` leg
+>    — which is exactly what cools 95 of 96 cores. **The harness cooled the box and
+>    then timed the recovery.** Measured inflation, paired, identical code: `gmrg`
+>    **2.02×**, `signed_maurer` 1.87×, `discrete_gaussian` 1.86×, `gradient_magnitude`
+>    1.47×.
+> 2. **The ITK column was flattered — by up to 2.4×.** `bench/cpp/main.cxx` warmed up
+>    with a **single call**, and ITK's fresh-process transient runs **fast and climbs
+>    to a plateau**: `gradient_magnitude` published **1.01 ms** against a sustained
+>    **2.43 ms**. This is the mirror image of the rust defect, and it is **per-process**
+>    — the old binary measures fast in *every* round no matter what preceded it, so
+>    **no quiet-gating removes it.** Only a warm-up that outlasts it does.
+> 3. **So a published ratio could be off by ~5×**, numerator and denominator failing
+>    in opposite directions. Nothing about auditing the rust column more carefully
+>    would ever have found this. The lesson is not "warm up longer" — it is that **a
+>    ratio has two halves and only one of them was ours.**
+>
+> Both harnesses are fixed (`WARM_UP_MS = 3000`, the same constant on both sides, from
+> the same measured ramp), and **the 64³ table is rebuilt from both columns under the
+> protocol.** Every certified cell is a win; `mean`, published here as a **2.82× loss**,
+> is a **0.28× win**.
+>
+> A fourth defect, still open: **short cells flip between two modes 2× apart.** One op
+> per process was believed to avoid it and **does not** — `gmrg` is bimodal *solo on a
+> quiet box*, in runs rather than as a coin flip. It is now localized: **NUMA is
+> excluded** (`numa_miss = numa_foreign = 0` on every plain leg, and forcing 43% of
+> pages remote with `numactl --interleave=all` leaves the 2× standing), and so are
+> clock, allocator threshold and heap layout. What survives is a **box-wide
+> page-backing state** — the fast mode is the freshly-idle box and persists across
+> *separate processes* for minutes (which is why legs come in runs), and the slow mode
+> does measurably more work (2367–2975 minor faults/iter vs 1328–2278) while `MemFree`
+> and `Cached` stay flat. Same family as the memory tax the user told me not to chase,
+> now with a fault-count signature. Three ops therefore have **no certifiable 64³
+> number** and are printed as *refused*.
+>
+> **Noise floor under the protocol: 1.13× at 64³, 1.08× at 256³, 1.15× at 512³. A
+> ratio inside the floor is not a tie — it is unresolved.** That strikes
+> `smoothing_recursive_gaussian` medium (1.02×), `gradient_magnitude` large
+> (1.02×) and `gmrg` large (1.01×) on its own, independent of any warm-up.
+>
+> **The rule this document used to state — "a number is comparable only within the
+> same sweep shape" — is too weak.** Numbers from the same sweep shape are not
+> comparable either, because the mode flips between runs of an identical binary.
+> The protocol is `bench/run_protocol.py`: one op per process, a `/proc/stat` quiet
+> gate that samples **during** a leg and not only at its edges, a median of ≥6
+> launches, and a **refusal to print** any cell whose spread exceeds the floor.
+>
+> Mechanism and proof: `bench/results/harness-instability-result.md`. Row-by-row
+> verdicts: `bench/results/harness-audit-of-bench-results.md`. The rebuild and the
+> ITK quantification: `bench/results/small-64-rebuilt.md`.
+>
+> **The 256³ and 512³ ITK columns have now been priced to complete coverage**, and
+> the result is two moved rows, both in the port's favour. The transient was checked
+> at both sizes for every op that *can* differ — the ≥3 s/call ops run a single
+> warm-up call in both binaries and are excluded by construction, not left untested.
+> Findings: `gradient_magnitude` 256³ is flattered 1.30× (→ ~0.43×); `rescale_intensity`
+> 512³ carries a *second* transient of the **opposite sign** (the un-warmed ITK column
+> read ITK *slower*), so its 0.41× understates the win (→ ~0.35×). **Every other tested
+> row at both sizes is within the old/new = 1.0 floor and stands.** The prediction that
+> the transient would be nil at 512³ was falsified: it shrinks with volume but does not
+> vanish, and there is a second mechanism, opposite in sign, that "climbing, amortized
+> by duration" does not describe. Named, not modelled, from one signal.
+>
+> **Still soft:** every `t1` figure in this document (the `t1` leg *is* the cooling
+> mechanism, and none has been retaken, on either harness, at any size); and the host
+> *denominators* of the GPU speedups in §1 and §2, which inherit the rust-side defect
+> one level down and inflate those speedups.
+
 - **`/proc/loadavg` is unusable as a gate on this box.** It reads 18–21 with four
   runnable tasks and no benchmark alive. Every number here is gated on real busy
   cores from `/proc/stat`, sampled every 5 s, with the benchmark's *own* load
   subtracted so a `tN` leg is not mistaken for foreign contention. Hours were lost
   to the naive gate before this was understood; the traces are in `bench/results/`.
-- **The `tN` numbers are the ones to quote.** Both rounds agree tightly there
-  (`mean` stddev 0.6 and 1.4 ms). Two `t1` rows — `mean` and `gmrg` — carry 15–21%
+- **The `tN` numbers are the ones to quote — and as of the retraction above, the `t1`
+  numbers are not quotable at all.** Both rounds agree tightly at `tN` (`mean` stddev
+  0.6 and 1.4 ms). Two `t1` rows — `mean` and `gmrg` — carry 15–21%
   sample stddev in *both* rounds, including the provably clean one, so their `t1`
   ratios are soft and are marked as such below. That is intrinsic to those
   measurements, not contention.
@@ -68,16 +145,26 @@ row that refutes it is a row I had already collected.**
 `rescale_intensity` — of the twelve benchmark ops, the only one with a device
 kernel — on the same tree and the same quiet box as every CPU row above:
 
-| size | CPU tN | GPU one-shot | **GPU resident** | ITK tN |
+| size | CPU tN ˢ | GPU one-shot | **GPU resident** | ITK tN ˢ |
 |---|---|---|---|---|
 | medium (256³) | 16.9 | 35.8 | **1.06** | 39.7 |
 | large (512³) | 108.1 | 205.5 | **4.5** | 266.1 |
 
+ˢ — the two CPU columns come from the twelve-op harness and inherit its defects (§0).
+At 256³ the paired old/new-harness test found no resolvable inflation (0.89–0.99×);
+at 512³ it was **never run**. So the CPU and ITK denominators here are soft, and both
+in the same direction — a slow denominator inflates the GPU's win.
+
 Both facts live in the same row:
 
 - **The one-shot API really does lose to the CPU** — 35.8 against 16.9 at medium.
+  This is the one comparison in the section that does **not** depend on a soft
+  denominator in a way that could reverse it: the one-shot loses by 2.1×, and the
+  bus cost that causes it (~17 ms of transfer at 256³) is arithmetic, not a timing.
 - **The device really does win**, by **16×** over the port's own CPU and **37×**
-  over ITK. At large: **24×** over CPU `tN`, **59×** over ITK.
+  over ITK. At large: **24×** over CPU `tN`, **59×** over ITK. These four multiples
+  are ratios against a soft denominator; the *sign* is not in doubt (1.06 ms against
+  16.9 ms is far outside any plausible harness inflation), the *multiple* is.
 
 The only difference between those two GPU columns is whether the bus is inside the
 timed region. The gap between them — **34.8 ms at medium, 201.0 ms at large** — is
@@ -132,6 +219,19 @@ The metric value is identical in all four runs — host `89.934407782061`, resid
 *host* column is not — its `20 iterations` row varies by 40% and its `smooth` row
 flips bimodally between ~1,540 and ~2,300 ms. The 62–81× spread is host noise, and
 §0's warning about this document's own reproducibility is what produced it.
+
+**That bimodality now has a name, and it is the harness's** (§0 retraction, item 2).
+A multi-op process flips short host cells between two modes about 2× apart, and the
+mode changes run to run; solo, the same cells are stable to 1.05–1.12×. This
+pipeline runs five host stages in one process, so it is exactly the shape that
+triggers it. **The consequence for this table is one-directional and it is worth
+stating plainly: the host column is the *denominator* of every speedup here, so a
+host mode that is 2× too slow inflates the speedup by 2×.** The 62–81× is therefore
+an upper-bounded quantity, not a centred one — the honest reading is **"the device is
+faster by something between the low tens and ~80×, most likely near the bottom of
+that range"**, and it will stay that way until the host column is retaken one-stage-
+per-process. The *device* column and the metric agreement (2.94e-12) are unaffected;
+neither depends on the host timing.
 
 **The metric-kernel fix cost 15% per iteration, not the 22% this document
 previously extrapolated** (138.0 → 152.9–163.7). The kernel had been forming the
@@ -188,24 +288,57 @@ contraction, because an FMA would be *more* accurate and therefore *different*.
 ## 3. Results — medium (256³), the reference size
 
 `tN` columns carry both rounds. Sorted by ratio: the port wins at the top.
+**Read the ᵘ and ˢ marks before quoting any cell — and the whole `t1` pair of
+columns is soft** (see below).
 
-| op | rust tN | itk tN | **rust/itk (tN)** | rust t1 | itk t1 |
+**The ITK column here is now priced to complete coverage, and one row moves.** The
+fresh-process transient that flattered ITK at 64³ was checked at 256³ for all eleven
+ops that *can* differ (the ≥3 s/call ops run one warm-up call in both binaries and
+cannot differ — a structural exclusion, not an untested gap). Result: **`gradient_magnitude`
+is the only affected row.** ITK is under-reported there by **1.30×** with disjoint
+bands (four campaigns agree 0.73–0.84), so its `0.64×` below should read **`~0.43×`**,
+a *bigger* win. **Every other 256³ row is within the old/new = 1.0 noise floor and
+stands as printed** — they are not upper bounds, they are the numbers.
+
+| op | rust tN | itk tN | **rust/itk (tN)** | rust t1 ˢ | itk t1 ˢ |
 |---|---|---|---|---|---|
 | binary_dilate | 65.6 / 67.1 | 2484 / 2480 | **0.03×** | 2390 | 1708 |
 | connected_component | 1126 / 1128 | 4352 / 4483 | **0.25×** | 1190 | 679 |
 | signed_maurer_distance_map | 87.9 / 88.7 | 244 / 295 | **0.30×** | 1601 | 3479 |
 | median | 203 / 206 | 544 / 540 | **0.38×** | 8550 | 19497 |
 | rescale_intensity | 16.0 / 16.9 | 38.0 / 39.7 | **0.42×** | 90.1 | 69.8 |
-| otsu_threshold | 46.5 / 36.7 | 56.8 / 64.1 | 0.57× | 989 | 780 |
-| discrete_gaussian | 114.0 / 131.8 | 162 / 174 | 0.76× | 1329 | 824 |
+| otsu_threshold ˢ | 46.5 / 36.7 | 56.8 / 64.1 | 0.57× | 989 | 780 |
+| discrete_gaussian ˢ | 114.0 / 131.8 | 162 / 174 | 0.76× | 1329 | 824 |
 | **mean** | **62.5 / 62.7** | 80.8 / 78.7 | **0.80×** | 1967 ᵗ | 1662 |
 | fft_convolution | 471 / 501 | 587 / 574 | 0.87× | 2148 | 1228 |
-| smoothing_recursive_gaussian | 64.6 / 67.2 | 52.3 / 66.0 | 1.02× | 1005 | 818 |
+| ~~smoothing_recursive_gaussian~~ ᵘ | 64.6 / 67.2 | 52.3 / 66.0 | ~~1.02×~~ | 1005 | 818 |
 | **gmrg** | **116.9** ᶠ | 207 / 247 | **0.47×** | 2319 ᵗ | 2426 |
-| **gradient_magnitude** | **22.5** ᶠ | 36.2 / 35.1 | **0.64×** | 511 | 314 |
+| **gradient_magnitude** | **22.5** ᶠ | 36.2 / 35.1 | **0.64× → ~0.43×** ᵛ | 511 | 314 |
+
+ᵛ — the ITK denominator here is flattered 1.30× by the fresh-process transient
+(§0). The **true ratio is ~0.43×**; the `0.64×` is what the un-warmed ITK column
+printed. This is the one 256³ row the transient moves — the other eleven are within
+the floor and stand.
+
+ᵘ — **struck: unresolved, not a tie.** The measured noise floor at 256³ is **1.08×**
+and this ratio is 1.02×, i.e. inside it. Worse, the two ITK legs alone span 52.3 and
+66.0 ms — 1.26× apart — so the denominator does not agree with itself. This row says
+nothing about which implementation is faster, and it was previously read as "parity".
+
+ˢ — **soft: the two legs disagree by more than the floor.** `otsu_threshold` 46.5 vs
+36.7 (1.27×) and `discrete_gaussian` 114.0 vs 131.8 (1.16×), against a 1.08× floor.
+Their *direction* (both well under 1.0×) survives; their magnitude does not. Quote
+"the port wins here", not the number.
+
+ˢ (on the `t1` columns) — **every `t1` figure in this document is soft.** The `t1`
+leg is what the harness ran immediately before each `tN` leg, single-threaded and
+seconds long, and it is the mechanism that cooled the box (see the §0 retraction).
+The `t1` legs are themselves ramp-contaminated, and no `t1` number has been retaken
+under the protocol. They are kept because the `tN`/`t1` *scaling* story is still
+directionally useful; no `t1` cell is quotable as a measurement.
 
 ᵗ — this `t1` carries 15–21% sample stddev in both rounds, including the provably
-clean one. Soft; quote the `tN` figure.
+clean one. Soft on two counts now; quote the `tN` figure.
 
 ᶠ — a **third** round, run 05:48–06:03 on `fd2b372` after the three `gradient.rs`
 fixes in §4.1, foreign load p50 1.0 / p90 1.4 cores. One column, not two, because
@@ -220,26 +353,146 @@ this table is still rounds 1/2, which is why they still carry two columns.
 | binary_dilate | 286 / 279 | 14812 / 15071 | **0.02×** |
 | connected_component | 8418 / 8623 | 30180 / 31409 | **0.27×** |
 | median | 1283 / 1298 | 3486 / 3328 | **0.39×** |
-| rescale_intensity | 105 / 108 | 261 / 266 | **0.41×** |
+| rescale_intensity | 105 / 108 | 261 / 266 | **0.41× → ~0.35×** ᵛ |
 | signed_maurer_distance_map | 613 / 581 | 1310 / 1257 | **0.46×** |
 | mean | 354 / 354 | 488 / 484 | 0.73× |
 | fft_convolution | 2700 / 2711 | 3327 / 3201 | 0.85× |
 | discrete_gaussian | 626 / 549 | 600 / 605 | 0.91× |
 | otsu_threshold | 260 / 260 | 189 / 190 | 1.37× |
-| gradient_magnitude | **100.8** ᶠ | 97.9 / 98.8 | 1.02× |
-| gmrg | **770.8** ᶠ | 772 / 761 | 1.01× |
+| ~~gradient_magnitude~~ ᵘ | **100.8** ᶠ | 97.9 / 98.8 | ~~1.02×~~ |
+| ~~gmrg~~ ᵘ | **770.8** ᶠ | 772 / 761 | ~~1.01×~~ |
 | **smoothing_recursive_gaussian** | 386 / 380 | 212 / 218 | **1.75×** |
 
-`gradient_magnitude` and `gmrg` are **ties at large, not wins** — 1.02× and 1.01×
-are parity and are not being claimed as anything else. They were 2.00× and 2.93×.
+ᵘ — **struck. These were published as "ties at large"; they are not ties, they are
+unresolved.** The measured noise floor at 512³ is **1.15×**, and 1.02× / 1.01× are
+well inside it. A ratio inside the floor carries no information about which side is
+faster — calling it parity claims a result the measurement cannot support. What the
+rows *did* establish stands: both were **2.00×** and **2.93×** before the
+`gradient.rs` fixes of §4.1, and those are outside the floor by a wide margin, so
+the fixes closed a real gap. Where they landed is not known.
 
-### small (64³) — where per-call overhead shows, and the medium table hides it
+ᵛ — **the ITK transient at 512³ runs the *opposite* way, and this is the one row it
+touches.** `rescale_intensity` — the cheapest op at the largest size — is the case
+where the un-warmed ITK column reported ITK *slower* than the warmed one (disjoint
+bands at 1.15×, inverted). So the printed `0.41×` *understates* the port's win; the
+true ratio is **~0.35×**. This is a second transient, opposite in sign to the 64³/256³
+one, and it is named — not modelled — from a single paired signal (§0). No mechanism
+is claimed for the inversion.
 
-Two rows are far worse here than at any other size, and neither is visible in the
-headline: **`otsu_threshold` 6.62×** (15.4 ms against ITK's 2.3) and **`mean`
-4.52×** (23.2 against 5.1). `mean` *beats* ITK at medium and large and loses by
-4.5× at small — a fixed per-call cost that larger volumes amortize away. If your
-volumes are small, read this row, not the headline.
+**The 512³ ITK column has now been priced, and the caveat that stood here is
+resolved.** It previously read "never run at 512³". The paired old/new-harness test
+was subsequently run at 512³ on the eight ops that *can* differ (the four ≥3 s/call
+ops — `connected_component`, `binary_dilate`, `median`, `fft_convolution` — run one
+warm-up call in both binaries and are excluded by construction, not left untested).
+Result: **`rescale_intensity` is the only affected row** (above), and it moves in the
+port's favour. Every other 512³ row is within the old/new = 1.0 floor and stands. The
+two struck rows are struck for the noise-floor reason, which is independent of the
+warm-up question and unchanged.
+
+### small (64³) — REBUILT 2026-07-15, both columns under the protocol
+
+**The 64³ losses were never losses.** The table that stood here was retracted for a
+defect in the *rust* column. Retaking the *ITK* column found the mirror image, and
+the two errors ran in **opposite directions**:
+
+- The **rust** column was **penalised**. The box's ~2.1 s ramp sat inside criterion's
+  500 ms warm-up, so the first samples were slow — up to **2.02×** inflation.
+- The **ITK** column was **flattered**, by up to **2.4×**. `bench/cpp/main.cxx` warmed
+  up with a *single call*, and ITK's fresh-process transient runs **fast and climbs to
+  a plateau**. Forty consecutive samples of `gradient_magnitude` on the old binary:
+  `2.33 1.32 0.95 0.90 0.93 1.25 … 2.03 2.64 2.28 … 2.72 2.36 2.32 2.65 2.35`. It
+  climbs from 0.90 ms to a ~2.4 ms plateau. **Published: 1.01 ms. Sustained: 2.43 ms.**
+
+A ratio built from a penalised numerator and a flattered denominator could be off by
+**~5×**, and that is the whole explanation of this port's small-volume "losses".
+Note that no amount of care on the rust column alone would have found this: the ITK
+transient is **per-process**, so the old binary measures fast in *every* round no
+matter what preceded it, and **no quiet-gating removes it.** Only a warm-up that
+outlasts it does.
+
+Rebuilt, both columns under `bench/run_protocol.py` (one op per process, quiet gate,
+median of ≥6 launches, and a cell whose spread exceeds the floor is **refused rather
+than printed**):
+
+| op, 64³ `tN` | rust | itk | **rust/itk** | status |
+|---|---|---|---|---|
+| connected_component | 11.637 | 142.757 | **0.08×** | certified |
+| binary_dilate | 3.200 | 36.274 | **0.09×** | certified |
+| median | 3.941 | 29.018 | **0.14×** | certified |
+| gradient_magnitude | 0.515 | 2.458 | **0.21×** | certified |
+| otsu_threshold | 0.886 | 3.855 | **0.23×** | certified |
+| discrete_gaussian | 1.980 | 7.536 | **0.26×** | certified |
+| mean | 1.664 | 6.020 | **0.28×** | certified |
+| rescale_intensity | 0.420 | 1.054 | **0.40×** | certified |
+| smoothing_recursive_gaussian | 2.066 | 2.883 | **0.72×** | certified |
+| signed_maurer_distance_map | 2.718 | *refused* | — | ITK spread 1.22× |
+| gmrg | *refused* | 11.953 | — | rust spread 2.39× |
+| fft_convolution | *refused* | *refused* | — | both |
+
+**Every certified cell is a win**, and the three refusals are reported as refusals
+because a cell this box cannot resolve is a result, not a gap to be filled with the
+number that happened to come out.
+
+The rows worth naming, because this document said the opposite of each:
+
+- **`mean` was published as a 2.82× loss. It is a 0.28× win.** It was the headline of
+  §6 and of the README's roadmap, and the optimization work it justified was aimed at
+  a number that did not exist.
+- **`gradient_magnitude` certifies after all**, at 0.515 ms → **0.21×**. The earlier
+  "cannot be certified at all" was a defect in the protocol driver — it gated foreign
+  load only at a leg's *edges*, so a sibling `cargo` that started and finished inside
+  a leg was invisible. Fixed at source (`LegWatch` samples *during* the leg); five
+  cells it had refused with spreads up to 1.96× re-take at 1.02–1.11×.
+- **`smoothing_recursive_gaussian`, the port's worst op, wins at 64³** (0.72×). Its
+  loss at 512³ (1.75×) is real and unchanged; the two coexist, and §6 names why.
+
+`bench/results/small-64-rebuilt.md` carries the ITK quantification and the raw legs.
+
+### The noise floor at `large`, measured — and what this table may therefore claim
+
+Publishing `rust-r4-grain.ndjson` surfaced three cells that appeared to have
+*regressed* against the r3 table: `gradient_magnitude` medium (22.5 → 28.8 ms),
+`gradient_magnitude` large (100.8 → 109.8), `discrete_gaussian` large (0.91× →
+1.05×). A four-leg **ABBA twin** (full published path, ~15 min per leg, r3's tree
+against merged main, ordered post/pre/pre/post so a monotonic drift cancels rather
+than loading onto one tree) settled it:
+
+| cell (tN) | pre legs | post legs | median post/pre |
+|---|---|---|---|
+| `gradient_magnitude` medium | 22.77, 25.74 | 24.42, 19.61 | **0.91×** |
+| `gradient_magnitude` large | 98.15, 104.79 | 97.99, 100.04 | **0.98×** |
+| `discrete_gaussian` large | 580.1, 638.4 | 655.7, 587.5 | **1.02×** |
+| `gradient_magnitude` small *(control)* | 7.30, 7.22 | **2.44, 2.53** | **0.34×** |
+| `discrete_gaussian` small *(control)* | 6.84, 6.40 | **3.04, 2.78** | **0.44×** |
+
+Every suspect cell's range **overlaps**; the r4 tree measures `gradient_magnitude`
+large at 98.0/100.0 ms — *below* r3's published 100.8 and nowhere near the 109.8
+attributed to it. **A regression the regressing code cannot reproduce is not a
+regression.** The control cells' ranges do *not* overlap, so the 64³ wins above are
+real and reproduce. The refactor suspected of causing it was also innocent by
+inspection: `gradient_magnitude_pass` was **already** on the borrowed-window path
+at `fd2b372`, and `gaussian_axis_pass` is byte-identical between the two trees —
+the hypothesis (a materialized copy amortized at 512³) described a copy the *older*
+tree had already deleted.
+
+What that costs this document is a claim, and it is the honest price:
+
+- **Process shape moves a cell by ~60%.** The identical binary measures
+  `gradient_magnitude` large at **155 ms** in a two-op process and **98 ms** in the
+  twelve-op sweep. A number is comparable only *within the same sweep shape*.
+- **Within-leg sample stddev at large is 9–25 ms** (`gradient_magnitude`) and
+  **46–94 ms** (`discrete_gaussian`) — the latter is larger than the entire gap it
+  was invoked to explain.
+- **Within-tree drift across one campaign:** `gradient_magnitude` large on one tree
+  alone walked 163.9 → 144.0 ms in a single session.
+
+So: **a `large` ratio in this document is worth about ±15%, and a difference
+smaller than that is not a result.** The 1.02× and 1.01× "ties" at large were
+already written as ties rather than wins, which survives; but no `large` row here
+should be read as a two-significant-figure fact, and a future change claiming a
+sub-15% win at `large` on this box is claiming something this harness cannot
+currently see. Quantifying `discrete_gaussian`'s 8–15% per-sample variance is
+**open and not chased**.
 
 ## 4. Where the port lost to ITK, and what the cause turned out to be
 
@@ -362,18 +615,38 @@ regressions in §5, so nothing here borrows credit from a degraded baseline):
 | `gmrg` | medium | 247.1 | 301.1 | **116.9** | **0.47×** | 1.22× |
 | `gmrg` | large | 761.4 | 2231.5 | **770.8** | 1.01× | 2.93× |
 
-Both beat ITK at medium; both are **ties at large**, and a tie is not a win.
+Both beat ITK at medium. **The `large` pair was published as "ties"; both are struck
+— 1.02× and 1.01× are inside the 1.15× floor and settle nothing.** What survives is
+the `was` column: 2.00× and 2.93× are far outside the floor, so the §4.1 fixes closed
+a real gap; where they landed is not measured.
 
-### What still loses, stated plainly
+### What still loses, stated plainly — **rewritten 2026-07-15, and it is a short list now**
 
-- **`gradient_magnitude`: 2.91× at small** (7.2 ms against ITK's 2.5) — now the
-  **worst cell in the whole table**, and the three fixes above did not move it at
-  all (7.0 → 7.2 ms, stddev 0.31 — flat, not a regression). At 64³ it is bound by
-  fixed per-call overhead, not by bandwidth, and none of the fixes targets that.
-- **`smoothing_recursive_gaussian`: 1.75× at large** (1.02× at medium).
-- **`otsu_threshold`: 1.37× at large, 6.62× at small.**
-- **`mean`: 4.52× at small**, which its medium crossover hides completely.
-- **`gmrg` at small: 1.09×**, improved from 1.45× but still a loss.
+*(This list has been wrong twice, in opposite directions, and both times the error was
+a number the harness handed it. Written before §5.2, it blamed `gradient_magnitude`'s
+64³ loss on "fixed per-call overhead"; that was the grain. Rewritten after §5.2, it
+quoted the 64³ table — which turned out to be measuring two broken harnesses against
+each other. **Six of its eight entries were 64³ "losses" and not one of them was a
+loss.** It is kept, rewritten, rather than deleted, because a list of what a port
+loses at is only worth reading if it has a record of being wrong out loud.)*
+
+**The port's two real losses. Both are at 512³, and both are the line pass:**
+
+- **`smoothing_recursive_gaussian`: 1.75× at large.** Well outside the 1.15× floor.
+  The largest remaining loss, and the only one I would act on today. Note it **wins at
+  64³** (0.72×) and is a wash at 256³ — the loss is specific to the size, which is what
+  points at the block decomposition rather than the kernel.
+- **`otsu_threshold`: 1.37× at large.** Outside the floor. A real loss — and it wins at
+  64³ (0.23×) and 256³ (0.57×). Same shape: large only.
+
+**Everything else that was on this list is gone**, and the ITK column is why. `mean`
+2.82×, `gradient_magnitude` 1.05×, `otsu` 0.68×, `gmrg` 1.19×, `fft_convolution` 1.41×
+— all five were 64³ ratios against an ITK column flattered by up to 2.4×. Rebuilt,
+`mean` is **0.28×** and `gradient_magnitude` **0.21×**. The port does not have a
+small-volume problem; the benchmark did.
+
+**Unchanged, because it never depended on a ratio:**
+
 - Not benchmarked and not measured, but sitting next to the code just fixed:
   `derivative`, `laplacian` and `sobel_edge_detection` still run a **serial**
   `iter().map().collect()` over the old copying neighborhood path, plus a full
@@ -442,16 +715,106 @@ What survives is the measurement, not the code:
 - `otsu_threshold` likewise, 1.12×.
 - **`gradient_magnitude` at 64³ is not pool-width-bound.** Four candidates were
   priced and all four are now refuted: pool wake-up, a fixed allocation, window
-  setup, and a `t1`/`tN` crossover. Its 2.81× against ITK is unexplained, and the
-  next investigation starts from an empty board rather than from these.
+  setup, and a `t1`/`tN` crossover. (This bullet used to end *"its 2.81× against ITK
+  is unexplained"*. That ratio is retracted with the 64³ table — but the refutations
+  are **paired, same-harness, port-against-port** comparisons, so the ramp defect
+  cancels in them and all four candidates stay dead. What is withdrawn is the *size*
+  of the gap it was failing to explain, not the fact that these four do not explain
+  it.)
+
+## 5.2 The empty board had one square left on it, and it was the grain
+
+The refutation above ended with `gradient_magnitude` at 64³ *unexplained* — a 2.81×
+loss with four dead candidates. The cause was none of them, and it was not specific
+to that op: **the chunk grain was a constant.** `map_grain`/`reduce_grain` handed
+rayon a fixed grain (`GRAIN = 4096`, and 65536 for the reduce), so a 64³ volume —
+262,144 elements — could raise **four tasks** on a 96-worker pool no matter what the
+kernel did. Every op with heavy per-element work was serialized into a quarter of
+the machine, and the reason `otsu_threshold` was the worst hit is that its
+`bin_index` (`histogram.rs:162`) is a **binary search with `partial_cmp().unwrap()`
+per probe** — about 188 ns per element, which put **12.3 ms of otsu's 13.7 ms** in
+`bin_counts`. Heavy per-element work through a four-task ceiling is the worst case
+this defect has.
+
+The seam is one function, `usize` in and `usize` out, so it *cannot* observe the
+thread count — it bounds the pool by shape rather than querying it:
+
+```rust
+grain(len, ceiling) = clamp(len.div_ceil(TARGET_TASKS), MIN_GRAIN, ceiling)
+```
+
+with `TARGET_TASKS = 256` (dominating any plausible pool width) and `MIN_GRAIN =
+2048` **derived** — the largest power of two under 262,144/96 = 2,730, which raises
+128 tasks where 4,096 would raise only 64. Applied at all five chunked sites
+(`min_max`, `bin_counts`, `fill_indexed`, `fill_zip`, `for_each_mut`).
+
+**Why this one was mergeable where §5.1's was not:** it was proved a no-op at and
+above 256³ rather than asserted to be. The emitted chunk boundaries are compared
+**as integers** against the old fixed grain in a unit test, and a binding probe over
+all twelve ops at all three sizes shows the rule binds at 64³ for all twelve and for
+**no** op at 256³ or 512³. Medium and large therefore run a byte-identical
+decomposition — which is also why the three cells that looked like large-size
+regressions in the r4 sweep could not have been caused by it, and were not (§3, the
+noise floor).
+
+**The result — restated 2026-07-15, twice, and the second restatement is the true
+one.** It originally read *"`otsu_threshold` 64³ 6.62× ITK → 0.68×, and
+`gradient_magnitude` 64³ 2.91× → 1.05×"*. Both halves of both ratios came from the
+broken harnesses (§0), so those four numbers are void — **the `6.62×` and `2.91×`
+"worst cells in the table" that motivated this fix did not exist.**
+
+Two things survive, and they are worth separating:
+
+- **The defect was real and the fix was right**, on evidence that never involved ITK:
+  the ABBA twin of §3 puts `gradient_magnitude` 64³ at **0.34×** and
+  `discrete_gaussian` 64³ at **0.44×** of the pre-seam tree — same harness on both
+  legs, so the harness defect cancels, and the ranges do not overlap. **The seam made
+  the port's own 64³ path 2–3× faster.** A four-task ceiling on a 96-worker pool is a
+  defect whether or not a benchmark can see it.
+- **Against ITK, rebuilt:** `otsu_threshold` 64³ is **0.23×** and `gradient_magnitude`
+  **0.21×**. Both are wins, by more than the fix moved them — because ITK was slower
+  all along than the flattered column said.
+
+So the fix was diagnosed from a fiction and was correct anyway. That is luck, not
+method, and it is recorded here as luck. Every checksum unmoved; `bit_parity` 18/18
+at 1, 4, 48 and 96 threads.
+
+The ceiling is load-bearing in the direction assumed but not previously measured: at
+256³ a flat 2,048 grain *regresses* `otsu_threshold` to 47.0 ms against 38.0 at
+65,536, because the sequential combine is O(chunks). The `clamp`'s upper bound is
+not tidiness.
 
 ## 6. What is still open
 
-- **Small volumes (64³) are where the port loses now.** `gradient_magnitude` 2.81×,
-  `otsu_threshold` 6.20×, `mean` 4.16× — the reference size amortizes this away and
-  the headline hides it. `gradient_magnitude` at small is the worst cell in the
-  table; none of the §4/§4.1 fixes touched it, and §5.1's pool-width rule is now
-  refuted for it specifically.
+- **Retake the 256³ and 512³ ITK columns.** Top open item, and it is the same mistake
+  one size up: the ITK transient was quantified at 64³ for all twelve ops, and at 256³
+  for exactly **one** — where ITK turned out to be under-reported by 1.37× with
+  disjoint bands. Nine of twelve at 256³ and ten of twelve at 512³ are **untested, not
+  cleared**. The prediction, written before the measurement: the transient is
+  per-process and climbing, so a longer benchmark *amortizes* it rather than escaping
+  it, and the defect should **shrink** with volume and may be nil at 512³. That is
+  falsifiable, and it is being falsified or confirmed now.
+- **The two-mode instability, which one-op-per-process does not avoid.** `gmrg` is
+  bimodal **solo on a quiet box** — `7.8 9.0 7.3 | 15.3 17.4 16.7` — and it moves in
+  *runs*, not as a coin flip, which says something persists across legs inside a
+  process and then flips. Clock, NUMA placement, allocator threshold and heap layout
+  are excluded by measurement. Three ops (`gmrg`, `fft_convolution`,
+  `signed_maurer_distance_map`'s ITK half) have **no certifiable 64³ number** because
+  of it, and are printed as refused rather than guessed at.
+- **`mean`'s window locality — the *cause* is still open; the *loss* never existed.**
+  This bullet used to read "the last 64³ loss, 2.82× ITK". `mean` at 64³ is a **0.28×
+  win**. What is still measured, and never involved ITK, is the pool-width effect: the
+  same 125-tap window costs **1.85× more** on 96 workers than on 8, paired. That is
+  **window locality**, not task count, and it remains a live optimization — a real
+  1.85× is worth having whether or not the op was ever losing. No rule has been written
+  for it, because the taps are non-monotonic (otsu's ~3 taps *win* on a narrow pool,
+  gm's 6 taps *lose*, mean's 125 *win*) and `gradient_magnitude`'s optimal pool width
+  **flips with the entry shape** — 8 workers on the direct path, 96 on the harness
+  path. No rule keyed on the op's own structure can be right in both.
+- **`for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor** sits below this box's 96
+  workers — the same arithmetic as §5.2's defect, but it decomposes by whole blocks
+  rather than element count, so it needs a different rule. `smoothing_recursive_gaussian`
+  and `gmrg` spend their time there and moved **0%** under the grain seam. Not fixed.
 - **`smoothing_recursive_gaussian` at large (1.75×)**, not investigated.
 - **The §2 pipeline table's `setup` / `20 iterations` rows** are re-measured; the
   `cast` / `rescale` / `smooth` rows still carry their original numbers.

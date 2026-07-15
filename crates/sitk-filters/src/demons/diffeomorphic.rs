@@ -59,7 +59,7 @@
 use sitk_core::Image;
 
 use super::DemonsResult;
-use super::common::{halt, initial_field, output_field, per_axis, validate_image_pair};
+use super::common::{halt, initial_field, output_field, per_axis, validate_verifying_image_pair};
 use super::compose::{exponential, warp};
 use super::esm::{EsmFunction, EsmGradient};
 use super::field::{Field, Smoothing, smooth_field};
@@ -174,7 +174,7 @@ pub fn diffeomorphic_demons_registration(
     initial_displacement_field: Option<&Image>,
     params: &DiffeomorphicDemonsParams,
 ) -> Result<DemonsResult> {
-    validate_image_pair(fixed, moving, params.maximum_error)?;
+    validate_verifying_image_pair(fixed, moving, params.maximum_error)?;
 
     let dim = fixed.dimension();
     let fixed_real = RealImage::new(fixed)?;

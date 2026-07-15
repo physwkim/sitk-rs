@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,410 tests** on the CPU, **3,517** with the CUDA
+> implemented and tested — **3,545 tests** on the CPU, **3,575** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -127,6 +127,14 @@ points, stop reason, and parameters to 3e-14:
 | single level, 256³ | 18.5–23.2 s | 209–210 ms | **88–111×** |
 | pyramid `[4,2,1]`, 256³ | 25.8–28.2 s | 291–297 ms | **87–97×** |
 | pyramid `[4,2,1]`, 128³ | 2.7 s | 42 ms | **63×** |
+
+**Read every speedup on this page as a range with a soft denominator.** The device
+columns are stable to a few percent; the *host* columns are not — 18.5–23.2 s is a
+1.25× spread on identical work, and the harness defect described under *Benchmarks*
+below inflates host times rather than device ones. A slow denominator inflates a
+speedup, so these multiples are upper-leaning, not centred. The *sign* is not in
+doubt (209 ms against 18.5 s survives any plausible inflation); the multiple is
+approximate, and the host column is owed a retake one-stage-per-process.
 
 **The pyramid is not what costs you — the volume is.** The device pays 83 ms to
 build the extra levels; the ratio barely moves. But at 128³ the GPU's fixed costs
@@ -307,18 +315,63 @@ NDJSON frozen in [`bench/results/`](bench/results/) and the contract in
 [`doc/bench-spec.md`](doc/bench-spec.md). `bench/compare.py` proves both
 harnesses received a byte-identical input before any timing is compared.
 
-At 256³, all cores, `rust/itk` (below 1.00 means the port is faster): the port wins
-on `binary_dilate` **0.03×**, `connected_component` 0.25×, `signed_maurer_distance_map`
-0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg` 0.47×, `otsu` 0.57×,
-`gradient_magnitude` 0.64×, `discrete_gaussian` 0.76×, `mean` 0.80×,
-`fft_convolution` 0.87×; and **loses on `smoothing_recursive_gaussian` (1.02×)**.
-At 512³ `gradient_magnitude` and `gmrg` are ties (1.02×, 1.01×) — ties, not wins.
+**A retraction first, because it is the most instructive thing in this section.**
+This README used to publish a set of small-volume *losses*. They were not losses —
+they were two broken harnesses measured against each other, failing in **opposite
+directions**. The Rust side was **penalised**: criterion warmed up for 500 ms against
+a ~2.1 s box ramp, and the harness ran a seconds-long *single-threaded* leg
+immediately before every all-cores leg, cooling 95 of 96 cores and then timing the
+recovery. The C++ side was **flattered by up to 2.4×**: it warmed up with a *single
+call*, and ITK's fresh-process transient runs **fast and climbs** to a plateau
+(`gradient_magnitude` published 1.01 ms; sustained, 2.43 ms). A ratio with a
+penalised numerator and a flattered denominator can be off by **~5×** — and no amount
+of care on our own column would ever have found it, because the ITK transient is
+per-process and survives any quiet gate.
 
-**Where the port loses now is small volumes**, not large ones: at 64³,
-`gradient_magnitude` is 2.91×, `otsu` 6.62× and `mean` 4.52× — fixed per-call cost
-that the reference size amortizes away.
+Both harnesses are fixed with the same constant from the same measured ramp, and both
+columns are now taken under `bench/run_protocol.py`: one op per process, a
+`/proc/stat` quiet gate, a median of ≥6 launches, and a **refusal to print** any cell
+whose spread exceeds the measured noise floor (1.13× at 64³, 1.08× at 256³, 1.15× at
+512³). A ratio inside the floor is not a tie — it is unresolved, and it does not get
+published as a result.
 
-The interesting one is `mean`. It used to lose by **4.39×**, and the cause was not
+**64³, all cores, `rust/itk` — rebuilt, both columns** (below 1.00 means the port is
+faster): `connected_component` **0.08×**, `binary_dilate` 0.09×, `median` 0.14×,
+`gradient_magnitude` 0.21×, `otsu` 0.23×, `discrete_gaussian` 0.26×, `mean` 0.28×,
+`rescale_intensity` 0.40×, `smoothing_recursive_gaussian` 0.72×. **Every certified
+cell is a win.** Three ops (`gmrg`, `fft_convolution`, and ITK's half of
+`signed_maurer_distance_map`) are **refused** rather than printed: this box cannot
+resolve them, and a cell it cannot resolve is a result, not a gap to fill with
+whatever number came out. `mean` was published here as a **2.82× loss** and is a
+**0.28× win**.
+
+**256³**: the port wins on `binary_dilate` **0.03×**, `connected_component` 0.25×,
+`signed_maurer_distance_map` 0.30×, `median` 0.38×, `rescale_intensity` 0.42×, `gmrg`
+0.47×, `otsu` 0.57×, `gradient_magnitude` **~0.43×**, `discrete_gaussian` 0.76×,
+`mean` 0.80×, `fft_convolution` 0.87×. The ITK transient has now been checked at this
+size for every op that can differ: `gradient_magnitude` was the only one it moved
+(flattered 1.30×, so 0.64× → ~0.43×), and every other row stands as printed.
+`smoothing_recursive_gaussian` used to be quoted here as a 1.02× loss; that is inside
+the floor and is withdrawn as unresolved.
+
+**The port's two real losses are both at 512³**: `smoothing_recursive_gaussian`
+**1.75×** and `otsu` **1.37×**. Both win at 64³ and 256³ — the loss is specific to the
+size, which is what points at the block decomposition rather than the kernel. At 512³
+the transient runs the *other* way for one op: `rescale_intensity`'s ITK column is
+under-reported, so its 0.41× is really nearer **0.35×** — a second, opposite-sign
+transient that is named from one signal, not modelled.
+
+Small volumes did have a real defect, and it was found and fixed *before* the harness
+was: the chunk grain was a **constant**, so a 64³ volume could raise only **four tasks
+on a 96-worker pool** no matter what the kernel did, and a second defect concentrated
+every expensive boundary voxel into one chunk. Both are closed. The improvement is
+measured port-against-port (same harness on both legs, so the defect cancels): the
+64³ path is **2–3× faster**, `bit_parity` unmoved at 1, 4, 48 and 96 threads. Worth
+saying plainly, since the record should show it: **that fix was diagnosed from a
+number that did not exist, and was correct anyway.** A four-task ceiling on a
+96-worker pool is a defect whether or not a benchmark can see it.
+
+The interesting one is `mean` at 256³. It used to lose by **4.39×**, and the cause was not
 the kernel, the decomposition, bandwidth, or NUMA — each eliminated by measurement.
 It was **glibc's allocator**: `mean` made **30,910,860 heap allocations per call** on
 the neighborhood boundary path, so at 48 threads the window walk ran 13.8 busy cores.
@@ -343,31 +396,42 @@ each one you can trust.
 
 ## Roadmap
 
-1. **Small-volume overhead** — now the port's only real loss. `gradient_magnitude`
-   is 2.91× at 64³, `otsu` 6.62×, `mean` 4.52×: fixed per-call cost that the
-   reference size amortizes away and the headline hides. None of the three
-   `gradient.rs` fixes moved `gradient_magnitude`'s small case by more than its own
-   noise, because it is overhead-bound, not bandwidth-bound.
-2. **`smoothing_recursive_gaussian` at 512³ (1.75×)**, not investigated. And three
-   un-parallelized stencils next to the ones just fixed — `derivative`, `laplacian`,
-   `sobel_edge_detection` still run a serial `iter().map().collect()`. They are not
-   in the benchmarked twelve, so no number is claimed for them.
-3. **Device coverage.** A **Correlation** metric — its moments are the same shape
-   the mean-squares kernel already reduces deterministically, so it inherits the
-   exactness story unchanged. Mattes needs a deterministic histogram built first
-   (above); ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs are
-   present and device 0 is the only one used.
-4. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
+1. **The two-mode instability** — the one measurement problem still open, now that the
+   ITK columns are priced. `gmrg` is bimodal solo on a quiet box, in *runs* rather than
+   as a coin flip — so something persists across *separate processes* and then flips.
+   Localized: NUMA is excluded (zero far-node faults, and forcing pages remote leaves
+   the 2× standing), as are clock, allocator threshold and heap layout. What survives
+   is a box-wide page-backing state — the fast mode is the freshly-idle box, the slow
+   mode takes measurably more minor faults. Three ops have no certifiable 64³ number
+   because of it.
+3. **The line pass.** `for_each_line_mut`'s `MIN_BLOCK_TASKS = 32` floor is under
+   this box's 96 workers — the same arithmetic the grain seam closed, but it
+   decomposes by whole blocks, so it needs a different rule. `smoothing_recursive_gaussian`
+   (**1.75× at 512³**, the port's largest remaining loss) and `gmrg` spend their time
+   there and moved **0%** under the grain seam.
+4. **`mean`'s window locality.** Independent of any ITK comparison, and measured
+   port-against-port: the same 125-tap window costs **1.85× more** on 96 workers than
+   on 8. That is window locality, not task count, and it is worth having even though
+   `mean` turns out to win at every size. No rule has been written, because the taps
+   are non-monotonic (a 3-tap histogram *wins* on a narrow pool, a 6-tap stencil
+   *loses*, a 125-tap window *wins*) and `gradient_magnitude`'s optimal pool width
+   flips with the call shape — so no rule keyed on the op's own structure can be right
+   in both places.
+5. **Device coverage.** **Mattes** — the deterministic histogram it was refused for
+   now exists and is pinned bit-identical to the host's naive loop; the metric is not
+   built on it yet. ANTS is a new kernel shape and is last. Then multi-GPU — four GPUs
+   are present and device 0 is the only one used.
+6. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
-5. **Close §5.** The open parity-vs-correctness decisions in the ledger.
+7. **Close §5.** The open parity-vs-correctness decisions in the ledger.
 
 ## Build
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,410 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,517, needs CUDA 13
+cargo nextest run --workspace                        # 3,545 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,575, needs CUDA 13
 ```
 
 License: Apache-2.0.

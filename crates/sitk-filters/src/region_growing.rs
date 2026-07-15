@@ -532,6 +532,14 @@ fn confidence_connected_typed<T: Scalar>(
     let num = in_bounds_seeds.len() as f64;
     mean /= num;
     let total_num = num * window_len;
+    // ITK divides by `totalNum - 1.0` unguarded
+    // (`itkConfidenceConnectedImageFilter.hxx:179`, `:209`), so a single-value sample —
+    // one in-bounds seed at radius 0 — gives it `0/0` = NaN, which survives both clamps
+    // (`:241-248`, `:252-253`) and reaches a float-to-integral `static_cast` at `:255`:
+    // undefined behaviour, not a value. This port substitutes 0 there instead, which
+    // collapses the bounds onto the seed's own intensity and segments the connected run
+    // of equal voxels. **Deliberate divergence, ledger §8** — see
+    // `confidence_connected_single_seed_at_radius_zero_substitutes_zero_for_itks_nan_variance`.
     let mut variance = if total_num > 1.0 {
         (sum_sq - mean * mean * total_num) / (total_num - 1.0)
     } else {
@@ -592,6 +600,10 @@ fn confidence_connected_typed<T: Scalar>(
             }
         }
         mean = s2 / n2;
+        // Same `0/0` as the initial pass, same substitution: a segmented region of one
+        // voxel divides by `n2 - 1.0` upstream. ITK gets NaN, this port gets 0 — which
+        // then trips the almost-zero break below, so a single-voxel region terminates the
+        // iteration instead of casting NaN to the pixel type. Ledger §8.
         variance = if n2 > 1.0 {
             (sq2 - s2 * s2 / n2) / (n2 - 1.0)
         } else {
@@ -1282,15 +1294,50 @@ mod tests {
 
     // ---- confidence_connected --------------------------------------------
 
+    /// **This pins a deliberate divergence from ITK, not agreement with it.**
+    ///
+    /// One in-bounds seed at `initial_neighborhood_radius = 0` gives ITK a sample of
+    /// exactly one value, and its variance divides by `totalNum - 1.0`
+    /// (`itkConfidenceConnectedImageFilter.hxx:179`, and `:209` for the radius-0 path):
+    /// `0.0 / 0.0` = **NaN**. Nothing upstream stops it — every NaN comparison in the
+    /// seed-intensity clamp (`:241-248`) is false, `std::max`/`std::min` in the
+    /// pixel-range clamp (`:252-253`) return the NaN operand, and the NaN reaches
+    /// `static_cast<InputImagePixelType>(lower)` at `:255`. A float-to-integral cast of
+    /// NaN is undefined behaviour in C++, so ITK's segmentation for this configuration
+    /// is not a defined value at all (ledger §1.77).
+    ///
+    /// This port substitutes `variance = 0` for that `0/0` (`region_growing.rs:535-539`,
+    /// `:595-599`), which makes the bounds collapse onto the seed's own intensity and
+    /// segments the connected run of exactly-equal voxels — a defined, useful answer.
+    /// That is a divergence and it is recorded as one (ledger §8); it is *not* parity,
+    /// and the assertion below must never be read as evidence that ITK agrees.
     #[test]
-    fn confidence_connected_zero_iterations_matches_initial_segmentation() {
-        // Uniform block of 100 with two outliers just outside 3*sigma; with
-        // radius 0 the initial stats come from the seed pixel alone
-        // (mean=100, variance=0 -> lower=upper=100), so with 0 iterations
-        // only the exact seed value should ever be admitted.
+    fn confidence_connected_single_seed_at_radius_zero_substitutes_zero_for_itks_nan_variance() {
+        // Radius 0 + one seed -> ITK: 0/0 = NaN -> UB cast. Port: variance = 0, so
+        // lower = upper = mean = 100 and only the equal-valued run is admitted.
         let img = Image::from_vec(&[5, 1], vec![0u8, 100, 100, 100, 0]).unwrap();
         let out = confidence_connected(&img, &[vec![2, 0]], 0, 2.5, 0, 1).unwrap();
         assert_eq!(out.scalar_slice::<u8>().unwrap(), &[0, 1, 1, 1, 0]);
+    }
+
+    /// The substitution above must fire **only** on `0/0`. Two in-bounds seeds at radius
+    /// 0 give `totalNum = 2`, so the variance is a real sample variance and ITK computes
+    /// it too — the port must use it, not collapse to the seed range.
+    ///
+    /// Seeds 100 and 102: variance 2, `2.5 * sqrt(2) ≈ 3.54`, so `[97.46, 104.54]` admits
+    /// the 104 beyond them. Had the zero-variance branch swallowed this case, the bounds
+    /// would clamp to the seeds' own range `[100, 102]` and 104 would be excluded — which
+    /// is exactly the assertion that fails.
+    #[test]
+    fn confidence_connected_two_seeds_at_radius_zero_use_the_real_variance() {
+        let img = Image::from_vec(&[5, 1], vec![0u8, 100, 102, 104, 0]).unwrap();
+        let out = confidence_connected(&img, &[vec![1, 0], vec![2, 0]], 0, 2.5, 0, 1).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u8>().unwrap(),
+            &[0, 1, 1, 1, 0],
+            "a computable variance must widen the bounds past the seed range; \
+             collapsing to variance = 0 here would give [0, 1, 1, 0, 0]"
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use sitk_core::{Image, LabelMap, LabelObjectLine};
+use sitk_core::{Image, LabelMap, LabelObjectLine, coord};
 
 // `MAX_DIM` is the maximum image dimension this filter supports, sized so that
 // fixed-size arrays can stand in for ITK's `Index`/`Offset`/`Matrix` types.
@@ -272,6 +272,12 @@ pub fn label_shape_statistics(
 
 /// `Image::TransformContinuousIndexToPhysicalPoint`:
 /// `p = origin + Direction * (spacing ⊙ index)`.
+/// `Image::TransformContinuousIndexToPhysicalPoint` — the continuous method,
+/// origin **last** (itkImageBase.h:558-572), via the shared [`sitk_core::coord`]
+/// primitive. This is the fold ITK uses for the fractional shape centroid
+/// (`itkShapeLabelMapFilter.hxx:298`); it differs from [`index_to_physical`]
+/// (integer method, origin-first) only at large origins. No heap allocation: the
+/// `IndexToPhysicalPoint` matrix is composed into a stack buffer.
 fn continuous_index_to_physical(
     idx: &[f64; MAX_DIM],
     dim: usize,
@@ -279,18 +285,23 @@ fn continuous_index_to_physical(
     origin: &[f64],
     direction: &[f64],
 ) -> [f64; MAX_DIM] {
+    let mut i2p = [0.0; MAX_DIM * MAX_DIM];
+    coord::index_to_physical_matrix_into(&direction[..dim * dim], &spacing[..dim], &mut i2p, dim);
     let mut p = [0.0; MAX_DIM];
-    for (i, pi) in p.iter_mut().enumerate().take(dim) {
-        let mut acc = origin[i];
-        for j in 0..dim {
-            acc += direction[i * dim + j] * spacing[j] * idx[j];
-        }
-        *pi = acc;
-    }
+    coord::continuous_index_to_physical_point_into(
+        &i2p[..dim * dim],
+        &origin[..dim],
+        &idx[..dim],
+        &mut p,
+        dim,
+    );
     p
 }
 
-/// `Image::TransformIndexToPhysicalPoint`.
+/// `Image::TransformIndexToPhysicalPoint` — the integer method, origin **first**
+/// (itkImageBase.h:592-604), via the shared [`sitk_core::coord`] primitive. ITK's
+/// second-moment and center-of-gravity accumulations use this integer fold. No
+/// heap allocation.
 pub(crate) fn index_to_physical(
     idx: &[i64; MAX_DIM],
     dim: usize,
@@ -298,11 +309,21 @@ pub(crate) fn index_to_physical(
     origin: &[f64],
     direction: &[f64],
 ) -> [f64; MAX_DIM] {
-    let mut c = [0.0; MAX_DIM];
+    let mut i2p = [0.0; MAX_DIM * MAX_DIM];
+    coord::index_to_physical_matrix_into(&direction[..dim * dim], &spacing[..dim], &mut i2p, dim);
+    let mut widened = [0.0; MAX_DIM];
     for d in 0..dim {
-        c[d] = idx[d] as f64;
+        widened[d] = idx[d] as f64;
     }
-    continuous_index_to_physical(&c, dim, spacing, origin, direction)
+    let mut p = [0.0; MAX_DIM];
+    coord::index_to_physical_point_f64_into(
+        &i2p[..dim * dim],
+        &origin[..dim],
+        &widened[..dim],
+        &mut p,
+        dim,
+    );
+    p
 }
 
 // ---- itkGeometryUtilities.cxx ---------------------------------------------
@@ -1017,6 +1038,33 @@ fn compute_oriented_bounding_box(
 mod tests {
     use super::*;
     use sitk_core::PixelId;
+
+    // L3 (coord-rounding-port-map.md §5): the fractional shape centroid is
+    // converted with ITK's CONTINUOUS method (origin last), while second-moment
+    // accumulation uses the INTEGER method (origin first). At a large origin with
+    // a shear direction (so one row gets two terms) the two folds differ; before
+    // the fix the centroid shared the integer origin-first fold and diverged from
+    // ITK's TransformContinuousIndexToPhysicalPoint.
+    #[test]
+    fn centroid_uses_continuous_origin_last_fold_unlike_integer_moments() {
+        let dim = 2;
+        let spacing = [1.0, 1.0];
+        let origin = [1e16, 0.0];
+        let direction = [1.0, 1.0, 0.0, 1.0]; // shear
+        let mut cidx = [0.0; MAX_DIM];
+        cidx[0] = 1.0;
+        cidx[1] = 1.0;
+        let mut iidx = [0i64; MAX_DIM];
+        iidx[0] = 1;
+        iidx[1] = 1;
+        let centroid = continuous_index_to_physical(&cidx, dim, &spacing, &origin, &direction);
+        let moment = index_to_physical(&iidx, dim, &spacing, &origin, &direction);
+        assert_eq!(centroid[0], 1.0000000000000002e16); // ((1 + 1) + origin)
+        assert_eq!(moment[0], 1e16); // ((origin + 1) + 1)
+        // Non-vacuity: identical bits would mean the centroid kept the integer
+        // origin-first fold.
+        assert_ne!(centroid[0], moment[0]);
+    }
 
     fn assert_close(a: f64, b: f64, tol: f64, what: &str) {
         assert!((a - b).abs() <= tol, "{what}: {a} vs expected {b}");

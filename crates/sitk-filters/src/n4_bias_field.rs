@@ -37,7 +37,8 @@ mod bspline;
 
 use crate::error::{FilterError, Result};
 use crate::fft::{Complex, LineKernel, transform_1d_unnormalized};
-use crate::{image_from_f64, quantize_to_pixel_type};
+use crate::geometry::require_same_physical_space;
+use crate::image_from_f64;
 use bspline::{FitInput, Lattice};
 use sitk_core::{Image, PixelId};
 
@@ -189,13 +190,17 @@ impl<'a> N4<'a> {
             return Err(FilterError::RequiresRealPixelType(image.pixel_id()));
         }
         let dim = image.dimension();
-        for other in [mask_image, confidence_image].into_iter().flatten() {
+        if let Some(other) = confidence_image {
             if other.size() != image.size() {
                 return Err(FilterError::SizeMismatch {
                     a: image.size().to_vec(),
                     b: other.size().to_vec(),
                 });
             }
+            // The confidence image is `itkSetInputMacro(ConfidenceImage, …)`
+            // (`itkN4BiasFieldCorrectionImageFilter.h:198`), a named input the
+            // inherited verifier walks — so its grid is compared like the mask's.
+            require_same_physical_space(image, other, 1)?;
         }
         if settings.number_of_histogram_bins < 2 {
             return Err(FilterError::N4InvalidHistogramBins(
@@ -212,24 +217,23 @@ impl<'a> N4<'a> {
             });
         }
 
-        // `CastImageToITK<MaskImageType>`: the mask reaches ITK as `uint8`.
-        let mask: Option<Vec<f64>> = mask_image
-            .map(|m| -> Result<Vec<f64>> {
-                Ok(m.to_f64_vec()?
-                    .into_iter()
-                    .map(|v| quantize_to_pixel_type(PixelId::UInt8, v))
-                    .collect())
-            })
+        // `CastImageToITK<MaskImageType>` is a `dynamic_cast`, and
+        // `N4BiasFieldCorrectionImageFilter.yaml` fixes `TMaskImage` to
+        // `itk::Image<uint8_t, Dim>`: a mask of any other pixel type throws upstream
+        // rather than being converted. The mask is also `SetNthInput`-bound, so its
+        // grid is verified — all three preconditions, one owner.
+        let mask: Option<&[u8]> = mask_image
+            .map(|m| crate::mask_input::uint8_mask_voxels(image, m))
             .transpose()?;
         let confidence: Option<Vec<f64>> = confidence_image.map(|c| c.to_f64_vec()).transpose()?;
 
-        let label = f64::from(settings.mask_label);
+        let label = settings.mask_label;
         let included: Vec<bool> = (0..image.number_of_pixels())
             .map(|i| {
                 let by_mask = match &mask {
                     None => true,
                     Some(m) if settings.use_mask_label => m[i] == label,
-                    Some(m) => m[i] != 0.0,
+                    Some(m) => m[i] != 0,
                 };
                 let by_confidence = match &confidence {
                     None => true,
@@ -899,6 +903,38 @@ mod tests {
                 a: vec![SIZE, SIZE],
                 b: vec![4, 4],
             }
+        );
+    }
+
+    /// `N4BiasFieldCorrectionImageFilter.yaml` fixes `TMaskImage` to
+    /// `itk::Image<uint8_t, Dim>`, and SimpleITK's `CastImageToITK` is a
+    /// `dynamic_cast` — a `UInt16` mask throws upstream. This port used to quantize
+    /// it, which silently reinterpreted a mask it had no right to accept.
+    #[test]
+    fn a_mask_that_is_not_uint8_is_refused_by_name() {
+        let (image, _) = phantom();
+        let mask = Image::from_vec(&[SIZE, SIZE], vec![1u16; SIZE * SIZE]).unwrap();
+        assert_eq!(
+            n4_bias_field_correction(&image, Some(&mask), None, &settings()).unwrap_err(),
+            FilterError::RequiresUInt8MaskPixelType(PixelId::UInt16)
+        );
+    }
+
+    /// The mask is a pipeline input, so `VerifyInputInformation` compares its
+    /// physical space with the image's. The aligned mask must be accepted first, or
+    /// the refusal proves nothing.
+    #[test]
+    fn a_mask_on_a_different_grid_is_refused() {
+        let (image, _) = phantom();
+        let aligned = Image::from_vec(&[SIZE, SIZE], vec![1u8; SIZE * SIZE]).unwrap();
+        n4_bias_field_correction(&image, Some(&aligned), None, &settings())
+            .expect("an aligned mask must be accepted, or the refusal below proves nothing");
+
+        let mut shifted = Image::from_vec(&[SIZE, SIZE], vec![1u8; SIZE * SIZE]).unwrap();
+        shifted.set_origin(&[5.0, 0.0]).unwrap();
+        assert_eq!(
+            n4_bias_field_correction(&image, Some(&shifted), None, &settings()).unwrap_err(),
+            FilterError::PhysicalSpaceMismatch { index: 1 }
         );
     }
 

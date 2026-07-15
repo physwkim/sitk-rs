@@ -29,7 +29,9 @@
 //! matching this crate's existing threshold functions.
 
 use crate::error::{FilterError, Result};
-use crate::histogram::Histogram;
+use crate::histogram::{
+    Histogram, ThresholdMask, apply_threshold_mask_output, threshold_histogram,
+};
 use sitk_core::Image;
 
 // ---- ThresholdImageFilter --------------------------------------------------
@@ -71,8 +73,9 @@ fn binarize_and_finish(
     threshold: f64,
     inside_value: u8,
     outside_value: u8,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
-    let out: Vec<u8> = vals
+    let mut out: Vec<u8> = vals
         .iter()
         .map(|&v| {
             if v <= threshold {
@@ -82,6 +85,10 @@ fn binarize_and_finish(
             }
         })
         .collect();
+    // `MaskImageFilter` on the thresholded output, as `HistogramThresholdImageFilter`
+    // does when `MaskOutput` is set (`.hxx:113-125`). Note it zeroes where the mask is
+    // `0`, not where it differs from `mask_value` — see `ThresholdMask`'s docs.
+    apply_threshold_mask_output(img, &mut out, mask)?;
     let mut result = Image::from_vec(img.size(), out)?;
     result.copy_geometry_from(img);
     Ok((result, threshold))
@@ -179,11 +186,12 @@ pub fn huang_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = huang_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- Intermodes ------------------------------------------------------------
@@ -274,11 +282,12 @@ pub fn intermodes_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = intermodes_threshold_value(&hist)?;
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- IsoData ----------------------------------------------------------
@@ -337,11 +346,12 @@ pub fn isodata_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = isodata_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- KittlerIllingworth ----------------------------------------------------
@@ -476,11 +486,12 @@ pub fn kittler_illingworth_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = kittler_illingworth_threshold_value(&hist)?;
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- Li ---------------------------------------------------------------
@@ -572,11 +583,12 @@ pub fn li_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = li_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- shared entropy-family scaffolding (MaximumEntropy / RenyiEntropy / Shanbhag) --
@@ -676,11 +688,12 @@ pub fn maximum_entropy_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = maximum_entropy_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- Moments ------------------------------------------------------------
@@ -736,11 +749,12 @@ pub fn moments_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = moments_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- RenyiEntropy -----------------------------------------------------
@@ -904,11 +918,12 @@ pub fn renyi_entropy_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = renyi_entropy_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- Shanbhag -----------------------------------------------------------
@@ -960,11 +975,12 @@ pub fn shanbhag_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = shanbhag_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 // ---- Yen ----------------------------------------------------------------
@@ -1032,11 +1048,12 @@ pub fn yen_threshold(
     inside_value: u8,
     outside_value: u8,
     number_of_histogram_bins: u32,
+    mask: Option<&ThresholdMask>,
 ) -> Result<(Image, f64)> {
     let vals = img.to_f64_vec()?;
-    let hist = Histogram::from_values(&vals, number_of_histogram_bins)?;
+    let hist = threshold_histogram(img, &vals, number_of_histogram_bins, mask)?;
     let threshold = yen_threshold_value(&hist);
-    binarize_and_finish(img, &vals, threshold, inside_value, outside_value)
+    binarize_and_finish(img, &vals, threshold, inside_value, outside_value, mask)
 }
 
 #[cfg(test)]
@@ -1079,7 +1096,7 @@ mod tests {
     #[test]
     fn inside_outside_values_plumb_through() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (out, _) = huang_threshold(&a, 7, 3, 10).unwrap();
+        let (out, _) = huang_threshold(&a, 7, 3, 10, None).unwrap();
         let got = out.scalar_slice::<u8>().unwrap();
         assert!(got[..50].iter().all(|&v| v == 7));
         assert!(got[50..].iter().all(|&v| v == 3));
@@ -1090,7 +1107,7 @@ mod tests {
     #[test]
     fn huang_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = huang_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = huang_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1105,15 +1122,15 @@ mod tests {
         // value on a degenerate histogram (margin == 0), so bin 0's
         // midpoint equals the constant too.
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = huang_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = huang_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
     #[test]
     fn huang_threshold_bin_count_changes_result() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, t_coarse) = huang_threshold(&a, 1, 0, 4).unwrap();
-        let (_, t_fine) = huang_threshold(&a, 1, 0, 100).unwrap();
+        let (_, t_coarse) = huang_threshold(&a, 1, 0, 4, None).unwrap();
+        let (_, t_fine) = huang_threshold(&a, 1, 0, 100, None).unwrap();
         assert_ne!(t_coarse, t_fine);
     }
 
@@ -1122,7 +1139,7 @@ mod tests {
     #[test]
     fn intermodes_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = intermodes_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = intermodes_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1135,7 +1152,7 @@ mod tests {
         // 3-point-mean smoothing, so this hits ITK's own iteration cap.
         let a = img_f64(&[4, 1], vec![9.0; 4]);
         assert!(matches!(
-            intermodes_threshold(&a, 1, 0, 5),
+            intermodes_threshold(&a, 1, 0, 5, None),
             Err(FilterError::ThresholdCalculatorFailed {
                 calculator: "Intermodes",
                 ..
@@ -1146,7 +1163,7 @@ mod tests {
     #[test]
     fn intermodes_threshold_single_bin_returns_that_bin() {
         let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
-        let (_, threshold) = intermodes_threshold(&a, 1, 0, 1).unwrap();
+        let (_, threshold) = intermodes_threshold(&a, 1, 0, 1, None).unwrap();
         assert!(threshold.is_finite());
     }
 
@@ -1155,7 +1172,7 @@ mod tests {
     #[test]
     fn isodata_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = isodata_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = isodata_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1165,7 +1182,7 @@ mod tests {
     #[test]
     fn isodata_threshold_constant_image_falls_back_to_mean() {
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = isodata_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = isodata_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1185,7 +1202,7 @@ mod tests {
         let mut vals: Vec<f64> = (0..=10).map(|v| 2.0 * v as f64).cycle().take(50).collect();
         vals.extend((0..=10).map(|v| 80.0 + 2.0 * v as f64).cycle().take(50));
         let a = img_f64(&[100, 1], vals);
-        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 20.0 && threshold < 80.0,
             "threshold {threshold}"
@@ -1195,7 +1212,7 @@ mod tests {
     #[test]
     fn kittler_illingworth_threshold_single_bin_returns_that_bin() {
         let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
-        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 1).unwrap();
+        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 1, None).unwrap();
         assert!(threshold.is_finite());
     }
 
@@ -1206,7 +1223,7 @@ mod tests {
         // breaks non-fatally on its first iteration without updating
         // threshold away from that bin.
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = kittler_illingworth_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1215,7 +1232,7 @@ mod tests {
     #[test]
     fn li_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = li_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = li_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1228,7 +1245,7 @@ mod tests {
         // histogram (margin == 0), so whichever bin the fixed-point search
         // lands on, its midpoint equals the constant.
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = li_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = li_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1237,7 +1254,7 @@ mod tests {
     #[test]
     fn maximum_entropy_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = maximum_entropy_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = maximum_entropy_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1247,7 +1264,7 @@ mod tests {
     #[test]
     fn maximum_entropy_threshold_constant_image_returns_the_constant_value() {
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = maximum_entropy_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = maximum_entropy_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1256,7 +1273,7 @@ mod tests {
     #[test]
     fn moments_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = moments_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = moments_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1270,7 +1287,7 @@ mod tests {
         // always false, so threshold stays 0 -- whose midpoint is still the
         // constant on this degenerate histogram (margin == 0).
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = moments_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = moments_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1279,7 +1296,7 @@ mod tests {
     #[test]
     fn renyi_entropy_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1289,14 +1306,14 @@ mod tests {
     #[test]
     fn renyi_entropy_threshold_single_bin_returns_that_bin() {
         let a = img_f64(&[3, 1], vec![1.0, 2.0, 3.0]);
-        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 1).unwrap();
+        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 1, None).unwrap();
         assert!(threshold.is_finite());
     }
 
     #[test]
     fn renyi_entropy_threshold_constant_image_returns_the_constant_value() {
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = renyi_entropy_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1305,7 +1322,7 @@ mod tests {
     #[test]
     fn shanbhag_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = shanbhag_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = shanbhag_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1320,7 +1337,7 @@ mod tests {
         // stays 0 -- whose midpoint is still the constant on this
         // degenerate histogram (margin == 0).
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = shanbhag_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = shanbhag_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1329,7 +1346,7 @@ mod tests {
     #[test]
     fn yen_threshold_separates_bimodal_deltas() {
         let a = bimodal_image(0.0, 100.0, 50);
-        let (_, threshold) = yen_threshold(&a, 1, 0, 10).unwrap();
+        let (_, threshold) = yen_threshold(&a, 1, 0, 10, None).unwrap();
         assert!(
             threshold > 0.0 && threshold < 100.0,
             "threshold {threshold}"
@@ -1339,7 +1356,7 @@ mod tests {
     #[test]
     fn yen_threshold_constant_image_returns_the_constant_value() {
         let a = img_f64(&[4, 1], vec![9.0; 4]);
-        let (_, threshold) = yen_threshold(&a, 1, 0, 5).unwrap();
+        let (_, threshold) = yen_threshold(&a, 1, 0, 5, None).unwrap();
         assert_eq!(threshold, 9.0);
     }
 
@@ -1349,11 +1366,11 @@ mod tests {
     fn zero_bins_errors_for_every_calculator() {
         let a = bimodal_image(0.0, 100.0, 5);
         assert!(matches!(
-            huang_threshold(&a, 1, 0, 0),
+            huang_threshold(&a, 1, 0, 0, None),
             Err(FilterError::InvalidHistogramBins(0))
         ));
         assert!(matches!(
-            yen_threshold(&a, 1, 0, 0),
+            yen_threshold(&a, 1, 0, 0, None),
             Err(FilterError::InvalidHistogramBins(0))
         ));
     }

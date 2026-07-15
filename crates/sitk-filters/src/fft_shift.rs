@@ -20,11 +20,13 @@
 //!
 //! `FFTShiftImageFilter.yaml` declares `pixel_types: NonLabelPixelIDTypeList`
 //! (SimpleITK's full pixel-type list minus label maps, which for the C++
-//! library includes complex pixel types); this crate's [`PixelId`] has no
-//! complex variant at all, so [`fft_shift`] naturally covers every pixel type
-//! it can represent -- the shift itself is pixel-type-agnostic index
-//! permutation, identical to how [`crate::geometry::wrap_pad`] and
-//! [`crate::grid_utility`] handle their own pure index math.
+//! library includes complex pixel types). The shift is pure pixel-type-agnostic
+//! index permutation, so [`fft_shift`] moves each pixel through the native
+//! [`sitk_core::Image::gather`] primitive and covers every pixel type this
+//! crate represents, complex and vector included — shifting a complex spectrum
+//! is the filter's canonical use. (An earlier port routed the copy through
+//! `to_f64_vec`, which both rounded `UInt64`/`Int64` magnitudes above 2^53 and
+//! rejected complex/vector images outright; the native gather closes both.)
 //!
 //! For an *even*-sized axis, `size[i] / 2` and `-(size[i] / 2)` are congruent
 //! mod `size[i]`, so `inverse` has no effect there. For an *odd*-sized axis
@@ -39,7 +41,6 @@
 //! shift, positive or negative, defaulting to no shift at all).
 
 use crate::error::{FilterError, Result};
-use crate::image_from_f64;
 use sitk_core::Image;
 
 /// First-index-fastest strides for a size vector.
@@ -61,13 +62,15 @@ fn require_dim(len: usize, dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// The wraparound core shared by [`fft_shift`] and [`cyclic_shift`]:
-/// `output[index] = input[(index[d] - shift[d]) mod size[d]]` for every axis
-/// `d` (`itkCyclicShiftImageFilter.hxx:70-78`, with the always-zero `outIdx`
-/// term dropped, see the module docs).
-fn cyclic_permute(vals: &[f64], size: &[usize], strides: &[usize], shift: &[i64]) -> Vec<f64> {
+/// The wraparound core shared by [`fft_shift`] and [`cyclic_shift`], as a
+/// per-output-pixel source index: `output[index] = input[(index[d] - shift[d])
+/// mod size[d]]` for every axis `d` (`itkCyclicShiftImageFilter.hxx:70-78`,
+/// with the always-zero `outIdx` term dropped, see the module docs). The result
+/// feeds [`Image::gather`], which moves each pixel natively.
+fn cyclic_sources(size: &[usize], strides: &[usize], shift: &[i64]) -> Vec<Option<usize>> {
     let dim = size.len();
-    (0..vals.len())
+    let count: usize = size.iter().product();
+    (0..count)
         .map(|flat| {
             let mut src_flat = 0usize;
             for d in 0..dim {
@@ -79,7 +82,7 @@ fn cyclic_permute(vals: &[f64], size: &[usize], strides: &[usize], shift: &[i64]
                 }
                 src_flat += shifted as usize * strides[d];
             }
-            vals[src_flat]
+            Some(src_flat)
         })
         .collect()
 }
@@ -90,7 +93,6 @@ fn cyclic_permute(vals: &[f64], size: &[usize], strides: &[usize], shift: &[i64]
 pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
     let size = img.size();
     let strides = strides(size);
-    let vals = img.to_f64_vec()?;
 
     let shift: Vec<i64> = size
         .iter()
@@ -100,8 +102,8 @@ pub fn fft_shift(img: &Image, inverse: bool) -> Result<Image> {
         })
         .collect();
 
-    let out = cyclic_permute(&vals, size, &strides, &shift);
-    image_from_f64(img.pixel_id(), size, img, &out)
+    let sources = cyclic_sources(size, &strides, &shift);
+    Ok(img.gather(size, &sources, 0.0)?)
 }
 
 /// `CyclicShiftImageFilter` (`itkCyclicShiftImageFilter.h(.hxx)`): shift every
@@ -115,10 +117,9 @@ pub fn cyclic_shift(img: &Image, shift: &[i64]) -> Result<Image> {
     let size = img.size();
     require_dim(shift.len(), size.len())?;
     let strides = strides(size);
-    let vals = img.to_f64_vec()?;
 
-    let out = cyclic_permute(&vals, size, &strides, shift);
-    image_from_f64(img.pixel_id(), size, img, &out)
+    let sources = cyclic_sources(size, &strides, shift);
+    Ok(img.gather(size, &sources, 0.0)?)
 }
 
 #[cfg(test)]
@@ -291,14 +292,52 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_shift_rejects_non_scalar_pixel_type() {
-        let img = Image::new(&[2, 1], sitk_core::PixelId::ComplexFloat32);
-        let err = cyclic_shift(&img, &[0, 0]).unwrap_err();
+    fn cyclic_shift_moves_u64_pixels_losslessly() {
+        // 2^53 + 1 is the smallest u64 an f64 cannot hold; the old to_f64_vec
+        // seam rounded it. Non-vacuity guard proves the values would corrupt.
+        let hi = (1u64 << 53) + 1;
+        assert_ne!(hi, (hi as f64) as u64);
+        let img = Image::from_vec(&[4, 1], vec![hi, hi + 1, hi + 2, hi + 3]).unwrap();
+        let out = cyclic_shift(&img, &[1, 0]).unwrap();
+        // out[idx] = in[(idx - 1) mod 4].
         assert_eq!(
-            err,
-            FilterError::Core(sitk_core::Error::RequiresScalarPixelType(
-                sitk_core::PixelId::ComplexFloat32
-            ))
+            out.scalar_slice::<u64>().unwrap(),
+            &[hi + 3, hi, hi + 1, hi + 2]
+        );
+    }
+
+    #[test]
+    fn cyclic_shift_now_moves_complex_pixels_natively() {
+        // FFTShift/CyclicShift are registered for NonLabelPixelIDTypeList
+        // (complex included) upstream, and shifting a complex spectrum is the
+        // filter's canonical use. Routing through native Image::gather lifts the
+        // scalar-only limitation the old to_f64_vec seam imposed — the shift is
+        // pure pixel-type-agnostic index permutation.
+        use sitk_core::Complex;
+        let img = Image::from_vec_complex(
+            &[4, 1],
+            vec![
+                Complex::new(1.0f32, 10.0),
+                Complex::new(2.0, 20.0),
+                Complex::new(3.0, 30.0),
+                Complex::new(4.0, 40.0),
+            ],
+        )
+        .unwrap();
+        let out = cyclic_shift(&img, &[1, 0]).unwrap();
+        assert_eq!(out.pixel_id(), sitk_core::PixelId::ComplexFloat32);
+        // out[idx] = in[(idx - 1) mod 4], whole complex pixels moved together.
+        assert_eq!(
+            out.get_complex::<f32>(&[0, 0]).unwrap(),
+            Complex::new(4.0, 40.0)
+        );
+        assert_eq!(
+            out.get_complex::<f32>(&[1, 0]).unwrap(),
+            Complex::new(1.0, 10.0)
+        );
+        assert_eq!(
+            out.get_complex::<f32>(&[3, 0]).unwrap(),
+            Complex::new(3.0, 30.0)
         );
     }
 }

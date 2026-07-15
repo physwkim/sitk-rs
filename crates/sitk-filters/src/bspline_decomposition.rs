@@ -56,13 +56,21 @@
 //!   the gain been applied and no recursion run, the values would have been
 //!   scaled by `λ`.)
 //! - **The coefficient type is `NumericTraits<OutputPixelType>::RealType`**,
-//!   which is `float` for a `Float32` image and `double` for `Float64`. The
-//!   scratch line, and therefore every intermediate accumulator (the running
-//!   `sum` of the causal initialization included), is stored in that type, so
-//!   a `Float32` image rounds to single precision after *each* recursion step
-//!   rather than only at write-out. This port reproduces that rounding
-//!   step-for-step via the private `narrow` function instead of computing the
-//!   whole line in `f64` — the results are not identical.
+//!   which is `double` for both `Float32` and `Float64` images
+//!   (`NumericTraits<float>::RealType == double`, `itkNumericTraits.h:1356`).
+//!   ITK's `m_Scratch` is `std::vector<CoeffType> = std::vector<double>`
+//!   (`itkBSplineDecompositionImageFilter.h:85,133,175`), so the gain multiply
+//!   and the whole IIR recursion — every intermediate accumulator, the running
+//!   `sum` of the causal initialization included — run in `double`. The single
+//!   narrowing to the output pixel type happens at *write-out*, when a filtered
+//!   line is copied back to the output image (`static_cast<OutputPixelType>`,
+//!   `CopyScratchToCoefficients`, `.hxx:281`). Because each axis reads the
+//!   already-rounded output of the previous axis (`CopyCoefficientsToScratch`
+//!   re-widens it, `.hxx:297`), a `Float32` image is rounded to single
+//!   precision **once per axis, at write-out** — not after every recursion
+//!   step. This port matches that: `data_to_coefficients_1d` runs a line
+//!   entirely in `f64`, and `coefficients_along_axis` narrows to the output
+//!   pixel type as it writes each line back.
 //!
 //! `pixel_types: RealPixelIDTypeList`, no `output_pixel_type` override: the
 //! input must be `Float32` or `Float64` and the output takes the input's pixel
@@ -100,8 +108,10 @@ pub fn bspline_spline_poles(spline_order: u32) -> Result<Vec<f64>> {
     })
 }
 
-/// `NumericTraits<PixelType>::RealType`'s rounding: every coefficient stored
-/// back into the scratch line of a `Float32` image is rounded to `float`.
+/// The write-out narrowing, `static_cast<OutputPixelType>` in ITK's
+/// `CopyScratchToCoefficients` (`.hxx:281`): a filtered line's coefficients are
+/// rounded to the output pixel type as they are written back to the image —
+/// once per axis, not per recursion step. Identity for `Float64`.
 fn narrower(pixel_id: PixelId) -> fn(f64) -> f64 {
     match pixel_id {
         PixelId::Float32 => |v: f64| v as f32 as f64,
@@ -111,7 +121,7 @@ fn narrower(pixel_id: PixelId) -> fn(f64) -> f64 {
 
 /// `SetInitialCausalCoefficient`: overwrite `s[0]` with the causal recursion's
 /// initial value under mirror boundaries.
-fn set_initial_causal_coefficient(s: &mut [f64], z: f64, tolerance: f64, narrow: fn(f64) -> f64) {
+fn set_initial_causal_coefficient(s: &mut [f64], z: f64, tolerance: f64) {
     let n_len = s.len();
     let mut zn = z;
 
@@ -123,7 +133,7 @@ fn set_initial_causal_coefficient(s: &mut [f64], z: f64, tolerance: f64, narrow:
             // Accelerated (truncated) loop: the mirrored tail is dropped.
             let mut sum = s[0];
             for &v in s.iter().take(horizon).skip(1) {
-                sum = narrow(sum + zn * v);
+                sum += zn * v;
                 zn *= z;
             }
             s[0] = sum;
@@ -134,34 +144,29 @@ fn set_initial_causal_coefficient(s: &mut [f64], z: f64, tolerance: f64, narrow:
     // Full loop: the exact mirror-boundary sum.
     let iz = 1.0 / z;
     let mut z2n = z.powf((n_len - 1) as f64);
-    let mut sum = narrow(s[0] + z2n * s[n_len - 1]);
+    let mut sum = s[0] + z2n * s[n_len - 1];
     // `z2n *= z2n * iz` upstream: z^(N-1) -> z^(2N-3).
     z2n = z2n * z2n * iz;
     for &v in s.iter().take(n_len - 1).skip(1) {
-        sum = narrow(sum + (zn + z2n) * v);
+        sum += (zn + z2n) * v;
         zn *= z;
         z2n *= iz;
     }
-    s[0] = narrow(sum / (1.0 - zn * zn));
+    s[0] = sum / (1.0 - zn * zn);
 }
 
 /// `SetInitialAntiCausalCoefficient`: overwrite `s[N-1]` with the anticausal
 /// recursion's initial value under mirror boundaries (Unser 1999 Box 2, with
 /// the published erratum applied).
-fn set_initial_anticausal_coefficient(s: &mut [f64], z: f64, narrow: fn(f64) -> f64) {
+fn set_initial_anticausal_coefficient(s: &mut [f64], z: f64) {
     let n_len = s.len();
-    s[n_len - 1] = narrow((z / (z * z - 1.0)) * (z * s[n_len - 2] + s[n_len - 1]));
+    s[n_len - 1] = (z / (z * z - 1.0)) * (z * s[n_len - 2] + s[n_len - 1]);
 }
 
 /// `DataToCoefficients1D`: in-place sample → coefficient transform of one
 /// line. Returns `false` (leaving `s` untouched) for a length-1 line, as ITK
 /// does — mirror boundaries need at least two samples.
-fn data_to_coefficients_1d(
-    s: &mut [f64],
-    poles: &[f64],
-    tolerance: f64,
-    narrow: fn(f64) -> f64,
-) -> bool {
+fn data_to_coefficients_1d(s: &mut [f64], poles: &[f64], tolerance: f64) -> bool {
     let n_len = s.len();
     if n_len == 1 {
         return false;
@@ -173,18 +178,18 @@ fn data_to_coefficients_1d(
         c0 *= (1.0 - z) * (1.0 - 1.0 / z);
     }
     for v in s.iter_mut() {
-        *v = narrow(*v * c0);
+        *v *= c0;
     }
 
     for &z in poles {
-        set_initial_causal_coefficient(s, z, tolerance, narrow);
+        set_initial_causal_coefficient(s, z, tolerance);
         for n in 1..n_len {
-            s[n] = narrow(s[n] + z * s[n - 1]);
+            s[n] += z * s[n - 1];
         }
 
-        set_initial_anticausal_coefficient(s, z, narrow);
+        set_initial_anticausal_coefficient(s, z);
         for n in (0..n_len - 1).rev() {
-            s[n] = narrow(z * (s[n + 1] - s[n]));
+            s[n] = z * (s[n + 1] - s[n]);
         }
     }
     true
@@ -222,9 +227,11 @@ fn coefficients_along_axis(
         for (j, v) in scratch.iter_mut().enumerate() {
             *v = data[base + j * stride];
         }
-        if data_to_coefficients_1d(&mut scratch, poles, tolerance, narrow) {
+        if data_to_coefficients_1d(&mut scratch, poles, tolerance) {
+            // Narrow to the output pixel type as the line is written back, once
+            // per axis — ITK's `CopyScratchToCoefficients` (`.hxx:281`).
             for (j, &v) in scratch.iter().enumerate() {
-                data[base + j * stride] = v;
+                data[base + j * stride] = narrow(v);
             }
         }
     }
@@ -289,7 +296,7 @@ mod tests {
     fn decompose_line(f: &[f64], order: u32, tolerance: f64) -> Vec<f64> {
         let mut s = f.to_vec();
         let poles = bspline_spline_poles(order).unwrap();
-        data_to_coefficients_1d(&mut s, &poles, tolerance, |v| v);
+        data_to_coefficients_1d(&mut s, &poles, tolerance);
         s
     }
 
@@ -439,7 +446,7 @@ mod tests {
     fn length_one_line_is_left_untouched_and_ungained() {
         let mut s = [4.0];
         let poles = bspline_spline_poles(3).unwrap();
-        assert!(!data_to_coefficients_1d(&mut s, &poles, TOLERANCE, |v| v));
+        assert!(!data_to_coefficients_1d(&mut s, &poles, TOLERANCE));
         // Not 24.0: the gain is never applied.
         assert_eq!(s[0], 4.0);
     }
@@ -550,24 +557,75 @@ mod tests {
     // ---- pixel type ----
 
     #[test]
-    fn float32_output_keeps_float32_and_rounds_per_step() {
+    fn float32_output_narrows_once_at_write_out_not_per_step() {
         let f: Vec<f32> = (0..20).map(|i| (i as f32).sin()).collect();
         let img = Image::from_vec(&[20], f.clone()).unwrap();
         let out = bspline_decomposition(&img, 3).unwrap();
         assert_eq!(out.pixel_id(), PixelId::Float32);
 
-        // The f32 coefficient type is not merely a narrowing of the f64 line:
-        // rounding after every recursion step gives a different answer.
+        // ITK runs the whole IIR recursion in `CoeffType = RealType = double`
+        // and narrows to the output pixel type once, at write-out
+        // (`static_cast<OutputPixelType>`, CopyScratchToCoefficients,
+        // itkBSplineDecompositionImageFilter.hxx:281). For this 1-D image that
+        // is a single narrowing of the f64 line — not rounding after each step.
         let f64_line = decompose_line(
             &f.iter().map(|&v| v as f64).collect::<Vec<_>>(),
             3,
             TOLERANCE,
         );
-        let mut f32_line: Vec<f64> = f.iter().map(|&v| v as f64).collect();
-        let poles = bspline_spline_poles(3).unwrap();
-        data_to_coefficients_1d(&mut f32_line, &poles, TOLERANCE, |v| v as f32 as f64);
-        assert_eq!(out.to_f64_vec().unwrap(), f32_line);
-        assert_ne!(f32_line, f64_line);
+        let want: Vec<f64> = f64_line.iter().map(|&v| v as f32 as f64).collect();
+        assert_eq!(out.to_f64_vec().unwrap(), want);
+
+        // The former bug rounded after every recursion step; that gives a
+        // different line, so the narrow-once result above is a real regression
+        // guard against reintroducing per-step rounding.
+        let mut per_step: Vec<f64> = f.iter().map(|&v| v as f64).collect();
+        narrow_per_step_reference(&mut per_step, &bspline_spline_poles(3).unwrap(), TOLERANCE);
+        assert_ne!(want, per_step);
+    }
+
+    /// The pre-fix behavior — rounding to f32 after *every* recursion step —
+    /// kept only to prove the fixed filter no longer matches it.
+    fn narrow_per_step_reference(s: &mut [f64], poles: &[f64], tolerance: f64) {
+        let nz = |v: f64| v as f32 as f64;
+        let n_len = s.len();
+        let mut c0 = 1.0;
+        for &z in poles {
+            c0 *= (1.0 - z) * (1.0 - 1.0 / z);
+        }
+        for v in s.iter_mut() {
+            *v = nz(*v * c0);
+        }
+        for &z in poles {
+            let mut zn = z;
+            let horizon = (tolerance.ln() / z.abs().ln()).ceil() as usize;
+            if tolerance > 0.0 && horizon < n_len {
+                let mut sum = s[0];
+                for &v in s.iter().take(horizon).skip(1) {
+                    sum = nz(sum + zn * v);
+                    zn *= z;
+                }
+                s[0] = sum;
+            } else {
+                let iz = 1.0 / z;
+                let mut z2n = z.powf((n_len - 1) as f64);
+                let mut sum = nz(s[0] + z2n * s[n_len - 1]);
+                z2n = z2n * z2n * iz;
+                for &v in s.iter().take(n_len - 1).skip(1) {
+                    sum = nz(sum + (zn + z2n) * v);
+                    zn *= z;
+                    z2n *= iz;
+                }
+                s[0] = nz(sum / (1.0 - zn * zn));
+            }
+            for n in 1..n_len {
+                s[n] = nz(s[n] + z * s[n - 1]);
+            }
+            s[n_len - 1] = nz((z / (z * z - 1.0)) * (z * s[n_len - 2] + s[n_len - 1]));
+            for n in (0..n_len - 1).rev() {
+                s[n] = nz(z * (s[n + 1] - s[n]));
+            }
+        }
     }
 
     #[test]

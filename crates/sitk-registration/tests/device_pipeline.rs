@@ -729,8 +729,11 @@ fn the_device_entry_point_refuses_at_the_boundary_by_name() {
 
     let run = |reg: &ImageRegistrationMethod| reg.execute_on_device(&d_f, &d_m, euler());
 
+    // A metric with no kernel. Mattes used to stand here and no longer does — it has one
+    // now, and `the_boundary_takes_correlation_and_still_names_what_it_refuses` pins that
+    // it is accepted, so this case has to be carried by a metric that is still refused.
     let mut reg = ImageRegistrationMethod::new();
-    reg.set_metric_as_mattes_mutual_information(32);
+    reg.set_metric_as_demons(0.001);
     assert!(matches!(
         run(&reg),
         Err(DeviceRegistrationError::UnsupportedMetric)
@@ -1797,19 +1800,52 @@ fn a_fixed_initial_transform_converges_where_execute_converges() {
             );
         }
         // The counts may differ by the border samples the two poses disagree on, but a
-        // device that sampled a *different set* would differ by the whole border shell,
-        // which is thousands of voxels — not a handful.
-        let (dv, hv) = (device.valid_points as f64, host.valid_points as f64);
-        let drift = (dv - hv).abs() / hv;
+        // device that sampled a *different set* would differ by the whole border shell.
+        //
+        // The bound is stated in **voxels**, not as a fraction of the sample count, and
+        // that is the point. The thing bounded is the shell of samples that straddle the
+        // moving buffer's face at two poses this close — a handful, and the same handful
+        // whether the configuration samples 150k points or 25k. A relative band divides
+        // that constant by the sample count, so it silently tightens by 6× on the
+        // virtual-domain configurations, which sample 25k where the others sample 150k;
+        // the old 1e-4 band admitted two straddling voxels there and three in the others,
+        // for no reason anyone chose. (It duly failed on a legitimate change to the
+        // sampler's rounding — the pin on the interpolant's arithmetic that Mattes made
+        // load-bearing — which moved the count by one voxel and nothing else.)
+        //
+        // What keeps this from being vacuous is `shell`: the samples the fixed-initial
+        // transform's resampling zeroes out, measured here rather than asserted. A device
+        // that resampled the fixed image through some other map, or sampled some other
+        // voxels, misses *that* population — thousands — not eight.
+        const STRADDLE_BUDGET: i64 = 8;
+        let bare = {
+            let mut reg = ImageRegistrationMethod::new();
+            reg.set_metric_as_mean_squares();
+            reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 25, 1e-8);
+            if with_domain {
+                virtual_domain(&mut reg);
+            }
+            reg.execute(&fixed, &moving, initial()).unwrap()
+        };
+        let shell = bare.valid_points as i64 - host.valid_points as i64;
         assert!(
-            drift <= 1e-4,
-            "{name}: {} valid points (device) vs {} (host) — a difference of {drift:e}, far \
-             more than the border samples two nearby poses can disagree on",
+            shell >= 100 * STRADDLE_BUDGET,
+            "{name}: the fixed-initial transform removes only {shell} samples, so a budget of \
+             {STRADDLE_BUDGET} straddling voxels is not orders below a wrong sample set — this \
+             assertion could no longer fail when the device sampled the wrong points"
+        );
+        let gap = device.valid_points as i64 - host.valid_points as i64;
+        assert!(
+            gap.abs() <= STRADDLE_BUDGET,
+            "{name}: {} valid points (device) vs {} (host) — {gap} apart, more than the border \
+             samples two poses this close can straddle, and on the scale of the {shell}-sample \
+             shell a wrong sample set would cost",
             device.valid_points,
             host.valid_points
         );
         println!(
-            "{name}: {} iters on both, params rel <= {worst:e}, valid {} (device) vs {} (host)",
+            "{name}: {} iters on both, params rel <= {worst:e}, valid {} (device) vs {} (host) \
+             — {gap} apart against a {shell}-sample shell",
             host.iterations, device.valid_points, host.valid_points
         );
     }
@@ -2437,8 +2473,8 @@ fn a_correlation_run_on_the_device_lands_where_the_host_correlation_run_lands() 
 /// N3: what the boundary says about the metric it now has a kernel for, and about the
 /// ones it does not.
 ///
-/// Correlation is accepted; the four metrics with no kernel are refused by name before
-/// the first iteration; and a **local-support** transform under correlation is refused
+/// Correlation and Mattes are accepted; the three metrics with no kernel are refused by
+/// name before the first iteration; and a **local-support** transform under correlation is refused
 /// as `RequiresGlobalTransform` — the metric's own rule, which
 /// `CorrelationMetric::check_transform` enforces on the host — rather than as the
 /// generic `NonAffineTransform` the mean-squares path reports for the same transform.
@@ -2455,25 +2491,35 @@ fn the_boundary_takes_correlation_and_still_names_what_it_refuses() {
     let c = n as f64 / 2.0;
     let euler = || Euler3DTransform::new(0.0, 0.0, 0.0, [0.0, 0.0, 0.0], [c, c, c]);
 
-    // Accepted: correlation has a kernel now, and the boundary must not decline it.
-    let mut reg = ImageRegistrationMethod::new();
-    reg.set_metric_as_correlation();
-    reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 5, 1e-8);
-    reg.set_optimizer_scales_from_physical_shift();
-    assert!(
-        !matches!(
-            reg.execute_on_device(&d_f, &d_m, euler()),
-            Err(DeviceRegistrationError::UnsupportedMetric)
-        ),
-        "correlation has a device kernel and must not be refused as unsupported"
-    );
-
-    // Still refused, each by name: the four metrics with no kernel.
+    // Accepted: correlation and Mattes have kernels now, and the boundary must not
+    // decline either. Mattes joined the accepted list when the joint histogram got a
+    // deterministic reduction — its value is bit-identical to the host's; see
+    // `tests/mattes_device.rs`.
     type Configure = fn(&mut ImageRegistrationMethod);
-    let refusals: [(&str, Configure); 4] = [
+    let accepted: [(&str, Configure); 2] = [
+        ("correlation", |r| {
+            r.set_metric_as_correlation();
+        }),
         ("mattes", |r| {
             r.set_metric_as_mattes_mutual_information(32);
         }),
+    ];
+    for (name, set) in accepted {
+        let mut reg = ImageRegistrationMethod::new();
+        set(&mut reg);
+        reg.set_optimizer_as_regular_step_gradient_descent(1.0, 1e-4, 5, 1e-8);
+        reg.set_optimizer_scales_from_physical_shift();
+        assert!(
+            !matches!(
+                reg.execute_on_device(&d_f, &d_m, euler()),
+                Err(DeviceRegistrationError::UnsupportedMetric)
+            ),
+            "{name} has a device kernel and must not be refused as unsupported"
+        );
+    }
+
+    // Still refused, each by name: the three metrics with no kernel.
+    let refusals: [(&str, Configure); 3] = [
         ("ants neighborhood correlation", |r| {
             r.set_metric_as_ants_neighborhood_correlation(2);
         }),

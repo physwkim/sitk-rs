@@ -52,7 +52,7 @@
 //! [`has_local_support`]: ParametricTransform::has_local_support
 //! [`sparse_jacobian_wrt_parameters`]: ParametricTransform::sparse_jacobian_wrt_parameters
 
-use sitk_core::Image;
+use sitk_core::{Image, coord};
 
 use crate::error::{Result, TransformError};
 use crate::interpolator::{is_inside, physical_to_index_matrix, strides};
@@ -322,7 +322,9 @@ impl ParametricTransform for DisplacementFieldTransform {
         // (frac = 0 ⇒ unit weight at the pixel's own displacement).
         let mut pixel = 0usize;
         for (d, &ci) in cindex.iter().enumerate() {
-            let idx = (ci.round() as isize).clamp(0, self.size[d] as isize - 1) as usize;
+            // RoundHalfIntegerUp (half toward +∞), matching ITK's index rounding,
+            // not Rust's half-away-from-zero `f64::round`.
+            let idx = coord::round_half_integer_up(ci).clamp(0, self.size[d] as i64 - 1) as usize;
             pixel += idx * self.strides[d];
         }
         let offset = pixel * dim;

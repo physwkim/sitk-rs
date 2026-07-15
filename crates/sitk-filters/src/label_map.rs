@@ -942,7 +942,7 @@ mod tests {
     fn binary_image_to_label_map_agrees_with_connected_component_on_a_zero_one_image() {
         let img = Image::from_vec(&[4, 3], vec![1u8, 1, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1]).unwrap();
         let (map, _) = binary_image_to_label_map(&img, &Default::default()).unwrap();
-        let cc = crate::label::connected_component(&img, false).unwrap();
+        let cc = crate::label::connected_component(&img, None, false).unwrap();
         assert_eq!(dense(&map), cc.scalar_slice::<u32>().unwrap());
     }
 
