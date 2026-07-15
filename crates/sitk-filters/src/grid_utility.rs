@@ -9,9 +9,8 @@
 
 use crate::error::{FilterError, Result};
 use crate::geometry::require_same_physical_space;
-use crate::image_from_f64;
 use crate::require_same_shape;
-use sitk_core::Image;
+use sitk_core::{Image, Scalar, dispatch_scalar};
 
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
@@ -61,9 +60,32 @@ pub fn checker_board(image1: &Image, image2: &Image, checker_pattern: &[u32]) ->
     }
 
     let strides = strides(size);
-    let vals1 = image1.to_f64_vec()?;
-    let vals2 = image2.to_f64_vec()?;
-    let out: Vec<f64> = (0..image1.number_of_pixels())
+    dispatch_scalar!(
+        image1.pixel_id(),
+        checker_native,
+        image1,
+        image2,
+        size,
+        &strides,
+        &factors
+    )
+}
+
+/// Select each output pixel from `image1` or `image2`'s **native** buffer —
+/// no `to_f64_vec` widening — so `UInt64`/`Int64` values above 2^53 keep their
+/// exact bits. `scalar_slice` rejects a non-scalar input, preserving the
+/// scalar-only contract the old seam enforced.
+fn checker_native<T: Scalar>(
+    image1: &Image,
+    image2: &Image,
+    size: &[usize],
+    strides: &[usize],
+    factors: &[usize],
+) -> Result<Image> {
+    let dim = size.len();
+    let vals1 = image1.scalar_slice::<T>()?;
+    let vals2 = image2.scalar_slice::<T>()?;
+    let out: Vec<T> = (0..image1.number_of_pixels())
         .map(|flat| {
             let mut sum = 0usize;
             for d in 0..dim {
@@ -77,8 +99,9 @@ pub fn checker_board(image1: &Image, image2: &Image, checker_pattern: &[u32]) ->
             }
         })
         .collect();
-
-    image_from_f64(image1.pixel_id(), size, image1, &out)
+    let mut out_image = Image::from_vec(size, out)?;
+    out_image.copy_geometry_from(image1);
+    Ok(out_image)
 }
 
 // ---- paste --------------------------------------------------------------
@@ -137,12 +160,37 @@ pub fn paste(
         };
     }
 
-    let mut out_vals = destination.to_f64_vec()?;
+    dispatch_scalar!(
+        destination.pixel_id(),
+        paste_native,
+        destination,
+        source,
+        &clipped_size,
+        source_index,
+        destination_index
+    )
+}
+
+/// Overlay `source`'s clipped block onto a **native** copy of `destination`'s
+/// buffer — no `to_f64_vec` widening — so `UInt64`/`Int64` values above 2^53
+/// keep their exact bits on both the pass-through and the overlaid pixels.
+/// `scalar_slice` rejects a non-scalar input, preserving the scalar-only
+/// contract the old seam enforced.
+fn paste_native<T: Scalar>(
+    destination: &Image,
+    source: &Image,
+    clipped_size: &[usize],
+    source_index: &[usize],
+    destination_index: &[usize],
+) -> Result<Image> {
+    let dim = destination.dimension();
+    let dest_size = destination.size();
+    let mut out: Vec<T> = destination.scalar_slice::<T>()?.to_vec();
     if clipped_size.iter().all(|&s| s > 0) {
         let dest_strides = strides(dest_size);
-        let src_strides = strides(source_extent);
-        let clipped_strides = strides(&clipped_size);
-        let src_vals = source.to_f64_vec()?;
+        let src_strides = strides(source.size());
+        let clipped_strides = strides(clipped_size);
+        let src = source.scalar_slice::<T>()?;
         let count: usize = clipped_size.iter().product();
         for o in 0..count {
             let mut dest_flat = 0usize;
@@ -152,11 +200,12 @@ pub fn paste(
                 dest_flat += (oi + destination_index[d]) * dest_strides[d];
                 src_flat += (oi + source_index[d]) * src_strides[d];
             }
-            out_vals[dest_flat] = src_vals[src_flat];
+            out[dest_flat] = src[src_flat];
         }
     }
-
-    image_from_f64(destination.pixel_id(), dest_size, destination, &out_vals)
+    let mut out_image = Image::from_vec(dest_size, out)?;
+    out_image.copy_geometry_from(destination);
+    Ok(out_image)
 }
 
 // ---- tile --------------------------------------------------------------
@@ -228,30 +277,61 @@ pub fn tile(images: &[&Image], layout: &[usize], default_pixel_value: f64) -> Re
         output_size[d] = offsets[d][layout[d] - 1] + sizes[d][layout[d] - 1];
     }
 
+    dispatch_scalar!(
+        pixel_id,
+        tile_native,
+        images,
+        &layout,
+        &tile_strides,
+        &offsets,
+        &output_size,
+        total_tiles,
+        default_pixel_value
+    )
+}
+
+/// Place each tile's **native** buffer into the output at its grid offset,
+/// gaps filled with the quantized `default_pixel_value` — no `to_f64_vec`
+/// widening, so `UInt64`/`Int64` values above 2^53 keep their exact bits.
+/// `scalar_slice` rejects a non-scalar input, preserving the scalar-only
+/// contract the old seam enforced.
+#[allow(clippy::too_many_arguments)]
+fn tile_native<T: Scalar>(
+    images: &[&Image],
+    layout: &[usize],
+    tile_strides: &[usize],
+    offsets: &[Vec<usize>],
+    output_size: &[usize],
+    total_tiles: usize,
+    default_pixel_value: f64,
+) -> Result<Image> {
+    let dim = output_size.len();
     let out_count: usize = output_size.iter().product();
-    let mut out_vals = vec![default_pixel_value; out_count];
-    let out_strides = strides(&output_size);
+    let mut out: Vec<T> = vec![T::from_f64(default_pixel_value); out_count];
+    let out_strides = strides(output_size);
 
     for (t, img) in images.iter().enumerate().take(total_tiles) {
         let img_size = img.size();
         let img_strides = strides(img_size);
-        let img_vals = img.to_f64_vec()?;
+        let src = img.scalar_slice::<T>()?;
         let mut cell_index = vec![0usize; dim];
         for (d, cell_index_d) in cell_index.iter_mut().enumerate() {
             let coord_d = (t / tile_strides[d]) % layout[d];
             *cell_index_d = offsets[d][coord_d];
         }
-        for (o, &val) in img_vals.iter().enumerate() {
+        for (o, &val) in src.iter().enumerate() {
             let mut out_flat = 0usize;
             for d in 0..dim {
                 let oi = (o / img_strides[d]) % img_size[d];
                 out_flat += (oi + cell_index[d]) * out_strides[d];
             }
-            out_vals[out_flat] = val;
+            out[out_flat] = val;
         }
     }
 
-    image_from_f64(pixel_id, &output_size, images[0], &out_vals)
+    let mut out_image = Image::from_vec(output_size, out)?;
+    out_image.copy_geometry_from(images[0]);
+    Ok(out_image)
 }
 
 #[cfg(test)]
@@ -503,5 +583,76 @@ mod tests {
         let a = Image::from_vec(&[1, 1], vec![7u8]).unwrap();
         let out = tile(&[&a], &[1, 1], 0.0).unwrap();
         assert_eq!(out.pixel_id(), PixelId::UInt8);
+    }
+
+    // ---- 64-bit-integer losslessness (native path, no f64 seam) ----------
+
+    // Two distinct `UInt64` values above 2^53 whose exact bits cannot survive
+    // an `f64` round-trip: the old `to_f64_vec` seam would have collapsed each
+    // onto an even neighbour, so any test that recovers them exactly proves the
+    // pixel path never widened through `f64`.
+    const HI_A: u64 = (1 << 53) + 1;
+    const HI_B: u64 = (1 << 53) + 3;
+
+    fn assert_non_f64(v: u64) {
+        // Non-vacuity guard: if this value *did* round-trip cleanly through
+        // f64, recovering it exactly below would prove nothing.
+        assert_ne!(v, (v as f64) as u64, "{v} survives an f64 round-trip");
+    }
+
+    #[test]
+    fn checker_board_selects_u64_pixels_losslessly() {
+        assert_non_f64(HI_A);
+        assert_non_f64(HI_B);
+        let a = Image::from_vec(&[4, 4], vec![HI_A; 16]).unwrap();
+        let b = Image::from_vec(&[4, 4], vec![HI_B; 16]).unwrap();
+        let out = checker_board(&a, &b, &[2, 2]).unwrap();
+        let got = out.scalar_slice::<u64>().unwrap();
+        let s = strides(&[4, 4]);
+        for row in 0..4 {
+            for col in 0..4 {
+                let flat = col * s[0] + row * s[1];
+                let want = if (col / 2 + row / 2) % 2 == 1 {
+                    HI_B
+                } else {
+                    HI_A
+                };
+                assert_eq!(got[flat], want, "at ({col},{row})");
+            }
+        }
+    }
+
+    #[test]
+    fn paste_moves_u64_pixels_losslessly() {
+        assert_non_f64(HI_A);
+        assert_non_f64(HI_B);
+        let dest = Image::from_vec(&[4, 4], vec![HI_A; 16]).unwrap();
+        let src = Image::from_vec(&[2, 2], vec![HI_B; 4]).unwrap();
+        let out = paste(&dest, &src, &[0, 0], &[2, 2], &[1, 1]).unwrap();
+        let got = out.scalar_slice::<u64>().unwrap();
+        let s = strides(&[4, 4]);
+        for row in 0..4 {
+            for col in 0..4 {
+                let flat = col * s[0] + row * s[1];
+                let inside = (1..=2).contains(&col) && (1..=2).contains(&row);
+                assert_eq!(got[flat], if inside { HI_B } else { HI_A });
+            }
+        }
+    }
+
+    #[test]
+    fn tile_moves_u64_pixels_losslessly() {
+        assert_non_f64(HI_A);
+        assert_non_f64(HI_B);
+        let a = Image::from_vec(&[2, 1], vec![HI_A, HI_A]).unwrap();
+        let b = Image::from_vec(&[2, 1], vec![HI_B, HI_B]).unwrap();
+        // `default_pixel_value` 0.0 fills no cell here (both cells are full),
+        // so every output pixel is an exact copy of an input pixel.
+        let out = tile(&[&a, &b], &[2, 1], 0.0).unwrap();
+        assert_eq!(out.size(), &[4, 1]);
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[HI_A, HI_A, HI_B, HI_B]
+        );
     }
 }
