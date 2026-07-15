@@ -60,9 +60,18 @@ use crate::error::{FilterError, Result};
 use crate::geometry::same_physical_space;
 use sitk_core::{Image, Scalar, dispatch_scalar};
 
-fn build_image<T: Scalar>(size: &[usize], vals: &[f64]) -> Result<Image> {
-    let data: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
-    Ok(Image::from_vec(size, data)?)
+/// Concatenate the inputs' **native** buffers into one slab-stacked output of
+/// pixel type `T`. Each input is copied through [`Image::scalar_slice`] — no
+/// `to_f64_vec` widening — so `UInt64`/`Int64` values above 2^53 keep their
+/// exact bits. `scalar_slice` also rejects a non-scalar input, preserving the
+/// scalar-only contract the old `to_f64_vec` seam enforced.
+fn join_native<T: Scalar>(images: &[&Image], out_size: &[usize]) -> Result<Image> {
+    let slab_len = images[0].number_of_pixels();
+    let mut data: Vec<T> = Vec::with_capacity(slab_len * images.len());
+    for img in images {
+        data.extend_from_slice(img.scalar_slice::<T>()?);
+    }
+    Ok(Image::from_vec(out_size, data)?)
 }
 
 /// `JoinSeriesImageFilter`: stack `images` (all sharing a pixel type and
@@ -141,17 +150,10 @@ pub fn join_series(images: &[&Image], origin: f64, spacing: f64) -> Result<Image
 
     // Every input now has exactly the primary's size (any mismatch was
     // rejected above), so its buffer is one slab of the output, laid out
-    // identically. The new axis is the output's slowest-varying, so slab `k`
-    // occupies the flat range `[k * slab_len, (k + 1) * slab_len)`.
-    let slab_len: usize = primary_size.iter().product();
-    let mut out_vals = vec![0.0f64; slab_len * images.len()];
-    for (slab_index, img) in images.iter().enumerate() {
-        let img_vals = img.to_f64_vec()?;
-        let out_offset = slab_index * slab_len;
-        out_vals[out_offset..out_offset + slab_len].copy_from_slice(&img_vals);
-    }
-
-    let mut out_image = dispatch_scalar!(pixel_id, build_image, &out_size, &out_vals)?;
+    // identically. The new axis is the output's slowest-varying, so the inputs
+    // concatenate in order — [`join_native`] copies each native buffer straight
+    // into the output.
+    let mut out_image = dispatch_scalar!(pixel_id, join_native, images, &out_size)?;
     out_image.set_spacing(&out_spacing)?;
     out_image.set_origin(&out_origin)?;
     out_image.set_direction(&out_direction)?;
@@ -180,6 +182,22 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
         );
         assert_eq!(out.pixel_id(), PixelId::Float32);
+    }
+
+    #[test]
+    fn join_series_stacks_u64_pixels_losslessly() {
+        // 2^53 + 1 is the smallest u64 an f64 cannot hold; the old to_f64_vec
+        // slab copy rounded it. Non-vacuity guard proves the values corrupt.
+        let hi = (1u64 << 53) + 1;
+        assert_ne!(hi, (hi as f64) as u64);
+        let a = img(&[2, 1], vec![hi, hi + 1]);
+        let b = img(&[2, 1], vec![hi + 2, hi + 3]);
+        let out = join_series(&[&a, &b], 0.0, 1.0).unwrap();
+        assert_eq!(out.pixel_id(), PixelId::UInt64);
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[hi, hi + 1, hi + 2, hi + 3]
+        );
     }
 
     #[test]
