@@ -5,7 +5,7 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > **Status: broad and deep, not complete.** The core model, ten image
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
-> implemented and tested — **3,410 tests** on the CPU, **3,517** with the CUDA
+> implemented and tested — **3,545 tests** on the CPU, **3,575** with the CUDA
 > feature on. Every algorithm is checked against the ITK v6 source, and every
 > upstream defect found along the way is recorded in
 > [`doc/upstream-findings.md`](doc/upstream-findings.md).
@@ -430,8 +430,8 @@ each one you can trust.
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,410 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,517, needs CUDA 13
+cargo nextest run --workspace                        # 3,545 tests
+cargo nextest run --workspace --features sitk-filters/cuda   # 3,575, needs CUDA 13
 ```
 
 License: Apache-2.0.
