@@ -394,6 +394,109 @@ fn build_from_f64<T: Scalar>(size: &[usize], geom: &Image, vals: &[f64]) -> Resu
     Ok(img)
 }
 
+// ---- integer-native value path (cast / clamp) -----------------------------
+//
+// `to_f64_vec()` + `image_from_f64()` widen every pixel through `f64`, which
+// loses precision for `UInt64`/`Int64` above `2^53` (`2^53 + 1` collapses to
+// `2^53`). The value-transform ops that ITK performs with a plain
+// `static_cast` — [`cast`], [`clamp`] — must therefore route an integer pixel
+// through `i128` instead: `i128` holds every integer pixel type losslessly
+// (`u64::MAX < i128::MAX`, `i64::MIN > i128::MIN`), so the widen-then-narrow is
+// exact. Kept filter-local (per the seam's scope: no `sitk-core` change); the
+// `f64` path stays for any float on either side, where it is already exact.
+
+/// Narrow an `i128` back to a pixel type with C++ `static_cast<Self>` semantics
+/// (`v as Self`): the write side of the integer-native value path.
+///
+/// Only ever *called* for an integer `Self` — the caller establishes
+/// [`PixelId::is_integer_scalar`] on the output type before dispatching. The
+/// `f32`/`f64` impls exist solely so the `dispatch_scalar!` table over the
+/// output type monomorphizes for every arm; they are never reached.
+pub(crate) trait FromWide: Scalar {
+    fn from_i128(v: i128) -> Self;
+}
+
+macro_rules! impl_from_wide {
+    ($($t:ty),+ $(,)?) => {$(
+        impl FromWide for $t {
+            #[inline]
+            fn from_i128(v: i128) -> Self {
+                v as $t
+            }
+        }
+    )+};
+}
+
+impl_from_wide!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
+
+/// Widen an integer scalar image's pixels to `i128` losslessly: the read side
+/// of the integer-native value path.
+///
+/// The caller must have established [`PixelId::is_integer_scalar`] on `img`
+/// (which also guarantees the image is scalar, so [`Image::scalar_slice`] never
+/// errors here); the non-integer arm is unreachable.
+pub(crate) fn read_pixels_i128(img: &Image) -> Result<Vec<i128>> {
+    Ok(match img.pixel_id() {
+        PixelId::UInt8 => img
+            .scalar_slice::<u8>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::Int8 => img
+            .scalar_slice::<i8>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::UInt16 => img
+            .scalar_slice::<u16>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::Int16 => img
+            .scalar_slice::<i16>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::UInt32 => img
+            .scalar_slice::<u32>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::Int32 => img
+            .scalar_slice::<i32>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::UInt64 => img
+            .scalar_slice::<u64>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        PixelId::Int64 => img
+            .scalar_slice::<i64>()?
+            .iter()
+            .map(|&x| x as i128)
+            .collect(),
+        other => unreachable!(
+            "read_pixels_i128 requires an integer scalar image; caller gates \
+             with is_integer_scalar (got {other:?})"
+        ),
+    })
+}
+
+/// [`build_from_f64`]'s integer-native twin: narrow each `i128` to `T` with
+/// [`FromWide::from_i128`] (a native `static_cast`), never through `f64`.
+fn build_from_i128<T: Scalar + FromWide>(
+    size: &[usize],
+    geom: &Image,
+    wide: &[i128],
+) -> Result<Image> {
+    let out: Vec<T> = parallel::map_slice(wide, |&v| T::from_i128(v));
+    let mut img = Image::from_vec(size, out)?;
+    img.copy_geometry_from(geom);
+    Ok(img)
+}
+
 /// Build an image of `target` pixel type from `f64` values, copying `geom`'s
 /// geometry.
 ///
@@ -538,11 +641,32 @@ fn require_same_shape(a: &Image, b: &Image) -> Result<()> {
 
 // ---- cast -----------------------------------------------------------------
 
-/// `CastImageFilter`: convert an image to another pixel type (`static_cast`
-/// semantics via [`Scalar::from_f64`]).
+/// `CastImageFilter`: convert an image to another pixel type. ITK's functor is
+/// `static_cast<TOutput>(A)` (`itkCastImageFilter.h`), so the cast must be exact
+/// for every input value.
+///
+/// **Integer input to integer output** takes the native path: each pixel is
+/// widened to `i128` (lossless for every integer pixel type) and narrowed with a
+/// native `static_cast` ([`read_pixels_i128`] / [`build_from_i128`]). Routing
+/// through `f64` — as the general filter exit does — would collapse a `UInt64`/
+/// `Int64` value above `2^53` (e.g. `2^53 + 1 -> 2^53`), which a `static_cast`
+/// never does.
+///
+/// **Any float on either side** keeps the `f64` path. For a float *input* it is
+/// exact (`f32 -> f64` is lossless). For an integer input cast to `Float32` it
+/// deliberately double-rounds (`native -> f64 -> f32`): the device cast in
+/// `sitk-cuda` mirrors that rounding to stay bit-identical to this filter (pinned
+/// by `sitk-registration/tests/upload_cast.rs`), so the host must not switch to a
+/// single rounding here. Integer input cast to `Float64` is identical either way
+/// (one rounding to `f64`).
 pub fn cast(img: &Image, target: PixelId) -> Result<Image> {
-    let vals = img.to_f64_vec()?;
-    image_from_f64(target, img.size(), img, &vals)
+    if img.pixel_id().is_integer_scalar() && target.is_integer_scalar() {
+        let wide = read_pixels_i128(img)?;
+        dispatch_scalar!(target, build_from_i128, img.size(), img, &wide)
+    } else {
+        let vals = img.to_f64_vec()?;
+        image_from_f64(target, img.size(), img, &vals)
+    }
 }
 
 // ---- binary arithmetic (image ⊕ image) ------------------------------------
@@ -914,6 +1038,33 @@ mod tests {
         let b = cast(&a, PixelId::Int16).unwrap();
         assert_eq!(b.spacing(), a.spacing());
         assert_eq!(b.origin(), a.origin());
+    }
+
+    /// A `UInt64`/`Int64` value above `2^53` survives a same-type (and wider)
+    /// integer cast bit-for-bit. The old `f64` round-trip collapsed `2^53 + 1`
+    /// to `2^53`; the native `i128` path (`static_cast<Out>(A)`) does not.
+    #[test]
+    fn cast_integer_above_2_53_is_lossless() {
+        let hard = (1u64 << 53) + 1; // 9_007_199_254_740_993, not f64-representable
+        let a = Image::from_vec(&[3, 1], vec![0u64, hard, u64::MAX]).unwrap();
+
+        // Same-type cast is the identity, exactly.
+        let same = cast(&a, PixelId::UInt64).unwrap();
+        assert_eq!(same.pixel_id(), PixelId::UInt64);
+        assert_eq!(same.scalar_slice::<u64>().unwrap(), &[0, hard, u64::MAX]);
+
+        // Widening to a signed 64-bit type keeps the same value (fits in i64).
+        let widened = cast(&a, PixelId::Int64).unwrap();
+        assert_eq!(
+            widened.scalar_slice::<i64>().unwrap(),
+            &[0, hard as i64, u64::MAX as i64]
+        );
+
+        // Int64 above 2^53 is likewise preserved by a same-type cast.
+        let hard_i = (1i64 << 53) + 1;
+        let b = Image::from_vec(&[2, 1], vec![i64::MIN, hard_i]).unwrap();
+        let same_i = cast(&b, PixelId::Int64).unwrap();
+        assert_eq!(same_i.scalar_slice::<i64>().unwrap(), &[i64::MIN, hard_i]);
     }
 
     #[test]
