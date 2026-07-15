@@ -10,9 +10,11 @@
 //! where `scales` (default all-ones) balances parameters of different physical
 //! magnitude — e.g. an affine's matrix entries (`≈1`) versus its translation
 //! (`≈ image extent`) — exactly as ITK's optimizer scales do. Iteration stops at
-//! `number_of_iterations`, early when the scaled step is below
-//! `min_step_tolerance`, or — when convergence monitoring is enabled — when the
-//! metric value plateaus (see [`crate::convergence`]).
+//! `number_of_iterations`, or earlier when convergence monitoring is enabled and
+//! the windowed metric value plateaus (see [`crate::convergence`]) — matching
+//! `itk::GradientDescentOptimizerv4`, whose only early stop is the convergence
+//! monitor (it has no minimum-step-length tolerance; that belongs to
+//! `itk::RegularStepGradientDescentOptimizerv4`).
 
 use sitk_core::compensated::compensated_sum;
 
@@ -71,7 +73,10 @@ where
 pub enum StopReason {
     /// Hit `number_of_iterations`.
     MaxIterations,
-    /// The scaled step length fell below `min_step_tolerance`.
+    /// A step-size tolerance was reached: `RegularStepGradientDescentOptimizer`'s
+    /// `minimum_step_length`, or `OnePlusOneEvolutionaryOptimizer`'s Frobenius
+    /// search-radius floor. `itk::GradientDescentOptimizerv4` and its line-search
+    /// subclasses have no such stop — they end early only via [`Self::Converged`].
     StepTooSmall,
     /// The windowed metric value plateaued at or below the minimum convergence
     /// value (`itk::WindowConvergenceMonitoringFunction`).
@@ -109,7 +114,6 @@ pub struct GradientDescentOptimizer {
     learning_rate: f64,
     number_of_iterations: usize,
     scales: Option<Vec<f64>>,
-    min_step_tolerance: f64,
     /// `(window_size, minimum_convergence_value)` when value-plateau monitoring
     /// is enabled; `None` disables it (the default).
     convergence: Option<(usize, f64)>,
@@ -117,14 +121,12 @@ pub struct GradientDescentOptimizer {
 
 impl GradientDescentOptimizer {
     /// A gradient-descent optimizer with the given step size and iteration cap.
-    /// Scales default to all-ones, the min-step tolerance to `1e-8`, and
-    /// convergence monitoring is disabled.
+    /// Scales default to all-ones and convergence monitoring is disabled.
     pub fn new(learning_rate: f64, number_of_iterations: usize) -> Self {
         Self {
             learning_rate,
             number_of_iterations,
             scales: None,
-            min_step_tolerance: 1e-8,
             convergence: None,
         }
     }
@@ -141,18 +143,12 @@ impl GradientDescentOptimizer {
         self
     }
 
-    /// Set the minimum scaled-step length below which iteration stops early.
-    pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
-        self.min_step_tolerance = tol;
-        self
-    }
-
     /// Enable value-plateau convergence monitoring
     /// (`itk::WindowConvergenceMonitoringFunction`): stop once the windowed
     /// metric value's trend flattens to at or below `minimum_convergence_value`.
-    /// Required for a non-shrinking step schedule (learning-rate estimation at
-    /// each iteration); fixed-rate runs converge via the min-step tolerance
-    /// instead.
+    /// This is the only early stop for gradient descent — ITK's
+    /// `GradientDescentOptimizerv4` enables it by default in every learning-rate
+    /// mode (fixed, estimate-once, estimate-each-iteration).
     pub fn set_convergence(
         &mut self,
         window_size: usize,
@@ -235,22 +231,14 @@ impl GradientDescentOptimizer {
             }
 
             let lr = learning_rate_of(&grad);
-            let mut step_sq = 0.0;
             for k in 0..n {
-                let step = lr * grad[k] / scales[k];
-                p[k] -= step;
-                step_sq += step * step;
+                p[k] -= lr * grad[k] / scales[k];
             }
             taken += 1;
 
             let (v, g) = eval(&p);
             value = v;
             grad = g;
-
-            if step_sq.sqrt() < self.min_step_tolerance {
-                stop_reason = StopReason::StepTooSmall;
-                break;
-            }
         }
 
         OptimizerResult {
@@ -590,9 +578,11 @@ fn golden_section_search(
 /// as [`LBFGSBOptimizer`](crate::LBFGSBOptimizer) does) to guard the rare case a
 /// bounded search overshoots.
 ///
-/// Iteration stops at `number_of_iterations`, early when the step length falls
-/// below `min_step_tolerance`, or — when convergence monitoring is enabled — when
-/// the windowed metric value plateaus (see [`crate::convergence`]).
+/// Iteration stops at `number_of_iterations`, or earlier when convergence
+/// monitoring is enabled and the windowed metric value plateaus (see
+/// [`crate::convergence`]) — matching `itk::GradientDescentLineSearchOptimizerv4`,
+/// which inherits `GradientDescentOptimizerv4`'s convergence-monitor stop and adds
+/// no minimum-step tolerance.
 #[derive(Clone, Debug)]
 pub struct GradientDescentLineSearchOptimizer {
     learning_rate: f64,
@@ -602,7 +592,6 @@ pub struct GradientDescentLineSearchOptimizer {
     upper_limit: f64,
     epsilon: f64,
     maximum_line_search_iterations: u32,
-    min_step_tolerance: f64,
     /// `(window_size, minimum_convergence_value)` when value-plateau monitoring
     /// is enabled; `None` disables it (the default).
     convergence: Option<(usize, f64)>,
@@ -612,8 +601,7 @@ impl GradientDescentLineSearchOptimizer {
     /// A line-search optimizer with the given base learning rate and iteration
     /// cap. The bracket limits (`0` and `5`), line-search resolution `epsilon`
     /// (`0.01`), and maximum line-search recursion (`20`) default to ITK's
-    /// values; scales default to all-ones, the min-step tolerance to `1e-8`, and
-    /// convergence monitoring is disabled.
+    /// values; scales default to all-ones and convergence monitoring is disabled.
     pub fn new(learning_rate: f64, number_of_iterations: usize) -> Self {
         Self {
             learning_rate,
@@ -623,7 +611,6 @@ impl GradientDescentLineSearchOptimizer {
             upper_limit: 5.0,
             epsilon: 0.01,
             maximum_line_search_iterations: 20,
-            min_step_tolerance: 1e-8,
             convergence: None,
         }
     }
@@ -662,12 +649,6 @@ impl GradientDescentLineSearchOptimizer {
     /// `20`).
     pub fn set_maximum_line_search_iterations(&mut self, iterations: u32) -> &mut Self {
         self.maximum_line_search_iterations = iterations;
-        self
-    }
-
-    /// Set the minimum step length below which iteration stops early.
-    pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
-        self.min_step_tolerance = tol;
         self
     }
 
@@ -790,26 +771,14 @@ impl GradientDescentLineSearchOptimizer {
             };
             base_lr = lr;
 
-            let mut step_sq = 0.0;
             for k in 0..n {
-                let step = lr * d[k];
-                p[k] -= step;
-                step_sq += step * step;
+                p[k] -= lr * d[k];
             }
             taken += 1;
 
             let (v, g) = eval.value_and_gradient(&p);
             value = v;
             grad = g;
-
-            if step_sq.sqrt() < self.min_step_tolerance {
-                if value < best_value {
-                    best_value = value;
-                    best_params.copy_from_slice(&p);
-                }
-                stop_reason = StopReason::StepTooSmall;
-                break;
-            }
         }
 
         OptimizerResult {
@@ -844,8 +813,8 @@ impl GradientDescentLineSearchOptimizer {
 /// drops stale conjugacy — ITK's guard against a direction that is no longer a
 /// descent direction. The step is then `p ← p − learning_rate · d`.
 ///
-/// Configuration, scales, stopping (`number_of_iterations`, `min_step_tolerance`,
-/// convergence monitoring), and best-value return match
+/// Configuration, scales, stopping (`number_of_iterations`, convergence
+/// monitoring), and best-value return match
 /// [`GradientDescentLineSearchOptimizer`].
 #[derive(Clone, Debug)]
 pub struct ConjugateGradientLineSearchOptimizer {
@@ -856,7 +825,6 @@ pub struct ConjugateGradientLineSearchOptimizer {
     upper_limit: f64,
     epsilon: f64,
     maximum_line_search_iterations: u32,
-    min_step_tolerance: f64,
     /// `(window_size, minimum_convergence_value)` when value-plateau monitoring
     /// is enabled; `None` disables it (the default).
     convergence: Option<(usize, f64)>,
@@ -866,8 +834,8 @@ impl ConjugateGradientLineSearchOptimizer {
     /// A conjugate-gradient line-search optimizer with the given base learning
     /// rate and iteration cap. The bracket limits (`0` and `5`), line-search
     /// resolution `epsilon` (`0.01`), and maximum line-search recursion (`20`)
-    /// default to ITK's values; scales default to all-ones, the min-step
-    /// tolerance to `1e-8`, and convergence monitoring is disabled.
+    /// default to ITK's values; scales default to all-ones and convergence
+    /// monitoring is disabled.
     pub fn new(learning_rate: f64, number_of_iterations: usize) -> Self {
         Self {
             learning_rate,
@@ -877,7 +845,6 @@ impl ConjugateGradientLineSearchOptimizer {
             upper_limit: 5.0,
             epsilon: 0.01,
             maximum_line_search_iterations: 20,
-            min_step_tolerance: 1e-8,
             convergence: None,
         }
     }
@@ -914,12 +881,6 @@ impl ConjugateGradientLineSearchOptimizer {
     /// `20`).
     pub fn set_maximum_line_search_iterations(&mut self, iterations: u32) -> &mut Self {
         self.maximum_line_search_iterations = iterations;
-        self
-    }
-
-    /// Set the minimum step length below which iteration stops early.
-    pub fn set_min_step_tolerance(&mut self, tol: f64) -> &mut Self {
-        self.min_step_tolerance = tol;
         self
     }
 
@@ -1056,26 +1017,14 @@ impl ConjugateGradientLineSearchOptimizer {
             };
             base_lr = lr;
 
-            let mut step_sq = 0.0;
             for k in 0..n {
-                let step = lr * conjugate[k];
-                p[k] -= step;
-                step_sq += step * step;
+                p[k] -= lr * conjugate[k];
             }
             taken += 1;
 
             let (v, g) = eval.value_and_gradient(&p);
             value = v;
             grad = g;
-
-            if step_sq.sqrt() < self.min_step_tolerance {
-                if value < best_value {
-                    best_value = value;
-                    best_params.copy_from_slice(&p);
-                }
-                stop_reason = StopReason::StepTooSmall;
-                break;
-            }
         }
 
         OptimizerResult {
@@ -1195,13 +1144,24 @@ mod tests {
     }
 
     #[test]
-    fn stops_early_when_step_is_tiny() {
+    fn gradient_descent_stops_on_convergence_monitor() {
+        // Finding A parity: fixed-rate gradient descent has no minimum-step stop;
+        // its only early stop is the value-plateau monitor, matching
+        // `itk::GradientDescentOptimizerv4`. On the bowl f(p) = (p0−3)² + (p1+2)²
+        // at learning rate 0.1 under SimpleITK's SetOptimizerAsGradientDescent
+        // convergence defaults (window 10, minimum convergence value 1e-6), the
+        // run stops Converged at iteration 37 — the count the port's own
+        // Finding-A measurement recorded, and the count a min-step stop (which
+        // fired at 83) would have pre-empted.
         let mut opt = GradientDescentOptimizer::new(0.1, 100_000);
-        opt.set_min_step_tolerance(1e-6);
-        let r = opt.optimize(vec![0.0], |p| (p[0] * p[0], vec![2.0 * p[0]]));
-        assert_eq!(r.stop_reason, StopReason::StepTooSmall);
-        assert!(r.iterations < 100_000);
-        assert!(r.parameters[0].abs() < 1e-5);
+        opt.set_convergence(10, 1e-6);
+        let r = opt.optimize(vec![0.0, 0.0], |p| {
+            let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];
+            let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
+            (v, g)
+        });
+        assert_eq!(r.stop_reason, StopReason::Converged);
+        assert_eq!(r.iterations, 37);
     }
 
     #[test]
@@ -1316,24 +1276,13 @@ mod tests {
     }
 
     #[test]
-    fn line_search_stops_early_when_step_is_tiny() {
-        // Near the minimum the gradient — and thus the step — shrinks below the
-        // min-step tolerance, stopping before the iteration cap.
-        let mut opt = GradientDescentLineSearchOptimizer::new(1.0, 100_000);
-        opt.set_min_step_tolerance(1e-6);
-        let r = opt.optimize(vec![0.0], |p| (p[0] * p[0], vec![2.0 * p[0]]));
-        assert_eq!(r.stop_reason, StopReason::StepTooSmall);
-        assert!(r.iterations < 100_000);
-        assert!(r.parameters[0].abs() < 1e-4, "{:?}", r.parameters);
-    }
-
-    #[test]
     fn line_search_stops_on_convergence_monitor() {
         // With value-plateau monitoring enabled, the run stops on the windowed
         // convergence check once the metric value flattens near the minimum,
-        // mirroring the base GradientDescentOptimizerv4 stop condition.
+        // mirroring the base GradientDescentOptimizerv4 stop condition. Finding A
+        // parity: there is no minimum-step stop to pre-empt it.
         let mut opt = GradientDescentLineSearchOptimizer::new(1.0, 100_000);
-        opt.set_min_step_tolerance(0.0).set_convergence(5, 1e-8);
+        opt.set_convergence(5, 1e-8);
         let r = opt.optimize(vec![0.0, 0.0], |p| {
             let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];
             let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
@@ -1365,13 +1314,20 @@ mod tests {
         // where steepest descent zig-zags. The conjugate direction combines
         // successive gradients so it reaches the minimum in far fewer iterations
         // than the plain golden-section line search on the identical problem.
+        // Both stop on the value-plateau monitor (Finding A parity: no min-step);
+        // a tight convergence value lets each reach the minimum accurately so the
+        // iteration-count gap is a fair comparison at equal precision.
         let f = |p: &[f64]| {
             let v = (p[0] - 3.0).powi(2) + 50.0 * (p[1] + 2.0).powi(2);
             let g = vec![2.0 * (p[0] - 3.0), 100.0 * (p[1] + 2.0)];
             (v, g)
         };
-        let cg = ConjugateGradientLineSearchOptimizer::new(1.0, 1000).optimize(vec![0.0, 0.0], f);
-        let ls = GradientDescentLineSearchOptimizer::new(1.0, 1000).optimize(vec![0.0, 0.0], f);
+        let mut cg_opt = ConjugateGradientLineSearchOptimizer::new(1.0, 1000);
+        cg_opt.set_convergence(10, 1e-10);
+        let cg = cg_opt.optimize(vec![0.0, 0.0], f);
+        let mut ls_opt = GradientDescentLineSearchOptimizer::new(1.0, 1000);
+        ls_opt.set_convergence(10, 1e-10);
+        let ls = ls_opt.optimize(vec![0.0, 0.0], f);
 
         assert!((cg.parameters[0] - 3.0).abs() < 1e-3, "{:?}", cg.parameters);
         assert!((cg.parameters[1] + 2.0).abs() < 1e-3, "{:?}", cg.parameters);
@@ -1399,23 +1355,12 @@ mod tests {
     }
 
     #[test]
-    fn conjugate_gradient_stops_early_when_step_is_tiny() {
-        // Near the minimum the step shrinks below the min-step tolerance, stopping
-        // before the iteration cap.
-        let mut opt = ConjugateGradientLineSearchOptimizer::new(1.0, 100_000);
-        opt.set_min_step_tolerance(1e-6);
-        let r = opt.optimize(vec![0.0], |p| (p[0] * p[0], vec![2.0 * p[0]]));
-        assert_eq!(r.stop_reason, StopReason::StepTooSmall);
-        assert!(r.iterations < 100_000);
-        assert!(r.parameters[0].abs() < 1e-4, "{:?}", r.parameters);
-    }
-
-    #[test]
     fn conjugate_gradient_stops_on_convergence_monitor() {
         // With value-plateau monitoring enabled, the run stops on the windowed
         // convergence check once the metric value flattens near the minimum.
+        // Finding A parity: there is no minimum-step stop to pre-empt it.
         let mut opt = ConjugateGradientLineSearchOptimizer::new(1.0, 100_000);
-        opt.set_min_step_tolerance(0.0).set_convergence(5, 1e-8);
+        opt.set_convergence(5, 1e-8);
         let r = opt.optimize(vec![0.0, 0.0], |p| {
             let g = vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] + 2.0)];
             let v = (p[0] - 3.0).powi(2) + (p[1] + 2.0).powi(2);
