@@ -10,32 +10,32 @@
 //!
 //! # Why this lives in `sitk-transform` and not `sitk-filters`
 //!
-//! `WarpImageFilter` takes no [`TransformBase`](crate::TransformBase) — its second
+//! `WarpImageFilter` takes no [`TransformBase`](crate::transform::TransformBase) — its second
 //! input is a displacement-field *image*. On that count it would belong in
 //! `sitk-filters`. But it needs `sitkCreateInterpolator.hxx`'s full
 //! `InterpolatorEnum` (`WarpImageFilter.yaml`'s `Interpolator` member), which
 //! in this workspace is [`Interpolator`] plus the kernels in
-//! [`crate::interpolator`]; and `sitk-filters` must not depend on
+//! [`crate::transform::interpolator`]; and `sitk-filters` must not depend on
 //! `sitk-transform` (the dependency runs the other way round, and
 //! `sitk-registration` depends on both). Duplicating nine interpolation kernels
 //! to honour a crate boundary would be the worse trade, so warping sits beside
-//! [`ResampleImageFilter`](crate::ResampleImageFilter) and shares its
+//! [`ResampleImageFilter`](crate::transform::ResampleImageFilter) and shares its
 //! `InterpolatedImage` sampler verbatim.
 
-use sitk_core::{Error, Image, matrix};
+use crate::core::{Error, Image, matrix};
 
-use crate::error::{Result, TransformError};
-use crate::interpolator::{
+use crate::transform::error::{Result, TransformError};
+use crate::transform::interpolator::{
     affine_apply, index_to_physical_matrix, physical_to_index_matrix, strides,
 };
-use crate::resample::{InterpolatedImage, Interpolator, build_output, increment};
+use crate::transform::resample::{InterpolatedImage, Interpolator, build_output, increment};
 
 /// `WarpImageFilter`: resample `image` at `p + d(p)` for every output physical
 /// point `p`, where `d` is a displacement-field image.
 ///
 /// # Output grid
 ///
-/// Unlike [`ResampleImageFilter`](crate::ResampleImageFilter), whose reference
+/// Unlike [`ResampleImageFilter`](crate::transform::ResampleImageFilter), whose reference
 /// geometry defaults to the *input image*'s, this filter's defaults are ITK's
 /// hardcoded ones (itkWarpImageFilter.hxx:43-48): unit spacing, zero origin,
 /// identity direction — none of them borrowed from either input. The size
@@ -59,7 +59,7 @@ use crate::resample::{InterpolatedImage, Interpolator, build_output, increment};
 /// `p + d` mapped outside the input image's buffer takes
 /// [`EdgePaddingValue`](Self::set_edge_padding_value) (default `0`). Inside is
 /// ITK's `InterpolateImageFunction::IsInsideBuffer`, the `[-0.5, size - 0.5)`
-/// pixel-centred coverage that [`crate::interpolator::is_inside`] implements.
+/// pixel-centred coverage that [`crate::transform::interpolator::is_inside`] implements.
 /// Note that this test is on the *input* image, not on the field: a point whose
 /// displacement had to be extrapolated off the edge of the field is not
 /// specially marked.
@@ -410,7 +410,7 @@ impl FieldReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_core::PixelId;
+    use crate::core::PixelId;
 
     /// A 4x4 ramp: pixel (i, j) holds `i + 4 * j`.
     fn ramp() -> Image {
@@ -693,8 +693,8 @@ mod tests {
     /// two filters' shared interpolation seam agrees.
     #[test]
     fn zero_field_warp_equals_identity_resample() {
-        use crate::resample::ResampleImageFilter;
-        use crate::transform::AffineTransform;
+        use crate::transform::resample::ResampleImageFilter;
+        use crate::transform::transform::AffineTransform;
 
         let img = ramp();
         let field = constant_field(&[4, 4], &[0.0, 0.0]);
@@ -715,8 +715,8 @@ mod tests {
     /// `DefaultPixelValue`'s role.
     #[test]
     fn constant_field_warp_equals_translation_resample() {
-        use crate::resample::ResampleImageFilter;
-        use crate::transform::TranslationTransform;
+        use crate::transform::resample::ResampleImageFilter;
+        use crate::transform::transform::TranslationTransform;
 
         let img = ramp();
         let field = constant_field(&[4, 4], &[1.5, -0.5]);
@@ -740,9 +740,9 @@ mod tests {
     /// of this port compose.
     #[test]
     fn warp_of_a_transform_to_displacement_field_matches_resample() {
-        use crate::resample::ResampleImageFilter;
-        use crate::transform::TranslationTransform;
-        use crate::transform_to_displacement_field::TransformToDisplacementFieldFilter;
+        use crate::transform::resample::ResampleImageFilter;
+        use crate::transform::transform::TranslationTransform;
+        use crate::transform::transform_to_displacement_field::TransformToDisplacementFieldFilter;
 
         let img = ramp();
         let t = TranslationTransform::new(vec![1.0, 1.0]);

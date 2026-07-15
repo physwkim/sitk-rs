@@ -1,6 +1,6 @@
 //! Transform / resampling error type.
 
-use sitk_core::PixelId;
+use crate::core::PixelId;
 
 /// Errors produced by transforms and resampling.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub enum TransformError {
     /// (`itkMatrixOffsetTransformBase.hxx:458-465`,
     /// `itkEuler3DTransform.hxx:131-139`).
     ///
-    /// [`ParametricTransform::set_fixed_parameters`]: crate::ParametricTransform::set_fixed_parameters
+    /// [`ParametricTransform::set_fixed_parameters`]: crate::transform::ParametricTransform::set_fixed_parameters
     #[error("invalid fixed parameters: got {got} value(s), expected {expected}")]
     InvalidFixedParameters { got: usize, expected: String },
 
@@ -85,8 +85,8 @@ pub enum TransformError {
     /// `VersorTransform` checks nothing at all, `BSplineTransform` demands exact
     /// equality); this port requires exact equality everywhere (ledger §4.47).
     ///
-    /// [`ParametricTransform::set_parameters`]: crate::ParametricTransform::set_parameters
-    /// [`ParametricTransform::number_of_parameters`]: crate::ParametricTransform::number_of_parameters
+    /// [`ParametricTransform::set_parameters`]: crate::transform::ParametricTransform::set_parameters
+    /// [`ParametricTransform::number_of_parameters`]: crate::transform::ParametricTransform::number_of_parameters
     #[error("invalid parameters: got {got} value(s), expected {expected}")]
     InvalidParameters { got: usize, expected: usize },
 
@@ -96,7 +96,7 @@ pub enum TransformError {
     /// GetInverse`, which throws when `SetInverse` fails
     /// (`sitkTransform.cxx:542-552`).
     ///
-    /// [`Transform::inverse`]: crate::Transform::inverse
+    /// [`Transform::inverse`]: crate::transform::Transform::inverse
     #[error("transform has no inverse: {0}")]
     NoInverse(&'static str),
 
@@ -109,13 +109,13 @@ pub enum TransformError {
     /// actually has a zero-pixel axis is a malformed request and is rejected
     /// here rather than silently ignored (ledger §2.37).
     ///
-    /// [`WarpImageFilter::set_output_size`]: crate::WarpImageFilter::set_output_size
+    /// [`WarpImageFilter::set_output_size`]: crate::transform::WarpImageFilter::set_output_size
     #[error("invalid output size {0:?}: every axis must have a non-zero extent")]
     InvalidOutputSize(Vec<usize>),
 
     /// A core image error surfaced.
     #[error(transparent)]
-    Core(#[from] sitk_core::Error),
+    Core(#[from] crate::core::Error),
 }
 
 /// Convenience alias for transform results.

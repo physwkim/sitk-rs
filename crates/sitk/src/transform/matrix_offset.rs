@@ -7,8 +7,8 @@
 //! > `transform.transform_point(p)` **is** `mat_vec(m.matrix, p) + m.offset` — bit for
 //! > bit, the same operations, in the same order, on the same operands.
 //!
-//! [`TransformBase::is_linear`](crate::TransformBase::is_linear) asks only whether the
-//! map *is* `x ↦ M·x + b` mathematically. [`ScaleTransform`](crate::ScaleTransform) is
+//! [`TransformBase::is_linear`](crate::transform::TransformBase::is_linear) asks only whether the
+//! map *is* `x ↦ M·x + b` mathematically. [`ScaleTransform`](crate::transform::ScaleTransform) is
 //! linear by that test and refused by this one, because it evaluates `(p − c)·s + c`
 //! and that is a **different rounding** from `M·p + b`.
 //!
@@ -46,14 +46,14 @@
 //!
 //! # What is refused, and why refusing beats approximating
 //!
-//! - [`ScaleTransform`](crate::ScaleTransform) /
-//!   [`ScaleLogarithmicTransform`](crate::ScaleLogarithmicTransform):
+//! - [`ScaleTransform`](crate::transform::ScaleTransform) /
+//!   [`ScaleLogarithmicTransform`](crate::transform::ScaleLogarithmicTransform):
 //!   `(p − c)·s + c` (`transform.rs:2848-2853`, `:2971-2973`). That *is* `M·p + b` with
 //!   `M = diag(s)`, `b = c − s·c` — in exact arithmetic. Folding it rounds `b` once
 //!   where the transform rounds per point, and the two differ in the last bits. The
 //!   last bits are the whole reason this function exists, so it does not fold: it
 //!   refuses.
-//! - [`CompositeTransform`](crate::CompositeTransform) **of two or more maps** applies them
+//! - [`CompositeTransform`](crate::transform::CompositeTransform) **of two or more maps** applies them
 //!   in sequence, each rounding on its own (`composite.rs:144-149`). Multiplying the stage
 //!   matrices together is the same error as folding a scale. A backend that wants such a
 //!   composite transcribes the stages **in order** ([`TransformBase::point_map_stages`]);
@@ -64,7 +64,7 @@
 //!
 //! # The one variant that rests on an argument
 //!
-//! [`TranslationTransform`](crate::TranslationTransform) has no `matrix`/`offset`
+//! [`TranslationTransform`](crate::transform::TranslationTransform) has no `matrix`/`offset`
 //! fields: it evaluates `p[d] + t[d]` (`transform.rs:329-336`), so the matrix here is
 //! *synthesized* as the identity, and the bitwise claim becomes an IEEE-754 argument
 //! rather than a shared field — `mat_vec(I, p)[0]` is `0.0 + 1.0·p₀ + 0.0·p₁ + 0.0·p₂`,
@@ -73,8 +73,8 @@
 //! test here that could genuinely fail, and if it ever does the answer is a translation
 //! form of its own in the consumer — not a refusal.
 
-use crate::TransformBase;
-use crate::erased::Transform;
+use crate::transform::TransformBase;
+use crate::transform::erased::Transform;
 
 /// A point map a backend can reproduce bit for bit: `x ↦ mat_vec(matrix, x) + offset`.
 ///
@@ -90,7 +90,7 @@ pub struct MatrixOffsetMap {
 /// Apply a stage list to a point, in order: `p ← mat_vec(Mᵢ, p) + tᵢ` for each stage.
 ///
 /// This is the *definition* of what a stage list means, and the contract every
-/// [`point_map_stages`](crate::TransformBase::point_map_stages) impl signs: for a
+/// [`point_map_stages`](crate::transform::TransformBase::point_map_stages) impl signs: for a
 /// transform that reports stages, `replay_stages(&stages, p, dim)` is
 /// `transform_point(p)` **bit for bit** — not to a tolerance
 /// (`the_stages_replay_transform_point_on_the_bits`). A backend that reproduces this
@@ -102,7 +102,7 @@ pub struct MatrixOffsetMap {
 pub fn replay_stages(stages: &[MatrixOffsetMap], p: &[f64], dim: usize) -> Vec<f64> {
     let mut q = p.to_vec();
     for s in stages {
-        let mq = sitk_core::matrix::mat_vec(&s.matrix, &q, dim);
+        let mq = crate::core::matrix::mat_vec(&s.matrix, &q, dim);
         q = (0..dim).map(|d| mq[d] + s.offset[d]).collect();
     }
     q
@@ -130,7 +130,7 @@ impl Transform {
     /// arithmetic is. A new variant that overrides nothing gets the trait's `None` default
     /// and is refused, which is the safe direction.
     ///
-    /// [`TransformBase::point_map_stages`]: crate::TransformBase::point_map_stages
+    /// [`TransformBase::point_map_stages`]: crate::transform::TransformBase::point_map_stages
     pub fn matrix_offset_map(&self) -> Option<MatrixOffsetMap> {
         let mut stages = self.point_map_stages()?;
         match stages.len() {
@@ -146,14 +146,14 @@ impl Transform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use crate::core::matrix::mat_vec;
+    use crate::transform::{
         AffineTransform, BSplineTransform, ComposeScaleSkewVersor3DTransform, CompositeTransform,
         DisplacementFieldTransform, Euler2DTransform, Euler3DTransform, ScaleLogarithmicTransform,
         ScaleSkewVersor3DTransform, ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform,
         Similarity3DTransform, TransformBase, TranslationTransform, VersorRigid3DTransform,
         VersorTransform,
     };
-    use sitk_core::matrix::mat_vec;
 
     /// Deterministic probe points over a physical extent an image would actually
     /// occupy (millimetres, off-origin, both signs), plus `±0.0`, a near-underflow and
@@ -501,7 +501,7 @@ mod tests {
 
         // And the fold is measurably not the transform: at least one probe disagrees on
         // the bits. Without this the refusal above would be a claim, not a finding.
-        let folded_matrix = sitk_core::matrix::matmul(&stages[1].matrix, &stages[0].matrix, 3);
+        let folded_matrix = crate::core::matrix::matmul(&stages[1].matrix, &stages[0].matrix, 3);
         let m1_b0 = mat_vec(&stages[1].matrix, &stages[0].offset, 3);
         let folded_offset: Vec<f64> = (0..3).map(|d| m1_b0[d] + stages[1].offset[d]).collect();
         let folded = MatrixOffsetMap {

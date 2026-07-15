@@ -19,9 +19,9 @@
 //!
 //! [`transform_point`]: TransformBase::transform_point
 
-use crate::erased::Transform;
-use crate::error::{Result, TransformError};
-use crate::transform::{ParametricTransform, TransformBase, check_len};
+use crate::transform::erased::Transform;
+use crate::transform::error::{Result, TransformError};
+use crate::transform::transform::{ParametricTransform, TransformBase, check_len};
 
 /// A stack of transforms composed by `y = T0(T1(...TN-1(x)...))`, where
 /// `T0, ..., TN-1` were added in that order (`itk::CompositeTransform`). See
@@ -58,8 +58,8 @@ use crate::transform::{ParametricTransform, TransformBase, check_len};
 /// [`DisplacementFieldTransform`] fall back to the trait's finite-difference
 /// default.
 ///
-/// [`BSplineTransform`]: crate::BSplineTransform
-/// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+/// [`BSplineTransform`]: crate::transform::BSplineTransform
+/// [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
 ///
 /// A sub-transform with [`ParametricTransform::has_local_support`] (e.g. a
 /// dense displacement field) still composes *correctly* here — its own
@@ -157,7 +157,7 @@ impl TransformBase for CompositeTransform {
     /// its own, so the product of the stage matrices is the same map and not the same
     /// arithmetic. The stages are therefore handed over as stages, in the order this very
     /// loop applies them, and the consumer replays the loop.
-    fn point_map_stages(&self) -> Option<Vec<crate::matrix_offset::MatrixOffsetMap>> {
+    fn point_map_stages(&self) -> Option<Vec<crate::transform::matrix_offset::MatrixOffsetMap>> {
         let mut stages = Vec::new();
         for t in self.transforms.iter().rev() {
             stages.extend(t.point_map_stages()?);
@@ -337,9 +337,9 @@ impl ParametricTransform for CompositeTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bspline::BSplineTransform;
-    use crate::erased::TransformKind;
-    use crate::transform::{
+    use crate::transform::bspline::BSplineTransform;
+    use crate::transform::erased::TransformKind;
+    use crate::transform::transform::{
         AffineTransform, Euler2DTransform, ScaleTransform, TranslationTransform,
     };
 

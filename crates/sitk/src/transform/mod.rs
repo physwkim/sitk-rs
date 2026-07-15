@@ -13,6 +13,10 @@ pub mod error;
 pub mod interpolator;
 pub mod matrix_offset;
 pub mod resample;
+// The former `sitk-transform` crate had a `transform` submodule (`transform.rs`);
+// folding the crate into `crate::transform` nests it as `transform::transform`.
+// Renaming it would change the public path, so the name is kept as-is.
+#[allow(clippy::module_inception)]
 pub mod transform;
 pub mod transform_geometry;
 pub mod transform_to_displacement_field;

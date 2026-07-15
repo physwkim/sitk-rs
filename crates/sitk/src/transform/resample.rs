@@ -5,15 +5,15 @@
 //! the input is interpolated there. Points that fall outside the input buffer
 //! take the default pixel value.
 
-use sitk_core::{Image, PixelId, matrix};
+use crate::core::{Image, PixelId, matrix};
 
-use crate::error::{Result, TransformError};
-use crate::interpolator::{
+use crate::transform::error::{Result, TransformError};
+use crate::transform::interpolator::{
     SincWindow, affine_apply, bspline_coefficients, bspline_value_and_gradient,
     gaussian_value_and_gradient, index_to_physical_matrix, linear_at, nearest_at,
     physical_to_index_matrix, strides, windowed_sinc_value_and_gradient,
 };
-use crate::transform::TransformBase;
+use crate::transform::transform::TransformBase;
 
 /// Interpolation kernel used when sampling the input image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,15 +34,15 @@ pub enum Interpolator {
     /// the other three kernels this is *not* interpolating — it smooths
     /// rather than reproducing samples exactly.
     ///
-    /// [`interpolator::GAUSSIAN_SIGMA`]: crate::interpolator::GAUSSIAN_SIGMA
-    /// [`interpolator::GAUSSIAN_ALPHA`]: crate::interpolator::GAUSSIAN_ALPHA
+    /// [`interpolator::GAUSSIAN_SIGMA`]: crate::transform::interpolator::GAUSSIAN_SIGMA
+    /// [`interpolator::GAUSSIAN_ALPHA`]: crate::transform::interpolator::GAUSSIAN_ALPHA
     Gaussian,
     /// Windowed sinc, Hamming window (`sitkHammingWindowedSinc`,
     /// `itk::WindowedSincInterpolateImageFunction` with
     /// `itk::Function::HammingWindowFunction`), fixed at SimpleITK's radius-5
     /// preset ([`interpolator::WINDOWED_SINC_RADIUS`]). Interpolating.
     ///
-    /// [`interpolator::WINDOWED_SINC_RADIUS`]: crate::interpolator::WINDOWED_SINC_RADIUS
+    /// [`interpolator::WINDOWED_SINC_RADIUS`]: crate::transform::interpolator::WINDOWED_SINC_RADIUS
     HammingWindowedSinc,
     /// Windowed sinc, Cosine window (`sitkCosineWindowedSinc`) — see
     /// [`HammingWindowedSinc`](Self::HammingWindowedSinc) for the shared
@@ -71,7 +71,7 @@ pub enum Interpolator {
 /// mixes whole lines through an IIR recursion and so cannot be done per voxel)
 /// happens once in [`InterpolatedImage::new`], and every voxel then goes
 /// through [`InterpolatedImage::sample`]. [`ResampleImageFilter`] and
-/// [`WarpImageFilter`](crate::WarpImageFilter) differ only in how they arrive
+/// [`WarpImageFilter`](crate::transform::WarpImageFilter) differ only in how they arrive
 /// at the continuous index they sample at.
 ///
 /// Sampling a continuous index outside the input buffer yields `None`, which is
@@ -291,12 +291,12 @@ impl ResampleImageFilter {
 }
 
 /// Cast an `f64` result buffer, one value per pixel, to a scalar image of pixel
-/// type `id`. Shared with [`WarpImageFilter`](crate::WarpImageFilter), whose
+/// type `id`. Shared with [`WarpImageFilter`](crate::transform::WarpImageFilter), whose
 /// output is `static_cast<PixelType>` of an interpolated `double` in exactly
 /// the same way.
 pub(crate) fn build_output(id: PixelId, size: &[usize], vals: Vec<f64>) -> Result<Image> {
-    use sitk_core::{Scalar, dispatch_scalar};
-    fn make<T: Scalar>(size: &[usize], vals: &[f64]) -> sitk_core::Result<Image> {
+    use crate::core::{Scalar, dispatch_scalar};
+    fn make<T: Scalar>(size: &[usize], vals: &[f64]) -> crate::core::Result<Image> {
         let out: Vec<T> = vals.iter().map(|&v| T::from_f64(v)).collect();
         Image::from_vec(size, out)
     }
@@ -318,7 +318,7 @@ pub(crate) fn increment(index: &mut [usize], size: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{AffineTransform, TranslationTransform};
+    use crate::transform::transform::{AffineTransform, TranslationTransform};
 
     fn ramp_2d(w: usize, h: usize) -> Image {
         let data: Vec<f32> = (0..w * h).map(|i| i as f32).collect();

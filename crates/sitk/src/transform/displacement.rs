@@ -52,11 +52,11 @@
 //! [`has_local_support`]: ParametricTransform::has_local_support
 //! [`sparse_jacobian_wrt_parameters`]: ParametricTransform::sparse_jacobian_wrt_parameters
 
-use sitk_core::{Image, coord};
+use crate::core::{Image, coord};
 
-use crate::error::{Result, TransformError};
-use crate::interpolator::{is_inside, physical_to_index_matrix, strides};
-use crate::transform::{ParametricTransform, TransformBase, check_len};
+use crate::transform::error::{Result, TransformError};
+use crate::transform::interpolator::{is_inside, physical_to_index_matrix, strides};
+use crate::transform::transform::{ParametricTransform, TransformBase, check_len};
 
 /// A dense displacement-field transform. See the [module docs](self).
 #[derive(Clone, Debug, PartialEq)]
@@ -171,7 +171,7 @@ impl DisplacementFieldTransform {
 
     /// The `2^dim` multilinear interpolation neighbours as `(pixel raster offset,
     /// weight)` pairs, with border indices clamped into `[0, size − 1]` exactly as
-    /// [`crate::interpolator::linear_at`]. Coincident (clamped) corners appear
+    /// [`crate::transform::interpolator::linear_at`]. Coincident (clamped) corners appear
     /// more than once, so consumers must **accumulate** their weights.
     fn corner_weights(&self, cindex: &[f64]) -> Vec<(usize, f64)> {
         let dim = self.dim;

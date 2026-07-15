@@ -4,9 +4,9 @@
 //! it maps a point in the **output** image's physical space to the **input**
 //! image's physical space (ITK's backward mapping convention).
 
-use crate::error::{Result, TransformError};
-use crate::matrix_offset::MatrixOffsetMap;
-use sitk_core::matrix;
+use crate::core::matrix;
+use crate::transform::error::{Result, TransformError};
+use crate::transform::matrix_offset::MatrixOffsetMap;
 
 /// A spatial coordinate transform.
 pub trait TransformBase {
@@ -45,7 +45,7 @@ pub trait TransformBase {
     ///
     /// A transform that does not override this is refused by any backend that needs bit
     /// equality — it falls back to the host rather than being approximated. See
-    /// [`crate::matrix_offset`] for the contract in full and for the variants that are
+    /// [`crate::transform::matrix_offset`] for the contract in full and for the variants that are
     /// mathematically linear and still refused (`ScaleTransform` evaluates
     /// `(p − c)·s + c`, which is a different rounding from `M·p + b`).
     ///
@@ -68,12 +68,12 @@ pub trait TransformBase {
     /// to the conjunction of its sub-transforms' own `is_linear()`
     /// (`itk::MultiTransform::IsLinear()`).
     ///
-    /// [`crate::transform_geometry`]'s linearity precondition is the only
+    /// [`crate::transform::transform_geometry`]'s linearity precondition is the only
     /// current caller.
     ///
-    /// [`BSplineTransform`]: crate::BSplineTransform
-    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
-    /// [`CompositeTransform`]: crate::CompositeTransform
+    /// [`BSplineTransform`]: crate::transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
+    /// [`CompositeTransform`]: crate::transform::CompositeTransform
     fn is_linear(&self) -> bool {
         true
     }
@@ -93,9 +93,9 @@ pub trait TransformBase {
     /// expose.
     ///
     /// [`transform_point`]: TransformBase::transform_point
-    /// [`CompositeTransform`]: crate::CompositeTransform
-    /// [`BSplineTransform`]: crate::BSplineTransform
-    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    /// [`CompositeTransform`]: crate::transform::CompositeTransform
+    /// [`BSplineTransform`]: crate::transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
     fn jacobian_wrt_position(&self, point: &[f64]) -> Vec<f64> {
         let dim = self.dimension();
         let mut jac = vec![0.0; dim * dim];
@@ -170,8 +170,8 @@ macro_rules! center_fixed_parameters {
             $dim
         }
 
-        fn set_fixed_parameters(&mut self, params: &[f64]) -> $crate::error::Result<()> {
-            $crate::transform::check_fixed_len(params, $dim, "the center of rotation")?;
+        fn set_fixed_parameters(&mut self, params: &[f64]) -> $crate::transform::error::Result<()> {
+            $crate::transform::transform::check_fixed_len(params, $dim, "the center of rotation")?;
             self.center.copy_from_slice(params);
             self.recompute();
             Ok(())
@@ -250,8 +250,8 @@ pub trait ParametricTransform: TransformBase + Sync {
     /// Insight-legacy reader has to apply the fixed parameters before the
     /// parameters (`itkTxtTransformIO.cxx:186-217`).
     ///
-    /// [`BSplineTransform`]: crate::BSplineTransform
-    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    /// [`BSplineTransform`]: crate::transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
     fn set_fixed_parameters(&mut self, params: &[f64]) -> Result<()>;
 
     /// Number of fixed parameters (`itk::Transform::GetNumberOfFixedParameters`).
@@ -326,8 +326,8 @@ pub trait ParametricTransform: TransformBase + Sync {
     /// [`jacobian_wrt_parameters`]: ParametricTransform::jacobian_wrt_parameters
     /// [`dimension`]: TransformBase::dimension
     /// [`has_local_support`]: ParametricTransform::has_local_support
-    /// [`BSplineTransform`]: crate::BSplineTransform
-    /// [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+    /// [`BSplineTransform`]: crate::transform::BSplineTransform
+    /// [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
     fn sparse_jacobian_wrt_parameters(&self, _point: &[f64]) -> Option<Vec<(usize, Vec<f64>)>> {
         None
     }

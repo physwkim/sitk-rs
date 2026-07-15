@@ -13,7 +13,7 @@
 //! (`itkLinearInterpolateImageFunction.hxx`); nearest-neighbour rounds half up
 //! (`Math::RoundHalfIntegerUp`, `itkImageBase.h`).
 
-use sitk_core::{Scalar, coord};
+use crate::core::{Scalar, coord};
 
 /// First-index-fastest strides for a size vector.
 pub fn strides(size: &[usize]) -> Vec<usize> {
@@ -175,7 +175,7 @@ pub fn nearest_value_and_gradient<T: Scalar>(
 /// for short lines — exact (not an approximation) for any length, just not
 /// the fast path for long ones.
 ///
-/// [`Interpolator::BSpline`]: crate::resample::Interpolator::BSpline
+/// [`Interpolator::BSpline`]: crate::transform::resample::Interpolator::BSpline
 pub fn bspline_coefficients<T: Scalar>(buf: &[T], size: &[usize], strides: &[usize]) -> Vec<f64> {
     let mut coeffs: Vec<f64> = buf.iter().map(|v| v.as_f64()).collect();
     let pole = 3.0_f64.sqrt() - 2.0;
@@ -365,7 +365,7 @@ pub fn bspline_value_and_gradient(
 /// spacing cancels out of ITK's `sigma / spacing` scaling factor, leaving
 /// this constant regardless of the image's physical spacing.
 ///
-/// [`Interpolator::Gaussian`]: crate::resample::Interpolator::Gaussian
+/// [`Interpolator::Gaussian`]: crate::transform::resample::Interpolator::Gaussian
 pub const GAUSSIAN_SIGMA: f64 = 0.8;
 /// Cutoff distance, in units of [`GAUSSIAN_SIGMA`], beyond which a pixel's
 /// contribution is ignored. Matches SimpleITK's `sitkGaussian` preset
@@ -612,7 +612,7 @@ fn dsinc(x: f64) -> f64 {
 /// `itk::WindowedSincInterpolateImageFunction::EvaluateAtContinuousIndex` at
 /// the fixed [`WINDOWED_SINC_RADIUS`] radius SimpleITK bakes into its five
 /// `sitk*WindowedSinc` presets — `m_Radius` is a compile-time template
-/// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::interpolator::GAUSSIAN_SIGMA)
+/// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::transform::interpolator::GAUSSIAN_SIGMA)
 /// it has no runtime setter to port.
 ///
 /// Per axis, the kernel `K(t) = w(t) sinc(t)` (`w` from `window`) is sampled
@@ -713,7 +713,7 @@ pub fn windowed_sinc_value_and_gradient<T: Scalar>(
 
 /// ITK `m_IndexToPhysicalPoint = Direction · diag(spacing)`, row-major: maps a
 /// continuous index to a physical displacement from the origin. The single
-/// implementation lives in [`sitk_core::coord`]; this re-exports it so resample,
+/// implementation lives in [`crate::core::coord`]; this re-exports it so resample,
 /// warp, and the metric share the one primitive.
 pub fn index_to_physical_matrix(direction: &[f64], spacing: &[f64], dim: usize) -> Vec<f64> {
     coord::index_to_physical_matrix(direction, spacing, dim)
@@ -721,7 +721,7 @@ pub fn index_to_physical_matrix(direction: &[f64], spacing: &[f64], dim: usize) 
 
 /// ITK `m_PhysicalPointToIndex = inverse(Direction · diag(spacing))`, row-major,
 /// or `None` if singular: maps a physical displacement from the origin to a
-/// continuous index. Inverts the **composed** matrix (via [`sitk_core::coord`]),
+/// continuous index. Inverts the **composed** matrix (via [`crate::core::coord`]),
 /// not the direction alone — so a diagonal geometry reciprocal-multiplies as ITK
 /// does. Previously this inverted the direction then divided by spacing, which
 /// diverged from ITK for oblique directions.
@@ -734,7 +734,7 @@ pub fn physical_to_index_matrix(
 }
 
 /// `origin + M · index` mapping a discrete output-grid index to a physical
-/// point, via [`sitk_core::coord::index_to_physical_point_f64`] — ITK's integer
+/// point, via [`crate::core::coord::index_to_physical_point_f64`] — ITK's integer
 /// `TransformIndexToPhysicalPoint` fold, origin **first**. (The callers pass an
 /// integer grid counter widened to `f64`.)
 pub fn affine_apply(m: &[f64], index: &[f64], origin: &[f64], dim: usize) -> Vec<f64> {
@@ -758,13 +758,13 @@ mod tests {
         let p2i = physical_to_index_matrix(&dir, &spacing, 2).unwrap();
         // p2i must be the inverse of index_to_physical_matrix bit-for-bit.
         let i2p = index_to_physical_matrix(&dir, &spacing, 2);
-        let prod = sitk_core::matrix::matmul(&p2i, &i2p, 2);
+        let prod = crate::core::matrix::matmul(&p2i, &i2p, 2);
         for (k, &v) in prod.iter().enumerate() {
             let want = if k == 0 || k == 3 { 1.0 } else { 0.0 };
             assert!((v - want).abs() < 1e-12, "prod[{k}]={v}");
         }
         // Guard: it is NOT the pre-fix diag(1/spacing)·inv(D).
-        let invd = sitk_core::matrix::invert(&dir, 2).unwrap();
+        let invd = crate::core::matrix::invert(&dir, 2).unwrap();
         let old = [
             invd[0] / spacing[0],
             invd[1] / spacing[0],

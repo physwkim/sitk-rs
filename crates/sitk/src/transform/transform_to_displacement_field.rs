@@ -7,14 +7,14 @@
 //! The output is a vector image whose component count is the spatial dimension
 //! — the field a [`DisplacementFieldTransform`] consumes.
 //!
-//! [`DisplacementFieldTransform`]: crate::DisplacementFieldTransform
+//! [`DisplacementFieldTransform`]: crate::transform::DisplacementFieldTransform
 
-use sitk_core::{Image, PixelId};
+use crate::core::{Image, PixelId};
 
-use crate::error::{Result, TransformError};
-use crate::interpolator::{affine_apply, index_to_physical_matrix};
-use crate::resample::increment;
-use crate::transform::TransformBase;
+use crate::transform::error::{Result, TransformError};
+use crate::transform::interpolator::{affine_apply, index_to_physical_matrix};
+use crate::transform::resample::increment;
+use crate::transform::transform::TransformBase;
 
 /// `TransformToDisplacementFieldFilter`: `displacement(p) = T(p) − p` sampled
 /// on an explicit output grid.
@@ -136,7 +136,7 @@ impl TransformToDisplacementFieldFilter {
         let direction = self
             .direction
             .clone()
-            .unwrap_or_else(|| sitk_core::matrix::identity(dim));
+            .unwrap_or_else(|| crate::core::matrix::identity(dim));
 
         if size.len() != dim
             || spacing.len() != dim
@@ -228,8 +228,8 @@ impl TransformToDisplacementFieldFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::displacement::DisplacementFieldTransform;
-    use crate::transform::{
+    use crate::transform::displacement::DisplacementFieldTransform;
+    use crate::transform::transform::{
         AffineTransform, Euler2DTransform, ParametricTransform, TranslationTransform,
     };
 

@@ -12,8 +12,8 @@
 //! shape `PixelId` uses for runtime pixel dispatch. `From` converts every
 //! concrete type into it, and it implements [`TransformBase`] and
 //! [`ParametricTransform`] itself, so an erased transform drops straight into
-//! [`ResampleImageFilter`](crate::ResampleImageFilter),
-//! [`transform_geometry`](crate::transform_geometry) and
+//! [`ResampleImageFilter`](crate::transform::ResampleImageFilter),
+//! [`transform_geometry`](crate::transform::transform_geometry) and
 //! [`CompositeTransform`].
 //!
 //! # Divergences from `itk::simple::Transform`
@@ -31,11 +31,11 @@
 
 use std::fmt;
 
-use crate::bspline::BSplineTransform;
-use crate::composite::CompositeTransform;
-use crate::displacement::DisplacementFieldTransform;
-use crate::error::{Result, TransformError};
-use crate::transform::{
+use crate::transform::bspline::BSplineTransform;
+use crate::transform::composite::CompositeTransform;
+use crate::transform::displacement::DisplacementFieldTransform;
+use crate::transform::error::{Result, TransformError};
+use crate::transform::transform::{
     AffineTransform, ComposeScaleSkewVersor3DTransform, Euler2DTransform, Euler3DTransform,
     ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform, ScaleTransform,
     ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform, TransformBase,
@@ -88,10 +88,10 @@ pub enum TransformKind {
 /// [module docs](self).
 ///
 /// Build one with `Transform::from(concrete)` / `.into()`, or read one from a
-/// file with `sitk_io::read_transform`.
+/// file with `crate::io::read_transform`.
 ///
 /// ```
-/// use sitk_transform::{Transform, TransformBase, TranslationTransform};
+/// use sitk::transform::{Transform, TransformBase, TranslationTransform};
 ///
 /// let t: Transform = TranslationTransform::new(vec![1.0, 2.0]).into();
 /// assert_eq!(t.dimension(), 2);
@@ -314,7 +314,7 @@ impl TransformBase for Transform {
     /// literally `mat_vec(M, p) + b`" belongs. [`Transform::matrix_offset_map`] is derived
     /// from this, so there is exactly one place that decides, per transform, whether its
     /// point map can be reproduced on the bits.
-    fn point_map_stages(&self) -> Option<Vec<crate::matrix_offset::MatrixOffsetMap>> {
+    fn point_map_stages(&self) -> Option<Vec<crate::transform::matrix_offset::MatrixOffsetMap>> {
         dispatch!(self, t => t.point_map_stages())
     }
 

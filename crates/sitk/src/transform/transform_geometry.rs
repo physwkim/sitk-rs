@@ -33,15 +33,15 @@
 //! `true`) and `b = transform_point(0)` (since `M·0 = 0`). `Tinv(y) =
 //! M⁻¹·(y − b)`, and `Tinv`'s linear part (what `TransformVector` applies,
 //! ignoring the offset) is just `M⁻¹`. `M` failing to invert
-//! (`sitk_core::matrix::invert` returning `None`) surfaces as
+//! (`crate::core::matrix::invert` returning `None`) surfaces as
 //! [`TransformError::NonInvertibleTransform`] -- see that variant's docs for
 //! why this port errors instead of reproducing ITK's null-pointer-deref
 //! crash on the same input.
 
-use sitk_core::{Image, matrix};
+use crate::core::{Image, matrix};
 
-use crate::error::{Result, TransformError};
-use crate::transform::TransformBase;
+use crate::transform::error::{Result, TransformError};
+use crate::transform::transform::TransformBase;
 
 /// `TransformGeometryImageFilter`: rewrite `image`'s origin, spacing, and
 /// direction so that its physical space relates to the original by
@@ -94,9 +94,9 @@ pub fn transform_geometry<T: TransformBase>(image: &Image, transform: &T) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::displacement::DisplacementFieldTransform;
-    use crate::transform::{AffineTransform, Euler2DTransform, TranslationTransform};
-    use sitk_core::PixelId;
+    use crate::core::PixelId;
+    use crate::transform::displacement::DisplacementFieldTransform;
+    use crate::transform::transform::{AffineTransform, Euler2DTransform, TranslationTransform};
 
     fn img_2d() -> Image {
         let mut img = Image::new(&[4, 4], PixelId::Float64);
