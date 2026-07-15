@@ -693,8 +693,8 @@ mod tests {
     /// two filters' shared interpolation seam agrees.
     #[test]
     fn zero_field_warp_equals_identity_resample() {
+        use crate::transform::parametric::AffineTransform;
         use crate::transform::resample::ResampleImageFilter;
-        use crate::transform::transform::AffineTransform;
 
         let img = ramp();
         let field = constant_field(&[4, 4], &[0.0, 0.0]);
@@ -715,8 +715,8 @@ mod tests {
     /// `DefaultPixelValue`'s role.
     #[test]
     fn constant_field_warp_equals_translation_resample() {
+        use crate::transform::parametric::TranslationTransform;
         use crate::transform::resample::ResampleImageFilter;
-        use crate::transform::transform::TranslationTransform;
 
         let img = ramp();
         let field = constant_field(&[4, 4], &[1.5, -0.5]);
@@ -740,8 +740,8 @@ mod tests {
     /// of this port compose.
     #[test]
     fn warp_of_a_transform_to_displacement_field_matches_resample() {
+        use crate::transform::parametric::TranslationTransform;
         use crate::transform::resample::ResampleImageFilter;
-        use crate::transform::transform::TranslationTransform;
         use crate::transform::transform_to_displacement_field::TransformToDisplacementFieldFilter;
 
         let img = ramp();

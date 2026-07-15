@@ -41,7 +41,7 @@
 use crate::core::{Image, matrix};
 
 use crate::transform::error::{Result, TransformError};
-use crate::transform::transform::TransformBase;
+use crate::transform::parametric::TransformBase;
 
 /// `TransformGeometryImageFilter`: rewrite `image`'s origin, spacing, and
 /// direction so that its physical space relates to the original by
@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::core::PixelId;
     use crate::transform::displacement::DisplacementFieldTransform;
-    use crate::transform::transform::{AffineTransform, Euler2DTransform, TranslationTransform};
+    use crate::transform::parametric::{AffineTransform, Euler2DTransform, TranslationTransform};
 
     fn img_2d() -> Image {
         let mut img = Image::new(&[4, 4], PixelId::Float64);

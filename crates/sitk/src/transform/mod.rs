@@ -12,12 +12,8 @@ pub mod erased;
 pub mod error;
 pub mod interpolator;
 pub mod matrix_offset;
+pub mod parametric;
 pub mod resample;
-// The former `sitk-transform` crate had a `transform` submodule (`transform.rs`);
-// folding the crate into `crate::transform` nests it as `transform::transform`.
-// Renaming it would change the public path, so the name is kept as-is.
-#[allow(clippy::module_inception)]
-pub mod transform;
 pub mod transform_geometry;
 pub mod transform_to_displacement_field;
 pub mod warp;
@@ -27,13 +23,13 @@ pub use composite::CompositeTransform;
 pub use displacement::DisplacementFieldTransform;
 pub use erased::{Transform, TransformKind};
 pub use error::{Result, TransformError};
-pub use resample::{Interpolator, ResampleImageFilter};
-pub use transform::{
+pub use parametric::{
     AffineTransform, CenteredTransform, ComposeScaleSkewVersor3DTransform, Euler2DTransform,
     Euler3DTransform, ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform,
     ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform,
     TransformBase, TranslationTransform, VersorRigid3DTransform, VersorTransform,
 };
+pub use resample::{Interpolator, ResampleImageFilter};
 pub use transform_geometry::transform_geometry;
 pub use transform_to_displacement_field::TransformToDisplacementFieldFilter;
 pub use warp::WarpImageFilter;

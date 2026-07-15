@@ -13,7 +13,7 @@ use crate::transform::interpolator::{
     gaussian_value_and_gradient, index_to_physical_matrix, linear_at, nearest_at,
     physical_to_index_matrix, strides, windowed_sinc_value_and_gradient,
 };
-use crate::transform::transform::TransformBase;
+use crate::transform::parametric::TransformBase;
 
 /// Interpolation kernel used when sampling the input image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,7 +318,7 @@ pub(crate) fn increment(index: &mut [usize], size: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::transform::{AffineTransform, TranslationTransform};
+    use crate::transform::parametric::{AffineTransform, TranslationTransform};
 
     fn ramp_2d(w: usize, h: usize) -> Image {
         let data: Vec<f32> = (0..w * h).map(|i| i as f32).collect();

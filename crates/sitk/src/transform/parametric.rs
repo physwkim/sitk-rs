@@ -171,7 +171,7 @@ macro_rules! center_fixed_parameters {
         }
 
         fn set_fixed_parameters(&mut self, params: &[f64]) -> $crate::transform::error::Result<()> {
-            $crate::transform::transform::check_fixed_len(params, $dim, "the center of rotation")?;
+            $crate::transform::parametric::check_fixed_len(params, $dim, "the center of rotation")?;
             self.center.copy_from_slice(params);
             self.recompute();
             Ok(())
