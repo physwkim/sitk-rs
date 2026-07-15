@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::coord;
 use crate::error::{Error, Result};
 use crate::matrix;
 use crate::pixel::{Complex, PixelId, Real, Scalar};
@@ -1075,59 +1076,73 @@ impl Image {
         self.component_vec_mut::<T>()
     }
 
-    /// Map a continuous index to a physical point:
-    /// `p = origin + Direction * (spacing ⊙ index)`.
+    /// Map a continuous index to a physical point — ITK's
+    /// `TransformContinuousIndexToPhysicalPoint` (itkImageBase.h:558-572).
+    ///
+    /// `p[r] = (Σ_c IndexToPhysicalPoint[r][c] · index[c]) + origin[r]`, with the
+    /// origin added **last** (the continuous-method fold) and
+    /// `IndexToPhysicalPoint = Direction · diag(spacing)` built once by
+    /// [`coord::index_to_physical_matrix`](crate::coord). One implementation,
+    /// shared with every consumer — see [`crate::coord`].
     pub fn continuous_index_to_physical_point(&self, index: &[f64]) -> Vec<f64> {
         let dim = self.dimension();
         debug_assert_eq!(index.len(), dim);
-        let scaled: Vec<f64> = (0..dim).map(|d| index[d] * self.spacing[d]).collect();
-        let rotated = matrix::mat_vec(&self.direction, &scaled, dim);
-        (0..dim).map(|d| self.origin[d] + rotated[d]).collect()
+        let i2p = coord::index_to_physical_matrix(&self.direction, &self.spacing, dim);
+        coord::continuous_index_to_physical_point(&i2p, &self.origin, index, dim)
     }
 
-    /// Map a physical point to a continuous index:
-    /// `index = (Direction⁻¹ * (p - origin)) ⊘ spacing`.
+    /// Map a physical point to a continuous index — ITK's
+    /// `TransformPhysicalPointToContinuousIndex` (itkImageBase.h:517-532):
+    /// `cindex = PhysicalPointToIndex · (p − origin)`, where
+    /// `PhysicalPointToIndex = inverse(Direction · diag(spacing))` — the inverse
+    /// of the **composed** matrix, not the direction alone. This is what makes a
+    /// diagonal geometry reciprocal-multiply (`(1/spacing)·d`) exactly as ITK
+    /// does, rather than dividing (`d/spacing`); the two differ in the last bit
+    /// and the difference flips a discrete index at the boundary.
     ///
-    /// Errors if the direction matrix is singular.
+    /// Errors if the composed matrix is singular.
     pub fn physical_point_to_continuous_index(&self, point: &[f64]) -> Result<Vec<f64>> {
         let dim = self.dimension();
         debug_assert_eq!(point.len(), dim);
-        let inv = matrix::invert(&self.direction, dim).ok_or(Error::SingularDirection)?;
-        let diff: Vec<f64> = (0..dim).map(|d| point[d] - self.origin[d]).collect();
-        let unrotated = matrix::mat_vec(&inv, &diff, dim);
-        Ok((0..dim).map(|d| unrotated[d] / self.spacing[d]).collect())
+        let p2i = coord::physical_to_index_matrix(&self.direction, &self.spacing, dim)
+            .ok_or(Error::SingularDirection)?;
+        Ok(coord::physical_point_to_continuous_index(
+            &p2i,
+            &self.origin,
+            point,
+            dim,
+        ))
     }
 
     /// Map an integer index to a physical point — SimpleITK's
-    /// `TransformIndexToPhysicalPoint` (sitkImage.h:291, sitkImage.cxx:420-425).
+    /// `TransformIndexToPhysicalPoint` (sitkImage.h:291, sitkImage.cxx:420-425),
+    /// ITK's integer method (itkImageBase.h:592-604).
     ///
-    /// ITK computes `p_i = origin_i + Σ_j IndexToPhysicalPoint[i][j] · index_j`
-    /// with `IndexToPhysicalPoint = Direction · diag(spacing)`
-    /// (itkImageBase.hxx:164-175), which is exactly
-    /// [`Image::continuous_index_to_physical_point`] on the widened index; ITK's
-    /// own `TransformIndexToPhysicalPoint` and
-    /// `TransformContinuousIndexToPhysicalPoint` share that matrix.
+    /// `p[r] = origin[r]; p[r] += IndexToPhysicalPoint[r][c] · index[c]` — the
+    /// origin is the initial accumulator term (origin **first**), which is ITK's
+    /// integer fold and differs from the continuous method
+    /// ([`Image::continuous_index_to_physical_point`], origin-last) at large
+    /// origins. Both share the one `IndexToPhysicalPoint` matrix.
     pub fn transform_index_to_physical_point(&self, index: &[i64]) -> Vec<f64> {
-        debug_assert_eq!(index.len(), self.dimension());
-        let continuous: Vec<f64> = index.iter().map(|&i| i as f64).collect();
-        self.continuous_index_to_physical_point(&continuous)
+        let dim = self.dimension();
+        debug_assert_eq!(index.len(), dim);
+        let i2p = coord::index_to_physical_matrix(&self.direction, &self.spacing, dim);
+        coord::index_to_physical_point(&i2p, &self.origin, index, dim)
     }
 
     /// Map a physical point to the integer index of the pixel containing it —
     /// SimpleITK's `TransformPhysicalPointToIndex` (sitkImage.h:295,
-    /// sitkImage.cxx:412-417).
+    /// sitkImage.cxx:412-417), ITK `itkImageBase.h:465-479`.
     ///
-    /// ITK rounds the continuous index with
-    /// `Math::RoundHalfIntegerUp<IndexValueType>` (itkImageBase.h:465-479),
-    /// whose base implementation is `floor(x + 0.5)`
-    /// (itkMathDetail.h:108-116): halfway cases go **up**, so `1.5 -> 2` and
-    /// `-1.5 -> -1`. Both `TransformPhysicalPointToIndex` and
-    /// `TransformPhysicalPointToContinuousIndex` read the same
-    /// `m_PhysicalPointToIndex` matrix (itkImageBase.h:474, :525), so rounding
-    /// [`Image::physical_point_to_continuous_index`] reproduces it.
+    /// [`Image::physical_point_to_continuous_index`] rounded with
+    /// [`coord::round_half_integer_up`](crate::coord) =
+    /// `Math::RoundHalfIntegerUp` (half toward +∞, `floor(x+0.5)`). ITK's
+    /// `TransformPhysicalPointToIndex` and `TransformPhysicalPointToContinuousIndex`
+    /// read the same `m_PhysicalPointToIndex` matrix, so rounding the continuous
+    /// index reproduces it exactly.
     ///
-    /// Errors with [`Error::SingularDirection`] if the direction matrix cannot
-    /// be inverted. (ITK cannot reach that state here: `SetDirection` refuses a
+    /// Errors with [`Error::SingularDirection`] if the composed matrix cannot be
+    /// inverted. (ITK cannot reach that state here: `SetDirection` refuses a
     /// singular matrix, so its precomputed inverse always exists.)
     ///
     /// # Divergence
@@ -1140,7 +1155,7 @@ impl Image {
         let continuous = self.physical_point_to_continuous_index(point)?;
         Ok(continuous
             .into_iter()
-            .map(|x| (x + 0.5).floor() as i64)
+            .map(coord::round_half_integer_up)
             .collect())
     }
 

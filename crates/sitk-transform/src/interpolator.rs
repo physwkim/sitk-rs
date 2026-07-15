@@ -13,7 +13,7 @@
 //! (`itkLinearInterpolateImageFunction.hxx`); nearest-neighbour rounds half up
 //! (`Math::RoundHalfIntegerUp`, `itkImageBase.h`).
 
-use sitk_core::{Scalar, matrix};
+use sitk_core::{Scalar, coord};
 
 /// First-index-fastest strides for a size vector.
 pub fn strides(size: &[usize]) -> Vec<usize> {
@@ -711,44 +711,81 @@ pub fn windowed_sinc_value_and_gradient<T: Scalar>(
     Some((value, grad))
 }
 
-/// `D · diag(spacing)`, row-major: maps a continuous index to a physical
-/// displacement from the origin.
+/// ITK `m_IndexToPhysicalPoint = Direction · diag(spacing)`, row-major: maps a
+/// continuous index to a physical displacement from the origin. The single
+/// implementation lives in [`sitk_core::coord`]; this re-exports it so resample,
+/// warp, and the metric share the one primitive.
 pub fn index_to_physical_matrix(direction: &[f64], spacing: &[f64], dim: usize) -> Vec<f64> {
-    let mut m = vec![0.0; dim * dim];
-    for r in 0..dim {
-        for c in 0..dim {
-            m[r * dim + c] = direction[r * dim + c] * spacing[c];
-        }
-    }
-    m
+    coord::index_to_physical_matrix(direction, spacing, dim)
 }
 
-/// `diag(1/spacing) · D⁻¹`, row-major, or `None` if `D` is singular: maps a
-/// physical displacement from the origin to a continuous index.
+/// ITK `m_PhysicalPointToIndex = inverse(Direction · diag(spacing))`, row-major,
+/// or `None` if singular: maps a physical displacement from the origin to a
+/// continuous index. Inverts the **composed** matrix (via [`sitk_core::coord`]),
+/// not the direction alone — so a diagonal geometry reciprocal-multiplies as ITK
+/// does. Previously this inverted the direction then divided by spacing, which
+/// diverged from ITK for oblique directions.
 pub fn physical_to_index_matrix(
     direction: &[f64],
     spacing: &[f64],
     dim: usize,
 ) -> Option<Vec<f64>> {
-    let inv = matrix::invert(direction, dim)?;
-    let mut m = vec![0.0; dim * dim];
-    for r in 0..dim {
-        for c in 0..dim {
-            m[r * dim + c] = inv[r * dim + c] / spacing[r];
-        }
-    }
-    Some(m)
+    coord::physical_to_index_matrix(direction, spacing, dim)
 }
 
-/// `origin + M · index`.
+/// `origin + M · index` mapping a discrete output-grid index to a physical
+/// point, via [`sitk_core::coord::index_to_physical_point_f64`] — ITK's integer
+/// `TransformIndexToPhysicalPoint` fold, origin **first**. (The callers pass an
+/// integer grid counter widened to `f64`.)
 pub fn affine_apply(m: &[f64], index: &[f64], origin: &[f64], dim: usize) -> Vec<f64> {
-    let mv = matrix::mat_vec(m, index, dim);
-    (0..dim).map(|d| origin[d] + mv[d]).collect()
+    coord::index_to_physical_point_f64(m, origin, index, dim)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // R6 (coord-rounding-port-map.md §4): physical_to_index_matrix now inverts
+    // the COMPOSED Direction·diag(spacing), matching ITK. For an oblique
+    // direction that differs in the last bits from the pre-fix inverse-then-
+    // divide; for a diagonal geometry it is unchanged. Non-vacuity: an
+    // axis-aligned direction would make both forms identical, so this uses an
+    // oblique D and checks the composed identity holds.
+    #[test]
+    fn physical_to_index_matrix_inverts_the_composed_matrix() {
+        let dir = [0.6, -0.8, 0.8, 0.6];
+        let spacing = [3.0, 2.0];
+        let p2i = physical_to_index_matrix(&dir, &spacing, 2).unwrap();
+        // p2i must be the inverse of index_to_physical_matrix bit-for-bit.
+        let i2p = index_to_physical_matrix(&dir, &spacing, 2);
+        let prod = sitk_core::matrix::matmul(&p2i, &i2p, 2);
+        for (k, &v) in prod.iter().enumerate() {
+            let want = if k == 0 || k == 3 { 1.0 } else { 0.0 };
+            assert!((v - want).abs() < 1e-12, "prod[{k}]={v}");
+        }
+        // Guard: it is NOT the pre-fix diag(1/spacing)·inv(D).
+        let invd = sitk_core::matrix::invert(&dir, 2).unwrap();
+        let old = [
+            invd[0] / spacing[0],
+            invd[1] / spacing[0],
+            invd[2] / spacing[1],
+            invd[3] / spacing[1],
+        ];
+        assert_ne!(p2i, old.to_vec());
+    }
+
+    // R5: affine_apply maps a discrete output index origin-FIRST (ITK integer
+    // TransformIndexToPhysicalPoint). A single row must accumulate two terms for
+    // the fold to bite, so the matrix is a shear at a large origin.
+    #[test]
+    fn affine_apply_uses_origin_first_fold() {
+        let m = [1.0, 1.0, 0.0, 1.0]; // shear
+        let origin = [1e16, 0.0];
+        let p = affine_apply(&m, &[1.0, 1.0], &origin, 2);
+        assert_eq!(p[0], 1e16); // ((origin + 1) + 1), origin-first
+        // Guard: the pre-fix origin-last fold ((1+1)+origin) gives a different bit.
+        assert_ne!(p[0], (1.0 + 1.0) + 1e16);
+    }
 
     // f(x, y) = 3x + 5y, exact for both linear and cubic B-spline
     // interpolation (a degree-1 polynomial is reproduced exactly by any
