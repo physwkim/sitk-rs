@@ -540,3 +540,186 @@ narrower-than-ITK REAL-BUG. Every one is the N4 §4.122 shape: keep the
 more-precise f64 (document each as §4.x) or reproduce ITK's float
 arithmetic to hold bit-for-bit. The sparse-field RMS stop is the only one
 not yet documented in-tree.
+
+# Tail verify — remaining filter-domain candidates
+
+Report-only. Closes the candidates the headline verify round did not convert.
+All type facts read firsthand in `/home/stevek/work/ITK`; separating inputs
+computed (scratchpad `canny.rs`/`unsharp2.rs`/`iso.rs`/`vcc.rs`/`seam.rs`).
+Verdict key as before (§4-POLICY = port more precise/wider, discrete divergence
+from ITK; REAL-BUG = port narrower → less correct; NOT-REAL = faithful/gated).
+
+## 1. Canny / zero-crossing edge — §4-POLICY
+
+Port f64 throughout; ITK runs the whole pipeline in `OutputImagePixelType`.
+Verified firsthand: `m_UpperThreshold`/`m_LowerThreshold` are
+`OutputImagePixelType` (`itkCannyEdgeDetectionImageFilter.h:186-192`), hysteresis
+is `if (value > m_UpperThreshold) FollowEdge(...)`
+(`.hxx:293-299`) — `value` is the float multiply-buffer. For SimpleITK's
+Float32-reachable Canny this is all **float**; the seed decision is discrete and
+`FollowEdge` grows a whole chain through `> m_LowerThreshold`, so one flipped
+seed adds/removes an entire edge.
+
+Separating input (hysteresis, `canny.rs`): `gx = gy = 0.01`. Grad-magnitude
+`sqrt(gx²+gy²)` = **float** `0.014142135` vs **f64** `0.0141421353076296`. Set
+`m_UpperThreshold` to the float value `0.0141421351581812` (what any float
+threshold rounds to): ITK's float grad-mag *equals* it → `value > T` is **false**
+→ no seed; the port's f64 grad-mag is strictly greater → **seeds an edge** and
+`FollowEdge` grows a chain ITK never starts. 64/99 such straddles exist for a
+`[0,255]`-scaled gradient grid.
+
+Zero-crossing refinement (`itkZeroCrossingImageFilter.hxx:132-152`): the divergent
+path is the Laplacian **sign** test (`this_one < 0 && that > 0`) on a float
+(ITK) vs f64 (port) smoothed-Laplacian buffer — a near-zero crossing lands on
+opposite sides. The `abs_this_one < abs_that` tie-break does **NOT** diverge:
+`Absolute` is exact and comparing two widened floats gives the identical result
+in f32 and f64 (0 flips found in a 9M-pair sweep). So the census "|a|<|b| tie"
+sub-claim is downgraded — only the buffer sign feeds the divergence.
+
+## 2. sharpening.rs unsharp 3-way branch — §4-POLICY
+
+SimpleITK sets `TInternalPrecision = InputImageType::PixelType`
+(`UnsharpMaskImageFilter.yaml:7`, `RealPixelIDTypeList`) → **float** for Float32.
+ITK computes `FunctorRealType diff = v - s` and the 3-way branch
+`if (diff > m_Threshold) / else if (-diff > m_Threshold) / else`
+(`itkUnsharpMaskImageFilter.h:209-219`) in float; the Gaussian blur `s` is a
+`Image<float>` buffer. Port computes `diff = v - s` in f64 with an f64 Gaussian
+(`sharpening.rs:118-127`, both operands via `to_f64_vec`). The branch selector is
+discrete.
+
+Separating input (`unsharp2.rs`): threshold `0` (default), `v = 0.3`, 5-tap
+symmetric neighborhood `[0.278, 0.289, 0.3, 0.311, 0.322]` with recursive-Gaussian
+weights `[0.05, 0.24, 0.42, 0.24, 0.05]`. Float blur → `s == v` exactly →
+`diff = 0` → ITK **unchanged** (`result = v`). f64 blur → `s = v − 6.7e-9` →
+`diff > 0` → port **sharpen+** (`result = v + diff·amount`). Different output pixel.
+
+## 3. region_growing.rs IsolatedConnected midpoint — §4-POLICY (port WIDER, §8-more-correct)
+
+The one integer-width candidate. ITK: `guess = (upper + lower) / 2` in
+`AccumulateType` (`itkIsolatedConnectedImageFilter.hxx:230`), and
+`NumericTraits<unsigned int>::AccumulateType = unsigned int` (32-bit, verified
+`itkNumericTraits.h:1027`). So for a **UInt32** image `upper + lower` **overflows
+mod 2³²**. Port computes the midpoint in **i128** (`region_growing.rs:698`) — true
+value. Port is wider and *more correct*; it exposes an ITK integer-overflow bug.
+
+Yes, ITK overflows on realistic input (`iso.rs`): UInt32 image, `m_Lower = 0`,
+`m_Upper = 4_000_000_000`, `find_upper_threshold`. `upper` and `lower` stay in
+`[0, 4e9]`; once the bisection's `lower` climbs to `5e8` (second seed still
+isolated, so `upper` stays `4e9`), the u32 sum `4.5e9` wraps → ITK
+`guess = 102,516,352`; port `guess = 2,250,000,000`. Divergent
+`ThresholdBetween(m_Lower, guess)` floods → different `m_IsolatedValue` and mask.
+Reachable: `IsolatedConnectedImageFilter.yaml` is `BasicPixelIDTypeList` (UInt32
+included). Int64/UInt64 (`AccumulateType` 64-bit) overflow the same way near
+`~9.2e18`. The port's i128 is exact for UInt32 (< 2⁵³, `as_f64` lossless); for
+UInt64/Int64 the `as_f64` pre-round (`:682`) is the separate seam bug in §4e.
+Decision: keep i128 (more correct, §8) vs reproduce ITK's overflow for
+bit-identity — user's call, same shape as the fixed-ITK-bug policy.
+
+## 4a. distance.rs IsoContour narrowband seed — §4-POLICY
+
+ITK computes `valNew0` in `PixelRealType` but **stores** it narrowed:
+`SetNext(n, 0, static_cast<PixelType>(valNew0))`, and the min-pick re-reads the
+float incumbent — `Absolute(double(valNew0)) < Absolute(double(GetNext(n,0)))`
+(`itkIsoContourDistanceImageFilter.hxx:363-372`). PixelType is **float** for the
+Float32 `ApproximateSignedDistanceMap` output. Port keeps the buffer in f64
+(`distance.rs:697-702`) with no per-write float narrowing. Discrete: at a pixel
+reachable from two iso-crossings, ITK compares the 2nd candidate against the
+**float-rounded** first write, the port against the **full-f64** first write —
+when rounding flips `<`, a different seed distance survives. Separating input is
+the same float-vs-f64 straddle mechanism as §1–2 applied to the stored incumbent;
+a full end-to-end map was not run (needs a built ITK distance filter).
+
+## 4b. distance.rs FastChamfer relaxation — §4-POLICY
+
+`WeightsType = FixedArray<float, ImageDimension>` (verified
+`itkFastChamferDistanceImageFilter.h:108`); running distance is `PixelType`=float
+and `m_MaximumDistance` is float. Port does the whole sweep in f64
+(`distance.rs:836-863`). Discrete: the saturation skip `>= maximum_distance` and
+the Gauss–Seidel relaxation min — where the float running distance lands exactly
+on the incumbent neighbor, the port's f64 value is strictly less/greater and a
+different front wins. Mechanism identical to §4a; end-to-end sweep not executed.
+
+## 4c. vector_connected_component.rs per-term dot — §4-POLICY
+
+ITK accumulates `dotProduct` in `RealType` (= double for float components) but
+each **per-term product `a[i] * b[i]` is float×float→float**
+(`itkVectorConnectedComponentImageFilter.h:79-84`), then the join predicate
+`static_cast<ValueType>(1.0 - |dotProduct|) <= m_Threshold` casts to **float**.
+Port keeps each product in f64 (`vector_connected_component.rs:122-126`). The
+census note that "only the accumulator is double" **misses** this per-term float
+rounding — verified: the divergence is the per-term round, not the accumulator.
+
+Separating input (`vcc.rs`): Float32 3-vectors `a = [0.3001, 0.49993, 0.4]`,
+`b = [0.30991, 0.49006, 0.41]`. ITK float-per-term dot = `0.501999691129`, port
+f64-per-term dot = `0.501999685260`. With `distance_threshold` in the gap, the
+predicate `1 − |dot|` puts ITK **above** the threshold (split, different labels)
+and the port **at/below** it (join, same label) → different connected components.
+
+## 4d. watershed_classic.rs — NOT-REAL via SimpleITK parity (GATED)
+
+ITK's classic `itk::WatershedImageFilter` uses `ScalarType = InputImageType::PixelType`
+(float/integer), and the port's `watershed_classic.rs` gates in f64 — a real
+type difference *in isolation*. But it is **not reachable** through any SimpleITK
+parity path: SimpleITK exposes only `IsolatedWatershed`, `MorphologicalWatershed`,
+`MorphologicalWatershedFromMarkers`, not the classic filter. `IsolatedWatershed`
+computes a `GradientMagnitude` into `RealImageType = Image<RealPixelType>` with
+`RealPixelType = NumericTraits<InputPixelType>::RealType` = **double**
+(`itkIsolatedWatershedImageFilter.h:72-73, 21-22`) and runs the classic watershed
+on that double image → `ScalarType == double`, which the port matches. The
+divergence bites only via the port's own standalone `watershed()` on non-double
+input, a path with no ITK/SimpleITK parity requirement. Verdict: NOT-REAL for
+parity; the port's standalone API on Float32/integer is the only divergent path
+and is out of the bit-for-bit contract's scope.
+
+## 4e. 64-bit-integer `to_f64_vec` seam (change_label / clamp / copy-faces) — REAL-BUG (direction-2, port NARROWER)
+
+ITK keeps these ops in the **native** pixel type: `ChangeLabelImageFilter`
+`ChangeMapType = std::map<TInput, TOutput>`, `m_ChangeMap.find(A)` on native `A`
+(`itkChangeLabelImageFilter.h:57,95`); `ClampImageFilter` `static_cast<OutputType>(A)`
+on native `A`; the geometry/grid/join copies are native `ImageAlgorithm::Copy`.
+The port round-trips every pixel through f64 (`to_f64_vec` → `from_f64`), which
+**rounds any `UInt64`/`Int64` value `> 2⁵³`** — a discrete corruption (map-key
+identity, saturating cast, or plain data movement), and the port is *narrower*
+than ITK, i.e. less correct. Confirmed the port round-trips even for pure
+rearrangement: `geometry.rs:507-519` (flip) and `:565-577` (permute) do
+`to_f64_vec()` → `image_from_f64` with no native path.
+
+Separating input (`seam.rs`): pixel `= 2⁵³+1 = 9_007_199_254_740_993`, which is
+**not** f64-representable → `p as f64 as u64 = 9_007_199_254_740_992`.
+- change_label with map key `9_007_199_254_740_992`: ITK's native `find` **misses**
+  (distinct key) → emits `…993` unchanged; the port conflates `…993` to `…992` →
+  **remaps** it. Reachable: `ChangeLabelImageFilter.yaml` `IntegerPixelIDTypeList`.
+- clamp full-range to UInt64: ITK emits `…993`; port emits `…992`. Reachable:
+  `ClampImageFilter.yaml` `BasicPixelIDTypeList`.
+- flip/permute/paste/tile of a UInt64 image: every `> 2⁵³` pixel is silently
+  rounded. Pure data-movement corruption.
+
+This is the only REAL-BUG in the tail. It is not a precision policy — the fix is
+structural: typed dispatch that copies/compares 64-bit integer pixels natively
+instead of through the f64 seam. Scope note: the seam is a shared `sitk-core`
+primitive (`pixel.rs:432/435`, `image.rs:156-158/886-888`); closing it is the
+main panel's call, flagged here per the report-only round.
+
+## Tail verify summary
+
+| Candidate | Verdict | Discrete decision | Separating input |
+|---|---|---|---|
+| Canny hysteresis | §4-POLICY | edge seed `value > upper` (propagating) | grad-mag `gx=gy=0.01`, T=`0.0141421351581812` → port seeds, ITK not |
+| Zero-crossing sign | §4-POLICY | Laplacian sign near 0 | near-zero crossing, float vs f64 buffer sign |
+| Zero-crossing `\|a\|<\|b\|` tie | NOT-REAL (downgrade) | — | abs exact; 0 flips in 9M sweep |
+| Unsharp 3-way branch | §4-POLICY | `diff > threshold` | v=0.3, 5-tap `[0.278,0.289,0.3,0.311,0.322]`, thr 0 → unchanged vs sharpen+ |
+| IsolatedConnected midpoint | §4-POLICY (port WIDER/§8) | `(upper+lower)/2` u32 overflow | UInt32 lo=0 hi=4e9, lo→5e8: guess 102,516,352 vs 2,250,000,000 |
+| IsoContour seed | §4-POLICY | narrowband min-pick vs float incumbent | multi-crossing pixel, float-stored vs f64 incumbent |
+| FastChamfer relaxation | §4-POLICY | saturation `>= maxdist` + G-S min | float running distance vs f64 |
+| VectorCC per-term dot | §4-POLICY | join `(float)(1-\|dot\|) <= thr` | a=`[0.3001,0.49993,0.4]` b=`[0.30991,0.49006,0.41]` → split vs join |
+| watershed_classic | NOT-REAL (gated) | `saliency < threshold` (`ScalarType`) | unreachable via SimpleITK; IsolatedWatershed feeds double |
+| to_f64_vec seam (change_label/clamp/copy-faces) | **REAL-BUG** (dir-2) | map-key / saturating cast / data copy | UInt64 `2⁵³+1` → port rounds to `2⁵³` |
+
+Nine of ten are direction-1 §4-POLICY (port f64/i128 more precise/wider; ITK
+float/32-bit) or gated/NOT-REAL — none narrower-than-ITK except the seam. The
+single REAL-BUG is the 64-bit-integer `to_f64_vec` seam (change_label, clamp,
+copy-face geometry), a structural typed-dispatch fix owned by the main panel.
+IsolatedConnected is the notable §8 case: the port's i128 *fixes* an ITK u32
+overflow. Two census sub-claims are downgraded on firsthand evidence: the
+zero-crossing `|a|<|b|` tie (abs is exact) and — from the headline round — the
+`histogram.rs` "ITK bins in double" doc (ITK's bin interval is float).
