@@ -658,6 +658,102 @@ impl Image {
         )
     }
 
+    /// Gather output pixels from this image's **native** buffer.
+    ///
+    /// Output pixel `i` is a bit-exact copy of this image's pixel at linear
+    /// source index `sources[i]`, or — when `sources[i]` is `None` — a constant
+    /// fill of `constant` quantized to the pixel type (`T::from_f64`). The copy
+    /// runs on the stored component buffer and never widens to `f64`, so it is
+    /// exact for every pixel type, including the `UInt64`/`Int64` magnitudes
+    /// above `2^53` that an `as f64` round-trip (`to_f64_vec` → `from_f64`)
+    /// would silently round.
+    ///
+    /// This is the native primitive behind every pure pixel-movement filter —
+    /// flip, permute, crop, extract, slice, shrink-subsample, cyclic shift. Each
+    /// computes a per-output source index and calls this, exactly as ITK moves
+    /// those pixels through `ImageAlgorithm::Copy` / a native `static_cast`
+    /// rather than a widened accumulator.
+    ///
+    /// A vector or complex image copies whole pixels: all
+    /// [`buffer_stride()`](Image::buffer_stride) interleaved components of the
+    /// source pixel move together, and a `None` slot fills every component with
+    /// the quantized `constant`.
+    ///
+    /// The output inherits this image's geometry when `out_size` has the same
+    /// dimension as this image, and default geometry (unit spacing, zero origin,
+    /// identity direction) otherwise. Either way the caller overrides
+    /// spacing/origin/direction as its grid transform requires — the geometry a
+    /// pixel-movement op needs is never the input's unchanged.
+    ///
+    /// Errors with [`Error::BufferSizeMismatch`] if `sources.len()` is not the
+    /// product of `out_size`, and with [`Error::GatherSourceOutOfBounds`] if any
+    /// `Some(idx)` is `>=` [`Image::number_of_pixels`].
+    pub fn gather(
+        &self,
+        out_size: &[usize],
+        sources: &[Option<usize>],
+        constant: f64,
+    ) -> Result<Image> {
+        let out_count: usize = out_size.iter().product();
+        if sources.len() != out_count {
+            return Err(Error::BufferSizeMismatch {
+                expected: out_count,
+                actual: sources.len(),
+            });
+        }
+        let n = self.number_of_pixels();
+        if let Some(&idx) = sources.iter().flatten().find(|&&idx| idx >= n) {
+            return Err(Error::GatherSourceOutOfBounds {
+                index: idx,
+                number_of_pixels: n,
+            });
+        }
+
+        fn build<T: Scalar>(img: &Image, sources: &[Option<usize>], constant: f64) -> PixelBuffer {
+            let stride = img.buffer_stride;
+            let src = img
+                .buffer
+                .as_slice::<T>()
+                .expect("dispatch_scalar selects the buffer's own component type");
+            let fill = T::from_f64(constant);
+            let mut out = Vec::with_capacity(sources.len() * stride);
+            for &s in sources {
+                match s {
+                    Some(idx) => {
+                        let start = idx * stride;
+                        out.extend_from_slice(&src[start..start + stride]);
+                    }
+                    None => {
+                        for _ in 0..stride {
+                            out.push(fill);
+                        }
+                    }
+                }
+            }
+            T::into_buffer(out)
+        }
+
+        let buffer = crate::dispatch_scalar!(self.pixel_id, build, self, sources, constant);
+        let (spacing, origin, direction) = if out_size.len() == self.dimension() {
+            (
+                self.spacing.clone(),
+                self.origin.clone(),
+                self.direction.clone(),
+            )
+        } else {
+            Self::default_geometry(out_size.len())
+        };
+        Self::assemble(
+            buffer,
+            self.pixel_id,
+            self.number_of_components_per_pixel(),
+            out_size.to_vec(),
+            spacing,
+            origin,
+            direction,
+        )
+    }
+
     /// Number of spatial dimensions.
     pub fn dimension(&self) -> usize {
         self.size.len()

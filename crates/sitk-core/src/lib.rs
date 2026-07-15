@@ -80,6 +80,109 @@ mod tests {
         );
     }
 
+    // ---- gather: native pixel movement ----------------------------------
+
+    #[test]
+    fn gather_is_bit_exact_for_u64_above_2_pow_53() {
+        let hi = (1u64 << 53) + 1; // 9007199254740993, not representable in f64.
+        // Non-vacuity: the f64 round-trip the old `to_f64_vec` seam used drops
+        // the low bit, so a lossless gather must be observably different.
+        assert_ne!(hi, (hi as f64) as u64);
+        let img = Image::from_vec(&[3], vec![hi, hi + 2, hi + 4]).unwrap();
+        let ident = img.gather(&[3], &[Some(0), Some(1), Some(2)], 0.0).unwrap();
+        assert_eq!(ident.scalar_slice::<u64>().unwrap(), &[hi, hi + 2, hi + 4]);
+        // Reversing the source order is still bit-exact — the copy never widens.
+        let rev = img.gather(&[3], &[Some(2), Some(1), Some(0)], 0.0).unwrap();
+        assert_eq!(rev.scalar_slice::<u64>().unwrap(), &[hi + 4, hi + 2, hi]);
+    }
+
+    #[test]
+    fn gather_is_bit_exact_for_i64_below_neg_2_pow_53() {
+        let lo = -((1i64 << 53) + 1); // -9007199254740993.
+        assert_ne!(lo, (lo as f64) as i64);
+        let img = Image::from_vec(&[2], vec![lo, lo - 2]).unwrap();
+        let out = img.gather(&[2], &[Some(1), Some(0)], 0.0).unwrap();
+        assert_eq!(out.scalar_slice::<i64>().unwrap(), &[lo - 2, lo]);
+    }
+
+    #[test]
+    fn gather_moves_whole_vector_pixels() {
+        // 3 pixels, 2 components each, u64 above 2^53 so a widening copy loses bits.
+        let hi = (1u64 << 53) + 1;
+        let data = vec![hi, hi + 1, hi + 2, hi + 3, hi + 4, hi + 5];
+        let img = Image::from_vec_vector(&[3], 2, data).unwrap();
+        // Reverse the pixel order; the `None` slot fills a fourth pixel's two
+        // components with the quantized constant.
+        let out = img
+            .gather(&[4], &[Some(2), Some(1), Some(0), None], 7.0)
+            .unwrap();
+        assert_eq!(out.pixel_id(), PixelId::VectorUInt64);
+        assert_eq!(out.number_of_components_per_pixel(), 2);
+        assert_eq!(
+            out.component_slice::<u64>().unwrap(),
+            &[hi + 4, hi + 5, hi + 2, hi + 3, hi, hi + 1, 7, 7]
+        );
+    }
+
+    #[test]
+    fn gather_constant_fill_is_quantized_to_the_pixel_type() {
+        let img = Image::from_vec(&[2], vec![10u8, 20]).unwrap();
+        // 3.9 quantizes to 3 (u8), like ITK's static_cast fill value.
+        let out = img.gather(&[3], &[Some(0), None, Some(1)], 3.9).unwrap();
+        assert_eq!(out.scalar_slice::<u8>().unwrap(), &[10, 3, 20]);
+    }
+
+    #[test]
+    fn gather_inherits_geometry_when_dimension_is_unchanged() {
+        let mut img = Image::from_vec(&[2, 2], vec![1u16, 2, 3, 4]).unwrap();
+        img.set_spacing(&[2.0, 3.0]).unwrap();
+        img.set_origin(&[5.0, 6.0]).unwrap();
+        let out = img
+            .gather(&[2, 2], &[Some(0), Some(1), Some(2), Some(3)], 0.0)
+            .unwrap();
+        assert_eq!(out.spacing(), &[2.0, 3.0]);
+        assert_eq!(out.origin(), &[5.0, 6.0]);
+        assert_eq!(out.direction(), img.direction());
+    }
+
+    #[test]
+    fn gather_uses_default_geometry_when_dimension_changes() {
+        let mut img = Image::from_vec(&[2, 2], vec![1u16, 2, 3, 4]).unwrap();
+        img.set_spacing(&[2.0, 3.0]).unwrap();
+        img.set_origin(&[5.0, 6.0]).unwrap();
+        // Collapse to 1-D: geometry cannot be inherited, so it defaults.
+        let out = img.gather(&[2], &[Some(0), Some(3)], 0.0).unwrap();
+        assert_eq!(out.dimension(), 1);
+        assert_eq!(out.spacing(), &[1.0]);
+        assert_eq!(out.origin(), &[0.0]);
+        assert_eq!(out.direction(), &[1.0]);
+        assert_eq!(out.scalar_slice::<u16>().unwrap(), &[1, 4]);
+    }
+
+    #[test]
+    fn gather_rejects_wrong_sources_length() {
+        let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
+        assert_eq!(
+            img.gather(&[2, 2], &[Some(0)], 0.0),
+            Err(Error::BufferSizeMismatch {
+                expected: 4,
+                actual: 1
+            })
+        );
+    }
+
+    #[test]
+    fn gather_rejects_a_source_index_past_the_image() {
+        let img = Image::from_vec(&[2], vec![1u8, 2]).unwrap();
+        assert_eq!(
+            img.gather(&[1], &[Some(2)], 0.0),
+            Err(Error::GatherSourceOutOfBounds {
+                index: 2,
+                number_of_pixels: 2
+            })
+        );
+    }
+
     #[test]
     fn linear_index_is_first_axis_fastest() {
         let img = Image::new(&[4, 3], PixelId::UInt8);

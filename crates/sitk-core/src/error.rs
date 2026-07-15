@@ -184,6 +184,14 @@ pub enum Error {
     /// object: the label map is full.")` (`itkLabelMap.hxx:431-434`).
     #[error("can't push the label object: the label map is full")]
     LabelMapFull,
+
+    /// [`Image::gather`](crate::Image::gather) was handed a source linear index
+    /// that is not a pixel of the source image.
+    #[error("gather source index {index} is outside an image of {number_of_pixels} pixels")]
+    GatherSourceOutOfBounds {
+        index: usize,
+        number_of_pixels: usize,
+    },
 }
 
 /// Convenience alias for core results.
