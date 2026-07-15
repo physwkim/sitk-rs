@@ -56,7 +56,7 @@ use crate::core::{Image, coord};
 
 use crate::transform::error::{Result, TransformError};
 use crate::transform::interpolator::{is_inside, physical_to_index_matrix, strides};
-use crate::transform::transform::{ParametricTransform, TransformBase, check_len};
+use crate::transform::parametric::{ParametricTransform, TransformBase, check_len};
 
 /// A dense displacement-field transform. See the [module docs](self).
 #[derive(Clone, Debug, PartialEq)]

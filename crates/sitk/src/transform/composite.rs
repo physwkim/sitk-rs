@@ -21,7 +21,7 @@
 
 use crate::transform::erased::Transform;
 use crate::transform::error::{Result, TransformError};
-use crate::transform::transform::{ParametricTransform, TransformBase, check_len};
+use crate::transform::parametric::{ParametricTransform, TransformBase, check_len};
 
 /// A stack of transforms composed by `y = T0(T1(...TN-1(x)...))`, where
 /// `T0, ..., TN-1` were added in that order (`itk::CompositeTransform`). See
@@ -339,7 +339,7 @@ mod tests {
     use super::*;
     use crate::transform::bspline::BSplineTransform;
     use crate::transform::erased::TransformKind;
-    use crate::transform::transform::{
+    use crate::transform::parametric::{
         AffineTransform, Euler2DTransform, ScaleTransform, TranslationTransform,
     };
 

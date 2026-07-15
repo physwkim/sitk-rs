@@ -77,7 +77,7 @@ use crate::transform::error::{Result, TransformError};
 use crate::transform::interpolator::{
     bspline_coefficients, bspline_value_and_gradient, physical_to_index_matrix,
 };
-use crate::transform::transform::{ParametricTransform, TransformBase, check_len};
+use crate::transform::parametric::{ParametricTransform, TransformBase, check_len};
 
 /// The B-spline order. Fixed at 3 (cubic), ITK's default and the only order this
 /// port implements; the Parzen/interpolation kernels elsewhere are cubic too.

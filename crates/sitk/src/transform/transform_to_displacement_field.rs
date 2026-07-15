@@ -13,8 +13,8 @@ use crate::core::{Image, PixelId};
 
 use crate::transform::error::{Result, TransformError};
 use crate::transform::interpolator::{affine_apply, index_to_physical_matrix};
+use crate::transform::parametric::TransformBase;
 use crate::transform::resample::increment;
-use crate::transform::transform::TransformBase;
 
 /// `TransformToDisplacementFieldFilter`: `displacement(p) = T(p) − p` sampled
 /// on an explicit output grid.
@@ -229,7 +229,7 @@ impl TransformToDisplacementFieldFilter {
 mod tests {
     use super::*;
     use crate::transform::displacement::DisplacementFieldTransform;
-    use crate::transform::transform::{
+    use crate::transform::parametric::{
         AffineTransform, Euler2DTransform, ParametricTransform, TranslationTransform,
     };
 

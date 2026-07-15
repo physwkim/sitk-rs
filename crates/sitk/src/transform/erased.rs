@@ -35,7 +35,7 @@ use crate::transform::bspline::BSplineTransform;
 use crate::transform::composite::CompositeTransform;
 use crate::transform::displacement::DisplacementFieldTransform;
 use crate::transform::error::{Result, TransformError};
-use crate::transform::transform::{
+use crate::transform::parametric::{
     AffineTransform, ComposeScaleSkewVersor3DTransform, Euler2DTransform, Euler3DTransform,
     ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform, ScaleTransform,
     ScaleVersor3DTransform, Similarity2DTransform, Similarity3DTransform, TransformBase,
