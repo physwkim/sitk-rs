@@ -31,7 +31,7 @@
 //! Every value the closure sees is the same `f64` it saw before (`Scalar::as_f64`
 //! is the same lossless cast `to_f64_vec` performed), and every value stored is
 //! `Scalar::from_f64` of the same `f64`, exactly as `image_from_f64` did. Only
-//! the *buffers between them* are gone. The pass is a [`crate::parallel`] map
+//! the *buffers between them* are gone. The pass is a [`crate::core::parallel`] map
 //! over independent output elements — element `i` is written by exactly one task
 //! from input `i` alone — so it introduces no reduction and nothing is
 //! re-associated. The result is bit-identical at any thread count.
@@ -40,13 +40,13 @@
 //!
 //! This module is for the **elementwise** family only, where the output pixel is
 //! a function of the input pixel at the same index. A sliding-window filter must
-//! not route through here: it needs [`crate::neighborhood::WindowView`], which
+//! not route through here: it needs [`crate::core::neighborhood::WindowView`], which
 //! solves a different (and, measured, much larger) problem.
 
-use crate::error::{Error, Result};
-use crate::image::Image;
-use crate::parallel;
-use crate::pixel::{PixelId, Scalar};
+use crate::core::error::{Error, Result};
+use crate::core::image::Image;
+use crate::core::parallel;
+use crate::core::pixel::{PixelId, Scalar};
 
 /// `out[i] = f(src[i] as f64)`, stored as `target`'s pixel type.
 ///
@@ -93,7 +93,7 @@ where
 ///
 /// [`map_pixels`] deleted the *intermediate* buffers; it still allocates the
 /// output one, and a fresh output volume costs a page fault per 4 KiB on first
-/// touch (see [`crate::alloc`]). A caller that runs the pass repeatedly — a
+/// touch (see [`crate::core::alloc`]). A caller that runs the pass repeatedly — a
 /// registration loop, a pyramid level, an iterative filter — can now hoist that
 /// out: allocate `dst` once, call this in the loop, and the pages are faulted
 /// once for the whole loop instead of once per iteration. Nothing else can
@@ -158,7 +158,7 @@ where
         let pixels = src.scalar_slice::<I>()?;
         dispatch_out(pixels, dst, f)
     }
-    crate::dispatch_scalar_infer!([, _] src.pixel_id(), inner, src, dst, f)
+    crate::core::dispatch_scalar_infer!([, _] src.pixel_id(), inner, src, dst, f)
 }
 
 fn dispatch_out<I, F>(pixels: &[I], dst: &mut Image, f: &F) -> Result<()>
@@ -177,7 +177,7 @@ where
         Ok(())
     }
     let target = dst.pixel_id();
-    crate::dispatch_scalar_infer!([, _, _] target, inner, pixels, dst, f)
+    crate::core::dispatch_scalar_infer!([, _, _] target, inner, pixels, dst, f)
 }
 
 #[cfg(test)]
@@ -198,7 +198,7 @@ mod tests {
         fn narrow<T: Scalar>(vals: &[f64]) -> Vec<f64> {
             vals.iter().map(|&v| T::from_f64(v).as_f64()).collect()
         }
-        let expected = crate::dispatch_scalar!(target, narrow, &staged);
+        let expected = crate::core::dispatch_scalar!(target, narrow, &staged);
         assert_eq!(fused.to_f64_vec().unwrap(), expected);
     }
 

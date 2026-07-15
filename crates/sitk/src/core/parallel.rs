@@ -56,7 +56,7 @@ use std::mem::MaybeUninit;
 
 use rayon::prelude::*;
 
-use crate::pixel::Scalar;
+use crate::core::pixel::Scalar;
 
 /// The coarsest grain a map pass is cut to — its per-task element count once the
 /// input is big enough that [`grain`] stops subdividing. Also the target
@@ -233,7 +233,7 @@ pub fn with_threads<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R 
 /// The bit-for-bit result of `(0..len).map(f).collect()`: `f` sees only `i`, and
 /// element `i` lands in slot `i` whatever the decomposition.
 ///
-/// The buffer comes from [`crate::alloc::resident_vec`], so its pages are
+/// The buffer comes from [`crate::core::alloc::resident_vec`], so its pages are
 /// faulted in on the pool rather than one 4 KiB page at a time by the loop that
 /// fills it. That is invisible in the result — see [`map_indexed_into`], which
 /// is the loop body this runs.
@@ -312,7 +312,7 @@ where
 ///
 /// If `src.len() != dst.len()`. This is the caller passing the wrong buffer, not
 /// a runtime condition to recover from — the image-level entry points
-/// ([`crate::map_pixels_into`]) turn a size mismatch into a typed error before
+/// ([`crate::core::map_pixels_into`]) turn a size mismatch into a typed error before
 /// it can reach here.
 pub fn map_slice_into<T, R, F>(src: &[T], dst: &mut [R], f: F)
 where
@@ -355,7 +355,7 @@ where
 /// [`map_indexed_init`] writing into a destination the **caller owns** — and the
 /// single loop body every map in this module is built from ([`map_indexed`],
 /// [`map_indexed_into`], [`map_indexed_init`] and, through
-/// [`crate::NeighborhoodIterator::par_map_window_into`], the whole stencil
+/// [`crate::core::NeighborhoodIterator::par_map_window_into`], the whole stencil
 /// family).
 ///
 /// Element `i` is written by exactly one task, from `i` and per-task scratch
@@ -664,12 +664,12 @@ where
 /// The buffer is deliberately **not** prefaulted: `fill` is a parallel pass, so
 /// its own workers fault their own pages concurrently. There is no serial fault
 /// to hoist, and a prefault would only write the buffer twice — measured, and
-/// rejected, in [`crate::alloc::resident_vec`]'s docs.
+/// rejected, in [`crate::core::alloc::resident_vec`]'s docs.
 fn collect_filled<R, G>(len: usize, fill: G) -> Vec<R>
 where
     G: FnOnce(&mut [MaybeUninit<R>]),
 {
-    let mut v = crate::alloc::resident_capacity::<R>(len);
+    let mut v = crate::core::alloc::resident_capacity::<R>(len);
     fill(&mut v.spare_capacity_mut()[..len]);
     // SAFETY: `resident_capacity(len)` reserved at least `len` slots, and `fill`
     // — every implementation of which lives in this module — writes each of the
@@ -826,7 +826,7 @@ pub fn map_rows_fold_in_order<S, I, C, F>(
 /// directly. `Scalar::as_f64` is the same lossless widening `Image::to_f64_vec`
 /// applies, so `min_max(img.scalar_slice::<f32>()?)` returns the identical bits
 /// to `min_max(&img.to_f64_vec()?)` — without materializing the `f64` copy. (See
-/// [`crate::fused`] for why that copy was the port's dominant cost.)
+/// [`crate::core::fused`] for why that copy was the port's dominant cost.)
 pub fn min_max<T: Scalar>(vals: &[T]) -> Option<(f64, f64)> {
     if vals.is_empty() {
         return None;

@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
-use crate::boundary::{BoundaryCondition, remapped};
-use crate::error::{Error, Result};
-use crate::image::{Image, ScalarView};
-use crate::parallel;
-use crate::pixel::Scalar;
+use crate::core::boundary::{BoundaryCondition, remapped};
+use crate::core::error::{Error, Result};
+use crate::core::image::{Image, ScalarView};
+use crate::core::parallel;
+use crate::core::pixel::Scalar;
 
 /// A snapshot of pixel values in an N-dimensional neighborhood window.
 ///
@@ -350,7 +350,7 @@ struct Cursor {
 /// The window walk visits one pixel at a time, so a buffer it allocates is a
 /// buffer it allocates once per pixel. Holding them here — allocated once by
 /// [`NeighborhoodIterator::window_state`] and reused for every pixel that task
-/// touches — is what makes [`crate::parallel`]'s "allocate per task, never per
+/// touches — is what makes [`crate::core::parallel`]'s "allocate per task, never per
 /// pixel" contract hold on the boundary path, which is the one path that used to
 /// break it.
 #[derive(Debug)]
@@ -566,7 +566,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     /// holding the ND index of the neighbor currently being resolved. It is a
     /// `&mut [i64]` and not a `Vec<i64>` on purpose: a slice cannot grow, so this
     /// function has no way to allocate, and the "allocate per task, never per
-    /// pixel" contract that [`crate::parallel`] states — and that the interior
+    /// pixel" contract that [`crate::core::parallel`] states — and that the interior
     /// path already kept — now holds on this path by construction rather than by
     /// care. It did not before: this function used to `vec!` `nd` and an ND index
     /// buffer on every call, and every out-of-bounds neighbor allocated again
@@ -632,7 +632,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     ///   (`sitk-filters`' Canny gate reads both the smoothed image and the
     ///   derivative field), and
     /// * a **reduction** whose parallel decomposition is fixed by
-    ///   [`crate::parallel::map_rows_fold_in_order`] rather than by this type's
+    ///   [`crate::core::parallel::map_rows_fold_in_order`] rather than by this type's
     ///   own walk, and which therefore needs the window at an index it is handed.
     ///
     /// Both used to materialize a [`Neighborhood`] per center for want of this.
@@ -819,7 +819,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     }
 
     /// The **cost-class partition** of this walk's index space — the thing the
-    /// chunker in [`crate::parallel`] cannot derive for itself.
+    /// chunker in [`crate::core::parallel`] cannot derive for itself.
     ///
     /// A window pass has two costs per pixel, not one. [`Self::window_view`]
     /// borrows the image when the window is interior and *materializes* it
@@ -915,7 +915,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     /// Whatever `f` computes *within* one window (a kernel dot product, a
     /// median selection, a structuring-element test) runs in `f`'s own sequential
     /// order, untouched. The output is therefore bit-identical to the sequential
-    /// walk for any thread count — see [`crate::parallel`].
+    /// walk for any thread count — see [`crate::core::parallel`].
     ///
     /// The window and the center index are per-task scratch, refilled in place
     /// for each pixel ([`Self::window_buffer`], [`Self::refill`]) — `f` sees the
@@ -1016,7 +1016,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> Iterator for NeighborhoodIterator<'
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::{
+    use crate::core::boundary::{
         ConstantBoundaryCondition, PeriodicBoundaryCondition, ZeroFluxNeumannBoundaryCondition,
     };
 
@@ -1479,7 +1479,7 @@ mod tests {
 #[cfg(test)]
 mod offset_read_parity {
     use super::*;
-    use crate::boundary::ZeroFluxNeumannBoundaryCondition;
+    use crate::core::boundary::ZeroFluxNeumannBoundaryCondition;
 
     /// Every offset of every window of a small volume, on both paths.
     ///

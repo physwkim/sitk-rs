@@ -98,10 +98,10 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use crate::error::{Error, Result};
-use crate::image::Image;
-use crate::pixel::{PixelId, Scalar};
-use crate::{dispatch_scalar, matrix};
+use crate::core::error::{Error, Result};
+use crate::core::image::Image;
+use crate::core::pixel::{PixelId, Scalar};
+use crate::core::{dispatch_scalar, matrix};
 
 /// The largest image dimension a [`LabelMap`] supports.
 ///

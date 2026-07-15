@@ -1,12 +1,12 @@
-//! Out-of-bounds pixel value rules for [`crate::neighborhood::NeighborhoodIterator`].
+//! Out-of-bounds pixel value rules for [`crate::core::neighborhood::NeighborhoodIterator`].
 //!
 //! Mirrors ITK's `itk::ImageBoundaryCondition` hierarchy
 //! (itkImageBoundaryCondition.h): each implementation supplies the pixel
 //! value ITK would return for an index that has walked off the edge of the
 //! image while sliding a neighborhood window across it.
 
-use crate::image::ScalarView;
-use crate::pixel::Scalar;
+use crate::core::image::ScalarView;
+use crate::core::pixel::Scalar;
 
 /// Supplies a pixel value for a (possibly) out-of-bounds ND `index` into
 /// `image`.
@@ -15,10 +15,10 @@ use crate::pixel::Scalar;
 /// axis `d`; each implementation decides how to remap it back onto the image
 /// (itkImageBoundaryCondition.h:153-154, `GetPixel`).
 ///
-/// `image` is a [`ScalarView`], not an [`Image`](crate::Image): the read is
+/// `image` is a [`ScalarView`], not an [`Image`](crate::core::Image): the read is
 /// infallible only because the view already proves the image is scalar and has
 /// pixel type `T`. Callers discharge that proof once, with
-/// [`Image::scalar_view`](crate::Image::scalar_view), outside the pixel loop.
+/// [`Image::scalar_view`](crate::core::Image::scalar_view), outside the pixel loop.
 pub trait BoundaryCondition<T: Scalar> {
     fn get_pixel(&self, index: &[i64], image: &ScalarView<'_, T>) -> T;
 }
@@ -28,13 +28,13 @@ pub trait BoundaryCondition<T: Scalar> {
 ///
 /// A boundary condition is a per-axis rule, and the pixel it names sits at a
 /// single linear index. Accumulating that index directly — dimension-0-fastest,
-/// exactly as [`Image::linear_index`](crate::Image::linear_index) does — means
+/// exactly as [`Image::linear_index`](crate::core::Image::linear_index) does — means
 /// no implementation ever materializes the remapped ND index, and materializing
 /// it is the only reason any of them would allocate.
 ///
 /// That matters because `get_pixel` runs once per out-of-bounds *neighbor*, not
 /// once per filter: a 256³ `mean` at radius 2 calls it tens of millions of
-/// times. A `Vec` in each call is what [`crate::parallel`]'s module docs warn
+/// times. A `Vec` in each call is what [`crate::core::parallel`]'s module docs warn
 /// about — it serializes every core on the allocator, and measurably did: the
 /// window walk ran 13.8 of 48 cores, against 43 for the same kernel with no
 /// window.
@@ -148,7 +148,7 @@ impl<T: Scalar> BoundaryCondition<T> for MirrorBoundaryCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image::Image;
+    use crate::core::image::Image;
 
     /// Discharges the scalar-and-type proof `get_pixel` now requires.
     fn view<T: Scalar>(img: &Image) -> ScalarView<'_, T> {

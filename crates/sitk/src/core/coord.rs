@@ -1,5 +1,5 @@
 //! The single implementation of ITK's `itk::ImageBase` index↔physical
-//! coordinate transforms, shared by [`Image`](crate::Image) and every filter,
+//! coordinate transforms, shared by [`Image`](crate::core::Image) and every filter,
 //! transform, and registration consumer that converts between a physical point,
 //! a continuous index, and a discrete index.
 //!
@@ -43,7 +43,7 @@
 //! (compose → invert → multiply) matches ITK, the last bits of the inverse
 //! entries may not. Documented, not hidden.
 
-use crate::matrix;
+use crate::core::matrix;
 
 /// [`index_to_physical_matrix`] writing into a caller-provided `dim × dim`
 /// buffer — the allocation-free form for per-pixel loops (label statistics).

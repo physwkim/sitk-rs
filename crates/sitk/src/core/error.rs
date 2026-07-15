@@ -1,6 +1,6 @@
 //! Error type shared across the sitk-rs core.
 
-use crate::pixel::PixelId;
+use crate::core::pixel::PixelId;
 
 /// Errors produced by core image operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -108,20 +108,20 @@ pub enum Error {
     #[error("pixel index {index:?} is outside an image of size {size:?}")]
     IndexOutOfBounds { index: Vec<usize>, size: Vec<usize> },
 
-    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on an
+    /// [`Image::to_vector_image`](crate::core::Image::to_vector_image) was called on an
     /// image whose pixel type or dimension has no `ToVectorInternal`
     /// instantiation — a complex image, or a scalar image of fewer than three
     /// dimensions (sitkImageExplicit.cxx:119-131).
     #[error("cannot convert a {dimension}-D {pixel_id:?} image to a vector image")]
     CannotConvertToVectorImage { pixel_id: PixelId, dimension: usize },
 
-    /// [`Image::to_scalar_image`](crate::Image::to_scalar_image) was called on an
+    /// [`Image::to_scalar_image`](crate::core::Image::to_scalar_image) was called on an
     /// image whose pixel type has no `ToScalarInternal` instantiation — a
     /// complex image (sitkImageExplicit.cxx:143-155).
     #[error("cannot convert a {dimension}-D {pixel_id:?} image to a scalar image")]
     CannotConvertToScalarImage { pixel_id: PixelId, dimension: usize },
 
-    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on a
+    /// [`Image::to_vector_image`](crate::core::Image::to_vector_image) was called on a
     /// scalar image whose direction cosine matrix does not have the first
     /// dimension's row and column equal to the identity's. Upstream's
     /// `sitkExceptionMacro("Cannot convert image with non-identity direction in
@@ -131,7 +131,7 @@ pub enum Error {
     )]
     NonIdentityFirstDimensionDirection,
 
-    /// [`Image::to_vector_image`](crate::Image::to_vector_image) was called on a
+    /// [`Image::to_vector_image`](crate::core::Image::to_vector_image) was called on a
     /// scalar image whose first axis carries geometry — `spacing[0] != 1.0` or
     /// `origin[0] != 0.0` — that the vector image, which has no slot for a
     /// component axis, would silently drop. SimpleITK drops it without warning
@@ -153,39 +153,39 @@ pub enum Error {
     #[error("this operation requires an integer scalar pixel type, got {0:?}")]
     RequiresIntegerPixelType(PixelId),
 
-    /// A [`LabelMap`](crate::LabelMap) was asked for a dimension outside
-    /// `1..=`[`MAX_DIM`](crate::label_map::MAX_DIM).
+    /// A [`LabelMap`](crate::core::LabelMap) was asked for a dimension outside
+    /// `1..=`[`MAX_DIM`](crate::core::label_map::MAX_DIM).
     #[error("label maps support dimensions 1..=3, got {0}")]
     UnsupportedLabelMapDimension(usize),
 
-    /// A [`LabelObjectLine`](crate::LabelObjectLine) would have covered no
+    /// A [`LabelObjectLine`](crate::core::LabelObjectLine) would have covered no
     /// pixels. Upstream stores such a line; the "optimized" invariant of
-    /// [`LabelObject`](crate::LabelObject) makes it unrepresentable.
+    /// [`LabelObject`](crate::core::LabelObject) makes it unrepresentable.
     #[error("a label object line must cover at least one pixel, got length {0}")]
     NonPositiveLineLength(i64),
 
-    /// A [`LabelObject`](crate::LabelObject) carrying the map's background
-    /// value was inserted into a [`LabelMap`](crate::LabelMap). Upstream admits
+    /// A [`LabelObject`](crate::core::LabelObject) carrying the map's background
+    /// value was inserted into a [`LabelMap`](crate::core::LabelMap). Upstream admits
     /// it into the container and then throws at every `GetLabelObject` and
     /// `RemoveLabel` (`itkLabelMap.hxx:110-116`, `:453-459`).
     #[error("label {0} is the label map's background value")]
     LabelIsBackground(i64),
 
     /// A label (or a background value) outside the `NumericTraits` range of the
-    /// [`LabelMap`](crate::LabelMap)'s `pixel_id` was offered to it. ITK cannot
+    /// [`LabelMap`](crate::core::LabelMap)'s `pixel_id` was offered to it. ITK cannot
     /// represent such a state at all — its `LabelType` *is* the label image's
     /// pixel type, so the conversion happens in the caller's `static_cast`. Here
     /// a label is an `i64` throughout, so the map enforces the range itself.
     #[error("label {label} is not representable in a {pixel_id:?} label image")]
     LabelOutOfRange { label: i64, pixel_id: PixelId },
 
-    /// [`LabelMap::push_label_object`](crate::LabelMap::push_label_object) found
+    /// [`LabelMap::push_label_object`](crate::core::LabelMap::push_label_object) found
     /// no free label. Upstream's `itkExceptionStringMacro("Can't push the label
     /// object: the label map is full.")` (`itkLabelMap.hxx:431-434`).
     #[error("can't push the label object: the label map is full")]
     LabelMapFull,
 
-    /// [`Image::gather`](crate::Image::gather) was handed a source linear index
+    /// [`Image::gather`](crate::core::Image::gather) was handed a source linear index
     /// that is not a pixel of the source image.
     #[error("gather source index {index} is outside an image of {number_of_pixels} pixels")]
     GatherSourceOutOfBounds {

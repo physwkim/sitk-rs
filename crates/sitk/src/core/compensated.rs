@@ -76,7 +76,7 @@
 /// than improved on.
 ///
 /// ```
-/// use sitk_core::compensated::CompensatedSum;
+/// use sitk::core::compensated::CompensatedSum;
 ///
 /// // The classic defeat of naive summation: a large term, then many tiny ones.
 /// let mut s = CompensatedSum::new();

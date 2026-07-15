@@ -42,6 +42,10 @@ pub use image::{Image, PixelBuffer, ScalarView};
 pub use label_map::{LabelMap, LabelObject, LabelObjectLine, MAX_DIM};
 pub use neighborhood::{Neighborhood, NeighborhoodIterator, Stencil, WindowScratch, WindowView};
 pub use pixel::{Complex, PixelId, Real, Scalar};
+// `#[macro_export]` hoists these to the crate root (`crate::dispatch_scalar!`);
+// re-export them here so the `crate::core::dispatch_scalar` paths that every
+// filter/transform module imports resolve to the same macros.
+pub use crate::{dispatch_scalar, dispatch_scalar_infer};
 
 #[cfg(test)]
 mod tests {

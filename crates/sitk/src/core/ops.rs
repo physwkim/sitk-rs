@@ -17,7 +17,7 @@
 //!    does not confer ownership for coherence purposes), so the impl cannot
 //!    legally live anywhere else.
 //! 2. **Acyclic crate graph.** `sitk-filters` already depends on `sitk-core`.
-//!    If these impls lived in `sitk-core` but called `sitk_filters::add` etc.,
+//!    If these impls lived in `sitk-core` but called `crate::filters::add` etc.,
 //!    `sitk-core` would have to depend on `sitk-filters`, which depends back
 //!    on `sitk-core` — Cargo rejects the cycle.
 //!
@@ -81,7 +81,7 @@
 //! [`Error::RequiresScalarPixelType`] even though upstream's `Add`/`Subtract`/
 //! `Multiply` accept a broader pixel type list
 //! (`AddImageFilter.yaml`'s `pixel_types: NonLabelPixelIDTypeList` includes
-//! vector and complex). This is the same restriction `sitk_filters::add` /
+//! vector and complex). This is the same restriction `crate::filters::add` /
 //! `subtract` / `multiply` already have today, not a new gap introduced by
 //! this module.
 //!
@@ -97,12 +97,12 @@
 //! stops the program either way) rather than returning a nonsensical
 //! `Image`. Callers who want a `Result` should use the named functions in
 //! [`sitk_filters`](https://docs.rs/sitk-filters) instead of the operator
-//! syntax: `sitk_filters::add`/`subtract`/`multiply`/`divide`/`modulus`/
+//! syntax: `crate::filters::add`/`subtract`/`multiply`/`divide`/`modulus`/
 //! `unary_minus`/`and`/`or`/`xor`/`bitwise_not`.
 
-use crate::dispatch_scalar;
-use crate::image::Image;
-use crate::pixel::Scalar;
+use crate::core::dispatch_scalar;
+use crate::core::image::Image;
+use crate::core::pixel::Scalar;
 
 // ---- panicking preconditions (SimpleITK throws; operators have no `Result`) ----
 
@@ -110,7 +110,7 @@ fn require_same_shape(a: &Image, b: &Image) {
     assert!(
         a.pixel_id() == b.pixel_id(),
         "sitk-core::ops: pixel type mismatch ({:?} vs {:?}); SimpleITK's operators throw here \
-         -- cast with `sitk_filters::cast` first, or use a named `sitk_filters` function for a \
+         -- cast with `crate::filters::cast` first, or use a named `sitk_filters` function for a \
          `Result` instead of a panic",
         a.pixel_id(),
         b.pixel_id()
@@ -124,7 +124,7 @@ fn require_same_shape(a: &Image, b: &Image) {
 }
 
 /// `Modulus`/`And`/`Or`/`Xor`/`BitwiseNot`'s integer-only gate, matching
-/// `sitk_filters::logic::require_integer_pixel_type`'s exact semantics
+/// `crate::filters::logic::require_integer_pixel_type`'s exact semantics
 /// (`is_floating_point()`, not `is_integer_scalar()`, so a vector or complex
 /// integer pixel id passes this check and is rejected downstream by
 /// [`Image::scalar_slice`] instead, with a more specific error).
@@ -132,19 +132,19 @@ fn require_integer(img: &Image) {
     assert!(
         !img.pixel_id().is_floating_point(),
         "sitk-core::ops: requires an integer pixel type, got {:?}; SimpleITK's Modulus/And/Or/Xor/\
-         BitwiseNot operators throw here -- use `sitk_filters::{{modulus,and,or,xor,bitwise_not}}` \
+         BitwiseNot operators throw here -- use `crate::filters::{{modulus,and,or,xor,bitwise_not}}` \
          for a `Result` instead of a panic",
         img.pixel_id()
     );
 }
 
 /// Unary `-`'s signed-only gate, matching
-/// `sitk_filters::require_signed_pixel_type`'s exact semantics.
+/// `crate::filters::require_signed_pixel_type`'s exact semantics.
 fn require_signed(img: &Image) {
     assert!(
         img.pixel_id().is_signed(),
         "sitk-core::ops: unary `-` requires a signed pixel type, got {:?}; SimpleITK's \
-         UnaryMinus operator throws here -- use `sitk_filters::unary_minus` for a `Result` \
+         UnaryMinus operator throws here -- use `crate::filters::unary_minus` for a `Result` \
          instead of a panic",
         img.pixel_id()
     );
@@ -544,7 +544,7 @@ impl_unary_ops!(Not, not, BitwiseNotOp, require_integer);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pixel::PixelId;
+    use crate::core::pixel::PixelId;
 
     fn img_u8(size: &[usize], data: Vec<u8>) -> Image {
         Image::from_vec(size, data).unwrap()
@@ -575,7 +575,7 @@ mod tests {
     fn add_image_constant_casts_constant_to_pixel_type_first() {
         // ToPixelType(3.7, u8) truncates to 3 (static_cast, not rounding),
         // then 250u8.wrapping_add(3) == 253 -- not the f64-then-saturate
-        // policy `sitk_filters::add_constant` uses (see the module docs).
+        // policy `crate::filters::add_constant` uses (see the module docs).
         let a = img_u8(&[1, 1], vec![250]);
         let out = &a + 3.7;
         assert_eq!(out.scalar_slice::<u8>().unwrap(), &[253]);

@@ -4,10 +4,10 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::coord;
-use crate::error::{Error, Result};
-use crate::matrix;
-use crate::pixel::{Complex, PixelId, Real, Scalar};
+use crate::core::coord;
+use crate::core::error::{Error, Result};
+use crate::core::matrix;
+use crate::core::pixel::{Complex, PixelId, Real, Scalar};
 
 /// Type-erased *component* storage: one `Vec` variant per scalar component type.
 ///
@@ -151,11 +151,11 @@ impl PixelBuffer {
     /// Widen every stored component to `f64`, preserving interleaved order.
     ///
     /// Nearly every filter starts here, so the widening runs through
-    /// [`crate::parallel::map_slice`]: a pure elementwise cast, bit-identical
+    /// [`crate::core::parallel::map_slice`]: a pure elementwise cast, bit-identical
     /// to the sequential map at any thread count.
     pub fn to_f64_vec(&self) -> Vec<f64> {
         fn widen<T: Scalar>(v: &[T]) -> Vec<f64> {
-            crate::parallel::map_slice(v, |&x| x.as_f64())
+            crate::core::parallel::map_slice(v, |&x| x.as_f64())
         }
         match self {
             PixelBuffer::UInt8(v) => widen(v),
@@ -607,7 +607,7 @@ impl Image {
             Ok(T::into_buffer(out))
         }
 
-        let buffer = crate::dispatch_scalar!(first.pixel_id, interleave, images)?;
+        let buffer = crate::core::dispatch_scalar!(first.pixel_id, interleave, images)?;
         Self::assemble(
             buffer,
             first.pixel_id.vector_id(),
@@ -646,7 +646,7 @@ impl Image {
             ))
         }
 
-        let buffer = crate::dispatch_scalar!(self.pixel_id, take, self, index)?;
+        let buffer = crate::core::dispatch_scalar!(self.pixel_id, take, self, index)?;
         Self::assemble(
             buffer,
             self.pixel_id.component_id(),
@@ -733,7 +733,7 @@ impl Image {
             T::into_buffer(out)
         }
 
-        let buffer = crate::dispatch_scalar!(self.pixel_id, build, self, sources, constant);
+        let buffer = crate::core::dispatch_scalar!(self.pixel_id, build, self, sources, constant);
         let (spacing, origin, direction) = if out_size.len() == self.dimension() {
             (
                 self.spacing.clone(),
@@ -917,7 +917,7 @@ impl Image {
     ///
     /// Errors exactly as [`Image::scalar_slice`]. This is the only way to build
     /// a `ScalarView`, which is why an API that takes one — such as
-    /// [`BoundaryCondition::get_pixel`](crate::BoundaryCondition::get_pixel) —
+    /// [`BoundaryCondition::get_pixel`](crate::core::BoundaryCondition::get_pixel) —
     /// can read pixels infallibly without a runtime type or component check.
     pub fn scalar_view<T: Scalar>(&self) -> Result<ScalarView<'_, T>> {
         Ok(ScalarView {
@@ -1178,8 +1178,8 @@ impl Image {
     /// `p[r] = (Σ_c IndexToPhysicalPoint[r][c] · index[c]) + origin[r]`, with the
     /// origin added **last** (the continuous-method fold) and
     /// `IndexToPhysicalPoint = Direction · diag(spacing)` built once by
-    /// [`coord::index_to_physical_matrix`](crate::coord). One implementation,
-    /// shared with every consumer — see [`crate::coord`].
+    /// [`coord::index_to_physical_matrix`](crate::core::coord). One implementation,
+    /// shared with every consumer — see [`crate::core::coord`].
     pub fn continuous_index_to_physical_point(&self, index: &[f64]) -> Vec<f64> {
         let dim = self.dimension();
         debug_assert_eq!(index.len(), dim);
@@ -1231,7 +1231,7 @@ impl Image {
     /// sitkImage.cxx:412-417), ITK `itkImageBase.h:465-479`.
     ///
     /// [`Image::physical_point_to_continuous_index`] rounded with
-    /// [`coord::round_half_integer_up`](crate::coord) =
+    /// [`coord::round_half_integer_up`](crate::core::coord) =
     /// `Math::RoundHalfIntegerUp` (half toward +∞, `floor(x+0.5)`). ITK's
     /// `TransformPhysicalPointToIndex` and `TransformPhysicalPointToContinuousIndex`
     /// read the same `m_PhysicalPointToIndex` matrix, so rounding the continuous
@@ -1678,11 +1678,11 @@ impl fmt::Display for Image {
 /// scalar id, so `$func` sees the type the buffer actually stores. That is not
 /// a licence to read the buffer as if it were scalar: `$func` reaches the
 /// pixels through [`Image::scalar_slice`], which rejects every non-scalar image
-/// with [`crate::Error::RequiresScalarPixelType`], or through the explicitly
+/// with [`crate::core::Error::RequiresScalarPixelType`], or through the explicitly
 /// component-aware [`Image::component_slice`].
 ///
 /// ```
-/// use sitk_core::{Image, Scalar, dispatch_scalar};
+/// use sitk::core::{Image, Scalar, dispatch_scalar};
 ///
 /// fn count<T: Scalar>(img: &Image) -> usize { img.number_of_pixels() }
 ///
@@ -1698,28 +1698,28 @@ macro_rules! dispatch_scalar {
     // instead of forcing a second copy of this table.
     (@table $id:expr, $func:ident, [$($extra:tt)*] $(, $arg:expr)* $(,)?) => {{
         match $id {
-            $crate::PixelId::UInt8
-            | $crate::PixelId::VectorUInt8 => $func::<u8 $($extra)*>($($arg),*),
-            $crate::PixelId::Int8
-            | $crate::PixelId::VectorInt8 => $func::<i8 $($extra)*>($($arg),*),
-            $crate::PixelId::UInt16
-            | $crate::PixelId::VectorUInt16 => $func::<u16 $($extra)*>($($arg),*),
-            $crate::PixelId::Int16
-            | $crate::PixelId::VectorInt16 => $func::<i16 $($extra)*>($($arg),*),
-            $crate::PixelId::UInt32
-            | $crate::PixelId::VectorUInt32 => $func::<u32 $($extra)*>($($arg),*),
-            $crate::PixelId::Int32
-            | $crate::PixelId::VectorInt32 => $func::<i32 $($extra)*>($($arg),*),
-            $crate::PixelId::UInt64
-            | $crate::PixelId::VectorUInt64 => $func::<u64 $($extra)*>($($arg),*),
-            $crate::PixelId::Int64
-            | $crate::PixelId::VectorInt64 => $func::<i64 $($extra)*>($($arg),*),
-            $crate::PixelId::Float32
-            | $crate::PixelId::ComplexFloat32
-            | $crate::PixelId::VectorFloat32 => $func::<f32 $($extra)*>($($arg),*),
-            $crate::PixelId::Float64
-            | $crate::PixelId::ComplexFloat64
-            | $crate::PixelId::VectorFloat64 => $func::<f64 $($extra)*>($($arg),*),
+            $crate::core::PixelId::UInt8
+            | $crate::core::PixelId::VectorUInt8 => $func::<u8 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Int8
+            | $crate::core::PixelId::VectorInt8 => $func::<i8 $($extra)*>($($arg),*),
+            $crate::core::PixelId::UInt16
+            | $crate::core::PixelId::VectorUInt16 => $func::<u16 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Int16
+            | $crate::core::PixelId::VectorInt16 => $func::<i16 $($extra)*>($($arg),*),
+            $crate::core::PixelId::UInt32
+            | $crate::core::PixelId::VectorUInt32 => $func::<u32 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Int32
+            | $crate::core::PixelId::VectorInt32 => $func::<i32 $($extra)*>($($arg),*),
+            $crate::core::PixelId::UInt64
+            | $crate::core::PixelId::VectorUInt64 => $func::<u64 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Int64
+            | $crate::core::PixelId::VectorInt64 => $func::<i64 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Float32
+            | $crate::core::PixelId::ComplexFloat32
+            | $crate::core::PixelId::VectorFloat32 => $func::<f32 $($extra)*>($($arg),*),
+            $crate::core::PixelId::Float64
+            | $crate::core::PixelId::ComplexFloat64
+            | $crate::core::PixelId::VectorFloat64 => $func::<f64 $($extra)*>($($arg),*),
         }
     }};
     ($id:expr, $func:ident $(, $arg:expr)* $(,)?) => {
@@ -1740,7 +1740,7 @@ macro_rules! dispatch_scalar {
 /// dispatch_scalar_infer!([, _, _] id, f, a)  =>  f::<u8, _, _>(a)
 /// ```
 ///
-/// [`crate::fused::map_pixels`] nests two of these to monomorphize its pass over
+/// [`crate::core::fused::map_pixels`] nests two of these to monomorphize its pass over
 /// the *(input, output)* type pair while the caller's `f64 -> f64` closure stays
 /// a generic parameter — so the inner loop keeps no dynamic dispatch.
 #[macro_export]

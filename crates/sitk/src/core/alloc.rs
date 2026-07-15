@@ -49,8 +49,8 @@
 //!
 //! Making the fault cheaper is not the same as not paying it. A caller in a loop
 //! still pays it once per call, because the buffer dies at the end of the call.
-//! That half is closed by the `_into` forms — [`crate::map_pixels_into`] and
-//! [`crate::NeighborhoodIterator::par_map_window_into`] — which write into a
+//! That half is closed by the `_into` forms — [`crate::core::map_pixels_into`] and
+//! [`crate::core::NeighborhoodIterator::par_map_window_into`] — which write into a
 //! destination the caller owns and can reuse.
 
 use std::mem::size_of;
@@ -85,9 +85,9 @@ const PREFAULT_GRAIN_BYTES: usize = 1 << 21;
 /// It does **not** pay when the buffer is filled by a parallel pass, because
 /// that pass's own workers already fault their own slices concurrently — there
 /// is no serial fault to move, and the prefault is then a second write pass for
-/// nothing. Measured: routing [`crate::map_pixels`]'s output through here cost
+/// nothing. Measured: routing [`crate::core::map_pixels`]'s output through here cost
 /// `binary_dilate` ~4% and gained `rescale_intensity` nothing. That is why the
-/// maps in [`crate::parallel`] take [`resident_capacity`] instead — the advice
+/// maps in [`crate::core::parallel`] take [`resident_capacity`] instead — the advice
 /// without the prefault.
 pub fn resident_vec<T: Default + Send>(len: usize) -> Vec<T> {
     let bytes = len * size_of::<T>();
@@ -131,7 +131,7 @@ pub fn resident_vec<T: Default + Send>(len: usize) -> Vec<T> {
 ///
 /// The returned `Vec` has length 0. Filling it means writing
 /// [`Vec::spare_capacity_mut`] and then [`Vec::set_len`], which is `unsafe`; the
-/// safe wrappers around that live in [`crate::parallel`].
+/// safe wrappers around that live in [`crate::core::parallel`].
 pub(crate) fn resident_capacity<T>(len: usize) -> Vec<T> {
     // Reserve first, advise second: the advice needs an address, and
     // `with_capacity` has not touched a single page yet.

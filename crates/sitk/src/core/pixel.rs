@@ -7,7 +7,7 @@
 //! an enum-of-`Vec` buffer, and recover static typing inside filters through the
 //! [`Scalar`] trait.
 
-use crate::image::PixelBuffer;
+use crate::core::image::PixelBuffer;
 
 /// Runtime pixel-type tag, mirroring SimpleITK's `PixelIDValueEnum`
 /// (sitkPixelIDValues.h:100-134), discriminants included.
@@ -29,7 +29,7 @@ use crate::image::PixelBuffer;
 ///   `T` per pixel.
 /// - `12..=21` — the ten `Vector*` variants, tagging `itk::VectorImage<T, N>`,
 ///   whose pixels hold
-///   [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel)
+///   [`Image::number_of_components_per_pixel`](crate::core::Image::number_of_components_per_pixel)
 ///   components of the same underlying scalar type. `VectorPixelIDTypeList`
 ///   (sitkPixelIDTypeLists.h:125-141) instantiates a vector variant for every
 ///   one of the ten scalar types and for no other, so this list is exactly the
@@ -38,7 +38,7 @@ use crate::image::PixelBuffer;
 /// `22..=25` are `sitkLabelUInt8..sitkLabelUInt64` upstream
 /// (sitkPixelIDValues.h:130-133) and are deliberately left unassigned here: an
 /// `itk::LabelMap` derives from `ImageBase` and has no pixel container
-/// (itkLabelMap.h:69), so it is not an [`Image`](crate::Image) in this port.
+/// (itkLabelMap.h:69), so it is not an [`Image`](crate::core::Image) in this port.
 ///
 /// [`PixelId::is_scalar`], [`PixelId::is_complex`] and [`PixelId::is_vector`]
 /// partition this enum exhaustively; `pixel_id_predicates_partition_the_enum`
@@ -82,12 +82,12 @@ impl PixelId {
     /// Size in bytes of one *component* of this pixel type: `4` for
     /// `ComplexFloat32`, whose buffer stores `f32`, and `1` for `VectorUInt8`.
     /// A pixel occupies `size_in_bytes()` times its image's
-    /// [`Image::buffer_stride`](crate::Image::buffer_stride) bytes.
+    /// [`Image::buffer_stride`](crate::core::Image::buffer_stride) bytes.
     ///
     /// SimpleITK's `Image::GetSizeOfPixelComponent()` returns
     /// `2 * sizeof(component)` for a complex pixel type, contradicting its own
     /// doc; this port fixed that (§3.20), so
-    /// [`Image::size_of_pixel_component`](crate::Image::size_of_pixel_component)
+    /// [`Image::size_of_pixel_component`](crate::core::Image::size_of_pixel_component)
     /// agrees with this method for every pixel type.
     pub const fn size_in_bytes(self) -> usize {
         match self {
@@ -115,7 +115,7 @@ impl PixelId {
     ///
     /// The `sitkUnknown` ("Unknown pixel id") and `sitkLabel*` ("label of ...")
     /// arms have no counterpart here: an unknown pixel type is unrepresentable,
-    /// and a [`LabelMap`](crate::LabelMap) is not an [`Image`](crate::Image) in
+    /// and a [`LabelMap`](crate::core::LabelMap) is not an [`Image`](crate::core::Image) in
     /// this port (see the type docs).
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -194,10 +194,10 @@ impl PixelId {
 
     /// How many buffer components one pixel of this type occupies, when the
     /// image reports `components_per_pixel` from
-    /// [`Image::number_of_components_per_pixel`](crate::Image::number_of_components_per_pixel);
+    /// [`Image::number_of_components_per_pixel`](crate::core::Image::number_of_components_per_pixel);
     /// `None` when that count is illegal for this pixel category.
     ///
-    /// This is the three-way rule of [`Image`](crate::Image)'s invariant, held
+    /// This is the three-way rule of [`Image`](crate::core::Image)'s invariant, held
     /// in one total `match` so that every category names its own stride rather
     /// than inheriting an `else` branch. `Image::assemble` is the only caller.
     /// A basic pixel type — complex included — admits exactly one component
@@ -331,7 +331,7 @@ impl PixelId {
     /// `(NumericTraits<T>::NonpositiveMin(), NumericTraits<T>::max())` for the
     /// eight integer scalar types, `None` for every other pixel type.
     ///
-    /// This is the constructor-side guard for [`LabelMap`](crate::LabelMap):
+    /// This is the constructor-side guard for [`LabelMap`](crate::core::LabelMap):
     /// taking the bounds *is* the proof that the pixel type can back a label
     /// image, so `LabelMap::push_label_object` can consult them without a
     /// runtime check of its own.
@@ -388,14 +388,14 @@ impl PixelId {
 /// [`Image::component_slice`] / [`Image::component_vec_mut`] (which name in
 /// their signature that they return interleaved components).
 ///
-/// [`PixelBuffer::as_slice`]: crate::PixelBuffer::as_slice
-/// [`Image::scalar_slice`]: crate::Image::scalar_slice
-/// [`Image::scalar_vec_mut`]: crate::Image::scalar_vec_mut
-/// [`Image::scalar_view`]: crate::Image::scalar_view
-/// [`Image::component_slice`]: crate::Image::component_slice
-/// [`Image::component_vec_mut`]: crate::Image::component_vec_mut
+/// [`PixelBuffer::as_slice`]: crate::core::PixelBuffer::as_slice
+/// [`Image::scalar_slice`]: crate::core::Image::scalar_slice
+/// [`Image::scalar_vec_mut`]: crate::core::Image::scalar_vec_mut
+/// [`Image::scalar_view`]: crate::core::Image::scalar_view
+/// [`Image::component_slice`]: crate::core::Image::component_slice
+/// [`Image::component_vec_mut`]: crate::core::Image::component_vec_mut
 /// `Send + Sync` is part of the contract because every filter's inner loop may
-/// be run through [`crate::parallel`]; the ten implementors are primitives, for
+/// be run through [`crate::core::parallel`]; the ten implementors are primitives, for
 /// which it holds trivially.
 pub trait Scalar: Copy + PartialOrd + Send + Sync + 'static {
     /// The runtime tag for this Rust type. Always a scalar variant: `Scalar` is
@@ -417,7 +417,7 @@ pub trait Scalar: Copy + PartialOrd + Send + Sync + 'static {
     /// Wrap a `Vec<Self>` into the matching [`PixelBuffer`] variant.
     ///
     /// The write direction stays public: building a buffer cannot misread one,
-    /// and an [`Image`](crate::Image) can only be assembled from it through the
+    /// and an [`Image`](crate::core::Image) can only be assembled from it through the
     /// invariant-checking constructors.
     fn into_buffer(v: Vec<Self>) -> PixelBuffer;
 }
@@ -482,7 +482,7 @@ impl Real for f64 {
 /// (sitkImage.h:536-538, sitkImage.cxx:596-608) likewise trade in
 /// `std::complex<T>` values; the buffer itself stays interleaved `re, im, ...`
 /// and is reached through
-/// [`Image::complex_components`](crate::Image::complex_components), the exact
+/// [`Image::complex_components`](crate::core::Image::complex_components), the exact
 /// analogue of `GetBufferAsFloat()` on a complex image
 /// (sitkPimpleImageBase.hxx:838-842).
 ///

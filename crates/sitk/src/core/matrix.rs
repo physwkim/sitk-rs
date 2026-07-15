@@ -1,6 +1,6 @@
 //! Minimal dense linear algebra for the physical-space model.
 //!
-//! Only what the [`Image`](crate::Image) coordinate transforms need: a
+//! Only what the [`Image`](crate::core::Image) coordinate transforms need: a
 //! row-major `n x n` matrix inverse and matrix/vector products. Kept dependency
 //! -free for Phase 0; a heavier linear-algebra crate can replace this once the
 //! registration framework needs one.
