@@ -23,12 +23,23 @@
 //! `margin == 0`, so every bin edge collapses to the same value and every
 //! pixel clips into the *last* bin — not bin 0.
 //!
-//! ITK computes bin edges in `NumericTraits<T>::RealType`, which is `double`
-//! for **every** scalar pixel type including `float`
-//! (itkNumericTraits.h:1349/1356) — and `ScalarImageToHistogramGenerator`
-//! hardcodes `Histogram<double>` outright — so both upstream Otsu paths run
-//! bin edges in `double` for every input. This port computes bin edges in
-//! `f64` uniformly for every caller, matching that rule exactly.
+//! **This port diverges from ITK on bin-edge precision (deliberate, §4.124).**
+//! `itk::Statistics::Histogram::Initialize(size, lower, upper)` computes the bin
+//! interval and every bin edge in `float`, *regardless* of the histogram's
+//! `MeasurementType`: `float interval = (float(upper) − float(lower)) /
+//! float(size)`, then `SetBinMin/Max(… (MeasurementType)(lower + float(j) *
+//! interval))` (`itkHistogram.hxx:224-235`). Both upstream paths reach exactly
+//! that method — `ImageToHistogramFilter` for the `HistogramThresholdImageFilter`
+//! family (`itkImageToHistogramFilter.hxx:178,237`) and `SampleToHistogramFilter`
+//! for `OtsuMultipleThresholds` via `ScalarImageToHistogramGenerator`
+//! (`itkSampleToHistogramFilter.hxx:248`) — so a `Histogram<double>` does *not*
+//! make the edge arithmetic `double`; the edges are float-precision positions
+//! widened to the measurement type. This port instead computes bin edges in
+//! `f64` uniformly for every caller. Away from float-exact intervals (e.g.
+//! 100/200/250 bins, or a float data range) a pixel can land in a different bin
+//! than ITK and shift the selected threshold — see ledger §4.124. The port keeps
+//! `f64` (uniform crate precision, strictly more accurate; SimpleITK's default
+//! 128-bin/`[0,255]` is float-exact, so defaults do not diverge).
 
 use crate::error::{FilterError, Result};
 use sitk_core::{Image, PixelId, parallel};
