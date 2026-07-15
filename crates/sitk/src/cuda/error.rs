@@ -1,6 +1,6 @@
+use crate::core::PixelId;
 use cudarc::driver::DriverError;
 use cudarc::nvrtc::CompileError;
-use sitk_core::PixelId;
 use thiserror::Error;
 
 /// Every way a GPU op can decline to produce a result.
@@ -50,7 +50,7 @@ pub enum CudaError {
     ///
     /// The rule is not "no mask with a selected sample set" but *a fixed mask requires
     /// a sample set that knows its grid index*: an index list
-    /// ([`FixedPoints::Indices`](crate::FixedPoints::Indices)) carries that index and
+    /// ([`FixedPoints::Indices`](crate::cuda::FixedPoints::Indices)) carries that index and
     /// is masked correctly. A bare point list has thrown it away, and this is where it
     /// says so.
     #[error(
@@ -80,14 +80,14 @@ pub enum CudaError {
     PassCountMismatch { sums: usize, moments: usize },
 
     /// The point map handed to a resident metric or to a resample-through has no
-    /// stages, or more than the device replays ([`MAX_STAGES`](crate::MAX_STAGES)).
+    /// stages, or more than the device replays ([`MAX_STAGES`](crate::cuda::MAX_STAGES)).
     ///
     /// The device replays the host's stages in the host's order — that is what makes
     /// the continuous index bit-identical — so it cannot silently drop, fold or
     /// truncate them. An empty list is refused too: a zero-stage replay is the
     /// identity map, which is a *plausible* wrong answer rather than an obvious one.
-    /// (The identity resample is spelled [`resample_linear`](crate::resample_linear) /
-    /// [`resample_nearest`](crate::resample_nearest), which says so.)
+    /// (The identity resample is spelled [`resample_linear`](crate::cuda::resample_linear) /
+    /// [`resample_nearest`](crate::cuda::resample_nearest), which says so.)
     #[error("the point map has {stages} stages; the device replays 1..={max}")]
     PointMapStageCount { stages: usize, max: usize },
 
@@ -104,5 +104,5 @@ pub enum CudaError {
     /// declared pixel type — `sitk_core` already names this precisely, so
     /// carry its message rather than reclassifying it.
     #[error("image is not a scalar image of the expected type: {0}")]
-    NotScalar(#[from] sitk_core::Error),
+    NotScalar(#[from] crate::core::Error),
 }

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{CompileOptions, compile_ptx, compile_ptx_with_opts};
 
-use crate::error::CudaError;
+use crate::cuda::error::CudaError;
 
 /// Device 0. Multi-GPU is a later wave; every path in this crate names the
 /// device through this constant so the widening is one edit.
@@ -97,7 +97,7 @@ impl Backend {
     /// level's fixed image where `execute` lands it. With contraction off, a
     /// `double` expression on the device performs the same multiplies and the same
     /// adds, in the same order, with the same rounding as the Rust it was
-    /// transcribed from — so `sitk_filters::recursive_gaussian` and its kernel
+    /// transcribed from — so `crate::filters::recursive_gaussian` and its kernel
     /// agree to the last bit rather than to a tolerance that would then have to be
     /// argued about level by level.
     pub fn function_exact(&self, src: &str, name: &str) -> Result<CudaFunction, CudaError> {

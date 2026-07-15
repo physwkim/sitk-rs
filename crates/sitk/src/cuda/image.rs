@@ -36,7 +36,7 @@
 //! pushes the native bytes, and converts on the device. A `UInt16` CT never
 //! materializes as an `f32` volume on the host at all.
 //!
-//! The conversion is the CPU filter's, exactly: `sitk_filters::cast` goes
+//! The conversion is the CPU filter's, exactly: `crate::filters::cast` goes
 //! `native → f64 → f32` (`to_f64_vec`, then `Scalar::from_f64`), so the kernel goes
 //! `(float)(double)x` and not `(float)x`. For the ≤32-bit types those are the same
 //! number, but for `Int64`/`UInt64` above 2⁵³ they are not — a single rounding and a
@@ -55,12 +55,12 @@
 //! The refusal is the point: the device never quietly converts something it was not
 //! asked to convert, and never quietly decides to be a CPU path.
 
+use crate::core::{Image, PixelId, Scalar};
 use cudarc::driver::{DeviceRepr, LaunchConfig, PushKernelArg};
-use sitk_core::{Image, PixelId, Scalar};
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
 
 /// Threads per block for the widen kernel.
 const BLOCK: u32 = 256;
@@ -171,7 +171,7 @@ impl DeviceImage {
     ///
     /// `img` may be **any scalar pixel type**: a `Float32` image is pushed as it
     /// is, and every other scalar type is pushed in its native width and cast to
-    /// `f32` **on the device**, bit-identically to `sitk_filters::cast(img,
+    /// `f32` **on the device**, bit-identically to `crate::filters::cast(img,
     /// Float32)` (see the [module docs](self)). A `UInt16` volume therefore crosses
     /// the bus at 2 bytes per voxel, not 4, and is never widened on the host.
     ///
@@ -263,12 +263,12 @@ impl DeviceImage {
     /// Copy the volume back to the host (**the D2H**, the other bus crossing) as a
     /// `Float32` image carrying this image's geometry.
     ///
-    /// The destination comes from [`sitk_core::alloc::resident_vec`], so the DMA
+    /// The destination comes from [`crate::core::alloc::resident_vec`], so the DMA
     /// lands on mapped pages rather than faulting in every one of them under
     /// itself — the difference between 7 ms and 61 ms at 256³.
     pub fn to_host(&self) -> Result<Image, CudaError> {
         let backend = backend()?;
-        let mut host = sitk_core::alloc::resident_vec::<f32>(self.buf.len());
+        let mut host = crate::core::alloc::resident_vec::<f32>(self.buf.len());
         self.buf.copy_to_host(backend, &mut host)?;
         backend.synchronize()?;
 

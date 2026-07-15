@@ -10,15 +10,15 @@
 //! [`Result<_, CudaError>`] and names its failure; the *caller* decides, once, at
 //! the top of the pipeline, whether to run the host chain instead.
 
-use crate::backend::backend;
-use crate::error::CudaError;
-use crate::image::DeviceImage;
-use crate::ops::rescale_intensity::rescale_intensity_resident;
+use crate::cuda::backend::backend;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
+use crate::cuda::ops::rescale_intensity::rescale_intensity_resident;
 
 /// `rescale_intensity` on a resident volume: linearly map `[min, max]` onto
 /// `[output_min, output_max]`, reading and writing device memory only.
 ///
-/// The same two kernels the host-side [`crate::rescale_intensity_gpu`] runs — the
+/// The same two kernels the host-side [`crate::cuda::rescale_intensity_gpu`] runs — the
 /// exact `min`/`max` reduction and the map — with the H2D, the D2H, and the host
 /// allocation all absent. At 256³ that is 1.06 ms of kernel against 17.42 ms for
 /// the CPU at 96 threads, where the one-shot form measured 30.42 ms because it

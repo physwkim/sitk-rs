@@ -25,11 +25,11 @@
 
 use cudarc::driver::LaunchConfig;
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::DeviceImage;
-use crate::mask::DeviceMask;
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
+use crate::cuda::mask::DeviceMask;
 
 /// Threads per block. The kernel's shared-memory tree is exactly this wide.
 pub(crate) const BLOCK: u32 = 256;
@@ -85,7 +85,7 @@ pub const MAX_STAGES: usize = 8;
 pub(crate) const SAMPLER_SRC: &str = r#"
 #define BLOCK 256
 
-// Mirrors sitk_transform::interpolator::is_inside exactly: a sample is valid iff
+// Mirrors crate::transform::interpolator::is_inside exactly: a sample is valid iff
 // every continuous-index component lies in [-0.5, size-0.5).
 __device__ __forceinline__ bool is_inside(const double* c, const long long* size) {
     for (int d = 0; d < 3; ++d) {
@@ -232,7 +232,7 @@ __device__ __forceinline__ bool take_sample(
     //     stages and is refused on the host, by name.
     //
     // Within a stage, `mat_vec` starts the accumulator at zero and the offset lands
-    // last, which is exactly `sitk_core::matrix::mat_vec` followed by the `+ offset`
+    // last, which is exactly `crate::core::matrix::mat_vec` followed by the `+ offset`
     // of `MatrixOffsetTransformBase::transform_point`.
     double p[3] = { x[0], x[1], x[2] };
     for (int st = 0; st < nstage; ++st) {
@@ -429,7 +429,7 @@ pub struct MovingGeometry<'a> {
     pub origin: &'a [f64],
     /// `inverse(Direction · diag(spacing))`, row-major `3 × 3` — the inverse of
     /// the whole composed matrix (ITK `itkImageBase.hxx:175`,
-    /// `sitk_core::coord::physical_to_index_matrix`), not the direction alone
+    /// `crate::core::coord::physical_to_index_matrix`), not the direction alone
     /// divided by spacing. The two agree for a diagonal geometry and diverge for
     /// an oblique direction.
     pub phys_to_index: &'a [f64],
@@ -449,7 +449,7 @@ pub struct MovingGeometry<'a> {
 ///
 /// [`Indices`](Self::Indices) is for a **sampled** set, and it is the one a sampling
 /// strategy uses. A sampled set is not an arbitrary point cloud: our sampler does not
-/// jitter (`sitk_registration::metric::FixedSamples::from_image_with`, a documented
+/// jitter (`crate::registration::metric::FixedSamples::from_image_with`, a documented
 /// deviation from ITK), so every sample is a voxel center and the sample is fully
 /// described by its flat grid index. Saying it that way costs 8 bytes per sample
 /// instead of 24, and buys two things the point list cannot:

@@ -24,22 +24,22 @@
 //! held to the strongest contract this crate has: **the same bits**. Each kernel
 //! is a transcription of the CPU filter's arithmetic — same expressions, same
 //! order, `double` throughout, narrowed to `f32` exactly once at the end — and it
-//! is compiled with [`Backend::function_exact`](crate::Backend::function_exact),
+//! is compiled with [`Backend::function_exact`](crate::cuda::Backend::function_exact),
 //! which turns multiply-add contraction off so the device rounds where the host
 //! rounds. `pyramid_parity.rs` asserts voxel-for-voxel equality against
-//! `sitk_filters::recursive_gaussian` / `::shrink` / `ResampleImageFilter`.
+//! `crate::filters::recursive_gaussian` / `::shrink` / `ResampleImageFilter`.
 //!
 //! One divergence is structural rather than arithmetic, and it is worth stating:
 //! a [`DeviceImage`] holds `f32`, so these ops smooth and resample in `f64` and
-//! store `f32`. `sitk_filters::recursive_gaussian` narrows back to its *input's*
+//! store `f32`. `crate::filters::recursive_gaussian` narrows back to its *input's*
 //! pixel type — for a `UInt16` CT it re-quantizes every level to `UInt16`. The
 //! device path therefore reproduces `execute` run on the **`Float32` casts** of
 //! the images, which is precisely what
-//! [`DeviceImage::upload`](crate::DeviceImage::upload) put on the device.
+//! [`DeviceImage::upload`](crate::cuda::DeviceImage::upload) put on the device.
 //!
 //! # The coefficients
 //!
-//! The Deriche/Farnebäck coefficient math is [`sitk_core::deriche`] — the one
+//! The Deriche/Farnebäck coefficient math is [`crate::core::deriche`] — the one
 //! implementation, shared with `sitk-filters`' host recursion rather than copied.
 //! `sitk-filters` depends on *this* crate, so the edge cannot run the other way;
 //! `sitk-core` is below both. `to_array()` hands the kernel the flat `[f64; 20]`
@@ -50,13 +50,13 @@
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use sitk_core::deriche::{Coefficients, GaussianOrder};
+use crate::core::deriche::{Coefficients, GaussianOrder};
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::{DeviceImage, Geometry};
-use crate::ops::resident::{MAX_STAGES, PointStage};
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::{DeviceImage, Geometry};
+use crate::cuda::ops::resident::{MAX_STAGES, PointStage};
 
 /// Threads per block for every kernel here.
 const BLOCK: u32 = 256;
@@ -203,7 +203,7 @@ extern "C" __global__ void narrow_f64_f32(
 "#;
 
 /// Gaussian-smooth a resident volume with the recursive (IIR) filter — the device
-/// form of [`sitk_filters::recursive_gaussian`], bit for bit.
+/// form of [`crate::filters::recursive_gaussian`], bit for bit.
 ///
 /// `sigma` is per dimension, in **physical** units (so the recursion runs at
 /// `sigma[d] / spacing[d]` index units, as on the host). An axis with `sigma == 0`
@@ -213,7 +213,7 @@ extern "C" __global__ void narrow_f64_f32(
 /// the wrong length, a negative `sigma`, or a smoothed axis shorter than the four
 /// voxels the fourth-order recursion needs — the same refusal the CPU filter makes.
 ///
-/// [`sitk_filters::recursive_gaussian`]: https://docs.rs/sitk-filters
+/// [`crate::filters::recursive_gaussian`]: https://docs.rs/sitk-filters
 pub fn recursive_gaussian(src: &DeviceImage, sigma: &[f64]) -> Result<DeviceImage, CudaError> {
     let geom = src.geometry().clone();
     require_3d(&geom)?;
@@ -358,7 +358,7 @@ pub fn shrunk_geometry(geom: &Geometry, factors: &[usize]) -> Result<Geometry, C
 }
 
 /// The output geometry and sampling offset of a shrink — `ShrinkImageFilter`'s
-/// `GenerateOutputInformation`, transcribed from `sitk_filters::shrink`.
+/// `GenerateOutputInformation`, transcribed from `crate::filters::shrink`.
 ///
 /// `δ` is the center-preserving shift in index units; the **origin** moves by the
 /// unrounded `δ` while the **sampling offset** is `δ` rounded. That gap — up to
@@ -410,7 +410,7 @@ fn shrink_geometry(geom: &Geometry, factors: &[usize]) -> Result<(Geometry, Vec<
 }
 
 /// Subsample a resident volume by an integer factor per axis — the device form of
-/// `sitk_filters::shrink`, bit for bit (it is a gather: no arithmetic touches a
+/// `crate::filters::shrink`, bit for bit (it is a gather: no arithmetic touches a
 /// voxel value).
 ///
 /// **This is not a resample.** It picks input voxel `j·f + offset`, where `offset`
@@ -521,10 +521,10 @@ __device__ __forceinline__ bool cindex_of(
     // together is the same map algebraically and rounds once where the host rounds
     // per stage; the difference lands in the last bits of `cindex`, and
     // `resample_nearest3` turns those bits into a whole voxel via `floor(c + 0.5)`.
-    // So the stages arrive as stages (`sitk_transform::TransformBase::point_map_stages`)
+    // So the stages arrive as stages (`crate::transform::TransformBase::point_map_stages`)
     // and are replayed here in the same order — see `PointStage`.
     //
-    // Same accumulation as `sitk_core::matrix::mat_vec` (left to right, `acc` seeded
+    // Same accumulation as `crate::core::matrix::mat_vec` (left to right, `acc` seeded
     // at 0.0, offset added last) and compiled `--fmad=false`, so the bits are the
     // host's. Every accepted transform *is* this arithmetic on its own stored fields;
     // `point_map_stages` returns `None` for the ones that are not, and the caller
@@ -646,7 +646,7 @@ extern "C" __global__ void resample_nearest3(
 /// (`inverse(Direction · diag(spacing))`), row-major — the two affines
 /// `ResampleImageFilter` precomputes. `None` if the composed matrix is singular.
 ///
-/// Both come from the one shared `sitk_core::coord` implementation the host now
+/// Both come from the one shared `crate::core::coord` implementation the host now
 /// routes through, so the device precomputes bit-for-bit the same matrices the
 /// host filter does. The physical→index matrix inverts the **whole composed**
 /// `Direction · diag(spacing)` (ITK `itkImageBase.hxx:175`), not the direction
@@ -655,8 +655,8 @@ extern "C" __global__ void resample_nearest3(
 /// index at a tie.
 fn affines(geom: &Geometry) -> Option<(Vec<f64>, Vec<f64>)> {
     let dim = geom.dimension();
-    let fwd = sitk_core::coord::index_to_physical_matrix(&geom.direction, &geom.spacing, dim);
-    let back = sitk_core::coord::physical_to_index_matrix(&geom.direction, &geom.spacing, dim)?;
+    let fwd = crate::core::coord::index_to_physical_matrix(&geom.direction, &geom.spacing, dim);
+    let back = crate::core::coord::physical_to_index_matrix(&geom.direction, &geom.spacing, dim)?;
     Some((fwd, back))
 }
 
@@ -686,7 +686,7 @@ pub fn resample_linear(
 /// `ResampleImageFilter::execute(input, transform)`.
 ///
 /// `stages` must be the transform's **own** arithmetic, bit for bit and stage for
-/// stage: pass what `sitk_transform::TransformBase::point_map_stages` returns, in the
+/// stage: pass what `crate::transform::TransformBase::point_map_stages` returns, in the
 /// order it returns them, and nothing else.
 ///
 /// Two things are refused rather than approximated, and both refusals are the same

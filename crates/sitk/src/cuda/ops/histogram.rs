@@ -49,9 +49,9 @@
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
 
 /// The number of contiguous chunks the entry list is cut into for the scatter — one
 /// block per tile.

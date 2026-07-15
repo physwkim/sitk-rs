@@ -65,7 +65,7 @@
 //! It is an **accumulator**: fourteen slots and the loop that fills them. The
 //! sampler that feeds it — point derivation, transform, validity, trilinear value
 //! and gradient — and the reduction that drains it both live in
-//! [`resident`](crate::ops::resident), shared with the correlation metric, because
+//! [`resident`](crate::cuda::ops::resident), shared with the correlation metric, because
 //! that chain is the host-parity contract and a second copy of it is a second
 //! chance to drift from the host silently. See that module for why.
 //!
@@ -80,21 +80,21 @@ use std::sync::OnceLock;
 
 use cudarc::driver::PushKernelArg;
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::DeviceImage;
-use crate::mask::DeviceMask;
-use crate::ops::resident::{Partials, Resident, SAMPLER_SRC, Volumes};
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
+use crate::cuda::mask::DeviceMask;
+use crate::cuda::ops::resident::{Partials, Resident, SAMPLER_SRC, Volumes};
 
-pub use crate::ops::resident::{DIM, FixedPoints, MAX_STAGES, MovingGeometry, PointStage};
+pub use crate::cuda::ops::resident::{DIM, FixedPoints, MAX_STAGES, MovingGeometry, PointStage};
 
 /// `sq` (1) + `S0[3]` (3) + `S1[3][3]` (9) + `count` (1).
 const NSLOT: usize = 14;
 
 /// The accumulator. Everything it needs to *reach* a sample — and everything it
 /// does with the fourteen numbers afterwards — comes from
-/// [`SAMPLER_SRC`](crate::ops::resident::SAMPLER_SRC), which is prepended to this.
+/// [`SAMPLER_SRC`](crate::cuda::ops::resident::SAMPLER_SRC), which is prepended to this.
 const KERNEL_BODY: &str = r#"
 #define NSLOT 14
 

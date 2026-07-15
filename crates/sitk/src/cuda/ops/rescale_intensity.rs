@@ -17,13 +17,13 @@
 
 use std::time::Instant;
 
+use crate::core::{Image, PixelId};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use sitk_core::{Image, PixelId};
 
-use crate::GpuTimings;
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
+use crate::cuda::GpuTimings;
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
 
 /// Threads per block. Also the shared-memory extent of the reduction, so the
 /// kernel source and the launch config must agree — both read this constant.
@@ -101,7 +101,7 @@ extern "C" __global__ void rescale_f32(
 /// final min/max fold happens (an exact, order-independent fold over ≤ 1024
 /// values). `alloc_ms` is the host-side cost of making the output buffer
 /// resident, and `d2h_ms` is then the DMA alone — see
-/// [`sitk_core::alloc`] for why those two must not be reported as one number.
+/// [`crate::core::alloc`] for why those two must not be reported as one number.
 pub fn rescale_intensity_gpu(
     img: &Image,
     output_min: f64,
@@ -120,7 +120,7 @@ pub fn rescale_intensity_gpu(
     // function returning a fresh `Image` cannot express. That is what
     // [`rescale_intensity_gpu_into`] is for.
     let t = Instant::now();
-    let mut host_out = sitk_core::alloc::resident_vec::<f32>(n);
+    let mut host_out = crate::core::alloc::resident_vec::<f32>(n);
     let alloc_ms = t.elapsed().as_secs_f64() * 1e3;
 
     let mut timings = run(img, output_min, output_max, &mut host_out)?;

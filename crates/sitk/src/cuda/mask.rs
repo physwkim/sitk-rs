@@ -12,21 +12,21 @@
 //! produces a new edge case every review round.
 //!
 //! So a mask is its own type, consumed at the one place that has a use for it —
-//! [`ResidentMetric`](crate::ResidentMetric) — and an unmasked run allocates nothing
+//! [`ResidentMetric`](crate::cuda::ResidentMetric) — and an unmasked run allocates nothing
 //! and says so in its types (`Option<&DeviceMask>` is `None`).
 //!
-//! [`rescale_intensity`]: crate::rescale_intensity
-//! [`recursive_gaussian`]: crate::recursive_gaussian
-//! [`shrink`]: crate::shrink
-//! [`resample_linear`]: crate::resample_linear
+//! [`rescale_intensity`]: crate::cuda::rescale_intensity
+//! [`recursive_gaussian`]: crate::cuda::recursive_gaussian
+//! [`shrink`]: crate::cuda::shrink
+//! [`resample_linear`]: crate::cuda::resample_linear
 
+use crate::core::Image;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use sitk_core::Image;
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::{DeviceImage, Geometry};
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::{DeviceImage, Geometry};
 
 /// Threads per block for the two elementwise mask kernels.
 const BLOCK: u32 = 256;
@@ -112,7 +112,7 @@ impl DeviceMask {
     /// This is how a mask reaches a pyramid level: the host resamples its masks onto
     /// the level's grid with nearest-neighbour interpolation and re-reads them as
     /// predicates (`prepare_level`), and the device does the same with
-    /// [`resample_nearest`](crate::resample_nearest) — whose output is a
+    /// [`resample_nearest`](crate::cuda::resample_nearest) — whose output is a
     /// [`DeviceImage`] of 0.0/1.0 that this turns back into a predicate without
     /// touching the bus.
     pub fn from_device_image(img: &DeviceImage) -> Result<Self, CudaError> {

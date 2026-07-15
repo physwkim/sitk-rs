@@ -2,7 +2,7 @@
 //!
 //! The metric is `value = −sfm²/(sff·smm)` over the mean-subtracted samples —
 //! `itk::CorrelationImageToImageMetricv4`, and here specifically
-//! `sitk_registration::correlation::CorrelationMetric`, which is the reference this
+//! `crate::registration::correlation::CorrelationMetric`, which is the reference this
 //! is measured against.
 //!
 //! # Why two passes, and not the one-pass kernel that exists
@@ -19,7 +19,7 @@
 //! That form is algebraically identical to this one and numerically worse, in a way
 //! that depends on the caller's data rather than on the algorithm: each line is a
 //! difference of comparable magnitudes, so `sff`'s relative error is
-//! `ε·(1 + f̄²/var(f))`. Measured (`sitk_registration::correlation`'s
+//! `ε·(1 + f̄²/var(f))`. Measured (`crate::registration::correlation`'s
 //! `one_pass_moment_form` tests) on a CT-like volume at mean 1000, that
 //! amplification is **1941**, and through a real reduction the one-pass form loses
 //! **7.8e-11** on the value where this two-pass form loses **1.5e-14** — a factor of
@@ -86,11 +86,11 @@ use std::sync::OnceLock;
 
 use cudarc::driver::PushKernelArg;
 
-use crate::backend::{Backend, backend};
-use crate::error::CudaError;
-use crate::image::DeviceImage;
-use crate::mask::DeviceMask;
-use crate::ops::resident::{
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
+use crate::cuda::mask::DeviceMask;
+use crate::cuda::ops::resident::{
     DIM, FixedPoints, MovingGeometry, Partials, PointStage, Resident, SAMPLER_SRC,
 };
 
@@ -297,7 +297,7 @@ impl ResidentCorrelation {
         Ok(Self {
             res: Resident::build(
                 n,
-                crate::ops::resident::Volumes::from_device(fixed, moving)?,
+                crate::cuda::ops::resident::Volumes::from_device(fixed, moving)?,
                 fixed_points,
                 fixed_mask,
                 moving_geometry,
@@ -470,8 +470,8 @@ impl ResidentCorrelation {
             }};
         }
         match vols {
-            crate::ops::resident::Volumes::F64 { fvals, mbuf } => launch_pass!(fvals, mbuf),
-            crate::ops::resident::Volumes::Split { fvals, mbuf } => launch_pass!(fvals, mbuf),
+            crate::cuda::ops::resident::Volumes::F64 { fvals, mbuf } => launch_pass!(fvals, mbuf),
+            crate::cuda::ops::resident::Volumes::Split { fvals, mbuf } => launch_pass!(fvals, mbuf),
         }
 
         partials.fold(backend)

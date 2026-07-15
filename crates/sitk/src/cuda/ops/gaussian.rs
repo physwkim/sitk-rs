@@ -3,7 +3,7 @@
 //!
 //! # Numerics: this mirrors the CPU filter, operation for operation
 //!
-//! `sitk_filters::smooth_gaussian` builds a symmetric 1-D kernel per axis —
+//! `crate::filters::smooth_gaussian` builds a symmetric 1-D kernel per axis —
 //! `σ_idx = sigma[d] / spacing[d]`, `w[k] = exp(−k²/(2σ_idx²))`, truncated at
 //! `⌈4σ_idx⌉`, normalized to sum 1 — and convolves the axes in sequence, in `f64`,
 //! with an edge-replicating (zero-flux) boundary, narrowing to the pixel type only
@@ -27,10 +27,10 @@
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::DeviceImage;
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
 
 const BLOCK: u32 = 256;
 
@@ -76,7 +76,7 @@ extern "C" __global__ void narrow_f64_f32(
 
 /// Gaussian-smooth a resident volume: separable FIR convolution, per-dimension
 /// `sigma` in **physical units** (the same contract as
-/// `sitk_filters::smooth_gaussian`), reading and writing device memory only.
+/// `crate::filters::smooth_gaussian`), reading and writing device memory only.
 ///
 /// Bit-identical to the CPU filter — see the [module docs](self) for why that is a
 /// claim about the arithmetic rather than a hope.

@@ -14,7 +14,7 @@
 //! (`MattesMutualInformationMetric::build_histogram`), so the entry list is **4n**, not
 //! 16n.
 //!
-//! That fan-out does **not** weaken [`crate::histogram`]'s determinism argument, and it
+//! That fan-out does **not** weaken [`crate::cuda::histogram`]'s determinism argument, and it
 //! is worth being precise about why, because the argument is the whole reason this
 //! metric can exist. The counting sort promises one thing: bin `b`'s entries are summed
 //! **in ascending entry index**. It does not care where the entries came from or how
@@ -96,17 +96,17 @@
 //! to the launch configuration. The twelve derivative moments go through the shared
 //! reduction tree and the host's block-order fold — no atomics, fixed grid — so they are
 //! bit-identical run to run. Neither half re-opens the hole
-//! [`crate::histogram_atomic`] demonstrates.
+//! [`crate::cuda::histogram_atomic`] demonstrates.
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use crate::backend::{Backend, backend};
-use crate::buffer::DeviceBuffer;
-use crate::error::CudaError;
-use crate::image::DeviceImage;
-use crate::mask::DeviceMask;
-use crate::ops::histogram::HistogramScratch;
-use crate::ops::resident::{
+use crate::cuda::backend::{Backend, backend};
+use crate::cuda::buffer::DeviceBuffer;
+use crate::cuda::error::CudaError;
+use crate::cuda::image::DeviceImage;
+use crate::cuda::mask::DeviceMask;
+use crate::cuda::ops::histogram::HistogramScratch;
+use crate::cuda::ops::resident::{
     BLOCK, DIM, FixedPoints, GRID, MovingGeometry, Partials, PointStage, Resident, SAMPLER_SRC,
     Volumes,
 };

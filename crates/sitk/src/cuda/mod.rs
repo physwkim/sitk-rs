@@ -65,7 +65,7 @@ pub struct GpuTimings {
     /// Host-to-device copy of the input buffer.
     pub h2d_ms: f64,
     /// Preparing the output allocation so the D2H does not fault under the DMA
-    /// (see [`sitk_core::alloc::resident_vec`]).
+    /// (see [`crate::core::alloc::resident_vec`]).
     ///
     /// This is a *host* cost, and it is broken out rather than folded into
     /// `d2h_ms` because folding it there is precisely the mistake that made a
