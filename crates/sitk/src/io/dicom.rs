@@ -90,11 +90,11 @@ use dicom_dictionary_std::StandardDataDictionary;
 use dicom_object::mem::InMemElement;
 use dicom_object::{FileDicomObject, InMemDicomObject, OpenFileOptions};
 
-use sitk_core::{Image, PixelBuffer, PixelId};
+use crate::core::{Image, PixelBuffer, PixelId};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 /// The parsed file, as `dicom-object` hands it back.
 type Obj = FileDicomObject<InMemDicomObject<StandardDataDictionary>>;
@@ -2331,7 +2331,7 @@ impl ImageIo for DicomImageIo {
     /// `CanWriteFile` is `HasSupportedWriteExtension(name, false)` —
     /// case-**sensitive** (itkGDCMImageIO.cxx:814-826), like `TIFFImageIO`'s.
     fn can_write_file(&self, path: &Path) -> bool {
-        crate::image_io::has_supported_extension(path, self.supported_write_extensions(), false)
+        crate::io::image_io::has_supported_extension(path, self.supported_write_extensions(), false)
     }
 
     fn read_information(&self, path: &Path) -> Result<ImageInformation> {
@@ -3063,7 +3063,7 @@ mod tests {
         let bytes = dicom_file(EVR_LE, CT, &d);
         let path = write_temp(&bytes, "negative_z_spacing.dcm");
 
-        let image = crate::read_image(&path).unwrap();
+        let image = crate::io::read_image(&path).unwrap();
 
         // Flipped positive: |−2.5| with the Z direction *column* negated.
         assert_eq!(image.spacing(), &[0.75, 0.5, 2.5]);

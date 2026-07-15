@@ -1,8 +1,8 @@
 //! MATLAB Level-4 transform files (`.mat`) — a port of
 //! `itk::MatlabTransformIOTemplate<double>`
 //! (`Modules/IO/TransformMatlab/src/itkMatlabTransformIO.cxx`), reached
-//! through [`crate::read_transform`] / [`crate::write_transform`] like
-//! [`crate::transform_io`] and [`crate::transform_hdf5`].
+//! through [`crate::io::read_transform`] / [`crate::io::write_transform`] like
+//! [`crate::io::transform_io`] and [`crate::io::transform_hdf5`].
 //!
 //! The format is `vnl_matlab_write`'s (`Modules/ThirdParty/VNL/src/vxl/core/
 //! vnl/vnl_matlab_write.h`/`.cxx`) — a MATLAB Level-4 `.mat` file holds a flat
@@ -29,8 +29,8 @@
 //!
 //! # No composite flattening
 //!
-//! Unlike [`crate::transform_io`] and [`crate::transform_hdf5`], a
-//! [`sitk_transform::Transform::Composite`] is **not** expanded into its
+//! Unlike [`crate::io::transform_io`] and [`crate::io::transform_hdf5`], a
+//! [`crate::transform::Transform::Composite`] is **not** expanded into its
 //! queue here. `TransformFileWriterTemplate::Update`'s composite-flattening
 //! `CompositeTransformIOHelper` runs only on the float↔double
 //! precision-*mismatch* write path (`itkTransformFileWriterSpecializations.cxx:
@@ -124,10 +124,10 @@
 use std::io::Read;
 use std::path::Path;
 
-use sitk_transform::{ParametricTransform, Transform};
+use crate::transform::{ParametricTransform, Transform};
 
-use crate::error::{IoError, Result};
-use crate::transform_io::{correct_transform_precision_type, create_transform};
+use crate::io::error::{IoError, Result};
+use crate::io::transform_io::{correct_transform_precision_type, create_transform};
 
 /// `MatlabTransformIOTemplate::CanReadFile` (`itkMatlabTransformIO.cxx:30-38`):
 /// the `.mat` extension, case-sensitive.
@@ -423,7 +423,7 @@ fn write_record(out: &mut Vec<u8>, name: &str, values: &[f64]) {
 mod tests {
     use std::path::PathBuf;
 
-    use sitk_transform::{
+    use crate::transform::{
         AffineTransform, BSplineTransform, ComposeScaleSkewVersor3DTransform, CompositeTransform,
         DisplacementFieldTransform, Euler2DTransform, Euler3DTransform, ScaleLogarithmicTransform,
         ScaleSkewVersor3DTransform, ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform,
@@ -431,7 +431,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{read_transform, write_transform as dispatch_write};
+    use crate::io::{read_transform, write_transform as dispatch_write};
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -870,7 +870,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(IoError::Transform(
-                sitk_transform::TransformError::InvalidParameters {
+                crate::transform::TransformError::InvalidParameters {
                     got: 1,
                     expected: 2
                 }

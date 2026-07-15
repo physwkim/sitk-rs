@@ -1,7 +1,7 @@
 //! HDF5 transform files (`.h5` / `.hdf5`) — a port of
 //! `itk::HDF5TransformIOTemplate<double>`
 //! (`Modules/IO/TransformHDF5/src/itkHDF5TransformIO.cxx`), reached through
-//! [`crate::read_transform`] / [`crate::write_transform`], which is where
+//! [`crate::io::read_transform`] / [`crate::io::write_transform`], which is where
 //! SimpleITK's `ReadTransform` / `WriteTransform` (`sitkTransform.cxx:668-737`)
 //! end up once `itk::TransformFileReader` / `Writer` pick the IO by extension.
 //!
@@ -48,11 +48,11 @@
 
 use std::path::Path;
 
+use crate::transform::{ParametricTransform, Transform};
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5File, H5Group};
-use sitk_transform::{ParametricTransform, Transform};
 
-use crate::error::{IoError, Result};
-use crate::transform_io::{correct_transform_precision_type, create_transform};
+use crate::io::error::{IoError, Result};
+use crate::io::transform_io::{correct_transform_precision_type, create_transform};
 
 /// `HDF5CommonPathNames::transformGroupName` (`itkHDF5TransformIO.cxx:415`),
 /// without the leading `/` that `rust-hdf5` strips from every stored link path.
@@ -311,7 +311,7 @@ fn write_double_array(group: &H5Group, name: &str, values: &[f64]) -> Result<()>
 mod tests {
     use std::path::PathBuf;
 
-    use sitk_transform::{
+    use crate::transform::{
         AffineTransform, BSplineTransform, ComposeScaleSkewVersor3DTransform, CompositeTransform,
         DisplacementFieldTransform, Euler2DTransform, Euler3DTransform, ScaleLogarithmicTransform,
         ScaleSkewVersor3DTransform, ScaleTransform, ScaleVersor3DTransform, Similarity2DTransform,
@@ -319,7 +319,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{read_transform, write_transform as dispatch_write};
+    use crate::io::{read_transform, write_transform as dispatch_write};
 
     /// A path that no other test in this crate shares. Each test removes its own
     /// file; `H5File::create` truncates anyway.
@@ -889,7 +889,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(IoError::Transform(
-                sitk_transform::TransformError::InvalidParameters {
+                crate::transform::TransformError::InvalidParameters {
                     got: 1,
                     expected: 2
                 }

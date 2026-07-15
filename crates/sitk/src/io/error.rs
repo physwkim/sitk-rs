@@ -9,14 +9,14 @@ pub enum IoError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// No registered [`ImageIo`](crate::ImageIo) claimed the file for reading,
+    /// No registered [`ImageIo`](crate::io::ImageIo) claimed the file for reading,
     /// and the file exists and is readable. `ImageReaderBase::GetImageIOBase`
     /// throws `"Unable to determine ImageIO reader for ..."` here
     /// (sitkImageReaderBase.cxx:99).
     #[error("unable to determine ImageIO reader for {0}")]
     NoReaderFound(PathBuf),
 
-    /// No registered [`ImageIo`](crate::ImageIo) claimed the file for writing.
+    /// No registered [`ImageIo`](crate::io::ImageIo) claimed the file for writing.
     /// `ImageFileWriter::GetImageIOBase` throws `"Unable to determine ImageIO
     /// writer for ..."` here (sitkImageFileWriter.cxx:209).
     #[error("unable to determine ImageIO writer for {0}")]
@@ -109,7 +109,7 @@ pub enum IoError {
 
     /// A PNG file's 8-byte signature was missing or did not match, discovered
     /// while parsing a header (rather than by [`ImageIo::can_read_file`]
-    /// (crate::ImageIo), which gates the normal registry path). Two upstream
+    /// (crate::io::ImageIo), which gates the normal registry path). Two upstream
     /// messages collapse into this one variant:
     /// `"PNGImageIO failed to read header for file: ..."` when fewer than 8
     /// bytes are present, and `"File is not png type: ..."` when 8 bytes are
@@ -122,9 +122,9 @@ pub enum IoError {
     /// (itkPNGImageIO.cxx:550). A 2-channel (gray + alpha) PNG, which
     /// upstream's own `GetPixelIDFromImageIO` cannot represent
     /// (itkPNGImageIO.cxx:452-461, sitkImageReaderBase.cxx:215-238), is *not*
-    /// one of these — this crate's [`PixelId`](sitk_core::PixelId) has no such
-    /// restriction, so [`crate::png`] reads and writes it as a 2-component
-    /// vector image instead (ledger §3.45). See [`crate::png`] and ledger §3.
+    /// one of these — this crate's [`PixelId`](crate::core::PixelId) has no such
+    /// restriction, so [`crate::io::png`] reads and writes it as a 2-component
+    /// vector image instead (ledger §3.45). See [`crate::io::png`] and ledger §3.
     #[error("unsupported PNG feature: {0}")]
     UnsupportedPngFeature(String),
 
@@ -161,7 +161,7 @@ pub enum IoError {
     /// photometric interpretation libtiff renders through
     /// `TIFFReadRGBAImageOriented` (§4.100, §4.102); the two multi-page buffer
     /// overflows `ReadVolume` commits, which safe Rust cannot reproduce
-    /// (§1.67, §1.66). See [`crate::tiff`].
+    /// (§1.67, §1.66). See [`crate::io::tiff`].
     #[error("unsupported TIFF feature: {0}")]
     UnsupportedTiffFeature(String),
 
@@ -176,7 +176,7 @@ pub enum IoError {
     /// A zlib or gzip stream could not be inflated. Upstream has no such error:
     /// `MET_PerformUncompression` returns `true` after printing "Uncompress
     /// failed" (metaUtils.cxx:883), leaving the caller's buffer uninitialised.
-    /// See [`crate::compression`] and ledger §4.75.
+    /// See [`crate::io::compression`] and ledger §4.75.
     #[error("corrupt compressed stream: {0}")]
     CorruptCompressedData(String),
 
@@ -188,7 +188,7 @@ pub enum IoError {
     #[error("invalid image path: {0}")]
     InvalidPath(PathBuf),
 
-    /// An extraction region set on [`ImageFileReader`](crate::ImageFileReader)
+    /// An extraction region set on [`ImageFileReader`](crate::io::ImageFileReader)
     /// is not contained in the file's region.
     #[error(
         "the requested extraction region (index {index:?}, size {size:?}) \
@@ -217,12 +217,12 @@ pub enum IoError {
 
     /// A core image error surfaced during assembly.
     #[error(transparent)]
-    Core(#[from] sitk_core::Error),
+    Core(#[from] crate::core::Error),
 
     /// A transform rejected the parameters read from a transform file, or a
     /// composite rejected a sub-transform of another dimension.
     #[error(transparent)]
-    Transform(#[from] sitk_transform::TransformError),
+    Transform(#[from] crate::transform::TransformError),
 
     /// The path's extension is not one an Insight legacy transform reader
     /// handles (`TxtTransformIO::CanReadFile` accepts only `.txt` and `.tfm`);
@@ -278,7 +278,7 @@ pub enum IoError {
     /// reads, because libhdf5 would convert the stored elements on the way out
     /// and [`rust_hdf5`] hands back the stored bytes — a big-endian parameter
     /// dataset, or a float element neither 4 nor 8 bytes wide.
-    /// See [`crate::transform_hdf5`] and ledger §4.81, §4.82.
+    /// See [`crate::io::transform_hdf5`] and ledger §4.81, §4.82.
     #[error("unsupported HDF5 transform file: {0}")]
     UnsupportedHdf5Transform(String),
 
@@ -295,7 +295,7 @@ pub enum IoError {
     /// libhdf5 would convert the stored elements on the way out where
     /// [`rust_hdf5`] hands back the stored bytes — a big-endian or bit-packed
     /// dataset — or because upstream would index out of bounds, as it does for
-    /// a non-square `Directions` matrix. See [`crate::image_hdf5`] and ledger
+    /// a non-square `Directions` matrix. See [`crate::io::image_hdf5`] and ledger
     /// §4.82, §4.89.
     #[error("unsupported HDF5 image: {0}")]
     UnsupportedHdf5Image(String),
@@ -303,7 +303,7 @@ pub enum IoError {
     /// The `itk::ImageIO` reported a pixel type SimpleITK cannot load.
     /// `ImageReaderBase::GetPixelIDFromImageIO` throws `"Unknown PixelType:
     /// <component>(<n>)"` (sitkImageReaderBase.cxx:236-238). Reachable from
-    /// [`crate::image_hdf5`], whose `ReadImageInformation` leaves the pixel
+    /// [`crate::io::image_hdf5`], whose `ReadImageInformation` leaves the pixel
     /// type `SCALAR` while setting a component count above one (ledger §3.47).
     #[error("unknown PixelType: {0}")]
     UnknownPixelType(String),
@@ -319,7 +319,7 @@ pub enum IoError {
     /// (`itkMatlabTransformIO.cxx:50-73`) ignores `vnl_matlab_readhdr::
     /// read_data`'s `bool` return, so a complex header leaves the stream
     /// desynchronized rather than raising an error; that has no stable,
-    /// reproducible semantics to match. See [`crate::transform_matlab`] and
+    /// reproducible semantics to match. See [`crate::io::transform_matlab`] and
     /// ledger §4.104.
     #[error("unsupported MATLAB transform feature: {0}")]
     UnsupportedMatlabTransformFeature(String),
@@ -334,7 +334,7 @@ pub enum IoError {
     /// component count is not 1 or 3, which upstream's `WriteSlice` accepts
     /// into an ill-defined `JCS_UNKNOWN` encoding with only a warning
     /// (itkJPEGImageIO.cxx:521-533) but `jpeg-encoder`'s typed `ColorType`
-    /// has no counterpart for. See [`crate::jpeg`] and ledger §4.
+    /// has no counterpart for. See [`crate::io::jpeg`] and ledger §4.
     #[error("unsupported JPEG feature: {0}")]
     UnsupportedJpegFeature(String),
 
@@ -370,7 +370,7 @@ pub enum IoError {
     /// component-type switch does not handle (`"Unhandled PixelFormat: ..."`,
     /// itkGDCMImageIO.cxx:502), a rescale that would overflow the output type
     /// (`"Pixel type larger than output type"`, `:544`), or a geometry element
-    /// GDCM reads past its declared values. See [`crate::dicom`].
+    /// GDCM reads past its declared values. See [`crate::io::dicom`].
     #[error("malformed DICOM image: {0}")]
     MalformedDicom(String),
 
@@ -380,7 +380,7 @@ pub enum IoError {
     /// whose geometry lives in a functional-groups sequence this port does not
     /// traverse (ledger §4.107); 12-bit-allocated pixels; or a photometric /
     /// bit-depth combination `GDCMImageIO` mishandles silently and this port
-    /// declines to reproduce. See [`crate::dicom`] and ledger §5.30.
+    /// declines to reproduce. See [`crate::io::dicom`] and ledger §5.30.
     #[error("unsupported DICOM feature: {0}")]
     UnsupportedDicomFeature(String),
 
@@ -454,9 +454,9 @@ pub enum IoError {
         expected: &'static str,
     },
 
-    /// A slice index passed to [`meta_data_keys`](crate::image_series_reader::ImageSeriesReader::meta_data_keys) /
-    /// [`has_meta_data_key`](crate::image_series_reader::ImageSeriesReader::has_meta_data_key) /
-    /// [`meta_data`](crate::image_series_reader::ImageSeriesReader::meta_data) is
+    /// A slice index passed to [`meta_data_keys`](crate::io::image_series_reader::ImageSeriesReader::meta_data_keys) /
+    /// [`has_meta_data_key`](crate::io::image_series_reader::ImageSeriesReader::has_meta_data_key) /
+    /// [`meta_data`](crate::io::image_series_reader::ImageSeriesReader::meta_data) is
     /// out of range for the dictionaries actually collected.
     /// `GetMetaDataKeysCustomCast::CustomCast` and its siblings index with
     /// `std::vector::at`, which throws `std::out_of_range`

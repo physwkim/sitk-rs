@@ -11,11 +11,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Complex, Image, PixelBuffer, PixelId, matrix};
+use crate::core::{Complex, Image, PixelBuffer, PixelId, matrix};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, reader_for};
-use crate::reader::{join_f64, normalize_reader_geometry};
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, reader_for};
+use crate::io::reader::{join_f64, normalize_reader_geometry};
 
 /// `SimpleITK_MAX_DIMENSION` (CMake `SimpleITK_MAX_DIMENSION_DEFAULT`), the
 /// ceiling `ImageSeriesReader::Execute` enforces on the promoted dimension
@@ -27,15 +27,15 @@ const SITK_MAX_DIMENSION: usize = 5;
 /// an `N`-dimensional one.
 ///
 /// ```no_run
-/// # use sitk_io::ImageSeriesReader;
+/// # use sitk::io::ImageSeriesReader;
 /// let mut reader = ImageSeriesReader::new();
 /// reader.set_file_names(&["slice0.png", "slice1.png", "slice2.png"]);
 /// let volume = reader.execute()?;
 /// assert_eq!(volume.dimension(), 3);
-/// # Ok::<(), sitk_io::IoError>(())
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 ///
-/// Every slice is read through the *same* [`ImageIo`](crate::ImageIo) —
+/// Every slice is read through the *same* [`ImageIo`](crate::io::ImageIo) —
 /// whichever one [`file_names`](ImageSeriesReader::set_file_names)`[0]`
 /// resolves to — even the "first" and "last" files used for geometry, which
 /// are a different file from `[0]` under [`ImageSeriesReader::reverse_order`].
@@ -47,7 +47,7 @@ const SITK_MAX_DIMENSION: usize = 5;
 /// upstream would.
 ///
 /// `SetOutputPixelType` and `SetImageIO` are not exposed, matching
-/// [`crate::ImageFileReader`]'s own scope (ledger §4): this crate has no
+/// [`crate::io::ImageFileReader`]'s own scope (ledger §4): this crate has no
 /// pixel-casting layer, and every slice must already share the pixel type
 /// [`ImageSeriesReader::execute`] deduces from the first file.
 #[derive(Clone, Debug)]
@@ -95,7 +95,7 @@ impl ImageSeriesReader {
     /// gates `itkWarningMacro`'s non-uniform-sampling warning
     /// (itkImageSeriesReader.hxx:486-490), and this crate has no logging
     /// infrastructure to emit it, matching the established convention
-    /// elsewhere in this crate (e.g. [`crate::dicom_orient`](crate) and
+    /// elsewhere in this crate (e.g. [`crate::io::dicom_orient`](crate) and
     /// `threshold.rs`'s dropped warnings).
     pub fn set_spacing_warning_rel_threshold(&mut self, threshold: f64) -> &mut Self {
         self.spacing_warning_rel_threshold = threshold;
@@ -599,7 +599,11 @@ fn pad_axes(
 /// the per-slice [`Image`] reads, which are what the collected dictionaries
 /// copy.
 fn normalize_info_geometry(info: &mut ImageInformation) {
-    crate::reader::flip_negative_spacing(info.dimension, &mut info.spacing, &mut info.direction);
+    crate::io::reader::flip_negative_spacing(
+        info.dimension,
+        &mut info.spacing,
+        &mut info.direction,
+    );
 }
 
 fn padded_info_geometry(
@@ -780,7 +784,7 @@ fn place_slice(
 }
 
 /// Wrap a completed component buffer into an [`Image`], dispatching on
-/// scalar / vector / complex exactly as [`crate::nrrd`]'s `build_image` does:
+/// scalar / vector / complex exactly as [`crate::io::nrrd`]'s `build_image` does:
 /// `Image::assemble` is private, so a complex image is built through
 /// `from_vec_complex` and then given its geometry.
 fn assemble_image(
@@ -826,7 +830,7 @@ fn assemble_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write_image;
+    use crate::io::write_image;
 
     fn tmp_dir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

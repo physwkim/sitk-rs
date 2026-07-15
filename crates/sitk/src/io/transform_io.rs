@@ -16,8 +16,8 @@
 //!
 //! Only the `double` precision variant exists here, matching SimpleITK, which
 //! instantiates `TransformFileReader`/`Writer` on `double` alone. `.h5` /
-//! `.hdf5` live in [`crate::transform_hdf5`] and MATLAB `.mat` in
-//! [`crate::transform_matlab`]; [`read_transform`] and [`write_transform`]
+//! `.hdf5` live in [`crate::io::transform_hdf5`] and MATLAB `.mat` in
+//! [`crate::io::transform_matlab`]; [`read_transform`] and [`write_transform`]
 //! dispatch to both.
 //!
 //! # Fidelity notes
@@ -36,7 +36,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use sitk_transform::{
+use crate::transform::{
     AffineTransform, BSplineTransform, ComposeScaleSkewVersor3DTransform, CompositeTransform,
     DisplacementFieldTransform, Euler2DTransform, Euler3DTransform, ParametricTransform,
     ScaleLogarithmicTransform, ScaleSkewVersor3DTransform, ScaleTransform, ScaleVersor3DTransform,
@@ -44,9 +44,9 @@ use sitk_transform::{
     VersorRigid3DTransform, VersorTransform,
 };
 
-use crate::error::{IoError, Result};
-use crate::transform_hdf5;
-use crate::transform_matlab;
+use crate::io::error::{IoError, Result};
+use crate::io::transform_hdf5;
+use crate::io::transform_matlab;
 
 /// How deep `ComponentTransformFile:` references may nest before the reader
 /// gives up. ITK has no such limit and recurses until the C++ stack is
@@ -455,8 +455,8 @@ fn read_component_file(master: &Path, value: &str, depth: usize) -> Result<Trans
 ///
 /// `TransformIOFactory::CreateTransformIO` polls every registered IO's
 /// `CanReadFile` in registration order. Three are ported: the Insight legacy
-/// text IO and [`crate::transform_matlab`], both extension-based, and
-/// [`crate::transform_hdf5`], which looks at the *content* alone. This port
+/// text IO and [`crate::io::transform_matlab`], both extension-based, and
+/// [`crate::io::transform_hdf5`], which looks at the *content* alone. This port
 /// asks the text IO first, then Matlab, then HDF5, so an HDF5 file misnamed
 /// `.tfm` is parsed as text and fails, where ITK's answer depends on its
 /// factory registration order (ledger §4.80).
@@ -510,11 +510,11 @@ fn can_handle(path: &Path) -> bool {
 /// `sitkExceptionMacro`.
 ///
 /// ```no_run
-/// use sitk_transform::TransformBase;
+/// use sitk::transform::TransformBase;
 ///
-/// let transform = sitk_io::read_transform("affine.tfm")?;
+/// let transform = sitk::io::read_transform("affine.tfm")?;
 /// println!("{}", transform.dimension());
-/// # Ok::<(), sitk_io::IoError>(())
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 pub fn read_transform<P: AsRef<Path>>(path: P) -> Result<Transform> {
     let path = path.as_ref();
@@ -555,8 +555,8 @@ fn print_vector(out: &mut String, values: &[f64]) {
 /// Write a transform to an Insight legacy transform file (`.tfm` / `.txt`) —
 /// `itk::simple::WriteTransform` (`sitkTransform.cxx:731-737`) over
 /// `TxtTransformIOTemplate::Write` (`itkTxtTransformIO.cxx:242-296`) — to a
-/// MATLAB one (`.mat`, see [`crate::transform_matlab`]), or to an HDF5 one,
-/// for the eight extensions [`crate::transform_hdf5`] claims.
+/// MATLAB one (`.mat`, see [`crate::io::transform_matlab`]), or to an HDF5 one,
+/// for the eight extensions [`crate::io::transform_hdf5`] claims.
 ///
 /// A [`CompositeTransform`] is written as a `CompositeTransform` line with no
 /// parameters, followed by each of its sub-transforms in queue order — the
@@ -565,11 +565,11 @@ fn print_vector(out: &mut String, values: &[f64]) {
 /// `"Composite Transform can only be 1st transform in a file"`.
 ///
 /// ```no_run
-/// use sitk_transform::{Transform, TranslationTransform};
+/// use sitk::transform::{Transform, TranslationTransform};
 ///
 /// let transform: Transform = TranslationTransform::new(vec![1.0, 2.0]).into();
-/// sitk_io::write_transform(&transform, "translation.tfm")?;
-/// # Ok::<(), sitk_io::IoError>(())
+/// sitk::io::write_transform(&transform, "translation.tfm")?;
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 pub fn write_transform<P: AsRef<Path>>(transform: &Transform, path: P) -> Result<()> {
     let path = path.as_ref();
@@ -1068,7 +1068,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(IoError::Transform(
-                sitk_transform::TransformError::InvalidParameters {
+                crate::transform::TransformError::InvalidParameters {
                     got: 1,
                     expected: 2
                 }

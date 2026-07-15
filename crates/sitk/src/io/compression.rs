@@ -46,7 +46,7 @@
 //! way (compression is inherent to the format), so `m_UseCompression = false`
 //! — SimpleITK's default — leaves libpng/zlib at their own built-in default,
 //! `Z_DEFAULT_COMPRESSION` (6), not at `m_CompressionLevel`'s `4`. Only a
-//! caller that turns compression on ever sees the `4`. See [`crate::png`].
+//! caller that turns compression on ever sees the `4`. See [`crate::io::png`].
 
 use std::io::{Read, Write};
 
@@ -55,7 +55,7 @@ use flate2::GzBuilder;
 use flate2::read::{GzDecoder, MultiGzDecoder, ZlibDecoder};
 use flate2::write::ZlibEncoder;
 
-use crate::error::{IoError, Result};
+use crate::io::error::{IoError, Result};
 
 /// `itk::ImageIOBase`'s clamp floor for `CompressionLevel`
 /// (itkImageIOBase.h:288).

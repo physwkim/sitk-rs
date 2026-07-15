@@ -126,7 +126,7 @@
 //!   (ledger §4.62).
 //! * `NiftiImageIO::Read`'s streaming sub-region path
 //!   (`nifti_read_subregion_image`); [`read`] always loads the whole image, as
-//!   [`crate::meta_image::read`] does.
+//!   [`crate::io::meta_image::read`] does.
 //! * `SetLegacyAnalyze75Mode` / `SetUseLegacyModeForTwoFileWriting`: SimpleITK
 //!   exposes neither, so only the compiled-in defaults
 //!   (`Analyze75Flavor::AnalyzeITK4Warning`, two-file writing as NIfTI-1 `ni1`)
@@ -140,14 +140,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Complex, Image, PixelBuffer, PixelId};
+use crate::core::{Complex, Image, PixelBuffer, PixelId};
 
-use crate::compression::{
+use crate::io::compression::{
     ZLIB_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gunzip_transparent_prefix, gzip_compress,
 };
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 // ---------------------------------------------------------------------------
 // nifti1.h constants
@@ -2350,7 +2350,7 @@ fn convert_ras_xyztc(buf: &mut [u8], component: PixelId, size: usize) {
 /// `NiftiImageIO::Read` (itkNiftiImageIO.cxx:292-584) reads a sub-region when
 /// the requested `ImageIORegion` is smaller than the file's; this port always
 /// takes the whole-block path, since [`ImageIo::read`] has no region parameter
-/// and [`crate::ImageFileReader`] extracts after the fact.
+/// and [`crate::io::ImageFileReader`] extracts after the fact.
 pub fn read(path: &Path) -> Result<Image> {
     let info = read_info(path)?;
     let nim = &info.nim;
@@ -3119,7 +3119,7 @@ impl ImageIo for NiftiImageIo {
     /// Note that `is_nifti_file` resolves the *header* file itself
     /// (`nifti_findhdrname`), so `can_read_file("brain")` is true when
     /// `brain.nii` exists — the extension is a hint, never a requirement, which
-    /// is the opposite of [`crate::meta_image::MetaImageIo`]'s behaviour.
+    /// is the opposite of [`crate::io::meta_image::MetaImageIo`]'s behaviour.
     fn can_read_file(&self, path: &Path) -> bool {
         is_nifti_file(path) >= 0
     }

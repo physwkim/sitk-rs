@@ -4,7 +4,7 @@
 //! # Geometry normalization
 //!
 //! Both read entry points — [`ImageFileReader::execute`] and the free
-//! [`crate::read_image`] — pass the raw image an `ImageIo` returns through
+//! [`crate::io::read_image`] — pass the raw image an `ImageIo` returns through
 //! [`normalize_reader_geometry`], the port of `itk::ImageFileReader`'s own
 //! post-read block (`itkImageFileReader.hxx:216-239`). Each `ImageIo` reports
 //! the file's raw geometry; the reader flips any negative spacing component
@@ -15,16 +15,16 @@
 
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Image, PixelBuffer, matrix};
+use crate::core::{Image, PixelBuffer, matrix};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, reader_for};
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, reader_for};
 
 /// Read an image file, optionally extracting a sub-region, and expose the
 /// file's header information without loading pixels.
 ///
 /// ```no_run
-/// # use sitk_io::ImageFileReader;
+/// # use sitk::io::ImageFileReader;
 /// let mut reader = ImageFileReader::new();
 /// reader.set_file_name("volume.mha");
 ///
@@ -34,7 +34,7 @@ use crate::image_io::{ImageInformation, reader_for};
 ///
 /// // A 2-D slice out of the 3-D file: the zero-size axis collapses.
 /// reader.set_extract_size(&[0, 0, 0]);
-/// # Ok::<(), sitk_io::IoError>(())
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct ImageFileReader {
@@ -178,7 +178,7 @@ impl ImageFileReader {
     /// retained physical components of the full `TransformIndexToPhysicalPoint`
     /// so an oblique slice `k` lands at its true world corner — lives in the
     /// direction-preserving `ExtractImageFilter` path
-    /// (`sitk_filters::geometry::extract`), which keeps the oblique submatrix
+    /// (`crate::filters::geometry::extract`), which keeps the oblique submatrix
     /// and so has a coherent frame to be correct in.
     pub fn execute(&mut self) -> Result<Image> {
         let io = reader_for(&self.file_name)?;
@@ -362,8 +362,8 @@ pub(crate) fn normalize_reader_geometry(image: &mut Image) -> Result<()> {
 /// physical geometry unchanged.
 ///
 /// [`normalize_reader_geometry`] applies this to a full [`Image`]; the series
-/// reader ([`crate::ImageSeriesReader`]) applies it to the raw
-/// [`ImageInformation`](crate::image_io::ImageInformation) geometry it derives
+/// reader ([`crate::io::ImageSeriesReader`]) applies it to the raw
+/// [`ImageInformation`](crate::io::image_io::ImageInformation) geometry it derives
 /// its inter-slice spacing/direction from, which upstream reads through the
 /// same `ImageFileReader` and so sees already-normalized
 /// (itkImageSeriesReader.hxx:120-122).
@@ -380,7 +380,7 @@ pub(crate) fn flip_negative_spacing(dim: usize, spacing: &mut [f64], direction: 
 
 /// Space-separated shortest-round-trip decimals, the string form the reader
 /// stores the `ITK_original_*` geometry under. Shared with the series reader
-/// ([`crate::ImageSeriesReader`]) so its padded per-slice originals format
+/// ([`crate::io::ImageSeriesReader`]) so its padded per-slice originals format
 /// byte-identically to the single-file path's.
 pub(crate) fn join_f64(values: &[f64]) -> String {
     values

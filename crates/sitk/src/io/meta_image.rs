@@ -7,7 +7,7 @@
 //! Phase-0 format for exercising the whole core model without pulling in an
 //! external image crate.
 //!
-//! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::ImageIo)
+//! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::io::ImageIo)
 //! implementor; [`read`] and [`write`] are its free-function core.
 //!
 //! # Channels: scalar, vector, and complex
@@ -92,7 +92,7 @@
 //! wrapper (metaUtils.cxx:808). Reading goes through
 //! `MET_PerformUncompression`'s `inflateInit2(&d, 47)`, which auto-detects zlib
 //! *and* gzip, so a gzip payload also reads (metaUtils.cxx:862). See
-//! [`crate::compression`].
+//! [`crate::io::compression`].
 //!
 //! `CompressedDataSize` tells the reader how many bytes to hand to inflate. It
 //! is written whenever it is non-zero (metaObject.cxx:1427-1432), so every
@@ -111,12 +111,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Image, PixelBuffer, PixelId};
+use crate::core::{Image, PixelBuffer, PixelId};
 
-use crate::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, inflate_auto, zlib_compress};
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, inflate_auto, zlib_compress};
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 /// Every header field name MetaIO registers for reading, in registration order:
 /// `MetaObject::M_SetupReadFields` (metaObject.cxx:1204-1306) followed by
@@ -746,7 +746,7 @@ fn uncompress_elements(source: &[u8], declared: Option<u64>, want: usize) -> Res
 /// consequence this has for a complex image.
 ///
 /// `0` channels is rejected: [`Image::from_parts_vector`] refuses zero
-/// components per pixel ([`sitk_core::Error::InvalidComponentCount`]), and a
+/// components per pixel ([`crate::core::Error::InvalidComponentCount`]), and a
 /// channel count the file's actual data is too short for is rejected as
 /// [`IoError::TruncatedData`].
 ///

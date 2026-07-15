@@ -185,11 +185,11 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use sitk_core::{Image, PixelBuffer, PixelId};
+use crate::core::{Image, PixelBuffer, PixelId};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 /// The first two header lines `WriteImageInformation` emits, verbatim.
 const HEADER_PREAMBLE: &str = "# vtk DataFile Version 3.0\n\
@@ -1076,7 +1076,11 @@ impl ImageIo for VtkImageIo {
     /// than four lines throws out of `ImageIOFactory::CreateImageIO`; here it is
     /// simply not claimed (§4.71).
     fn can_read_file(&self, path: &Path) -> bool {
-        if !crate::image_io::has_supported_extension(path, self.supported_read_extensions(), true) {
+        if !crate::io::image_io::has_supported_extension(
+            path,
+            self.supported_read_extensions(),
+            true,
+        ) {
             return false;
         }
         let Ok(file) = std::fs::File::open(path) else {

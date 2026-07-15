@@ -222,7 +222,7 @@
 //! encoder at all, and its `Deflate` writes only the modern tag `8`, never
 //! upstream's legacy tag `32946`; see [`TiffCompressor`]). Those three are
 //! now reachable through [`WriteOptions::compressor`] /
-//! [`ImageFileWriter::set_compressor`](crate::writer::ImageFileWriter::set_compressor),
+//! [`ImageFileWriter::set_compressor`](crate::io::writer::ImageFileWriter::set_compressor),
 //! gated by [`WriteOptions::use_compression`] exactly as upstream gates
 //! `m_Compression` on `m_UseCompression` (`:692-716`). `None` (the default)
 //! keeps the prior behaviour: `COMPRESSION_NONE` ↔ `COMPRESSION_PACKBITS`.
@@ -275,16 +275,16 @@ use std::io::{BufReader, BufWriter, Seek, Write};
 use std::marker::PhantomData;
 use std::path::Path;
 
-use sitk_core::{Image, PixelBuffer, PixelId};
+use crate::core::{Image, PixelBuffer, PixelId};
 use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult};
 use tiff::encoder::colortype::ColorType as EncoderColorType;
 use tiff::encoder::{Compression, DeflateLevel, Rational, TiffEncoder, TiffKind, TiffValue};
 use tiff::tags::{ExtraSamples, PhotometricInterpretation, ResolutionUnit, SampleFormat, Tag};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo, has_supported_extension};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo, has_supported_extension};
+use crate::io::writer::WriteOptions;
 
 /// `TIFFTAG_PAGENUMBER`, which `tiff::tags::Tag` has no variant for.
 const TAG_PAGE_NUMBER: Tag = Tag::from_u16_exhaustive(297);

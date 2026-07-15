@@ -1,7 +1,7 @@
 //! HDF5 image files (`.h5`, `.hdf5`, and six more extensions) — a port of
 //! `itk::HDF5ImageIO` (`Modules/IO/HDF5/src/itkHDF5ImageIO.cxx`), reached
-//! through [`crate::read_image`] / [`crate::write_image`] once
-//! [`crate::create_image_io`] picks the IO.
+//! through [`crate::io::read_image`] / [`crate::io::write_image`] once
+//! [`crate::io::create_image_io`] picks the IO.
 //!
 //! The on-disk layout, from `WriteImageInformation` (`:1114-1204`) and the
 //! class comment (`itkHDF5ImageIO.h:56-81`), with `N` the image dimension:
@@ -34,7 +34,7 @@
 //! *column* `i` of the direction matrix — "direction cosines are stored as
 //! columns of the direction matrix" (`itkImageFileReader.hxx:180-183`,
 //! `itkImageFileWriter.hxx:188-194`). The dataset is the transpose of the
-//! row-major matrix [`sitk_core::Image::direction`] returns.
+//! row-major matrix [`crate::core::Image::direction`] returns.
 //!
 //! # `VoxelType` is written and never read
 //!
@@ -90,14 +90,14 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::path::Path;
 
+use crate::core::{Image, PixelBuffer, PixelId};
 use rust_hdf5::{ByteOrder, DatatypeMessage, H5Dataset, H5File, H5Group};
-use sitk_core::{Image, PixelBuffer, PixelId};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::nrrd::c_format_g;
-use crate::transform_hdf5::{HDF_VERSION, ITK_VERSION};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::nrrd::c_format_g;
+use crate::io::transform_hdf5::{HDF_VERSION, ITK_VERSION};
+use crate::io::writer::WriteOptions;
 
 /// `ImageGroup` (`itkHDF5ImageIO.cxx:64`), without the leading `/` that
 /// `rust-hdf5` strips from every stored link path.
@@ -283,7 +283,7 @@ impl Header {
 /// it names a group, so a *dataset* called `/ITKImage` makes `CanReadFile`
 /// answer yes and the following `ReadImageInformation` throw. That is
 /// reproduced here (ledger §2.131), and it is where this IO parts company with
-/// [`crate::transform_hdf5::can_read_file`], which consults `openGroup` and so
+/// [`crate::io::transform_hdf5::can_read_file`], which consults `openGroup` and so
 /// declines (ledger §2.123).
 pub fn can_read_file(path: &Path) -> bool {
     let Ok(file) = H5File::open(path) else {
@@ -857,8 +857,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::image_io::{FileMode, create_image_io};
-    use crate::{read_image, write_image};
+    use crate::io::image_io::{FileMode, create_image_io};
+    use crate::io::{read_image, write_image};
 
     /// A path no other test in this crate shares. `H5File::create` truncates,
     /// so no test needs to remove its file first.

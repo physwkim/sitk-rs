@@ -5,30 +5,30 @@
 
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Complex, Image, PixelBuffer, PixelId, matrix};
+use crate::core::{Complex, Image, PixelBuffer, PixelId, matrix};
 
-use crate::error::{IoError, Result};
-use crate::image_io::{image_io_by_name, registered_image_ios, writer_for};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{image_io_by_name, registered_image_ios, writer_for};
+use crate::io::writer::WriteOptions;
 
 /// Slice a 3-D image into `size()[2]` numbered 2-D files.
 ///
 /// ```no_run
-/// # use sitk_core::{Image, PixelId};
-/// # use sitk_io::ImageSeriesWriter;
+/// # use sitk::core::{Image, PixelId};
+/// # use sitk::io::ImageSeriesWriter;
 /// let image = Image::new(&[4, 4, 3], PixelId::UInt8);
 /// let mut writer = ImageSeriesWriter::new();
 /// writer.set_file_names(&["s0.mha", "s1.mha", "s2.mha"]);
 /// writer.execute(&image)?;
-/// # Ok::<(), sitk_io::IoError>(())
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 ///
 /// Only a 3-D image is accepted: `ImageSeriesWriter` dispatches through the
-/// same `MemberFunctionFactory` machinery as [`crate::ImageFileWriter`], but
+/// same `MemberFunctionFactory` machinery as [`crate::io::ImageFileWriter`], but
 /// registers only dimension 3 (sitkImageSeriesWriter.cxx:43-55) — see
 /// [`ImageSeriesWriter::execute`].
 ///
-/// `SetCompressor` is not exposed, matching [`crate::ImageFileWriter`]'s own
+/// `SetCompressor` is not exposed, matching [`crate::io::ImageFileWriter`]'s own
 /// scope decision (ledger §6): the empty string — which resolves to each
 /// format's own default compressor — is the only setting this port
 /// implements.
@@ -91,7 +91,7 @@ impl ImageSeriesWriter {
         self.options.compression_level
     }
 
-    /// Override the automatically detected [`ImageIo`](crate::ImageIo) by
+    /// Override the automatically detected [`ImageIo`](crate::io::ImageIo) by
     /// class name. `None` (the default) restores automatic detection from the
     /// first file name.
     ///
@@ -109,7 +109,7 @@ impl ImageSeriesWriter {
         self.image_io_name.as_deref()
     }
 
-    /// The class names of every registered [`ImageIo`](crate::ImageIo) —
+    /// The class names of every registered [`ImageIo`](crate::io::ImageIo) —
     /// `GetRegisteredImageIOs` (sitkImageSeriesWriter.h:65-68).
     pub fn registered_image_ios(&self) -> Vec<&'static str> {
         registered_image_ios()
@@ -125,7 +125,7 @@ impl ImageSeriesWriter {
     ///
     /// 1. `image.dimension() != 3` —
     ///    [`IoError::SeriesWriterUnsupportedDimension`], the same
-    ///    `MemberFunctionFactory` rejection [`crate::ImageFileWriter`] would
+    ///    `MemberFunctionFactory` rejection [`crate::io::ImageFileWriter`] would
     ///    hit for an unregistered pixel type/dimension pair
     ///    (sitkMemberFunctionFactory.hxx).
     /// 2. no file names — [`IoError::EmptySeriesWriterFileNames`].
@@ -167,8 +167,8 @@ impl ImageSeriesWriter {
     /// slices), `ITK_NumberOfDimensions` (`3`, constant), and `ITK_ZDirection`
     /// (the full 3x3 direction matrix, *transposed*) —
     /// itkImageSeriesWriter.hxx:293-333. Most of this crate's `ImageIo`
-    /// writers do not persist a dictionary at all (see [`crate::meta_image`]);
-    /// [`crate::image_hdf5`] is the one format here that round-trips it.
+    /// writers do not persist a dictionary at all (see [`crate::io::meta_image`]);
+    /// [`crate::io::image_hdf5`] is the one format here that round-trips it.
     pub fn execute(&self, image: &Image) -> Result<()> {
         if image.dimension() != 3 {
             return Err(IoError::SeriesWriterUnsupportedDimension {
@@ -223,7 +223,7 @@ impl ImageSeriesWriter {
 
     /// `Execute(image, fileNames, useCompression, compressionLevel)`
     /// (sitkImageSeriesWriter.cxx:188-198). As with
-    /// [`crate::ImageFileWriter::execute_with`], upstream's overload sets
+    /// [`crate::io::ImageFileWriter::execute_with`], upstream's overload sets
     /// `SetFileNames` / `SetUseCompression` / `SetCompressionLevel` on `this`
     /// and then calls the one-argument `Execute` — so all three persist.
     pub fn execute_with<P: AsRef<Path>>(
@@ -366,8 +366,8 @@ fn extract_slice_buffer(image: &Image, slice: usize) -> PixelBuffer {
 }
 
 /// Wrap a completed component buffer into an [`Image`], dispatching on
-/// scalar / vector / complex exactly as [`crate::image_series_reader`]'s own
-/// `assemble_image` does (itself matching [`crate::nrrd`]'s `build_image`):
+/// scalar / vector / complex exactly as [`crate::io::image_series_reader`]'s own
+/// `assemble_image` does (itself matching [`crate::io::nrrd`]'s `build_image`):
 /// `Image::assemble` is private, so a complex image is built through
 /// `from_vec_complex` and then given its geometry.
 fn assemble_2d_image(
@@ -413,7 +413,7 @@ fn assemble_2d_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::read_image;
+    use crate::io::read_image;
 
     fn tmp_dir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

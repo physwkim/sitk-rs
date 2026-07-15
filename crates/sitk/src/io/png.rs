@@ -21,7 +21,7 @@
 //! [`Transformations::EXPAND`] does exactly `png_set_palette_to_rgb` +
 //! `png_set_expand_gray_1_2_4_to_8` + `png_set_tRNS_to_alpha` in one flag. The
 //! `m_IsReadAsScalarPlusPalette` / `m_ColorPalette` path is not implemented —
-//! unreachable through this crate's [`ImageFileReader`](crate::ImageFileReader).
+//! unreachable through this crate's [`ImageFileReader`](crate::io::ImageFileReader).
 //! Ledger §4.84.
 //!
 //! # Pixel types: a 2-channel PNG, unrepresentable through SimpleITK, is implemented here
@@ -70,7 +70,7 @@
 //! way, so turning compression "off" does not skip deflating, it only skips
 //! *choosing a level*, leaving libpng/zlib at their own built-in default
 //! (`Z_DEFAULT_COMPRESSION`, 6) rather than at `PNGImageIO`'s own constructed
-//! default of 4 (`:271-272`). See [`crate::compression`] and ledger §3.46.
+//! default of 4 (`:271-272`). See [`crate::io::compression`] and ledger §3.46.
 //! [`write`] reproduces this: `options.use_compression` gates whether
 //! [`Encoder::set_deflate_compression`] is called at all — left alone, the
 //! `png` crate's own default is `DeflateCompression::Level(6)`
@@ -136,13 +136,13 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 
+use crate::core::{Image, PixelBuffer, PixelId};
 use png::{BitDepth, ColorType, Decoder, DeflateCompression, Encoder, Reader, Transformations};
-use sitk_core::{Image, PixelBuffer, PixelId};
 
-use crate::compression::PNG_DEFAULT_COMPRESSION_LEVEL;
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo, has_supported_extension};
-use crate::writer::WriteOptions;
+use crate::io::compression::PNG_DEFAULT_COMPRESSION_LEVEL;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo, has_supported_extension};
+use crate::io::writer::WriteOptions;
 
 /// `png_sig_cmp`'s eight-byte signature (itkPNGImageIO.cxx:79-89).
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];

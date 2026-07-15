@@ -57,6 +57,7 @@ pub mod writer;
 
 use std::path::Path;
 
+use crate::core::Image;
 pub use error::{IoError, Result};
 pub use image_io::{
     FileMode, ImageInformation, ImageIo, create_image_io, image_io_by_name, registered_image_ios,
@@ -65,7 +66,6 @@ pub use image_io::{
 pub use image_series_reader::ImageSeriesReader;
 pub use image_series_writer::ImageSeriesWriter;
 pub use reader::ImageFileReader;
-use sitk_core::Image;
 pub use transform_io::{read_transform, write_transform};
 pub use writer::{ImageFileWriter, WriteOptions};
 
@@ -118,7 +118,7 @@ pub fn write_image_with<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sitk_core::{Complex, Image, PixelId};
+    use crate::core::{Complex, Image, PixelId};
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -366,7 +366,7 @@ mod tests {
     }
 
     /// `ElementNumberOfChannels = 0` is meaningless for every pixel category
-    /// and is rejected via [`sitk_core::Error::InvalidComponentCount`]
+    /// and is rejected via [`crate::core::Error::InvalidComponentCount`]
     /// ([`Image::from_parts_vector`]'s zero-component guard), not silently
     /// coerced to `1`.
     #[test]
@@ -1805,7 +1805,7 @@ mod tests {
 
     /// A gzipped NIfTI is claimed by the registry and round-trips. Compression
     /// follows the `.gz` name, never `WriteOptions` — see
-    /// [`crate::nifti::write`] and `tests/compression.rs` for the rest.
+    /// [`crate::io::nifti::write`] and `tests/compression.rs` for the rest.
     #[test]
     fn nii_gz_is_recognised_and_round_trips() {
         let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
@@ -3291,7 +3291,7 @@ mod tests {
         let path = tmp_path("int64.gipl.gz");
         let result = write_image(&img, &path);
         let written =
-            crate::compression::gunzip_transparent(&std::fs::read(&path).unwrap()).unwrap();
+            crate::io::compression::gunzip_transparent(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert!(
@@ -3302,7 +3302,7 @@ mod tests {
     }
 
     /// `CheckExtension` claims `.gipl.gz` for reading and writing, and `write`
-    /// now compresses through [`crate::compression`] instead of refusing
+    /// now compresses through [`crate::io::compression`] instead of refusing
     /// (ledger §4.68, closed).
     #[test]
     fn gipl_gz_is_recognised_and_round_trips() {
@@ -3409,7 +3409,7 @@ mod tests {
     fn gipl_gz_reads_a_hand_built_stored_block_gzip_stream() {
         let mut bytes = gipl_header([2, 2, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
         bytes.extend_from_slice(&[7, 8, 9, 10]);
-        let fixture = crate::compression::stored_block_gzip(&bytes);
+        let fixture = crate::io::compression::stored_block_gzip(&bytes);
 
         let path = tmp_path("fixture.gipl.gz");
         std::fs::write(&path, &fixture).unwrap();
@@ -3427,7 +3427,7 @@ mod tests {
     fn gipl_gz_truncated_pixel_data_is_an_error() {
         let mut bytes = gipl_header([4, 4, 1, 1], 8, [1.0; 4], [0.0; 4], gipl::GIPL_MAGIC_NUMBER);
         bytes.extend_from_slice(&[1, 2, 3]); // 16 pixels declared, 3 present
-        let fixture = crate::compression::stored_block_gzip(&bytes);
+        let fixture = crate::io::compression::stored_block_gzip(&bytes);
 
         let path = tmp_path("gz_short.gipl.gz");
         std::fs::write(&path, &fixture).unwrap();
@@ -4931,7 +4931,7 @@ mod tests {
     /// Fixed §3.51: `SetCompressor("PACKBITS")` with no explicit
     /// [`ImageFileWriter::set_compressor`] call is upstream's own default
     /// (itkTIFFImageIO.cxx:214, :260-266), so leaving
-    /// [`TiffCompressor`](crate::tiff::TiffCompressor) unset must write
+    /// [`TiffCompressor`](crate::io::tiff::TiffCompressor) unset must write
     /// byte-identical output to selecting `PackBits` explicitly.
     #[test]
     fn tiff_explicit_packbits_compressor_matches_the_bare_use_compression_default() {
@@ -4946,7 +4946,7 @@ mod tests {
         writer
             .set_file_name(&explicit)
             .use_compression_on()
-            .set_compressor(Some(crate::tiff::TiffCompressor::PackBits));
+            .set_compressor(Some(crate::io::tiff::TiffCompressor::PackBits));
         writer.execute(&img).unwrap();
 
         let a = std::fs::read(&implicit).unwrap();
@@ -4974,7 +4974,7 @@ mod tests {
         writer
             .set_file_name(&compressed)
             .use_compression_on()
-            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+            .set_compressor(Some(crate::io::tiff::TiffCompressor::Lzw));
         writer.execute(&img).unwrap();
 
         let plain_len = std::fs::metadata(&plain).unwrap().len();
@@ -5007,7 +5007,7 @@ mod tests {
         writer
             .set_file_name(&compressed)
             .use_compression_on()
-            .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+            .set_compressor(Some(crate::io::tiff::TiffCompressor::Deflate));
         writer.execute(&img).unwrap();
 
         let plain_len = std::fs::metadata(&plain).unwrap().len();
@@ -5044,7 +5044,7 @@ mod tests {
                 .set_file_name(&path)
                 .use_compression_on()
                 .set_compression_level(level)
-                .set_compressor(Some(crate::tiff::TiffCompressor::Deflate));
+                .set_compressor(Some(crate::io::tiff::TiffCompressor::Deflate));
             writer.execute(&img).unwrap();
             let back = read_image(&path).unwrap();
             assert_eq!(back.scalar_slice::<u8>().unwrap(), data.as_slice());
@@ -5089,7 +5089,7 @@ mod tests {
         writer
             .set_file_name(&gated_off)
             .use_compression_off()
-            .set_compressor(Some(crate::tiff::TiffCompressor::Lzw));
+            .set_compressor(Some(crate::io::tiff::TiffCompressor::Lzw));
         writer.execute(&img).unwrap();
 
         let a = std::fs::read(&plain).unwrap();

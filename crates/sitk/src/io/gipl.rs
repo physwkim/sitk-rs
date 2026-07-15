@@ -116,7 +116,7 @@
 //! `.gipl.gz` is handled upstream by a `gzFile`: `CanReadFile` seeks through it
 //! to the magic number (`:143-174`), `ReadImageInformation`/`Read` walk it
 //! field by field with `gzread` (`:251-585`, `:210-243`), and `Write` walks it
-//! with `gzwrite` (`:669-1044`). This port reuses [`crate::compression`]'s gzip
+//! with `gzwrite` (`:669-1044`). This port reuses [`crate::io::compression`]'s gzip
 //! door instead of a `gzFile`: [`read`] and [`read_information`] decompress
 //! with `gunzip_transparent`/`gunzip_transparent_prefix` before parsing exactly
 //! as the uncompressed path does, and [`write`] compresses the same bytes the
@@ -155,14 +155,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use sitk_core::{Image, PixelBuffer, PixelId};
+use crate::core::{Image, PixelBuffer, PixelId};
 
-use crate::compression::{
+use crate::io::compression::{
     ZLIB_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gunzip_transparent_prefix, gzip_compress,
 };
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 /// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write`] emits.
 pub const GIPL_MAGIC_NUMBER: u32 = 0xefff_e9b0;

@@ -3,15 +3,15 @@
 
 use std::path::{Path, PathBuf};
 
-use sitk_core::Image;
+use crate::core::Image;
 
-use crate::compression::{MAX_COMPRESSION_LEVEL, MIN_COMPRESSION_LEVEL};
-use crate::error::Result;
-use crate::image_io::{image_io_by_name, registered_image_ios, writer_for};
-use crate::tiff::TiffCompressor;
+use crate::io::compression::{MAX_COMPRESSION_LEVEL, MIN_COMPRESSION_LEVEL};
+use crate::io::error::Result;
+use crate::io::image_io::{image_io_by_name, registered_image_ios, writer_for};
+use crate::io::tiff::TiffCompressor;
 
 /// The compression knobs SimpleITK's writer hands to `itk::ImageIOBase`, as
-/// one value, because this crate's [`ImageIo`](crate::ImageIo) implementors
+/// one value, because this crate's [`ImageIo`](crate::io::ImageIo) implementors
 /// are stateless singletons in a static registry where upstream's are
 /// per-write objects carrying `m_UseCompression` / `m_CompressionLevel` (and,
 /// for TIFF, `m_Compressor`).
@@ -64,16 +64,16 @@ impl WriteOptions {
 }
 
 /// Write an image, choosing the format by file name or by an explicit
-/// [`ImageIo`](crate::ImageIo) name.
+/// [`ImageIo`](crate::io::ImageIo) name.
 ///
 /// ```no_run
-/// # use sitk_core::{Image, PixelId};
-/// # use sitk_io::ImageFileWriter;
+/// # use sitk::core::{Image, PixelId};
+/// # use sitk::io::ImageFileWriter;
 /// # let image = Image::new(&[4, 4], PixelId::UInt8);
 /// let mut writer = ImageFileWriter::new();
 /// writer.set_file_name("out.mha").set_use_compression(true);
 /// writer.execute(&image)?;
-/// # Ok::<(), sitk_io::IoError>(())
+/// # Ok::<(), sitk::io::IoError>(())
 /// ```
 ///
 /// `SetCompressor` is exposed only for TIFF, through
@@ -159,13 +159,13 @@ impl ImageFileWriter {
         self.options.compressor
     }
 
-    /// Override the automatically detected [`ImageIo`](crate::ImageIo) by class
+    /// Override the automatically detected [`ImageIo`](crate::io::ImageIo) by class
     /// name, e.g. `"MetaImageIO"`. `None` (the default) restores automatic
     /// detection.
     ///
     /// `SetImageIO` (sitkImageFileWriter.h:128-141). An unknown name is
     /// reported by [`ImageFileWriter::execute`] as
-    /// [`IoError::UnknownImageIo`](crate::IoError::UnknownImageIo), matching
+    /// [`IoError::UnknownImageIo`](crate::io::IoError::UnknownImageIo), matching
     /// upstream, where `CreateImageIOByName` throws inside `Execute`.
     pub fn set_image_io(&mut self, name: Option<&str>) -> &mut Self {
         self.image_io_name = name.map(str::to_string);
@@ -177,7 +177,7 @@ impl ImageFileWriter {
         self.image_io_name.as_deref()
     }
 
-    /// The class names of every registered [`ImageIo`](crate::ImageIo) —
+    /// The class names of every registered [`ImageIo`](crate::io::ImageIo) —
     /// `GetRegisteredImageIOs` (sitkImageFileWriter.h:75-77).
     pub fn registered_image_ios(&self) -> Vec<&'static str> {
         registered_image_ios()

@@ -174,12 +174,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use sitk_core::{Complex, Image, PixelBuffer, PixelId};
+use crate::core::{Complex, Image, PixelBuffer, PixelId};
 
-use crate::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gzip_compress};
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo};
-use crate::writer::WriteOptions;
+use crate::io::compression::{ITK_DEFAULT_COMPRESSION_LEVEL, gunzip_transparent, gzip_compress};
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo};
+use crate::io::writer::WriteOptions;
 
 /// `NRRD_DIM_MAX` (nrrdDefines.h).
 const DIM_MAX: usize = 16;
@@ -3095,7 +3095,11 @@ impl ImageIo for NrrdImageIo {
     fn can_read_file(&self, path: &Path) -> bool {
         use std::io::Read;
 
-        if !crate::image_io::has_supported_extension(path, self.supported_read_extensions(), true) {
+        if !crate::io::image_io::has_supported_extension(
+            path,
+            self.supported_read_extensions(),
+            true,
+        ) {
             return false;
         }
         let Ok(mut file) = std::fs::File::open(path) else {

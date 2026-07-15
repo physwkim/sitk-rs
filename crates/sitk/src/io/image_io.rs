@@ -35,27 +35,27 @@
 //!
 //! Phase 2 cannot currently rescue anything, because [`MetaImageIo`]'s own
 //! `can_read_file` re-checks the extension itself — see
-//! [`crate::meta_image`]'s module docs for that upstream quirk.
+//! [`crate::io::meta_image`]'s module docs for that upstream quirk.
 //!
-//! [`MetaImageIo`]: crate::meta_image::MetaImageIo
+//! [`MetaImageIo`]: crate::io::meta_image::MetaImageIo
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use sitk_core::{Image, PixelId};
+use crate::core::{Image, PixelId};
 
-use crate::dicom::DicomImageIo;
-use crate::error::{IoError, Result};
-use crate::gipl::GiplImageIo;
-use crate::image_hdf5::Hdf5ImageIo;
-use crate::jpeg::JpegImageIo;
-use crate::meta_image::MetaImageIo;
-use crate::nifti::NiftiImageIo;
-use crate::nrrd::NrrdImageIo;
-use crate::png::PngImageIo;
-use crate::tiff::TiffImageIo;
-use crate::vtk::VtkImageIo;
-use crate::writer::WriteOptions;
+use crate::io::dicom::DicomImageIo;
+use crate::io::error::{IoError, Result};
+use crate::io::gipl::GiplImageIo;
+use crate::io::image_hdf5::Hdf5ImageIo;
+use crate::io::jpeg::JpegImageIo;
+use crate::io::meta_image::MetaImageIo;
+use crate::io::nifti::NiftiImageIo;
+use crate::io::nrrd::NrrdImageIo;
+use crate::io::png::PngImageIo;
+use crate::io::tiff::TiffImageIo;
+use crate::io::vtk::VtkImageIo;
+use crate::io::writer::WriteOptions;
 
 /// Which of [`ImageIo::can_read_file`] / [`ImageIo::can_write_file`] the
 /// registry probe should use. `itk::IOFileModeEnum`
@@ -111,7 +111,7 @@ impl ImageInformation {
     }
 
     /// The value stored under `key` — `GetMetaData`, which throws on an absent
-    /// key where this returns `None` (as [`sitk_core::Image::meta_data`] does).
+    /// key where this returns `None` (as [`crate::core::Image::meta_data`] does).
     pub fn meta_data(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).map(String::as_str)
     }
@@ -125,7 +125,7 @@ impl ImageInformation {
 pub trait ImageIo: Sync {
     /// The IO's class name, as `GetNameOfClass` reports it (`"MetaImageIO"`).
     /// This is the string [`registered_image_ios`] lists and
-    /// [`crate::ImageFileWriter::set_image_io`] accepts.
+    /// [`crate::io::ImageFileWriter::set_image_io`] accepts.
     fn name(&self) -> &'static str;
 
     /// Extensions this IO advertises for reading, each including the dot and
@@ -219,18 +219,18 @@ static DICOM_IMAGE_IO: DicomImageIo = DicomImageIo;
 /// [`JpegImageIo`] advertises `.jpg`/`.JPG`/`.jpeg`/`.JPEG`, disjoint from every
 /// other IO's extension set.
 ///
-/// [`VtkImageIo`]: crate::vtk::VtkImageIo
-/// [`GiplImageIo`]: crate::gipl::GiplImageIo
-/// [`PngImageIo`]: crate::png::PngImageIo
+/// [`VtkImageIo`]: crate::io::vtk::VtkImageIo
+/// [`GiplImageIo`]: crate::io::gipl::GiplImageIo
+/// [`PngImageIo`]: crate::io::png::PngImageIo
 /// [`TiffImageIo`]'s `can_read_file` opens the file as a TIFF and looks for the
 /// `IMAGEWIDTH` / `IMAGELENGTH` tags of directory 0, ignoring the extension —
 /// so phase 2 lets it claim a TIFF under any name. It is *not* a promise the
 /// file can be read: upstream's `CanReadFile` likewise skips
 /// `TIFFReaderInternal::CanRead` (itkTIFFImageIO.cxx:30-50).
 ///
-/// [`Hdf5ImageIo`]: crate::image_hdf5::Hdf5ImageIo
-/// [`JpegImageIo`]: crate::jpeg::JpegImageIo
-/// [`TiffImageIo`]: crate::tiff::TiffImageIo
+/// [`Hdf5ImageIo`]: crate::io::image_hdf5::Hdf5ImageIo
+/// [`JpegImageIo`]: crate::io::jpeg::JpegImageIo
+/// [`TiffImageIo`]: crate::io::tiff::TiffImageIo
 pub fn registry() -> &'static [&'static dyn ImageIo] {
     const IOS: &[&dyn ImageIo] = &[
         &META_IMAGE_IO,

@@ -13,7 +13,7 @@
 //! unlike every other format ported so far, `JPEGImageIO`'s constructor never
 //! calls `SetMaximumCompressionLevel` — so the ceiling stays at
 //! `ImageIOBase`'s own default of **100** (itkImageIOBase.h:830), not the `9`
-//! that bounds MetaImage/NRRD/PNG (see [`crate::compression`]). The
+//! that bounds MetaImage/NRRD/PNG (see [`crate::io::compression`]). The
 //! constructor sets the default quality to 95 (itkJPEGImageIO.cxx:300).
 //! Ledger §3.49.
 //!
@@ -100,7 +100,7 @@
 //! `X_density`/`Y_density` (itkJPEGImageIO.cxx:420-433), which libjpeg
 //! populates from the JFIF `APP0` marker. `jpeg-decoder` parses that marker
 //! only far enough to set a boolean (`is_jfif`) — the density fields
-//! themselves are discarded (`crate::parser::AppData::Jfif` is a unit
+//! themselves are discarded (`crate::io::parser::AppData::Jfif` is a unit
 //! variant). [`scan_jfif_density`] walks the marker stream by hand to recover
 //! them, and [`spacing_from_density`] reproduces
 //! `ReadImageInformation`'s exact unit-1-is-inches/unit-2-is-centimetres
@@ -143,7 +143,7 @@
 //! # `CanReadFile` is stricter than PNG's
 //!
 //! PNG's `CanReadFile` checks only the 8-byte signature (ledger, see
-//! [`crate::png`]). JPEG's checks three things in sequence
+//! [`crate::io::png`]). JPEG's checks three things in sequence
 //! (itkJPEGImageIO.cxx:90-158): the extension (`HasSupportedReadExtension`,
 //! case-**sensitive** — `:102`), the 2-byte `0xFFD8` magic (`:117-130`), and
 //! then a full `jpeg_read_header` parse (`:141-155`) — a malformed JPEG with
@@ -167,7 +167,7 @@
 //!   whatever tail of the caller's buffer had not yet been decoded
 //!   uninitialised while still reporting success — the same shape as the
 //!   already-ledgered `MET_PerformUncompression` quirk (§4.75,
-//!   [`crate::compression`]). Not expressible in safe Rust: [`read`] returns
+//!   [`crate::io::compression`]). Not expressible in safe Rust: [`read`] returns
 //!   [`IoError::JpegDecode`] for a failure at any point, header or mid-scan.
 //!   Ledger §4.92.
 //! * **A 2- or 5-plus-component JPEG.** `ReadImageInformation`'s component
@@ -194,14 +194,14 @@
 use std::io::Cursor;
 use std::path::Path;
 
+use crate::core::{Image, PixelBuffer, PixelId};
 use jpeg_decoder::{Decoder as JpegDecoder, PixelFormat};
 use jpeg_encoder::{ColorType, Density, Encoder as JpegEncoder, SamplingFactor};
-use sitk_core::{Image, PixelBuffer, PixelId};
 
-use crate::compression::MIN_COMPRESSION_LEVEL;
-use crate::error::{IoError, Result};
-use crate::image_io::{ImageInformation, ImageIo, has_supported_extension};
-use crate::writer::WriteOptions;
+use crate::io::compression::MIN_COMPRESSION_LEVEL;
+use crate::io::error::{IoError, Result};
+use crate::io::image_io::{ImageInformation, ImageIo, has_supported_extension};
+use crate::io::writer::WriteOptions;
 
 /// `ImageIOBase`'s own default `MaximumCompressionLevel`, never lowered by
 /// `JPEGImageIO`'s constructor (itkImageIOBase.h:830) — see the module doc.
@@ -277,7 +277,7 @@ impl Default for JpegWriteOptions {
 
 /// `GetQuality`/`SetQuality`'s clamp, `1..=100` (see module doc, ledger
 /// §3.49) — distinct from every other format's `1..=9`
-/// ([`crate::compression::MAX_COMPRESSION_LEVEL`]), so this crate cannot
+/// ([`crate::io::compression::MAX_COMPRESSION_LEVEL`]), so this crate cannot
 /// reuse [`WriteOptions::resolved_level`].
 fn resolved_quality(options: &WriteOptions) -> u8 {
     let quality = if options.compression_level < 0 {
