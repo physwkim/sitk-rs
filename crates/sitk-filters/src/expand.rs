@@ -16,7 +16,7 @@
 
 use crate::error::{FilterError, Result};
 use crate::image_from_f64;
-use sitk_core::Image;
+use sitk_core::{Image, coord};
 
 /// Interpolation kernel used by [`expand`] to resample the input at each
 /// output pixel's continuous input-space location.
@@ -80,12 +80,14 @@ fn linear_at(vals: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) ->
 /// round `cindex` to the nearest integer index per axis (defensively clamped
 /// to `[0, size[d]-1]`, though [`expand`]'s own sampling positions never
 /// actually reach outside that range for this rounding step — see
-/// [`expand`]'s doc comment).
+/// [`expand`]'s doc comment). ITK's nearest-neighbour rounds via
+/// `ConvertContinuousIndexToNearestIndex` = `Math::RoundHalfIntegerUp` (half
+/// toward +∞), not Rust's half-away-from-zero `f64::round`.
 fn nearest_at(vals: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -> f64 {
     let dim = size.len();
     let mut flat = 0usize;
     for d in 0..dim {
-        let idx = cindex[d].round().clamp(0.0, (size[d] - 1) as f64) as usize;
+        let idx = coord::round_half_integer_up(cindex[d]).clamp(0, size[d] as i64 - 1) as usize;
         flat += idx * strides[d];
     }
     vals[flat]

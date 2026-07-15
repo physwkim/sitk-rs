@@ -64,7 +64,7 @@
 //! other transform's.
 
 use sitk_core::parallel;
-use sitk_core::{Image, Scalar, dispatch_scalar};
+use sitk_core::{Image, Scalar, coord, dispatch_scalar};
 use sitk_transform::Interpolator;
 use sitk_transform::ParametricTransform;
 use sitk_transform::interpolator::{
@@ -807,8 +807,13 @@ impl MovingImage {
     }
 
     /// Whether continuous index `c` is allowed by the moving mask (always
-    /// `true` when there is no mask). Rounds to the nearest voxel, matching
-    /// ITK's `ImageMaskSpatialObject` point-in-mask test.
+    /// `true` when there is no mask). Rounds to the nearest voxel with
+    /// `RoundHalfIntegerUp` (half toward +∞), matching ITK's
+    /// `ImageMaskSpatialObject` point-in-mask test — which rounds via
+    /// `TransformPhysicalPointToIndex` (itkImageBase.h:476), not Rust's
+    /// half-away-from-zero `f64::round`. The two differ at a negative half:
+    /// `c = −0.5` is inside the buffer (`≥ −0.5`), ITK keeps voxel 0, half-away
+    /// would drop it (`−1`).
     fn mask_allows(&self, c: &[f64]) -> bool {
         let mask = match &self.mask {
             None => return true,
@@ -816,8 +821,8 @@ impl MovingImage {
         };
         let mut flat = 0usize;
         for (d, &cd) in c.iter().enumerate() {
-            let r = cd.round();
-            if r < 0.0 || r as usize >= self.size[d] {
+            let r = coord::round_half_integer_up(cd);
+            if r < 0 || r as usize >= self.size[d] {
                 return false;
             }
             flat += r as usize * self.strides[d];
@@ -1632,6 +1637,36 @@ mod tests {
             after < before,
             "moving mask should drop previously-valid points: after {after} vs before {before}"
         );
+    }
+
+    // The mask point-in-buffer test rounds the continuous index with ITK's
+    // RoundHalfIntegerUp, not Rust's half-away-from-zero f64::round. They diverge
+    // at exactly a negative half: continuous index -0.5 is inside the buffer,
+    // ITK's ImageMaskSpatialObject keeps voxel 0, so a set voxel-0 mask ALLOWS it.
+    // The pre-fix port rounded -0.5 with f64::round -> -1 -> out of bounds ->
+    // wrongly rejected the sample.
+    #[test]
+    fn mask_allows_keeps_negative_half_index_at_voxel_zero() {
+        let img = Image::from_vec(&[4, 4], vec![1.0; 16]).unwrap();
+        // Mask allows only voxel (0,0); every other voxel is masked out.
+        let mut mv = vec![0.0f64; 16];
+        mv[0] = 1.0;
+        let mask = Image::from_vec(&[4, 4], mv).unwrap();
+        let moving = MovingImage::from_image(&img)
+            .unwrap()
+            .with_moving_mask(&mask)
+            .unwrap();
+
+        // Continuous index (-0.5, -0.5): RoundHalfIntegerUp -> (0, 0), inside the
+        // set voxel -> allowed.
+        assert!(moving.mask_allows(&[-0.5, -0.5]));
+        // Non-vacuity: Rust f64::round would send -0.5 -> -1 (out of bounds), so a
+        // regressed mask_allows using it would return false here.
+        assert_eq!((-0.5f64).round() as i64, -1);
+        // And a component just past the half (-0.6) does round to -1 under ITK too,
+        // so the mask correctly rejects it — proving the -0.5 accept is the boundary,
+        // not blanket acceptance of all negatives.
+        assert!(!moving.mask_allows(&[-0.6, -0.5]));
     }
 
     /// The pre-fast-path mean-squares reduction: always uses the dense

@@ -236,4 +236,23 @@ mod tests {
         // Non-vacuity: identical bits would mean the fold order was not preserved.
         assert_ne!(integer[0], continuous[0]);
     }
+
+    // ITK NN / mask / sparse-Jacobian rounding is RoundHalfIntegerUp = floor(x+0.5),
+    // half toward +INF; Rust f64::round is half AWAY from zero. They diverge on the
+    // exact half at every negative half-integer. The separating input the mask path
+    // cares about: a continuous index component of -0.5 -> ITK keeps voxel 0, while
+    // f64::round drops to -1 (out of bounds -> the sample is wrongly rejected).
+    #[test]
+    fn round_half_integer_up_keeps_negative_half_at_zero_unlike_rust_round() {
+        assert_eq!(round_half_integer_up(-0.5), 0); // ITK keeps voxel 0
+        assert_eq!(round_half_integer_up(-1.5), -1);
+        assert_eq!(round_half_integer_up(-2.5), -2);
+        assert_eq!(round_half_integer_up(0.5), 1);
+        assert_eq!(round_half_integer_up(1.5), 2);
+        // Non-vacuity: Rust's half-away-from-zero round is the bug being replaced;
+        // it maps every negative half the other way.
+        assert_eq!((-0.5f64).round() as i64, -1);
+        assert_eq!((-1.5f64).round() as i64, -2);
+        assert_ne!(round_half_integer_up(-0.5), (-0.5f64).round() as i64);
+    }
 }
