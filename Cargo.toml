@@ -7,7 +7,7 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
-repository = "https://github.com/pls2-controls/sitk-rs"
+repository = "https://github.com/physwkim/sitk-rs"
 description = "A pure-Rust port of SimpleITK"
 
 [workspace.dependencies]
