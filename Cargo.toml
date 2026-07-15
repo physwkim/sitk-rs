@@ -1,39 +1,25 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/sitk-core",
-    "crates/sitk-cuda",
-    "crates/sitk-io",
-    "crates/sitk-filters",
-    "crates/sitk-transform",
-    "crates/sitk-registration",
-    "crates/sitk",
-]
+members = ["crates/sitk"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
-repository = "https://github.com/pls2-controls/sitk-rs"
+repository = "https://github.com/physwkim/sitk-rs"
 description = "A pure-Rust port of SimpleITK"
 
 [workspace.dependencies]
-sitk-core = { path = "crates/sitk-core", version = "0.0.1" }
-sitk-cuda = { path = "crates/sitk-cuda", version = "0.0.1" }
-sitk-io = { path = "crates/sitk-io", version = "0.0.1" }
-sitk-filters = { path = "crates/sitk-filters", version = "0.0.1" }
-sitk-transform = { path = "crates/sitk-transform", version = "0.0.1" }
-sitk-registration = { path = "crates/sitk-registration", version = "0.0.1" }
 thiserror = "2.0"
-# Deterministic CPU parallelism. Deliberately a dependency of `sitk-core` ONLY:
-# every parallel loop in the port goes through `sitk_core::parallel`, whose API
-# admits no float reduction, so no filter crate can reach `par_iter().sum()` and
-# re-associate a float fold. See `crates/sitk-core/src/parallel.rs`.
+# Deterministic CPU parallelism. Every parallel loop in the port goes through
+# `crate::core::parallel`, whose API admits no float reduction, so no filter
+# module can reach `par_iter().sum()` and re-associate a float fold. See
+# `crates/sitk/src/core/parallel.rs`.
 rayon = "1.10"
-# `madvise` only. A dependency of `sitk-core` ONLY, and used at exactly one call
-# site (`sitk_core::alloc`), whose advice is advisory: every failure path there
-# falls back to the plain allocation. See `crates/sitk-core/src/alloc.rs`.
+# `madvise` only, used at exactly one call site (`crate::core::alloc`), whose
+# advice is advisory: every failure path there falls back to the plain
+# allocation. See `crates/sitk/src/core/alloc.rs`.
 libc = "0.2"
 # Pure-Rust zlib/gzip. `default-features = false` + `rust_backend` pins the
 # miniz_oxide implementation and keeps every C-binding backend (`zlib-sys`,

@@ -6,9 +6,8 @@ A **pure-Rust port of [SimpleITK](https://simpleitk.org/)** — no ITK/C++ linka
 > formats, ~90 filter modules, seventeen transform types, and a registration
 > framework (six metrics, twelve optimizers, multi-resolution pyramid) are
 > implemented and tested — **3,545 tests** on the CPU, **3,575** with the CUDA
-> feature on. Every algorithm is checked against the ITK v6 source, and every
-> upstream defect found along the way is recorded in
-> [`doc/upstream-findings.md`](doc/upstream-findings.md).
+> feature on. Every algorithm is written for behavioural parity with the ITK v6
+> source.
 
 ## Why a rewrite, not a binding
 
@@ -21,23 +20,25 @@ fills in the algorithms behind it, referencing ITK for behavioural parity.
 
 Two things fall out of doing it in Rust rather than binding to it:
 
-- **The C++ undefined behaviour has to go somewhere.** Signed/unsigned
-  wraparound, `NaN → int` casts, reads of unallocated regions — Rust will not
-  reproduce them, so each one forced a decision. They are all written down.
-- **You can read the parity.** Where the port reproduces an ITK quirk it is
+- **Memory safety by construction.** The port is pure safe Rust; where the C++
+  relies on behaviour Rust does not provide, the port makes an explicit,
+  documented choice instead.
+- **You can read the parity.** Where the port reproduces ITK's behaviour it is
   pinned by a test; where it diverges, the module doc says why.
 
-## Workspace layout
+## Crate layout
 
-| Crate | Responsibility |
+`sitk` is a single crate; its modules mirror the responsibilities that used to
+be split across separate crates:
+
+| Module | Responsibility |
 |---|---|
-| `sitk-core` | Runtime-typed `Image`, pixel dispatch (`dispatch_scalar!`), physical-space geometry, the parallel/fused primitives (`map_pixels`, `map_rows_fold_in_order`) |
-| `sitk-io` | MetaImage, NIfTI, NRRD, DICOM, PNG, JPEG, TIFF, VTK, GIPL, HDF5; series reader/writer; transform IO (HDF5, MATLAB, `.tfm`) |
-| `sitk-filters` | ~90 modules: morphology, level sets, distance maps, FFT/deconvolution, N4 bias field, watershed, denoising, label maps, thresholding, statistics, … |
-| `sitk-transform` | 17 transform types (translation, affine, Euler, versor, similarity, scale-skew, B-spline, displacement field, composite), interpolation, `ResampleImageFilter` |
-| `sitk-registration` | `ImageRegistrationMethod`: 6 metrics, 12 optimizers, physical-shift scales, multi-resolution pyramid, transform initializers, device-resident metric |
-| `sitk-cuda` | Device-resident images and ops (`DeviceImage`, `upload`/`to_host`) — optional, behind the `cuda` feature |
-| `sitk` | Umbrella crate re-exporting the above under one namespace |
+| `sitk::core` | Runtime-typed `Image`, pixel dispatch (`dispatch_scalar!`), physical-space geometry, the parallel/fused primitives (`map_pixels`, `map_rows_fold_in_order`) |
+| `sitk::io` | MetaImage, NIfTI, NRRD, DICOM, PNG, JPEG, TIFF, VTK, GIPL, HDF5; series reader/writer; transform IO (HDF5, MATLAB, `.tfm`) |
+| `sitk::filters` | ~90 modules: morphology, level sets, distance maps, FFT/deconvolution, N4 bias field, watershed, denoising, label maps, thresholding, statistics, … |
+| `sitk::transform` | 17 transform types (translation, affine, Euler, versor, similarity, scale-skew, B-spline, displacement field, composite), interpolation, `ResampleImageFilter` |
+| `sitk::registration` | `ImageRegistrationMethod`: 6 metrics, 12 optimizers, physical-shift scales, multi-resolution pyramid, transform initializers, device-resident metric |
+| `sitk::cuda` | Device-resident images and ops (`DeviceImage`, `upload`/`to_host`) — optional, behind the `cuda` feature |
 
 ## Architecture
 
@@ -54,7 +55,7 @@ Two things fall out of doing it in Rust rather than binding to it:
   handed to rayon, so a thread-count-dependent reduction is *unwritable* against
   the API rather than merely discouraged. `bit_parity.rs` pins 16 ops' output
   checksums to catch it if it ever became writable.
-- **The bus is a thing the caller schedules.** `sitk-cuda` exposes `DeviceImage`,
+- **The bus is a thing the caller schedules.** `sitk::cuda` exposes `DeviceImage`,
   and `upload` / `to_host` are the only two functions in the crate that cross
   PCIe. An op's signature (`&DeviceImage -> DeviceImage`) *cannot express* a
   round trip, so no filter can hide one behind your back. See
@@ -62,7 +63,7 @@ Two things fall out of doing it in Rust rather than binding to it:
 
 ## Registration
 
-`sitk-registration` ports ITK's v4 registration framework
+`sitk::registration` ports ITK's v4 registration framework
 (`itk::ImageRegistrationMethodv4` / SimpleITK `ImageRegistrationMethod`).
 
 - **Metrics:** mean squares, correlation, ANTS neighborhood correlation, Mattes
@@ -87,13 +88,12 @@ Smoothing in the pyramid uses the bit-exact recursive Gaussian
 `SmoothingRecursiveGaussianImageFilter`. The separable truncated-FIR Gaussian
 (`smooth_gaussian`) stays available behind the same seam.
 
-**A warning that ITK does not print.** ITK initializes the optimizer scales to
-all ones when you set neither scales nor an estimator
-(`itkObjectToObjectOptimizerBase.cxx:103-107`), and the estimators are opt-in. On
-a rotation-bearing transform, unit scales make descent *chaotic* — a ~500×
-amplification per step, so two mathematically identical paths converge to
-different local minima. Call `set_optimizer_scales_from_physical_shift()`. This
-is reproduced ITK behaviour, not a port defect; recorded as ledger §2.157.
+**Set the optimizer scales.** With neither scales nor an estimator set, the
+optimizer initializes its scales to all ones, and on a rotation-bearing transform
+unit scales make descent *unstable* — a ~500× amplification per step, so two
+mathematically identical paths can converge to different local minima. Call
+`set_optimizer_scales_from_physical_shift()`, or use one of the `_estimated`
+optimizer variants, and the scales are taken from physical shift for you.
 
 ## GPU: device residency (CUDA)
 
@@ -269,43 +269,25 @@ and a `[4,2,1]`/`[2,1,0]` schedule takes the same 154 iterations to the same
   filter), so this is new acceleration, not a port.
 
 The CPU path is unaffected: the test suite passes with the feature **off**
-(3,410), with it **on** (3,517), and with it on but `CUDA_VISIBLE_DEVICES=""`
-(3,517) — a machine with no GPU is a supported configuration, not a crash.
+(3,545), with it **on** (3,575), and with it on but `CUDA_VISIBLE_DEVICES=""`
+(3,575) — a machine with no GPU is a supported configuration, not a crash.
 
-## ITK parity — and what we found in ITK
+## ITK parity
 
 Every algorithm is written against the ITK v6 source
-(`v6.0b02-5846-ge46eb723a5`, checked out at `~/work/ITK`; SimpleITK's yamls at
+(`v6.0b02-5846-ge46eb723a5`, referenced at `~/work/ITK`; SimpleITK's yamls at
 `~/work/SimpleITK`). Neither is vendored here.
 
-Porting a numerical library line-by-line turns out to be an excellent way to find
-bugs in it. [`doc/upstream-findings.md`](doc/upstream-findings.md) is the index:
+The port's behaviour follows one of three policies, stated per module in its doc:
 
-| Section | Rows | What it holds |
-|---|---|---|
-| §1 | 74 | **ITK bugs** — wrong results, NaN, or C++ UB on live code paths |
-| §2 | 157 | ITK inconsistencies and quirks — **reproduced** and pinned by tests |
-| §3 | 56 | SimpleITK wrapping issues |
-| §4 | 116 | **Deliberate divergences of this port** — each with its reason |
-| §5 | — | Open decision points (parity vs. correctness, awaiting a call) |
-| §7 | 2 | ITK *performance* defects — ops that get slower with more threads |
-
-The §1 bugs and the upstream-relevant §2 rows were re-verified against that
-checkout and filed upstream on 2026-07-10 as
-[ITK issue #6575](https://github.com/InsightSoftwareConsortium/ITK/issues/6575).
-Thirty-nine of them are **fixed in this port** rather than reproduced.
-
-The policy, per entry:
-
-- **reproduced** — upstream behaviour is reproduced bit-for-bit, quirk included,
-  and pinned by a test. Parity wins over correctness.
-- **diverged** — this port intentionally differs; the module doc states the
-  divergence and the reason (memory safety, defined behaviour where C++ has UB,
-  or `f64` precision).
+- **reproduced** — ITK's behaviour is reproduced bit-for-bit and pinned by a
+  test. Parity wins over correctness.
+- **diverged** — the port intentionally differs; the module doc states the
+  divergence and the reason (memory safety, defined behaviour, or `f64`
+  precision).
 - **open** — a decision is pending.
 
-The authoritative text for any entry is the module doc it names. The ledger is
-the index, not the source of truth.
+The authoritative text for any entry is the module doc it names.
 
 ## Benchmarks
 
@@ -424,14 +406,14 @@ each one you can trust.
 6. **Filter breadth.** SimpleITK's `Code/BasicFilters/yaml/*.yaml` definitions
    are intended to be consumed directly to generate the remaining wrappers;
    the algorithm bodies are what get written in Rust.
-7. **Close §5.** The open parity-vs-correctness decisions in the ledger.
+7. **Close the open decisions.** The remaining parity-vs-correctness calls.
 
 ## Build
 
 ```sh
 cargo build --workspace
-cargo nextest run --workspace                        # 3,545 tests
-cargo nextest run --workspace --features sitk-filters/cuda   # 3,575, needs CUDA 13
+cargo nextest run --workspace                # 3,545 tests
+cargo nextest run --workspace --features sitk/cuda   # 3,575, needs CUDA 13
 ```
 
 License: Apache-2.0.

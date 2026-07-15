@@ -38,28 +38,31 @@
 //! ```
 
 /// Core image model and pixel dispatch.
-pub use sitk_core as core;
+pub mod core;
+/// Optional CUDA backend (behind the `cuda` feature).
+#[cfg(feature = "cuda")]
+pub mod cuda;
 /// Image filters (procedural interface).
-pub use sitk_filters as filters;
+pub mod filters;
 /// Image file IO.
-pub use sitk_io as io;
+pub mod io;
 /// Image registration (metrics, optimizers, `ImageRegistrationMethod`).
-pub use sitk_registration as registration;
+pub mod registration;
 /// Spatial transforms and resampling.
-pub use sitk_transform as transform;
+pub mod transform;
 
 // The most-used types promoted to the crate root, as SimpleITK exposes them
 // directly (`sitk.Image`, `sitk.AffineTransform`, `sitk.Cast`, ...).
-pub use sitk_core::{
+pub use core::{
     Image, LabelMap, LabelObject, LabelObjectLine, MAX_DIM, PixelBuffer, PixelId, Scalar,
 };
 /// Read a transform from an Insight legacy transform file (`.tfm`/`.txt`) —
 /// `itk::simple::ReadTransform`.
-pub use sitk_io::read_transform;
+pub use io::read_transform;
 /// Write a transform to an Insight legacy transform file (`.tfm`/`.txt`) —
 /// `itk::simple::WriteTransform`.
-pub use sitk_io::write_transform;
-pub use sitk_transform::{
+pub use io::write_transform;
+pub use transform::{
     AffineTransform, BSplineTransform, CenteredTransform, ComposeScaleSkewVersor3DTransform,
     CompositeTransform, DisplacementFieldTransform, Euler2DTransform, Euler3DTransform,
     ParametricTransform, ScaleLogarithmicTransform, ScaleSkewVersor3DTransform, ScaleTransform,
