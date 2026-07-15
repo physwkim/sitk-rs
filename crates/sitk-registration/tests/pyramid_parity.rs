@@ -1197,3 +1197,164 @@ fn a_composite_is_replayed_stage_by_stage_and_at_a_tie_the_fold_is_visible() {
         stages.len()
     );
 }
+
+/// **The physical→index matrix is the inverse of the *composed* `Direction·diag(spacing)`,
+/// not the direction-only inverse — pinned on an oblique geometry at a tie.**
+///
+/// The two inverses are algebraically identical — `inverse(D·diag(s)) =
+/// diag(1/s)·inverse(D)` — so for a diagonal direction they are bit-identical and no
+/// identity/axis-aligned test can tell them apart. For an **oblique** direction the two
+/// factorings round differently in the last bits of the matrix, and a physical point that
+/// lands on a nearest-neighbour tie is resolved to different voxels by the two. The host
+/// filter now inverts the composed matrix (`sitk_core::coord::physical_to_index_matrix`);
+/// the device `affines()` must too, or the coarse mask carried to a level under an oblique
+/// input geometry is a different image.
+///
+/// The grid is the input's own geometry shifted half a voxel in index space, so every
+/// output voxel's continuous index into the input is an exact half-integer `i + 0.5` — a
+/// tie at `floor(c + 0.5)`. The test asserts host↔device bit-identity, then proves it is
+/// load-bearing two ways: the composed inverse differs in bits from the direction-only
+/// inverse for this geometry, and resolving the tie with the direction-only inverse flips
+/// at least one voxel away from the composed answer (what the pre-fix device kernel did).
+#[test]
+fn the_physical_to_index_matrix_inverts_the_composed_matrix_not_direction_only() {
+    if no_device() {
+        println!("SKIPPED: no CUDA device");
+        return;
+    }
+    use sitk_core::coord;
+    use sitk_core::matrix::{invert, mat_vec, matmul};
+
+    // A dense, fully oblique orthonormal direction: Rz(0.6)·Ry(0.5)·Rx(0.4). Every entry
+    // is non-zero, so `inverse(D·diag(s))` and `diag(1/s)·inverse(D)` genuinely differ in
+    // the last bits (a diagonal or single-axis rotation would leave them bit-identical).
+    let (rx, ry, rz) = (0.4f64, 0.5f64, 0.6f64);
+    let mx = [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        rx.cos(),
+        -rx.sin(),
+        0.0,
+        rx.sin(),
+        rx.cos(),
+    ];
+    let my = [
+        ry.cos(),
+        0.0,
+        ry.sin(),
+        0.0,
+        1.0,
+        0.0,
+        -ry.sin(),
+        0.0,
+        ry.cos(),
+    ];
+    let mz = [
+        rz.cos(),
+        -rz.sin(),
+        0.0,
+        rz.sin(),
+        rz.cos(),
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let dir = matmul(&mz, &matmul(&my, &mx, 3), 3);
+    let spacing = [0.7f64, 1.1, 1.3];
+    let in_origin = [-12.0f64, 5.5, 3.25];
+
+    let n = 16usize;
+    let mut src = volume(n);
+    src.set_spacing(&spacing).unwrap();
+    src.set_origin(&in_origin).unwrap();
+    src.set_direction(&dir).unwrap();
+    let mask = binary_mask(&src); // inherits src's oblique geometry
+
+    // The output grid: the same oblique geometry, its origin shifted so output voxel `i`
+    // maps to input continuous index `i + 0.5` on every axis. `out_origin = in_origin +
+    // (D·diag(s))·[½,½,½]` (origin-first), so `phys(i) − in_origin = i2p·(i + ½)` and the
+    // composed inverse sends it back to `i + ½` up to the last bits.
+    let i2p = coord::index_to_physical_matrix(&dir, &spacing, 3);
+    let out_origin = coord::index_to_physical_point_f64(&i2p, &in_origin, &[0.5, 0.5, 0.5], 3);
+    let mut grid = src.clone();
+    grid.set_origin(&out_origin).unwrap();
+    let g = Geometry::of(&grid);
+
+    let identity = AffineTransform::identity(3);
+    for (payload, image, interp) in [
+        ("textured/linear", &src, Interpolator::Linear),
+        ("mask/nearest", &mask, Interpolator::NearestNeighbor),
+    ] {
+        let mut resampler = ResampleImageFilter::new();
+        resampler
+            .set_reference_image(&grid)
+            .set_interpolator(interp)
+            .set_default_pixel_value(0.0);
+        let host = resampler.execute(image, &identity).expect("host resample");
+
+        let d = DeviceImage::upload(image).unwrap();
+        let device = match interp {
+            Interpolator::Linear => sitk_cuda::resample_linear(&d, &g, 0.0),
+            _ => sitk_cuda::resample_nearest(&d, &g, 0.0),
+        }
+        .expect("device resample")
+        .to_host()
+        .unwrap();
+
+        assert_bit_identical(&host, &device, &format!("oblique tie grid, {payload}"));
+    }
+
+    // Non-vacuity A: the composed inverse differs in bits from the direction-only inverse
+    // for this geometry. If it did not, the fix would be invisible and this test vacuous.
+    let p2i_composed = coord::physical_to_index_matrix(&dir, &spacing, 3).unwrap();
+    let dinv = invert(&dir, 3).unwrap();
+    let mut p2i_dir_only = vec![0.0f64; 9];
+    for r in 0..3 {
+        for c in 0..3 {
+            p2i_dir_only[r * 3 + c] = dinv[r * 3 + c] / spacing[r];
+        }
+    }
+    let matrix_bits_differ = p2i_composed
+        .iter()
+        .zip(p2i_dir_only.iter())
+        .any(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(
+        matrix_bits_differ,
+        "on this oblique geometry the composed inverse equals the direction-only inverse on \
+         the bits, so nothing distinguishes the fix — pick a more oblique direction"
+    );
+
+    // Non-vacuity B (the load-bearing flip): resolving each output voxel's tie with the
+    // direction-only inverse the pre-fix kernel used lands on a different voxel than the
+    // composed inverse for at least one sample. This is the whole point of site 2.
+    let mut flips = 0usize;
+    for flat in 0..(n * n * n) {
+        let idx_f = [
+            (flat % n) as f64,
+            ((flat / n) % n) as f64,
+            (flat / (n * n)) as f64,
+        ];
+        let phys = coord::index_to_physical_point_f64(&i2p, &out_origin, &idx_f, 3);
+        let diff: Vec<f64> = (0..3).map(|k| phys[k] - in_origin[k]).collect();
+        let c_composed = mat_vec(&p2i_composed, &diff, 3);
+        let c_dir_only = mat_vec(&p2i_dir_only, &diff, 3);
+        for d in 0..3 {
+            if coord::round_half_integer_up(c_composed[d])
+                != coord::round_half_integer_up(c_dir_only[d])
+            {
+                flips += 1;
+            }
+        }
+    }
+    assert!(
+        flips > 0,
+        "the direction-only inverse resolved every tie to the same voxel as the composed \
+         inverse ({} voxels), so this grid does not exercise site 2 — the latent fix would \
+         be unverified",
+        n * n * n
+    );
+    println!("oblique tie grid: direction-only inverse would flip {flips} nearest-voxel ties");
+}

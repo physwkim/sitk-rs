@@ -488,12 +488,21 @@ __device__ __forceinline__ bool cindex_of(
         index_f[d] = (double)((o / g[9 + d]) % g[3 + d]);
     }
 
-    // phys = out_origin + M_out * index
+    // phys = out_origin + M_out * index, ORIGIN FIRST. ITK's integer
+    // `TransformIndexToPhysicalPoint` (itkImageBase.h:598-602) seeds the
+    // accumulator with the origin and adds the `D·diag(spacing)·index` terms
+    // after — `((origin + t0) + t1) + t2`, not `(t0 + t1 + t2) + origin`. The
+    // host resample now folds through `coord::index_to_physical_point_f64`
+    // (origin-first), and at a large origin the two folds land on different bits;
+    // the output index is discrete, so this is the integer method, and the same
+    // origin-first fold `VirtualGrid::write_point` / `resident.rs:210` already
+    // use. A fold difference here is a continuous-index difference downstream, and
+    // `resample_nearest3`'s `floor(c + 0.5)` turns it into a whole voxel.
     double phys[3];
     for (int r = 0; r < 3; ++r) {
-        double acc = 0.0;
+        double acc = p[r];
         for (int c = 0; c < 3; ++c) acc += p[3 + r * 3 + c] * index_f[c];
-        phys[r] = p[r] + acc;
+        phys[r] = acc;
     }
 
     // mapped = transform(phys): the transform's OWN stages, replayed in the host's
@@ -633,27 +642,21 @@ extern "C" __global__ void resample_nearest3(
 }
 "#;
 
-/// `index_to_physical` (`D · diag(spacing)`) and `physical_to_index`
-/// (`diag(1/spacing) · D⁻¹`), row-major — the two affines `ResampleImageFilter`
-/// precomputes. `None` if the direction matrix is singular.
+/// `index_to_physical` (`Direction · diag(spacing)`) and `physical_to_index`
+/// (`inverse(Direction · diag(spacing))`), row-major — the two affines
+/// `ResampleImageFilter` precomputes. `None` if the composed matrix is singular.
+///
+/// Both come from the one shared `sitk_core::coord` implementation the host now
+/// routes through, so the device precomputes bit-for-bit the same matrices the
+/// host filter does. The physical→index matrix inverts the **whole composed**
+/// `Direction · diag(spacing)` (ITK `itkImageBase.hxx:175`), not the direction
+/// alone divided by spacing: the two agree for a diagonal geometry but diverge
+/// for an oblique direction, where the direction-only inverse can flip a discrete
+/// index at a tie.
 fn affines(geom: &Geometry) -> Option<(Vec<f64>, Vec<f64>)> {
     let dim = geom.dimension();
-    let mut fwd = vec![0.0; dim * dim];
-    for r in 0..dim {
-        for c in 0..dim {
-            fwd[r * dim + c] = geom.direction[r * dim + c] * geom.spacing[c];
-        }
-    }
-    // The same `invert` `ResampleImageFilter` calls — `sitk_core::matrix` is a
-    // dependency of this crate, so this one is shared rather than duplicated, and
-    // the inverse is bit-identical by construction.
-    let inv = sitk_core::matrix::invert(&geom.direction, dim)?;
-    let mut back = vec![0.0; dim * dim];
-    for r in 0..dim {
-        for c in 0..dim {
-            back[r * dim + c] = inv[r * dim + c] / geom.spacing[r];
-        }
-    }
+    let fwd = sitk_core::coord::index_to_physical_matrix(&geom.direction, &geom.spacing, dim);
+    let back = sitk_core::coord::physical_to_index_matrix(&geom.direction, &geom.spacing, dim)?;
     Some((fwd, back))
 }
 

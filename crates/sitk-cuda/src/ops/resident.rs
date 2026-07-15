@@ -427,7 +427,11 @@ pub struct MovingGeometry<'a> {
     pub size: &'a [usize],
     pub strides: &'a [usize],
     pub origin: &'a [f64],
-    /// `diag(1/spacing) · D⁻¹`, row-major `3 × 3`.
+    /// `inverse(Direction · diag(spacing))`, row-major `3 × 3` — the inverse of
+    /// the whole composed matrix (ITK `itkImageBase.hxx:175`,
+    /// `sitk_core::coord::physical_to_index_matrix`), not the direction alone
+    /// divided by spacing. The two agree for a diagonal geometry and diverge for
+    /// an oblique direction.
     pub phys_to_index: &'a [f64],
     pub mask: Option<&'a [bool]>,
 }
