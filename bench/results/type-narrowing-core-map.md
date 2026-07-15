@@ -417,3 +417,126 @@ evolution runs in f64 where ITK's `ScalarValueType`/`ValueType` is float for a
 Float32 image, feeding three discrete decisions — narrow-band membership
 (`:494/:512`), RMS convergence stop (`:227`, the direct §4.122 analog), and
 promote-neighbor abs-ordering (`:507/:521`) — none narrowed, none documented.
+
+# Verification round — firm verdicts with separating inputs
+
+Report-only. Each candidate: one-line verdict, both-side type evidence
+(read firsthand in `/home/stevek/work/ITK`), a concrete separating input.
+Direction-2 candidates (bspline_decomposition, colliding_fronts,
+fast_marching) are the sister panel's — not re-verified here.
+
+Verdict key: **§4-POLICY** = port computes in f64 where ITK uses `float`;
+the port is *more precise*, but a discrete decision diverges from ITK's
+exact float arithmetic (the N4 §4.122 precedent — user decides keep-precise
+vs match-ITK-float). **REAL-BUG** = port is *narrower* than ITK and simply
+wrong. **NOT-REAL** = faithful / continuous-only, no discrete divergence.
+
+## Candidate 1 — HISTOGRAM-THRESHOLD family — §4-POLICY
+
+Port `Histogram` bin edges are f64 (`histogram.rs:316-359`, doc `:313-315`
+states the deviation explicitly). ITK `itkHistogram::Initialize`
+(`itkHistogram.hxx:216-235`) hardcodes `float interval =
+(float(upper)-float(lower))/float(size)` and `SetBinMin(j, lower +
+float(j)*interval)` — float regardless of `MeasurementType`. Bin membership
+(`GetIndex`, `:243-296`) is a discrete decision, and the selected threshold
+(Otsu/Huang/… argmax over bins) is discrete and propagates to the binary
+segmentation.
+
+Separating input, single-pixel bin flip (computed, `hist_edge.rs`):
+range `[0,255]`, 100 bins. ITK float edge[1] = `2.54999995231628418`,
+port f64 edge[1] = `2.55`. A `Float32` pixel set to `2.54999995231628418`
+(a representable value, = ITK's edge exactly) lands in ITK **bin 1**
+(`v >= edge`) but port **bin 0** (`v < 2.55`). Gap `4.768e-8`; 64 of 99
+interior edges have such a pixel for this range/bin-count.
+
+Separating input, flipped *selected* threshold (computed, `otsu2.rs`):
+a constructed 92-pixel `Float32` image (clusters at 38.0/127.0/216.0 plus
+3 pixels on each ITK float edge in bins 60–71) makes Otsu's between-class
+variance a near-tie between two peaks. ITK's float histogram selects
+**bin 49, threshold 126.22**; the port's f64 histogram selects **bin 14,
+threshold 36.98**. **10 of 92 pixels** land in different binary classes.
+
+Reachability: all 12 threshold calculators (`threshold.rs`) + Otsu +
+every `ImageToHistogram`-based filter. Bites only when the interval is
+**not** float-exact — bins = 100/200/250, or an arbitrary float data range.
+**Zero** divergence for float-exact intervals: `[0,255]`/128 (SimpleITK's
+default OtsuThreshold), `[0,200]`/128, `[0,4095]`/256 all give
+`fi == fp` (verified). For `Float32` input a pixel must sit exactly on a
+float edge (constructible, or quantized/rescaled data); for `Float64`
+input the edge gap is densely populated → generic divergence.
+
+## Candidate 2 — N4 histogram binning (`n4_bias_field.rs:395-396`) — §4-POLICY
+
+Port computes `bin_minimum`, `bin_maximum`, `histogram_slope`, and
+`cidx = (pixel - bin_minimum)/histogram_slope` in f64, then
+`finite_floor(cidx)` (discrete). ITK
+(`itkN4BiasFieldCorrectionImageFilter.hxx:272,303,318-319`) computes all of
+these in `RealType`, and N4 hardcodes `using RealType = float`
+(`itkN4BiasFieldCorrectionImageFilter.h:114`, verified). So ITK's
+`histogramSlope`, `cidx`, and `itk::Math::floor(cidx)` are float.
+
+Separating input (computed, `n4.rs`): log-intensity range `[0,7]`, 200 bins
+(default). ITK float slope = `0.03517587855458260`, port f64 slope =
+`0.03517587939698492`. Log-voxel `p = 0.035175879` (f32) → ITK
+`cidx = 1.000000000` (float) → floor **1**; port `cidx = 0.999999976`
+(f64) → floor **0**. The voxel is Parzen-binned into bin 1 (ITK) vs bin 0
+(port) → different histogram → different sharpened intensity map →
+different bias field, and the divergence iterates. Five such voxels found
+in the first sweep (`p = 0.0703…, 0.1055…, 0.1407…, 0.1759…`, each floor
+off-by-one). N4 is `Float32`-reachable in SimpleITK; default 200 bins →
+non-float-exact slope → generic.
+
+## Candidate 3 — level-set / curvature — §4-POLICY (one site UNDOCUMENTED)
+
+The whole sparse-field / chan-vese / min-max-curvature evolution runs in
+f64 in the port, where ITK instantiates on the output pixel type. ITK
+`SparseFieldLevelSetImageFilter::ValueType = OutputImageType::ValueType`
+(`itkSparseFieldLevelSetImageFilter.h:269`, verified) — **float** for the
+`Float32` level-set output SimpleITK produces. So `new_value`,
+`rms_change_accumulator` (`itkSparseFieldLevelSetImageFilter.hxx:303,344`),
+and the layer thresholds are float. chan_vese's port doc (`chan_vese.rs:167-173`)
+already states "the Heaviside image, the update buffer, the level set and
+ComputeUpdate's entire arithmetic are float; this port computes in f64
+throughout." min_max_curvature_flow's gate compares ball-average vs
+threshold in f64 where ITK uses `PixelType`=float (`min_max_curvature_flow.rs:49-54`).
+
+Discrete decisions that can flip at the float-vs-f64 boundary:
+- **RMS convergence stop** (`sparse_field.rs:227`, `maximum_rms_error >
+  rms_change`) — **UNDOCUMENTED**.
+- **Narrow-band membership** (`sparse_field.rs:494/512`, `new_value >=
+  upper_active_threshold` / `< lower_active_threshold`).
+- **chan_vese `phi < 0` sign** — pixel classified inside vs outside →
+  different output label *and* different `c_in`/`c_out` region means.
+- **min/max curvature gate** — ball-average `< threshold` picks
+  `max(κ|∇I|,0)` vs `min(κ|∇I|,0)` → opposite smoothing sign.
+
+Separating input, RMS-halt primitive (computed, `rms.rs`): a 400-pixel
+active layer (`center = 1.0 + i*0.013`, `Δ = 0.0069 + (i%7)*1e-6`, all
+`Float32`). Float accumulation → `rms_change = 0.006903004367`; f64
+accumulation → `0.006903007927`. With `maximum_rms_error = 0.006903006`,
+ITK's float RMS is *below* the bound → **halt fires**; the port's f64 RMS
+is *above* it → **halt does not fire**. ITK stops, the port takes another
+iteration → different iteration count → different final level set. Any
+`maximum_rms_error` in `(0.006903004367, 0.006903007927]` flips the halt.
+
+Full end-to-end ITK-vs-port segmentation divergence is **not executed** here
+(would need a built ITK level-set run); the primitive-level flip above proves
+the discrete decision is reachable, and the type divergence is confirmed
+firsthand.
+
+## Verification summary
+
+| Candidate | Verdict | Discrete outcome that diverges | Separating input |
+|---|---|---|---|
+| Histogram-threshold (12 calc + Otsu) | §4-POLICY | selected threshold / bin membership | Otsu bin 49↔14, 10/92 px reclassified |
+| N4 histogram binning | §4-POLICY | Parzen floor bin | log-voxel 0.035175879 → floor 1↔0 |
+| Sparse-field RMS stop | §4-POLICY (undoc) | iteration count (halt) | max_rms 0.006903006 → halt ITK / run port |
+| Sparse-field layer membership | §4-POLICY | promote/demote at ±g/2 | boundary value on `±constant_gradient/2` |
+| chan_vese `phi<0` | §4-POLICY (doc) | inside/outside label + c_in/c_out | pixel with `phi ≈ 0` |
+| min_max_curvature gate | §4-POLICY (doc) | min vs max smoothing sign | ball-average ≈ threshold |
+
+All six are direction-1 (port f64, more precise; ITK float) — none is a
+narrower-than-ITK REAL-BUG. Every one is the N4 §4.122 shape: keep the
+more-precise f64 (document each as §4.x) or reproduce ITK's float
+arithmetic to hold bit-for-bit. The sparse-field RMS stop is the only one
+not yet documented in-tree.
