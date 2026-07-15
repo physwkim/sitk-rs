@@ -885,81 +885,24 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 name = "sitk"
 version = "0.0.1"
 dependencies = [
- "sitk-core",
- "sitk-filters",
- "sitk-io",
- "sitk-registration",
- "sitk-transform",
-]
-
-[[package]]
-name = "sitk-core"
-version = "0.0.1"
-dependencies = [
- "libc",
- "rayon",
- "thiserror",
-]
-
-[[package]]
-name = "sitk-cuda"
-version = "0.0.1"
-dependencies = [
- "cudarc",
- "sitk-core",
- "thiserror",
-]
-
-[[package]]
-name = "sitk-filters"
-version = "0.0.1"
-dependencies = [
  "criterion",
- "rayon",
- "realfft",
- "rustfft",
- "serde",
- "serde_json",
- "sitk-core",
- "sitk-cuda",
- "thiserror",
-]
-
-[[package]]
-name = "sitk-io"
-version = "0.0.1"
-dependencies = [
+ "cudarc",
  "dicom-core",
  "dicom-dictionary-std",
  "dicom-object",
  "flate2",
  "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "png",
+ "rayon",
+ "realfft",
  "rust-hdf5",
- "sitk-core",
- "sitk-transform",
+ "rustfft",
+ "serde",
+ "serde_json",
  "thiserror",
  "tiff",
-]
-
-[[package]]
-name = "sitk-registration"
-version = "0.0.1"
-dependencies = [
- "sitk-core",
- "sitk-cuda",
- "sitk-filters",
- "sitk-transform",
- "thiserror",
-]
-
-[[package]]
-name = "sitk-transform"
-version = "0.0.1"
-dependencies = [
- "sitk-core",
- "thiserror",
 ]
 
 [[package]]

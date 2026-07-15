@@ -5,11 +5,104 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A pure-Rust port of SimpleITK (umbrella crate)"
+description = "A pure-Rust port of SimpleITK"
+
+[features]
+# Default OFF. On, every op with a GPU kernel tries the GPU first and falls
+# back to the CPU implementation whenever the GPU declines (no driver, no
+# device, NVRTC failure, out of memory, unsupported pixel type). Off, the crate
+# is exactly what it was before the `cuda` module existed: no cudarc, no device
+# code, no `crate::cuda`. This single feature gates `pub mod cuda` and every
+# `#[cfg(feature = "cuda")]` path in `crate::filters` and `crate::registration`.
+default = []
+cuda = ["dep:cudarc"]
 
 [dependencies]
-sitk-core.workspace = true
-sitk-io.workspace = true
-sitk-filters.workspace = true
-sitk-transform.workspace = true
-sitk-registration.workspace = true
+# `madvise` only, at exactly one call site (`crate::core::alloc`), whose advice
+# is advisory: every failure path there falls back to the plain allocation. See
+# `src/core/alloc.rs`.
+libc.workspace = true
+# Deterministic CPU parallelism. Every parallel loop in the port goes through
+# `crate::core::parallel`, whose API admits no float reduction, so no filter
+# module can reach `par_iter().sum()` and re-associate a float fold. See
+# `src/core/parallel.rs`.
+rayon.workspace = true
+thiserror.workspace = true
+# Pure-Rust zlib/gzip. `default-features = false` + `rust_backend` pins the
+# miniz_oxide implementation and keeps every C-binding backend (`zlib-sys`,
+# `zlib-ng`, `libz-rs`) out of the tree — ledger §5.8, §5.17.
+flate2.workspace = true
+# Pure-Rust HDF5 (superblock/heap/btree writer + reader), used by
+# `crate::io::transform_hdf5` for `.h5` / `.hdf5` transform files. The C-binding
+# `hdf5` crate is deliberately not used — ledger §5.8. `deflate` is the crate's
+# default feature and rides on the same flate2/miniz_oxide backend as
+# `crate::io::compression`.
+rust-hdf5 = "0.3"
+# Pure-Rust PNG decoding/encoding, used by `crate::io::png` for `.png` image
+# IO. Default features only: `fdeflate` for the write-side deflate and
+# `miniz_oxide` (via `flate2`) for the read side — no `*-sys` crate enters the
+# tree (verified with `cargo tree`) — ledger §5.8.
+png = "0.18"
+# Pure-Rust JPEG decoding/encoding, used by `crate::io::jpeg` for `.jpg`
+# image IO. Both crates are `#![forbid(unsafe_code)]`/`#![deny(unsafe_code)]`
+# safe Rust with no `*-sys` crate in the tree (verified with `cargo tree`) —
+# ledger §5.8/§5.26. `jpeg-decoder`'s default `rayon` feature (multithreaded
+# decode) is dropped — this crate has no use for it and it is the one feature
+# that would otherwise pull in a large extra dependency graph.
+jpeg-encoder = "0.6.1"
+jpeg-decoder = { version = "0.3.2", default-features = false }
+# Pure-Rust TIFF decoding/encoding, used by `crate::io::tiff` for
+# `.tif` / `.tiff` image IO in place of libtiff, which `itk::TIFFImageIO` links
+# — no `*-sys` crate enters the tree — ledger §5.8. The crate reads LZW,
+# Deflate and PackBits, which covers every compressor `TIFFImageIO` can write;
+# what it cannot express — palette images and libtiff's
+# `TIFFReadRGBAImageOriented` fallback — is refused rather than approximated
+# (ledger §4.100, §4.102).
+tiff = "0.11"
+# Pure-Rust DICOM parsing, used by `crate::io::dicom` to read `.dcm` files in
+# place of GDCM, which `itk::GDCMImageIO` links — no `*-sys` crate enters the
+# tree — ledger §5.8(a). `deflate` adds Deflated Explicit VR Little Endian,
+# which rides on the same `flate2`/`miniz_oxide` backend as
+# `crate::io::compression`. Every *encapsulated* transfer syntax is refused
+# rather than decoded, because GDCM's pixel output for those is
+# libijg/openjpeg's bit-for-bit and no pure-Rust codec reproduces it — ledger
+# §4.106.
+#
+# `dicom-pixeldata` is deliberately *not* a dependency: it exists to decode
+# encapsulated pixel data, which this module refuses, and its `native` feature
+# rewrites the photometric interpretation of every 3-sample frame to `RGB`,
+# which `GDCMImageIO` does not do.
+dicom-object = { version = "0.10", default-features = false, features = ["deflate"] }
+dicom-core = { version = "0.10", default-features = false }
+dicom-dictionary-std = { version = "0.10", default-features = false }
+# Pure-Rust FFT, used by the FFT-based filter family in `crate::filters`.
+realfft = "3.5.0"
+rustfft = "6.4.1"
+# `dynamic-loading`: cudarc dlopens libcuda / libnvrtc at *runtime*. No
+# build-time C linkage, no *-sys crate, no nvcc build step — the only exception
+# to the pure-Rust policy (ledger §5.8), and a missing driver degrades to "no
+# device" (CPU fallback) instead of a link error. Gated by the `cuda` feature.
+#
+# `cuda-13000` selects the driver/NVRTC ABI cudarc binds against; the installed
+# toolkit is 13.0.2.
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-13000",
+    "dynamic-loading",
+], optional = true }
+
+[dev-dependencies]
+# Statistics/timing engine for the doc/bench-spec.md benchmark harness.
+# `harness = false` below: `benches/bench_ops.rs` is a plain `fn main()` that
+# drives `criterion::Criterion` directly (not the `criterion_group!`/
+# `criterion_main!` macros) so it can read each run's `estimates.json` back
+# and emit the spec's NDJSON schema instead of criterion's own CLI report.
+criterion = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bench]]
+name = "bench_ops"
+harness = false
