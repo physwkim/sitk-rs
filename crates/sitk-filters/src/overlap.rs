@@ -114,6 +114,7 @@
 
 use crate::distance::signed_maurer_distance_map;
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use sitk_core::Image;
 use sitk_core::compensated::CompensatedSum;
 use std::collections::BTreeMap;
@@ -243,6 +244,7 @@ pub fn label_overlap_measures(source: &Image, target: &Image) -> Result<OverlapM
     require_integer_pixel_type(source)?;
     require_integer_pixel_type(target)?;
     require_same_size(source, target)?;
+    require_same_physical_space(source, target, 1)?;
 
     let source_labels: Vec<i64> = source
         .to_f64_vec()?
@@ -381,6 +383,7 @@ pub fn directed_hausdorff_distance(
     image2: &Image,
 ) -> Result<DirectedHausdorffMeasures> {
     require_same_size(image1, image2)?;
+    require_same_physical_space(image1, image2, 1)?;
 
     // BeforeThreadedGenerateData: SignedMaurerDistanceMapImageFilter on
     // image2, SquaredDistance(false), UseImageSpacing(true),
@@ -485,6 +488,7 @@ pub fn hausdorff_distance(image1: &Image, image2: &Image) -> Result<HausdorffMea
 /// `image1`'s, which the ITK pipeline rejects downstream.
 pub fn similarity_index(image1: &Image, image2: &Image) -> Result<f64> {
     require_same_size(image1, image2)?;
+    require_same_physical_space(image1, image2, 1)?;
 
     let vals1 = image1.to_f64_vec()?;
     let vals2 = image2.to_f64_vec()?;

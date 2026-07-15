@@ -70,6 +70,7 @@
 //! divergence.
 
 use crate::functor::{self, UnaryFunctor};
+use crate::geometry::require_same_physical_space;
 use crate::{FilterError, Result, image_from_f64, require_same_shape};
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
@@ -351,6 +352,7 @@ fn two_image_f64_with_output(
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<Image> {
     require_same_shape(a, b)?;
+    require_same_physical_space(a, b, 1)?;
     let va = a.to_f64_vec()?;
     let vb = b.to_f64_vec()?;
     let out: Vec<f64> = va.iter().zip(&vb).map(|(&x, &y)| f(x, y)).collect();
@@ -375,6 +377,7 @@ fn two_image_f64_typed_in_place<T: Scalar>(
 
 fn two_image_f64_in_place(mut a: Image, b: &Image, f: &dyn Fn(f64, f64) -> f64) -> Result<Image> {
     require_same_shape(&a, b)?;
+    require_same_physical_space(&a, b, 1)?;
     let vb = b.to_f64_vec()?;
     dispatch_scalar!(a.pixel_id(), two_image_f64_typed_in_place, &mut a, &vb, f)?;
     Ok(a)
@@ -543,8 +546,9 @@ fn require_inputs(images: &[&Image]) -> Result<()> {
     let Some((first, rest)) = images.split_first() else {
         return Err(FilterError::EmptyImageList);
     };
-    for img in rest {
+    for (i, img) in rest.iter().enumerate() {
         require_same_shape(first, img)?;
+        require_same_physical_space(first, img, i + 1)?;
     }
     Ok(())
 }
@@ -588,6 +592,8 @@ fn three_image_f64(
 ) -> Result<Image> {
     require_same_shape(a, b)?;
     require_same_shape(a, c)?;
+    require_same_physical_space(a, b, 1)?;
+    require_same_physical_space(a, c, 2)?;
     let va = a.to_f64_vec()?;
     let vb = b.to_f64_vec()?;
     let vc = c.to_f64_vec()?;
@@ -621,6 +627,8 @@ fn three_image_f64_in_place(
 ) -> Result<Image> {
     require_same_shape(&a, b)?;
     require_same_shape(&a, c)?;
+    require_same_physical_space(&a, b, 1)?;
+    require_same_physical_space(&a, c, 2)?;
     let vb = b.to_f64_vec()?;
     let vc = c.to_f64_vec()?;
     dispatch_scalar!(

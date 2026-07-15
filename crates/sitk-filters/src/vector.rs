@@ -14,6 +14,7 @@
 use sitk_core::{Error, Image, PixelId, Scalar, dispatch_scalar};
 
 use crate::Result;
+use crate::geometry::require_same_physical_space;
 
 /// `ComposeImageFilter` (`itkComposeImageFilter.hxx`): interleave several
 /// same-typed scalar images into one vector image, one input per component.
@@ -31,6 +32,13 @@ use crate::Result;
 /// yields a `VectorFloat32` image of one component, which SimpleITK keeps
 /// distinct from `Float32` — the vector-ness is in the pixel id, not the count.
 pub fn compose(images: &[&Image]) -> Result<Image> {
+    // ComposeImageFilter indexes every input, so the inherited verifier walks
+    // them all; each component past the first must share input 0's grid.
+    if let Some((first, rest)) = images.split_first() {
+        for (i, img) in rest.iter().enumerate() {
+            require_same_physical_space(first, img, i + 1)?;
+        }
+    }
     Ok(Image::from_component_images(images)?)
 }
 
@@ -218,13 +226,18 @@ mod tests {
         );
     }
 
-    /// The output takes `images[0]`'s geometry.
+    /// ComposeImageFilter inherits ImageToImageFilter::VerifyInputInformation, so
+    /// the component images must share physical space (a mismatch is refused —
+    /// pinned in tests/physical_space_precondition.rs). Given congruent inputs the
+    /// output carries that geometry.
     #[test]
-    fn compose_copies_the_first_inputs_geometry() {
+    fn compose_carries_the_shared_geometry() {
         let mut a = Image::new(&[2], PixelId::Float32);
         a.set_spacing(&[0.5]).unwrap();
         a.set_origin(&[3.0]).unwrap();
-        let b = Image::new(&[2], PixelId::Float32);
+        let mut b = Image::new(&[2], PixelId::Float32);
+        b.set_spacing(&[0.5]).unwrap();
+        b.set_origin(&[3.0]).unwrap();
 
         let v = compose(&[&a, &b]).unwrap();
         assert_eq!(v.spacing(), &[0.5]);

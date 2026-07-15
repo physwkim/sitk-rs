@@ -778,12 +778,18 @@ fn the_filter_runs_in_three_dimensions() {
     assert_close(&components(&result.displacement_field, 2), &[0.0; 80]);
 }
 
-/// The output field carries the fixed image's geometry.
+/// The output field carries the fixed image's geometry. LevelSetMotionRegistration
+/// derives from PDEDeformableRegistrationFilter (unlike the classic
+/// DemonsRegistrationFilter, it does not disable the check), so it inherits the
+/// base VerifyInputInformation: fixed and moving must share physical space, and a
+/// mismatch is refused (pinned in tests/physical_space_precondition.rs). Under the
+/// congruent contract the shared geometry is the fixed image's.
 #[test]
 fn the_output_field_takes_the_fixed_images_geometry() {
     let mut moving = valley();
     let mut fixed = grid(|x, _| (x as f64 - 2.0).abs() + 1.0);
     moving.set_spacing(&[0.5, 0.5]).unwrap();
+    moving.set_origin(&[-1.0, 2.0]).unwrap();
     fixed.set_spacing(&[0.5, 0.5]).unwrap();
     fixed.set_origin(&[-1.0, 2.0]).unwrap();
 

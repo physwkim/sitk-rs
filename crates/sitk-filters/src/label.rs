@@ -70,6 +70,7 @@
 //! every label value present in `label_img` gets an entry.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 use sitk_core::{Image, PixelId};
 use std::collections::{BTreeMap, HashMap};
@@ -655,6 +656,7 @@ pub fn label_statistics(img: &Image, label_img: &Image) -> Result<BTreeMap<i64, 
             b: label_img.size().to_vec(),
         });
     }
+    require_same_physical_space(img, label_img, 1)?;
 
     let size = img.size();
     let dim = size.len();

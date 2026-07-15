@@ -91,6 +91,7 @@ pub use anti_alias::anti_alias_binary;
 use crate::canny::{canny_edge_detection, zero_crossing_values};
 use crate::distance::danielsson_distance_map;
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::gradient::laplacian;
 use crate::image_from_f64;
 use crate::recursive_gaussian::{GaussianOrder, recursive_gaussian_f64};
@@ -593,6 +594,10 @@ fn check_same_size(initial_level_set: &Image, feature_image: &Image) -> Result<(
             b: feature_image.size().to_vec(),
         });
     }
+    // The feature image is a named ProcessObject input, walked by the same
+    // iterator the inherited verifier uses (unlike Chan–Vese's deep-copied
+    // level set), so its grid must match the initial level set's.
+    require_same_physical_space(initial_level_set, feature_image, 1)?;
     Ok(())
 }
 

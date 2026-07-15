@@ -97,6 +97,7 @@ use sitk_core::{Image, PixelId};
 use crate::convolution::{ravel, unravel};
 use crate::error::{FilterError, Result};
 use crate::fft::{self, Complex, LineKernel};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 
 /// Output pixel-type mapping for both filters: `Float32` for a `Float32`
@@ -297,8 +298,14 @@ fn precision_tolerance(max_denominator: f64, real: PixelId) -> f64 {
 
 /// SimpleITK casts every input through `CastImageToITK<InputImageType>` (both
 /// yamls' `custom_itk_cast`), which requires one pixel type across the images
-/// and their masks; `VerifyInputInformation` (hxx:602-633) additionally
-/// requires each mask to match its own image's size.
+/// and their masks. `VerifyInputInformation` (hxx:602-633) is
+/// VERIFIES-AND-ADDS: it first calls `Superclass::VerifyInputInformation()`,
+/// which walks every input (`FixedImage`, `MovingImage`, `FixedImageMask`,
+/// `MovingImageMask` are all `itkSetInputMacro` inputs, `.h:189,194,199,204`)
+/// and compares each against the fixed image's origin/spacing/direction
+/// (`itkImageToImageFilter.hxx:148-223`), *then* additionally requires each mask
+/// to match its own image's size. The physical-space check is the inherited
+/// superclass part; the size checks below are what this subclass adds.
 fn check_inputs(
     fixed: &Image,
     moving: &Image,
@@ -316,6 +323,15 @@ fn check_inputs(
             a: fixed.pixel_id(),
             b: moving.pixel_id(),
         });
+    }
+    // Superclass::VerifyInputInformation: every input shares the fixed image's
+    // physical space. Masks are inputs too, so they are compared when present.
+    require_same_physical_space(fixed, moving, 1)?;
+    if let Some(mask) = fixed_mask {
+        require_same_physical_space(fixed, mask, 2)?;
+    }
+    if let Some(mask) = moving_mask {
+        require_same_physical_space(fixed, mask, 3)?;
     }
     for (image, mask) in [(fixed, fixed_mask), (moving, moving_mask)] {
         let Some(mask) = mask else { continue };
@@ -691,10 +707,18 @@ mod tests {
 
     #[test]
     fn output_origin_centres_the_moving_image_on_each_score() {
+        // MaskedFFTNormalizedCorrelationImageFilter inherits the base
+        // VerifyInputInformation (its own override only adds the mask-size checks),
+        // so fixed and moving must share physical space — a mismatch is refused
+        // (pinned in tests/physical_space_precondition.rs). The output origin
+        // depends on the fixed geometry and the moving *size*, not the moving
+        // origin/spacing, so a congruent moving leaves the assertion intact.
         let mut fixed = noise(&[6, 4], 3);
         fixed.set_spacing(&[2.0, 0.5]).unwrap();
         fixed.set_origin(&[10.0, -3.0]).unwrap();
-        let moving = noise(&[3, 5], 4);
+        let mut moving = noise(&[3, 5], 4);
+        moving.set_spacing(&[2.0, 0.5]).unwrap();
+        moving.set_origin(&[10.0, -3.0]).unwrap();
 
         let out = fft_normalized_correlation(&fixed, &moving, 0, 0.0).unwrap();
         // Continuous index (-(3-1)/2, -(5-1)/2) = (-1, -2) of the fixed image.

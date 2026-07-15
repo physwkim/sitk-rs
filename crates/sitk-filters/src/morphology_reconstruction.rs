@@ -182,6 +182,7 @@
 //! `BackgroundValue` member at all.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::label::connected_component;
 use crate::morphology::{
     StructuringElement, binary_dilate, binary_erode, bounds_for, grayscale_dilate, grayscale_erode,
@@ -452,6 +453,7 @@ pub fn binary_reconstruction_by_dilation(
     fully_connected: bool,
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
+    require_same_physical_space(marker_image, mask_image, 1)?;
     let out = reconstruct_by_dilation_components(
         &marker_image.to_f64_vec()?,
         &mask_image.to_f64_vec()?,
@@ -475,6 +477,7 @@ pub fn binary_reconstruction_by_erosion(
     fully_connected: bool,
 ) -> Result<Image> {
     require_same_shape(marker_image, mask_image)?;
+    require_same_physical_space(marker_image, mask_image, 1)?;
     let out = reconstruct_by_erosion_components(
         &marker_image.to_f64_vec()?,
         &mask_image.to_f64_vec()?,

@@ -72,6 +72,7 @@
 use sitk_core::{Complex, Image, PixelId, Real};
 
 use crate::error::FilterError;
+use crate::geometry::require_same_physical_space;
 use crate::{Result, require_same_shape};
 
 /// The component-type arithmetic the four complex functors need, held on one
@@ -243,10 +244,12 @@ fn complex_binary(a: &Image, b: &Image, how: Compose) -> Result<Image> {
     match a.pixel_id() {
         PixelId::Float32 => {
             require_same_shape(a, b)?;
+            require_same_physical_space(a, b, 1)?;
             combine::<f32>(a, b, how)
         }
         PixelId::Float64 => {
             require_same_shape(a, b)?;
+            require_same_physical_space(a, b, 1)?;
             combine::<f64>(a, b, how)
         }
         other => Err(FilterError::RequiresRealPixelType(other)),
@@ -465,11 +468,18 @@ mod tests {
     }
 
     #[test]
-    fn real_and_imaginary_to_complex_takes_the_first_inputs_geometry() {
+    fn real_and_imaginary_to_complex_carries_the_shared_geometry() {
+        // ComposeImageFilter (which SimpleITK's RealAndImaginaryToComplex wraps)
+        // inherits ImageToImageFilter::VerifyInputInformation, so the two inputs
+        // must occupy the same physical space; a mismatch is refused (that
+        // direction is pinned in tests/physical_space_precondition.rs). Given
+        // congruent inputs, the output carries that geometry.
         let mut re = Image::from_vec(&[2, 1], vec![1.0f64, 2.0]).unwrap();
         re.set_spacing(&[0.5, 2.0]).unwrap();
         re.set_origin(&[-1.0, 3.0]).unwrap();
-        let im = Image::from_vec(&[2, 1], vec![3.0f64, 4.0]).unwrap();
+        let mut im = Image::from_vec(&[2, 1], vec![3.0f64, 4.0]).unwrap();
+        im.set_spacing(&[0.5, 2.0]).unwrap();
+        im.set_origin(&[-1.0, 3.0]).unwrap();
         let out = real_and_imaginary_to_complex(&re, &im).unwrap();
         assert_eq!(out.spacing(), re.spacing());
         assert_eq!(out.origin(), re.origin());

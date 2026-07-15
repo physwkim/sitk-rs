@@ -88,6 +88,7 @@
 //! [`crate::reconstruction::NeighborWalker`].
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 use crate::label::connected_component;
 use crate::reconstruction::{Half, NeighborWalker};
@@ -154,6 +155,7 @@ pub fn morphological_watershed_from_markers(
             b: marker_image.size().to_vec(),
         });
     }
+    require_same_physical_space(image, marker_image, 1)?;
 
     let size = image.size();
     let total = image.number_of_pixels();

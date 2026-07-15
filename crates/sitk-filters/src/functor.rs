@@ -49,6 +49,7 @@
 //! same reason.
 
 use crate::Result;
+use crate::geometry::require_same_physical_space;
 use crate::require_same_shape;
 use sitk_core::{Image, Scalar, dispatch_scalar};
 
@@ -215,6 +216,7 @@ pub(crate) fn comparison_apply<F: AllScalarsComparisonFunctor>(
     f: &F,
 ) -> Result<Image> {
     require_same_shape(a, b)?;
+    require_same_physical_space(a, b, 1)?;
     dispatch_scalar!(a.pixel_id(), comparison_apply_typed, a, b, f)
 }
 
@@ -319,6 +321,7 @@ pub(crate) fn binary_apply<F: AllScalarsBinaryFunctor>(
     f: &F,
 ) -> Result<Image> {
     require_same_shape(a, b)?;
+    require_same_physical_space(a, b, 1)?;
     dispatch_scalar!(a.pixel_id(), binary_apply_typed, a, b, f)
 }
 
@@ -331,6 +334,7 @@ pub(crate) fn binary_apply_in_place<F: AllScalarsBinaryFunctor>(
     f: &F,
 ) -> Result<Image> {
     require_same_shape(&a, b)?;
+    require_same_physical_space(&a, b, 1)?;
     dispatch_scalar!(a.pixel_id(), binary_apply_typed_in_place, a, b, f)
 }
 

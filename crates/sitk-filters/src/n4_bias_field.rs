@@ -37,6 +37,7 @@ mod bspline;
 
 use crate::error::{FilterError, Result};
 use crate::fft::{Complex, LineKernel, transform_1d_unnormalized};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 use bspline::{FitInput, Lattice};
 use sitk_core::{Image, PixelId};
@@ -189,13 +190,17 @@ impl<'a> N4<'a> {
             return Err(FilterError::RequiresRealPixelType(image.pixel_id()));
         }
         let dim = image.dimension();
-        if let Some(other) = confidence_image
-            && other.size() != image.size()
-        {
-            return Err(FilterError::SizeMismatch {
-                a: image.size().to_vec(),
-                b: other.size().to_vec(),
-            });
+        if let Some(other) = confidence_image {
+            if other.size() != image.size() {
+                return Err(FilterError::SizeMismatch {
+                    a: image.size().to_vec(),
+                    b: other.size().to_vec(),
+                });
+            }
+            // The confidence image is `itkSetInputMacro(ConfidenceImage, …)`
+            // (`itkN4BiasFieldCorrectionImageFilter.h:198`), a named input the
+            // inherited verifier walks — so its grid is compared like the mask's.
+            require_same_physical_space(image, other, 1)?;
         }
         if settings.number_of_histogram_bins < 2 {
             return Err(FilterError::N4InvalidHistogramBins(

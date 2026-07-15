@@ -8,6 +8,7 @@
 //! out of scope).
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::image_from_f64;
 use crate::require_same_shape;
 use sitk_core::Image;
@@ -42,6 +43,7 @@ fn require_dim(len: usize, dim: usize) -> Result<()> {
 /// `image1` and `image2` must have the same size and pixel type.
 pub fn checker_board(image1: &Image, image2: &Image, checker_pattern: &[u32]) -> Result<Image> {
     require_same_shape(image1, image2)?;
+    require_same_physical_space(image1, image2, 1)?;
     let dim = image1.dimension();
     require_dim(checker_pattern.len(), dim)?;
 

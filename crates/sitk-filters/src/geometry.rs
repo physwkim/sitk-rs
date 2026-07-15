@@ -46,6 +46,35 @@ pub(crate) fn same_physical_space(primary: &Image, other: &Image) -> bool {
     )
 }
 
+/// The one gate every multi-image filter that ITK *verifies* routes through:
+/// `other` (the filter's input number `index`, counting the primary as input 0)
+/// must sit on the primary's grid, or the whole family returns the *same*
+/// [`FilterError::PhysicalSpaceMismatch`]. A caller cannot tell `add` from `mask`
+/// by which error fired — exactly as ITK throws one "Inputs do not occupy the
+/// same physical space!" for every filter that inherits
+/// `ImageToImageFilter::VerifyInputInformation`.
+///
+/// The audit that decides who calls this is `doc/physical-space-audit.md`.
+/// VERIFIES-AND-ADDS filters (`masked_fft_normalized_correlation`) call this
+/// first and then add their own comparison beside it, mirroring an override that
+/// calls `Superclass::VerifyInputInformation()` first. Filters ITK exempts
+/// (`histogram_matching`, the convolution/deconvolution family, `paste`, `tile`,
+/// `demons_registration`) and those whose second image never becomes a pipeline
+/// input (`scalar_chan_and_vese_dense_level_set`'s initial level set,
+/// `normalized_correlation`'s template) must **not** call this — a check there is
+/// a divergence, not a fix.
+pub(crate) fn require_same_physical_space(
+    primary: &Image,
+    other: &Image,
+    index: usize,
+) -> Result<()> {
+    if same_physical_space(primary, other) {
+        Ok(())
+    } else {
+        Err(FilterError::PhysicalSpaceMismatch { index })
+    }
+}
+
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
     let mut s = vec![1usize; size.len()];

@@ -76,6 +76,7 @@
 //!    the honest resolution. Ledger §2.54.
 
 use crate::error::{FilterError, Result};
+use crate::geometry::require_same_physical_space;
 use crate::quantize_to_pixel_type;
 use sitk_core::{Image, PixelId, Scalar, dispatch_scalar};
 
@@ -276,6 +277,7 @@ pub fn label_overlay(
     colormap: &[u8],
 ) -> Result<Image> {
     require_same_size(image, label_image)?;
+    require_same_physical_space(image, label_image, 1)?;
 
     let base_id = image.pixel_id();
     // §2.54: the palette is scaled by the base image's own
