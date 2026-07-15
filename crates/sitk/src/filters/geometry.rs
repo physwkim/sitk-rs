@@ -1,0 +1,1170 @@
+//! Image-grid / geometry filters: every filter here changes the index grid, so
+//! each recomputes origin / spacing / direction exactly as its ITK
+//! `GenerateOutputInformation()` does, then applies SimpleITK's universal
+//! `FixNonZeroIndex` step (sitkImageFilter.h) that folds a non-zero region
+//! start index into an origin shift, since [`Image`] is always zero-indexed.
+//! `FixNonZeroIndex` reduces to `Image::continuous_index_to_physical_point`.
+//!
+//! Ported from:
+//! - `itkCropImageFilter.h` / `.hxx` ([`crop`])
+//! - `itkRegionOfInterestImageFilter.h` / `.hxx` ([`region_of_interest`])
+//! - `itkExtractImageFilter.h` / `.hxx` (Core/Common; [`extract`]), submatrix
+//!   direction-collapse strategy only (`DIRECTIONCOLLAPSETOSUBMATRIX`, the
+//!   forced default of `CropImageFilter`)
+//! - `itkPadImageFilterBase.h` / `.hxx`, `itkPadImageFilter.h` / `.hxx`,
+//!   `itkConstantPadImageFilter.h`, `itkMirrorPadImageFilter.h`,
+//!   `itkWrapPadImageFilter.h`, `itkZeroFluxNeumannPadImageFilter.h`
+//!   ([`constant_pad`], [`mirror_pad`], [`wrap_pad`], [`zero_flux_neumann_pad`])
+//! - `itkFlipImageFilter.h` / `.hxx` ([`flip`])
+//! - `itkPermuteAxesImageFilter.h` / `.hxx` ([`permute_axes`])
+
+use crate::core::{
+    BoundaryCondition, ConstantBoundaryCondition, Image, MirrorBoundaryCondition,
+    PeriodicBoundaryCondition, Scalar, ScalarView, ZeroFluxNeumannBoundaryCondition,
+    dispatch_scalar, matrix,
+};
+use crate::filters::error::{FilterError, Result};
+
+/// Whether a filter's secondary input (a mask, a second series member) sits on
+/// the same physical grid as its primary — `ImageBase::IsCongruentImageGeometry`
+/// (`itkImageBase.hxx:391-406`), which every `ImageToImageFilter` applies to its
+/// extra inputs in `VerifyInputInformation` before it will run.
+///
+/// The predicate itself lives in `sitk-core` as
+/// [`Image::is_congruent_image_geometry`]; this is only the point that pins the
+/// tolerances to `ImageToImageFilter`'s `GlobalDefaultCoordinateTolerance` /
+/// `GlobalDefaultDirectionTolerance` (`itkImageToImageFilter.h`), which none of
+/// this crate's filters override. It is one function because it was three: two
+/// filter modules had grown byte-identical private copies, and the masked
+/// thresholds (§2.173) needed a third.
+pub(crate) fn same_physical_space(primary: &Image, other: &Image) -> bool {
+    primary.is_congruent_image_geometry(
+        other,
+        Image::DEFAULT_IMAGE_COORDINATE_TOLERANCE,
+        Image::DEFAULT_IMAGE_DIRECTION_TOLERANCE,
+    )
+}
+
+/// The one gate every multi-image filter that ITK *verifies* routes through:
+/// `other` (the filter's input number `index`, counting the primary as input 0)
+/// must sit on the primary's grid, or the whole family returns the *same*
+/// [`FilterError::PhysicalSpaceMismatch`]. A caller cannot tell `add` from `mask`
+/// by which error fired — exactly as ITK throws one "Inputs do not occupy the
+/// same physical space!" for every filter that inherits
+/// `ImageToImageFilter::VerifyInputInformation`.
+///
+/// The audit that decides who calls this is `doc/physical-space-audit.md`.
+/// VERIFIES-AND-ADDS filters (`masked_fft_normalized_correlation`) call this
+/// first and then add their own comparison beside it, mirroring an override that
+/// calls `Superclass::VerifyInputInformation()` first. Filters ITK exempts
+/// (`histogram_matching`, the convolution/deconvolution family, `paste`, `tile`,
+/// `demons_registration`) and those whose second image never becomes a pipeline
+/// input (`scalar_chan_and_vese_dense_level_set`'s initial level set,
+/// `normalized_correlation`'s template) must **not** call this — a check there is
+/// a divergence, not a fix.
+pub(crate) fn require_same_physical_space(
+    primary: &Image,
+    other: &Image,
+    index: usize,
+) -> Result<()> {
+    if same_physical_space(primary, other) {
+        Ok(())
+    } else {
+        Err(FilterError::PhysicalSpaceMismatch { index })
+    }
+}
+
+/// First-index-fastest strides for a size vector.
+fn strides(size: &[usize]) -> Vec<usize> {
+    let mut s = vec![1usize; size.len()];
+    for d in 1..size.len() {
+        s[d] = s[d - 1] * size[d - 1];
+    }
+    s
+}
+
+fn require_dim(len: usize, dim: usize) -> Result<()> {
+    if len != dim {
+        return Err(FilterError::DimensionLength {
+            expected: dim,
+            got: len,
+        });
+    }
+    Ok(())
+}
+
+// ---- crop / region_of_interest --------------------------------------------
+//
+// Neither collapses dimensions, so both reduce to: copy the `[offset,
+// offset+out_size)` block, and shift the origin to
+// `img.continuous_index_to_physical_point(offset)` (RegionOfInterestImageFilter
+// ::GenerateOutputInformation calls this directly; CropImageFilter delegates to
+// ExtractImageFilter, whose non-collapsing path is the same computation, see
+// `extract`'s module doc for the collapsing path).
+
+fn extract_block(img: &Image, offset: &[usize], out_size: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    let in_size = img.size();
+    let in_strides = strides(in_size);
+    let out_strides = strides(out_size);
+    let out_count: usize = out_size.iter().product();
+
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
+        let mut in_flat = 0usize;
+        for d in 0..dim {
+            let oi = (o / out_strides[d]) % out_size[d];
+            in_flat += (oi + offset[d]) * in_strides[d];
+        }
+        *slot = Some(in_flat);
+    }
+
+    let offset_f: Vec<f64> = offset.iter().map(|&o| o as f64).collect();
+    let out_origin = img.continuous_index_to_physical_point(&offset_f);
+
+    let mut out = img.gather(out_size, &sources, 0.0)?;
+    out.set_origin(&out_origin)?;
+    Ok(out)
+}
+
+/// `CropImageFilter`: remove `lower[d]` pixels from the start and `upper[d]`
+/// from the end of each axis.
+///
+/// Errors if `lower[d] + upper[d]` exceeds `img.size()[d]` for any axis
+/// (`CropImageFilter::VerifyInputInformation`); equal to the size is allowed
+/// and yields a zero-length axis.
+pub fn crop(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+
+    let size = img.size();
+    let mut out_size = vec![0usize; dim];
+    for d in 0..dim {
+        if lower[d] + upper[d] > size[d] {
+            return Err(FilterError::InvalidCropBounds {
+                axis: d,
+                lower: lower[d],
+                upper: upper[d],
+                size: size[d],
+            });
+        }
+        out_size[d] = size[d] - lower[d] - upper[d];
+    }
+    extract_block(img, lower, &out_size)
+}
+
+/// `RegionOfInterestImageFilter`: extract the block `[index, index + size)`.
+///
+/// Errors if `index[d] + size[d]` exceeds `img.size()[d]` for any axis.
+pub fn region_of_interest(img: &Image, index: &[usize], size: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(index.len(), dim)?;
+    require_dim(size.len(), dim)?;
+
+    let input_size = img.size();
+    for d in 0..dim {
+        if index[d] + size[d] > input_size[d] {
+            return Err(FilterError::RegionOutOfBounds {
+                index: index.to_vec(),
+                size: size.to_vec(),
+                input_size: input_size.to_vec(),
+            });
+        }
+    }
+    extract_block(img, index, size)
+}
+
+// ---- extract ----------------------------------------------------------
+
+/// `ExtractImageFilter` (itkExtractImageFilter.h, Core/Common): extract the
+/// block `[index, index + size)`, collapsing any axis where `size[d] == 0`
+/// into a fixed slice at `index[d]` (matching ITK's
+/// `nonzeroSizeCount`-driven output dimension). Direction-collapse strategy is
+/// always Submatrix, `CropImageFilter`'s forced default
+/// (`SetDirectionCollapseToSubmatrix`).
+///
+/// The output origin is the true physical location of the slice's start
+/// index (**Fixed in this port**). ITK's `GenerateOutputInformation` builds
+/// the output origin only from the *retained* axes' spacing/direction
+/// submatrix and index, so a collapsed axis's own index and any direction
+/// cosine coupling it to a retained physical component are dropped — on an
+/// oblique volume every slice then reports slice 0's in-plane origin, so the
+/// slices no longer stack at their true world positions. This port instead
+/// takes the retained physical components of the full N-D
+/// `TransformIndexToPhysicalPoint(index)`, so slice `k` lands where it
+/// physically is. (For a diagonal direction this coincides with ITK's result,
+/// since no collapsed axis couples into a retained component.)
+///
+/// Errors if a retained axis's `[index, index + size)` exceeds the input size,
+/// if a collapsed axis's `index` is out of bounds, if every axis collapses
+/// (`ExtractCollapsedAllAxes`), or if the collapsed direction submatrix is
+/// singular (`SingularCollapsedDirection`, ITK's `vnl_determinant == 0` check).
+pub fn extract(img: &Image, size: &[usize], index: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(size.len(), dim)?;
+    require_dim(index.len(), dim)?;
+
+    let in_size = img.size();
+    for d in 0..dim {
+        let in_bounds = if size[d] == 0 {
+            index[d] < in_size[d]
+        } else {
+            index[d] + size[d] <= in_size[d]
+        };
+        if !in_bounds {
+            return Err(FilterError::RegionOutOfBounds {
+                index: index.to_vec(),
+                size: size.to_vec(),
+                input_size: in_size.to_vec(),
+            });
+        }
+    }
+
+    let retained: Vec<usize> = (0..dim).filter(|&d| size[d] != 0).collect();
+    if retained.is_empty() {
+        return Err(FilterError::ExtractCollapsedAllAxes);
+    }
+    let out_dim = retained.len();
+
+    let in_spacing = img.spacing();
+    let in_direction = img.direction();
+
+    let mut out_size = vec![0usize; out_dim];
+    let mut out_spacing = vec![0.0f64; out_dim];
+    let mut out_direction = vec![0.0f64; out_dim * out_dim];
+    for (a, &d) in retained.iter().enumerate() {
+        out_size[a] = size[d];
+        out_spacing[a] = in_spacing[d];
+        for (b, &e) in retained.iter().enumerate() {
+            out_direction[a * out_dim + b] = in_direction[d * dim + e];
+        }
+    }
+
+    if out_dim != dim && matrix::invert(&out_direction, out_dim).is_none() {
+        return Err(FilterError::SingularCollapsedDirection);
+    }
+
+    // FixNonZeroIndex: the output origin is the physical location of the
+    // slice's start index in the input image (see the doc comment above). ITK
+    // builds it from the retained submatrix alone, so a collapsed axis's index
+    // and the direction cosines coupling it into a retained physical component
+    // are dropped; this port instead takes the retained physical components of
+    // the full N-D `TransformIndexToPhysicalPoint(index)`, so an oblique
+    // volume's slice k lands at its true world position.
+    let index_f: Vec<f64> = index.iter().map(|&i| i as f64).collect();
+    let phys = img.continuous_index_to_physical_point(&index_f);
+    let out_origin: Vec<f64> = retained.iter().map(|&d| phys[d]).collect();
+
+    let in_strides = strides(in_size);
+    let out_strides = strides(&out_size);
+    let out_count: usize = out_size.iter().product();
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
+        let mut in_flat = 0usize;
+        for d in 0..dim {
+            if size[d] == 0 {
+                in_flat += index[d] * in_strides[d];
+            }
+        }
+        for (a, &d) in retained.iter().enumerate() {
+            let oi = (o / out_strides[a]) % out_size[a];
+            in_flat += (oi + index[d]) * in_strides[d];
+        }
+        *slot = Some(in_flat);
+    }
+
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
+    out.set_spacing(&out_spacing)?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(&out_direction)?;
+    Ok(out)
+}
+
+// ---- constant_pad / mirror_pad / wrap_pad ----------------------------------
+//
+// `PadImageFilter::GenerateOutputInformation`: outSize[d] = inSize[d] +
+// lower[d] + upper[d], outStartIndex[d] = -lower[d]; spacing/direction are
+// unchanged, and FixNonZeroIndex folds the (always non-zero-once-any lower[d]
+// > 0) start index into an origin shift, using the *input*'s own geometry
+// (spacing/direction unchanged at that point): out_origin =
+// img.continuous_index_to_physical_point(-lower).
+//
+// `PadImageFilterBase::DynamicThreadedGenerateData` fills every output pixel
+// through the filter's `ImageBoundaryCondition`, evaluated at the input-space
+// index `outputIndex - lower` (an interior pixel is a boundary condition
+// evaluated at an in-bounds index, which every impl reads through as-is).
+
+fn pad_geometry(img: &Image, lower: &[usize], upper: &[usize]) -> (Vec<usize>, Vec<f64>) {
+    let dim = img.dimension();
+    let in_size = img.size();
+    let out_size: Vec<usize> = (0..dim).map(|d| in_size[d] + lower[d] + upper[d]).collect();
+    let neg_lower: Vec<f64> = lower.iter().map(|&l| -(l as f64)).collect();
+    let out_origin = img.continuous_index_to_physical_point(&neg_lower);
+    (out_size, out_origin)
+}
+
+fn pad_fill<T: Scalar, B: BoundaryCondition<T>>(
+    img: &ScalarView<'_, T>,
+    lower: &[usize],
+    out_size: &[usize],
+    boundary: &B,
+) -> Vec<T> {
+    let dim = out_size.len();
+    let out_strides = strides(out_size);
+    let out_count: usize = out_size.iter().product();
+    let mut out = Vec::with_capacity(out_count);
+    for o in 0..out_count {
+        let mut ext_index = vec![0i64; dim];
+        for d in 0..dim {
+            let oi = (o / out_strides[d]) % out_size[d];
+            ext_index[d] = oi as i64 - lower[d] as i64;
+        }
+        out.push(boundary.get_pixel(&ext_index, img));
+    }
+    out
+}
+
+fn constant_pad_typed<T: Scalar>(
+    img: &Image,
+    lower: &[usize],
+    out_size: &[usize],
+    constant: f64,
+) -> Result<Image> {
+    let bc = ConstantBoundaryCondition::new(T::from_f64(constant));
+    let vals = pad_fill(&img.scalar_view::<T>()?, lower, out_size, &bc);
+    Ok(Image::from_vec(out_size, vals)?)
+}
+
+fn mirror_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &MirrorBoundaryCondition,
+    );
+    Ok(Image::from_vec(out_size, vals)?)
+}
+
+fn wrap_pad_typed<T: Scalar>(img: &Image, lower: &[usize], out_size: &[usize]) -> Result<Image> {
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &PeriodicBoundaryCondition,
+    );
+    Ok(Image::from_vec(out_size, vals)?)
+}
+
+/// `ConstantPadImageFilter`: grow the image by `lower`/`upper` pixels per
+/// axis, filling new pixels with `constant`.
+pub fn constant_pad(img: &Image, lower: &[usize], upper: &[usize], constant: f64) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+    let (out_size, out_origin) = pad_geometry(img, lower, upper);
+    let mut out = dispatch_scalar!(
+        img.pixel_id(),
+        constant_pad_typed,
+        img,
+        lower,
+        &out_size,
+        constant
+    )?;
+    out.set_spacing(img.spacing())?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(img.direction())?;
+    Ok(out)
+}
+
+/// `MirrorPadImageFilter`: grow the image by `lower`/`upper` pixels per axis,
+/// filling new pixels by mirror-reflecting the input at its edges
+/// ([`crate::core::MirrorBoundaryCondition`]).
+pub fn mirror_pad(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+    let (out_size, out_origin) = pad_geometry(img, lower, upper);
+    let mut out = dispatch_scalar!(img.pixel_id(), mirror_pad_typed, img, lower, &out_size)?;
+    out.set_spacing(img.spacing())?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(img.direction())?;
+    Ok(out)
+}
+
+/// `WrapPadImageFilter`: grow the image by `lower`/`upper` pixels per axis,
+/// filling new pixels by periodically wrapping the input
+/// ([`crate::core::PeriodicBoundaryCondition`]).
+pub fn wrap_pad(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+    let (out_size, out_origin) = pad_geometry(img, lower, upper);
+    let mut out = dispatch_scalar!(img.pixel_id(), wrap_pad_typed, img, lower, &out_size)?;
+    out.set_spacing(img.spacing())?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(img.direction())?;
+    Ok(out)
+}
+
+fn zero_flux_neumann_pad_typed<T: Scalar>(
+    img: &Image,
+    lower: &[usize],
+    out_size: &[usize],
+) -> Result<Image> {
+    let vals: Vec<T> = pad_fill(
+        &img.scalar_view::<T>()?,
+        lower,
+        out_size,
+        &ZeroFluxNeumannBoundaryCondition,
+    );
+    Ok(Image::from_vec(out_size, vals)?)
+}
+
+/// `ZeroFluxNeumannPadImageFilter` (`itkZeroFluxNeumannPadImageFilter.h`):
+/// grow the image by `lower`/`upper` pixels per axis, filling new pixels by
+/// clamping each out-of-bounds index to the nearest edge pixel per axis
+/// independently ([`crate::core::ZeroFluxNeumannBoundaryCondition`]) -- unlike
+/// [`mirror_pad`]/[`wrap_pad`], every padded pixel repeats its nearest edge
+/// value rather than reflecting or wrapping.
+pub fn zero_flux_neumann_pad(img: &Image, lower: &[usize], upper: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(lower.len(), dim)?;
+    require_dim(upper.len(), dim)?;
+    let (out_size, out_origin) = pad_geometry(img, lower, upper);
+    let mut out = dispatch_scalar!(
+        img.pixel_id(),
+        zero_flux_neumann_pad_typed,
+        img,
+        lower,
+        &out_size
+    )?;
+    out.set_spacing(img.spacing())?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(img.direction())?;
+    Ok(out)
+}
+
+// ---- flip -------------------------------------------------------------
+
+/// `FlipImageFilter`: reverse pixel order along each axis where `axes[d]` is
+/// `true`.
+///
+/// `flip_about_origin` selects which of ITK's two origin/direction
+/// conventions applies (`itkFlipImageFilter.hxx::GenerateOutputInformation`):
+/// - `false`: the output covers the same physical extent read in reverse —
+///   direction column `d` is negated for each flipped axis, origin becomes the
+///   physical point of the last voxel along that axis.
+/// - `true`: direction is unchanged, and the (still-computed) origin is
+///   negated component-wise for each flipped axis, mirroring the image through
+///   the physical-space origin.
+pub fn flip(img: &Image, axes: &[bool], flip_about_origin: bool) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(axes.len(), dim)?;
+
+    let size = img.size();
+    let direction = img.direction();
+
+    let new_index: Vec<f64> = (0..dim)
+        .map(|d| if axes[d] { (size[d] - 1) as f64 } else { 0.0 })
+        .collect();
+    let mut out_origin = img.continuous_index_to_physical_point(&new_index);
+    if flip_about_origin {
+        for (d, o) in out_origin.iter_mut().enumerate() {
+            if axes[d] {
+                *o = -*o;
+            }
+        }
+    }
+
+    let mut out_direction = direction.to_vec();
+    if !flip_about_origin {
+        for d in 0..dim {
+            if axes[d] {
+                for row in 0..dim {
+                    out_direction[row * dim + d] *= -1.0;
+                }
+            }
+        }
+    }
+
+    let in_strides = strides(size);
+    let out_count = img.number_of_pixels();
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o, slot) in sources.iter_mut().enumerate() {
+        let mut in_flat = 0usize;
+        for d in 0..dim {
+            let oi = (o / in_strides[d]) % size[d];
+            let ii = if axes[d] { size[d] - 1 - oi } else { oi };
+            in_flat += ii * in_strides[d];
+        }
+        *slot = Some(in_flat);
+    }
+
+    let mut out = img.gather(size, &sources, 0.0)?;
+    out.set_origin(&out_origin)?;
+    out.set_direction(&out_direction)?;
+    Ok(out)
+}
+
+// ---- permute_axes -----------------------------------------------------
+
+/// `PermuteAxesImageFilter`: reorder axes so output axis `j` is input axis
+/// `order[j]`. Origin is unchanged (`GenerateOutputInformation` copies
+/// `inputOrigin[j]` to `outputOrigin[j]` directly, without permuting it).
+///
+/// Errors if `order` is not a permutation of `0..img.dimension()`
+/// (`PermuteAxesImageFilter::SetOrder`).
+pub fn permute_axes(img: &Image, order: &[usize]) -> Result<Image> {
+    let dim = img.dimension();
+    require_dim(order.len(), dim)?;
+
+    let mut seen = vec![false; dim];
+    for &o in order {
+        if o >= dim || seen[o] {
+            return Err(FilterError::InvalidPermutation(order.to_vec(), dim));
+        }
+        seen[o] = true;
+    }
+    let mut inverse_order = vec![0usize; dim];
+    for (j, &o) in order.iter().enumerate() {
+        inverse_order[o] = j;
+    }
+
+    let in_size = img.size();
+    let in_spacing = img.spacing();
+    let in_direction = img.direction();
+
+    let out_size: Vec<usize> = order.iter().map(|&o| in_size[o]).collect();
+    let out_spacing: Vec<f64> = order.iter().map(|&o| in_spacing[o]).collect();
+    let mut out_direction = vec![0.0f64; dim * dim];
+    for i in 0..dim {
+        for (j, &o) in order.iter().enumerate() {
+            out_direction[i * dim + j] = in_direction[i * dim + o];
+        }
+    }
+
+    let in_strides = strides(in_size);
+    let out_strides = strides(&out_size);
+    let out_count: usize = out_size.iter().product();
+    let mut sources: Vec<Option<usize>> = vec![None; out_count];
+    for (o_flat, slot) in sources.iter_mut().enumerate() {
+        let mut in_flat = 0usize;
+        for j in 0..dim {
+            let k = inverse_order[j];
+            let idx_k = (o_flat / out_strides[k]) % out_size[k];
+            in_flat += idx_k * in_strides[j];
+        }
+        *slot = Some(in_flat);
+    }
+
+    let mut out = img.gather(&out_size, &sources, 0.0)?;
+    out.set_spacing(&out_spacing)?;
+    out.set_direction(&out_direction)?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::PixelId;
+
+    /// An oblique (non-identity) 2-D rotation direction, used by every test
+    /// that must prove a formula actually consults the direction matrix
+    /// rather than assuming identity.
+    fn rotated_2d(size: &[usize], spacing: &[f64], origin: &[f64], data: Vec<f64>) -> Image {
+        let mut img = Image::from_vec(size, data).unwrap();
+        img.set_spacing(spacing).unwrap();
+        img.set_origin(origin).unwrap();
+        let theta = std::f64::consts::FRAC_PI_6;
+        img.set_direction(&[theta.cos(), -theta.sin(), theta.sin(), theta.cos()])
+            .unwrap();
+        img
+    }
+
+    // ---- crop ----
+
+    #[test]
+    fn crop_removes_pixels_and_shifts_origin_through_direction() {
+        let img = rotated_2d(
+            &[4, 4],
+            &[2.0, 3.0],
+            &[10.0, -5.0],
+            (0..16).map(|v| v as f64).collect(),
+        );
+        let out = crop(&img, &[1, 1], &[1, 1]).unwrap();
+        assert_eq!(out.size(), &[2, 2]);
+        assert_eq!(out.spacing(), img.spacing());
+        assert_eq!(out.direction(), img.direction());
+        let expected_origin = img.continuous_index_to_physical_point(&[1.0, 1.0]);
+        for (a, b) in out.origin().iter().zip(expected_origin.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        // Row-major, first-index-fastest: interior 2x2 block of a 4x4 grid
+        // starting at (1,1) is values [5,6,9,10].
+        assert_eq!(out.to_f64_vec().unwrap(), vec![5.0, 6.0, 9.0, 10.0]);
+    }
+
+    #[test]
+    fn crop_zero_width_axis_is_allowed() {
+        // lower + upper == size on axis 0: ITK's VerifyInputInformation only
+        // throws on strictly-insufficient size, not equality.
+        let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
+        let out = crop(&img, &[4, 0], &[0, 0]).unwrap();
+        assert_eq!(out.size(), &[0, 3]);
+        assert_eq!(out.number_of_pixels(), 0);
+    }
+
+    #[test]
+    fn crop_bounds_exceeding_size_errors() {
+        let img = Image::new(&[4, 4], PixelId::UInt8);
+        assert_eq!(
+            crop(&img, &[3, 0], &[2, 0]),
+            Err(FilterError::InvalidCropBounds {
+                axis: 0,
+                lower: 3,
+                upper: 2,
+                size: 4
+            })
+        );
+    }
+
+    #[test]
+    fn crop_physical_point_of_surviving_voxel_is_invariant() {
+        // A voxel that survives the crop must sit at the same physical point
+        // before and after, even under anisotropic spacing and an oblique
+        // direction.
+        let img = rotated_2d(
+            &[6, 5],
+            &[1.5, 0.75],
+            &[3.0, -2.0],
+            (0..30).map(|v| v as f64).collect(),
+        );
+        let out = crop(&img, &[2, 1], &[1, 1]).unwrap();
+        let survivor_in_input = [3.0, 2.0]; // index (2,1) + (1,1) inside the retained block
+        let survivor_in_output = [1.0, 1.0];
+        let p_in = img.continuous_index_to_physical_point(&survivor_in_input);
+        let p_out = out.continuous_index_to_physical_point(&survivor_in_output);
+        for (a, b) in p_in.iter().zip(p_out.iter()) {
+            assert!((a - b).abs() < 1e-10, "{p_in:?} vs {p_out:?}");
+        }
+    }
+
+    // ---- region_of_interest ----
+
+    #[test]
+    fn region_of_interest_extracts_block() {
+        let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
+        let out = region_of_interest(&img, &[1, 0], &[2, 2]).unwrap();
+        assert_eq!(out.size(), &[2, 2]);
+        // Block starting at (1,0), 2x2: values [1,2,5,6].
+        assert_eq!(out.to_f64_vec().unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
+        let expected_origin = img.continuous_index_to_physical_point(&[1.0, 0.0]);
+        assert_eq!(out.origin(), expected_origin.as_slice());
+    }
+
+    #[test]
+    fn region_of_interest_zero_size_axis_is_allowed() {
+        let img = Image::from_vec(&[4, 3], (0..12).map(|v| v as f64).collect()).unwrap();
+        let out = region_of_interest(&img, &[2, 1], &[0, 2]).unwrap();
+        assert_eq!(out.size(), &[0, 2]);
+    }
+
+    #[test]
+    fn region_of_interest_out_of_bounds_errors() {
+        let img = Image::new(&[4, 3], PixelId::UInt8);
+        assert!(matches!(
+            region_of_interest(&img, &[3, 0], &[2, 1]),
+            Err(FilterError::RegionOutOfBounds { .. })
+        ));
+    }
+
+    // ---- extract ----
+
+    #[test]
+    fn extract_same_dimension_matches_region_of_interest() {
+        let img = rotated_2d(
+            &[5, 4],
+            &[1.0, 2.0],
+            &[0.0, 0.0],
+            (0..20).map(|v| v as f64).collect(),
+        );
+        let a = extract(&img, &[2, 2], &[1, 1]).unwrap();
+        let b = region_of_interest(&img, &[1, 1], &[2, 2]).unwrap();
+        assert_eq!(a.size(), b.size());
+        assert_eq!(a.origin(), b.origin());
+        assert_eq!(a.direction(), b.direction());
+        assert_eq!(a.to_f64_vec().unwrap(), b.to_f64_vec().unwrap());
+    }
+
+    #[test]
+    fn extract_collapses_zero_size_axis_and_drops_dimension() {
+        // 3x3x3 volume, value(x,y,z) = x + 10y + 100z; extract the z=1 slice.
+        let mut data = vec![0.0f64; 27];
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    data[z * 9 + y * 3 + x] = (x + 10 * y + 100 * z) as f64;
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[3, 3, 3], data).unwrap();
+        img.set_spacing(&[1.0, 1.0, 2.0]).unwrap();
+        img.set_origin(&[5.0, 5.0, 5.0]).unwrap();
+        let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
+        assert_eq!(out.dimension(), 2);
+        assert_eq!(out.size(), &[3, 3]);
+        // Diagonal direction: the collapsed z axis does not couple into the
+        // x/y physical components, so the true physical point of index
+        // [0,0,1] still has x=5, y=5 (only its z advances, which the 2-D
+        // output cannot carry). The oblique case below is where the fix bites.
+        assert_eq!(out.origin(), &[5.0, 5.0]);
+        assert_eq!(out.spacing(), &[1.0, 1.0]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![
+                100.0, 101.0, 102.0, 110.0, 111.0, 112.0, 120.0, 121.0, 122.0
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_collapsed_oblique_axis_shifts_the_retained_origin() {
+        // 3x3x3 volume, direction = rotation about y by 30 degrees, so the z
+        // axis (column 2 = [sin30, 0, cos30]) couples into physical x. Extract
+        // the z=1 slice (collapsing z). The true physical point of index
+        // [0,0,1] is origin + D * (spacing (.) index) = [sin30 * 2, 0, cos30 *
+        // 2] = [1.0, 0.0, 1.732...]; its retained (x,y) components give the
+        // output origin [1.0, 0.0]. ITK, building the origin from the retained
+        // submatrix alone, would drop the z coupling and report slice 0's
+        // origin [0.0, 0.0]; this port reports the true world position.
+        let mut data = vec![0.0f64; 27];
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    data[z * 9 + y * 3 + x] = (x + 10 * y + 100 * z) as f64;
+                }
+            }
+        }
+        let mut img = Image::from_vec(&[3, 3, 3], data).unwrap();
+        img.set_spacing(&[1.0, 1.0, 2.0]).unwrap();
+        img.set_origin(&[0.0, 0.0, 0.0]).unwrap();
+        let theta = std::f64::consts::FRAC_PI_6;
+        let (c, s) = (theta.cos(), theta.sin());
+        img.set_direction(&[
+            c, 0.0, s, //
+            0.0, 1.0, 0.0, //
+            -s, 0.0, c,
+        ])
+        .unwrap();
+        let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
+        assert_eq!(out.dimension(), 2);
+        assert_eq!(out.size(), &[3, 3]);
+        let origin = out.origin();
+        assert!((origin[0] - 1.0).abs() < 1e-12, "{origin:?}");
+        assert!((origin[1] - 0.0).abs() < 1e-12, "{origin:?}");
+        // The retained (x,y) direction submatrix is diagonal: [[cos, 0],[0,1]].
+        let dir = out.direction();
+        assert!((dir[0] - c).abs() < 1e-12, "{dir:?}");
+        assert_eq!(dir[1], 0.0);
+        assert_eq!(dir[2], 0.0);
+        assert_eq!(dir[3], 1.0);
+        assert_eq!(out.spacing(), &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn extract_collapsing_all_axes_errors() {
+        let img = Image::new(&[4, 4], PixelId::UInt8);
+        assert_eq!(
+            extract(&img, &[0, 0], &[1, 1]),
+            Err(FilterError::ExtractCollapsedAllAxes)
+        );
+    }
+
+    #[test]
+    fn extract_collapsed_axis_out_of_bounds_errors() {
+        let img = Image::new(&[3, 3, 3], PixelId::UInt8);
+        assert!(matches!(
+            extract(&img, &[3, 3, 0], &[0, 0, 5]),
+            Err(FilterError::RegionOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn extract_singular_collapsed_direction_errors() {
+        // 3-D direction whose 2x2 submatrix over the retained (x,y) axes is
+        // singular (both rows equal), even though the full 3x3 is not
+        // degenerate in a way `Image::set_direction` rejects.
+        let mut img = Image::new(&[2, 2, 2], PixelId::Float64);
+        img.set_direction(&[
+            1.0, 0.0, 0.0, //
+            1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0,
+        ])
+        .unwrap();
+        assert_eq!(
+            extract(&img, &[2, 2, 0], &[0, 0, 0]),
+            Err(FilterError::SingularCollapsedDirection)
+        );
+    }
+
+    // ---- constant_pad / mirror_pad / wrap_pad ----
+
+    #[test]
+    fn constant_pad_grows_and_shifts_origin_through_direction() {
+        let img = rotated_2d(&[2, 2], &[2.0, 3.0], &[1.0, 1.0], vec![1.0, 2.0, 3.0, 4.0]);
+        let out = constant_pad(&img, &[1, 0], &[0, 1], 9.0).unwrap();
+        assert_eq!(out.size(), &[3, 3]);
+        assert_eq!(out.spacing(), img.spacing());
+        assert_eq!(out.direction(), img.direction());
+        let expected_origin = img.continuous_index_to_physical_point(&[-1.0, 0.0]);
+        for (a, b) in out.origin().iter().zip(expected_origin.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        // Original 2x2 sits at output offset (1,0); new pixels are 9.0.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![9.0, 1.0, 2.0, 9.0, 3.0, 4.0, 9.0, 9.0, 9.0]
+        );
+    }
+
+    #[test]
+    fn pad_of_size_zero_is_identity() {
+        let img = Image::from_vec(&[3, 2], (0..6).map(|v| v as f64).collect()).unwrap();
+        let out = constant_pad(&img, &[0, 0], &[0, 0], 42.0).unwrap();
+        assert_eq!(out.size(), img.size());
+        assert_eq!(out.origin(), img.origin());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
+    }
+
+    #[test]
+    fn mirror_pad_reflects_edges() {
+        let img = Image::from_vec(&[4, 1], vec![10.0f64, 11.0, 12.0, 13.0]).unwrap();
+        let out = mirror_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(out.size(), &[8, 1]);
+        // index -1,-2 mirror to 0,1; index 4,5 mirror to 3,2.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![11.0, 10.0, 10.0, 11.0, 12.0, 13.0, 13.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn wrap_pad_wraps_edges() {
+        let img = Image::from_vec(&[4, 1], vec![10.0f64, 11.0, 12.0, 13.0]).unwrap();
+        let out = wrap_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(out.size(), &[8, 1]);
+        // index -1,-2 wrap to 3,2; index 4,5 wrap to 0,1.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0]
+        );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_clamps_to_the_nearest_edge_pixel() {
+        let img = Image::from_vec(&[4, 1], vec![10.0f64, 11.0, 12.0, 13.0]).unwrap();
+        let out = zero_flux_neumann_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(out.size(), &[8, 1]);
+        // index -1,-2 both clamp to 0; index 4,5 both clamp to 3.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![10.0, 10.0, 10.0, 11.0, 12.0, 13.0, 13.0, 13.0]
+        );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_matches_the_yaml_doc_example() {
+        // itkZeroFluxNeumannPadImageFilter.h:38-53 / the yaml's own
+        // detaileddescription: padding a 5x3 corner by lower=[2,2],
+        // upper=[0,0] replicates each edge value outward, including the
+        // top-left corner value into the whole padded corner block.
+        let img = Image::from_vec(
+            &[5, 3],
+            vec![
+                1.0f64, 2.0, 3.0, 4.0, 5.0, //
+                3.0, 3.0, 5.0, 5.0, 6.0, //
+                4.0, 4.0, 6.0, 7.0, 8.0,
+            ],
+        )
+        .unwrap();
+        let out = zero_flux_neumann_pad(&img, &[2, 2], &[0, 0]).unwrap();
+        assert_eq!(out.size(), &[7, 5]);
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0, //
+                3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 6.0, //
+                4.0, 4.0, 4.0, 4.0, 6.0, 7.0, 8.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_flux_neumann_pad_of_size_zero_is_identity() {
+        let img = Image::from_vec(&[3, 2], (0..6).map(|v| v as f64).collect()).unwrap();
+        let out = zero_flux_neumann_pad(&img, &[0, 0], &[0, 0]).unwrap();
+        assert_eq!(out.size(), img.size());
+        assert_eq!(out.origin(), img.origin());
+        assert_eq!(out.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
+    }
+
+    // ---- flip ----
+
+    #[test]
+    fn flip_not_about_origin_negates_direction_column_and_shifts_origin() {
+        let img = rotated_2d(
+            &[3, 2],
+            &[1.0, 2.0],
+            &[5.0, -1.0],
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        );
+        let out = flip(&img, &[true, false], false).unwrap();
+        assert_eq!(out.size(), img.size());
+        let expected_origin = img.continuous_index_to_physical_point(&[2.0, 0.0]);
+        for (a, b) in out.origin().iter().zip(expected_origin.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        // direction column 0 negated, column 1 unchanged.
+        let d = img.direction();
+        assert_eq!(out.direction(), &[-d[0], d[1], -d[2], d[3]]);
+        // x-axis reversed per row.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn flip_about_origin_keeps_direction_and_negates_origin_component() {
+        let img = rotated_2d(
+            &[3, 2],
+            &[1.0, 2.0],
+            &[5.0, -1.0],
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        );
+        let out = flip(&img, &[true, false], true).unwrap();
+        assert_eq!(out.direction(), img.direction());
+        let mut expected_origin = img.continuous_index_to_physical_point(&[2.0, 0.0]);
+        expected_origin[0] = -expected_origin[0];
+        for (a, b) in out.origin().iter().zip(expected_origin.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        // Pixel order still reverses along the flipped axis regardless of
+        // the origin convention.
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![2.0, 1.0, 0.0, 5.0, 4.0, 3.0]
+        );
+    }
+
+    // ---- permute_axes ----
+
+    #[test]
+    fn permute_axes_swap_2d_reorders_spacing_direction_and_pixels_but_not_origin() {
+        let img = rotated_2d(
+            &[3, 2],
+            &[1.0, 2.0],
+            &[7.0, -3.0],
+            vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        );
+        let out = permute_axes(&img, &[1, 0]).unwrap();
+        assert_eq!(out.size(), &[2, 3]);
+        assert_eq!(out.spacing(), &[2.0, 1.0]);
+        assert_eq!(out.origin(), img.origin());
+        let d = img.direction();
+        assert_eq!(out.direction(), &[d[1], d[0], d[3], d[2]]);
+        // input(x,y) = x + 3y (row-major); output(y,x) = input(x,y).
+        assert_eq!(
+            out.to_f64_vec().unwrap(),
+            vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn permute_axes_applied_twice_with_self_inverse_order_is_identity() {
+        let img = rotated_2d(
+            &[4, 3],
+            &[1.5, 0.5],
+            &[2.0, 2.0],
+            (0..12).map(|v| v as f64).collect(),
+        );
+        let once = permute_axes(&img, &[1, 0]).unwrap();
+        let twice = permute_axes(&once, &[1, 0]).unwrap();
+        assert_eq!(twice.size(), img.size());
+        assert_eq!(twice.spacing(), img.spacing());
+        assert_eq!(twice.origin(), img.origin());
+        assert_eq!(twice.direction(), img.direction());
+        assert_eq!(twice.to_f64_vec().unwrap(), img.to_f64_vec().unwrap());
+    }
+
+    #[test]
+    fn permute_axes_rejects_non_permutation() {
+        let img = Image::new(&[2, 2], PixelId::UInt8);
+        assert_eq!(
+            permute_axes(&img, &[0, 0]),
+            Err(FilterError::InvalidPermutation(vec![0, 0], 2))
+        );
+        assert_eq!(
+            permute_axes(&img, &[0, 2]),
+            Err(FilterError::InvalidPermutation(vec![0, 2], 2))
+        );
+    }
+
+    // ---- native pixel movement: lossless for u64 above 2^53 ----
+    //
+    // 2^53 + 1 (9007199254740993) is the smallest u64 an f64 cannot represent;
+    // the old `to_f64_vec` seam rounded it to 2^53. Each test's `assert_ne!`
+    // non-vacuity guard proves the input is a value the f64 round-trip would
+    // corrupt, so a pass demonstrates the native gather path really moved the
+    // exact bits.
+
+    const U64_NON_F64: u64 = (1 << 53) + 1;
+
+    fn u64_seq(len: usize) -> Vec<u64> {
+        (0..len as u64).map(|v| U64_NON_F64 + v).collect()
+    }
+
+    #[test]
+    fn crop_and_region_of_interest_move_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[4, 4], u64_seq(16)).unwrap();
+        let cropped = crop(&img, &[1, 1], &[1, 1]).unwrap();
+        assert_eq!(
+            cropped.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 6,
+                U64_NON_F64 + 9,
+                U64_NON_F64 + 10
+            ]
+        );
+        let roi = region_of_interest(&img, &[1, 0], &[2, 2]).unwrap();
+        assert_eq!(
+            roi.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 6
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 3, 3], u64_seq(27)).unwrap();
+        let out = extract(&img, &[3, 3, 0], &[0, 0, 1]).unwrap();
+        // The z=1 slice collapses to 2-D; it is input pixels 9..18.
+        let expected: Vec<u64> = (9..18).map(|i| U64_NON_F64 + i).collect();
+        assert_eq!(out.dimension(), 2);
+        assert_eq!(out.scalar_slice::<u64>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn flip_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 2], u64_seq(6)).unwrap();
+        let out = flip(&img, &[true, false], false).unwrap();
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 1,
+                U64_NON_F64,
+                U64_NON_F64 + 5,
+                U64_NON_F64 + 4,
+                U64_NON_F64 + 3
+            ]
+        );
+    }
+
+    #[test]
+    fn permute_axes_moves_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[3, 2], u64_seq(6)).unwrap();
+        let out = permute_axes(&img, &[1, 0]).unwrap();
+        // output(y, x) = input(x, y): source offsets [0, 3, 1, 4, 2, 5].
+        assert_eq!(
+            out.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 4,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 5
+            ]
+        );
+    }
+
+    // The pad ops were already native (they read pixels through `ScalarView`,
+    // never `to_f64_vec`); these pin that interior pixels keep exact bits — the
+    // constant fill still quantizes, matching ITK's `static_cast` fill value.
+    #[test]
+    fn pads_move_u64_pixels_losslessly() {
+        assert_ne!(U64_NON_F64, (U64_NON_F64 as f64) as u64);
+        let img = Image::from_vec(&[4, 1], u64_seq(4)).unwrap();
+
+        let cp = constant_pad(&img, &[1, 0], &[1, 0], 9.0).unwrap();
+        assert_eq!(
+            cp.scalar_slice::<u64>().unwrap(),
+            &[
+                9,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                9
+            ]
+        );
+
+        let mp = mirror_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            mp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 1,
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 2
+            ]
+        );
+
+        let wp = wrap_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            wp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64,
+                U64_NON_F64 + 1
+            ]
+        );
+
+        let zp = zero_flux_neumann_pad(&img, &[2, 0], &[2, 0]).unwrap();
+        assert_eq!(
+            zp.scalar_slice::<u64>().unwrap(),
+            &[
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64,
+                U64_NON_F64 + 1,
+                U64_NON_F64 + 2,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3,
+                U64_NON_F64 + 3
+            ]
+        );
+    }
+}
