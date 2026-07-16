@@ -494,11 +494,22 @@ fn crop_border(img: &Image, radius: &[usize]) -> Result<Image> {
 
 // ---- grayscale opening / closing ---------------------------------------
 
-/// `GrayscaleMorphologicalOpeningImageFilter` (`SafeBorder = true`, ITK's
-/// default — see module docs): `dilate(erode(f))`, with `f` padded by the
-/// kernel radius using erode's own boundary sentinel before the compose,
-/// cropped back after.
-pub fn grayscale_morphological_opening(img: &Image, kernel: &StructuringElement) -> Result<Image> {
+/// `GrayscaleMorphologicalOpeningImageFilter`: `dilate(erode(f))`.
+///
+/// `safe_border` mirrors the ITK member of the same name (default `true`).
+/// When `true`, `f` is padded by the kernel radius using erode's own boundary
+/// sentinel before the compose and cropped back after, so border pixels do not
+/// see the image edge as structure. When `false`, erode and dilate run
+/// directly on the original extent (each applying its own boundary condition).
+pub fn grayscale_morphological_opening(
+    img: &Image,
+    kernel: &StructuringElement,
+    safe_border: bool,
+) -> Result<Image> {
+    if !safe_border {
+        let eroded = grayscale_erode(img, kernel)?;
+        return grayscale_dilate(&eroded, kernel);
+    }
     let (max_value, _) = bounds_for(img.pixel_id());
     let padded = pad_constant(img, kernel.radius(), max_value)?;
     let eroded = grayscale_erode(&padded, kernel)?;
@@ -506,11 +517,21 @@ pub fn grayscale_morphological_opening(img: &Image, kernel: &StructuringElement)
     crop_border(&dilated, kernel.radius())
 }
 
-/// `GrayscaleMorphologicalClosingImageFilter` (`SafeBorder = true`, ITK's
-/// default — see module docs): `erode(dilate(f))`, with `f` padded by the
-/// kernel radius using dilate's own boundary sentinel before the compose,
-/// cropped back after.
-pub fn grayscale_morphological_closing(img: &Image, kernel: &StructuringElement) -> Result<Image> {
+/// `GrayscaleMorphologicalClosingImageFilter`: `erode(dilate(f))`.
+///
+/// `safe_border` mirrors the ITK member of the same name (default `true`).
+/// When `true`, `f` is padded by the kernel radius using dilate's own boundary
+/// sentinel before the compose and cropped back after. When `false`, dilate
+/// and erode run directly on the original extent.
+pub fn grayscale_morphological_closing(
+    img: &Image,
+    kernel: &StructuringElement,
+    safe_border: bool,
+) -> Result<Image> {
+    if !safe_border {
+        let dilated = grayscale_dilate(img, kernel)?;
+        return grayscale_erode(&dilated, kernel);
+    }
     let (_, nonpositive_min) = bounds_for(img.pixel_id());
     let padded = pad_constant(img, kernel.radius(), nonpositive_min)?;
     let dilated = grayscale_dilate(&padded, kernel)?;
@@ -717,17 +738,17 @@ pub fn binary_morphological_closing(
 
 // ---- white / black top-hat ------------------------------------------------
 
-/// `WhiteTopHatImageFilter`: `input - opening(input)` (`SafeBorder = true`,
-/// via [`grayscale_morphological_opening`]).
-pub fn white_top_hat(img: &Image, kernel: &StructuringElement) -> Result<Image> {
-    let opened = grayscale_morphological_opening(img, kernel)?;
+/// `WhiteTopHatImageFilter`: `input - opening(input)`. `safe_border` (ITK
+/// default `true`) is forwarded to [`grayscale_morphological_opening`].
+pub fn white_top_hat(img: &Image, kernel: &StructuringElement, safe_border: bool) -> Result<Image> {
+    let opened = grayscale_morphological_opening(img, kernel, safe_border)?;
     subtract(img, &opened)
 }
 
-/// `BlackTopHatImageFilter`: `closing(input) - input` (`SafeBorder = true`,
-/// via [`grayscale_morphological_closing`]).
-pub fn black_top_hat(img: &Image, kernel: &StructuringElement) -> Result<Image> {
-    let closed = grayscale_morphological_closing(img, kernel)?;
+/// `BlackTopHatImageFilter`: `closing(input) - input`. `safe_border` (ITK
+/// default `true`) is forwarded to [`grayscale_morphological_closing`].
+pub fn black_top_hat(img: &Image, kernel: &StructuringElement, safe_border: bool) -> Result<Image> {
+    let closed = grayscale_morphological_closing(img, kernel, safe_border)?;
     subtract(&closed, img)
 }
 
@@ -854,23 +875,30 @@ mod tests {
         );
     }
 
-    // ---- grayscale opening: SafeBorder vs a naive unpadded compose ----
+    // ---- grayscale opening: SafeBorder true vs false at the edge ----
 
     #[test]
-    fn grayscale_opening_safe_border_differs_from_naive_unpadded_compose_at_the_edge() {
+    fn grayscale_opening_safe_border_true_and_false_diverge_at_the_edge() {
         let se = StructuringElement::box_(&[1]);
         let f = img_u8(&[3], vec![5, 1, 1]);
 
-        let opened = grayscale_morphological_opening(&f, &se).unwrap();
+        // SafeBorder = true: the padded compose preserves the edge value.
+        let opened = grayscale_morphological_opening(&f, &se, true).unwrap();
         assert_eq!(opened.scalar_slice::<u8>().unwrap(), &[5, 1, 1]);
 
-        // Naive: erode then dilate directly, no pad/crop.
+        // SafeBorder = false: erode then dilate directly, no pad/crop — the
+        // edge sees the image boundary as structure and erodes away.
+        let unpadded = grayscale_morphological_opening(&f, &se, false).unwrap();
         let naive = grayscale_dilate(&grayscale_erode(&f, &se).unwrap(), &se).unwrap();
-        assert_eq!(naive.scalar_slice::<u8>().unwrap(), &[1, 1, 1]);
+        assert_eq!(unpadded.scalar_slice::<u8>().unwrap(), &[1, 1, 1]);
+        assert_eq!(
+            unpadded.scalar_slice::<u8>().unwrap(),
+            naive.scalar_slice::<u8>().unwrap(),
+        );
 
         assert_ne!(
             opened.scalar_slice::<u8>().unwrap(),
-            naive.scalar_slice::<u8>().unwrap()
+            unpadded.scalar_slice::<u8>().unwrap()
         );
     }
 
@@ -880,8 +908,8 @@ mod tests {
     fn grayscale_opening_is_idempotent() {
         let se = StructuringElement::box_(&[1, 1]);
         let f = img_u8(&[4, 3], vec![10, 250, 0, 5, 90, 1, 3, 200, 40, 60, 0, 255]);
-        let once = grayscale_morphological_opening(&f, &se).unwrap();
-        let twice = grayscale_morphological_opening(&once, &se).unwrap();
+        let once = grayscale_morphological_opening(&f, &se, true).unwrap();
+        let twice = grayscale_morphological_opening(&once, &se, true).unwrap();
         assert_eq!(
             once.scalar_slice::<u8>().unwrap(),
             twice.scalar_slice::<u8>().unwrap()
@@ -894,7 +922,7 @@ mod tests {
     fn white_top_hat_recovers_a_spike_narrower_than_the_kernel() {
         let se = StructuringElement::box_(&[1]);
         let f = img_u8(&[5], vec![0, 0, 9, 0, 0]);
-        let wth = white_top_hat(&f, &se).unwrap();
+        let wth = white_top_hat(&f, &se, true).unwrap();
         assert_eq!(wth.scalar_slice::<u8>().unwrap(), &[0, 0, 9, 0, 0]);
     }
 
@@ -902,7 +930,7 @@ mod tests {
     fn black_top_hat_recovers_a_notch_narrower_than_the_kernel() {
         let se = StructuringElement::box_(&[1]);
         let f = img_u8(&[5], vec![9, 9, 0, 9, 9]);
-        let bth = black_top_hat(&f, &se).unwrap();
+        let bth = black_top_hat(&f, &se, true).unwrap();
         assert_eq!(bth.scalar_slice::<u8>().unwrap(), &[0, 0, 9, 0, 0]);
     }
 
