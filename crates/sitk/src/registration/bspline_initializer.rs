@@ -34,7 +34,7 @@
 //! `sitkBSplineTransformInitializerFilter.h:86-95`; dispatch table
 //! `sitkBSplineTransformInitializerFilter.cxx:123-136`, rejecting anything
 //! else). This port implements only the cubic kernel
-//! ([`BSplineTransform`](crate::transform::BSplineTransform) hardcodes its
+//! ([`BSplineTransform`] hardcodes its
 //! spline order to 3), so [`execute`](BSplineTransformInitializer::execute)
 //! errors for any `order != 3`.
 //!

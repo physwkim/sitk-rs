@@ -15,7 +15,7 @@
 //! each ITK functor promotes its input to `double`, applies a `<cmath>`
 //! function, and `static_cast`s back down (`itkAcosImageFilter.h`'s `Acos`:
 //! `static_cast<TOutput>(std::acos(static_cast<double>(A)))`), matching this
-//! crate's [`UnaryFunctor`] / [`functor::unary_functor!`] seam exactly.
+//! crate's [`UnaryFunctor`] / `functor::unary_functor!` seam exactly.
 //! Out-of-domain inputs (`sqrt` of a negative, `log` of `0`) produce
 //! `NaN`/`-inf` in `f64`, which [`crate::core::Scalar::from_f64`] then narrows:
 //! integer outputs saturate (`NaN` maps to `0`, `-inf` maps to the type's
@@ -25,7 +25,7 @@
 //! *two* images (e.g. `itkSquaredDifferenceImageFilter.h`'s
 //! `SquaredDifference2` functor: `diff = double(A) - double(B);
 //! static_cast<TOutput>(diff * diff)`), which is outside both `functor.rs`
-//! traits ([`UnaryFunctor`] takes one image; [`BinaryFunctor`] computes in
+//! traits ([`UnaryFunctor`] takes one image; [`crate::filters::BinaryFunctor`] computes in
 //! the pixel type rather than `f64`). Doing the subtraction in the pixel
 //! type would be wrong for unsigned inputs (`5u8 - 10u8` wraps instead of
 //! producing `-5`), so these are implemented directly against
@@ -487,7 +487,7 @@ pub fn divide_floor_in_place(a: Image, b: &Image) -> Result<Image> {
 /// `double` for every basic pixel type, including `float`
 /// (`itkNumericTraits.h`'s `NumericTraits<float>::RealType = double`), so ITK
 /// itself always calls `std::pow(double, double)` here regardless of `a`/`b`'s
-/// concrete input types -- exactly what [`two_image_f64`] does by promoting
+/// concrete input types -- exactly what `two_image_f64` does by promoting
 /// both operands to `f64`.
 pub fn pow(a: &Image, b: &Image) -> Result<Image> {
     two_image_f64(a, b, |x, y| x.powf(y))
@@ -516,7 +516,7 @@ fn real_type(id: PixelId) -> PixelId {
 
 /// `DivideRealImageFilter` (`itkArithmeticOpsFunctors.h`'s `DivReal`
 /// functor): pixel-wise `RealType(a) / RealType(b)`. The output pixel type
-/// is `a`'s `NumericTraits<T>::RealType` (see [`real_type`]), matching
+/// is `a`'s `NumericTraits<T>::RealType` (see `real_type`), matching
 /// `DivideRealImageFilter.yaml`'s `output_pixel_type` override -- unlike
 /// [`divide_floor`], the output is always real, so there is no
 /// integer-narrowing special case: `b == 0` naturally yields `+inf`/`-inf`/
@@ -524,7 +524,7 @@ fn real_type(id: PixelId) -> PixelId {
 /// always floating-point. The division itself runs in `f64`, which **matches**
 /// `DivReal`'s `RealType(A) / RealType(B)` exactly — `RealType` is `double`
 /// for every scalar input type, `Float32` included. The only divergence is
-/// the output pixel type for `Float32` inputs (see [`real_type`], §5.6).
+/// the output pixel type for `Float32` inputs (see `real_type`, §5.6).
 ///
 /// No in-place variant: like [`intensity::normalize`](crate::filters::intensity::normalize),
 /// the output pixel type does not generally match the input's, so there is

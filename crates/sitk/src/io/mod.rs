@@ -1,38 +1,38 @@
 //! Image and transform file IO for sitk-rs.
 //!
-//! Every format is an [`ImageIo`] implementor sitting in one [`registry`];
-//! [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
+//! Every format is an [`crate::io::ImageIo`] implementor sitting in one [`crate::io::registry`];
+//! [`crate::io::ImageFileReader`] and [`crate::io::ImageFileWriter`] ask the registry which IO
 //! handles a path, exactly as SimpleITK's readers and writers ask
 //! `itk::ImageIOFactory`. Adding PNG or DICOM later is a new module plus
-//! one registry entry — no dispatch to extend. See [`image_io`] for the probe
+//! one registry entry — no dispatch to extend. See [`crate::io::image_io`] for the probe
 //! order.
 //!
-//! [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
+//! [`crate::io::read_image`] and [`crate::io::write_image`] are the procedural shorthand SimpleITK
 //! also provides (`itk::simple::ReadImage` / `WriteImage`).
 //!
 //! Three formats are supported, each in an uncompressed and a compressed form:
 //!
-//! * [`meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw` / `.zraw`), ITK's
+//! * [`crate::io::meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw` / `.zraw`), ITK's
 //!   native format. Round-trips every scalar and vector pixel type and the full
 //!   geometry; a complex image survives as a two-channel vector image (see that
 //!   module for the upstream quirk). `CompressedData = True` is read and
 //!   written.
-//! * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), `raw` and `gzip` encodings, both of
+//! * [`crate::io::nrrd`] — NRRD (`.nrrd` / `.nhdr`), `raw` and `gzip` encodings, both of
 //!   which round-trip a complex image because the `kinds` field records the
 //!   distinction. `bzip2`, `hex` and `zrl` remain unimplemented.
-//! * [`nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`, and the `.gz` spelling of
+//! * [`crate::io::nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`, and the `.gz` spelling of
 //!   each). Round-trips every scalar pixel type, vector images, and complex
 //!   images as complex.
 //!
-//! Compression on write is opt-in through [`ImageFileWriter::set_use_compression`]
-//! or [`write_image_with`] — except for NIfTI, where the `.gz` extension alone
-//! decides, exactly as upstream's `nifti_is_gzfile` does. [`compression`] owns
+//! Compression on write is opt-in through [`crate::io::ImageFileWriter::set_use_compression`]
+//! or [`crate::io::write_image_with`] — except for NIfTI, where the `.gz` extension alone
+//! decides, exactly as upstream's `nifti_is_gzfile` does. [`crate::io::compression`] owns
 //! every zlib and gzip stream the three formats produce or consume.
 //!
 //! Transforms have their own reader and writer, [`read_transform`] and
 //! [`write_transform`], over three formats: the Insight legacy text format
-//! (`.tfm` / `.txt`, see [`transform_io`]), HDF5 (`.h5` / `.hdf5`, see
-//! [`transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`transform_matlab`]).
+//! (`.tfm` / `.txt`, see [`crate::io::transform_io`]), HDF5 (`.h5` / `.hdf5`, see
+//! [`crate::io::transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`crate::io::transform_matlab`]).
 
 pub mod compression;
 pub mod dicom;
@@ -75,7 +75,7 @@ pub use writer::{ImageFileWriter, WriteOptions};
 /// The returned image carries the file's meta-data dictionary, and its geometry
 /// is normalized exactly as [`ImageFileReader::execute`] does — the negative
 /// spacing sign-flip plus the `ITK_original_*` records
-/// ([`reader::normalize_reader_geometry`], `itkImageFileReader.hxx:216-239`).
+/// (`reader::normalize_reader_geometry`, `itkImageFileReader.hxx:216-239`).
 pub fn read_image<P: AsRef<Path>>(path: P) -> Result<Image> {
     let path = path.as_ref();
     let mut image = image_io::reader_for(path)?.read(path)?;

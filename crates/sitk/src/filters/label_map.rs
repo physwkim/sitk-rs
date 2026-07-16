@@ -33,7 +33,7 @@
 //!
 //! `itkBinaryImageToLabelMapFilter` derives from the same `ScanlineFilterCommon`
 //! as `itkConnectedComponentImageFilter`, so it shares
-//! [`crate::filters::label::scanline_components`] and [`crate::filters::label::create_consecutive`]
+//! `crate::filters::label::scanline_components` and `crate::filters::label::create_consecutive`
 //! with [`crate::filters::label::connected_component`]. The three differences:
 //!
 //! 1. **Foreground is an equality test, not "nonzero".** `.hxx:167` compares
@@ -52,7 +52,7 @@
 //!
 //! 3. **The output is a `LabelMap`, not an image.** Each run becomes one
 //!    `SetLine` (`.hxx:128-141`), in raster order, so no line ever merges with
-//!    another and the [`LabelObject`](crate::core::LabelObject) invariant costs
+//!    another and the [`LabelObject`] invariant costs
 //!    nothing.
 //!
 //! `BinaryImageToLabelMapFilter.yaml` fixes the label type to `uint32_t`
@@ -274,7 +274,7 @@ pub fn aggregate_label_map(map: &LabelMap) -> Result<LabelMap> {
 ///
 /// `change_map` is a list of `(original, result)` pairs mirroring the yaml's
 /// `std::map<double, double>` member, with the same raw-key ordering and
-/// last-write-wins overwrite semantics [`crate::filters::change_label`] documents: the
+/// last-write-wins overwrite semantics [`crate::filters::change_label()`] documents: the
 /// pairs are sorted by *raw* key, then each key and value is cast to the map's
 /// label type, so `1.2` and `1.4` collapse onto key `1` with `1.4`'s value
 /// winning.
@@ -285,7 +285,7 @@ pub fn aggregate_label_map(map: &LabelMap) -> Result<LabelMap> {
 ///
 /// - **no chaining.** `{1 -> 2, 2 -> 3}` sends object 1 to label 2 and object 2
 ///   to label 3. Object 1 is not then re-read as a `2` and forwarded to `3`,
-///   matching the scalar [`crate::filters::change_label`].
+///   matching the scalar [`crate::filters::change_label()`].
 /// - **collisions merge.** `{1 -> 3, 2 -> 3}` unions both objects' pixels into
 ///   label 3; so does `{1 -> 5}` when label 5 already exists and is untouched.
 /// - **the background can be relabelled.** A `(background, new)` entry moves the
@@ -482,7 +482,7 @@ pub fn merge_label_map(maps: &[LabelMap], method: MergeLabelMapMethod) -> Result
 /// The counter's `if (label == GetBackgroundValue()) ++label` runs each
 /// iteration but the counter only rises, so the background is skipped exactly
 /// once — the same shape as
-/// [`create_consecutive`](crate::filters::label::create_consecutive).
+/// `create_consecutive`.
 pub fn relabel_label_map(map: &LabelMap, reverse_ordering: bool) -> Result<LabelMap> {
     let mut objects: Vec<LabelObject> = map.label_objects().cloned().collect();
     if reverse_ordering {

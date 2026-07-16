@@ -3,7 +3,7 @@
 //! A short text header followed by pixel data that is **always big-endian** when
 //! the header says `BINARY`, or whitespace-separated decimal text when it says
 //! `ASCII`. `VTKImageIO` reads both and writes whichever `m_FileType` says;
-//! SimpleITK never flips that switch, so [`write`] always emits `BINARY`.
+//! SimpleITK never flips that switch, so [`write()`] always emits `BINARY`.
 //!
 //! # The header ITK writes
 //!
@@ -101,7 +101,7 @@
 //!
 //! `sitk::Image` never produces `IOPixelEnum::RGB`/`RGBA` — every
 //! multi-component image is an `itk::VectorImage` — so the `COLOR_SCALARS` write
-//! branch (`:686-691`) is dead through SimpleITK and [`write`] never emits it.
+//! branch (`:686-691`) is dead through SimpleITK and [`write()`] never emits it.
 //! Reading `COLOR_SCALARS` is fully supported. Ledger §2.102.
 //!
 //! What is left:
@@ -147,7 +147,7 @@
 //! `num_get::_M_extract_int` accumulates into the unsigned representation and
 //! bounds the magnitude by `max`, then negates (locale_facets.tcc:472-475,
 //! :576-583). `-1` into an `unsigned short` is `65535` with no `failbit`, while
-//! `-70000` overflows to `65535` *with* one. Reproduced by [`read_ascii_ints`];
+//! `-70000` overflows to `65535` *with* one. Reproduced by `read_ascii_ints`;
 //! ledger §2.105.
 //!
 //! ASCII **writing** is unreachable through SimpleITK, and lossy where it is

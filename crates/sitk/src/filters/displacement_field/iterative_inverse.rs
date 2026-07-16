@@ -140,7 +140,7 @@ fn warp_negated_field_by_itself(forward: &Field) -> Vec<f64> {
 /// The output is a displacement field on the input's lattice, with the input's
 /// geometry and component type.
 ///
-/// Errors: [`super::require_displacement_field`]'s, on an input that is not a
+/// Errors: `super::require_displacement_field`'s, on an input that is not a
 /// real-valued vector image with one component per dimension.
 pub fn iterative_inverse_displacement_field(
     displacement_field: &Image,

@@ -89,7 +89,7 @@
 //!    (`Modules/Filtering/LabelErodeDilate/test/CMakeLists.txt`), so this is
 //!    untested upstream. The `+ 1` margin of the non-spacing branch
 //!    (`.hxx:329`) exists precisely to avoid it. Pinned by
-//!    [`tests::spacing_mode_radius_one_is_an_identity`].
+//!    `tests::spacing_mode_radius_one_is_an_identity`.
 //!
 //! 3. **`firstval` and "the first pass" were not the same axis — fixed here
 //!    (§2.57(b)).** `firstval` is the first *nonzero radius* (`.hxx:339-347`),
@@ -108,8 +108,8 @@
 //!    predicate `firstval` keys off), so a zero-radius axis is skipped and the
 //!    first axis processed *is* `firstval`. In spacing mode `scale[d] > 0`
 //!    already coincides with `radius[d] != 0`, so that path is unchanged. Pinned
-//!    by [`tests::dilate_zero_leading_radius_dilates_the_named_axis_only`] and
-//!    [`tests::erode_zero_leading_radius_erodes_the_named_axis_only`].
+//!    by `tests::dilate_zero_leading_radius_dilates_the_named_axis_only` and
+//!    `tests::erode_zero_leading_radius_erodes_the_named_axis_only`.
 //!
 //! 4. **Erosion can leave the output image uninitialized.** The label output is
 //!    written only when `lastpass` is true (`itkLabelSetUtils.h:345`, `:572`),
@@ -120,7 +120,7 @@
 //!    uninitialized memory. Likewise, if *no* axis runs (every radius `0`,
 //!    spacing mode) neither filter writes the output at all. C++ UB; this port
 //!    defines both cases as all-background (`0`), the value-initialized pixel.
-//!    Pinned by [`tests::erode_zero_trailing_radius_with_spacing_yields_background`].
+//!    Pinned by `tests::erode_zero_trailing_radius_with_spacing_yields_background`.
 //!
 //! 5. **`doOneDimensionErodeFirstPass` never clears `lineBuf` at background
 //!    positions.** `lineBuf` is allocated once per axis (`.h:260`) and the
@@ -139,10 +139,10 @@
 //!    label to `float` before `val != labBuf[idxend]` promotes each subsequent
 //!    label back to `float`, so two distinct labels that round to the same
 //!    `float` — e.g. `16777216` and `16777217` for `Int32` — merged into one
-//!    run and eroded as a single object instead of separating. [`same_run`]
+//!    run and eroded as a single object instead of separating. `same_run`
 //!    compares in the `f64` label domain the rest of the filter uses, so
 //!    distinct integer labels stay distinct. Pinned by
-//!    [`tests::f64_label_comparison_separates_adjacent_int32_labels`].
+//!    `tests::f64_label_comparison_separates_adjacent_int32_labels`.
 //!
 //! 7. **`DoLineDilateFirstPass`'s right pass reads the *original* labels at
 //!    the contact point** (`labBuf[lastcontact]`, `.h:108`), not the labels the
@@ -161,7 +161,7 @@
 //! i.e. whatever the negative half decided. **The lower index along the current
 //! axis wins**, regardless of which label value is numerically larger.
 //! `DoLineDilateFirstPass` reaches the same rule through strict `>` tests
-//! (`.h:82`, `.h:106`). Pinned by [`tests::dilate_tie_goes_to_the_lower_index`].
+//! (`.h:82`, `.h:106`). Pinned by `tests::dilate_tie_goes_to_the_lower_index`.
 
 use crate::core::Image;
 use crate::filters::error::{FilterError, Result};

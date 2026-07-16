@@ -3,7 +3,7 @@
 //! [`real_to_half_hermitian_forward_fft`], [`half_hermitian_to_real_inverse_fft`]
 //! and [`fft_pad`].
 //!
-//! (`FFTShiftImageFilter` is the sixth, and lives in [`crate::filters::fft_shift`].)
+//! (`FFTShiftImageFilter` is the sixth, and lives in [`mod@crate::filters::fft_shift`].)
 //!
 //! # Which ITK implementation this ports
 //!
@@ -12,7 +12,7 @@
 //! always-available default
 //! (`Modules/Filtering/FFT/src/itkPocketFFTImageFilterInitFactory.cxx`), so
 //! these four transforms are ports of the `itkPocketFFT*FFTImageFilter.hxx`
-//! `GenerateData` bodies on top of [`crate::filters::fft`], which reimplements the
+//! `GenerateData` bodies on top of `crate::filters::fft`, which reimplements the
 //! pocketfft kernels this workspace takes no dependency on.
 //!
 //! None of them pads. A `ForwardFFTImageFilter` on a 97-pixel axis transforms
@@ -172,7 +172,7 @@ fn forward_fft_typed<T: Real>(img: &Image) -> Result<Image> {
 /// [`real_to_half_hermitian_forward_fft`] exploits.
 ///
 /// No padding happens: an axis of prime length transforms at that length,
-/// through [`crate::filters::fft`]'s Bluestein path. Use [`fft_pad`] first for a fast
+/// through `crate::filters::fft`'s Bluestein path. Use [`fft_pad`] first for a fast
 /// length.
 ///
 /// `Float32` in gives `ComplexFloat32` out, `Float64` gives `ComplexFloat64`;
@@ -344,7 +344,7 @@ fn half_hermitian_to_real_typed<T: Real>(img: &Image, odd: bool) -> Result<Image
 ///
 /// The imaginary parts of the DC column, and of the Nyquist column when the
 /// output width is even, are ignored rather than checked; see
-/// [`expand_hermitian_line`].
+/// `expand_hermitian_line`.
 pub fn half_hermitian_to_real_inverse_fft(
     img: &Image,
     actual_x_dimension_is_odd: bool,

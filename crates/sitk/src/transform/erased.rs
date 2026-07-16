@@ -13,7 +13,7 @@
 //! concrete type into it, and it implements [`TransformBase`] and
 //! [`ParametricTransform`] itself, so an erased transform drops straight into
 //! [`ResampleImageFilter`](crate::transform::ResampleImageFilter),
-//! [`transform_geometry`](crate::transform::transform_geometry) and
+//! [`transform_geometry`](crate::transform::transform_geometry()) and
 //! [`CompositeTransform`].
 //!
 //! # Divergences from `itk::simple::Transform`

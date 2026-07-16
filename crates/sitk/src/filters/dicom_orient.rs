@@ -25,8 +25,8 @@
 //! (`CoordinateEnum`, `itkDICOMOrientation.h:47-56`) into one `uint32_t`, and
 //! a 48-entry `std::map<std::string, OrientationEnum>`
 //! (`itkDICOMOrientation.cxx:74-163`) both parses a 3-letter code and prints
-//! one back. This port drops the packed code and the table: [`Orientation`]
-//! is just `Option<[Coordinate; 3]>` (`None` for `INVALID`), [`Coordinate`] is
+//! one back. This port drops the packed code and the table: `Orientation`
+//! is just `Option<[Coordinate; 3]>` (`None` for `INVALID`), `Coordinate` is
 //! one of `{Right, Left, Anterior, Posterior, Inferior, Superior}`, and the
 //! string form is computed directly from the terms' single-letter labels in
 //! both directions. This is algebraically equivalent to the table (every one

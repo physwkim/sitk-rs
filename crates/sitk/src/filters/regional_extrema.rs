@@ -7,7 +7,7 @@
 //!   both thin instantiations of `itkValuedRegionalExtremaImageFilter.hxx`
 //!   (`TFunction1 = TFunction2 = std::greater` for maxima, `std::less` for
 //!   minima) exactly as [`crate::filters::reconstruction`]'s erosion/dilation pair
-//!   instantiate `itkReconstructionImageFilter.hxx` — [`ExtremaKind`] plays
+//!   instantiate `itkReconstructionImageFilter.hxx` — `ExtremaKind` plays
 //!   the same role here as `ReconstructionKind` does there.
 //! - [`regional_maxima`] — `itkRegionalMaximaImageFilter.hxx`: delegates
 //!   entirely to [`valued_regional_maxima`] (it has no flooding logic of its
@@ -22,9 +22,9 @@
 //!   holding the flood value -- `else -> foreground_value`, the same
 //!   `BinaryThresholdImageFilter` shape `RegionalMaximaImageFilter.hxx` uses,
 //!   just built on the minima marker). A private, non-parity `regional_minima`
-//!   helper already exists in [`crate::filters::watershed`], restricted to that
+//!   helper already exists in [`mod@crate::filters::watershed`], restricted to that
 //!   module's own boolean flooding use case (see this module's own docs
-//!   above on why [`crate::filters::watershed`]'s helper stays a separate,
+//!   above on why [`mod@crate::filters::watershed`]'s helper stays a separate,
 //!   unrefactored implementation); this is the unrelated, public,
 //!   SimpleITK-parity port of the real `RegionalMinimaImageFilter`.
 //!
@@ -49,7 +49,7 @@
 //! the "correct" flooded value and the aliasing shortcut's do-nothing value
 //! are identical (`MarkerValue` either way). This port therefore tracks
 //! "visited" in a separate `marked` buffer instead of aliasing it onto a
-//! pixel value (matching [`crate::filters::watershed`]'s private `regional_minima`
+//! pixel value (matching [`mod@crate::filters::watershed`]'s private `regional_minima`
 //! helper, which predates this module and stays a separate, unrefactored
 //! implementation restricted to that module's own boolean use case), and
 //! reads neighbor values from the untouched input throughout, which is
@@ -57,7 +57,7 @@
 //!
 //! `ConstantBoundaryCondition`s of `MarkerValue` sit on both the input and
 //! output shaped iterators. As in [`crate::filters::reconstruction`] and
-//! [`crate::filters::watershed`], a boundary neighbor's assumed value can never win
+//! [`mod@crate::filters::watershed`], a boundary neighbor's assumed value can never win
 //! its comparison (`NonpositiveMin` is never `>` anything for maxima;
 //! `max()` is never `<` anything for minima), so this port simply skips
 //! out-of-bounds neighbors rather than materializing the boundary.

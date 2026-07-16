@@ -1744,7 +1744,7 @@ impl ImageRegistrationMethod {
     /// `ImageRegistrationMethodv4::SetMovingInitialTransform`.
     ///
     /// The metric samples the moving image at
-    /// `moving_initial(optimized(virtual_point))` (see [`Composed`] for the
+    /// `moving_initial(optimized(virtual_point))` (see `Composed` for the
     /// source lines that fix this order), so a moving-initial transform is the
     /// alignment already achieved by an earlier stage: the optimizer starts from
     /// where it left off without folding that stage into its own parameters.

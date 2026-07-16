@@ -114,7 +114,7 @@
 //! double precision, and this port's `f64`-throughout matches that rule
 //! rather than diverging from it. Bit-exact agreement is still out
 //! of reach: ITK's `SymmetricEigenAnalysis` is a different
-//! eigensolver from the cyclic Jacobi in [`crate::filters::linalg`], and the two agree
+//! eigensolver from the cyclic Jacobi in `crate::filters::linalg`, and the two agree
 //! only to solver accuracy.
 //!
 //! A zero `noise_scale` or `feature_scale` is the identity here, because

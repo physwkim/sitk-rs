@@ -5,13 +5,13 @@
 //!
 //! - [`reconstruction_by_erosion`] / [`reconstruction_by_dilation`] —
 //!   `itkReconstructionImageFilter.hxx`, Luc Vincent's raster / anti-raster /
-//!   FIFO three-pass algorithm, generalized here over [`ReconstructionKind`]
+//!   FIFO three-pass algorithm, generalized here over `ReconstructionKind`
 //!   exactly as the `.hxx` is generalized over its `TCompare` template
 //!   parameter: `itkReconstructionByErosionImageFilter.h` fixes
 //!   `TCompare = std::less`, `itkReconstructionByDilationImageFilter.h` fixes
 //!   `TCompare = std::greater`. Both are thin instantiations; neither adds any
 //!   logic of its own beyond the comparator and the `MarkerValue` used for
-//!   boundary padding — see [`reconstruct`]'s docs for why this port needs
+//!   boundary padding — see `reconstruct`'s docs for why this port needs
 //!   neither.
 //! - [`grayscale_fillhole`] / [`grayscale_grindpeak`] —
 //!   `itkGrayscaleFillholeImageFilter.hxx` / `itkGrayscaleGrindPeakImageFilter.hxx`:
@@ -29,14 +29,14 @@
 //!
 //! ## The `reconstruct` engine
 //!
-//! [`reconstruct`] is [`crate::filters::watershed`]'s former private
+//! `reconstruct` is [`mod@crate::filters::watershed`]'s former private
 //! `reconstruction_by_erosion` (`TCompare = std::less`), generalized to
-//! [`ReconstructionKind`] so it also serves `TCompare = std::greater`. The
+//! `ReconstructionKind` so it also serves `TCompare = std::greater`. The
 //! generalization is mechanical: every comparison in the `.hxx`
 //! (`compare(VN, V)` picking a neighbor, `compare(V, iV)` clamping to the
 //! mask, `compare(V, VN) && compare(iN, VN)` seeding the FIFO,
 //! `compare(V, VN) && iN != VN` / `compare(iN, V)` driving the FIFO) is
-//! literally `TCompare::operator()`, so substituting [`ReconstructionKind::compare`]
+//! literally `TCompare::operator()`, so substituting `ReconstructionKind::compare`
 //! for each one reproduces both instantiations from one function body.
 //!
 //! The `.hxx`'s `UseInternalCopy` (default on) pads `marker`/`mask` by one
@@ -54,17 +54,17 @@
 //! the boundary; the FIFO driver needs `iN != VN` where again `iN == VN`. So a
 //! boundary neighbor never wins a comparison and never gets written — this
 //! port simply skips out-of-bounds neighbors instead of materializing any
-//! padding, for either [`ReconstructionKind`].
+//! padding, for either `ReconstructionKind`.
 //!
 //! ## Neighbor order and connectivity
 //!
-//! [`NeighborWalker`], [`Half`], and the private `Connectivity`/`neighbor_offsets`/
+//! `NeighborWalker`, `Half`, and the private `Connectivity`/`neighbor_offsets`/
 //! `strides`/`multi_index` helpers below are shared with
-//! [`crate::filters::watershed`]'s own flooding and regional-minima code, which needs
+//! [`mod@crate::filters::watershed`]'s own flooding and regional-minima code, which needs
 //! the identical `ShapedNeighborhoodIterator` active-offset order (ascending
 //! neighborhood index, ties resolved by `itkConnectedComponentAlgorithm.h`'s
 //! `setConnectivity`/`setConnectivityPrevious`/`setConnectivityLater` split —
-//! [`Half`]'s three variants) for its own order-dependent flooding. This is
+//! `Half`'s three variants) for its own order-dependent flooding. This is
 //! the shared home for that geometry so neither module carries its own copy.
 
 use crate::core::Image;
@@ -453,9 +453,9 @@ pub fn grayscale_grindpeak(image: &Image, fully_connected: bool) -> Result<Image
 /// `image` by erosion under the marker `image + height`.
 ///
 /// `height` is quantized to `image`'s pixel type before use, matching
-/// [`quantize_to_pixel_type`]'s doc; the marker is then formed the way
+/// `quantize_to_pixel_type`'s doc; the marker is then formed the way
 /// `ShiftScaleImageFilter` forms it — accumulate `image + height` in a real
-/// type, then saturate into the pixel type, which is what [`image_from_f64`]
+/// type, then saturate into the pixel type, which is what `image_from_f64`
 /// does via `Scalar::from_f64`.
 pub fn h_minima(image: &Image, height: f64, fully_connected: bool) -> Result<Image> {
     let height = quantize_to_pixel_type(image.pixel_id(), height);

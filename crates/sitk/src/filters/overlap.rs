@@ -159,29 +159,29 @@ struct LabelCounts {
 /// `Get*(LabelType)` accessors.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelOverlapMeasures {
-    /// `GetTargetOverlap(label)`: `intersection / target`; [`REAL_TYPE_MAX`]
+    /// `GetTargetOverlap(label)`: `intersection / target`; `REAL_TYPE_MAX`
     /// when `target == 0`.
     pub target_overlap: f64,
     /// `GetUnionOverlap(label)` a.k.a. Jaccard coefficient:
-    /// `intersection / union`; [`REAL_TYPE_MAX`] when `union == 0`.
+    /// `intersection / union`; `REAL_TYPE_MAX` when `union == 0`.
     pub union_overlap: f64,
     /// `GetMeanOverlap(label)` a.k.a. Dice coefficient: `2*uo / (1+uo)`
     /// where `uo` is [`Self::union_overlap`] (no additional zero-guard).
     pub mean_overlap: f64,
     /// `GetVolumeSimilarity(label)`: `2*(source-target) / (source+target)`;
-    /// [`REAL_TYPE_MAX`] when `source + target == 0`, which is unreachable for
+    /// `REAL_TYPE_MAX` when `source + target == 0`, which is unreachable for
     /// a recorded label (`source + target >= 1` always).
     pub volume_similarity: f64,
     /// `GetFalseNegativeError(label)`: `target_complement / target`;
-    /// [`REAL_TYPE_MAX`] when `target == 0`.
+    /// `REAL_TYPE_MAX` when `target == 0`.
     pub false_negative_error: f64,
     /// `GetFalsePositiveError(label)`: `source_complement /
-    /// (source_complement + (n_vox - union))`; [`REAL_TYPE_MAX`] when that
+    /// (source_complement + (n_vox - union))`; `REAL_TYPE_MAX` when that
     /// denominator is `0`. Upstream instead guards on `source == 0` — see the
     /// module docs (§1.12).
     pub false_positive_error: f64,
     /// `GetFalseDiscoveryRate(label)`: `source_complement / source`;
-    /// [`REAL_TYPE_MAX`] when `source == 0`.
+    /// `REAL_TYPE_MAX` when `source == 0`.
     pub false_discovery_rate: f64,
 }
 

@@ -3,7 +3,7 @@
 //!
 //! Ported from `itkReinitializeLevelSetImageFilter.h/.hxx` and the
 //! `itkLevelSetNeighborhoodExtractor.h/.hxx` it drives. The fast-marching half
-//! reuses [`crate::filters::fast_marching`]'s solver through its `march_flat` seam.
+//! reuses [`mod@crate::filters::fast_marching`]'s solver through its `march_flat` seam.
 //!
 //! # The pipeline
 //!

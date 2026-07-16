@@ -56,13 +56,13 @@
 //! splits the region and seeds each piece with its own work-unit id, giving a
 //! different (also machine-dependent, since the split depends on the work-unit
 //! count) result; that divergence is inherent to ITK's design and is the same
-//! policy [`crate::filters::noise`] follows.
+//! policy [`mod@crate::filters::noise`] follows.
 //!
 //! Within an iteration the sampler's stream is consumed in a fixed order: the
 //! kernel-bandwidth Newton iterations first (when
 //! `kernel_bandwidth_estimation` is on), then the image update, walking
 //! `ImageBoundaryFacesCalculator`'s face list — interior region first, then the
-//! low/high boundary face of each axis in axis order. [`boundary_faces`]
+//! low/high boundary face of each axis in axis order. `boundary_faces`
 //! reproduces that ordering because it determines which draws each pixel gets.
 //!
 //! # Boundary handling
@@ -85,8 +85,8 @@
 //!   and the three fidelity terms subtract/multiply two `PixelValueType`
 //!   values *before* widening to `double`. For pixel types narrower than
 //!   `int` that promotes to `int` and is exact; for `uint32`/`int32`/`uint64`/
-//!   `int64` it wraps in the pixel type. [`PatchPixel::sub_f64`] and
-//!   [`PatchPixel::mul_f64`] reproduce this per type rather than computing in
+//!   `int64` it wraps in the pixel type. `PatchPixel::sub_f64` and
+//!   `PatchPixel::mul_f64` reproduce this per type rather than computing in
 //!   `f64` throughout.
 //! - `NoiseSigma` is consumed by the `RICIAN` model only. `GAUSSIAN` and
 //!   `POISSON` never read it, so setting it changes nothing for them.
@@ -106,12 +106,12 @@
 //!   Upstream casts `0.99999` to the pixel type *before* the `min`, so
 //!   `static_cast<PixelValueType>(0.99999)` is **0** for every integer pixel
 //!   type and the step collapses to `1e-5` regardless of the pixel value.
-//!   [`poisson_step_size`] takes the `min` in real arithmetic, so an integer
+//!   `poisson_step_size` takes the `min` in real arithmetic, so an integer
 //!   pixel of value `v ≥ 1` gets the intended saturated step `0.99999 + 0.00001`.
 //! - `GaussianRandomSpatialNeighborSubsampler::GetIntegerVariate` casts a
 //!   possibly-negative `std::floor(randVar)` to `unsigned int` (undefined
 //!   behaviour) and relies on the wrapped value failing the `> upperBound`
-//!   test. [`GaussianSampler::integer_variate`] rejects out-of-range variates
+//!   test. `GaussianSampler::integer_variate` rejects out-of-range variates
 //!   directly, which agrees with the wrapping implementations for every
 //!   variate a `sqrt(SampleVariance)`-scaled normal can realistically produce.
 //! - When `CanSelectQuery` is off (the kernel-bandwidth pass) and the search
@@ -120,7 +120,7 @@
 //!   an empty patch set instead, which makes `ThreadedComputeSigmaUpdate`'s
 //!   `0 / 0` produce a `NaN` that its own `probJointEntropy > 0` assertion
 //!   rejects: the filter fails with [`FilterError::NoPatchesSampled`] rather
-//!   than hanging. See [`GaussianSampler::search`].
+//!   than hanging. See `GaussianSampler::search`.
 
 use crate::core::{Image, Scalar, dispatch_scalar};
 use crate::filters::denoise::{modified_bessel_i0, modified_bessel_i1};

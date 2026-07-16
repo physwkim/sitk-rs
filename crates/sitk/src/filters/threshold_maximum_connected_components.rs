@@ -36,7 +36,7 @@
 //! biases the search's very first split toward `lowerBound`; upstream then
 //! computes `midpoint - lowerBound` on that biased value, which for integer
 //! pixel types can go negative and, for unsigned pixel types, wraps modulo
-//! `2^bits`. [`bisect`] instead computes the true center,
+//! `2^bits`. `bisect` instead computes the true center,
 //! `lowerBound + (upperBound - lowerBound) / 2`, matching the quarter-point
 //! formula every subsequent iteration already uses
 //! (`lowerBound + (midpoint - lowerBound) / 2` and
@@ -69,7 +69,7 @@
 //! overflow is UB) to seed a garbage bisection over a nonsensical interval.
 //! This port instead clamps `upper_bound0 = max(min(image_max, UpperBoundary),
 //! image_min)`, so the search interval `[image_min, upper_bound0]` can never
-//! be inverted -- [`bisect`]'s plain (non-wrapping) subtraction would
+//! be inverted -- `bisect`'s plain (non-wrapping) subtraction would
 //! otherwise debug-panic / release-wrap on it. The degenerate input collapses
 //! to a zero-width interval: the loop never runs, `threshold_value` stays at
 //! `image_min`, and the final `binary_threshold` over the empty `[image_min,
@@ -93,7 +93,7 @@
 //! objects that *survive* the minimum-size filter. Because
 //! [`crate::filters::relabel_component`] assigns surviving objects consecutive labels
 //! `1..=N`, that count is exactly the maximum pixel value in its output, which
-//! [`count_components`] uses instead of threading a separate count out of
+//! `count_components` uses instead of threading a separate count out of
 //! `crate::filters::label`.
 //!
 //! ## `outside_value != 0` breaks the internal search
@@ -110,7 +110,7 @@
 //! separation, not a specific inside value). But a caller-chosen
 //! **nonzero** `outside_value` makes *every* pixel nonzero after
 //! binarization -- the whole image becomes one connected component for
-//! every threshold candidate, so every comparison in [`bisect`] ties, the
+//! every threshold candidate, so every comparison in `bisect` ties, the
 //! loop always takes the "keep searching left" branch, and the search
 //! degenerates toward `image_min` regardless of the image's actual
 //! content. This is reproduced here exactly as upstream would behave, not
@@ -120,7 +120,7 @@
 //!
 //! `ConnectedComponentImageFilter`'s `FullyConnected` defaults to `false`
 //! and `ThresholdMaximumConnectedComponentsImageFilter` never overrides it;
-//! this is not exposed by the yaml either. [`count_components`] always calls
+//! this is not exposed by the yaml either. `count_components` always calls
 //! [`crate::filters::connected_component`] with `fully_connected = false`.
 //!
 //! ## `m_LowerBoundary` is dead

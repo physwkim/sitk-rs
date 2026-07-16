@@ -9,7 +9,7 @@
 //! - [`area_closing`] -- `itkAreaClosingImageFilter.h`, the same base class
 //!   with `TFunction = std::less<InputPixelType>`.
 //!
-//! [`AttributeKind`] plays the same role here as `ExtremaKind` does in
+//! `AttributeKind` plays the same role here as `ExtremaKind` does in
 //! [`crate::filters::regional_extrema`] and `ReconstructionKind` does in
 //! [`crate::filters::reconstruction`].
 //!
@@ -82,13 +82,13 @@
 //! proves it sorts no later than the current pixel, which is exactly when
 //! it has already been swept -- holds for *every* flat index, so
 //! `find_root` never observes an `INACTIVE` (`-1`) node in practice; the
-//! `parent[x] < 0` conflation in [`find_root`] is dead code once the sort is
+//! `parent[x] < 0` conflation in `find_root` is dead code once the sort is
 //! correct, not a latent defect of its own.
 //!
 //! `UseImageSpacing` scales each pixel's starting attribute contribution by
 //! the product of [`Image::spacing`], matching `psize = Π spacing[i]`; when
 //! `false`, each pixel simply contributes `1.0`. `FullyConnected` selects
-//! [`Half::Full`] neighbor connectivity, exactly as `SetupOffsetVec`'s
+//! `Half::Full` neighbor connectivity, exactly as `SetupOffsetVec`'s
 //! `setConnectivity(&It, m_FullyConnected)` does. Output pixel type always
 //! matches the input (`AreaOpeningImageFilter.yaml`/
 //! `AreaClosingImageFilter.yaml` have no `output_pixel_type`).

@@ -1,6 +1,6 @@
 //! Shared 1-D histogram scaffolding for every histogram-driven threshold
 //! calculator in this crate: [`crate::filters::intensity`]'s Otsu/Triangle family and
-//! [`crate::filters::threshold`]'s Huang/Intermodes/IsoData/KittlerIllingworth/Li/
+//! [`mod@crate::filters::threshold`]'s Huang/Intermodes/IsoData/KittlerIllingworth/Li/
 //! MaximumEntropy/Moments/RenyiEntropy/Shanbhag/Yen family. All of them are
 //! built on `itk::Statistics::Histogram`
 //! (`Modules/Numerics/Statistics/include/itkHistogram.h(.hxx)`) as populated
@@ -8,7 +8,7 @@
 //!
 //! ## Histogram construction
 //!
-//! [`Histogram`] mirrors the `AutoMinimumMaximum` path shared by
+//! `Histogram` mirrors the `AutoMinimumMaximum` path shared by
 //! `itk::Statistics::ImageToHistogramFilter` (used by every
 //! `HistogramThresholdImageFilter` subclass) and
 //! `itk::Statistics::SampleToHistogramFilter` (used by
@@ -63,7 +63,7 @@ use crate::filters::error::{FilterError, Result};
 ///   `!= 0`. `mask_value` defaults to `NumericTraits<MaskPixelType>::max()`, i.e.
 ///   **255** (`itkHistogramThresholdImageFilter.hxx`'s ctor; SimpleITK's yaml carries
 ///   the same `255u` default).
-/// * **Output masking**, when [`mask_output`](Self::mask_output) is true (ITK's and
+/// * **Output masking**, when `mask_output` is true (ITK's and
 ///   SimpleITK's default), runs the thresholded image through `MaskImageFilter`
 ///   (`.hxx:113-125`), which zeroes where the mask equals its *masking value* — and
 ///   that is **`0`**, not `mask_value`.

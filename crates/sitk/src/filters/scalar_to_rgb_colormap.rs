@@ -21,7 +21,7 @@
 //! (`UseInputImageExtremaForScaling = true`, the scan in
 //! `BeforeThreadedGenerateData`) or from `ColormapFunction`'s own
 //! constructor defaults (`itkColormapFunction.h:78-83`). It then computes a
-//! per-channel formula of `value` (see [`apply_colormap`]) and narrows each
+//! per-channel formula of `value` (see `apply_colormap`) and narrows each
 //! channel back to `uint8_t` via `RescaleRGBComponentValue`
 //! (`itkColormapFunction.h:105-112`): `static_cast<uint8_t>(255.0 * c)` --
 //! since SimpleITK exposes no setter for `MinimumRGBComponentValue`/
@@ -42,7 +42,7 @@
 //! value for floating types, and identical to `min()` for every integer
 //! type) -- and uses it in exactly this role elsewhere, e.g.
 //! `MinimumMaximumImageCalculator::Compute` (`itkMinimumMaximumImageCalculator.hxx:37,89`).
-//! This port now uses [`crate::filters::numeric_traits_nonpositive_min`] everywhere
+//! This port now uses `crate::filters::numeric_traits_nonpositive_min` everywhere
 //! the old, buggy `NumericTraits<T>::min()` seed appeared.
 //!
 //! 1. **The `UseInputImageExtremaForScaling = true` scan's `maximumValue`
@@ -62,9 +62,9 @@
 //!    the effective rescale range and pushing every pixel's `value` higher
 //!    than it should be (e.g. an image of `[-10, -5, -1]` used to rescale
 //!    `-1` to `0.9` instead of the correct `1.0`). With the
-//!    `NonpositiveMin()` seed [`input_extrema`]'s scan now finds the true
+//!    `NonpositiveMin()` seed `input_extrema`'s scan now finds the true
 //!    negative maximum in every case; pinned by
-//!    [`tests::float_all_non_positive_image_scan_finds_the_true_negative_maximum`].
+//!    `tests::float_all_non_positive_image_scan_finds_the_true_negative_maximum`.
 //!
 //! 2. **`UseInputImageExtremaForScaling = false`'s fallback range.**
 //!    `itkColormapFunction.h:78-83`'s constructor seeds
@@ -79,7 +79,7 @@
 //!    it. With the `NonpositiveMin()` seed, `Float32`/`Float64` now get the
 //!    same true full-native-range fallback integer types always had (`d ≈
 //!    2·FLT_MAX`/`2·DBL_MAX`); pinned by
-//!    [`tests::extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range`].
+//!    `tests::extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range`.
 
 use crate::core::{Image, PixelId};
 use crate::filters::error::Result;

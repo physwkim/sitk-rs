@@ -41,8 +41,8 @@ fn cumulative_function(u: f64, v: f64, alpha: f64, beta: f64) -> f64 {
 }
 
 /// `AdaptiveHistogramEqualizationImageFilter`: per-pixel power-law adaptive
-/// histogram equalization over an axis-aligned `radius` window (`2*radius[d]
-/// + 1` pixels wide per axis), blended from classical histogram
+/// histogram equalization over an axis-aligned `radius` window
+/// (`2*radius[d] + 1` pixels wide per axis), blended from classical histogram
 /// equalization (`alpha=0`) toward an unsharp mask (`alpha=1`) by `alpha`,
 /// and from that toward the identity by `beta`
 /// (`itkAdaptiveHistogramEqualizationImageFilter.hxx`'s `ConfigureHistogram`,
@@ -56,7 +56,7 @@ fn cumulative_function(u: f64, v: f64, alpha: f64, beta: f64) -> f64 {
 /// Boundary handling: a window position that extends past the image edge
 /// does **not** clamp the out-of-bounds offset to the nearest in-bounds
 /// pixel (unlike e.g. [`crate::core::ZeroFluxNeumannBoundaryCondition`], or
-/// [`crate::filters::expand`]'s corner sampling); instead, out-of-bounds offsets are
+/// [`crate::filters::expand()`]'s corner sampling); instead, out-of-bounds offsets are
 /// excluded from the local frequency map entirely and merely counted
 /// (`AddBoundary`/`RemoveBoundary` in `itkMovingHistogramImageFilter.hxx`),
 /// which shrinks the normalizing denominator (`kernel_size -
@@ -92,7 +92,7 @@ fn cumulative_function(u: f64, v: f64, alpha: f64, beta: f64) -> f64 {
 /// before use in `CumulativeFunction` and the output reconstruction — a
 /// sub-ULP precision loss on every pixel. This port keeps `u`/`v`/`sum` in
 /// `f64` throughout, matching the crate's established "widen to `f64`, never
-/// narrow until the final output quantization" idiom (see e.g. [`crate::filters::clamp`]).
+/// narrow until the final output quantization" idiom (see e.g. [`crate::filters::clamp()`]).
 /// This changes no qualitative behavior (the `alpha=1,beta=1` exact-identity
 /// collapse survives the switch from `f32` to `f64` intermediates unchanged)
 /// — it only makes this port's results *more* precise than upstream's, never

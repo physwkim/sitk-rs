@@ -63,7 +63,7 @@
 //!   flips, exactly as the `.hxx` does). `VotingBinaryHoleFillingImageFilter.yaml`
 //!   restricts `pixel_types` to `IntegerPixelIDTypeList`;
 //!   [`voting_binary_hole_filling`] enforces this via
-//!   [`crate::filters::logic::require_integer_pixel_type`], but [`voting_binary`] and
+//!   `crate::filters::logic::require_integer_pixel_type`, but [`voting_binary`] and
 //!   [`voting_binary_iterative_hole_filling`] declare the same restriction in
 //!   their own yamls without enforcing it — a pre-existing gap in this
 //!   port, outside this change's scope.
@@ -395,7 +395,7 @@ pub struct VotingBinaryHoleFillingResult {
 /// the same per-pass rule [`voting_binary_iterative_hole_filling`] loops —
 /// computes `birth_threshold` from `majority_threshold` and `radius`
 /// (`BeforeThreadedGenerateData`, see module docs), then runs
-/// [`voting_binary_hole_filling_pass`] exactly once, unlike the iterative
+/// `voting_binary_hole_filling_pass` exactly once, unlike the iterative
 /// filter's convergence loop.
 ///
 /// Requires an integer pixel type (`VotingBinaryHoleFillingImageFilter.yaml`'s
@@ -426,7 +426,7 @@ pub fn voting_binary_hole_filling(
 
 /// `VotingBinaryIterativeHoleFillingImageFilter`
 /// (`itkVotingBinaryIterativeHoleFillingImageFilter.hxx`): repeatedly apply
-/// [`voting_binary_hole_filling_pass`]'s per-iteration rule, input := previous
+/// `voting_binary_hole_filling_pass`'s per-iteration rule, input := previous
 /// output, until either `maximum_number_of_iterations` passes have run or a
 /// pass changes no pixels. See the module docs for `birth_threshold`'s
 /// derivation from `majority_threshold` and `radius`.

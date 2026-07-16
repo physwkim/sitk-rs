@@ -29,7 +29,7 @@
 //! integer types -- `AndImageFilter`'s `BitwiseOperators` concept check
 //! (mirrored by SimpleITK's `IntegerPixelIDTypeList` restriction on the
 //! generated wrappers) rejects float instantiations at compile time. This
-//! port checks [`PixelId::is_floating_point`] at runtime and returns
+//! port checks [`crate::core::PixelId::is_floating_point`] at runtime and returns
 //! [`FilterError::RequiresIntegerPixelType`] in place of the C++ compile
 //! error; [`BinaryFunctor`] impls for `f32`/`f64` exist only to satisfy the
 //! dispatch engine's blanket bound and `unreachable!()` if ever reached.
@@ -61,7 +61,7 @@
 //! as required parameters instead of hard-coding either default, matching
 //! [`mask`]/[`mask_negated`]'s precedent. Separately,
 //! `BinaryNotImageFilter.yaml`'s prose description ("output_pixel =
-//! static_cast<PixelType>( input1_pixel != input2_pixel )") describes a
+//! `static_cast<PixelType>( input1_pixel != input2_pixel )`") describes a
 //! *two*-image `!=` comparison and does not match either the single-image
 //! `operator()` in `itkBinaryNotImageFilter.h` or `number_of_inputs: 1` in
 //! the same yaml file -- an upstream copy-paste error in the yaml's prose,
@@ -618,7 +618,7 @@ fn masked_assign_typed_in_place<T: Scalar>(
 
 /// `MaskedAssignImageFilter`: pixel-wise `mask != 0 ? assign : image` (see
 /// the module docs). `mask` must be `UInt8`, share `image`'s size and sit on `image`'s
-/// grid ([`crate::filters::mask_input::uint8_mask_voxels`]); `assign` must share `image`'s
+/// grid (`crate::filters::mask_input::uint8_mask_voxels`); `assign` must share `image`'s
 /// pixel type and size.
 pub fn masked_assign(image: &Image, mask: &Image, assign: &Image) -> Result<Image> {
     let mask_bytes = crate::filters::mask_input::uint8_mask_voxels(image, mask)?;

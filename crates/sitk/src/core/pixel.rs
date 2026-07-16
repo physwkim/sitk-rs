@@ -379,7 +379,7 @@ impl PixelId {
 /// A Rust scalar type that can back a pixel buffer.
 ///
 /// Recovering a concrete `&[T]` from a type-erased [`PixelBuffer`] is
-/// deliberately *not* on this trait — see [`PixelBuffer::as_slice`], which is
+/// deliberately *not* on this trait — see `PixelBuffer::as_slice`, which is
 /// crate-private. A `&[T]` taken straight off the buffer says nothing about
 /// whether the owning image is scalar, and reading it as one element per pixel
 /// silently misreads a vector image. Outside this crate the only ways to a
@@ -388,7 +388,6 @@ impl PixelId {
 /// [`Image::component_slice`] / [`Image::component_vec_mut`] (which name in
 /// their signature that they return interleaved components).
 ///
-/// [`PixelBuffer::as_slice`]: crate::core::PixelBuffer::as_slice
 /// [`Image::scalar_slice`]: crate::core::Image::scalar_slice
 /// [`Image::scalar_vec_mut`]: crate::core::Image::scalar_vec_mut
 /// [`Image::scalar_view`]: crate::core::Image::scalar_view

@@ -39,7 +39,7 @@
 //!
 //! so the conductance terms `exp(g²/K)` are ITK's spelling of
 //! `exp(−g²/(2·conductance²·⟨|∇u|²⟩))`. `itkScalarAnisotropicDiffusionFunction.hxx`'s
-//! estimator ([`average_gradient_magnitude_squared`]) is the mean over *every*
+//! estimator (`average_gradient_magnitude_squared`) is the mean over *every*
 //! pixel of the current solution (interior and zero-flux boundary faces alike,
 //! `counter` counting pixels, not pixel×axis) of
 //! `Σᵢ (scale[i]·(u[p+eᵢ] − u[p−eᵢ]) / −2)²`. When `K == 0` — a constant image,

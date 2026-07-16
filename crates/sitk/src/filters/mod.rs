@@ -17,12 +17,12 @@
 //!   out-of-range float→int cast is undefined in C++, and we define it as
 //!   saturation.
 //!
-//! Both policies are the two faces of the [`functor`] module's pixel-functor
+//! Both policies are the two faces of the [`crate::filters::functor`] module's pixel-functor
 //! seam (ITK's `UnaryFunctorImageFilter` / `BinaryFunctorImageFilter`), which
 //! `add`/`subtract`/`multiply`/`divide`, the `*_constant` ops, and `abs` are
 //! built on.
 //!
-//! [`unary_minus`] is the unary face of the same pixel-type-compute policy
+//! [`crate::filters::unary_minus`] is the unary face of the same pixel-type-compute policy
 //! as `add`/`subtract`/`multiply`/`divide`/`modulus` (ITK's `UnaryMinus`
 //! functor, `itkArithmeticOpsFunctors.h`): `static_cast<T>(-a)`, computed in
 //! the pixel type with no `f64` promotion, so a signed integer's minimum
@@ -32,7 +32,7 @@
 //! `UnaryMinusImageFilter.yaml` restricts this to signed pixel types
 //! (`Functor::UnaryMinus`'s doc comment: "Assumed that the output type is
 //! signed"); this port checks [`PixelId::is_signed`] at runtime and returns
-//! [`FilterError::RequiresSignedPixelType`] in place of the C++ compile-time
+//! [`crate::filters::FilterError::RequiresSignedPixelType`] in place of the C++ compile-time
 //! restriction.
 //!
 //! The struct-style filter API and the remaining ~290 filters arrive with the
@@ -648,7 +648,7 @@ fn require_same_shape(a: &Image, b: &Image) -> Result<()> {
 ///
 /// **Integer input to integer output** takes the native path: each pixel is
 /// widened to `i128` (lossless for every integer pixel type) and narrowed with a
-/// native `static_cast` ([`read_pixels_i128`] / [`build_from_i128`]). Routing
+/// native `static_cast` (`read_pixels_i128` / `build_from_i128`). Routing
 /// through `f64` — as the general filter exit does — would collapse a `UInt64`/
 /// `Int64` value above `2^53` (e.g. `2^53 + 1 -> 2^53`), which a `static_cast`
 /// never does.

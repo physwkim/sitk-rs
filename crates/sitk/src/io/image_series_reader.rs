@@ -197,7 +197,7 @@ impl ImageSeriesReader {
     /// file's own third axis has size `1` (sitkImageSeriesReader.cxx:219-229) —
     /// so three 100x100x1 files promote to a 3-D `100x100x3` volume, not a 4-D
     /// one. The promoted dimension must land in `2..=5`
-    /// ([`SITK_MAX_DIMENSION`]).
+    /// (`SITK_MAX_DIMENSION`).
     ///
     /// # Which axis the slices stack along
     ///

@@ -1,0 +1,3 @@
+ Documenting sitk v0.0.3 (/home/stevek/work/sitk-rs/crates/sitk)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.28s
+   Generated /home/stevek/work/sitk-rs/target/doc/sitk/index.html

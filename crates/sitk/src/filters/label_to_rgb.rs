@@ -4,7 +4,7 @@
 //! `itkLabelOverlayImageFilter.h`/`.hxx`, plus SimpleITK's shared colormap
 //! parsing (`sitkLabelFunctorUtils.hxx`'s `SetLabelFunctorFromColormap`).
 //!
-//! [`build_color_table`] and [`label_color_indices`] are shared by both
+//! `build_color_table` and `label_color_indices` are shared by both
 //! filters, which differ only in output pixel type and per-pixel
 //! combination:
 //!
@@ -51,7 +51,7 @@
 //!    `colormap[i + 1]`/`colormap[i + 2]` unconditionally on its last
 //!    iteration -- an out-of-bounds `std::vector::operator[]` read (undefined
 //!    behavior) when the remainder is 1 or 2 bytes, not a graceful skip.
-//!    [`build_color_table`] implements the *documented* behavior (via
+//!    `build_color_table` implements the *documented* behavior (via
 //!    `chunks_exact(3)`, which drops an incomplete trailing remainder), a
 //!    diverge-for-C++-UB case per this crate's porting policy.
 //!
@@ -268,7 +268,7 @@ pub(crate) fn vector_image_from_f64(
 /// not per pixel -- so `opaque[c]` can itself lose precision (e.g. truncating
 /// a scaled byte to an integer `ValueType`) before it's promoted back to
 /// `double` for the blend. This port reproduces that two-step rounding via
-/// [`quantize_to_pixel_type`] when building `scaled_colors`.
+/// `quantize_to_pixel_type` when building `scaled_colors`.
 pub fn label_overlay(
     image: &Image,
     label_image: &Image,

@@ -108,8 +108,8 @@ pub enum IoError {
     UnsupportedVtkFeature(String),
 
     /// A PNG file's 8-byte signature was missing or did not match, discovered
-    /// while parsing a header (rather than by [`ImageIo::can_read_file`]
-    /// (crate::io::ImageIo), which gates the normal registry path). Two upstream
+    /// while parsing a header (rather than by
+    /// [`ImageIo::can_read_file`](crate::io::ImageIo::can_read_file), which gates the normal registry path). Two upstream
     /// messages collapse into this one variant:
     /// `"PNGImageIO failed to read header for file: ..."` when fewer than 8
     /// bytes are present, and `"File is not png type: ..."` when 8 bytes are

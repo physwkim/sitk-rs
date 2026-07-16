@@ -45,7 +45,7 @@
 //! 1. **both codes `UNKNOWN`** → origin `0`, direction identity, and return.
 //!    (The Analyze-7.5 `analyze75_orient` branch is skipped under the default
 //!    `Analyze75Flavor::AnalyzeITK4Warning`, so it is not ported — see
-//!    [`the_mat`].)
+//!    `the_mat`.)
 //! 2. otherwise `prefer_sform_over_qform` starts as "the two matrices agree
 //!    element by element", and is then refined: if the sform is an invertible
 //!    affine whose 3×3 normalises to an orthonormal matrix, the sform wins when
@@ -3139,7 +3139,7 @@ impl ImageIo for NiftiImageIo {
     }
 
     /// `options` is ignored: NIfTI compresses iff the file name ends in `.gz`,
-    /// and always at zlib's default level. See [`write`].
+    /// and always at zlib's default level. See [`write()`].
     fn write(&self, image: &Image, path: &Path, _options: &WriteOptions) -> Result<()> {
         write(image, path)
     }

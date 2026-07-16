@@ -7,7 +7,7 @@
 //! > `transform.transform_point(p)` **is** `mat_vec(m.matrix, p) + m.offset` — bit for
 //! > bit, the same operations, in the same order, on the same operands.
 //!
-//! [`TransformBase::is_linear`](crate::transform::TransformBase::is_linear) asks only whether the
+//! [`TransformBase::is_linear`] asks only whether the
 //! map *is* `x ↦ M·x + b` mathematically. [`ScaleTransform`](crate::transform::ScaleTransform) is
 //! linear by that test and refused by this one, because it evaluates `(p − c)·s + c`
 //! and that is a **different rounding** from `M·p + b`.

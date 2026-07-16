@@ -349,7 +349,7 @@ struct Cursor {
 ///
 /// The window walk visits one pixel at a time, so a buffer it allocates is a
 /// buffer it allocates once per pixel. Holding them here — allocated once by
-/// [`NeighborhoodIterator::window_state`] and reused for every pixel that task
+/// `NeighborhoodIterator::window_state` and reused for every pixel that task
 /// touches — is what makes [`crate::core::parallel`]'s "allocate per task, never per
 /// pixel" contract hold on the boundary path, which is the one path that used to
 /// break it.
@@ -657,7 +657,7 @@ impl<'a, T: Scalar, B: BoundaryCondition<T>> NeighborhoodIterator<'a, T, B> {
     /// `nd` is caller-owned working storage of exactly `dimension()` elements,
     /// reused across centers for the same reason `window` is: this is the
     /// per-pixel path, and a buffer allocated inside it would be a buffer
-    /// allocated 16.7 M times. See [`Self::push_values_checked`].
+    /// allocated 16.7 M times. See `Self::push_values_checked`.
     ///
     /// Leaves `window` exactly as [`Self::neighborhood_at`] would have built it.
     pub fn refill(&self, center: &[usize], nd: &mut [i64], window: &mut Neighborhood<T>) {

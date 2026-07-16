@@ -20,7 +20,7 @@
 //! (`itkFloodFilledFunctionConditionalConstIterator.h` / `.hxx`,
 //! `itkShapedFloodFilledFunctionConditionalConstIterator.h` / `.hxx`): an
 //! explicit work queue, never recursion, so a large volume cannot blow the
-//! stack. [`flood_fill`] is the shared core every filter below builds on.
+//! stack. `flood_fill` is the shared core every filter below builds on.
 //!
 //! ## Seed admission
 //!
@@ -29,7 +29,7 @@
 //! outside the image, or whose own value fails the filter's inclusion test,
 //! is silently dropped — it never starts a flood and is never an error. An
 //! all-dropped seed list (including an empty one) yields the pre-zeroed
-//! output unchanged. [`flood_fill`] reproduces this exactly.
+//! output unchanged. `flood_fill` reproduces this exactly.
 //!
 //! ## Connectivity
 //!
@@ -102,7 +102,7 @@
 //!
 //! `itk::Math::AlmostEquals`/`NotAlmostEquals` (`itkMath.h`) use a
 //! ULP-and-epsilon float comparison; this port uses a small fixed absolute
-//! tolerance ([`VARIANCE_ALMOST_ZERO`], and `1e-9` for the sum comparisons
+//! tolerance (`VARIANCE_ALMOST_ZERO`, and `1e-9` for the sum comparisons
 //! in `isolated_connected`) instead of replicating ULP counting bit for bit
 //! — both exist only to absorb floating-point rounding noise around exact
 //! zero, and the sums/variances here never approach magnitudes where the
@@ -1160,7 +1160,7 @@ fn vector_confidence_connected_typed<T: Scalar>(
 /// doc's `vector_confidence_connected` section for the exact algorithm and
 /// its quirks. Errors with [`crate::core::Error::RequiresVectorPixelType`] on
 /// a scalar image (`pixel_types: VectorPixelIDTypeList` — unlike
-/// [`crate::filters::vector_connected_component`], not restricted to real-valued
+/// [`crate::filters::vector_connected_component()`], not restricted to real-valued
 /// components). Output pixel type is `UInt8`, matching SimpleITK's
 /// `VectorConfidenceConnectedImageFilter.yaml`.
 #[allow(clippy::too_many_arguments)]

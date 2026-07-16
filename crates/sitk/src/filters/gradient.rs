@@ -484,7 +484,7 @@ fn sobel_pass<T: Scalar>(img: &Image, use_legacy_operator_coefficients: bool) ->
 /// `GradientMagnitudeRecursiveGaussianImageFilter`: the Euclidean norm of the
 /// gradient of `img` convolved with a Gaussian of physical-space `sigma`
 /// (isotropic — one value for every axis, matching ITK's single `Sigma`
-/// parameter). Composes per-axis [`recursive_gaussian_f64_from_into`] calls —
+/// parameter). Composes per-axis `recursive_gaussian_f64_from_into` calls —
 /// [`GaussianOrder::FirstOrder`] on one axis, [`GaussianOrder::ZeroOrder`] on
 /// the rest — dividing each axis's derivative by `spacing[d]` again to convert
 /// it from the recursion's index space to physical space.
@@ -585,7 +585,7 @@ pub fn gradient_magnitude_recursive_gaussian(
 
 /// `LaplacianRecursiveGaussianImageFilter`: the Laplacian-of-Gaussian of
 /// `img`, `sum_d d2/dx_d^2 [G_sigma * img]`. Composes per-axis
-/// [`recursive_gaussian_f64_from_into`] calls — [`GaussianOrder::SecondOrder`] on
+/// `recursive_gaussian_f64_from_into` calls — [`GaussianOrder::SecondOrder`] on
 /// one axis, [`GaussianOrder::ZeroOrder`] on the rest — dividing each axis's
 /// second derivative by `spacing[d]^2` again to convert it from
 /// the recursion's index space to physical space.
@@ -773,7 +773,7 @@ fn gradient_pass<T: Scalar>(
 /// `GradientRecursiveGaussianImageFilter.yaml:9-11`, default `1.0`), assembled
 /// into a covariant-vector image.
 ///
-/// For each axis `d`, this composes per-axis [`recursive_gaussian_f64_from_into`] calls
+/// For each axis `d`, this composes per-axis `recursive_gaussian_f64_from_into` calls
 /// exactly like [`gradient_magnitude_recursive_gaussian`] does —
 /// [`GaussianOrder::FirstOrder`] on axis `d`, [`GaussianOrder::ZeroOrder`] on
 /// the rest — then divides that axis's derivative by `spacing[d]` again to

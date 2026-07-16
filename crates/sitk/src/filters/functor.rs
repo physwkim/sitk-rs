@@ -33,18 +33,18 @@
 //!   exact where an `f64` promotion could lose precision above 2^53), but
 //!   the output type is always `u8` instead of `T`.
 //!
-//! [`unary_functor!`] and [`binary_functor!`] each wire a functor value to a
+//! `unary_functor!` and `binary_functor!` each wire a functor value to a
 //! pair of public functions: an allocating one taking `&Image`, and an
 //! in-place one that consumes an owned `Image` and reuses its buffer,
 //! mirroring the fact that both `UnaryFunctorImageFilter` and
 //! `BinaryFunctorImageFilter` derive from `InPlaceImageFilter` in ITK.
-//! [`comparison_functor!`] emits only the allocating function: the output
+//! `comparison_functor!` emits only the allocating function: the output
 //! pixel type (`u8`) can differ from the (shared) input pixel type, so
 //! there is no buffer to reuse in place (matching `divide_real`'s precedent
 //! in `math.rs`). [`UnaryPixelFunctor`] has no such macro: every current
 //! consumer (`unary_minus`, `bitwise_not`, `binary_not`) needs a pixel-type
-//! precondition check before dispatch, so they call [`unary_pixel_apply`] /
-//! [`unary_pixel_apply_in_place`] directly instead, the same way
+//! precondition check before dispatch, so they call `unary_pixel_apply` /
+//! `unary_pixel_apply_in_place` directly instead, the same way
 //! `and`/`or`/`xor`/`not` bypass `binary_functor!`/`unary_functor!` for the
 //! same reason.
 

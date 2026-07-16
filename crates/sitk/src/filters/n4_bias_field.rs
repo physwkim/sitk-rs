@@ -7,14 +7,14 @@
 //! 1. **Sharpen** the current log-uncorrected image by deconvolving its
 //!    intensity histogram with a Gaussian of the given full width at half
 //!    maximum, using a Wiener filter, and remapping every voxel through the
-//!    resulting expectation `E(u | v)` ([`sharpen_image`]).
+//!    resulting expectation `E(u | v)` (`sharpen_image`).
 //! 2. Take the **residual** `log-uncorrected − log-sharpened`, fit a B-spline
 //!    scalar field to it at every included voxel (confidence-weighted), and
 //!    **add** the fitted control-point lattice to the running estimate
-//!    ([`update_bias_field_estimate`]).
+//!    (`update_bias_field_estimate`).
 //! 3. Measure **convergence** as the coefficient of variation of
 //!    `exp(previous − current)` over the included voxels
-//!    ([`calculate_convergence_measurement`]).
+//!    (`calculate_convergence_measurement`).
 //!
 //! Between fitting levels the control-point lattice is refined dyadically, so
 //! later levels model finer structure. The corrected output is
@@ -26,7 +26,7 @@
 //!   `to_f64_vec` idiom. Every formula is transcribed literally otherwise.
 //! - ITK's `SharpenImage` indexes its histogram with `itk::Math::floor` —
 //!   a `static_cast<int>` of a `float` that is `0.0/0.0 = NaN` when the
-//!   bin range is degenerate (see [`sharpen_image`]); a NaN→int conversion
+//!   bin range is degenerate (see `sharpen_image`); a NaN→int conversion
 //!   is undefined behaviour in C++ and the resulting index is used
 //!   unchecked. Here the index is bounds-checked and the voxel skipped.
 //! - Degeneracies ITK dereferences a null lattice on, or divides by zero on,

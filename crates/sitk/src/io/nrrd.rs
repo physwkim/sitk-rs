@@ -5,9 +5,9 @@
 //! because they are distinct upstream:
 //!
 //! * **NrrdIO** (`Modules/ThirdParty/NrrdIO/src/NrrdIO/`) — the header grammar,
-//!   the field enums, the encodings, the data-file forms. [`Nrrd`] and
-//!   [`IoState`] below mirror teem's `Nrrd` and `NrrdIoState` structs, and
-//!   [`read_header`] mirrors `formatNRRD_read` (formatNRRD.c:430-533) plus the
+//!   the field enums, the encodings, the data-file forms. `Nrrd` and
+//!   `IoState` below mirror teem's `Nrrd` and `NrrdIoState` structs, and
+//!   `read_header` mirrors `formatNRRD_read` (formatNRRD.c:430-533) plus the
 //!   per-field parsers in parseNrrd.c.
 //! * **NrrdImageIO** (`Modules/IO/NRRD/src/itkNrrdImageIO.cxx`) — the mapping
 //!   from a `Nrrd` to an ITK image: which axis becomes the pixel component

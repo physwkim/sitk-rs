@@ -5,7 +5,7 @@
 //! `itkLabelMapToRGBImageFilter.h`/`.hxx`, `itkLabelMapOverlayImageFilter.h`/`.hxx`
 //! and `itkLabelMapContourOverlayImageFilter.h`/`.hxx`, which reuse
 //! `itkLabelToRGBFunctor.h` / `itkLabelOverlayFunctor.h` — the same functors
-//! [`crate::filters::label_to_rgb`] already ports. The palette, the
+//! [`mod@crate::filters::label_to_rgb`] already ports. The palette, the
 //! `SetLabelFunctorFromColormap` replacement rule
 //! (`sitkLabelFunctorUtils.hxx:38-46`) and its two upstream findings are shared
 //! from that module verbatim; only the two facts below are new to the label-map
@@ -208,7 +208,7 @@ fn color_index(label: i64, num_colors: usize) -> usize {
 /// on a black background, as a 3-component `VectorUInt8` image.
 ///
 /// The background is black rather than "a gray pixel with the same intensity",
-/// for the reason [`crate::filters::label_to_rgb`]'s upstream finding 1 gives: the
+/// for the reason [`mod@crate::filters::label_to_rgb`]'s upstream finding 1 gives: the
 /// functor's `m_BackgroundColor` (`itkLabelToRGBFunctor.h:86-87`) is
 /// zero-filled and SimpleITK exposes no setter. `BeforeThreadedGenerateData`
 /// fills the buffer with `function(GetBackgroundValue())`

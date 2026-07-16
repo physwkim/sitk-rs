@@ -6,22 +6,22 @@
 //! `itkCannyEdgeDetectionImageFilter.hxx` top to bottom, `GenerateData` runs:
 //!
 //! 1. **Smoothing** (`m_GaussianFilter`, a `DiscreteGaussianImageFilter`) —
-//!    [`crate::filters::denoise::discrete_gaussian_f64`], the `f64` core shared with
+//!    `crate::filters::denoise::discrete_gaussian_f64`, the `f64` core shared with
 //!    the public [`crate::filters::denoise::discrete_gaussian`] (see below).
 //! 2. **`ComputeCannyEdge`** — the second directional derivative of the
 //!    smoothed image along its own gradient direction,
 //!    `D_uu f = (∇f)ᵀ H (∇f) / |∇f|²` with `u = ∇f/|∇f|`, evaluated per pixel
-//!    over a single radius-1 neighborhood ([`second_directional_derivative_field`]).
+//!    over a single radius-1 neighborhood (`second_directional_derivative_field`).
 //! 3. **`ThreadedCompute2ndDerivativePos`** — the derivative of *that* field
 //!    along the smoothed image's gradient direction (approximating the third
 //!    directional derivative's sign); wherever it is `<= 0`, the pixel keeps
 //!    the smoothed image's gradient magnitude, else `0`
-//!    ([`positional_gate_field`]).
+//!    (`positional_gate_field`).
 //! 4. **Non-maximum suppression** — the zero-crossings of step 2's field
-//!    ([`zero_crossing_values`], the engine behind the public [`zero_crossing`]),
+//!    (`zero_crossing_values`, the engine behind the public [`zero_crossing`]),
 //!    multiplied elementwise into step 3's field (`MultiplyImageFilter`).
 //! 5. **Hysteresis thresholding** (`HysteresisThresholding`/`FollowEdge`) —
-//!    [`hysteresis_threshold`], a flood fill seeded from every pixel above
+//!    `hysteresis_threshold`, a flood fill seeded from every pixel above
 //!    `upper_threshold`, pulling in any full-neighborhood neighbor above
 //!    `lower_threshold` that hasn't been visited yet.
 //!
@@ -42,8 +42,8 @@
 //! instance of itself, or divided by its own vector norm, so that global sign
 //! cancels out and the unflipped convention used here is numerically
 //! equivalent to the flipped one. The order-2 operator is symmetric, so
-//! flipping is a no-op for it regardless. [`derivative_operator_coefficients`]
-//! is [`crate::filters::gradient`]'s verified generator for both, reused here
+//! flipping is a no-op for it regardless. `derivative_operator_coefficients`
+//! is [`mod@crate::filters::gradient`]'s verified generator for both, reused here
 //! `pub(crate)` rather than re-derived.
 //!
 //! Only the smoothing step honors image spacing (`DiscreteGaussianImageFilter`'s
@@ -54,7 +54,7 @@
 //!
 //! The smoothing stage delegates to [`crate::filters::denoise`]'s
 //! `DiscreteGaussianImageFilter` port via its `f64` core
-//! ([`crate::filters::denoise::discrete_gaussian_f64`]), pinned to the only
+//! (`crate::filters::denoise::discrete_gaussian_f64`), pinned to the only
 //! configuration ITK's Canny ever uses: `UseImageSpacing` on and the default
 //! `MaximumKernelWidth` of 32, under `ZeroFluxNeumannBoundaryCondition`.
 

@@ -22,7 +22,7 @@
 //! one sample per output pixel, it **averages** every input pixel in the
 //! `Π factor[d]`-sized bin block, `AccumulatePixelType` (`double`) accumulated
 //! then narrowed back to the input's own pixel type by `RoundIfInteger` --
-//! `itk::Math::Round` (round-half-*up*, [`round_half_up`]) for an integer
+//! `itk::Math::Round` (round-half-*up*, `round_half_up`) for an integer
 //! pixel type, a plain (unrounded) narrowing cast for a floating-point one.
 //! Its output geometry differs from [`shrink`]'s too:
 //!

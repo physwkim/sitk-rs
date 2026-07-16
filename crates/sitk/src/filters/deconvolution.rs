@@ -2,7 +2,7 @@
 //!
 //! Six filters, all sharing `itk::FFTConvolutionImageFilter`'s padding and
 //! transform plumbing (`itkFFTConvolutionImageFilter.hxx`, ported in
-//! [`crate::filters::convolution`]):
+//! [`mod@crate::filters::convolution`]):
 //!
 //! | filter | ITK header | parameter |
 //! |---|---|---|
@@ -20,18 +20,18 @@
 //! # The shared pipeline
 //!
 //! `PrepareInputs` pads the input out to an 11-smooth extent through the
-//! boundary condition ([`crate::filters::convolution::pad_input`]) and builds the
+//! boundary condition (`crate::filters::convolution::pad_input`) and builds the
 //! transfer function `H` — the kernel, upper-zero-padded and cyclically shifted
 //! so its origin sits at index 0, transformed
-//! ([`crate::filters::convolution::kernel_spectrum`]). The three *spectral* filters then
+//! (`crate::filters::convolution::kernel_spectrum`). The three *spectral* filters then
 //! evaluate one binary functor over `(I[k], H[k])`, invert the transform and
-//! crop ([`crate::filters::convolution::crop_output`]). The three *iterative* filters
+//! crop (`crate::filters::convolution::crop_output`). The three *iterative* filters
 //! keep a real-valued estimate in that padded domain, refine it once per
 //! iteration against the cached `H`, and crop at the end
 //! (itkIterativeDeconvolutionImageFilter.hxx:42-134).
 //!
 //! ITK's transforms are half-Hermitian (real input, half spectrum); this port's
-//! [`crate::filters::fft`] is a full complex DFT. Every functor here maps a
+//! `crate::filters::fft` is a full complex DFT. Every functor here maps a
 //! conjugate-symmetric spectrum to a conjugate-symmetric spectrum, so the
 //! inverse transform's imaginary part is zero up to round-off and taking `.re`
 //! is exact.
@@ -47,7 +47,7 @@
 //! installed — even though `PadInput` and `CropOutput` are the very same
 //! `FFTConvolutionImageFilter` methods the one-shot spectral filters use
 //! correctly. This port never modeled that region-clobbering step: each
-//! iterative filter's `output_region_mode` reaches [`plan`] exactly as the
+//! iterative filter's `output_region_mode` reaches `plan` exactly as the
 //! spectral filters' does, so `VALID` narrows the padded working domain (and
 //! therefore every iteration) to the kernel-radius margin, then crops to it.
 //!

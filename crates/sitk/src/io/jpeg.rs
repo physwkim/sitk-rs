@@ -19,14 +19,14 @@
 //!
 //! Because that ITK alias is a *single* field, this port has nothing to
 //! disambiguate: it exposes one knob, [`WriteOptions::compression_level`],
-//! which [`resolved_quality`] interprets as the JPEG quality. There is no
+//! which `resolved_quality` interprets as the JPEG quality. There is no
 //! separate `Quality` option, so the alias collapses to one field with one
 //! meaning — verified 2026-07-11, no code change (ledger §3.49).
 //!
 //! `m_UseCompression = false` is set in the same constructor (`:299`) and
 //! never referenced again anywhere in `itkJPEGImageIO.cxx` — dead code.
 //! `Write` calls `jpeg_set_quality` unconditionally; there is no branch that
-//! skips it. [`write`] reproduces this: [`resolved_quality`] never consults
+//! skips it. [`write()`] reproduces this: `resolved_quality` never consults
 //! [`WriteOptions::use_compression`]. Ledger §2.138.
 //!
 //! # `Progressive` and `CMYKtoRGB` are always on upstream — configurable here
@@ -45,7 +45,7 @@
 //! This port keeps that as the default but exposes the capability upstream
 //! hides:
 //!
-//! * **Write** — the [`ImageIo`] trait and [`write`] use
+//! * **Write** — the [`ImageIo`] trait and [`write()`] use
 //!   [`JpegWriteOptions::default`] (progressive on, 4:2:0), byte-identical to
 //!   before; [`write_with_jpeg_options`] takes an explicit [`JpegWriteOptions`]
 //!   to pick the progressive flag and one of 4:4:4 / 4:2:2 / 4:2:0 chroma
@@ -89,7 +89,7 @@
 //! `jpeg_encoder::ColorType::Cmyk` and `::CmykAsYcck` through
 //! `jpeg_decoder::Decoder` and confirming they recover the same original
 //! bytes (this crate's test module, `cmyk_and_ycck_sources_of_the_same_color_read_back_to_the_same_rgb`).
-//! [`cmyk_to_rgb`] restores the inversion ITK's formula
+//! `cmyk_to_rgb` restores the inversion ITK's formula
 //! expects — `invC = 255 - C`, etc. — before applying the same `invC·invK/255`
 //! arithmetic, which is then correct uniformly for both source encodings.
 //! Ledger §1.65, §4.93.
@@ -101,8 +101,8 @@
 //! populates from the JFIF `APP0` marker. `jpeg-decoder` parses that marker
 //! only far enough to set a boolean (`is_jfif`) — the density fields
 //! themselves are discarded (`crate::io::parser::AppData::Jfif` is a unit
-//! variant). [`scan_jfif_density`] walks the marker stream by hand to recover
-//! them, and [`spacing_from_density`] reproduces
+//! variant). `scan_jfif_density` walks the marker stream by hand to recover
+//! them, and `spacing_from_density` reproduces
 //! `ReadImageInformation`'s exact unit-1-is-inches/unit-2-is-centimetres
 //! arithmetic, `unit == 0` (or no marker at all) included default `[1.0,
 //! 1.0]`.
@@ -122,13 +122,13 @@
 //! exposes it cleanly and `0.75`/`2.54` exercise the (unaffected) inches
 //! branch. Ledger §1.64.
 //!
-//! [`density_for_spacing`] reproduces the *effect* — a cm-favoured spacing
+//! `density_for_spacing` reproduces the *effect* — a cm-favoured spacing
 //! round-trips to `[1.0, 1.0]`, not the value written — via
 //! [`jpeg_encoder::Density::None`] rather than byte-exact `unit = 0` output:
 //! `Density`'s own JFIF writer hardwires `X = Y = 1` under `Density::None`
 //! (`jpeg_encoder::writer::JfifWriter::write_header`), where upstream's buggy
 //! branch still writes its real (if unusable) computed `X_density`/
-//! `Y_density`. [`spacing_from_density`] does not distinguish the two byte
+//! `Y_density`. `spacing_from_density` does not distinguish the two byte
 //! patterns — both fail the `unit == 2` guard identically — so the observable
 //! round-trip behaviour matches exactly. Ledger §4.95.
 //!
@@ -137,7 +137,7 @@
 //! `Write` throws immediately when `GetNumberOfDimensions() != 2`
 //! (itkJPEGImageIO.cxx:459-463) — no slice of a 3-D image is ever written,
 //! unlike `PNGImageIO::WriteSlice`, which silently takes only the first
-//! Z-slice (ledger §2.125). [`write`] reproduces the throw as
+//! Z-slice (ledger §2.125). [`write()`] reproduces the throw as
 //! [`IoError::JpegWriteRejected`]. Ledger §2.135.
 //!
 //! # `CanReadFile` is stricter than PNG's
@@ -182,13 +182,13 @@
 //!   (`JCS_RGB`); anything else falls to `default: JCS_UNKNOWN` plus a warning
 //!   (itkJPEGImageIO.cxx:521-533) — an encoding with no defined colour
 //!   transform that `jpeg_encoder::ColorType` has no counterpart for (its
-//!   variants are all named, fixed-arity colour spaces). [`write`] refuses
+//!   variants are all named, fixed-arity colour spaces). [`write()`] refuses
 //!   any component count other than 1 or 3 with
 //!   [`IoError::UnsupportedJpegFeature`]. Ledger §4.94.
 //! * **A >8-bit-precision (lossless) JPEG.** `m_ComponentType` is hard-coded
 //!   `UCHAR` at compile time — `#if BITS_IN_JSAMPLE == 8` / `#error` otherwise
 //!   (itkJPEGImageIO.cxx:292-297) — so no mainline ITK build reads one either.
-//!   [`header_from_info`] refuses `PixelFormat::L16` with
+//!   `header_from_info` refuses `PixelFormat::L16` with
 //!   [`IoError::UnsupportedJpegFeature`]. Ledger §4.97.
 
 use std::io::Cursor;
@@ -254,7 +254,7 @@ impl JpegChromaSubsampling {
 
 /// The two JPEG encode knobs `JPEGImageIO` hard-wires and SimpleITK cannot
 /// reach — `m_Progressive` and the chroma-subsampling factor (ledger §3.50,
-/// §5.27). [`write`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
+/// §5.27). [`write()`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
 /// whose values reproduce upstream exactly (progressive on, 4:2:0);
 /// [`write_with_jpeg_options`] takes an explicit set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -580,7 +580,7 @@ pub fn write(image: &Image, path: &Path, options: &WriteOptions) -> Result<()> {
 }
 
 /// Write a `.jpg` file, choosing the progressive flag and chroma-subsampling
-/// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write`] is this with
+/// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write()`] is this with
 /// [`JpegWriteOptions::default`], which is byte-identical to upstream.
 pub fn write_with_jpeg_options(
     image: &Image,

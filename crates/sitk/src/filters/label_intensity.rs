@@ -30,7 +30,7 @@
 //! - **the bin width is computed in `float`**, not `double`
 //!   (`itkHistogram.hxx:214-238`, lines 225-226: `float interval = (float(upper) -
 //!   float(lower)) / float(size)`), and every bin bound but the last is
-//!   `double(lower) + float(j) * interval`. [`histogram_bins`] reproduces the
+//!   `double(lower) + float(j) * interval`. `histogram_bins` reproduces the
 //!   narrowing exactly.
 //! - `SetClipBinsAtEnds(false)`, so a value below the first bin lands in bin 0
 //!   and a value at or above the last bin's max lands in the last bin

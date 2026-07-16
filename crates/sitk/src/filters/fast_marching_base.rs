@@ -18,7 +18,7 @@
 //! `static_cast<float>`, which this port reproduces by narrowing through
 //! `f32` before storing.
 //!
-//! This is *not* [`crate::filters::fast_marching`]'s filter with extra options: the two
+//! This is *not* [`crate::filters::fast_marching()`]'s filter with extra options: the two
 //! class hierarchies differ in the constants they use, in where they test the
 //! stopping value, and in how they walk neighbors. The differences that change
 //! output are called out below.
@@ -47,7 +47,7 @@
 //!
 //! ## Where this filter differs from `FastMarchingImageFilter`
 //!
-//! [`crate::filters::fast_marching`] ports the *old* `itk::FastMarchingImageFilter`.
+//! [`crate::filters::fast_marching()`] ports the *old* `itk::FastMarchingImageFilter`.
 //! Four differences change results:
 //!
 //! 1. **`m_LargeValue` is the pixel type's max, not half of it.**
@@ -144,12 +144,12 @@
 //!
 //! Per the port's honor-or-reject policy this crate makes `NoHandles` **live**:
 //! it maintains the connected-component labels from the advancing front instead
-//! of from the (never-set) `m_AlivePoints`. [`Marcher::components`] is a
+//! of from the (never-set) `m_AlivePoints`. `Marcher::components` is a
 //! union-find over pixel indices; each node that goes alive is unioned with its
-//! alive face neighbors ([`Marcher::join_alive_neighbors`]), so at a junction the
+//! alive face neighbors (`Marcher::join_alive_neighbors`), so at a junction the
 //! two facing neighbors carry the real component labels the upstream algorithm
 //! meant to compare. `NoHandles` then rejects a strict violation only when those
-//! labels are equal ([`Marcher::change_creates_handle`]) — a same-component
+//! labels are equal (`Marcher::change_creates_handle`) — a same-component
 //! self-closure is a handle and is rejected, while two distinct fronts are
 //! allowed to merge. Pinned by `no_handles_allows_a_distinct_component_merge`
 //! (distinct fronts merge, unlike `Strict`),

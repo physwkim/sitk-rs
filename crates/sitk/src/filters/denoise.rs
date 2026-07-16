@@ -18,7 +18,7 @@
 //! via `select_nth_unstable_by` at index `len/2` — ITK's own
 //! `std::nth_element` position — which on an even-length window is the
 //! *upper* median, never an average of the two middle values; every window
-//! here happens to be odd-length (`Π (2·radius[d]+1)`), but [`select_median`]
+//! here happens to be odd-length (`Π (2·radius[d]+1)`), but `select_median`
 //! itself is exercised directly against an even-length slice in the tests to
 //! prove that convention.
 //!
@@ -27,12 +27,12 @@
 //! accumulator arithmetic clips the window to the pixels that actually lie
 //! inside the image rather than zero-flux-replicating the edge, so the
 //! effective window shrinks at the border instead of reusing the edge value
-//! multiple times — see [`box_accumulate`]'s doc comment for the derivation.
+//! multiple times — see `box_accumulate`'s doc comment for the derivation.
 //!
 //! [`discrete_gaussian`] convolves a Lindeberg discrete-Gaussian kernel
 //! (`GaussianOperator::GenerateCoefficients`'s modified-Bessel-function
 //! construction, transcribed operation-for-operation in
-//! [`gaussian_operator_kernel`]) separably, one axis at a time, truncated by
+//! `gaussian_operator_kernel`) separably, one axis at a time, truncated by
 //! `maximum_error`/`maximum_kernel_width`.
 //!
 //! [`discrete_gaussian_derivative`]
@@ -198,7 +198,7 @@ fn median_typed<T: Scalar>(img: &Image, radius: &[usize]) -> Result<Image> {
     Ok(result)
 }
 
-/// `MedianImageFilter`: the [`select_median`] of a per-axis `radius`
+/// `MedianImageFilter`: the `select_median` of a per-axis `radius`
 /// neighborhood, selected directly in `img`'s own pixel type (never rounded
 /// through `f64`), under [`ZeroFluxNeumannBoundaryCondition`].
 ///
@@ -277,7 +277,7 @@ fn box_accumulate(
 
 /// `BoxMeanImageFilter`: the box average over a per-axis `radius`
 /// neighborhood, *clipped* to the image at the border rather than
-/// zero-flux-replicated (see [`box_accumulate`]'s doc comment). Narrowed
+/// zero-flux-replicated (see `box_accumulate`'s doc comment). Narrowed
 /// back to `img`'s own pixel type.
 ///
 /// Errors if `radius.len() != img.dimension()`.
@@ -308,7 +308,7 @@ pub fn box_mean(img: &Image, radius: &[usize]) -> Result<Image> {
 /// `BoxSigmaImageFilter`: the box sample standard deviation (`N - 1`
 /// divisor, `BoxSigmaCalculatorFunction`'s `sqrt((Σ² - Σ²/N) / (N - 1))`)
 /// over a per-axis `radius` neighborhood, clipped to the image at the border
-/// exactly like [`box_mean`] (see [`box_accumulate`]'s doc comment).
+/// exactly like [`box_mean`] (see `box_accumulate`'s doc comment).
 /// Narrowed back to `img`'s own pixel type.
 ///
 /// At `radius = [0, ..., 0]` every box has `N = 1`: upstream's `N - 1`
@@ -503,7 +503,7 @@ pub(crate) fn gaussian_operator_kernel(
 }
 
 /// `DiscreteGaussianImageFilter`: separable convolution with
-/// [`gaussian_operator_kernel`], one axis at a time, under
+/// `gaussian_operator_kernel`, one axis at a time, under
 /// [`ZeroFluxNeumannBoundaryCondition`]. `variance` and `maximum_error` are
 /// per axis (`ArrayType` in ITK); when `use_image_spacing`, each axis's
 /// variance is converted from physical to index units via `variance[d] /
@@ -831,7 +831,7 @@ fn gaussian_derivative_operator_coefficients(
 }
 
 /// `DiscreteGaussianDerivativeImageFilter`: separable convolution with
-/// [`gaussian_derivative_operator_coefficients`], one axis at a time, under
+/// `gaussian_derivative_operator_coefficients`, one axis at a time, under
 /// [`ZeroFluxNeumannBoundaryCondition`].
 ///
 /// `variance` and `order` are per axis; `maximum_error` and
@@ -869,7 +869,7 @@ fn gaussian_derivative_operator_coefficients(
 ///    real-arithmetic result rounded a single time.
 ///
 /// `maximum_error` is clamped to `[0.00001, 0.99999]` rather than rejected (see
-/// [`clamp_maximum_error`]). Errors if `variance.len()` or `order.len()` differ
+/// `clamp_maximum_error`). Errors if `variance.len()` or `order.len()` differ
 /// from `img.dimension()`, or any `variance` is negative.
 pub fn discrete_gaussian_derivative(
     img: &Image,

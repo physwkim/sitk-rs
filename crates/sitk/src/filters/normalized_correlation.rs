@@ -28,7 +28,7 @@
 //! padded extent floor-divide by two to the same quotient, `radius[i] =
 //! size[i] / 2` computed on the *raw* template size already gives the right
 //! answer — this port never materializes the padded image, and instead reads
-//! [`padded_template_coefficients`] straight off the raw buffer, substituting
+//! `padded_template_coefficients` straight off the raw buffer, substituting
 //! `0.0` for the padding cell. **This means an even-extent template's own
 //! zero pad is a real data point in the mean/variance below**, not just
 //! boundary filler for the image neighborhood — the `EvenKernel` yaml test
@@ -42,7 +42,7 @@
 //! (itkNeighborhood.hxx:41-67), so a raw template pixel at box-position `m`
 //! lands at exactly that same relative offset from center. This crate's own
 //! [`crate::core::NeighborhoodIterator`] windows use that identical order
-//! (`Neighborhood::values`'s doc), so [`padded_template_coefficients`]'s
+//! (`Neighborhood::values`'s doc), so `padded_template_coefficients`'s
 //! output lines up element-for-element with a gathered image window with no
 //! reindexing on either side — and, critically, **no flip**: unlike
 //! [`crate::filters::convolution::convolution`] (which reverses the kernel buffer
@@ -90,7 +90,7 @@
 //! against — so both quotients are now a defined `0.0`, matching this
 //! filter's own "correlation undefined → 0" convention already used for
 //! pixels outside the mask (`itkNormalizedCorrelationImageFilter.hxx:230-234`).
-//! [`normalize_template`] guards on the template's variance itself rather
+//! `normalize_template` guards on the template's variance itself rather
 //! than the literal `k == 0.0` case, so a single-coefficient template
 //! (`num == 1`, whose variance is `0.0 / 0.0 == NaN` rather than exactly
 //! `0.0`) is covered by the same guard instead of reintroducing a NaN
@@ -100,7 +100,7 @@
 //!
 //! `output_pixel_type: typename itk::NumericTraits<InputImageType::PixelType>::RealType`,
 //! the same expression [`crate::filters::intensity::normalize_to_constant`] resolves
-//! through [`crate::filters::real_pixel_id`] — including that helper's own tracked
+//! through `crate::filters::real_pixel_id` — including that helper's own tracked
 //! `Float32 → Float32` divergence from ITK's true `RealType` rule (always
 //! `double`); see its doc comment and upstream-findings ledger §5.6.
 //!

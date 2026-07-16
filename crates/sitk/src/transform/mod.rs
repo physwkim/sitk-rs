@@ -1,7 +1,7 @@
 //! Spatial transforms and resampling for sitk-rs.
 //!
 //! Phase 0 covers [`TranslationTransform`], [`AffineTransform`], and
-//! [`ResampleImageFilter`] with nearest-neighbour and linear interpolation —
+//! [`crate::transform::ResampleImageFilter`] with nearest-neighbour and linear interpolation —
 //! enough to close the read → transform → resample → write vertical slice. The
 //! remaining transform classes and interpolators follow in later phases.
 

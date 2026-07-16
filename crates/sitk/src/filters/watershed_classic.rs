@@ -8,17 +8,17 @@
 //! constructor pins them to:
 //!
 //! - `itkWatershedSegmenter.h` / `.hxx` with `DoBoundaryAnalysis(false)` and
-//!   `SortEdgeLists(true)` — [`segment`];
+//!   `SortEdgeLists(true)` — `segment`;
 //! - `itkWatershedSegmentTreeGenerator.h` / `.hxx` with `Merge(false)` and
-//!   `ConsumeInput(false)` — [`generate_segment_tree`];
-//! - `itkWatershedRelabeler.h` / `.hxx` — [`WatershedTree::relabel`].
+//!   `ConsumeInput(false)` — `generate_segment_tree`;
+//! - `itkWatershedRelabeler.h` / `.hxx` — `WatershedTree::relabel`.
 //!
 //! Because `DoBoundaryAnalysis` is off, the streaming machinery
 //! (`itkWatershedBoundary`, `itkWatershedBoundaryResolver`,
 //! `itkWatershedEquivalenceRelabeler`, `Segmenter::AnalyzeBoundaryFlow`,
 //! `Segmenter::CollectBoundaryInformation`) is unreachable and is not ported.
 //! The `flat_region_t::is_on_boundary` flag it would set is therefore always
-//! `false`; the one place that reads it ([`descend_flat_regions`]) keeps the
+//! `false`; the one place that reads it (`descend_flat_regions`) keeps the
 //! check so the transcription lines up with the `.hxx`.
 //!
 //! ## Not a SimpleITK filter
@@ -126,7 +126,7 @@
 //! - **`PruneEdgeLists` keeps one edge too many.** `itkWatershedSegmentTable.hxx`
 //!   finds the first edge with `height - min > maximum_saliency`, then does
 //!   `++e; erase(e, end())` — so the offending edge itself survives the prune,
-//!   and only the ones after it are dropped. [`prune_edge_lists`] reproduces
+//!   and only the ones after it are dropped. `prune_edge_lists` reproduces
 //!   the off-by-one.
 //!
 //! - **A single-segment image is a hard error.** `CompileMergeList` dereferences
@@ -174,8 +174,8 @@
 //! smaller, so a merged group is named by its minimum label regardless of the
 //! direction or order the merges were recorded in.
 //!
-//! The binary heap itself is *not* left to chance: [`make_heap`], [`push_heap`]
-//! and [`pop_heap`] transcribe libstdc++'s `__adjust_heap` / `__push_heap`
+//! The binary heap itself is *not* left to chance: `make_heap`, `push_heap`
+//! and `pop_heap` transcribe libstdc++'s `__adjust_heap` / `__push_heap`
 //! exactly, so given the same heap contents the same element is popped.
 //!
 //! ## `Math::AlmostEquals`
@@ -183,7 +183,7 @@
 //! Flat-region detection compares pixel values with `itk::Math::AlmostEquals`,
 //! not `==`. Its overload set makes that an exact comparison for integer pixel
 //! types and a 4-ULP comparison (with a `0.1 * epsilon` absolute-difference
-//! escape hatch near zero) for `float` and `double`. [`AlmostEquals`] selects
+//! escape hatch near zero) for `float` and `double`. `AlmostEquals` selects
 //! the same three behaviors off the input image's [`PixelId`], comparing in
 //! `f32` ULPs for a `Float32` input even though this port's working buffer is
 //! `f64` — a `Float32` image's values are exactly representable in `f64`, so

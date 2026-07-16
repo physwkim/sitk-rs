@@ -26,7 +26,7 @@
 //! # Algorithm
 //!
 //! 1. **Grid initialisation.** Cluster centres come from shrinking the input
-//!    by `SuperGridSize` (`itk::ShrinkImageFilter`; see [`crate::filters::shrink`]).
+//!    by `SuperGridSize` (`itk::ShrinkImageFilter`; see [`crate::filters::shrink()`]).
 //!    The centre of grid cell `j` sits at continuous index
 //!    `j·f + δ` with `δ_d = (size_d−1)/2 − f_d·(outSize_d−1)/2`, and takes
 //!    the value of input pixel `j·f + round(δ)`.

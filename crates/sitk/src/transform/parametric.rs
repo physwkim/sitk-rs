@@ -68,7 +68,7 @@ pub trait TransformBase {
     /// to the conjunction of its sub-transforms' own `is_linear()`
     /// (`itk::MultiTransform::IsLinear()`).
     ///
-    /// [`crate::transform::transform_geometry`]'s linearity precondition is the only
+    /// [`crate::transform::transform_geometry()`]'s linearity precondition is the only
     /// current caller.
     ///
     /// [`BSplineTransform`]: crate::transform::BSplineTransform
