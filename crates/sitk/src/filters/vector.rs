@@ -76,7 +76,7 @@ pub fn compose(images: &[&Image]) -> Result<Image> {
 ///
 /// This port checks the documented intent — `index >=
 /// number_of_components_per_pixel()` — and returns
-/// [`Error::ComponentIndexOutOfRange`](crate::core::Error::ComponentIndexOutOfRange).
+/// [`Error::ComponentIndexOutOfRange`].
 pub fn vector_index_selection_cast(
     img: &Image,
     index: usize,

@@ -45,7 +45,7 @@
 //!
 //! ## Parallelism, and why the numbers do not move
 //!
-//! All three sample loops — [`means`](CorrelationMetric::means) (pass 1),
+//! All three sample loops — `means` (pass 1),
 //! [`evaluate`](CorrelationMetric::evaluate) (pass 2) and
 //! [`value`](CorrelationMetric::value) — run on every core and return **the same
 //! bits they returned when they were serial**, at any thread count. They get that

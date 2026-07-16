@@ -70,7 +70,7 @@
 //!   spacing that would have compared smaller at full `double` precision
 //!   can be missed if the earlier narrowing rounded the running minimum
 //!   upward. This port reproduces the narrow-once/widen-to-compare order
-//!   exactly (see [`min_spacing_f32`]) rather than computing the minimum at
+//!   exactly (see `min_spacing_f32`) rather than computing the minimum at
 //!   full `double` precision throughout.
 //!
 //! The `distancesFrequency[k] == 0` guard in the `.hxx`'s final summation

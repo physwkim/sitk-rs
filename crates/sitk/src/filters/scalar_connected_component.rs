@@ -7,7 +7,7 @@
 //! `Functor::SimilarPixelsFunctor` as its join predicate: two pixels join
 //! when `|a - b| <= DistanceThreshold` (`static_cast<TInput>` of the
 //! absolute difference, i.e. rounded/truncated to the input pixel type the
-//! same way [`crate::filters::quantize_to_pixel_type`]'s other `pixeltype: Input`
+//! same way `crate::filters::quantize_to_pixel_type`'s other `pixeltype: Input`
 //! callers are -- `DistanceThreshold` itself gets the same treatment before
 //! comparison, matching `ScalarConnectedComponentImageFilter.yaml`'s
 //! `pixeltype: Input`).
@@ -24,14 +24,14 @@
 //! `ConnectedComponentFunctorImageFilter::GenerateData()` makes one raster
 //! pass, examining only each pixel's "previous" neighbors (already visited:
 //! face-connected `-1` steps, or every earlier-in-neighborhood-order offset
-//! when `FullyConnected`) -- [`Half::Previous`], the same connectivity half
-//! [`crate::filters::label::connected_component`] and [`crate::filters::watershed`] use for
+//! when `FullyConnected`) -- `Half::Previous`, the same connectivity half
+//! [`crate::filters::label::connected_component`] and [`crate::filters::watershed()`] use for
 //! their own raster sweeps. A pixel adopts the label of (is unioned with)
 //! every previous neighbor within threshold; a pixel with no such neighbor
 //! starts a new component. An `EquivalencyTable` records merges made mid-scan
 //! and flattens them in a second pass. This port collapses both passes into
 //! a single union-find over pixel indices (join iff `|a - b| <=
-//! DistanceThreshold`, restricted to [`Half::Previous`] neighbor pairs so
+//! DistanceThreshold`, restricted to `Half::Previous` neighbor pairs so
 //! the total edge set searched matches upstream exactly) -- group-theoretically
 //! identical to the two-pass eqTable scan, since both reduce to the same
 //! union-find closure regardless of merge bookkeeping order.
@@ -100,7 +100,7 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// `if (mit.Get() == MaskPixelType{}) { oit.Set(OutputPixelType{}); }`), which is
 /// `MaskImageFilter`'s convention, not the threshold family's. It must be
 /// `UInt8`, `image`'s size, and on `image`'s grid — see
-/// [`crate::filters::mask_input::uint8_mask_voxels`].
+/// `crate::filters::mask_input::uint8_mask_voxels`.
 pub fn scalar_connected_component(
     image: &Image,
     mask: Option<&Image>,

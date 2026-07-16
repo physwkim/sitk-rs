@@ -135,7 +135,7 @@ pub struct InvertDisplacementFieldResult {
 ///
 /// Errors on a `displacement_field` that is not a real-component vector image
 /// with one component per dimension (see
-/// [`require_displacement_field`](super::require_displacement_field)), on the
+/// `require_displacement_field`), on the
 /// same for the initial estimate, and with [`FilterError::SizeMismatch`] when
 /// the estimate's lattice differs from the field's.
 pub fn invert_displacement_field(

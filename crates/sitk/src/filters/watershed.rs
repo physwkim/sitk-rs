@@ -15,10 +15,10 @@
 //! [`crate::filters::reconstruction::reconstruction_by_erosion`]
 //! (`itkReconstructionImageFilter.hxx` with `TCompare = std::less`) — is a
 //! public filter in its own right, ported fully in [`crate::filters::reconstruction`].
-//! Only [`regional_minima`] is ported here as a module-private helper,
+//! Only `regional_minima` is ported here as a module-private helper,
 //! because only the watershed needs it so far:
 //!
-//! - [`regional_minima`] — `itkValuedRegionalMinimaImageFilter.h` driving
+//! - `regional_minima` — `itkValuedRegionalMinimaImageFilter.h` driving
 //!   `itkValuedRegionalExtremaImageFilter.hxx`, thresholded as
 //!   `itkRegionalMinimaImageFilter.hxx` does (`FlatIsMinima` defaults to
 //!   `true`, so a completely flat image is one big minimum).
@@ -42,7 +42,7 @@
 //! level currently being drained (a lower or equal level goes onto the
 //! *current* queue instead), the map's smallest key never decreases. This port
 //! therefore replaces the `std::map` with a bucket per distinct input value
-//! ([`value_ranks`] maps each pixel's value onto its rank in the sorted set
+//! (`value_ranks` maps each pixel's value onto its rank in the sorted set
 //! of distinct values) and drains the buckets in ascending rank — the same
 //! sequence of pops in the same order, without the per-pop `O(log n)`.
 //!
@@ -84,8 +84,8 @@
 //! sorted). `crate::filters::reconstruction`'s private `neighbor_offsets` reproduces
 //! that order, and `itkConnectedComponentAlgorithm.h`'s `setConnectivity` /
 //! `setConnectivityPrevious` / `setConnectivityLater` become its three
-//! [`crate::filters::reconstruction::Half`] variants, reused here via
-//! [`crate::filters::reconstruction::NeighborWalker`].
+//! `crate::filters::reconstruction::Half` variants, reused here via
+//! `crate::filters::reconstruction::NeighborWalker`.
 
 use crate::core::Image;
 use crate::filters::error::{FilterError, Result};

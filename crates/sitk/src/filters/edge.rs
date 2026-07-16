@@ -2,9 +2,9 @@
 //! (`Modules/Filtering/ImageFeature/include/itkZeroCrossingBasedEdgeDetectionImageFilter.h(.hxx)`):
 //! a three-stage mini-pipeline built from pieces already ported elsewhere in
 //! this crate —
-//! [`crate::filters::denoise::discrete_gaussian_f64`] (smoothing) into
+//! `crate::filters::denoise::discrete_gaussian_f64` (smoothing) into
 //! [`crate::filters::gradient::laplacian`] (second derivative) into
-//! [`crate::filters::canny::zero_crossing_values`] (sign-change marking) — composed
+//! `crate::filters::canny::zero_crossing_values` (sign-change marking) — composed
 //! exactly as `GenerateData()` wires the three internal filters:
 //!
 //! - `gaussianFilter` only has `SetVariance`/`SetMaximumError` called on it, so
@@ -28,7 +28,7 @@
 //! unlike the standalone [`crate::filters::canny::zero_crossing`], whose
 //! `ZeroCrossingImageFilter.yaml` hardcodes `output_pixel_type: uint8_t`
 //! regardless of input. So this port calls
-//! [`crate::filters::canny::zero_crossing_values`] — the untyped `f64` core shared by
+//! `crate::filters::canny::zero_crossing_values` — the untyped `f64` core shared by
 //! both `zero_crossing` and `canny_edge_detection` — directly, and narrows
 //! back to `img`'s own pixel type rather than to `UInt8`.
 //!
@@ -49,11 +49,11 @@ use crate::filters::image_from_f64;
 
 /// `ZeroCrossingBasedEdgeDetectionImageFilter`: Gaussian-smooth `img`
 /// (`variance`/`maximum_error` per axis, under
-/// [`discrete_gaussian_f64`]'s `MaximumKernelWidth = 32`,
+/// `discrete_gaussian_f64`'s `MaximumKernelWidth = 32`,
 /// `use_image_spacing = true` — the embedded `DiscreteGaussianImageFilter`'s
 /// own untouched defaults), take its Laplacian ([`laplacian`] with
 /// `use_image_spacing = true`, `LaplacianImageFilter`'s own default), then
-/// mark every zero-crossing of that field ([`zero_crossing_values`]) with
+/// mark every zero-crossing of that field (`zero_crossing_values`) with
 /// `foreground_value`/`background_value`. Output keeps `img`'s own pixel
 /// type (see the module docs for why this differs from
 /// [`crate::filters::canny::zero_crossing`]'s hardcoded `UInt8`).
@@ -62,7 +62,7 @@ use crate::filters::image_from_f64;
 /// ([`FilterError::RequiresRealPixelType`] — the outer filter's
 /// `PixelTypeIsFloatingPointCheck` concept is a C++ compile-time constraint
 /// with no runtime equivalent, enforced here instead), or if
-/// `variance`/`maximum_error` fail [`discrete_gaussian_f64`]'s own validation
+/// `variance`/`maximum_error` fail `discrete_gaussian_f64`'s own validation
 /// (wrong length, negative variance, `maximum_error` outside `(0.0, 1.0)`).
 pub fn zero_crossing_based_edge_detection(
     img: &Image,

@@ -12,10 +12,10 @@
 //!
 //! | Layer | ITK source |
 //! |---|---|
-//! | [`grid`] | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
-//! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx`, `itkCurvatureFlowFunction.h/.hxx` |
-//! | [`sparse_field`] | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
-//! | [`anti_alias`] | `itkAntiAliasBinaryImageFilter.h/.hxx` |
+//! | `grid` | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
+//! | `function` | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx`, `itkCurvatureFlowFunction.h/.hxx` |
+//! | `sparse_field` | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
+//! | `anti_alias` | `itkAntiAliasBinaryImageFilter.h/.hxx` |
 //! | this module | `itkSegmentationLevelSetImageFilter.h/.hxx` plus the five `itk*LevelSetFunction.h/.hxx` + `itk*LevelSetImageFilter.h/.hxx` pairs |
 //!
 //! The rest of this doc describes the five *segmentation* filters;
@@ -403,7 +403,7 @@ pub struct CannyLevelSetResult {
 ///
 /// Errors if the two images differ in size, or if `variance` is negative
 /// (`GaussianOperator`'s constraint, surfaced by
-/// [`canny_edge_detection`](crate::filters::canny_edge_detection)).
+/// [`canny_edge_detection`]).
 #[allow(clippy::too_many_arguments)]
 pub fn canny_segmentation_level_set(
     initial_level_set: &Image,

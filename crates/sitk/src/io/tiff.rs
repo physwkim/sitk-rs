@@ -95,7 +95,7 @@
 //!
 //! Dropping every sample past the first is silent data loss, not a shape to
 //! reproduce: this crate's [`PixelId`] has no restriction against a
-//! multi-component grayscale image, so **fixed §2.140** — [`layout_for`] now
+//! multi-component grayscale image, so **fixed §2.140** — `layout_for` now
 //! sets `number_of_components` to the page's true `SamplesPerPixel` for
 //! `GRAYSCALE` too, exactly as it already did for `RGB`, and a `MINISBLACK`
 //! page reads back as a vector image with every sample intact.
@@ -106,14 +106,14 @@
 //! sample and nothing else (decoder/mod.rs:713-769), so a multi-sample
 //! `MINISWHITE` page (`ColorType::Multiband`), a signed / non-32-bit-float
 //! single-sample one, or an odd-width `Gray` makes [`read`] error with
-//! `UnknownInterpretation`. [`layout_for`] refuses those at
+//! `UnknownInterpretation`. `layout_for` refuses those at
 //! `read_information` time (`crate_can_invert_whiteiszero`) so the header does
 //! not advertise components [`read`] cannot deliver — the same
 //! `colortype()`-based decodability guard the `RGB` arm applies. This also makes
-//! [`page_rows`]'s two stride parameters always equal — `layout.number_of_components`
+//! `page_rows`'s two stride parameters always equal — `layout.number_of_components`
 //! and `page.samples_per_pixel` are the same count on every path once
 //! `read_current_page`'s per-page geometry check (§1.67) has passed — so
-//! [`page_rows`] takes a single `components` count and copies each row
+//! `page_rows` takes a single `components` count and copies each row
 //! verbatim rather than truncating it.
 //!
 //! # A 2-component image wrote as `PHOTOMETRIC_RGB` with 2 samples — this port writes `MINISBLACK` plus one extra sample
@@ -127,7 +127,7 @@
 //! **Fixed §2.141** — a 2-component image now writes `PHOTOMETRIC_MINISBLACK`
 //! with one `ExtraSamples::Unspecified` sample past the declared grayscale
 //! sample, a standard, unambiguous TIFF construct: `SamplesPerPixel = 2`
-//! with an `ExtraSamples` tag describing the second. [`layout_for`]'s §2.140
+//! with an `ExtraSamples` tag describing the second. `layout_for`'s §2.140
 //! fix reads that back as a 2-component vector image, every sample intact.
 //!
 //! # Multi-page TIFF → 3-D volume, and two ways upstream walks off the buffer
@@ -1222,7 +1222,7 @@ pub enum TiffCompressor {
     /// `COMPRESSION_LZW`.
     Lzw,
     /// `COMPRESSION_ADOBE_DEFLATE` (tag `8`). Ratio set by
-    /// [`WriteOptions::compression_level`] through [`deflate_level_for`] —
+    /// [`WriteOptions::compression_level`] through `deflate_level_for` —
     /// fixed §3.52.
     Deflate,
     /// `COMPRESSION_PACKBITS` — the same compressor a bare

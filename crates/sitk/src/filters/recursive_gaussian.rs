@@ -23,7 +23,7 @@
 //!
 //! What *is* here is the recursion the coefficients drive
 //! (`RecursiveSeparableImageFilter::FilterDataArray`, ported as the private
-//! [`filter_line`]/[`filter_axis`]). It does not depend on the order at all —
+//! `filter_line`/`filter_axis`). It does not depend on the order at all —
 //! only the coefficients do — so all three orders share this one recursion.
 //!
 //! `NormalizeAcrossScale` (Lindeberg scale-space normalization) multiplies

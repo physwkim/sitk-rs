@@ -17,7 +17,7 @@
 //!
 //! (`sitkImageConvert.hxx:38-42`). So a displacement field is exactly: a vector
 //! image, floating-point components, and **one component per image dimension**.
-//! [`require_displacement_field`] is that check, and every filter in this module
+//! `require_displacement_field` is that check, and every filter in this module
 //! goes through it.
 //!
 //! # Compute precision
@@ -33,7 +33,7 @@
 //!
 //! # Interpolation
 //!
-//! [`Field::evaluate_at_point`] is `VectorLinearInterpolateImageFunction`
+//! `Field::evaluate_at_point` is `VectorLinearInterpolateImageFunction`
 //! (`itkVectorLinearInterpolateImageFunction.hxx:33-107`) behind
 //! `ImageFunction::IsInsideBuffer` (`itkImageFunction.h:158-184`). Two details
 //! are load-bearing and are reproduced literally:

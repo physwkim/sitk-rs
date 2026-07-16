@@ -1,31 +1,31 @@
 //! Image registration for sitk-rs: metrics, optimizers, and the
-//! [`ImageRegistrationMethod`] driver.
+//! [`crate::registration::ImageRegistrationMethod`] driver.
 //!
 //! The core is the smallest end-to-end registration that actually aligns two
-//! images: the **mean-squares** metric ([`MeanSquaresMetric`]) sampled over the
+//! images: the **mean-squares** metric ([`crate::registration::MeanSquaresMetric`]) sampled over the
 //! full fixed grid, **linear** interpolation of the moving image, a
-//! **gradient-descent** optimizer ([`GradientDescentOptimizer`] with a fixed or
-//! estimated rate, or [`RegularStepGradientDescentOptimizer`], which halves its
+//! **gradient-descent** optimizer ([`crate::registration::GradientDescentOptimizer`] with a fixed or
+//! estimated rate, or [`crate::registration::RegularStepGradientDescentOptimizer`], which halves its
 //! step on each overshoot), and [`TranslationTransform`]/[`AffineTransform`] as
 //! the moving parameters, mirroring `itk::ImageRegistrationMethodv4`. It runs at
 //! a single resolution by default and over a **multi-resolution pyramid** when a
 //! shrink/smoothing schedule is configured (see
 //! [Multi-resolution](#multi-resolution) below).
 //!
-//! The metric is selectable: mean squares ([`MeanSquaresMetric`]) by default, or
-//! **Mattes mutual information** ([`MattesMutualInformationMetric`],
+//! The metric is selectable: mean squares ([`crate::registration::MeanSquaresMetric`]) by default, or
+//! **Mattes mutual information** ([`crate::registration::MattesMutualInformationMetric`],
 //! `itk::MattesMutualInformationImageToImageMetricv4`) for **multi-modality**
 //! registration — images related by an arbitrary invertible intensity map, where
 //! mean squares fails — via
-//! [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information).
+//! [`set_metric_as_mattes_mutual_information`](crate::registration::ImageRegistrationMethod::set_metric_as_mattes_mutual_information).
 //!
 //! Optimizer scales and the learning rate are **estimated automatically** from
 //! physical shift ([`ScalesEstimator`], ITK's
 //! `RegistrationParameterScalesFromPhysicalShift` +
 //! `GradientDescentOptimizerv4` learning-rate estimation), so no hand-tuning is
 //! required. The Jacobian and index-shift estimators are available too, via
-//! [`ImageRegistrationMethod::set_optimizer_scales_from_jacobian`] and
-//! [`ImageRegistrationMethod::set_optimizer_scales_from_index_shift`]:
+//! [`crate::registration::ImageRegistrationMethod::set_optimizer_scales_from_jacobian`] and
+//! [`crate::registration::ImageRegistrationMethod::set_optimizer_scales_from_index_shift`]:
 //!
 //! ```
 //! use sitk::core::Image;
@@ -95,20 +95,20 @@
 //! [`filters::shrink`] (`itk::ShrinkImageFilter`).
 //!
 //! [`set_shrink_factors_per_level`]:
-//! ImageRegistrationMethod::set_shrink_factors_per_level
+//! crate::registration::ImageRegistrationMethod::set_shrink_factors_per_level
 //! [`set_smoothing_sigmas_per_level`]:
-//! ImageRegistrationMethod::set_smoothing_sigmas_per_level
+//! crate::registration::ImageRegistrationMethod::set_smoothing_sigmas_per_level
 //! [`set_optimizer_as_regular_step_gradient_descent_estimated`]:
-//! ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
+//! crate::registration::ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
 //! [`filters::smooth_gaussian`]: crate::filters::smooth_gaussian
 //! [`filters::recursive_gaussian`]: crate::filters::recursive_gaussian()
 //! [`filters::shrink`]: crate::filters::shrink()
 //!
 //! ## GPU seam
 //!
-//! The metric's per-sample reduction is isolated behind [`MetricBackend`]; the
-//! shipped [`CpuBackend`] runs on the host. A backend implementing the same trait
-//! drops in via [`ImageRegistrationMethod::set_metric_backend`] — no change to
+//! The metric's per-sample reduction is isolated behind [`crate::registration::MetricBackend`]; the
+//! shipped [`crate::registration::CpuBackend`] runs on the host. A backend implementing the same trait
+//! drops in via [`crate::registration::ImageRegistrationMethod::set_metric_backend`] — no change to
 //! the metric or the registration loop.
 //!
 //! `CudaMetricBackend` (behind the `cuda` feature, **default off**, so it is
@@ -116,7 +116,7 @@
 //! the fixed samples and the moving volume resident on the device across the whole
 //! optimizer run, so each iteration ships only the transform's twelve affine
 //! coefficients up and a fixed-size moment vector back. It is a strict accelerator
-//! — it falls back to [`CpuBackend`] on every condition that is not a GPU success
+//! — it falls back to [`crate::registration::CpuBackend`] on every condition that is not a GPU success
 //! (no driver, no device, a non-affine transform), so it cannot turn a working
 //! registration into a failing one.
 //!

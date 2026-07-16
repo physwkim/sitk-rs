@@ -171,7 +171,7 @@ fn real_type(id: PixelId) -> PixelId {
 /// reusing [`crate::filters::statistics`] for `mean`/`sigma` and
 /// `itkShiftScaleImageFilter.hxx`'s `(x + shift) * scale` evaluation order
 /// (`shift = -mean`, `scale = 1 / sigma`). The output pixel type is the
-/// input's `NumericTraits<T>::RealType` (see [`real_type`]), matching
+/// input's `NumericTraits<T>::RealType` (see `real_type`), matching
 /// `NormalizeImageFilter.yaml`'s `output_pixel_type` — unlike this crate's
 /// other unary intensity filters, the output type is not the input's own.
 ///
@@ -217,7 +217,7 @@ pub struct ShiftScaleResult {
 /// m_Scale` in that order. `RealType` is `NumericTraits<OutputPixelType>::RealType`,
 /// always `double`; this port computes in `f64` throughout, an exact match
 /// (not a precision simplification, unlike this module's other filters —
-/// see [`real_type`]'s doc for the family this usually diverges in).
+/// see `real_type`'s doc for the family this usually diverges in).
 ///
 /// Unlike a plain `static_cast` narrowing, the `.hxx` clamps explicitly
 /// *before* assigning: `value < NonpositiveMin() -> NonpositiveMin(),
@@ -225,8 +225,8 @@ pub struct ShiftScaleResult {
 /// `static_cast<Output>(value)`. This is not undefined behavior to begin
 /// with, so there is nothing to "define instead of" here (contrast
 /// [`crate::filters::math::round`]) — this port reproduces the same three-way clamp
-/// directly against `output_id`'s bounds ([`crate::filters::morphology::bounds_for`]),
-/// so the final narrow through [`crate::filters::image_from_f64`] is always exact
+/// directly against `output_id`'s bounds (`crate::filters::morphology::bounds_for`),
+/// so the final narrow through `crate::filters::image_from_f64` is always exact
 /// (the value is already inside the target type's range).
 ///
 /// `output_pixel_type`: `None` is SimpleITK's `sitkUnknown` default (`type2 =
@@ -279,7 +279,7 @@ pub fn shift_scale(
 /// `divisor = StatisticsImageFilter(img).sum / constant` once, then applies
 /// `DivideImageFilter`'s per-pixel-vs-scalar-constant mode (`div->SetConstant2(divisor)`),
 /// i.e. every output pixel is `input / divisor`. Output pixel type is
-/// `NumericTraits<InputPixelType>::RealType` ([`crate::filters::real_pixel_id`], reused
+/// `NumericTraits<InputPixelType>::RealType` (`crate::filters::real_pixel_id`, reused
 /// per `fast_marching`'s precedent — including that helper's own tracked
 /// `Float32 -> Float32` divergence from ITK's true `RealType` rule, ledger
 /// §5.6).

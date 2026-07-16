@@ -130,7 +130,7 @@
 //!   `maurer->SetUseImageSpacing(m_UseImageSpacing)`
 //!   (itkMultiphaseDenseFiniteDifferenceImageFilter.hxx:227) — leaving
 //!   `use_image_spacing = false` a silent no-op for the PDE. This port keys the
-//!   Hessian's inverse spacing ([`pde_inv_spacing`]) on the flag too: `true`
+//!   Hessian's inverse spacing (`pde_inv_spacing`) on the flag too: `true`
 //!   keeps the feature image's physical spacing (as upstream), `false` uses unit
 //!   (pixel-unit) spacing, so the flag's documented "use image spacing" meaning
 //!   holds for the whole iteration. The distance map's own spacing still comes

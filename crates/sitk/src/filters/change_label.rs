@@ -11,7 +11,7 @@
 //! `ChangeLabelImageFilter.yaml`'s `ChangeMap` member is `std::map<double,
 //! double>`, cast per-entry to `InputPixelType`/`OutputPixelType`
 //! (`static_cast`, i.e. truncating for integer types, matching
-//! [`crate::filters::quantize_to_pixel_type`]) before being handed to the filter.
+//! `crate::filters::quantize_to_pixel_type`) before being handed to the filter.
 //! `std::map` is keyed and iterated by the *raw, uncast* `double`, so two
 //! distinct raw keys that happen to truncate to the same pixel-type value
 //! (e.g. `1.2` and `1.4` both truncating to `1` for an integer pixel type)

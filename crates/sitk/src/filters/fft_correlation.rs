@@ -71,7 +71,7 @@
 //!
 //! This filter does **not** use `itkFFTPadImageFilter`, and its valid lengths
 //! are not the FFT backend's `SizeGreatestPrimeFactor`. It carries its own
-//! search: [`find_closest_valid_dimension`] (hxx:549-564) walks up from
+//! search: `find_closest_valid_dimension` (hxx:549-564) walks up from
 //! `size(fixed) + size(moving) - 1` until `FactorizeNumber` (hxx:528-545)
 //! divides the length away by 2s, 3s and 5s alone — "These are the only
 //! factors that are valid for the FFT calculation", says a comment written for

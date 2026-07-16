@@ -57,7 +57,7 @@
 //! read back by it — the one missing `SetPixelType(VECTOR)` call (ledger §3.47,
 //! §5.25).
 //!
-//! This port closes that at source: [`write`] still takes any pixel type, and
+//! This port closes that at source: [`write()`] still takes any pixel type, and
 //! [`read`] reconstructs the vector image the trailing component axis records.
 //! A `VoxelData` of rank `dimension + 1` reads back as the vector pixel type
 //! whose components are `VoxelData`'s own datatype ([`PixelId::vector_id`]),
@@ -79,7 +79,7 @@
 //! level 1 or above; `SetUseCompression(false)` cannot turn it off
 //! (ledger §3.48).
 //!
-//! This port makes the flag live: [`write`] applies the deflate filter only
+//! This port makes the flag live: [`write()`] applies the deflate filter only
 //! when [`WriteOptions::use_compression`] is set, and
 //! [`WriteOptions::compression_level`] is meaningful only then. The chunk — the
 //! `N-1` dimensional slab `[1, ...]` — is written unconditionally either way,

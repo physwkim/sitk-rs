@@ -87,7 +87,7 @@ const PREFAULT_GRAIN_BYTES: usize = 1 << 21;
 /// is no serial fault to move, and the prefault is then a second write pass for
 /// nothing. Measured: routing [`crate::core::map_pixels`]'s output through here cost
 /// `binary_dilate` ~4% and gained `rescale_intensity` nothing. That is why the
-/// maps in [`crate::core::parallel`] take [`resident_capacity`] instead — the advice
+/// maps in [`crate::core::parallel`] take `resident_capacity` instead — the advice
 /// without the prefault.
 pub fn resident_vec<T: Default + Send>(len: usize) -> Vec<T> {
     let bytes = len * size_of::<T>();

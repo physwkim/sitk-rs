@@ -66,7 +66,7 @@
 //! data has been read (`:243`), so a 32-bit-integer GIPL file still throws on
 //! read. Upstream's `Write` calls it before the pixel data is written
 //! (`:1010`/`:1024`), only *after* truncating the file and emitting the full
-//! 256-byte header — fixed in this port (ledger §1.52): [`write`] checks
+//! 256-byte header — fixed in this port (ledger §1.52): [`write()`] checks
 //! swappability before writing anything, so the target is left untouched.
 //!
 //! 64-bit integers never reach that point: `Write`'s own `image_type` switch has
@@ -99,7 +99,7 @@
 //! header describes, and reading it back yields a *scalar* image holding the
 //! first `numPixels` components (silent component loss). A complex image
 //! corrupts the same way (two components per pixel). This port **fixes** it
-//! (ledger §2.96): [`write`] rejects any non-scalar image (`buffer_stride > 1`)
+//! (ledger §2.96): [`write()`] rejects any non-scalar image (`buffer_stride > 1`)
 //! with an [`IoError::UnsupportedGiplFeature`] before touching the target,
 //! since GIPL cannot represent one.
 //!
@@ -119,7 +119,7 @@
 //! with `gzwrite` (`:669-1044`). This port reuses [`crate::io::compression`]'s gzip
 //! door instead of a `gzFile`: [`read`] and [`read_information`] decompress
 //! with `gunzip_transparent`/`gunzip_transparent_prefix` before parsing exactly
-//! as the uncompressed path does, and [`write`] compresses the same bytes the
+//! as the uncompressed path does, and [`write()`] compresses the same bytes the
 //! uncompressed path would have written with `gzip_compress`. Ledger §4.68,
 //! closed.
 //!
@@ -164,7 +164,7 @@ use crate::io::error::{IoError, Result};
 use crate::io::image_io::{ImageInformation, ImageIo};
 use crate::io::writer::WriteOptions;
 
-/// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write`] emits.
+/// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write()`] emits.
 pub const GIPL_MAGIC_NUMBER: u32 = 0xefff_e9b0;
 /// `GIPL_MAGIC_NUMBER2` (itkGiplImageIO.cxx:73), accepted on read.
 pub const GIPL_MAGIC_NUMBER2: u32 = 0x2ae3_89b8;
@@ -663,7 +663,7 @@ impl ImageIo for GiplImageIo {
     }
 
     /// `CanWriteFile` is `CheckExtension` alone (itkGiplImageIO.cxx:177-196), so
-    /// `.gipl.gz` is claimed for writing and [`write`] compresses it.
+    /// `.gipl.gz` is claimed for writing and [`write()`] compresses it.
     fn can_write_file(&self, path: &Path) -> bool {
         check_extension(path).is_some()
     }

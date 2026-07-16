@@ -7,8 +7,8 @@
 //! Phase-0 format for exercising the whole core model without pulling in an
 //! external image crate.
 //!
-//! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::io::ImageIo)
-//! implementor; [`read`] and [`write`] are its free-function core.
+//! [`MetaImageIo`] is this crate's first [`ImageIo`]
+//! implementor; [`read`] and [`write()`] are its free-function core.
 //!
 //! # Channels: scalar, vector, and complex
 //!
@@ -27,7 +27,7 @@
 //! `ElementNumberOfChannels() > 1`, regardless of what wrote the file
 //! (itkMetaImageIO.cxx:241-244), and SimpleITK's reader only takes the
 //! scalar/complex branch when `NumberOfComponents == 1`
-//! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write`]
+//! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write()`]
 //! reads back — in real ITK/SimpleITK as much as in [`read`] here — as a
 //! same-sized **vector** image: `PixelId::ComplexFloat32` round-trips to
 //! `PixelId::VectorFloat32`, not back to itself. The interleaved `re, im`
@@ -366,9 +366,9 @@ fn build_header(img: &Image, element_data_file: &str, compressed_size: Option<u6
 /// (itkMetaImageIO.cxx:62-64, 717-718).
 ///
 /// Every pixel category is written: scalar, vector, and complex alike, since
-/// [`buffer_to_le_bytes`] already serialises the image's full interleaved
+/// `buffer_to_le_bytes` already serialises the image's full interleaved
 /// buffer (`number_of_pixels * buffer_stride` components) regardless of
-/// category, and [`build_header`] now writes that same `buffer_stride` as
+/// category, and `build_header` now writes that same `buffer_stride` as
 /// `ElementNumberOfChannels`. See the module docs for the read-side
 /// consequence: MetaIO cannot tell a complex image from a same-width vector
 /// one, so a complex image does not read back as complex.

@@ -278,7 +278,7 @@ pub enum FilterError {
     #[error("prior_probabilities needs at least {expected} entries (one per label), got {got}")]
     InvalidPriorProbabilities { got: usize, expected: usize },
 
-    /// [`crate::filters::label_voting`] / [`crate::filters::multi_label_staple`]: the label that
+    /// [`crate::filters::label_fusion::label_voting`] / [`crate::filters::label_fusion::multi_label_staple`]: the label that
     /// marks an undecided voxel does not fit the output pixel type. Upstream
     /// `static_cast`s it (`itkLabelVotingImageFilter.hxx:78`,
     /// `itkMultiLabelSTAPLEImageFilter.hxx:224`), so the default `max_label +
@@ -815,7 +815,7 @@ pub enum FilterError {
     #[error("objectness_measure supports 2-D and 3-D images only, got {0}-D")]
     UnsupportedObjectnessDimension(usize),
 
-    /// [`crate::filters::sources::grid_source`]: `GridImageSource::BeforeThreadedGenerateData`
+    /// [`crate::filters::sources::grid_source`] — `GridImageSource::BeforeThreadedGenerateData`
     /// builds each axis's response with every *other* index held at `0`
     /// (`itkGridImageSource.hxx:60-81`), which only reduces to the correct
     /// physical point when `direction`'s off-diagonal entries are all zero —
@@ -835,8 +835,8 @@ pub enum FilterError {
     Core(#[from] crate::core::Error),
 
     /// A transform-crate error surfaced from a filter that internally reuses a
-    /// transform primitive — e.g. [`crate::filters::expand`] sampling through
-    /// [`crate::transform::resample::InterpolatedImage`].
+    /// transform primitive — e.g. [`crate::filters::expand()`] sampling through
+    /// `crate::transform::resample::InterpolatedImage`.
     #[error(transparent)]
     Transform(#[from] crate::transform::error::TransformError),
 }

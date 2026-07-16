@@ -4,7 +4,7 @@
 //! Port of `itk::FastMarchingUpwindGradientImageFilter`
 //! (`itkFastMarchingUpwindGradientImageFilter.h` / `.hxx`), with the API
 //! surface `FastMarchingUpwindGradientImageFilter.yaml` declares. It is a
-//! subclass of the [`crate::filters::fast_marching`] solver and reuses its heap through
+//! subclass of the [`mod@crate::filters::fast_marching`] solver and reuses its heap through
 //! that module's `march_flat` seam; only the per-accepted-point tail of
 //! `UpdateNeighbors` is new.
 //!
@@ -59,7 +59,7 @@
 //! ITK's fourth mode, `AllTargets`, is unreachable from this API — the clamp
 //! makes `SomeTargets` with `n >= target_points.len()` behave identically
 //! anyway, since each distinct in-bounds target is accepted at most once.
-//! [`crate::filters::colliding_fronts`] drives `AllTargets` through the internal seam.
+//! [`crate::filters::colliding_fronts()`] drives `AllTargets` through the internal seam.
 //!
 //! **§1.24 (fixed here):** `SomeTargets`/`AllTargets` terminate on the number
 //! of *distinct in-bounds* targets, not the raw container size. Upstream inserts
@@ -198,7 +198,7 @@ fn check_point_lengths(points: &[Vec<u32>], dim: usize) -> Result<()> {
     Ok(())
 }
 
-/// `FastMarchingUpwindGradientImageFilter`: the [`crate::filters::fast_marching`] march,
+/// `FastMarchingUpwindGradientImageFilter`: the [`crate::filters::fast_marching()`] march,
 /// plus the upwind gradient of the arrival-time field and an optional target
 /// stopping condition.
 ///

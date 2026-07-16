@@ -38,7 +38,7 @@
 //! `PNGImageIO`, but SimpleITK's own pixel-ID wrapping cannot name the result —
 //! not a PNG-format limit at all. This port's [`Image`] has no such
 //! restriction (a [`PixelId::VectorUInt8`]/[`PixelId::VectorUInt16`] admits any
-//! component count ≥ 1), so [`read`]/[`read_information`]/[`write`] implement
+//! component count ≥ 1), so [`read`]/[`read_information`]/[`write()`] implement
 //! the 2-channel case exactly like 3 and 4: a vector image, `component_id()`
 //! plus `vector_id()`. **Fixed §3.45.**
 //!
@@ -56,8 +56,8 @@
 //! format is big-endian, and on a little-endian host libpng byte-swaps every
 //! sample into the host's native order on the way in and back to big-endian
 //! on the way out. The `png` crate has no such transform: [`Reader::next_frame`]
-//! and [`Writer::write_image_data`] hand over raw, always-big-endian bytes.
-//! [`pack_pixels`] and [`buffer_to_be_bytes`] do the swap by hand with
+//! and [`png::Writer::write_image_data`] hand over raw, always-big-endian bytes.
+//! `pack_pixels` and `buffer_to_be_bytes` do the swap by hand with
 //! [`u16::from_be_bytes`]/[`u16::to_be_bytes`], which is a no-op on a
 //! big-endian host and the swap upstream performs on a little-endian one.
 //!
@@ -71,7 +71,7 @@
 //! *choosing a level*, leaving libpng/zlib at their own built-in default
 //! (`Z_DEFAULT_COMPRESSION`, 6) rather than at `PNGImageIO`'s own constructed
 //! default of 4 (`:271-272`). See [`crate::io::compression`] and ledger §3.46.
-//! [`write`] reproduces this: `options.use_compression` gates whether
+//! [`write()`] reproduces this: `options.use_compression` gates whether
 //! [`Encoder::set_deflate_compression`] is called at all — left alone, the
 //! `png` crate's own default is `DeflateCompression::Level(6)`
 //! (`flate2::Compression::default()`), matching zlib's built-in default byte
@@ -92,7 +92,7 @@
 //! `height` rows starting at the buffer's first byte; a 3-D image's second and
 //! later slices are simply never addressed, with no error upstream. PNG has no
 //! container for a third axis, so a 3-D source could never round-trip back
-//! out of the file it produces; [`write`] refuses it instead of reproducing
+//! out of the file it produces; [`write()`] refuses it instead of reproducing
 //! the silent data loss. **Fixed §2.125** — see [`IoError::PngWriteRejected`].
 //!
 //! # A >4-component vector image is refused
@@ -106,7 +106,7 @@
 //! the declared channel count — leaving every row's trailing
 //! `(numComp - 4)` components' worth of bytes untouched and unwritten, with no
 //! error upstream. PNG has no color type past 4 channels, so such a write
-//! could never round-trip; [`write`] refuses it instead of reproducing the
+//! could never round-trip; [`write()`] refuses it instead of reproducing the
 //! truncation. **Fixed §2.126** — see [`IoError::PngWriteRejected`].
 //!
 //! # Not implemented
@@ -117,7 +117,7 @@
 //!   `WriteSlice` writes them back with `png_set_sCAL` under the same guard
 //!   (`:671-673`). The `png` crate parses no such chunk — there is no
 //!   `sCAL` entry in [`png::chunk`] at all — so [`read_information`]/[`read`]
-//!   always report unit spacing `[1.0, 1.0]` and [`write`] never emits the
+//!   always report unit spacing `[1.0, 1.0]` and [`write()`] never emits the
 //!   chunk. `gAMA` is not a substitute: `itkPNGImageIO.cxx` never references
 //!   it. Ledger §4.85.
 //! * **`sBIT`-driven shifting.** `png_get_sBIT`/`png_set_shift` renormalizes

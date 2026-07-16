@@ -8,7 +8,7 @@
 //! `sitkLinear`).
 //!
 //! The per-output-pixel interpolation reuses the transform crate's shared
-//! sampling primitive ([`crate::transform::resample::InterpolatedImage`]) rather
+//! sampling primitive (`crate::transform::resample::InterpolatedImage`) rather
 //! than a filter-local linear/nearest implementation: after the single-crate
 //! consolidation there is no dependency edge to avoid, and that primitive
 //! already carries every kernel SimpleITK's `ExpandImageFilter.yaml` exposes
@@ -48,7 +48,7 @@ fn strides(size: &[usize]) -> Vec<usize> {
 /// ```
 ///
 /// The origin *does* shift — this is not the "origin stays put" one might
-/// assume by analogy with [`crate::filters::shrink`]. Expand resamples at continuous
+/// assume by analogy with [`crate::filters::shrink()`]. Expand resamples at continuous
 /// index `(outIndex+0.5)/factor - 0.5`, i.e. a finer grid whose first sample
 /// isn't centered on the input's first pixel unless `factor == 1`
 /// (`fraction == 0`), so the physical origin must shift by half the input
@@ -59,7 +59,7 @@ fn strides(size: &[usize]) -> Vec<usize> {
 /// for `factor[d] >= 1`: the minimum sample `(0+0.5)/factor - 0.5` is `> -0.5`
 /// (the `0.5/factor` term is strictly positive), and the maximum sample
 /// `size - 0.5 - 0.5/factor` is `< size - 0.5`. That is exactly the half-open
-/// range [`InterpolatedImage::sample`] treats as inside the buffer
+/// range `InterpolatedImage::sample` treats as inside the buffer
 /// (`is_inside`: `c >= -0.5 && c < size-0.5`), so the sample is always `Some`
 /// and the `.expect()` below cannot fire — a broken bound would panic rather
 /// than silently interpolate out-of-domain data. Within that range the
@@ -77,7 +77,7 @@ fn strides(size: &[usize]) -> Vec<usize> {
 /// factor set per-axis reaches `GenerateOutputInformation` and divides by
 /// zero there. This port declines to reproduce that division-by-zero
 /// footgun and rejects a zero factor as an error instead: a deliberate
-/// divergence, analogous to [`crate::filters::shrink`]'s `InvalidShrinkFactor`.
+/// divergence, analogous to [`crate::filters::shrink()`]'s `InvalidShrinkFactor`.
 pub fn expand(img: &Image, factors: &[usize], interpolator: Interpolator) -> Result<Image> {
     let dim = img.dimension();
     if factors.len() != dim {

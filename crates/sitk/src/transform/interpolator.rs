@@ -612,7 +612,7 @@ fn dsinc(x: f64) -> f64 {
 /// `itk::WindowedSincInterpolateImageFunction::EvaluateAtContinuousIndex` at
 /// the fixed [`WINDOWED_SINC_RADIUS`] radius SimpleITK bakes into its five
 /// `sitk*WindowedSinc` presets — `m_Radius` is a compile-time template
-/// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::transform::interpolator::GAUSSIAN_SIGMA)
+/// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`]
 /// it has no runtime setter to port.
 ///
 /// Per axis, the kernel `K(t) = w(t) sinc(t)` (`w` from `window`) is sampled
@@ -630,7 +630,7 @@ fn dsinc(x: f64) -> f64 {
 /// product rule), **without** the delta override, even when `distance == 0`.
 /// This is deliberate, not an oversight: `K` is even in `t` (every `w` here is
 /// even, and `sinc`/`d(sinc)` are each individually well-defined — see
-/// [`sinc`]/[`dsinc`] — at `t == 0`) so `K` is `C^1` straight through
+/// `sinc`/`dsinc` — at `t == 0`) so `K` is `C^1` straight through
 /// `distance == 0` with no kink for a delta-shaped gradient to model; the
 /// delta only ever existed to suppress the value's floating-point noise.
 ///

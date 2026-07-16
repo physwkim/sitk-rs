@@ -6,11 +6,11 @@
 //! with parameter names/defaults from `SimpleITK/Code/BasicFilters/yaml/`'s
 //! definitions of the same four filters.
 //!
-//! Every filter here draws from one of the two RNGs in [`crate::filters::random`]:
+//! Every filter here draws from one of the two RNGs in `crate::filters::random`:
 //! [`additive_gaussian_noise`] and [`shot_noise`] use
 //! `Statistics::NormalVariateGenerator` (C.S. Wallace's "FastNorm", *not* the
 //! Mersenne Twister's own Box-Muller `GetNormalVariate` — see
-//! [`crate::filters::random`]'s module doc comment for why that distinction matters);
+//! `crate::filters::random`'s module doc comment for why that distinction matters);
 //! [`salt_and_pepper_noise`], [`shot_noise`]'s Poisson branch, and
 //! [`speckle_noise`] draw uniform variates from
 //! `Statistics::MersenneTwisterRandomVariateGenerator` directly. This matches
@@ -38,7 +38,7 @@
 //! `double` to `[NumericTraits<T>::NonpositiveMin(), NumericTraits<T>::max()]`,
 //! then for integer `T` rounds half-up (`Math::Round` ==
 //! `RoundHalfIntegerUp`, i.e. `floor(value + 0.5)`) rather than truncating;
-//! [`clamp_cast`] mirrors this exactly (unlike [`crate::core::Scalar::from_f64`]'s
+//! `clamp_cast` mirrors this exactly (unlike [`crate::core::Scalar::from_f64`]'s
 //! plain saturating-truncating `as` cast used elsewhere in this crate).
 
 use crate::core::{Image, Scalar, dispatch_scalar};
@@ -137,8 +137,8 @@ fn additive_gaussian_noise_typed<T: ClampBounds>(
 }
 
 /// `AdditiveGaussianNoiseImageFilter`: `I = I0 + mean + standard_deviation *
-/// N(0, 1)`, `N(0, 1)` drawn from [`NormalVariateGenerator`]. Output keeps
-/// `img`'s pixel type, narrowed via [`clamp_cast`].
+/// N(0, 1)`, `N(0, 1)` drawn from `NormalVariateGenerator`. Output keeps
+/// `img`'s pixel type, narrowed via `clamp_cast`.
 pub fn additive_gaussian_noise(
     img: &Image,
     mean: f64,
@@ -246,7 +246,7 @@ fn shot_noise_typed<T: ClampBounds>(img: &Image, scale: f64, seed: u32) -> Resul
 /// repeated-uniform-product rejection method when `lambda < 50`, or by its
 /// `lambda + sqrt(lambda) * N(0,1)` Gaussian approximation once `lambda`
 /// grows too large for the exact method to stay efficient. Output keeps
-/// `img`'s pixel type, narrowed via [`clamp_cast`].
+/// `img`'s pixel type, narrowed via `clamp_cast`.
 pub fn shot_noise(img: &Image, scale: f64, seed: u32) -> Result<Image> {
     dispatch_scalar!(img.pixel_id(), shot_noise_typed, img, scale, seed)
 }
@@ -309,7 +309,7 @@ fn speckle_noise_typed<T: ClampBounds>(
 /// `SpeckleNoiseImageFilter`: multiplicative `I = I0 * G`, `G` a
 /// gamma-distributed variate of mean 1 and variance `standard_deviation^2`
 /// (shape `1/standard_deviation^2`, scale `standard_deviation^2`). Output
-/// keeps `img`'s pixel type, narrowed via [`clamp_cast`].
+/// keeps `img`'s pixel type, narrowed via `clamp_cast`.
 ///
 /// `standard_deviation` at or extremely near `0.0` makes the shape parameter
 /// `1/standard_deviation^2` diverge; ITK's own algorithm has no guard against

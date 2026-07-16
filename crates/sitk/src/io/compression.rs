@@ -6,8 +6,8 @@
 //!
 //! | door | upstream | container | on garbage input |
 //! |---|---|---|---|
-//! | [`zlib_compress`] / [`inflate_auto`] | MetaIO `MET_PerformCompression` / `MET_PerformUncompression` (metaUtils.cxx:790-893) | writes **zlib**, reads zlib *or* gzip | error |
-//! | [`gzip_compress`] / [`gunzip_transparent`] | NrrdIO `nrrd__GzOpen` (gzio.c:161-232) and nifti's `znzopen` → zlib's `gzopen` (znzlib.c:48-82) | **gzip** | *transparent copy* |
+//! | `zlib_compress` / `inflate_auto` | MetaIO `MET_PerformCompression` / `MET_PerformUncompression` (metaUtils.cxx:790-893) | writes **zlib**, reads zlib *or* gzip | error |
+//! | `gzip_compress` / `gunzip_transparent` | NrrdIO `nrrd__GzOpen` (gzio.c:161-232) and nifti's `znzopen` → zlib's `gzopen` (znzlib.c:48-82) | **gzip** | *transparent copy* |
 //!
 //! The asymmetry is real and load-bearing:
 //!
@@ -20,7 +20,7 @@
 //!   stream (`deflateInit2(..., -MAX_WBITS, ...)`) in a hand-written gzip
 //!   header and CRC-32/ISIZE trailer. Both, on reading, fall back to a
 //!   byte-for-byte copy when the gzip magic is absent (`s->transparent = 1`,
-//!   gzio.c:516; zlib's `gz_look` sets `state->how = COPY`). [`gunzip_transparent`]
+//!   gzio.c:516; zlib's `gz_look` sets `state->how = COPY`). `gunzip_transparent`
 //!   reproduces that (§2.113).
 //!
 //! # Compression level

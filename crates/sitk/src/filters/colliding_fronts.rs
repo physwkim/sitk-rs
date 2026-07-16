@@ -7,7 +7,7 @@
 //!
 //! ## The pipeline
 //!
-//! Two [`crate::filters::fast_marching_upwind_gradient`] marches over the *same* speed
+//! Two [`crate::filters::fast_marching_upwind_gradient()`] marches over the *same* speed
 //! image (the filter's input), each seeded on one point set and targeted at the
 //! other, both with `GenerateGradientImage` on. The output is the pointwise
 //! **dot product** of the two upwind gradient fields — upstream this is
@@ -72,7 +72,7 @@
 //!   ([`FilterError::DimensionLength`]), matching `sitkSTLVectorToITK`'s
 //!   "Unable to convert vector to ITK type". A `dim + 1`-th element is the
 //!   seed's initial arrival time, as in
-//!   [`crate::filters::fast_marching_upwind_gradient`]; `CollidingFrontsImageFilter`
+//!   [`crate::filters::fast_marching_upwind_gradient()`]; `CollidingFrontsImageFilter`
 //!   exposes no `InitialTrialValues`, so that is the only way to offset a seed.
 //! - With `stop_on_targets`, an empty *other* seed list is
 //!   [`FilterError::NoTargetPoints`], from the marches'

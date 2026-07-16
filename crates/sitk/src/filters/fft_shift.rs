@@ -15,7 +15,7 @@
 //! `[0, size[i])`. This crate's images always start at index 0 (there is no
 //! `LargestPossibleRegion` index offset concept here), so the `outIdx` term
 //! is always zero and drops out of the port. Both functions share that same
-//! wraparound core, [`cyclic_permute`], differing only in how `shift` is
+//! wraparound core, `cyclic_sources`, differing only in how `shift` is
 //! produced.
 //!
 //! `FFTShiftImageFilter.yaml` declares `pixel_types: NonLabelPixelIDTypeList`

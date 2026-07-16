@@ -215,7 +215,7 @@ fn resolve_weights(
 ///
 /// Errors:
 ///
-/// - [`super::require_displacement_field`]'s, on an input that is not a
+/// - `super::require_displacement_field`'s, on an input that is not a
 ///   real-valued vector image with one component per dimension;
 /// - [`FilterError::DimensionLength`] when `derivative_weights` is non-empty and
 ///   does not have one entry per dimension.

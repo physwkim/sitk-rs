@@ -92,7 +92,7 @@ fn wrap_to_pixel_type(target: PixelId, v: f64) -> f64 {
 /// `threshold` must be `>= 0` (`VerifyPreconditions`). When `clamp` is true
 /// the result is clamped to `[NonpositiveMin, max]` of `img`'s pixel type
 /// before narrowing; when false and the pixel type is an integer, an
-/// out-of-range result wraps (see [`wrap_to_pixel_type`]) rather than
+/// out-of-range result wraps (see `wrap_to_pixel_type`) rather than
 /// saturating.
 pub fn unsharp_mask(
     img: &Image,

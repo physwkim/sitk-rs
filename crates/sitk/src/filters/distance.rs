@@ -892,7 +892,7 @@ fn fast_chamfer_distance(vals: &mut [f64], geo: &Geometry, maximum_distance: f64
 /// `inside_value` (default `1`), `outside_value` (default `0`). Both are
 /// declared `pixeltype: Input` there, so they are cast to the input's pixel
 /// type before the ITK filter sees them; we do the same via
-/// [`quantize_to_pixel_type`]. That cast is load-bearing — it is the cast
+/// `quantize_to_pixel_type`. That cast is load-bearing — it is the cast
 /// values that decide `InsideValue > OutsideValue`, hence the final sign flip.
 ///
 /// SimpleITK only instantiates this wrapper for `IntegerPixelIDTypeList`; the

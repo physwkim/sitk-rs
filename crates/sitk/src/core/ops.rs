@@ -78,7 +78,7 @@
 //! Like every `sitk-filters` filter built on the pixel-type-compute functor
 //! seam, these operators read pixels through [`Image::scalar_slice`] /
 //! [`Image::scalar_vec_mut`], which reject a vector or complex image with
-//! [`Error::RequiresScalarPixelType`] even though upstream's `Add`/`Subtract`/
+//! [`crate::core::Error::RequiresScalarPixelType`] even though upstream's `Add`/`Subtract`/
 //! `Multiply` accept a broader pixel type list
 //! (`AddImageFilter.yaml`'s `pixel_types: NonLabelPixelIDTypeList` includes
 //! vector and complex). This is the same restriction `crate::filters::add` /

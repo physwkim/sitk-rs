@@ -19,7 +19,7 @@
 //! Output pixel type per filter comes from SimpleITK's
 //! `Code/BasicFilters/yaml/*ProjectionImageFilter.yaml`, not the raw ITK
 //! default: `Mean`/`Sum`/`StandardDeviation` declare `output_pixel_type:
-//! NumericTraits<InputPixelType>::RealType` (see [`real_type`]); the rest
+//! NumericTraits<InputPixelType>::RealType` (see `real_type`); the rest
 //! (`Median`/`Maximum`/`Minimum`/`Binary`) declare none, so output type
 //! matches input. `BinaryProjectionImageFilter.yaml` also overrides ITK's own
 //! `ForegroundValue`/`BackgroundValue` defaults (`NumericTraits::max()` /
@@ -198,7 +198,7 @@ fn project(
 }
 
 /// `MeanProjectionImageFilter`: `sum(line) / line.len()`. Output pixel type is
-/// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+/// `NumericTraits<InputPixelType>::RealType` (see `real_type`).
 ///
 /// On an empty line (a projected axis of size 0) this is `0.0 / 0 == NaN`,
 /// matching `MeanAccumulator::GetValue`'s unconditional floating-point
@@ -211,7 +211,7 @@ pub fn mean_projection(img: &Image, projection_dimension: usize) -> Result<Image
 }
 
 /// `SumProjectionImageFilter`: `sum(line)`. Output pixel type is
-/// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+/// `NumericTraits<InputPixelType>::RealType` (see `real_type`).
 pub fn sum_projection(img: &Image, projection_dimension: usize) -> Result<Image> {
     let output_id = real_type(img.pixel_id());
     project(img, projection_dimension, output_id, |line| {
@@ -223,7 +223,7 @@ pub fn sum_projection(img: &Image, projection_dimension: usize) -> Result<Image>
 /// `line` (divisor `line.len() - 1`, matching
 /// `StandardDeviationAccumulator::GetValue`'s `std::sqrt(squaredSum /
 /// (m_Size - 1))`). Output pixel type is
-/// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+/// `NumericTraits<InputPixelType>::RealType` (see `real_type`).
 ///
 /// `line.len() <= 1` returns `0.0` exactly (`GetValue`'s explicit
 /// divide-by-zero guard), rather than `0.0 / 0.0`.
@@ -318,7 +318,7 @@ pub fn binary_projection(
 /// `threshold_value` is narrowed through the input pixel type and back
 /// (`static_cast<InputPixelType>` in SimpleITK's generated wrapper,
 /// `ThresholdValue` is `pixeltype: Input`) before comparison, via
-/// [`crate::filters::quantize_to_pixel_type`] — the same narrowing
+/// `crate::filters::quantize_to_pixel_type` — the same narrowing
 /// [`binary_projection`]'s `foreground_value`/`background_value` already use.
 pub fn binary_threshold_projection(
     img: &Image,

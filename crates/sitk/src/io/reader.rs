@@ -5,7 +5,7 @@
 //!
 //! Both read entry points — [`ImageFileReader::execute`] and the free
 //! [`crate::io::read_image`] — pass the raw image an `ImageIo` returns through
-//! [`normalize_reader_geometry`], the port of `itk::ImageFileReader`'s own
+//! `normalize_reader_geometry`, the port of `itk::ImageFileReader`'s own
 //! post-read block (`itkImageFileReader.hxx:216-239`). Each `ImageIo` reports
 //! the file's raw geometry; the reader flips any negative spacing component
 //! positive (negating the matching direction column so the physical geometry is

@@ -13,7 +13,7 @@
 //!    differences. Before applying this filter it is expected that a Gaussian
 //!    smoothing filter at an appropriate scale (sigma) was applied to the
 //!    input image." So this port needs none of the crate's
-//!    [`crate::filters::recursive_gaussian`] machinery; callers who want the
+//!    [`mod@crate::filters::recursive_gaussian`] machinery; callers who want the
 //!    multi-scale Frangi behavior smooth the input themselves first.
 //! 2. `itk::HessianToObjectnessMeasureImageFilter`
 //!    (`ITK/Modules/Filtering/ImageFeature/include/itkHessianToObjectnessMeasureImageFilter.hxx`)
@@ -67,7 +67,7 @@
 //!   evaluates left-to-right entirely in `float` (three roundings) before the
 //!   `double` division by `4 s_i s_j`.
 //!
-//! [`hessian_at`] reproduces both roundings exactly (`narrow_f32`), rather
+//! `hessian_at` reproduces both roundings exactly (`narrow_f32`), rather
 //! than computing throughout in `f64`: `f32 + f32` and `f32 - f32` are exact
 //! in `f64`, so rounding the `f64` result once to `f32` equals the `f32`
 //! operation.
@@ -142,7 +142,7 @@
 //!    ranges of at most 16 elements, which *is* stable, so in practice the
 //!    ascending-by-value order coming out of `SymmetricEigenAnalysis`
 //!    survives the tie and the negative eigenvalue lands first. This port
-//!    pins that behavior with a stable sort ([`sort_by_magnitude`]).
+//!    pins that behavior with a stable sort (`sort_by_magnitude`).
 //!
 //! 4. **The sign constraint admits zero eigenvalues.** `.hxx:252` tests
 //!    `sortedEigenValues[i] > 0.0` (bright) / `< 0.0` (dark), so an exactly

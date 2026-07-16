@@ -6,7 +6,7 @@
 //! `sitkCenteredVersorTransformInitializerFilter.h/.cxx`).
 //!
 //! [`initialize`](CenteredVersorTransformInitializer::initialize) always runs
-//! in [`OperationMode::Moments`](crate::registration::OperationMode::Moments) — it calls
+//! in [`OperationMode::Moments`] — it calls
 //! [`CenteredTransformInitializer`] directly for the center/translation step
 //! — mirroring the ITK subclass's constructor, which forces
 //! `Superclass::MomentsOn()` unconditionally
@@ -30,8 +30,8 @@
 //! `GetPrincipalAxes` sorts eigenvalues **ascending**, sign-canonicalizes
 //! each eigenvector so its largest-magnitude component is positive, then
 //! flips the *last* row's sign if needed to force `det(Pa) = +1` (a proper
-//! rotation) — this port's [`principal_axes`] follows the same three steps,
-//! reusing the shared [`crate::registration::eigen::jacobi_eigen_symmetric`] solver.
+//! rotation) — this port's `principal_axes` follows the same three steps,
+//! reusing the shared `crate::registration::eigen::jacobi_eigen_symmetric` solver.
 //!
 //! **Quirk reproduced, not a guaranteed exact recovery:** because each
 //! image's eigenvector signs are canonicalized independently (based only on
@@ -57,7 +57,7 @@
 //! second central-moment matrix; its "principal axes" then reduce to
 //! whatever orthonormal basis the eigensolver returns for a triply-degenerate
 //! zero eigenvalue (the identity, in practice, since
-//! [`crate::registration::eigen::jacobi_eigen_symmetric`] never rotates a matrix that is
+//! `crate::registration::eigen::jacobi_eigen_symmetric` never rotates a matrix that is
 //! already diagonal) — not an error, matching ITK, which likewise performs
 //! no additional validation before eigendecomposing `m_Cm`.
 //!

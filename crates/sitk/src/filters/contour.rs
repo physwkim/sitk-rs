@@ -34,7 +34,7 @@
 //! Within one line-pair comparison, `CompareLines` finds each overlapping
 //! `[start, end]` span between a "current" run and a "neighbour" run by
 //! padding the **neighbour's** span (not the current run's) by a tolerance
-//! of `0` or `1` pixels before checking overlap ([`overlap_with_tolerance`]
+//! of `0` or `1` pixels before checking overlap (`overlap_with_tolerance`
 //! mirrors its four overlap cases exactly). That padding is `1` whenever the
 //! two lines being compared are literally the same line (an fg/bg run pair
 //! that RLE-abut on one line are adjacent-but-not-overlapping index ranges,

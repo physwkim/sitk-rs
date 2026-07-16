@@ -47,7 +47,7 @@
 //! `FullyConnected = false`" — it drops the one thing `FullyConnected =
 //! false` always includes (the center itself). This is upstream's own
 //! asymmetry, reproduced unchanged (not a deliberate divergence): see
-//! [`elementary_kernel`].
+//! `elementary_kernel`.
 //!
 //! One consequence, verified in the tests below: a converged
 //! (`RunOneIteration = false`), `FullyConnected = false` geodesic
@@ -60,7 +60,7 @@
 //! `FullyConnected = true` run does **not** agree with
 //! `reconstruction_by_dilation`/`reconstruction_by_erosion` at
 //! `fully_connected = true` in general, even though both are nominally
-//! "reconstruction" per the class docs: [`crate::filters::reconstruction::reconstruct`]'s
+//! "reconstruction" per the class docs: `crate::filters::reconstruction::reconstruct`'s
 //! per-pixel update *always* starts from the pixel's own current value
 //! (`let mut v = out[f];`) regardless of `fully_connected`, so it is
 //! extensive (never drops below the marker) by construction, while this

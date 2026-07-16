@@ -366,11 +366,11 @@ pub(crate) fn create_consecutive(
 /// family's mask ([`crate::filters::histogram::ThresholdMask`]), which admits a voxel only
 /// where the mask **equals** `mask_value` (default **255**), and a mask of all
 /// `1`s admits nothing. Two upstream classes, two conventions; see
-/// [`crate::filters::mask_input`] and ledger §2.175.
+/// `crate::filters::mask_input` and ledger §2.175.
 ///
 /// The mask must be `UInt8`, the image's size, and on the image's grid — ITK's
 /// three preconditions for a mask *input*, enforced by
-/// [`crate::filters::mask_input::uint8_mask_voxels`].
+/// `crate::filters::mask_input::uint8_mask_voxels`.
 pub fn connected_component(
     img: &Image,
     mask: Option<&Image>,
@@ -657,7 +657,7 @@ fn histogram_median(hist: &[u64], count: u64, mins: &[f64], maxs: &[f64]) -> f64
 /// exact.** SimpleITK sets `UseHistograms: true` by *default* and configures the bins in
 /// `LabelStatisticsImageFilter.yaml`'s `custom_itk_cast`, so this filter always builds
 /// them (there is no "histograms off" mode to mirror — the getter would simply return
-/// `0.0`). The range is [`histogram_bounds`]: the padded **pixel-type** range for
+/// `0.0`). The range is `histogram_bounds`: the padded **pixel-type** range for
 /// `UInt8`/`Int8`, which puts one integer per bin and makes the median exact; the **whole
 /// intensity image's** data range for every other type, which quantizes it to a bin
 /// centre — and note *whole image*, not *this label's voxels*, so a label confined to a

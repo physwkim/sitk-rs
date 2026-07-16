@@ -1,0 +1,3393 @@
+ Documenting sitk v0.0.3 (/home/stevek/work/sitk-rs/crates/sitk)
+warning: unresolved link to `ops`
+  |
+  = note: the link appears in this line:
+          
+          - [`ops`]'s `std::ops` operator overloads (`img1 + img2`, ...): Rust's orphan
+             ^^^^^
+  = note: no item named `ops` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `ops`
+  |
+  = note: the link appears in this line:
+          
+            than in `sitk-filters` — see the [`ops`] module docs.
+                                                ^^^^^
+  = note: no item named `ops` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `deriche`
+  |
+  = note: the link appears in this line:
+          
+          - [`deriche`]'s recursive-Gaussian coefficients: they have two consumers,
+             ^^^^^^^^^
+  = note: no item named `deriche` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `deriche`
+  |
+  = note: the link appears in this line:
+          
+            does not mean writing it twice — see the [`deriche`] module docs.
+                                                        ^^^^^^^^^
+  = note: no item named `deriche` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `resident_vec` links to private item `resident_capacity`
+  --> crates/sitk/src/core/alloc.rs:90:46
+   |
+90 | /// maps in [`crate::core::parallel`] take [`resident_capacity`] instead — the advice
+   |                                              ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+   = note: `#[warn(rustdoc::private_intra_doc_links)]` on by default
+
+warning: public documentation for `WindowScratch` links to private item `NeighborhoodIterator::window_state`
+   --> crates/sitk/src/core/neighborhood.rs:352:7
+    |
+352 | /// [`NeighborhoodIterator::window_state`] and reused for every pixel that task
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `refill` links to private item `Self::push_values_checked`
+   --> crates/sitk/src/core/neighborhood.rs:660:39
+    |
+660 |     /// allocated 16.7 M times. See [`Self::push_values_checked`].
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `Error::RequiresScalarPixelType`
+  --> crates/sitk/src/core/ops.rs:81:7
+   |
+81 | //! [`Error::RequiresScalarPixelType`] even though upstream's `Add`/`Subtract`/
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `Error` in scope
+
+warning: public documentation for `parallel` links to private item `grain`
+  --> crates/sitk/src/core/parallel.rs:24:58
+   |
+24 | //! - Chunk boundaries come from one private function, [`grain`], whose signature
+   |                                                          ^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `parallel` links to private item `SERIAL_THRESHOLD`
+  --> crates/sitk/src/core/parallel.rs:52:7
+   |
+52 | //! [`SERIAL_THRESHOLD`] returns the same bits as the parallel path — the
+   |       ^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `map_indexed_init_by_cost` links to private item `fill_indexed`
+   --> crates/sitk/src/core/parallel.rs:391:7
+    |
+391 | /// [`fill_indexed`] cuts `0..len` into equal-**count** chunks, which are equal-**cost**
+    |       ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `map_indexed_init_by_cost` links to private item `TARGET_TASKS`
+   --> crates/sitk/src/core/parallel.rs:404:42
+    |
+404 | /// **Each class is split into its own [`TARGET_TASKS`] chunks**, so
+    |                                          ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `map_indexed_init_by_cost` links to private item `GRAIN`
+   --> crates/sitk/src/core/parallel.rs:412:75
+    |
+412 | /// that mislabels a run makes the balance worse, never the answer. The [`GRAIN`] ceiling
+    |                                                                           ^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `map_indexed_init_by_cost` links to private item `TARGET_TASKS`
+   --> crates/sitk/src/core/parallel.rs:415:23
+    |
+415 | /// per element and [`TARGET_TASKS`] is what bounds the task count.
+    |                       ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `map_indexed_init_by_cost` links to private item `grain`
+   --> crates/sitk/src/core/parallel.rs:421:54
+    |
+421 | /// in slot `i`. It is the same argument that lets [`grain`] be tuned freely — no
+    |                                                      ^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `Scalar` links to private item `crate::core::PixelBuffer::as_slice`
+   --> crates/sitk/src/core/pixel.rs:391:32
+    |
+391 | /// [`PixelBuffer::as_slice`]: crate::core::PixelBuffer::as_slice
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `functor`
+  |
+  = note: the link appears in this line:
+          
+          Both policies are the two faces of the [`functor`] module's pixel-functor
+                                                  ^^^^^^^^^
+  = note: no item named `functor` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `unary_minus`
+  |
+  = note: the link appears in this line:
+          
+          [`unary_minus`] is the unary face of the same pixel-type-compute policy
+           ^^^^^^^^^^^^^
+  = note: no item named `unary_minus` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `FilterError::RequiresSignedPixelType`
+  |
+  = note: the link appears in this line:
+          
+          [`FilterError::RequiresSignedPixelType`] in place of the C++ compile-time
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `FilterError` in scope
+
+warning: unresolved link to `d`
+  --> crates/sitk/src/filters/adaptive_histogram_equalization.rs:44:76
+   |
+44 | /// histogram equalization over an axis-aligned `radius` window (`2*radius[d]
+   |                                                                            ^ no item named `d` in scope
+   |
+   = note: `macro_rules` named `d` exists in this crate, but it is not in scope at this link's location
+
+warning: public documentation for `anisotropic_diffusion` links to private item `average_gradient_magnitude_squared`
+  --> crates/sitk/src/filters/anisotropic_diffusion.rs:42:18
+   |
+42 | //! estimator ([`average_gradient_magnitude_squared`]) is the mean over *every*
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `attribute_morphology` links to private item `AttributeKind`
+  --> crates/sitk/src/filters/attribute_morphology.rs:12:7
+   |
+12 | //! [`AttributeKind`] plays the same role here as `ExtremaKind` does in
+   |       ^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `attribute_morphology` links to private item `find_root`
+  --> crates/sitk/src/filters/attribute_morphology.rs:85:37
+   |
+85 | //! `parent[x] < 0` conflation in [`find_root`] is dead code once the sort is
+   |                                     ^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `attribute_morphology` links to private item `Half::Full`
+  --> crates/sitk/src/filters/attribute_morphology.rs:91:7
+   |
+91 | //! [`Half::Full`] neighbor connectivity, exactly as `SetupOffsetVec`'s
+   |       ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `binary_morphology` links to private item `crate::filters::logic::require_integer_pixel_type`
+  --> crates/sitk/src/filters/binary_morphology.rs:66:9
+   |
+66 | //!   [`crate::filters::logic::require_integer_pixel_type`], but [`voting_binary`] and
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `voting_binary_hole_filling` links to private item `voting_binary_hole_filling_pass`
+   --> crates/sitk/src/filters/binary_morphology.rs:398:7
+    |
+398 | /// [`voting_binary_hole_filling_pass`] exactly once, unlike the iterative
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `voting_binary_iterative_hole_filling` links to private item `voting_binary_hole_filling_pass`
+   --> crates/sitk/src/filters/binary_morphology.rs:429:7
+    |
+429 | /// [`voting_binary_hole_filling_pass`]'s per-iteration rule, input := previous
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `crate::filters::denoise::discrete_gaussian_f64`
+ --> crates/sitk/src/filters/canny.rs:9:10
+  |
+9 | //!    [`crate::filters::denoise::discrete_gaussian_f64`], the `f64` core shared with
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `second_directional_derivative_field`
+  --> crates/sitk/src/filters/canny.rs:14:47
+   |
+14 | //!    over a single radius-1 neighborhood ([`second_directional_derivative_field`]).
+   |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `positional_gate_field`
+  --> crates/sitk/src/filters/canny.rs:19:11
+   |
+19 | //!    ([`positional_gate_field`]).
+   |           ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `zero_crossing_values`
+  --> crates/sitk/src/filters/canny.rs:21:11
+   |
+21 | //!    ([`zero_crossing_values`], the engine behind the public [`zero_crossing`]),
+   |           ^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `hysteresis_threshold`
+  --> crates/sitk/src/filters/canny.rs:24:10
+   |
+24 | //!    [`hysteresis_threshold`], a flood fill seeded from every pixel above
+   |          ^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `derivative_operator_coefficients`
+  --> crates/sitk/src/filters/canny.rs:45:46
+   |
+45 | //! flipping is a no-op for it regardless. [`derivative_operator_coefficients`]
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `canny` links to private item `crate::filters::denoise::discrete_gaussian_f64`
+  --> crates/sitk/src/filters/canny.rs:57:8
+   |
+57 | //! ([`crate::filters::denoise::discrete_gaussian_f64`]), pinned to the only
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `chan_vese` links to private item `pde_inv_spacing`
+   --> crates/sitk/src/filters/chan_vese.rs:133:36
+    |
+133 | //!   Hessian's inverse spacing ([`pde_inv_spacing`]) on the flag too: `true`
+    |                                    ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `change_label` links to private item `crate::filters::quantize_to_pixel_type`
+  --> crates/sitk/src/filters/change_label.rs:14:7
+   |
+14 | //! [`crate::filters::quantize_to_pixel_type`]) before being handed to the filter.
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `clamp` links to private item `read_pixels_i128`
+  --> crates/sitk/src/filters/clamp.rs:59:37
+   |
+59 | /// path now runs through `i128` ([`read_pixels_i128`] / [`build_clamp_from_i128`]),
+   |                                     ^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `clamp` links to private item `build_clamp_from_i128`
+  --> crates/sitk/src/filters/clamp.rs:59:60
+   |
+59 | /// path now runs through `i128` ([`read_pixels_i128`] / [`build_clamp_from_i128`]),
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `coherence_enhancing_diffusion` links to private item `crate::filters::linalg`
+   --> crates/sitk/src/filters/coherence_enhancing_diffusion.rs:117:45
+    |
+117 | //! eigensolver from the cyclic Jacobi in [`crate::filters::linalg`], and the two agree
+    |                                             ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `contour` links to private item `overlap_with_tolerance`
+  --> crates/sitk/src/filters/contour.rs:37:53
+   |
+37 | //! of `0` or `1` pixels before checking overlap ([`overlap_with_tolerance`]
+   |                                                     ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `contour_extractor_2d` links to private item `ContourData::add_segment`
+  --> crates/sitk/src/filters/contour_extractor_2d.rs:33:32
+   |
+33 | //! Segments are stitched by [`ContourData::add_segment`], which keeps two hash
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `deconvolution` links to private item `crate::filters::convolution::pad_input`
+  --> crates/sitk/src/filters/deconvolution.rs:23:27
+   |
+23 | //! boundary condition ([`crate::filters::convolution::pad_input`]) and builds the
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `deconvolution` links to private item `crate::filters::convolution::kernel_spectrum`
+  --> crates/sitk/src/filters/deconvolution.rs:26:8
+   |
+26 | //! ([`crate::filters::convolution::kernel_spectrum`]). The three *spectral* filters then
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `deconvolution` links to private item `crate::filters::convolution::crop_output`
+  --> crates/sitk/src/filters/deconvolution.rs:28:13
+   |
+28 | //! crop ([`crate::filters::convolution::crop_output`]). The three *iterative* filters
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `deconvolution` links to private item `crate::filters::fft`
+  --> crates/sitk/src/filters/deconvolution.rs:34:7
+   |
+34 | //! [`crate::filters::fft`] is a full complex DFT. Every functor here maps a
+   |       ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `deconvolution` links to private item `plan`
+  --> crates/sitk/src/filters/deconvolution.rs:50:55
+   |
+50 | //! iterative filter's `output_region_mode` reaches [`plan`] exactly as the
+   |                                                       ^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `denoise` links to private item `select_median`
+  --> crates/sitk/src/filters/denoise.rs:21:64
+   |
+21 | //! here happens to be odd-length (`Π (2·radius[d]+1)`), but [`select_median`]
+   |                                                                ^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `denoise` links to private item `box_accumulate`
+  --> crates/sitk/src/filters/denoise.rs:30:28
+   |
+30 | //! multiple times — see [`box_accumulate`]'s doc comment for the derivation.
+   |                            ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `denoise` links to private item `gaussian_operator_kernel`
+  --> crates/sitk/src/filters/denoise.rs:35:7
+   |
+35 | //! [`gaussian_operator_kernel`]) separably, one axis at a time, truncated by
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `median` links to private item `select_median`
+   --> crates/sitk/src/filters/denoise.rs:201:32
+    |
+201 | /// `MedianImageFilter`: the [`select_median`] of a per-axis `radius`
+    |                                ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `box_mean` links to private item `box_accumulate`
+   --> crates/sitk/src/filters/denoise.rs:280:33
+    |
+280 | /// zero-flux-replicated (see [`box_accumulate`]'s doc comment). Narrowed
+    |                                 ^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `box_sigma` links to private item `box_accumulate`
+   --> crates/sitk/src/filters/denoise.rs:311:38
+    |
+311 | /// exactly like [`box_mean`] (see [`box_accumulate`]'s doc comment).
+    |                                      ^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `discrete_gaussian` links to private item `gaussian_operator_kernel`
+   --> crates/sitk/src/filters/denoise.rs:506:7
+    |
+506 | /// [`gaussian_operator_kernel`], one axis at a time, under
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `discrete_gaussian_derivative` links to private item `gaussian_derivative_operator_coefficients`
+   --> crates/sitk/src/filters/denoise.rs:834:7
+    |
+834 | /// [`gaussian_derivative_operator_coefficients`], one axis at a time, under
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `discrete_gaussian_derivative` links to private item `clamp_maximum_error`
+   --> crates/sitk/src/filters/denoise.rs:872:7
+    |
+872 | /// [`clamp_maximum_error`]). Errors if `variance.len()` or `order.len()` differ
+    |       ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `dicom_orient` links to private item `Orientation`
+  --> crates/sitk/src/filters/dicom_orient.rs:28:64
+   |
+28 | //! one back. This port drops the packed code and the table: [`Orientation`]
+   |                                                                ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `dicom_orient` links to private item `Coordinate`
+  --> crates/sitk/src/filters/dicom_orient.rs:29:65
+   |
+29 | //! is just `Option<[Coordinate; 3]>` (`None` for `INVALID`), [`Coordinate`] is
+   |                                                                 ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `displacement_field` links to private item `require_displacement_field`
+  --> crates/sitk/src/filters/displacement_field.rs:20:7
+   |
+20 | //! [`require_displacement_field`] is that check, and every filter in this module
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `displacement_field` links to private item `Field::evaluate_at_point`
+  --> crates/sitk/src/filters/displacement_field.rs:36:7
+   |
+36 | //! [`Field::evaluate_at_point`] is `VectorLinearInterpolateImageFunction`
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `invert_displacement_field` links to private item `super::require_displacement_field`
+   --> crates/sitk/src/filters/displacement_field/invert.rs:138:36
+    |
+138 | /// [`require_displacement_field`](super::require_displacement_field)), on the
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `iterative_inverse_displacement_field` links to private item `super::require_displacement_field`
+   --> crates/sitk/src/filters/displacement_field/iterative_inverse.rs:143:15
+    |
+143 | /// Errors: [`super::require_displacement_field`]'s, on an input that is not a
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `displacement_field_jacobian_determinant` links to private item `super::require_displacement_field`
+   --> crates/sitk/src/filters/displacement_field/jacobian_determinant.rs:218:9
+    |
+218 | /// - [`super::require_displacement_field`]'s, on an input that is not a
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `approximate_signed_distance_map` links to private item `quantize_to_pixel_type`
+   --> crates/sitk/src/filters/distance.rs:895:7
+    |
+895 | /// [`quantize_to_pixel_type`]. That cast is load-bearing — it is the cast
+    |       ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `edge` links to private item `crate::filters::denoise::discrete_gaussian_f64`
+ --> crates/sitk/src/filters/edge.rs:5:7
+  |
+5 | //! [`crate::filters::denoise::discrete_gaussian_f64`] (smoothing) into
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `edge` links to private item `crate::filters::canny::zero_crossing_values`
+ --> crates/sitk/src/filters/edge.rs:7:7
+  |
+7 | //! [`crate::filters::canny::zero_crossing_values`] (sign-change marking) — composed
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `edge` links to private item `crate::filters::canny::zero_crossing_values`
+  --> crates/sitk/src/filters/edge.rs:31:7
+   |
+31 | //! [`crate::filters::canny::zero_crossing_values`] — the untyped `f64` core shared by
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `zero_crossing_based_edge_detection` links to private item `discrete_gaussian_f64`
+  --> crates/sitk/src/filters/edge.rs:52:7
+   |
+52 | /// [`discrete_gaussian_f64`]'s `MaximumKernelWidth = 32`,
+   |       ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `zero_crossing_based_edge_detection` links to private item `zero_crossing_values`
+  --> crates/sitk/src/filters/edge.rs:56:47
+   |
+56 | /// mark every zero-crossing of that field ([`zero_crossing_values`]) with
+   |                                               ^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `zero_crossing_based_edge_detection` links to private item `discrete_gaussian_f64`
+  --> crates/sitk/src/filters/edge.rs:65:39
+   |
+65 | /// `variance`/`maximum_error` fail [`discrete_gaussian_f64`]'s own validation
+   |                                       ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `crate::filters::label_voting`
+   --> crates/sitk/src/filters/error.rs:281:11
+    |
+281 |     /// [`crate::filters::label_voting`] / [`crate::filters::multi_label_staple`]: the label that
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `label_voting` in module `filters`
+
+warning: unresolved link to `crate::filters::multi_label_staple`
+   --> crates/sitk/src/filters/error.rs:281:46
+    |
+281 |     /// [`crate::filters::label_voting`] / [`crate::filters::multi_label_staple`]: the label that
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `multi_label_staple` in module `filters`
+
+warning: unresolved link to `GridImageSource::BeforeThreadedGenerateData`
+   --> crates/sitk/src/filters/error.rs:818:52
+    |
+818 |     /// [`crate::filters::sources::grid_source`]: `GridImageSource::BeforeThreadedGenerateData`
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `GridImageSource` in scope
+
+warning: public documentation for `Transform` links to private item `crate::transform::resample::InterpolatedImage`
+   --> crates/sitk/src/filters/error.rs:839:11
+    |
+839 |     /// [`crate::transform::resample::InterpolatedImage`].
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `expand` links to private item `crate::transform::resample::InterpolatedImage`
+  --> crates/sitk/src/filters/expand.rs:11:27
+   |
+11 | //! sampling primitive ([`crate::transform::resample::InterpolatedImage`]) rather
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `expand` links to private item `InterpolatedImage::sample`
+  --> crates/sitk/src/filters/expand.rs:62:13
+   |
+62 | /// range [`InterpolatedImage::sample`] treats as inside the buffer
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `output_pixel_id` links to private item `real_pixel_id`
+   --> crates/sitk/src/filters/fast_marching.rs:142:60
+    |
+142 | /// `double`, itkNumericTraits.h:1349/1356); this port's [`real_pixel_id`]
+    |                                                            ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `fast_marching_base` links to private item `Marcher::components`
+   --> crates/sitk/src/filters/fast_marching_base.rs:147:48
+    |
+147 | //! of from the (never-set) `m_AlivePoints`. [`Marcher::components`] is a
+    |                                                ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `fast_marching_base` links to private item `Marcher::join_alive_neighbors`
+   --> crates/sitk/src/filters/fast_marching_base.rs:149:29
+    |
+149 | //! alive face neighbors ([`Marcher::join_alive_neighbors`]), so at a junction the
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `fast_marching_base` links to private item `Marcher::change_creates_handle`
+   --> crates/sitk/src/filters/fast_marching_base.rs:152:25
+    |
+152 | //! labels are equal ([`Marcher::change_creates_handle`]) — a same-component
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `fft_correlation` links to private item `find_closest_valid_dimension`
+  --> crates/sitk/src/filters/fft_correlation.rs:74:15
+   |
+74 | //! search: [`find_closest_valid_dimension`] (hxx:549-564) walks up from
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `cyclic_permute`
+  --> crates/sitk/src/filters/fft_shift.rs:18:24
+   |
+18 | //! wraparound core, [`cyclic_permute`], differing only in how `shift` is
+   |                        ^^^^^^^^^^^^^^ no item named `cyclic_permute` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `fourier` links to private item `crate::filters::fft`
+  --> crates/sitk/src/filters/fourier.rs:15:39
+   |
+15 | //! `GenerateData` bodies on top of [`crate::filters::fft`], which reimplements the
+   |                                       ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `forward_fft` links to private item `crate::filters::fft`
+   --> crates/sitk/src/filters/fourier.rs:175:15
+    |
+175 | /// through [`crate::filters::fft`]'s Bluestein path. Use [`fft_pad`] first for a fast
+    |               ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `half_hermitian_to_real_inverse_fft` links to private item `expand_hermitian_line`
+   --> crates/sitk/src/filters/fourier.rs:347:7
+    |
+347 | /// [`expand_hermitian_line`].
+    |       ^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `functor` links to private item `unary_functor`
+  --> crates/sitk/src/filters/functor.rs:36:7
+   |
+36 | //! [`unary_functor!`] and [`binary_functor!`] each wire a functor value to a
+   |       ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `functor` links to private item `binary_functor`
+  --> crates/sitk/src/filters/functor.rs:36:30
+   |
+36 | //! [`unary_functor!`] and [`binary_functor!`] each wire a functor value to a
+   |                              ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `functor` links to private item `comparison_functor`
+  --> crates/sitk/src/filters/functor.rs:41:7
+   |
+41 | //! [`comparison_functor!`] emits only the allocating function: the output
+   |       ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `functor` links to private item `unary_pixel_apply`
+  --> crates/sitk/src/filters/functor.rs:46:56
+   |
+46 | //! precondition check before dispatch, so they call [`unary_pixel_apply`] /
+   |                                                        ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `functor` links to private item `unary_pixel_apply_in_place`
+  --> crates/sitk/src/filters/functor.rs:47:7
+   |
+47 | //! [`unary_pixel_apply_in_place`] directly instead, the same way
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `geodesic_morphology` links to private item `elementary_kernel`
+  --> crates/sitk/src/filters/geodesic_morphology.rs:50:7
+   |
+50 | //! [`elementary_kernel`].
+   |       ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `crate::filters::reconstruction::reconstruct`
+  --> crates/sitk/src/filters/geodesic_morphology.rs:63:44
+   |
+63 | //! "reconstruction" per the class docs: [`crate::filters::reconstruction::reconstruct`]'s
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `reconstruct` in module `reconstruction`
+
+warning: public documentation for `gradient_magnitude_recursive_gaussian` links to private item `recursive_gaussian_f64_from_into`
+   --> crates/sitk/src/filters/gradient.rs:487:37
+    |
+487 | /// parameter). Composes per-axis [`recursive_gaussian_f64_from_into`] calls —
+    |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `laplacian_recursive_gaussian` links to private item `recursive_gaussian_f64_from_into`
+   --> crates/sitk/src/filters/gradient.rs:588:7
+    |
+588 | /// [`recursive_gaussian_f64_from_into`] calls — [`GaussianOrder::SecondOrder`] on
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `gradient_recursive_gaussian` links to private item `recursive_gaussian_f64_from_into`
+   --> crates/sitk/src/filters/gradient.rs:776:49
+    |
+776 | /// For each axis `d`, this composes per-axis [`recursive_gaussian_f64_from_into`] calls
+    |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `histogram` links to private item `Histogram`
+  --> crates/sitk/src/filters/histogram.rs:11:7
+   |
+11 | //! [`Histogram`] mirrors the `AutoMinimumMaximum` path shared by
+   |       ^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `ThresholdMask` links to private item `Self::mask_output`
+  --> crates/sitk/src/filters/histogram.rs:66:48
+   |
+66 | /// * **Output masking**, when [`mask_output`](Self::mask_output) is true (ITK's and
+   |                                                ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalize` links to private item `real_type`
+   --> crates/sitk/src/filters/intensity.rs:174:49
+    |
+174 | /// input's `NumericTraits<T>::RealType` (see [`real_type`]), matching
+    |                                                 ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `shift_scale` links to private item `real_type`
+   --> crates/sitk/src/filters/intensity.rs:220:11
+    |
+220 | /// see [`real_type`]'s doc for the family this usually diverges in).
+    |           ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `shift_scale` links to private item `crate::filters::morphology::bounds_for`
+   --> crates/sitk/src/filters/intensity.rs:228:46
+    |
+228 | /// directly against `output_id`'s bounds ([`crate::filters::morphology::bounds_for`]),
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `shift_scale` links to private item `crate::filters::image_from_f64`
+   --> crates/sitk/src/filters/intensity.rs:229:35
+    |
+229 | /// so the final narrow through [`crate::filters::image_from_f64`] is always exact
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalize_to_constant` links to private item `crate::filters::real_pixel_id`
+   --> crates/sitk/src/filters/intensity.rs:282:50
+    |
+282 | /// `NumericTraits<InputPixelType>::RealType` ([`crate::filters::real_pixel_id`], reused
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `kmeans` links to private item `run_kmeans`
+  --> crates/sitk/src/filters/kmeans.rs:31:58
+   |
+31 | //! plain per-pixel nearest-centroid pass (this port's [`run_kmeans`]) and the
+   |                                                          ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `kmeans` links to private item `MAXIMUM_ITERATION`
+  --> crates/sitk/src/filters/kmeans.rs:47:7
+   |
+47 | //! [`MAXIMUM_ITERATION`] and an exact-zero convergence test.
+   |       ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `kmeans` links to private item `run_kmeans`
+  --> crates/sitk/src/filters/kmeans.rs:74:16
+   |
+74 | //! not 200. [`run_kmeans`] reproduces this by running `0..=MAXIMUM_ITERATION`
+   |                ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `kmeans` links to private item `run_kmeans`
+  --> crates/sitk/src/filters/kmeans.rs:86:61
+   |
+86 | //! vectors that is exactly `|previous[i] - current[i]|`. [`run_kmeans`]'s
+   |                                                             ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `kmeans` links to private item `nearest_mean_index`
+   --> crates/sitk/src/filters/kmeans.rs:106:7
+    |
+106 | //! [`nearest_mean_index`] is shared by both phases and reproduces this exact
+    |       ^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `connected_component` links to private item `crate::filters::mask_input`
+   --> crates/sitk/src/filters/label.rs:369:7
+    |
+369 | /// [`crate::filters::mask_input`] and ledger §2.175.
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `connected_component` links to private item `crate::filters::mask_input::uint8_mask_voxels`
+   --> crates/sitk/src/filters/label.rs:373:7
+    |
+373 | /// [`crate::filters::mask_input::uint8_mask_voxels`].
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_statistics` links to private item `histogram_bounds`
+   --> crates/sitk/src/filters/label.rs:660:28
+    |
+660 | /// `0.0`). The range is [`histogram_bounds`]: the padded **pixel-type** range for
+    |                            ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_intensity` links to private item `histogram_bins`
+  --> crates/sitk/src/filters/label_intensity.rs:33:48
+   |
+33 | //!   `double(lower) + float(j) * interval`. [`histogram_bins`] reproduces the
+   |                                                ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_map` links to private item `crate::filters::label::scanline_components`
+  --> crates/sitk/src/filters/label_map.rs:36:7
+   |
+36 | //! [`crate::filters::label::scanline_components`] and [`crate::filters::label::create_consecutive`]
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_map` links to private item `crate::filters::label::create_consecutive`
+  --> crates/sitk/src/filters/label_map.rs:36:58
+   |
+36 | //! [`crate::filters::label::scanline_components`] and [`crate::filters::label::create_consecutive`]
+   |                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `relabel_label_map` links to private item `crate::filters::label::create_consecutive`
+   --> crates/sitk/src/filters/label_map.rs:485:28
+    |
+485 | /// [`create_consecutive`](crate::filters::label::create_consecutive).
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `tests::spacing_mode_radius_one_is_an_identity`
+  --> crates/sitk/src/filters/label_set_morphology.rs:92:10
+   |
+92 | //!    [`tests::spacing_mode_radius_one_is_an_identity`].
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: unresolved link to `tests::dilate_zero_leading_radius_dilates_the_named_axis_only`
+   --> crates/sitk/src/filters/label_set_morphology.rs:111:13
+    |
+111 | //!    by [`tests::dilate_zero_leading_radius_dilates_the_named_axis_only`] and
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: unresolved link to `tests::erode_zero_leading_radius_erodes_the_named_axis_only`
+   --> crates/sitk/src/filters/label_set_morphology.rs:112:10
+    |
+112 | //!    [`tests::erode_zero_leading_radius_erodes_the_named_axis_only`].
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: unresolved link to `tests::erode_zero_trailing_radius_with_spacing_yields_background`
+   --> crates/sitk/src/filters/label_set_morphology.rs:123:20
+    |
+123 | //!    Pinned by [`tests::erode_zero_trailing_radius_with_spacing_yields_background`].
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: public documentation for `label_set_morphology` links to private item `same_run`
+   --> crates/sitk/src/filters/label_set_morphology.rs:142:67
+    |
+142 | //!    run and eroded as a single object instead of separating. [`same_run`]
+    |                                                                   ^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `tests::f64_label_comparison_separates_adjacent_int32_labels`
+   --> crates/sitk/src/filters/label_set_morphology.rs:145:10
+    |
+145 | //!    [`tests::f64_label_comparison_separates_adjacent_int32_labels`].
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: unresolved link to `tests::dilate_tie_goes_to_the_lower_index`
+   --> crates/sitk/src/filters/label_set_morphology.rs:164:38
+    |
+164 | //! (`.h:82`, `.h:106`). Pinned by [`tests::dilate_tie_goes_to_the_lower_index`].
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: public documentation for `label_to_rgb` links to private item `build_color_table`
+ --> crates/sitk/src/filters/label_to_rgb.rs:7:7
+  |
+7 | //! [`build_color_table`] and [`label_color_indices`] are shared by both
+  |       ^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_to_rgb` links to private item `label_color_indices`
+ --> crates/sitk/src/filters/label_to_rgb.rs:7:33
+  |
+7 | //! [`build_color_table`] and [`label_color_indices`] are shared by both
+  |                                 ^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_to_rgb` links to private item `build_color_table`
+  --> crates/sitk/src/filters/label_to_rgb.rs:54:10
+   |
+54 | //!    [`build_color_table`] implements the *documented* behavior (via
+   |          ^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `label_overlay` links to private item `quantize_to_pixel_type`
+   --> crates/sitk/src/filters/label_to_rgb.rs:271:7
+    |
+271 | /// [`quantize_to_pixel_type`] when building `scaled_colors`.
+    |       ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `level_set` links to private item `grid`
+  --> crates/sitk/src/filters/level_set/mod.rs:15:9
+   |
+15 | //! | [`grid`] | `itkSparseFieldLevelSetImageFilter.hxx` (`SparseFieldCityBlockNeighborList`) |
+   |         ^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `level_set` links to private item `function`
+  --> crates/sitk/src/filters/level_set/mod.rs:16:9
+   |
+16 | //! | [`function`] | `itkLevelSetFunction.h/.hxx`, `itkSegmentationLevelSetFunction.h/.hxx`, `itkCurvatureFlowFunction.h/.hxx` |
+   |         ^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `level_set` links to private item `sparse_field`
+  --> crates/sitk/src/filters/level_set/mod.rs:17:9
+   |
+17 | //! | [`sparse_field`] | `itkSparseFieldLevelSetImageFilter.h/.hxx`, `itkFiniteDifferenceImageFilter.hxx` |
+   |         ^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `level_set` links to private item `anti_alias`
+  --> crates/sitk/src/filters/level_set/mod.rs:18:9
+   |
+18 | //! | [`anti_alias`] | `itkAntiAliasBinaryImageFilter.h/.hxx` |
+   |         ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `PixelId::is_floating_point`
+  --> crates/sitk/src/filters/logic.rs:32:19
+   |
+32 | //! port checks [`PixelId::is_floating_point`] at runtime and returns
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `PixelId` in scope
+
+warning: public documentation for `masked_assign` links to private item `crate::filters::mask_input::uint8_mask_voxels`
+   --> crates/sitk/src/filters/logic.rs:621:13
+    |
+621 | /// grid ([`crate::filters::mask_input::uint8_mask_voxels`]); `assign` must share `image`'s
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `math` links to private item `functor::unary_functor`
+  --> crates/sitk/src/filters/math.rs:18:34
+   |
+18 | //! crate's [`UnaryFunctor`] / [`functor::unary_functor!`] seam exactly.
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `BinaryFunctor`
+  --> crates/sitk/src/filters/math.rs:28:49
+   |
+28 | //! traits ([`UnaryFunctor`] takes one image; [`BinaryFunctor`] computes in
+   |                                                 ^^^^^^^^^^^^^ no item named `BinaryFunctor` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `pow` links to private item `two_image_f64`
+   --> crates/sitk/src/filters/math.rs:490:44
+    |
+490 | /// concrete input types -- exactly what [`two_image_f64`] does by promoting
+    |                                            ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `divide_real` links to private item `real_type`
+   --> crates/sitk/src/filters/math.rs:519:50
+    |
+519 | /// is `a`'s `NumericTraits<T>::RealType` (see [`real_type`]), matching
+    |                                                  ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `divide_real` links to private item `real_type`
+   --> crates/sitk/src/filters/math.rs:527:55
+    |
+527 | /// the output pixel type for `Float32` inputs (see [`real_type`], §5.6).
+    |                                                       ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `sharpen_image`
+  --> crates/sitk/src/filters/n4_bias_field.rs:10:44
+   |
+10 | //!    resulting expectation `E(u | v)` ([`sharpen_image`]).
+   |                                            ^^^^^^^^^^^^^ no item named `sharpen_image` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `update_bias_field_estimate`
+  --> crates/sitk/src/filters/n4_bias_field.rs:14:11
+   |
+14 | //!    ([`update_bias_field_estimate`]).
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `update_bias_field_estimate` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `calculate_convergence_measurement`
+  --> crates/sitk/src/filters/n4_bias_field.rs:17:11
+   |
+17 | //!    ([`calculate_convergence_measurement`]).
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `calculate_convergence_measurement` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `sharpen_image`
+  --> crates/sitk/src/filters/n4_bias_field.rs:29:38
+   |
+29 | //!   bin range is degenerate (see [`sharpen_image`]); a NaN→int conversion
+   |                                      ^^^^^^^^^^^^^ no item named `sharpen_image` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `noise` links to private item `crate::filters::random`
+ --> crates/sitk/src/filters/noise.rs:9:59
+  |
+9 | //! Every filter here draws from one of the two RNGs in [`crate::filters::random`]:
+  |                                                           ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `noise` links to private item `crate::filters::random`
+  --> crates/sitk/src/filters/noise.rs:13:7
+   |
+13 | //! [`crate::filters::random`]'s module doc comment for why that distinction matters);
+   |       ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `noise` links to private item `clamp_cast`
+  --> crates/sitk/src/filters/noise.rs:41:7
+   |
+41 | //! [`clamp_cast`] mirrors this exactly (unlike [`crate::core::Scalar::from_f64`]'s
+   |       ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `additive_gaussian_noise` links to private item `NormalVariateGenerator`
+   --> crates/sitk/src/filters/noise.rs:140:38
+    |
+140 | /// N(0, 1)`, `N(0, 1)` drawn from [`NormalVariateGenerator`]. Output keeps
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `additive_gaussian_noise` links to private item `clamp_cast`
+   --> crates/sitk/src/filters/noise.rs:141:40
+    |
+141 | /// `img`'s pixel type, narrowed via [`clamp_cast`].
+    |                                        ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `shot_noise` links to private item `clamp_cast`
+   --> crates/sitk/src/filters/noise.rs:249:40
+    |
+249 | /// `img`'s pixel type, narrowed via [`clamp_cast`].
+    |                                        ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `speckle_noise` links to private item `clamp_cast`
+   --> crates/sitk/src/filters/noise.rs:312:46
+    |
+312 | /// keeps `img`'s pixel type, narrowed via [`clamp_cast`].
+    |                                              ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalized_correlation` links to private item `padded_template_coefficients`
+  --> crates/sitk/src/filters/normalized_correlation.rs:31:7
+   |
+31 | //! [`padded_template_coefficients`] straight off the raw buffer, substituting
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalized_correlation` links to private item `padded_template_coefficients`
+  --> crates/sitk/src/filters/normalized_correlation.rs:45:42
+   |
+45 | //! (`Neighborhood::values`'s doc), so [`padded_template_coefficients`]'s
+   |                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalized_correlation` links to private item `normalize_template`
+  --> crates/sitk/src/filters/normalized_correlation.rs:93:7
+   |
+93 | //! [`normalize_template`] guards on the template's variance itself rather
+   |       ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `normalized_correlation` links to private item `crate::filters::real_pixel_id`
+   --> crates/sitk/src/filters/normalized_correlation.rs:103:15
+    |
+103 | //! through [`crate::filters::real_pixel_id`] — including that helper's own tracked
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `objectness` links to private item `hessian_at`
+  --> crates/sitk/src/filters/objectness.rs:70:7
+   |
+70 | //! [`hessian_at`] reproduces both roundings exactly (`narrow_f32`), rather
+   |       ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `objectness` links to private item `sort_by_magnitude`
+   --> crates/sitk/src/filters/objectness.rs:145:49
+    |
+145 | //!    pins that behavior with a stable sort ([`sort_by_magnitude`]).
+    |                                                 ^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `target_overlap` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:162:63
+    |
+162 |     /// `GetTargetOverlap(label)`: `intersection / target`; [`REAL_TYPE_MAX`]
+    |                                                               ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `union_overlap` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:166:35
+    |
+166 |     /// `intersection / union`; [`REAL_TYPE_MAX`] when `union == 0`.
+    |                                   ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `volume_similarity` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:172:11
+    |
+172 |     /// [`REAL_TYPE_MAX`] when `source + target == 0`, which is unreachable for
+    |           ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `false_negative_error` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:176:11
+    |
+176 |     /// [`REAL_TYPE_MAX`] when `target == 0`.
+    |           ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `false_positive_error` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:179:51
+    |
+179 |     /// (source_complement + (n_vox - union))`; [`REAL_TYPE_MAX`] when that
+    |                                                   ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `false_discovery_rate` links to private item `REAL_TYPE_MAX`
+   --> crates/sitk/src/filters/overlap.rs:184:11
+    |
+184 |     /// [`REAL_TYPE_MAX`] when `source == 0`.
+    |           ^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `boundary_faces`
+  --> crates/sitk/src/filters/patch_based_denoising.rs:65:58
+   |
+65 | //! low/high boundary face of each axis in axis order. [`boundary_faces`]
+   |                                                          ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `PatchPixel::sub_f64`
+  --> crates/sitk/src/filters/patch_based_denoising.rs:88:45
+   |
+88 | //!   `int64` it wraps in the pixel type. [`PatchPixel::sub_f64`] and
+   |                                             ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `PatchPixel::mul_f64`
+  --> crates/sitk/src/filters/patch_based_denoising.rs:89:9
+   |
+89 | //!   [`PatchPixel::mul_f64`] reproduce this per type rather than computing in
+   |         ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `poisson_step_size`
+   --> crates/sitk/src/filters/patch_based_denoising.rs:109:9
+    |
+109 | //!   [`poisson_step_size`] takes the `min` in real arithmetic, so an integer
+    |         ^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `GaussianSampler::integer_variate`
+   --> crates/sitk/src/filters/patch_based_denoising.rs:114:15
+    |
+114 | //!   test. [`GaussianSampler::integer_variate`] rejects out-of-range variates
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `patch_based_denoising` links to private item `GaussianSampler::search`
+   --> crates/sitk/src/filters/patch_based_denoising.rs:123:27
+    |
+123 | //!   than hanging. See [`GaussianSampler::search`].
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `projection` links to private item `real_type`
+  --> crates/sitk/src/filters/projection.rs:22:53
+   |
+22 | //! NumericTraits<InputPixelType>::RealType` (see [`real_type`]); the rest
+   |                                                     ^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `mean_projection` links to private item `real_type`
+   --> crates/sitk/src/filters/projection.rs:201:54
+    |
+201 | /// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+    |                                                      ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `sum_projection` links to private item `real_type`
+   --> crates/sitk/src/filters/projection.rs:214:54
+    |
+214 | /// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+    |                                                      ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `standard_deviation_projection` links to private item `real_type`
+   --> crates/sitk/src/filters/projection.rs:226:54
+    |
+226 | /// `NumericTraits<InputPixelType>::RealType` (see [`real_type`]).
+    |                                                      ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `binary_threshold_projection` links to private item `crate::filters::quantize_to_pixel_type`
+   --> crates/sitk/src/filters/projection.rs:321:7
+    |
+321 | /// [`crate::filters::quantize_to_pixel_type`] — the same narrowing
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `ReconstructionKind`
+ --> crates/sitk/src/filters/reconstruction.rs:8:58
+  |
+8 | //!   FIFO three-pass algorithm, generalized here over [`ReconstructionKind`]
+  |                                                          ^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `reconstruct`
+  --> crates/sitk/src/filters/reconstruction.rs:14:32
+   |
+14 | //!   boundary padding — see [`reconstruct`]'s docs for why this port needs
+   |                                ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `reconstruct`
+  --> crates/sitk/src/filters/reconstruction.rs:32:7
+   |
+32 | //! [`reconstruct`] is [`crate::filters::watershed`]'s former private
+   |       ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `ReconstructionKind`
+  --> crates/sitk/src/filters/reconstruction.rs:34:7
+   |
+34 | //! [`ReconstructionKind`] so it also serves `TCompare = std::greater`. The
+   |       ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `ReconstructionKind::compare`
+  --> crates/sitk/src/filters/reconstruction.rs:39:57
+   |
+39 | //! literally `TCompare::operator()`, so substituting [`ReconstructionKind::compare`]
+   |                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `ReconstructionKind`
+  --> crates/sitk/src/filters/reconstruction.rs:57:27
+   |
+57 | //! padding, for either [`ReconstructionKind`].
+   |                           ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `NeighborWalker`
+  --> crates/sitk/src/filters/reconstruction.rs:61:7
+   |
+61 | //! [`NeighborWalker`], [`Half`], and the private `Connectivity`/`neighbor_offsets`/
+   |       ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `Half`
+  --> crates/sitk/src/filters/reconstruction.rs:61:27
+   |
+61 | //! [`NeighborWalker`], [`Half`], and the private `Connectivity`/`neighbor_offsets`/
+   |                           ^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reconstruction` links to private item `Half`
+  --> crates/sitk/src/filters/reconstruction.rs:67:7
+   |
+67 | //! [`Half`]'s three variants) for its own order-dependent flooding. This is
+   |       ^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `h_minima` links to private item `quantize_to_pixel_type`
+   --> crates/sitk/src/filters/reconstruction.rs:456:7
+    |
+456 | /// [`quantize_to_pixel_type`]'s doc; the marker is then formed the way
+    |       ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `h_minima` links to private item `image_from_f64`
+   --> crates/sitk/src/filters/reconstruction.rs:458:62
+    |
+458 | /// type, then saturate into the pixel type, which is what [`image_from_f64`]
+    |                                                              ^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `recursive_gaussian` links to private item `filter_line`
+  --> crates/sitk/src/filters/recursive_gaussian.rs:26:7
+   |
+26 | //! [`filter_line`]/[`filter_axis`]). It does not depend on the order at all —
+   |       ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `recursive_gaussian` links to private item `filter_axis`
+  --> crates/sitk/src/filters/recursive_gaussian.rs:26:23
+   |
+26 | //! [`filter_line`]/[`filter_axis`]). It does not depend on the order at all —
+   |                       ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `region_growing` links to private item `flood_fill`
+  --> crates/sitk/src/filters/region_growing.rs:23:14
+   |
+23 | //! stack. [`flood_fill`] is the shared core every filter below builds on.
+   |              ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `region_growing` links to private item `flood_fill`
+  --> crates/sitk/src/filters/region_growing.rs:32:25
+   |
+32 | //! output unchanged. [`flood_fill`] reproduces this exactly.
+   |                         ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `region_growing` links to private item `VARIANCE_ALMOST_ZERO`
+   --> crates/sitk/src/filters/region_growing.rs:105:18
+    |
+105 | //! tolerance ([`VARIANCE_ALMOST_ZERO`], and `1e-9` for the sum comparisons
+    |                  ^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `regional_extrema` links to private item `ExtremaKind`
+  --> crates/sitk/src/filters/regional_extrema.rs:10:58
+   |
+10 | //!   instantiate `itkReconstructionImageFilter.hxx` — [`ExtremaKind`] plays
+   |                                                          ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_connected_component` links to private item `crate::filters::quantize_to_pixel_type`
+  --> crates/sitk/src/filters/scalar_connected_component.rs:10:16
+   |
+10 | //! same way [`crate::filters::quantize_to_pixel_type`]'s other `pixeltype: Input`
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_connected_component` links to private item `Half::Previous`
+  --> crates/sitk/src/filters/scalar_connected_component.rs:27:33
+   |
+27 | //! when `FullyConnected`) -- [`Half::Previous`], the same connectivity half
+   |                                 ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_connected_component` links to private item `Half::Previous`
+  --> crates/sitk/src/filters/scalar_connected_component.rs:34:41
+   |
+34 | //! DistanceThreshold`, restricted to [`Half::Previous`] neighbor pairs so
+   |                                         ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_connected_component` links to private item `crate::filters::mask_input::uint8_mask_voxels`
+   --> crates/sitk/src/filters/scalar_connected_component.rs:103:7
+    |
+103 | /// [`crate::filters::mask_input::uint8_mask_voxels`].
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_to_rgb_colormap` links to private item `apply_colormap`
+  --> crates/sitk/src/filters/scalar_to_rgb_colormap.rs:24:43
+   |
+24 | //! per-channel formula of `value` (see [`apply_colormap`]) and narrows each
+   |                                           ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_to_rgb_colormap` links to private item `crate::filters::numeric_traits_nonpositive_min`
+  --> crates/sitk/src/filters/scalar_to_rgb_colormap.rs:45:26
+   |
+45 | //! This port now uses [`crate::filters::numeric_traits_nonpositive_min`] everywhere
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `scalar_to_rgb_colormap` links to private item `input_extrema`
+  --> crates/sitk/src/filters/scalar_to_rgb_colormap.rs:65:34
+   |
+65 | //!    `NonpositiveMin()` seed [`input_extrema`]'s scan now finds the true
+   |                                  ^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `tests::float_all_non_positive_image_scan_finds_the_true_negative_maximum`
+  --> crates/sitk/src/filters/scalar_to_rgb_colormap.rs:67:10
+   |
+67 | //!    [`tests::float_all_non_positive_image_scan_finds_the_true_negative_maximum`].
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: unresolved link to `tests::extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range`
+  --> crates/sitk/src/filters/scalar_to_rgb_colormap.rs:82:10
+   |
+82 | //!    [`tests::extrema_scaling_disabled_on_a_float_image_uses_the_true_native_range`].
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `tests` in scope
+
+warning: public documentation for `unsharp_mask` links to private item `wrap_to_pixel_type`
+  --> crates/sitk/src/filters/sharpening.rs:95:38
+   |
+95 | /// out-of-range result wraps (see [`wrap_to_pixel_type`]) rather than
+   |                                      ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `shrink` links to private item `round_half_up`
+  --> crates/sitk/src/filters/shrink.rs:25:44
+   |
+25 | //! `itk::Math::Round` (round-half-*up*, [`round_half_up`]) for an integer
+   |                                            ^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `stochastic_fractal_dimension` links to private item `min_spacing_f32`
+  --> crates/sitk/src/filters/stochastic_fractal_dimension.rs:73:22
+   |
+73 | //!   exactly (see [`min_spacing_f32`]) rather than computing the minimum at
+   |                      ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `threshold_maximum_connected_components` links to private item `bisect`
+  --> crates/sitk/src/filters/threshold_maximum_connected_components.rs:39:17
+   |
+39 | //! `2^bits`. [`bisect`] instead computes the true center,
+   |                 ^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `threshold_maximum_connected_components` links to private item `bisect`
+  --> crates/sitk/src/filters/threshold_maximum_connected_components.rs:72:22
+   |
+72 | //! be inverted -- [`bisect`]'s plain (non-wrapping) subtraction would
+   |                      ^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `threshold_maximum_connected_components` links to private item `count_components`
+  --> crates/sitk/src/filters/threshold_maximum_connected_components.rs:96:7
+   |
+96 | //! [`count_components`] uses instead of threading a separate count out of
+   |       ^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `threshold_maximum_connected_components` links to private item `bisect`
+   --> crates/sitk/src/filters/threshold_maximum_connected_components.rs:113:57
+    |
+113 | //! every threshold candidate, so every comparison in [`bisect`] ties, the
+    |                                                         ^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `threshold_maximum_connected_components` links to private item `count_components`
+   --> crates/sitk/src/filters/threshold_maximum_connected_components.rs:123:47
+    |
+123 | //! this is not exposed by the yaml either. [`count_components`] always calls
+    |                                               ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed` links to private item `regional_minima`
+  --> crates/sitk/src/filters/watershed.rs:18:12
+   |
+18 | //! Only [`regional_minima`] is ported here as a module-private helper,
+   |            ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed` links to private item `regional_minima`
+  --> crates/sitk/src/filters/watershed.rs:21:9
+   |
+21 | //! - [`regional_minima`] — `itkValuedRegionalMinimaImageFilter.h` driving
+   |         ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed` links to private item `value_ranks`
+  --> crates/sitk/src/filters/watershed.rs:45:8
+   |
+45 | //! ([`value_ranks`] maps each pixel's value onto its rank in the sorted set
+   |        ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed` links to private item `crate::filters::reconstruction::Half`
+  --> crates/sitk/src/filters/watershed.rs:87:7
+   |
+87 | //! [`crate::filters::reconstruction::Half`] variants, reused here via
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed` links to private item `crate::filters::reconstruction::NeighborWalker`
+  --> crates/sitk/src/filters/watershed.rs:88:7
+   |
+88 | //! [`crate::filters::reconstruction::NeighborWalker`].
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `segment`
+  --> crates/sitk/src/filters/watershed_classic.rs:11:33
+   |
+11 | //!   `SortEdgeLists(true)` — [`segment`];
+   |                                 ^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `generate_segment_tree`
+  --> crates/sitk/src/filters/watershed_classic.rs:13:33
+   |
+13 | //!   `ConsumeInput(false)` — [`generate_segment_tree`];
+   |                                 ^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `WatershedTree::relabel`
+  --> crates/sitk/src/filters/watershed_classic.rs:14:46
+   |
+14 | //! - `itkWatershedRelabeler.h` / `.hxx` — [`WatershedTree::relabel`].
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `descend_flat_regions`
+  --> crates/sitk/src/filters/watershed_classic.rs:21:45
+   |
+21 | //! `false`; the one place that reads it ([`descend_flat_regions`]) keeps the
+   |                                             ^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `prune_edge_lists`
+   --> crates/sitk/src/filters/watershed_classic.rs:129:49
+    |
+129 | //!   and only the ones after it are dropped. [`prune_edge_lists`] reproduces
+    |                                                 ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `make_heap`
+   --> crates/sitk/src/filters/watershed_classic.rs:177:55
+    |
+177 | //! The binary heap itself is *not* left to chance: [`make_heap`], [`push_heap`]
+    |                                                       ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `push_heap`
+   --> crates/sitk/src/filters/watershed_classic.rs:177:70
+    |
+177 | //! The binary heap itself is *not* left to chance: [`make_heap`], [`push_heap`]
+    |                                                                      ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `pop_heap`
+   --> crates/sitk/src/filters/watershed_classic.rs:178:11
+    |
+178 | //! and [`pop_heap`] transcribe libstdc++'s `__adjust_heap` / `__push_heap`
+    |           ^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `watershed_classic` links to private item `AlmostEquals`
+   --> crates/sitk/src/filters/watershed_classic.rs:186:57
+    |
+186 | //! escape hatch near zero) for `float` and `double`. [`AlmostEquals`] selects
+    |                                                         ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `cast` links to private item `read_pixels_i128`
+   --> crates/sitk/src/filters/mod.rs:651:29
+    |
+651 | /// native `static_cast` ([`read_pixels_i128`] / [`build_from_i128`]). Routing
+    |                             ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `cast` links to private item `build_from_i128`
+   --> crates/sitk/src/filters/mod.rs:651:52
+    |
+651 | /// native `static_cast` ([`read_pixels_i128`] / [`build_from_i128`]). Routing
+    |                                                    ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ImageIo`
+  |
+  = note: the link appears in this line:
+          
+          Every format is an [`ImageIo`] implementor sitting in one [`registry`];
+                              ^^^^^^^^^
+  = note: no item named `ImageIo` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `registry`
+  |
+  = note: the link appears in this line:
+          
+          Every format is an [`ImageIo`] implementor sitting in one [`registry`];
+                                                                     ^^^^^^^^^^
+  = note: no item named `registry` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ImageFileReader`
+  |
+  = note: the link appears in this line:
+          
+          [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
+           ^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageFileReader` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ImageFileWriter`
+  |
+  = note: the link appears in this line:
+          
+          [`ImageFileReader`] and [`ImageFileWriter`] ask the registry which IO
+                                   ^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageFileWriter` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `image_io`
+  |
+  = note: the link appears in this line:
+          
+          one registry entry — no dispatch to extend. See [`image_io`] for the probe
+                                                             ^^^^^^^^^^
+  = note: no item named `image_io` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `read_image`
+  |
+  = note: the link appears in this line:
+          
+          [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
+           ^^^^^^^^^^^^
+  = note: no item named `read_image` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `write_image`
+  |
+  = note: the link appears in this line:
+          
+          [`read_image`] and [`write_image`] are the procedural shorthand SimpleITK
+                              ^^^^^^^^^^^^^
+  = note: no item named `write_image` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `meta_image`
+  |
+  = note: the link appears in this line:
+          
+          * [`meta_image`] — MetaImage (`.mha`, `.mhd` + `.raw` / `.zraw`), ITK's
+             ^^^^^^^^^^^^
+  = note: no item named `meta_image` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `nrrd`
+  |
+  = note: the link appears in this line:
+          
+          * [`nrrd`] — NRRD (`.nrrd` / `.nhdr`), `raw` and `gzip` encodings, both of
+             ^^^^^^
+  = note: no item named `nrrd` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `nifti`
+  |
+  = note: the link appears in this line:
+          
+          * [`nifti`] — NIfTI-1 (`.nii`, `.hdr` + `.img`, and the `.gz` spelling of
+             ^^^^^^^
+  = note: no item named `nifti` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ImageFileWriter::set_use_compression`
+  |
+  = note: the link appears in this line:
+          
+          Compression on write is opt-in through [`ImageFileWriter::set_use_compression`]
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageFileWriter` in scope
+
+warning: unresolved link to `write_image_with`
+  |
+  = note: the link appears in this line:
+          
+          or [`write_image_with`] — except for NIfTI, where the `.gz` extension alone
+              ^^^^^^^^^^^^^^^^^^
+  = note: no item named `write_image_with` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `compression`
+  |
+  = note: the link appears in this line:
+          
+          decides, exactly as upstream's `nifti_is_gzfile` does. [`compression`] owns
+                                                                  ^^^^^^^^^^^^^
+  = note: no item named `compression` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `transform_io`
+  |
+  = note: the link appears in this line:
+          
+          (`.tfm` / `.txt`, see [`transform_io`]), HDF5 (`.h5` / `.hdf5`, see
+                                 ^^^^^^^^^^^^^^
+  = note: no item named `transform_io` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `transform_hdf5`
+  |
+  = note: the link appears in this line:
+          
+          [`transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`transform_matlab`]).
+           ^^^^^^^^^^^^^^^^
+  = note: no item named `transform_hdf5` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `transform_matlab`
+  |
+  = note: the link appears in this line:
+          
+          [`transform_hdf5`]), and MATLAB Level-4 (`.mat`, see [`transform_matlab`]).
+                                                                ^^^^^^^^^^^^^^^^^^
+  = note: no item named `transform_matlab` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `compression` links to private item `zlib_compress`
+ --> crates/sitk/src/io/compression.rs:9:9
+  |
+9 | //! | [`zlib_compress`] / [`inflate_auto`] | MetaIO `MET_PerformCompression` / `MET_PerformUncompression` (metaUtils.cxx:790-893) | w...
+  |         ^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `compression` links to private item `inflate_auto`
+ --> crates/sitk/src/io/compression.rs:9:29
+  |
+9 | //! | [`zlib_compress`] / [`inflate_auto`] | MetaIO `MET_PerformCompression` / `MET_PerformUncompression` (metaUtils.cxx:790-893) | w...
+  |                             ^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `compression` links to private item `gzip_compress`
+  --> crates/sitk/src/io/compression.rs:10:9
+   |
+10 | //! | [`gzip_compress`] / [`gunzip_transparent`] | NrrdIO `nrrd__GzOpen` (gzio.c:161-232) and nifti's `znzopen` → zlib's `gzopen` (z...
+   |         ^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `compression` links to private item `gunzip_transparent`
+  --> crates/sitk/src/io/compression.rs:10:29
+   |
+10 | //! | [`gzip_compress`] / [`gunzip_transparent`] | NrrdIO `nrrd__GzOpen` (gzio.c:161-232) and nifti's `znzopen` → zlib's `gzopen` (z...
+   |                             ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `compression` links to private item `gunzip_transparent`
+  --> crates/sitk/src/io/compression.rs:23:65
+   |
+23 | //!   gzio.c:516; zlib's `gz_look` sets `state->how = COPY`). [`gunzip_transparent`]
+   |                                                                 ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ImageIo::can_read_file`
+   --> crates/sitk/src/io/error.rs:111:50
+    |
+111 |     /// while parsing a header (rather than by [`ImageIo::can_read_file`]
+    |                                                  ^^^^^^^^^^^^^^^^^^^^^^ no item named `ImageIo` in scope
+
+warning: public documentation for `execute` links to private item `SITK_MAX_DIMENSION`
+   --> crates/sitk/src/io/image_series_reader.rs:200:12
+    |
+200 |     /// ([`SITK_MAX_DIMENSION`]).
+    |            ^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `resolved_quality`
+  --> crates/sitk/src/io/jpeg.rs:22:13
+   |
+22 | //! which [`resolved_quality`] interprets as the JPEG quality. There is no
+   |             ^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `resolved_quality`
+  --> crates/sitk/src/io/jpeg.rs:29:44
+   |
+29 | //! skips it. [`write`] reproduces this: [`resolved_quality`] never consults
+   |                                            ^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `cmyk_to_rgb`
+  --> crates/sitk/src/io/jpeg.rs:92:7
+   |
+92 | //! [`cmyk_to_rgb`] restores the inversion ITK's formula
+   |       ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `scan_jfif_density`
+   --> crates/sitk/src/io/jpeg.rs:104:17
+    |
+104 | //! variant). [`scan_jfif_density`] walks the marker stream by hand to recover
+    |                 ^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `spacing_from_density`
+   --> crates/sitk/src/io/jpeg.rs:105:17
+    |
+105 | //! them, and [`spacing_from_density`] reproduces
+    |                 ^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `density_for_spacing`
+   --> crates/sitk/src/io/jpeg.rs:125:7
+    |
+125 | //! [`density_for_spacing`] reproduces the *effect* — a cm-favoured spacing
+    |       ^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `spacing_from_density`
+   --> crates/sitk/src/io/jpeg.rs:131:20
+    |
+131 | //! `Y_density`. [`spacing_from_density`] does not distinguish the two byte
+    |                    ^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `jpeg` links to private item `header_from_info`
+   --> crates/sitk/src/io/jpeg.rs:191:9
+    |
+191 | //!   [`header_from_info`] refuses `PixelFormat::L16` with
+    |         ^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `write` links to private item `buffer_to_le_bytes`
+   --> crates/sitk/src/io/meta_image.rs:369:7
+    |
+369 | /// [`buffer_to_le_bytes`] already serialises the image's full interleaved
+    |       ^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `write` links to private item `build_header`
+   --> crates/sitk/src/io/meta_image.rs:371:21
+    |
+371 | /// category, and [`build_header`] now writes that same `buffer_stride` as
+    |                     ^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `nifti` links to private item `the_mat`
+  --> crates/sitk/src/io/nifti.rs:48:10
+   |
+48 | //!    [`the_mat`].)
+   |          ^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `nrrd` links to private item `Nrrd`
+ --> crates/sitk/src/io/nrrd.rs:8:62
+  |
+8 | //!   the field enums, the encodings, the data-file forms. [`Nrrd`] and
+  |                                                              ^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `nrrd` links to private item `IoState`
+ --> crates/sitk/src/io/nrrd.rs:9:9
+  |
+9 | //!   [`IoState`] below mirror teem's `Nrrd` and `NrrdIoState` structs, and
+  |         ^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `nrrd` links to private item `read_header`
+  --> crates/sitk/src/io/nrrd.rs:10:9
+   |
+10 | //!   [`read_header`] mirrors `formatNRRD_read` (formatNRRD.c:430-533) plus the
+   |         ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `Writer::write_image_data`
+  --> crates/sitk/src/io/png.rs:59:11
+   |
+59 | //! and [`Writer::write_image_data`] hand over raw, always-big-endian bytes.
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `Writer` in scope
+
+warning: public documentation for `png` links to private item `pack_pixels`
+  --> crates/sitk/src/io/png.rs:60:7
+   |
+60 | //! [`pack_pixels`] and [`buffer_to_be_bytes`] do the swap by hand with
+   |       ^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `png` links to private item `buffer_to_be_bytes`
+  --> crates/sitk/src/io/png.rs:60:27
+   |
+60 | //! [`pack_pixels`] and [`buffer_to_be_bytes`] do the swap by hand with
+   |                           ^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `reader` links to private item `normalize_reader_geometry`
+ --> crates/sitk/src/io/reader.rs:8:7
+  |
+8 | //! [`normalize_reader_geometry`], the port of `itk::ImageFileReader`'s own
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+  |
+  = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `tiff` links to private item `layout_for`
+  --> crates/sitk/src/io/tiff.rs:98:62
+   |
+98 | //! multi-component grayscale image, so **fixed §2.140** — [`layout_for`] now
+   |                                                              ^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `tiff` links to private item `layout_for`
+   --> crates/sitk/src/io/tiff.rs:109:32
+    |
+109 | //! `UnknownInterpretation`. [`layout_for`] refuses those at
+    |                                ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `tiff` links to private item `page_rows`
+   --> crates/sitk/src/io/tiff.rs:113:7
+    |
+113 | //! [`page_rows`]'s two stride parameters always equal — `layout.number_of_components`
+    |       ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `tiff` links to private item `page_rows`
+   --> crates/sitk/src/io/tiff.rs:116:7
+    |
+116 | //! [`page_rows`] takes a single `components` count and copies each row
+    |       ^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `tiff` links to private item `layout_for`
+   --> crates/sitk/src/io/tiff.rs:130:57
+    |
+130 | //! with an `ExtraSamples` tag describing the second. [`layout_for`]'s §2.140
+    |                                                         ^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `Deflate` links to private item `deflate_level_for`
+    --> crates/sitk/src/io/tiff.rs:1225:55
+     |
+1225 |     /// [`WriteOptions::compression_level`] through [`deflate_level_for`] —
+     |                                                       ^^^^^^^^^^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `transform_io` links to private item `convert_number_to_string`
+  --> crates/sitk/src/io/transform_io.rs:28:11
+   |
+28 | //! see [`convert_number_to_string`].
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `transform_matlab` links to private item `write_transform`
+  --> crates/sitk/src/io/transform_matlab.rs:62:18
+   |
+62 | //! option b): [`write_transform`] refuses a non-empty composite up front with
+   |                  ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `transform_matlab` links to private item `read_transform_list`
+  --> crates/sitk/src/io/transform_matlab.rs:66:7
+   |
+66 | //! [`read_transform_list`], whose fresh empty `CompositeTransform` accepts the
+   |       ^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `transform_matlab` links to private item `write_transform`
+  --> crates/sitk/src/io/transform_matlab.rs:70:44
+   |
+70 | //! makes the outer composite non-empty, [`write_transform`] refuses it too —
+   |                                            ^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `vtk` links to private item `read_ascii_ints`
+   --> crates/sitk/src/io/vtk.rs:150:63
+    |
+150 | //! `-70000` overflows to `65535` *with* one. Reproduced by [`read_ascii_ints`];
+    |                                                               ^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `read_image` links to private item `reader::normalize_reader_geometry`
+  --> crates/sitk/src/io/mod.rs:78:8
+   |
+78 | /// ([`reader::normalize_reader_geometry`], `itkImageFileReader.hxx:216-239`).
+   |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ImageRegistrationMethod`
+  |
+  = note: the link appears in this line:
+          
+          [`ImageRegistrationMethod`] driver.
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MeanSquaresMetric`
+  |
+  = note: the link appears in this line:
+          
+          images: the **mean-squares** metric ([`MeanSquaresMetric`]) sampled over the
+                                                ^^^^^^^^^^^^^^^^^^^
+  = note: no item named `MeanSquaresMetric` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `GradientDescentOptimizer`
+  |
+  = note: the link appears in this line:
+          
+          **gradient-descent** optimizer ([`GradientDescentOptimizer`] with a fixed or
+                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `GradientDescentOptimizer` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `RegularStepGradientDescentOptimizer`
+  |
+  = note: the link appears in this line:
+          
+          estimated rate, or [`RegularStepGradientDescentOptimizer`], which halves its
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `RegularStepGradientDescentOptimizer` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MeanSquaresMetric`
+  |
+  = note: the link appears in this line:
+          
+          The metric is selectable: mean squares ([`MeanSquaresMetric`]) by default, or
+                                                   ^^^^^^^^^^^^^^^^^^^
+  = note: no item named `MeanSquaresMetric` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MattesMutualInformationMetric`
+  |
+  = note: the link appears in this line:
+          
+          **Mattes mutual information** ([`MattesMutualInformationMetric`],
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `MattesMutualInformationMetric` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ImageRegistrationMethod::set_metric_as_mattes_mutual_information`
+  |
+  = note: the link appears in this line:
+          
+          [`set_metric_as_mattes_mutual_information`](ImageRegistrationMethod::set_metric_as_mattes_mutual_information).
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `ImageRegistrationMethod::set_optimizer_scales_from_jacobian`
+  |
+  = note: the link appears in this line:
+          
+          [`ImageRegistrationMethod::set_optimizer_scales_from_jacobian`] and
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `ImageRegistrationMethod::set_optimizer_scales_from_index_shift`
+  |
+  = note: the link appears in this line:
+          
+          [`ImageRegistrationMethod::set_optimizer_scales_from_index_shift`]:
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `ImageRegistrationMethod::set_shrink_factors_per_level`
+  |
+  = note: the link appears in this line:
+          
+          ImageRegistrationMethod::set_shrink_factors_per_level
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `ImageRegistrationMethod::set_smoothing_sigmas_per_level`
+  |
+  = note: the link appears in this line:
+          
+          ImageRegistrationMethod::set_smoothing_sigmas_per_level
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated`
+  |
+  = note: the link appears in this line:
+          
+          ImageRegistrationMethod::set_optimizer_as_regular_step_gradient_descent_estimated
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `MetricBackend`
+  |
+  = note: the link appears in this line:
+          
+          The metric's per-sample reduction is isolated behind [`MetricBackend`]; the
+                                                                ^^^^^^^^^^^^^^^
+  = note: no item named `MetricBackend` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `CpuBackend`
+  |
+  = note: the link appears in this line:
+          
+          shipped [`CpuBackend`] runs on the host. A backend implementing the same trait
+                   ^^^^^^^^^^^^
+  = note: no item named `CpuBackend` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ImageRegistrationMethod::set_metric_backend`
+  |
+  = note: the link appears in this line:
+          
+          drops in via [`ImageRegistrationMethod::set_metric_backend`] — no change to
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ImageRegistrationMethod` in scope
+
+warning: unresolved link to `CpuBackend`
+  |
+  = note: the link appears in this line:
+          
+          — it falls back to [`CpuBackend`] on every condition that is not a GPU success
+                                ^^^^^^^^^^^^
+  = note: no item named `CpuBackend` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `centered_versor` links to private item `principal_axes`
+  --> crates/sitk/src/registration/centered_versor.rs:33:31
+   |
+33 | //! rotation) — this port's [`principal_axes`] follows the same three steps,
+   |                               ^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `centered_versor` links to private item `crate::registration::eigen::jacobi_eigen_symmetric`
+  --> crates/sitk/src/registration/centered_versor.rs:34:26
+   |
+34 | //! reusing the shared [`crate::registration::eigen::jacobi_eigen_symmetric`] solver.
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `centered_versor` links to private item `crate::registration::eigen::jacobi_eigen_symmetric`
+  --> crates/sitk/src/registration/centered_versor.rs:60:7
+   |
+60 | //! [`crate::registration::eigen::jacobi_eigen_symmetric`] never rotates a matrix that is
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `correlation` links to private item `CorrelationMetric::means`
+  --> crates/sitk/src/registration/correlation.rs:48:40
+   |
+48 | //! All three sample loops — [`means`](CorrelationMetric::means) (pass 1),
+   |                                        ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+   |
+   = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `set_moving_initial_transform` links to private item `Composed`
+    --> crates/sitk/src/registration/method.rs:1747:59
+     |
+1747 |     /// `moving_initial(optimized(virtual_point))` (see [`Composed`] for the
+     |                                                           ^^^^^^^^ this item is private
+     |
+     = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `from_image_with` links to private item `VirtualGrid::write_point`
+   --> crates/sitk/src/registration/metric.rs:489:15
+    |
+489 |     /// and [`VirtualGrid::write_point`] recovers any sample's point from its
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: unresolved link to `ResampleImageFilter`
+  |
+  = note: the link appears in this line:
+          
+          [`ResampleImageFilter`] with nearest-neighbour and linear interpolation —
+           ^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `ResampleImageFilter` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: public documentation for `windowed_sinc_value_and_gradient` links to private item `sinc`
+   --> crates/sitk/src/transform/interpolator.rs:633:7
+    |
+633 | /// [`sinc`]/[`dsinc`] — at `t == 0`) so `K` is `C^1` straight through
+    |       ^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: public documentation for `windowed_sinc_value_and_gradient` links to private item `dsinc`
+   --> crates/sitk/src/transform/interpolator.rs:633:16
+    |
+633 | /// [`sinc`]/[`dsinc`] — at `t == 0`) so `K` is `C^1` straight through
+    |                ^^^^^ this item is private
+    |
+    = note: this link will resolve properly if you pass `--document-private-items`
+
+warning: redundant explicit link target
+  --> crates/sitk/src/filters/label_map.rs:55:40
+   |
+55 | //!    another and the [`LabelObject`](crate::core::LabelObject) invariant costs
+   |                         -------------  ^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |                         |
+   |                         because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+   = note: `#[warn(rustdoc::redundant_explicit_links)]` on by default
+help: remove explicit link target
+   |
+55 - //!    another and the [`LabelObject`](crate::core::LabelObject) invariant costs
+55 + //!    another and the [`LabelObject`] invariant costs
+   |
+
+warning: redundant explicit link target
+   --> crates/sitk/src/filters/label_map.rs:485:28
+    |
+485 | /// [`create_consecutive`](crate::filters::label::create_consecutive).
+    |      --------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+    |      |
+    |      because label contains path that resolves to same destination
+    |
+    = note: when a link's destination is not specified,
+            the label is used to resolve intra-doc links
+help: remove explicit link target
+    |
+485 - /// [`create_consecutive`](crate::filters::label::create_consecutive).
+485 + /// [`create_consecutive`].
+    |
+
+warning: redundant explicit link target
+   --> crates/sitk/src/filters/level_set/mod.rs:406:30
+    |
+406 | /// [`canny_edge_detection`](crate::filters::canny_edge_detection)).
+    |      ----------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+    |      |
+    |      because label contains path that resolves to same destination
+    |
+    = note: when a link's destination is not specified,
+            the label is used to resolve intra-doc links
+help: remove explicit link target
+    |
+406 - /// [`canny_edge_detection`](crate::filters::canny_edge_detection)).
+406 + /// [`canny_edge_detection`]).
+    |
+
+warning: unclosed HTML tag `PixelType`
+  --> crates/sitk/src/filters/logic.rs:64:16
+   |
+64 | //! static_cast<PixelType>( input1_pixel != input2_pixel )") describes a
+   |                ^^^^^^^^^^^
+   |
+   = note: `#[warn(rustdoc::invalid_html_tags)]` on by default
+help: try marking as source code
+   |
+64 | //! `static_cast<PixelType>`( input1_pixel != input2_pixel )") describes a
+   |     +                      +
+
+warning: redundant explicit link target
+  --> crates/sitk/src/filters/vector.rs:79:41
+   |
+79 | /// [`Error::ComponentIndexOutOfRange`](crate::core::Error::ComponentIndexOutOfRange).
+   |      ---------------------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |      |
+   |      because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+79 - /// [`Error::ComponentIndexOutOfRange`](crate::core::Error::ComponentIndexOutOfRange).
+79 + /// [`Error::ComponentIndexOutOfRange`].
+   |
+
+warning: redundant explicit link target
+  --> crates/sitk/src/io/meta_image.rs:10:55
+   |
+10 | //! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::io::ImageIo)
+   |                                            ---------  ^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |                                            |
+   |                                            because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+10 - //! [`MetaImageIo`] is this crate's first [`ImageIo`](crate::io::ImageIo)
+10 + //! [`MetaImageIo`] is this crate's first [`ImageIo`]
+   |
+
+warning: redundant explicit link target
+  --> crates/sitk/src/registration/bspline_initializer.rs:37:27
+   |
+37 | //! ([`BSplineTransform`](crate::transform::BSplineTransform) hardcodes its
+   |       ------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |       |
+   |       because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+37 - //! ([`BSplineTransform`](crate::transform::BSplineTransform) hardcodes its
+37 + //! ([`BSplineTransform`] hardcodes its
+   |
+
+warning: redundant explicit link target
+ --> crates/sitk/src/registration/centered_versor.rs:9:35
+  |
+9 | //! in [`OperationMode::Moments`](crate::registration::OperationMode::Moments) — it calls
+  |         ------------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+  |         |
+  |         because label contains path that resolves to same destination
+  |
+  = note: when a link's destination is not specified,
+          the label is used to resolve intra-doc links
+help: remove explicit link target
+  |
+9 - //! in [`OperationMode::Moments`](crate::registration::OperationMode::Moments) — it calls
+9 + //! in [`OperationMode::Moments`] — it calls
+  |
+
+warning: redundant explicit link target
+   --> crates/sitk/src/transform/interpolator.rs:615:52
+    |
+615 | /// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::transform::interpolator::GAUSSIAN_SIGMA)
+    |                                  ----------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+    |                                  |
+    |                                  because label contains path that resolves to same destination
+    |
+    = note: when a link's destination is not specified,
+            the label is used to resolve intra-doc links
+help: remove explicit link target
+    |
+615 - /// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`](crate::transform::interpolator::GAUSSIAN_SIGMA)
+615 + /// parameter in ITK, so unlike [`GAUSSIAN_SIGMA`]
+    |
+
+warning: redundant explicit link target
+  --> crates/sitk/src/transform/matrix_offset.rs:10:34
+   |
+10 | //! [`TransformBase::is_linear`](crate::transform::TransformBase::is_linear) asks only whether the
+   |      --------------------------  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ explicit target is redundant
+   |      |
+   |      because label contains path that resolves to same destination
+   |
+   = note: when a link's destination is not specified,
+           the label is used to resolve intra-doc links
+help: remove explicit link target
+   |
+10 - //! [`TransformBase::is_linear`](crate::transform::TransformBase::is_linear) asks only whether the
+10 + //! [`TransformBase::is_linear`] asks only whether the
+   |
+
+warning: `crate::filters::expand` is both a function and a module
+  --> crates/sitk/src/filters/adaptive_histogram_equalization.rs:59:7
+   |
+59 | /// [`crate::filters::expand`]'s corner sampling); instead, out-of-bounds offsets are
+   |       ^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+59 | /// [`crate::filters::expand()`]'s corner sampling); instead, out-of-bounds offsets are
+   |                             ++
+help: to link to the module, prefix with `mod@`
+   |
+59 | /// [`mod@crate::filters::expand`]'s corner sampling); instead, out-of-bounds offsets are
+   |       ++++
+
+warning: `crate::filters::clamp` is both a function and a module
+  --> crates/sitk/src/filters/adaptive_histogram_equalization.rs:95:67
+   |
+95 | /// narrow until the final output quantization" idiom (see e.g. [`crate::filters::clamp`]).
+   |                                                                   ^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+95 | /// narrow until the final output quantization" idiom (see e.g. [`crate::filters::clamp()`]).
+   |                                                                                        ++
+help: to link to the module, prefix with `mod@`
+   |
+95 | /// narrow until the final output quantization" idiom (see e.g. [`mod@crate::filters::clamp`]).
+   |                                                                   ++++
+
+warning: `crate::filters::gradient` is both a function and a module
+  --> crates/sitk/src/filters/canny.rs:46:10
+   |
+46 | //! is [`crate::filters::gradient`]'s verified generator for both, reused here
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+46 | //! is [`crate::filters::gradient()`]'s verified generator for both, reused here
+   |                                  ++
+help: to link to the module, prefix with `mod@`
+   |
+46 | //! is [`mod@crate::filters::gradient`]'s verified generator for both, reused here
+   |          ++++
+
+warning: `crate::filters::fast_marching_upwind_gradient` is both a function and a module
+  --> crates/sitk/src/filters/colliding_fronts.rs:10:11
+   |
+10 | //! Two [`crate::filters::fast_marching_upwind_gradient`] marches over the *same* speed
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+10 | //! Two [`crate::filters::fast_marching_upwind_gradient()`] marches over the *same* speed
+   |                                                        ++
+help: to link to the module, prefix with `mod@`
+   |
+10 | //! Two [`mod@crate::filters::fast_marching_upwind_gradient`] marches over the *same* speed
+   |           ++++
+
+warning: `crate::filters::fast_marching_upwind_gradient` is both a function and a module
+  --> crates/sitk/src/filters/colliding_fronts.rs:75:9
+   |
+75 | //!   [`crate::filters::fast_marching_upwind_gradient`]; `CollidingFrontsImageFilter`
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+75 | //!   [`crate::filters::fast_marching_upwind_gradient()`]; `CollidingFrontsImageFilter`
+   |                                                      ++
+help: to link to the module, prefix with `mod@`
+   |
+75 | //!   [`mod@crate::filters::fast_marching_upwind_gradient`]; `CollidingFrontsImageFilter`
+   |         ++++
+
+warning: `crate::filters::convolution` is both a function and a module
+ --> crates/sitk/src/filters/deconvolution.rs:5:7
+  |
+5 | //! [`crate::filters::convolution`]):
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+5 | //! [`crate::filters::convolution()`]):
+  |                                  ++
+help: to link to the module, prefix with `mod@`
+  |
+5 | //! [`mod@crate::filters::convolution`]):
+  |       ++++
+
+warning: `crate::filters::expand` is both a function and a module
+   --> crates/sitk/src/filters/error.rs:838:38
+    |
+838 |     /// transform primitive — e.g. [`crate::filters::expand`] sampling through
+    |                                      ^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+838 |     /// transform primitive — e.g. [`crate::filters::expand()`] sampling through
+    |                                                            ++
+help: to link to the module, prefix with `mod@`
+    |
+838 |     /// transform primitive — e.g. [`mod@crate::filters::expand`] sampling through
+    |                                      ++++
+
+warning: `crate::filters::shrink` is both a function and a module
+  --> crates/sitk/src/filters/expand.rs:51:30
+   |
+51 | /// assume by analogy with [`crate::filters::shrink`]. Expand resamples at continuous
+   |                              ^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+51 | /// assume by analogy with [`crate::filters::shrink()`]. Expand resamples at continuous
+   |                                                    ++
+help: to link to the module, prefix with `mod@`
+   |
+51 | /// assume by analogy with [`mod@crate::filters::shrink`]. Expand resamples at continuous
+   |                              ++++
+
+warning: `crate::filters::shrink` is both a function and a module
+  --> crates/sitk/src/filters/expand.rs:80:32
+   |
+80 | /// divergence, analogous to [`crate::filters::shrink`]'s `InvalidShrinkFactor`.
+   |                                ^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+80 | /// divergence, analogous to [`crate::filters::shrink()`]'s `InvalidShrinkFactor`.
+   |                                                      ++
+help: to link to the module, prefix with `mod@`
+   |
+80 | /// divergence, analogous to [`mod@crate::filters::shrink`]'s `InvalidShrinkFactor`.
+   |                                ++++
+
+warning: `crate::filters::fast_marching` is both a function and a module
+  --> crates/sitk/src/filters/fast_marching_base.rs:21:21
+   |
+21 | //! This is *not* [`crate::filters::fast_marching`]'s filter with extra options: the two
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+21 | //! This is *not* [`crate::filters::fast_marching()`]'s filter with extra options: the two
+   |                                                  ++
+help: to link to the module, prefix with `mod@`
+   |
+21 | //! This is *not* [`mod@crate::filters::fast_marching`]'s filter with extra options: the two
+   |                     ++++
+
+warning: `crate::filters::fast_marching` is both a function and a module
+  --> crates/sitk/src/filters/fast_marching_base.rs:50:7
+   |
+50 | //! [`crate::filters::fast_marching`] ports the *old* `itk::FastMarchingImageFilter`.
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+50 | //! [`crate::filters::fast_marching()`] ports the *old* `itk::FastMarchingImageFilter`.
+   |                                    ++
+help: to link to the module, prefix with `mod@`
+   |
+50 | //! [`mod@crate::filters::fast_marching`] ports the *old* `itk::FastMarchingImageFilter`.
+   |       ++++
+
+warning: `crate::filters::fast_marching` is both a function and a module
+ --> crates/sitk/src/filters/fast_marching_upwind_gradient.rs:7:23
+  |
+7 | //! subclass of the [`crate::filters::fast_marching`] solver and reuses its heap through
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+7 | //! subclass of the [`crate::filters::fast_marching()`] solver and reuses its heap through
+  |                                                    ++
+help: to link to the module, prefix with `mod@`
+  |
+7 | //! subclass of the [`mod@crate::filters::fast_marching`] solver and reuses its heap through
+  |                       ++++
+
+warning: `crate::filters::colliding_fronts` is both a function and a module
+  --> crates/sitk/src/filters/fast_marching_upwind_gradient.rs:62:7
+   |
+62 | //! [`crate::filters::colliding_fronts`] drives `AllTargets` through the internal seam.
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+62 | //! [`crate::filters::colliding_fronts()`] drives `AllTargets` through the internal seam.
+   |                                       ++
+help: to link to the module, prefix with `mod@`
+   |
+62 | //! [`mod@crate::filters::colliding_fronts`] drives `AllTargets` through the internal seam.
+   |       ++++
+
+warning: `crate::filters::fast_marching` is both a function and a module
+   --> crates/sitk/src/filters/fast_marching_upwind_gradient.rs:201:52
+    |
+201 | /// `FastMarchingUpwindGradientImageFilter`: the [`crate::filters::fast_marching`] march,
+    |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+201 | /// `FastMarchingUpwindGradientImageFilter`: the [`crate::filters::fast_marching()`] march,
+    |                                                                                 ++
+help: to link to the module, prefix with `mod@`
+    |
+201 | /// `FastMarchingUpwindGradientImageFilter`: the [`mod@crate::filters::fast_marching`] march,
+    |                                                    ++++
+
+warning: `crate::filters::fft_shift` is both a function and a module
+ --> crates/sitk/src/filters/fourier.rs:6:57
+  |
+6 | //! (`FFTShiftImageFilter` is the sixth, and lives in [`crate::filters::fft_shift`].)
+  |                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+6 | //! (`FFTShiftImageFilter` is the sixth, and lives in [`crate::filters::fft_shift()`].)
+  |                                                                                  ++
+help: to link to the module, prefix with `mod@`
+  |
+6 | //! (`FFTShiftImageFilter` is the sixth, and lives in [`mod@crate::filters::fft_shift`].)
+  |                                                         ++++
+
+warning: `crate::filters::threshold` is both a function and a module
+ --> crates/sitk/src/filters/histogram.rs:3:7
+  |
+3 | //! [`crate::filters::threshold`]'s Huang/Intermodes/IsoData/KittlerIllingworth/Li/
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+3 | //! [`crate::filters::threshold()`]'s Huang/Intermodes/IsoData/KittlerIllingworth/Li/
+  |                                ++
+help: to link to the module, prefix with `mod@`
+  |
+3 | //! [`mod@crate::filters::threshold`]'s Huang/Intermodes/IsoData/KittlerIllingworth/Li/
+  |       ++++
+
+warning: `crate::filters::change_label` is both a function and a module
+   --> crates/sitk/src/filters/label_map.rs:277:43
+    |
+277 | /// last-write-wins overwrite semantics [`crate::filters::change_label`] documents: the
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+277 | /// last-write-wins overwrite semantics [`crate::filters::change_label()`] documents: the
+    |                                                                       ++
+help: to link to the module, prefix with `mod@`
+    |
+277 | /// last-write-wins overwrite semantics [`mod@crate::filters::change_label`] documents: the
+    |                                           ++++
+
+warning: `crate::filters::change_label` is both a function and a module
+   --> crates/sitk/src/filters/label_map.rs:288:29
+    |
+288 | ///   matching the scalar [`crate::filters::change_label`].
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+288 | ///   matching the scalar [`crate::filters::change_label()`].
+    |                                                         ++
+help: to link to the module, prefix with `mod@`
+    |
+288 | ///   matching the scalar [`mod@crate::filters::change_label`].
+    |                             ++++
+
+warning: `crate::filters::label_to_rgb` is both a function and a module
+ --> crates/sitk/src/filters/label_map_overlay.rs:8:7
+  |
+8 | //! [`crate::filters::label_to_rgb`] already ports. The palette, the
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+8 | //! [`crate::filters::label_to_rgb()`] already ports. The palette, the
+  |                                   ++
+help: to link to the module, prefix with `mod@`
+  |
+8 | //! [`mod@crate::filters::label_to_rgb`] already ports. The palette, the
+  |       ++++
+
+warning: `crate::filters::label_to_rgb` is both a function and a module
+   --> crates/sitk/src/filters/label_map_overlay.rs:211:22
+    |
+211 | /// for the reason [`crate::filters::label_to_rgb`]'s upstream finding 1 gives: the
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+211 | /// for the reason [`crate::filters::label_to_rgb()`]'s upstream finding 1 gives: the
+    |                                                  ++
+help: to link to the module, prefix with `mod@`
+    |
+211 | /// for the reason [`mod@crate::filters::label_to_rgb`]'s upstream finding 1 gives: the
+    |                      ++++
+
+warning: `crate::filters::recursive_gaussian` is both a function and a module
+  --> crates/sitk/src/filters/objectness.rs:16:10
+   |
+16 | //!    [`crate::filters::recursive_gaussian`] machinery; callers who want the
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+16 | //!    [`crate::filters::recursive_gaussian()`] machinery; callers who want the
+   |                                            ++
+help: to link to the module, prefix with `mod@`
+   |
+16 | //!    [`mod@crate::filters::recursive_gaussian`] machinery; callers who want the
+   |          ++++
+
+warning: `crate::filters::noise` is both a function and a module
+  --> crates/sitk/src/filters/patch_based_denoising.rs:59:14
+   |
+59 | //! policy [`crate::filters::noise`] follows.
+   |              ^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+59 | //! policy [`crate::filters::noise()`] follows.
+   |                                   ++
+help: to link to the module, prefix with `mod@`
+   |
+59 | //! policy [`mod@crate::filters::noise`] follows.
+   |              ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/reconstruction.rs:32:26
+   |
+32 | //! [`reconstruct`] is [`crate::filters::watershed`]'s former private
+   |                          ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+32 | //! [`reconstruct`] is [`crate::filters::watershed()`]'s former private
+   |                                                   ++
+help: to link to the module, prefix with `mod@`
+   |
+32 | //! [`reconstruct`] is [`mod@crate::filters::watershed`]'s former private
+   |                          ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/reconstruction.rs:63:7
+   |
+63 | //! [`crate::filters::watershed`]'s own flooding and regional-minima code, which needs
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+63 | //! [`crate::filters::watershed()`]'s own flooding and regional-minima code, which needs
+   |                                ++
+help: to link to the module, prefix with `mod@`
+   |
+63 | //! [`mod@crate::filters::watershed`]'s own flooding and regional-minima code, which needs
+   |       ++++
+
+warning: `crate::filters::vector_connected_component` is both a function and a module
+    --> crates/sitk/src/filters/region_growing.rs:1163:7
+     |
+1163 | /// [`crate::filters::vector_connected_component`], not restricted to real-valued
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+     |
+help: to link to the function, add parentheses
+     |
+1163 | /// [`crate::filters::vector_connected_component()`], not restricted to real-valued
+     |                                                 ++
+help: to link to the module, prefix with `mod@`
+     |
+1163 | /// [`mod@crate::filters::vector_connected_component`], not restricted to real-valued
+     |       ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/regional_extrema.rs:25:34
+   |
+25 | //!   helper already exists in [`crate::filters::watershed`], restricted to that
+   |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+25 | //!   helper already exists in [`crate::filters::watershed()`], restricted to that
+   |                                                           ++
+help: to link to the module, prefix with `mod@`
+   |
+25 | //!   helper already exists in [`mod@crate::filters::watershed`], restricted to that
+   |                                  ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/regional_extrema.rs:27:22
+   |
+27 | //!   above on why [`crate::filters::watershed`]'s helper stays a separate,
+   |                      ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+27 | //!   above on why [`crate::filters::watershed()`]'s helper stays a separate,
+   |                                               ++
+help: to link to the module, prefix with `mod@`
+   |
+27 | //!   above on why [`mod@crate::filters::watershed`]'s helper stays a separate,
+   |                      ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/regional_extrema.rs:52:29
+   |
+52 | //! pixel value (matching [`crate::filters::watershed`]'s private `regional_minima`
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+52 | //! pixel value (matching [`crate::filters::watershed()`]'s private `regional_minima`
+   |                                                      ++
+help: to link to the module, prefix with `mod@`
+   |
+52 | //! pixel value (matching [`mod@crate::filters::watershed`]'s private `regional_minima`
+   |                             ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/regional_extrema.rs:60:7
+   |
+60 | //! [`crate::filters::watershed`], a boundary neighbor's assumed value can never win
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+60 | //! [`crate::filters::watershed()`], a boundary neighbor's assumed value can never win
+   |                                ++
+help: to link to the module, prefix with `mod@`
+   |
+60 | //! [`mod@crate::filters::watershed`], a boundary neighbor's assumed value can never win
+   |       ++++
+
+warning: `crate::filters::fast_marching` is both a function and a module
+ --> crates/sitk/src/filters/reinitialize_level_set.rs:6:14
+  |
+6 | //! reuses [`crate::filters::fast_marching`]'s solver through its `march_flat` seam.
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+6 | //! reuses [`crate::filters::fast_marching()`]'s solver through its `march_flat` seam.
+  |                                           ++
+help: to link to the module, prefix with `mod@`
+  |
+6 | //! reuses [`mod@crate::filters::fast_marching`]'s solver through its `march_flat` seam.
+  |              ++++
+
+warning: `crate::filters::watershed` is both a function and a module
+  --> crates/sitk/src/filters/scalar_connected_component.rs:28:58
+   |
+28 | //! [`crate::filters::label::connected_component`] and [`crate::filters::watershed`] use for
+   |                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+28 | //! [`crate::filters::label::connected_component`] and [`crate::filters::watershed()`] use for
+   |                                                                                   ++
+help: to link to the module, prefix with `mod@`
+   |
+28 | //! [`crate::filters::label::connected_component`] and [`mod@crate::filters::watershed`] use for
+   |                                                          ++++
+
+warning: `crate::filters::shrink` is both a function and a module
+  --> crates/sitk/src/filters/slic.rs:29:60
+   |
+29 | //!    by `SuperGridSize` (`itk::ShrinkImageFilter`; see [`crate::filters::shrink`]).
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+29 | //!    by `SuperGridSize` (`itk::ShrinkImageFilter`; see [`crate::filters::shrink()`]).
+   |                                                                                  ++
+help: to link to the module, prefix with `mod@`
+   |
+29 | //!    by `SuperGridSize` (`itk::ShrinkImageFilter`; see [`mod@crate::filters::shrink`]).
+   |                                                            ++++
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/gipl.rs:69:60
+   |
+69 | //! 256-byte header — fixed in this port (ledger §1.52): [`write`] checks
+   |                                                            ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+69 | //! 256-byte header — fixed in this port (ledger §1.52): [`write()`] checks
+   |                                                                 ++
+help: to link to the macro, add an exclamation mark
+   |
+69 | //! 256-byte header — fixed in this port (ledger §1.52): [`write!`] checks
+   |                                                                 +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/gipl.rs:102:23
+    |
+102 | //! (ledger §2.96): [`write`] rejects any non-scalar image (`buffer_stride > 1`)
+    |                       ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+102 | //! (ledger §2.96): [`write()`] rejects any non-scalar image (`buffer_stride > 1`)
+    |                            ++
+help: to link to the macro, add an exclamation mark
+    |
+102 | //! (ledger §2.96): [`write!`] rejects any non-scalar image (`buffer_stride > 1`)
+    |                            +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/gipl.rs:122:42
+    |
+122 | //! as the uncompressed path does, and [`write`] compresses the same bytes the
+    |                                          ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+122 | //! as the uncompressed path does, and [`write()`] compresses the same bytes the
+    |                                               ++
+help: to link to the macro, add an exclamation mark
+    |
+122 | //! as the uncompressed path does, and [`write!`] compresses the same bytes the
+    |                                               +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/gipl.rs:167:63
+    |
+167 | /// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write`] emits.
+    |                                                               ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+167 | /// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write()`] emits.
+    |                                                                    ++
+help: to link to the macro, add an exclamation mark
+    |
+167 | /// `GIPL_MAGIC_NUMBER` (itkGiplImageIO.cxx:72) — the value [`write!`] emits.
+    |                                                                    +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/image_hdf5.rs:60:40
+   |
+60 | //! This port closes that at source: [`write`] still takes any pixel type, and
+   |                                        ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+60 | //! This port closes that at source: [`write()`] still takes any pixel type, and
+   |                                             ++
+help: to link to the macro, add an exclamation mark
+   |
+60 | //! This port closes that at source: [`write!`] still takes any pixel type, and
+   |                                             +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/image_hdf5.rs:82:38
+   |
+82 | //! This port makes the flag live: [`write`] applies the deflate filter only
+   |                                      ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+82 | //! This port makes the flag live: [`write()`] applies the deflate filter only
+   |                                           ++
+help: to link to the macro, add an exclamation mark
+   |
+82 | //! This port makes the flag live: [`write!`] applies the deflate filter only
+   |                                           +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/jpeg.rs:29:17
+   |
+29 | //! skips it. [`write`] reproduces this: [`resolved_quality`] never consults
+   |                 ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+29 | //! skips it. [`write()`] reproduces this: [`resolved_quality`] never consults
+   |                      ++
+help: to link to the macro, add an exclamation mark
+   |
+29 | //! skips it. [`write!`] reproduces this: [`resolved_quality`] never consults
+   |                      +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/jpeg.rs:48:47
+   |
+48 | //! * **Write** — the [`ImageIo`] trait and [`write`] use
+   |                                               ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+48 | //! * **Write** — the [`ImageIo`] trait and [`write()`] use
+   |                                                    ++
+help: to link to the macro, add an exclamation mark
+   |
+48 | //! * **Write** — the [`ImageIo`] trait and [`write!`] use
+   |                                                    +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/jpeg.rs:140:32
+    |
+140 | //! Z-slice (ledger §2.125). [`write`] reproduces the throw as
+    |                                ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+140 | //! Z-slice (ledger §2.125). [`write()`] reproduces the throw as
+    |                                     ++
+help: to link to the macro, add an exclamation mark
+    |
+140 | //! Z-slice (ledger §2.125). [`write!`] reproduces the throw as
+    |                                     +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/jpeg.rs:185:61
+    |
+185 | //!   variants are all named, fixed-arity colour spaces). [`write`] refuses
+    |                                                             ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+185 | //!   variants are all named, fixed-arity colour spaces). [`write()`] refuses
+    |                                                                  ++
+help: to link to the macro, add an exclamation mark
+    |
+185 | //!   variants are all named, fixed-arity colour spaces). [`write!`] refuses
+    |                                                                  +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/jpeg.rs:257:15
+    |
+257 | /// §5.27). [`write`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
+    |               ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+257 | /// §5.27). [`write()`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
+    |                    ++
+help: to link to the macro, add an exclamation mark
+    |
+257 | /// §5.27). [`write!`] and the [`ImageIo`] trait use [`JpegWriteOptions::default`],
+    |                    +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/jpeg.rs:583:58
+    |
+583 | /// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write`] is this with
+    |                                                          ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+583 | /// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write()`] is this with
+    |                                                               ++
+help: to link to the macro, add an exclamation mark
+    |
+583 | /// factor SimpleITK hard-wires (ledger §3.50, §5.27). [`write!`] is this with
+    |                                                               +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/meta_image.rs:11:33
+   |
+11 | //! implementor; [`read`] and [`write`] are its free-function core.
+   |                                 ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+11 | //! implementor; [`read`] and [`write()`] are its free-function core.
+   |                                      ++
+help: to link to the macro, add an exclamation mark
+   |
+11 | //! implementor; [`read`] and [`write!`] are its free-function core.
+   |                                      +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/meta_image.rs:30:72
+   |
+30 | //! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write`]
+   |                                                                        ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+30 | //! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write()`]
+   |                                                                             ++
+help: to link to the macro, add an exclamation mark
+   |
+30 | //! (sitkImageReaderBase.cxx:215-233). So a complex image written by [`write!`]
+   |                                                                             +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/png.rs:41:62
+   |
+41 | //! component count ≥ 1), so [`read`]/[`read_information`]/[`write`] implement
+   |                                                              ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+41 | //! component count ≥ 1), so [`read`]/[`read_information`]/[`write()`] implement
+   |                                                                   ++
+help: to link to the macro, add an exclamation mark
+   |
+41 | //! component count ≥ 1), so [`read`]/[`read_information`]/[`write!`] implement
+   |                                                                   +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/png.rs:74:7
+   |
+74 | //! [`write`] reproduces this: `options.use_compression` gates whether
+   |       ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+74 | //! [`write()`] reproduces this: `options.use_compression` gates whether
+   |            ++
+help: to link to the macro, add an exclamation mark
+   |
+74 | //! [`write!`] reproduces this: `options.use_compression` gates whether
+   |            +
+
+warning: `write` is both a function and a macro
+  --> crates/sitk/src/io/png.rs:95:36
+   |
+95 | //! out of the file it produces; [`write`] refuses it instead of reproducing
+   |                                    ^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+95 | //! out of the file it produces; [`write()`] refuses it instead of reproducing
+   |                                         ++
+help: to link to the macro, add an exclamation mark
+   |
+95 | //! out of the file it produces; [`write!`] refuses it instead of reproducing
+   |                                         +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/png.rs:109:31
+    |
+109 | //! could never round-trip; [`write`] refuses it instead of reproducing the
+    |                               ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+109 | //! could never round-trip; [`write()`] refuses it instead of reproducing the
+    |                                    ++
+help: to link to the macro, add an exclamation mark
+    |
+109 | //! could never round-trip; [`write!`] refuses it instead of reproducing the
+    |                                    +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/png.rs:120:53
+    |
+120 | //!   always report unit spacing `[1.0, 1.0]` and [`write`] never emits the
+    |                                                     ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+120 | //!   always report unit spacing `[1.0, 1.0]` and [`write()`] never emits the
+    |                                                          ++
+help: to link to the macro, add an exclamation mark
+    |
+120 | //!   always report unit spacing `[1.0, 1.0]` and [`write!`] never emits the
+    |                                                          +
+
+warning: `write` is both a function and a macro
+ --> crates/sitk/src/io/vtk.rs:6:45
+  |
+6 | //! SimpleITK never flips that switch, so [`write`] always emits `BINARY`.
+  |                                             ^^^^^ ambiguous link
+  |
+help: to link to the function, add parentheses
+  |
+6 | //! SimpleITK never flips that switch, so [`write()`] always emits `BINARY`.
+  |                                                  ++
+help: to link to the macro, add an exclamation mark
+  |
+6 | //! SimpleITK never flips that switch, so [`write!`] always emits `BINARY`.
+  |                                                  +
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/vtk.rs:104:57
+    |
+104 | //! branch (`:686-691`) is dead through SimpleITK and [`write`] never emits it.
+    |                                                         ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+104 | //! branch (`:686-691`) is dead through SimpleITK and [`write()`] never emits it.
+    |                                                              ++
+help: to link to the macro, add an exclamation mark
+    |
+104 | //! branch (`:686-691`) is dead through SimpleITK and [`write!`] never emits it.
+    |                                                              +
+
+warning: `crate::transform::transform_geometry` is both a function and a module
+  --> crates/sitk/src/transform/erased.rs:16:28
+   |
+16 | //! [`transform_geometry`](crate::transform::transform_geometry) and
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+16 | //! [`transform_geometry`](crate::transform::transform_geometry()) and
+   |                                                                ++
+help: to link to the module, prefix with `mod@`
+   |
+16 | //! [`transform_geometry`](mod@crate::transform::transform_geometry) and
+   |                            ++++
+
+warning: `crate::transform::transform_geometry` is both a function and a module
+  --> crates/sitk/src/transform/parametric.rs:71:11
+   |
+71 |     /// [`crate::transform::transform_geometry`]'s linearity precondition is the only
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ambiguous link
+   |
+help: to link to the function, add parentheses
+   |
+71 |     /// [`crate::transform::transform_geometry()`]'s linearity precondition is the only
+   |                                               ++
+help: to link to the module, prefix with `mod@`
+   |
+71 |     /// [`mod@crate::transform::transform_geometry`]'s linearity precondition is the only
+   |           ++++
+
+warning: `write` is both a function and a macro
+   --> crates/sitk/src/io/gipl.rs:666:49
+    |
+666 |     /// `.gipl.gz` is claimed for writing and [`write`] compresses it.
+    |                                                 ^^^^^ ambiguous link
+    |
+help: to link to the function, add parentheses
+    |
+666 |     /// `.gipl.gz` is claimed for writing and [`write()`] compresses it.
+    |                                                      ++
+help: to link to the macro, add an exclamation mark
+    |
+666 |     /// `.gipl.gz` is claimed for writing and [`write!`] compresses it.
+    |                                                      +
+
+warning: `write` is both a function and a macro
+    --> crates/sitk/src/io/nifti.rs:3142:51
+     |
+3142 |     /// and always at zlib's default level. See [`write`].
+     |                                                   ^^^^^ ambiguous link
+     |
+help: to link to the function, add parentheses
+     |
+3142 |     /// and always at zlib's default level. See [`write()`].
+     |                                                        ++
+help: to link to the macro, add an exclamation mark
+     |
+3142 |     /// and always at zlib's default level. See [`write!`].
+     |                                                        +
+
+warning: `sitk` (lib doc) generated 364 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.03s
+   Generated /home/stevek/work/sitk-rs/target/doc/sitk/index.html

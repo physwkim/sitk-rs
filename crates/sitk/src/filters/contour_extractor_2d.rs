@@ -30,7 +30,7 @@
 //! — fixed at `t = 0.5` in `label_contours` mode, where the values are labels
 //! and interpolating between them is meaningless.
 //!
-//! Segments are stitched by [`ContourData::add_segment`], which keeps two hash
+//! Segments are stitched by `ContourData::add_segment`, which keeps two hash
 //! maps from vertex to growing contour: one keyed by each contour's first
 //! vertex, one by its last. A new segment `from → to` therefore either starts a
 //! contour, extends one at either end, joins two distinct contours, or — when

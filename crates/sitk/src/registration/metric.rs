@@ -486,7 +486,7 @@ impl FixedSamples {
     /// points — is a function of that selection and the grid. Writing it that way
     /// is what lets the default case (every voxel, in grid order) carry **no
     /// index list and no points buffer at all**: its selection is the identity,
-    /// and [`VirtualGrid::write_point`] recovers any sample's point from its
+    /// and `VirtualGrid::write_point` recovers any sample's point from its
     /// index in nine flops. The buffer that used to hold those points was 402 MB
     /// at 256³ and the largest single term in a GPU registration's setup.
     ///

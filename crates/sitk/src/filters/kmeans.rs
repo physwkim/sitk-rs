@@ -28,7 +28,7 @@
 //! -- the actual update rule -- and the loop's termination check
 //! (`StartOptimization`'s `while (true)` with the max-iteration and
 //! centroid-position-change tests) do not reference the tree at all. So a
-//! plain per-pixel nearest-centroid pass (this port's [`run_kmeans`]) and the
+//! plain per-pixel nearest-centroid pass (this port's `run_kmeans`) and the
 //! KdTree filtering pass compute *identical* assignments, sums, and
 //! centroids at every iteration -- the tree changes only how fast the
 //! assignment is computed, never what it computes. This port uses the
@@ -44,7 +44,7 @@
 //! `estimator->SetCentroidPositionChangesThreshold(0.0)` (0.0 is also the
 //! class default, but is set explicitly). Neither is exposed by
 //! `ScalarImageKmeansImageFilter.yaml`, so both are hardcoded here as
-//! [`MAXIMUM_ITERATION`] and an exact-zero convergence test.
+//! `MAXIMUM_ITERATION` and an exact-zero convergence test.
 //!
 //! `estimator->SetUseClusterLabels` is never called (defaults to `false`),
 //! so the `if (m_UseClusterLabels)` cluster-label-filling pass at the end of
@@ -71,7 +71,7 @@
 //!
 //! so with `MaximumIteration = 200`, passes run for `CurrentIteration =
 //! 0, 1, ..., 200` -- **201** passes total if convergence is never reached,
-//! not 200. [`run_kmeans`] reproduces this by running `0..=MAXIMUM_ITERATION`
+//! not 200. `run_kmeans` reproduces this by running `0..=MAXIMUM_ITERATION`
 //! (inclusive) and checking convergence after every pass, matching the same
 //! total pass count and the same iteration at which an early convergence
 //! break can occur.
@@ -83,7 +83,7 @@
 //! `EuclideanDistanceMetric::Evaluate`'s two-vector overload, which returns
 //! `sqrt(sum((x1[j] - x2[j])^2))`, i.e. the *unsquared* Euclidean distance
 //! (`itkEuclideanDistanceMetric.hxx`). For this filter's 1-D measurement
-//! vectors that is exactly `|previous[i] - current[i]|`. [`run_kmeans`]'s
+//! vectors that is exactly `|previous[i] - current[i]|`. `run_kmeans`'s
 //! convergence sum matches this (plain absolute differences, not squared).
 //!
 //! ## Frozen empty clusters
@@ -103,7 +103,7 @@
 //! same (`discriminantScores[i] < min`, seeded from index 0), operating on
 //! `DistanceToCentroidMembershipFunction::Evaluate`'s plain Euclidean
 //! distance to each final mean (`itkDistanceToCentroidMembershipFunction.hxx`).
-//! [`nearest_mean_index`] is shared by both phases and reproduces this exact
+//! `nearest_mean_index` is shared by both phases and reproduces this exact
 //! tie rule.
 //!
 //! ## Empty `class_with_initial_mean`

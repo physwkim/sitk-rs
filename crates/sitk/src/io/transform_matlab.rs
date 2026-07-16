@@ -59,15 +59,15 @@
 //! `WriteAndReadEmptyCompositeTransform`, and no non-empty one.
 //!
 //! This port does **not** reproduce that write-then-fail asymmetry (§5.29,
-//! option b): [`write_transform`] refuses a non-empty composite up front with
+//! option b): `write_transform` refuses a non-empty composite up front with
 //! [`IoError::UnsupportedMatlabTransformFeature`], so the failure surfaces at
 //! write rather than on a later read, and no unreadable file is produced. An
 //! empty composite still writes and round-trips through
-//! [`read_transform_list`], whose fresh empty `CompositeTransform` accepts the
+//! `read_transform_list`, whose fresh empty `CompositeTransform` accepts the
 //! empty aggregate vectors. See ledger §1.69/§2.144.
 //!
 //! The same guard covers nesting: because a composite containing a composite
-//! makes the outer composite non-empty, [`write_transform`] refuses it too —
+//! makes the outer composite non-empty, `write_transform` refuses it too —
 //! where upstream's `Write` never special-cases `CompositeTransform` at all
 //! and so places **no restriction on composite nesting**, unlike `.tfm`
 //! (`"Composite Transform can only be 1st transform in a file"`) and `.h5`

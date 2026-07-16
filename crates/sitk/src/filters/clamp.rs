@@ -56,7 +56,7 @@ use crate::filters::{FromWide, read_pixels_i128};
 /// The old port cast the *`f64` copy* in the in-range branch
 /// (`static_cast<Out>(dA)`), collapsing a `UInt64`/`Int64` value above `2^53`
 /// (e.g. `2^53 + 1 -> 2^53`). For **integer input to integer output** the value
-/// path now runs through `i128` ([`read_pixels_i128`] / [`build_clamp_from_i128`]),
+/// path now runs through `i128` (`read_pixels_i128` / `build_clamp_from_i128`),
 /// so `static_cast<Out>(A)` is exact. **Any float on either side** keeps the
 /// `f64` path: for a float input it is already exact (`f32 -> f64` lossless), and
 /// for an integer input clamped to `Float32` it preserves the existing

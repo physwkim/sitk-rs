@@ -21,7 +21,7 @@
 //!   re-associate, because no entry point accepts one. Adding a new reduction
 //!   means adding a function *here*, next to this comment, with a proof that its
 //!   operator is exactly associative.
-//! - Chunk boundaries come from one private function, [`grain`], whose signature
+//! - Chunk boundaries come from one private function, `grain`, whose signature
 //!   is `usize` in and `usize` out: it *cannot* observe the thread count, because
 //!   there is no argument through which it could. No entry point takes a chunk
 //!   count, a grain size, or a thread count either, so no decomposition in the
@@ -49,7 +49,7 @@
 //!   an element is a pure function of that element.
 //!
 //! Because all four are *exact*, the serial fast path taken below
-//! [`SERIAL_THRESHOLD`] returns the same bits as the parallel path — the
+//! `SERIAL_THRESHOLD` returns the same bits as the parallel path — the
 //! threshold is a speed knob, never a correctness one.
 
 use std::mem::MaybeUninit;
@@ -388,7 +388,7 @@ pub struct CostRun {
 ///
 /// # The defect this closes
 ///
-/// [`fill_indexed`] cuts `0..len` into equal-**count** chunks, which are equal-**cost**
+/// `fill_indexed` cuts `0..len` into equal-**count** chunks, which are equal-**cost**
 /// chunks only when every index costs the same. A stencil pass is where that fails: a
 /// pixel whose window overhangs the image takes the checked path, which materializes
 /// the window through the boundary condition and measures ~**8×** the interior path
@@ -401,7 +401,7 @@ pub struct CostRun {
 ///
 /// # The rule, and why it carries no cost constant
 ///
-/// **Each class is split into its own [`TARGET_TASKS`] chunks**, so
+/// **Each class is split into its own `TARGET_TASKS` chunks**, so
 ///
 /// ```text
 /// c_max = max over classes of (W_class / TARGET_TASKS)  <=  W / TARGET_TASKS
@@ -409,16 +409,16 @@ pub struct CostRun {
 ///
 /// The ratio *between* the classes never enters: the classes are counted, not weighted,
 /// so there is no cost model here to get wrong and none to fit to a benchmark. A caller
-/// that mislabels a run makes the balance worse, never the answer. The [`GRAIN`] ceiling
+/// that mislabels a run makes the balance worse, never the answer. The `GRAIN` ceiling
 /// still applies per class — dropping it measured **1.41× slower** on `binary_dilate` at
 /// 256³ — while the *floor* does not, because a floor in elements cannot serve two costs
-/// per element and [`TARGET_TASKS`] is what bounds the task count.
+/// per element and `TARGET_TASKS` is what bounds the task count.
 ///
 /// # Bit-for-bit
 ///
 /// This changes **which task** computes an element, never **how**: chunks are still
 /// contiguous index ranges, element `i` is still `f(&mut scratch, i)`, and it still lands
-/// in slot `i`. It is the same argument that lets [`grain`] be tuned freely — no
+/// in slot `i`. It is the same argument that lets `grain` be tuned freely — no
 /// element's value depends on the decomposition, so no decomposition can move a bit.
 ///
 /// # Panics

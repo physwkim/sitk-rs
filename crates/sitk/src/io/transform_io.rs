@@ -25,7 +25,7 @@
 //! Numbers are emitted through the exact ECMAScript shortest-round-trip
 //! algorithm ITK uses (`itk::NumberToString<double>` → double-conversion's
 //! `EcmaScriptConverter().ToShortest()`), so output is byte-identical to ITK's;
-//! see [`convert_number_to_string`].
+//! see `convert_number_to_string`.
 //!
 //! The reader reproduces the upstream parser's quirks rather than tightening
 //! them — the header line is never validated, parameter lists truncate silently
