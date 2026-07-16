@@ -41,6 +41,13 @@ jobs:
       - name: Doctests
         run: cargo test --doc --workspace
 
+      # The doc build reached zero warnings in PR #7 (365 intra-doc-link
+      # warnings resolved); this step is what keeps it there — without it a
+      # broken [`link`] in a doc comment ships silently and the family
+      # regrows one PR at a time.
+      - name: Docs (rustdoc warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
   # The manifest claims `rust-version = "1.89"`. This job is what makes that
   # claim true rather than aspirational: it compiles every target on exactly
   # that toolchain. It does not run the tests — the CPU job above owns that —
