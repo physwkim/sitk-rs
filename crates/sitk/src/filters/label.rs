@@ -48,11 +48,14 @@
 //!
 //! ## `relabel_component`
 //!
-//! Counts pixels per nonzero label, sorts descending by count with ties
-//! broken by ascending original label value (`itkRelabelComponentImageFilter.hxx`'s
-//! `std::sort` comparator, applied to a `std::map`-ordered — i.e.
-//! ascending-label — initial vector), and remaps the largest object to label
-//! 1, the second largest to label 2, etc. Objects smaller than
+//! Counts pixels per nonzero label. With `sort_by_object_size == true`
+//! (ITK's default) it sorts descending by count with ties broken by ascending
+//! original label value (`itkRelabelComponentImageFilter.hxx`'s `std::sort`
+//! comparator, applied to a `std::map`-ordered — i.e. ascending-label —
+//! initial vector) and remaps the largest object to label 1, the second
+//! largest to label 2, etc. With `false`, ITK skips that `std::sort`, so the
+//! objects keep the `std::map` ascending-original-label order. Objects smaller
+//! than
 //! `minimum_object_size` map to background (0) without consuming an output
 //! label. `minimum_object_size == 0` means no minimum, matching ITK's
 //! `MinimumObjectSize` default. Output pixel type matches the input's
@@ -441,12 +444,19 @@ fn pixel_id_max_label(id: PixelId) -> u64 {
     }
 }
 
-/// `RelabelComponentImageFilter`: relabel the (background-0) objects in
-/// `img` so label 1 is the largest object, label 2 the second largest, etc.,
-/// descending by pixel count. Ties are broken by ascending original label
-/// value. Objects with fewer than `minimum_object_size` pixels are dropped
-/// to background; `minimum_object_size == 0` means no minimum.
-pub fn relabel_component(img: &Image, minimum_object_size: u64) -> Result<Image> {
+/// `RelabelComponentImageFilter`: relabel the (background-0) objects in `img`.
+///
+/// With `sort_by_object_size == true` (ITK's default), label 1 is the largest
+/// object, label 2 the second largest, etc., descending by pixel count; ties
+/// are broken by ascending original label value. With `false`, ITK skips the
+/// size sort and the objects keep their ascending original-label order.
+/// Objects with fewer than `minimum_object_size` pixels are dropped to
+/// background; `minimum_object_size == 0` means no minimum.
+pub fn relabel_component(
+    img: &Image,
+    minimum_object_size: u64,
+    sort_by_object_size: bool,
+) -> Result<Image> {
     let labels: Vec<i64> = img
         .to_f64_vec()?
         .iter()
@@ -464,10 +474,15 @@ pub fn relabel_component(img: &Image, minimum_object_size: u64) -> Result<Image>
     }
 
     let mut size_vec: Vec<(i64, u64)> = size_map.into_iter().collect();
-    // Descending by size; ties keep ascending original-label order, matching
-    // `a.second.m_SizeInPixels > b.second.m_SizeInPixels || (sizes equal &&
-    // a.first < b.first)` in `itkRelabelComponentImageFilter.hxx`.
-    size_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // ITK sorts descending by size only when `m_SortByObjectSize`; ties keep
+    // ascending original-label order (`a.second.m_SizeInPixels >
+    // b.second.m_SizeInPixels || (sizes equal && a.first < b.first)` in
+    // `itkRelabelComponentImageFilter.hxx`). When false, ITK leaves the
+    // `std::map` ascending-original-label order untouched — reproduced here by
+    // the `BTreeMap` order `size_vec` already carries.
+    if sort_by_object_size {
+        size_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
 
     let max_output_label = pixel_id_max_label(img.pixel_id());
     let mut relabel_map: HashMap<i64, u64> = HashMap::new();
@@ -863,7 +878,7 @@ mod tests {
             *v = 4;
         }
         let img = img_u32(&[18, 1], data);
-        let out = relabel_component(&img, 0).unwrap();
+        let out = relabel_component(&img, 0, true).unwrap();
         assert_eq!(out.pixel_id(), PixelId::UInt32);
         let relabeled = out.scalar_slice::<u32>().unwrap();
 
@@ -872,6 +887,38 @@ mod tests {
         assert!(relabeled[5..8].iter().all(|&v| v == 3)); // orig label 2
         assert!(relabeled[8..11].iter().all(|&v| v == 4)); // orig label 3
         assert!(relabeled[11..18].iter().all(|&v| v == 1)); // orig label 4
+    }
+
+    #[test]
+    fn relabel_without_sort_keeps_ascending_original_label_order() {
+        // Same objects as the sorted test: 1(5), 2(3), 3(3), 4(7).
+        let mut data = vec![0u32; 18];
+        for v in data.iter_mut().take(5) {
+            *v = 1;
+        }
+        for v in data[5..8].iter_mut() {
+            *v = 2;
+        }
+        for v in data[8..11].iter_mut() {
+            *v = 3;
+        }
+        for v in data[11..18].iter_mut() {
+            *v = 4;
+        }
+        let img = img_u32(&[18, 1], data);
+
+        // SortByObjectSize = false: objects keep ascending original-label
+        // order, so each label maps to itself (1->1, 2->2, 3->3, 4->4).
+        let out = relabel_component(&img, 0, false).unwrap();
+        let relabeled = out.scalar_slice::<u32>().unwrap();
+        assert!(relabeled[0..5].iter().all(|&v| v == 1));
+        assert!(relabeled[5..8].iter().all(|&v| v == 2));
+        assert!(relabeled[8..11].iter().all(|&v| v == 3));
+        assert!(relabeled[11..18].iter().all(|&v| v == 4));
+
+        // And this differs from the size-sorted relabeling.
+        let sorted = relabel_component(&img, 0, true).unwrap();
+        assert_ne!(relabeled, sorted.scalar_slice::<u32>().unwrap(),);
     }
 
     #[test]
@@ -885,7 +932,7 @@ mod tests {
         data[4] = 2;
         data[5] = 2;
         let img = img_u32(&[6, 1], data);
-        let out = relabel_component(&img, 3).unwrap();
+        let out = relabel_component(&img, 3, true).unwrap();
         let relabeled = out.scalar_slice::<u32>().unwrap();
         assert_eq!(&relabeled[0..2], &[0, 0]);
         assert_eq!(&relabeled[2..6], &[1, 1, 1, 1]);
@@ -894,7 +941,7 @@ mod tests {
     #[test]
     fn relabel_preserves_input_pixel_type() {
         let img = img_u8(&[4, 1], vec![1, 1, 0, 2]);
-        let out = relabel_component(&img, 0).unwrap();
+        let out = relabel_component(&img, 0, true).unwrap();
         assert_eq!(out.pixel_id(), PixelId::UInt8);
     }
 

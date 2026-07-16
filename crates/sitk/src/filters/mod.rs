@@ -137,6 +137,7 @@ pub mod watershed_classic;
 
 use crate::core::compensated::CompensatedSum;
 use crate::core::{Image, PixelId, Scalar, dispatch_scalar, parallel};
+pub use crate::transform::Interpolator;
 pub use adaptive_histogram_equalization::adaptive_histogram_equalization;
 pub use anisotropic_diffusion::{
     curvature_anisotropic_diffusion, gradient_anisotropic_diffusion, stable_time_step_bound,
@@ -191,7 +192,7 @@ pub use distance::{
 };
 pub use edge::zero_crossing_based_edge_detection;
 pub use error::{FilterError, Result};
-pub use expand::{Interpolator, expand};
+pub use expand::expand;
 pub use fast_marching::fast_marching;
 pub use fast_marching_upwind_gradient::{
     FastMarchingUpwindGradientResult, FastMarchingUpwindGradientSettings,

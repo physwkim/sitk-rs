@@ -833,6 +833,12 @@ pub enum FilterError {
     /// A core image error surfaced.
     #[error(transparent)]
     Core(#[from] crate::core::Error),
+
+    /// A transform-crate error surfaced from a filter that internally reuses a
+    /// transform primitive — e.g. [`crate::filters::expand`] sampling through
+    /// [`crate::transform::resample::InterpolatedImage`].
+    #[error(transparent)]
+    Transform(#[from] crate::transform::error::TransformError),
 }
 
 /// Convenience alias for filter results.

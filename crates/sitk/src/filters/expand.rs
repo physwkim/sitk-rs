@@ -7,31 +7,20 @@
 //! (`ExpandFactors` default `[1, 1, ...]`, `Interpolator` default
 //! `sitkLinear`).
 //!
-//! `sitk-filters` does not depend on `sitk-transform` (which already has
-//! `nearest_at`/`linear_at` sampling for the resample pipeline); rather than
-//! add a workspace dependency edge for this one filter, the linear/nearest
-//! sampling used here is implemented locally, working directly on the flat
-//! `f64` pixel buffers this crate already uses everywhere else (see
-//! [`crate::filters::image_from_f64`]).
+//! The per-output-pixel interpolation reuses the transform crate's shared
+//! sampling primitive ([`crate::transform::resample::InterpolatedImage`]) rather
+//! than a filter-local linear/nearest implementation: after the single-crate
+//! consolidation there is no dependency edge to avoid, and that primitive
+//! already carries every kernel SimpleITK's `ExpandImageFilter.yaml` exposes
+//! (`sitkLinear`, `sitkNearestNeighbor`, `sitkBSpline`, `sitkGaussian`, and the
+//! windowed-sinc family), so `Interpolator` here is a re-export of
+//! [`crate::transform::Interpolator`] and Expand gains the full set for free.
 
-use crate::core::{Image, coord};
+use crate::core::Image;
 use crate::filters::error::{FilterError, Result};
 use crate::filters::image_from_f64;
-
-/// Interpolation kernel used by [`expand`] to resample the input at each
-/// output pixel's continuous input-space location.
-///
-/// SimpleITK's `ExpandImageFilter.yaml` exposes an `InterpolatorEnum` with
-/// five variants (`sitkLinear` default, `sitkNearestNeighbor`, `sitkBSpline`,
-/// `sitkGaussian`, `sitkLabelGaussian`); only the two reproduced here are
-/// ported — see the module doc comment for why the others (which live in
-/// `sitk-transform`) are out of scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Interpolator {
-    #[default]
-    Linear,
-    NearestNeighbor,
-}
+use crate::transform::Interpolator;
+use crate::transform::resample::InterpolatedImage;
 
 /// First-index-fastest strides for a size vector.
 fn strides(size: &[usize]) -> Vec<usize> {
@@ -40,57 +29,6 @@ fn strides(size: &[usize]) -> Vec<usize> {
         s[d] = s[d - 1] * size[d - 1];
     }
     s
-}
-
-/// `itk::LinearInterpolateImageFunction::EvaluateUnoptimized`: the weighted
-/// sum over the `2^dim` corners surrounding `cindex`'s per-axis floor, each
-/// corner's axis component clamped *independently* to `[0, size[d]-1]`
-/// (`itkLinearInterpolateImageFunction.hxx`'s `std::min`/`std::max` against
-/// `m_EndIndex`/`m_StartIndex`) — the same "clamp each axis independently"
-/// rule as [`crate::core::ZeroFluxNeumannBoundaryCondition`], applied per
-/// corner rather than per neighborhood-window offset.
-fn linear_at(vals: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -> f64 {
-    let dim = size.len();
-    let mut base = vec![0i64; dim];
-    let mut frac = vec![0f64; dim];
-    for d in 0..dim {
-        let b = cindex[d].floor();
-        base[d] = b as i64;
-        frac[d] = cindex[d] - b;
-    }
-
-    let corners = 1usize << dim;
-    let mut sum = 0.0;
-    for counter in 0..corners {
-        let mut weight = 1.0;
-        let mut flat = 0usize;
-        for d in 0..dim {
-            let upper = (counter >> d) & 1 == 1;
-            let idx = if upper { base[d] + 1 } else { base[d] };
-            let clamped = idx.clamp(0, size[d] as i64 - 1) as usize;
-            weight *= if upper { frac[d] } else { 1.0 - frac[d] };
-            flat += clamped * strides[d];
-        }
-        sum += weight * vals[flat];
-    }
-    sum
-}
-
-/// `itk::NearestNeighborInterpolateImageFunction::EvaluateAtContinuousIndex`:
-/// round `cindex` to the nearest integer index per axis (defensively clamped
-/// to `[0, size[d]-1]`, though [`expand`]'s own sampling positions never
-/// actually reach outside that range for this rounding step — see
-/// [`expand`]'s doc comment). ITK's nearest-neighbour rounds via
-/// `ConvertContinuousIndexToNearestIndex` = `Math::RoundHalfIntegerUp` (half
-/// toward +∞), not Rust's half-away-from-zero `f64::round`.
-fn nearest_at(vals: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -> f64 {
-    let dim = size.len();
-    let mut flat = 0usize;
-    for d in 0..dim {
-        let idx = coord::round_half_integer_up(cindex[d]).clamp(0, size[d] as i64 - 1) as usize;
-        flat += idx * strides[d];
-    }
-    vals[flat]
 }
 
 /// `ExpandImageFilter`: upsamples `img` by the per-axis integer `factors`,
@@ -117,15 +55,17 @@ fn nearest_at(vals: &[f64], size: &[usize], strides: &[usize], cindex: &[f64]) -
 /// spacing scaled by `(factor-1)/factor` to keep the two grids aligned in
 /// physical space. Direction is unchanged.
 ///
-/// Since every sampled continuous index satisfies `cindex[d] ∈ (-0.5,
-/// size[d]-0.5)` for `factor[d] >= 1` (the formula's numerator `out_index +
-/// 0.5` never reaches `factor[d] * size[d]`, its supremum), nearest-neighbor
-/// rounding never needs its boundary clamp and linear interpolation's corner
-/// clamp only ever fires at the two edge samples per axis — both filters'
-/// literal `std::min`/`std::max`-against-`EndIndex`/`StartIndex` boundary
-/// handling is reproduced anyway rather than relied-upon-to-never-fire, so
-/// the port stays correct if that supremum reasoning is ever wrong at some
-/// unswept corner.
+/// Every sampled continuous index satisfies `cindex[d] ∈ [-0.5, size[d]-0.5)`
+/// for `factor[d] >= 1`: the minimum sample `(0+0.5)/factor - 0.5` is `> -0.5`
+/// (the `0.5/factor` term is strictly positive), and the maximum sample
+/// `size - 0.5 - 0.5/factor` is `< size - 0.5`. That is exactly the half-open
+/// range [`InterpolatedImage::sample`] treats as inside the buffer
+/// (`is_inside`: `c >= -0.5 && c < size-0.5`), so the sample is always `Some`
+/// and the `.expect()` below cannot fire — a broken bound would panic rather
+/// than silently interpolate out-of-domain data. Within that range the
+/// interpolator's own boundary clamp (linear's per-corner
+/// `std::min`/`std::max` against `Start/EndIndex`, nearest's
+/// `RoundHalfIntegerUp`-then-clamp) reproduces ITK's edge handling.
 ///
 /// Errors if `factors.len()` doesn't match `img`'s dimension, or any factor
 /// is `0`. Upstream's own array-typed setter
@@ -176,8 +116,7 @@ pub fn expand(img: &Image, factors: &[usize], interpolator: Interpolator) -> Res
         *o += acc;
     }
 
-    let in_vals = img.to_f64_vec()?;
-    let in_strides = strides(in_size);
+    let interp = InterpolatedImage::new(img, interpolator)?;
     let out_strides = strides(&out_size);
     let out_count: usize = out_size.iter().product();
 
@@ -188,10 +127,9 @@ pub fn expand(img: &Image, factors: &[usize], interpolator: Interpolator) -> Res
             let oi = (o / out_strides[d]) % out_size[d];
             cindex[d] = (oi as f64 + 0.5) / factors[d] as f64 - 0.5;
         }
-        *slot = match interpolator {
-            Interpolator::Linear => linear_at(&in_vals, in_size, &in_strides, &cindex),
-            Interpolator::NearestNeighbor => nearest_at(&in_vals, in_size, &in_strides, &cindex),
-        };
+        *slot = interp
+            .sample(&cindex)
+            .expect("expand samples cindex ∈ [-0.5, size-0.5), always inside the buffer");
     }
 
     let mut out = image_from_f64(img.pixel_id(), &out_size, img, &out_vals)?;
@@ -297,5 +235,54 @@ mod tests {
         let img = Image::from_vec(&[2, 2], vec![1u8, 2, 3, 4]).unwrap();
         let out = expand(&img, &[2, 2], Interpolator::Linear).unwrap();
         assert_eq!(out.pixel_id(), crate::core::PixelId::UInt8);
+    }
+
+    #[test]
+    fn factor_one_bspline_reproduces_input_exactly() {
+        // At factor 1 every sampled cindex is an integer index, and BSpline is
+        // interpolating — it must reproduce the input samples exactly. This
+        // also proves the shared interpolator's `is_inside` guard never trips
+        // (an out-of-buffer sample would return `None` and panic in `expand`).
+        let img = Image::from_vec(&[5], vec![1.0, 4.0, 9.0, 16.0, 25.0]).unwrap();
+        let out = expand(&img, &[1], Interpolator::BSpline).unwrap();
+        let got = out.to_f64_vec().unwrap();
+        for (g, e) in got.iter().zip([1.0, 4.0, 9.0, 16.0, 25.0]) {
+            assert!((g - e).abs() < 1e-9, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn bspline_and_gaussian_diverge_from_linear_on_a_curved_signal() {
+        // On a non-linear signal the higher-order (BSpline) and smoothing
+        // (Gaussian) kernels must produce a different upsampling than the
+        // piecewise-linear one — the whole point of exposing them on Expand.
+        let img = Image::from_vec(&[5], vec![1.0, 4.0, 9.0, 16.0, 25.0]).unwrap();
+        let linear = expand(&img, &[3], Interpolator::Linear)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let bspline = expand(&img, &[3], Interpolator::BSpline)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        let gaussian = expand(&img, &[3], Interpolator::Gaussian)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        assert_ne!(linear, bspline);
+        assert_ne!(linear, gaussian);
+    }
+
+    #[test]
+    fn windowed_sinc_stays_finite_across_the_whole_grid() {
+        // A windowed-sinc kernel touches a radius-5 neighbourhood; run it over
+        // a 2-D expansion to confirm every sample resolves (no `None`/panic)
+        // and stays finite.
+        let img = Image::from_vec(&[4, 4], (0..16).map(|v| v as f64).collect()).unwrap();
+        let out = expand(&img, &[2, 3], Interpolator::HammingWindowedSinc).unwrap();
+        assert_eq!(out.size(), &[8, 12]);
+        for v in out.to_f64_vec().unwrap() {
+            assert!(v.is_finite(), "non-finite sample {v}");
+        }
     }
 }
