@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A pure-Rust port of SimpleITK"
+readme = "README.md"
 
 [features]
 # Default OFF. On, every op with a GPU kernel tries the GPU first and falls
